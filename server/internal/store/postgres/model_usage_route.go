@@ -143,6 +143,32 @@ func conversationRouteSnapshotsMatch(first, second app.ConversationRouteSnapshot
 	return reflect.DeepEqual(first, second)
 }
 
+func conversationRouteHistoryProjectionMatches(expected, actual []app.ConversationRouteHistory, incomplete bool) bool {
+	index := 0
+	for _, item := range actual {
+		for index < len(expected) && expected[index].MessageID != item.MessageID {
+			if !incomplete {
+				return false
+			}
+			index++
+		}
+		if index == len(expected) {
+			return false
+		}
+		original := expected[index]
+		index++
+		if item.Content != original.Content && !(incomplete && item.Content == "" && item.Truncated) ||
+			item.Truncated != original.Truncated && !(incomplete && item.Truncated) {
+			return false
+		}
+		item.Content, item.Truncated = original.Content, original.Truncated
+		if !reflect.DeepEqual(item, original) {
+			return false
+		}
+	}
+	return incomplete || index == len(expected)
+}
+
 func checkConversationRouteModelFence(ctx context.Context, tx pgx.Tx, fence app.ConversationRouteModelFence, modelID string) error {
 	claim, value := fence.Claim, fence.Context
 	if value.ActorID != claim.Message.ActorID || value.ReferenceTaskID != claim.Input.ReferenceTaskID ||
@@ -216,6 +242,11 @@ func checkConversationRouteModelFence(ctx context.Context, tx pgx.Tx, fence app.
 	expected.RequestCandidates = value.RequestCandidates
 	expected.AggregationCandidates = value.AggregationCandidates
 	expected.CandidateSetIncomplete = value.CandidateSetIncomplete
+	expected.HistoryIncomplete = expected.HistoryIncomplete || value.HistoryIncomplete
+	if !conversationRouteHistoryProjectionMatches(expected.History, value.History, value.HistoryIncomplete) {
+		return domain.NewError(domain.CodeConflict, "authorized route history changed")
+	}
+	expected.History = value.History
 	if snapshot.PreviousCycle || !reflect.DeepEqual(expected, value) {
 		return domain.NewError(domain.CodeConflict, "authorized route context changed")
 	}
@@ -240,12 +271,13 @@ WHERE r.service_instance_id=$1::uuid AND r.actor_id=$2 AND r.conversation_id=$3 
 	}
 	for _, item := range value.History {
 		var valid bool
-		err := tx.QueryRow(ctx, `SELECT m.conversation_id=$2 AND m.owner_id=$3 AND m.sequence=$4 AND m.role=$6 AND m.content=$7
+		err := tx.QueryRow(ctx, `SELECT m.conversation_id=$2 AND m.owner_id=$3 AND m.sequence=$4 AND m.role=$6
+ AND (m.content=$7 OR $12::bool)
  AND (m.sequence<$5 OR (m.sequence>$5 AND m.actor_id=$8 AND m.role='user' AND EXISTS (
    SELECT 1 FROM conversation_message_routes predecessor WHERE predecessor.message_id=m.id
     AND predecessor.service_instance_id=$9::uuid AND predecessor.owner_id=$3 AND predecessor.actor_id=$8
     AND predecessor.conversation_id=$2 AND predecessor.client_message_id=$11)))
- AND (octet_length(m.content)<=4096 OR (m.sequence>$5 AND m.actor_id=$8 AND m.role='user' AND EXISTS (
+ AND (octet_length(m.content)<=4096 OR $12::bool OR (m.sequence>$5 AND m.actor_id=$8 AND m.role='user' AND EXISTS (
    SELECT 1 FROM conversation_message_routes predecessor WHERE predecessor.message_id=m.id
     AND predecessor.service_instance_id=$9::uuid AND predecessor.owner_id=$3 AND predecessor.actor_id=$8
     AND predecessor.conversation_id=$2 AND predecessor.client_message_id=$11))) AND (
@@ -271,7 +303,7 @@ WHERE r.service_instance_id=$1::uuid AND r.actor_id=$2 AND r.conversation_id=$3 
 FROM conversation_messages m LEFT JOIN tasks t ON t.id=m.task_id AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id
 WHERE m.id=$1 FOR SHARE OF m`, item.MessageID, claim.Message.ConversationID, claim.Message.OwnerID,
 			item.Sequence, claim.Message.Sequence, string(item.Role), item.Content, claim.Message.ActorID, claim.ServiceInstanceID,
-			claim.Input.ProjectID, claim.Input.PreviousClientMessageID).Scan(&valid)
+			claim.Input.ProjectID, claim.Input.PreviousClientMessageID, item.Truncated).Scan(&valid)
 		if err != nil || !valid {
 			return domain.NewError(domain.CodeUnauthenticated, "route history is unavailable")
 		}

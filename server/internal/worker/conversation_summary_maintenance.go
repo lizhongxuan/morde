@@ -114,11 +114,14 @@ func (w *ConversationRouteWorker) compactConversationSummary(ctx context.Context
 	if err != nil {
 		return false, err
 	}
-	text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(result.Text), conversationSummaryIncompleteNotice+"\n\n"))
+	text := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(result.Text), conversationSummaryIncompleteNotice))
+	if text == "" {
+		return false, domain.NewError(domain.CodeInvalidState, "conversation summary did not produce a smaller bounded result")
+	}
 	if !input.historyComplete {
 		text = conversationSummaryIncompleteNotice + "\n\n" + text
 	}
-	if strings.TrimSpace(text) == "" || len(text) > conversationSummaryMaintenanceMaxOutputBytes ||
+	if len(text) > conversationSummaryMaintenanceMaxOutputBytes ||
 		len(text) >= input.inputBytes || result.ModelID != modelID || result.SessionID == "" || result.Through < 0 {
 		return false, domain.NewError(domain.CodeInvalidState, "conversation summary did not produce a smaller bounded result")
 	}

@@ -117,10 +117,10 @@ export function PortalLayout() {
   const { canGoBack, canGoForward, goBack, goForward } = useContext(RouteHistoryContext);
   const [contextSidebarCollapsed, setContextSidebarCollapsed] = useState(readContextSidebarCollapsed);
   const [logoutConfirmationOpen, setLogoutConfirmationOpen] = useState(false);
-  const [assistantPanelOpen, setAssistantPanelOpen] = useState(true);
+  const [assistantPanelOpen, setAssistantPanelOpen] = useState(false);
   const [assistantWorkspaceWidth, setAssistantWorkspaceWidth] = useState<number | null>(null);
-  const [assistantPanelTab, setAssistantPanelTab] = useState<AssistantPanelTab>('computer');
-  const [assistantOpenPanelTabs, setAssistantOpenPanelTabs] = useState<AssistantPanelTab[]>(['computer', 'tasks', 'files']);
+  const [assistantPanelTab, setAssistantPanelTab] = useState<AssistantPanelTab>('tasks');
+  const [assistantOpenPanelTabs, setAssistantOpenPanelTabs] = useState<AssistantPanelTab[]>(['tasks']);
   const assistantPanelToggle = useRef<HTMLButtonElement>(null);
   const focusAssistantPanelToggle = useCallback(() => assistantPanelToggle.current?.focus(), []);
   const assistantWorkspaceAddMenu = useRef<HTMLDetailsElement>(null);
@@ -191,6 +191,13 @@ export function PortalLayout() {
       else setAssistantPanelOpen(false);
     }
   };
+  const toggleAssistantPanel = () => {
+    if (!assistantPanelOpen && assistantOpenPanelTabs.length === 0) {
+      setAssistantOpenPanelTabs(['tasks']);
+      setAssistantPanelTab('tasks');
+    }
+    setAssistantPanelOpen((open) => !open);
+  };
 
   return <div className={`morde-shell${contextSidebarCollapsed ? ' morde-shell-context-collapsed' : ''}${pageNavigation ? ' morde-shell-with-page-navigation' : ''}${isSettingsNavigation ? ' morde-shell-settings-navigation' : ''}${isAssistantPage ? ` morde-shell-assistant-workspace${assistantPanelOpen ? '' : ' morde-shell-assistant-workspace-collapsed'}` : ''}`}
     style={isAssistantPage && assistantWorkspaceWidth !== null ? { '--pc-workspace-panel-user-width': `${assistantWorkspaceWidth}px` } as CSSProperties : undefined}>
@@ -221,7 +228,7 @@ export function PortalLayout() {
       </nav>}
       <button ref={assistantPanelToggle} type="button" className="morde-workspace-icon"
         aria-label={assistantPanelOpen ? '隐藏工作区侧栏' : '显示工作区侧栏'} title={assistantPanelOpen ? '隐藏工作区侧栏' : '显示工作区侧栏'}
-        aria-expanded={assistantPanelOpen} onClick={() => setAssistantPanelOpen((open) => !open)}><MordeIcon name="panel" /></button>
+        aria-expanded={assistantPanelOpen} onClick={toggleAssistantPanel}><MordeIcon name="panel" /></button>
     </> : <><Link className="morde-notification-link" to="/clients" aria-label="查看客户端与设备"><MordeIcon name="monitor" /></Link><Link className="morde-notification-link" to="/notifications" aria-label="查看通知"><MordeIcon name="bell" /></Link><span className="morde-avatar" aria-hidden="true">{user?.name.slice(0, 1) || 'M'}</span><span className="morde-top-user">{user?.name}</span></>}</div></header>
     <aside className="morde-sidebar" aria-label="PC 用户端导航">
       <Link to="/assistant" className="morde-brand" aria-label="Morde 对话" title="Morde 对话"><span className="morde-brand-mark" aria-hidden="true">M</span><span><strong>Morde</strong><small>PC 用户端</small></span></Link>

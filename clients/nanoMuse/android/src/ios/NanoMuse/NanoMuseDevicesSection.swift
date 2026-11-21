@@ -32,7 +32,7 @@ struct NanoMuseDevicesSection: View {
         } header: {
             Text(AppLocalized("Devices"))
         } footer: {
-            Text(AppLocalized("Every device signed in to this account is a Muse: this iPhone, your computers running morde Desktop, the web console. Each can ask the others for things, on any network, through morde Cloud. On iOS the others can open links here and send notifications; the iPhone's own Muse works on the iPhone."))
+            Text(AppLocalized("Every device signed in to this account is a Muse: this iPhone, your computers running morde Desktop. Each can ask the others for things, on any network, through morde Cloud. On iOS the others can open links here and send notifications; the iPhone's own Muse works on the iPhone."))
         }
         .alert(AppLocalized("This iPhone's name"), isPresented: $editingName) {
             TextField(AppLocalized("Name"), text: $name)

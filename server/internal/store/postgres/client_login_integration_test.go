@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -204,9 +203,8 @@ func TestClientLoginAtomicCredentialsReplayRenewalAndLogout(t *testing.T) {
 	}
 	_, err = clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", "", "login-after-logout-0001", "192.0.2.1",
 		app.ClientLoginAttempt{InstanceID: "9f0de095-66ba-49c6-a87b-0c527f4f81a1", Generation: 5})
-	var loginErr *domain.Error
-	if domain.CodeOf(err) != domain.CodeConflict || !errors.As(err, &loginErr) || loginErr.Details["reason"] != "client_login_state_changed" {
-		t.Fatalf("login stream restored a logged-out installation = %v; want client_login_state_changed conflict", err)
+	if err == nil || domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("login stream restored a logged-out installation = %v; want unauthenticated", err)
 	}
 	items, err := store.ListClientInstallations(ctx, owner.ID)
 	if err != nil || len(items) != 1 || items[0].RevokedAt == nil {
@@ -614,6 +612,24 @@ func TestClientLoginRejectsLateGenerationAfterNewerRetry(t *testing.T) {
 	}
 }
 
+func TestClientLoginAfterInstallationRevocationIsUnauthenticated(t *testing.T) {
+	store, _, clients, owner := clientLoginFixture(t)
+	ctx := context.Background()
+	instanceID := "5f0de095-66ba-49c6-a87b-0c527f4f81a1"
+	first, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", "", "login-revoked-0001", "192.0.2.1",
+		app.ClientLoginAttempt{InstanceID: instanceID, Generation: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RevokeClientInstallation(ctx, first.InstallationID, owner.ID, "192.0.2.2", audit.ActorSession, nil); err != nil {
+		t.Fatalf("revoke client installation: %v", err)
+	}
+	if _, err := clients.Login(ctx, owner.Name, "client-password-123", "desktop", "laptop", first.InstallationID, "login-revoked-0002", "192.0.2.1",
+		app.ClientLoginAttempt{InstanceID: instanceID, Generation: 2}); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("login renewed a revoked installation = %v; want unauthenticated", err)
+	}
+}
+
 func TestClientLoginRacingRevocationCannotRestoreInstallation(t *testing.T) {
 	store, credentials, clients, owner := clientLoginFixture(t)
 	ctx := context.Background()
@@ -900,8 +916,8 @@ func TestClientLoginHTTPPostgresSessionFenceAndLogout(t *testing.T) {
 			Details map[string]any `json:"details"`
 		} `json:"error"`
 	}
-	if lateLogin.Code != http.StatusConflict || json.Unmarshal(lateLogin.Body.Bytes(), &lateLoginError) != nil ||
-		lateLoginError.Error.Code != string(domain.CodeConflict) || lateLoginError.Error.Details["reason"] != "client_login_state_changed" {
+	if lateLogin.Code != http.StatusUnauthorized || json.Unmarshal(lateLogin.Body.Bytes(), &lateLoginError) != nil ||
+		lateLoginError.Error.Code != string(domain.CodeUnauthenticated) {
 		t.Fatalf("late login restored logged-out installation = %d %s", lateLogin.Code, lateLogin.Body)
 	}
 	iosBody := `{"name":"` + owner.Name + `","password":"client-password-123","platform":"ios","display_name":"phone","client_instance_id":"3f0de095-66ba-49c6-a87b-0c527f4f81a1","attempt_generation":1}`

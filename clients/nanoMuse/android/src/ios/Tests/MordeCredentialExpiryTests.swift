@@ -1290,12 +1290,13 @@ enum MordeCredentialExpiryTests {
         precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: [unverifiedFirst, wireSecond]) == nil)
         var unknownFirst = delayed[0]
         unknownFirst.state = .unknown
+        unknownFirst.submissionUncertain = true
         let uncertainQueue = [unknownFirst, wireSecond, wireLong, otherConversation]
         precondition(MordeOutboxScheduling.readyIDs(uncertainQueue, scope: scope, inFlight: []) ==
-            [wireSecond.id, wireLong.id, otherConversation.id])
+            [otherConversation.id])
         unknownFirst.state = .sending
         precondition(MordeOutboxScheduling.readyIDs([unknownFirst, wireSecond, wireLong, otherConversation],
-            scope: scope, inFlight: []) == [wireFirst.id, wireSecond.id, wireLong.id, otherConversation.id])
+            scope: scope, inFlight: []) == [wireFirst.id, otherConversation.id])
         precondition(MordeOutboxScheduling.waitingForEarlierMessage(wireSecond, in: uncertainQueue) == nil)
         for code in [400, 403, 404, 413, 422] {
             precondition(MordeOutboxFailurePolicy.confirmsRejection(submissionBegan: true, firstSubmission: true,

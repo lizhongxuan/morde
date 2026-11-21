@@ -14,6 +14,7 @@ import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { CommandId } from '@deepseek-ai/dsh-commands/brand'
+import type { TokenMeasurement } from '@deepseek-ai/dsh-token-meter'
 // Type-only: makes the optional sibling service available to `ctx.get()`.
 import type {} from '@deepseek-ai/dsh-compaction-tool-result-pruner'
 import {
@@ -137,6 +138,17 @@ export class BasicCompactionEngine extends CompactionEngine {
     super(ctx)
     this.config = resolveConfig(config)
     if (this.config.auto) this._registerAutomaticCompaction()
+  }
+
+  /** Selection seam for backends that need a different safe surface window. */
+  protected selectRange(
+    session: Session,
+    measurement: TokenMeasurement,
+    retainTokens: number,
+    _contextWindow?: number,
+    _outputTokens = 0,
+  ): { start: SessionSeq; end: SessionSeq } | null {
+    return selectCompactableRange(session, measurement, retainTokens)
   }
 
   /**
@@ -302,7 +314,7 @@ export class BasicCompactionEngine extends CompactionEngine {
       case 'context-overflow': {
         this.ctx.get('toolResultPruner')?.pruneSession(agent.session)
         const measurement = this.ctx.tokenMeter.measure(agent.session)
-        const range = selectCompactableRange(agent.session, measurement, 0)
+        const range = this.selectRange(agent.session, measurement, 0)
         if (range === null) return null
         return this.compactRegion(range.start, range.end, agent, signal)
       }
@@ -334,11 +346,8 @@ export class BasicCompactionEngine extends CompactionEngine {
         + 'configure contextWindow on that adapter model',
       )
     }
-    const spec = resolveCompactSpec(
-      policy,
-      info.context.contextWindow,
-      reservedCompletionTokens(header, info.defaultMaxTokens),
-    )
+    const outputTokens = reservedCompletionTokens(header, info.defaultMaxTokens)
+    const spec = resolveCompactSpec(policy, info.context.contextWindow, outputTokens)
     if (measurement.totalTokens < spec.thresholdTokens) return null
 
     // Once pressure qualifies, land the model-free pass before choosing a
@@ -351,7 +360,8 @@ export class BasicCompactionEngine extends CompactionEngine {
 
     let result: CompactionResult | null = null
     for (let attempt = 0; attempt <= spec.compactionRetries; attempt += 1) {
-      const range = selectCompactableRange(agent.session, measurement, spec.retainTokens)
+      const range = this.selectRange(agent.session, measurement, spec.retainTokens,
+        info.context.contextWindow, outputTokens)
       if (range === null) {
         if (result === null && !requireBelowThreshold) return null
         throw new Error(
@@ -415,10 +425,12 @@ export class BasicCompactionEngine extends CompactionEngine {
         const operationSignal = AbortSignal.any([agentSignal, signal])
         try {
           operationSignal.throwIfAborted()
-          const range = selectCompactableRange(
+          const range = this.selectRange(
             agent.session,
             this.ctx.tokenMeter.measure(agent.session),
             0,
+            agent.session.requestContext()?.contextWindow,
+            agent.session.requestHeader()?.config.maxTokens ?? 0,
           )
           if (range === null) return null
           return await compactSurfaceRegion(

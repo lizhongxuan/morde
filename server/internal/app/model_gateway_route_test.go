@@ -191,7 +191,8 @@ func TestConversationRouteGatewayUsesConfiguredGPT6LunaMaxReasoning(t *testing.T
 	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
 	client := &modelGatewayClientTest{response: ModelResponse{Text: `{"action":"reply","task_id":"","question":"","reply":"OK"}`,
 		StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3}}}
-	resolver := &modelGatewayResolverTest{personal: true, endpoint: ModelEndpoint{
+	window := 65_536
+	resolver := &modelGatewayResolverTest{personal: true, contextWindow: &window, endpoint: ModelEndpoint{
 		BaseURL: "https://api.openai.com/v1", APIKey: "test-key", ModelID: "gpt-6-luna",
 	}}
 	service, err := NewModelGatewayService(store, resolver, client)

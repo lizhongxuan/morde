@@ -758,6 +758,14 @@ func (e *CloudDSHExecutor) deliverPendingMessagesOnce(ctx context.Context, fence
 			!utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) {
 			return errors.New("pending conversation message is invalid")
 		}
+		mode := message.Mode
+		if mode == "" {
+			mode = app.AgentMessageDeliveryFollowup
+		}
+		if mode != app.AgentMessageDeliverySteer && mode != app.AgentMessageDeliveryFollowup {
+			return errors.New("pending conversation message delivery mode is invalid")
+		}
+		message.Mode = mode
 		fingerprint := cloudDSHMessageDeliveryFingerprint(message)
 		if content, ok := seen[message.ID]; ok {
 			if content != fingerprint {
@@ -765,11 +773,11 @@ func (e *CloudDSHExecutor) deliverPendingMessagesOnce(ctx context.Context, fence
 			}
 			continue
 		}
-		frame := map[string]any{"type": "message_delivery", "version": 2,
+		frame := map[string]any{"type": "message_delivery", "version": 3,
 			"task_id": fence.TaskID, "owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID,
 			"generation": fence.AgentGeneration, "authorization_version": fence.AuthorizationVersion,
 			"session_id": fence.AgentSessionID, "message_id": message.ID, "content": message.Content,
-			"attachment_ids": append([]string{}, message.AttachmentIDs...)}
+			"attachment_ids": append([]string{}, message.AttachmentIDs...), "mode": string(message.Mode)}
 		if err := writeCloudDSHFrame(ctx, input, frame); err != nil {
 			return err
 		}
@@ -779,7 +787,11 @@ func (e *CloudDSHExecutor) deliverPendingMessagesOnce(ctx context.Context, fence
 }
 
 func cloudDSHMessageDeliveryFingerprint(message app.AgentConversationMessage) string {
-	return message.Content + "\x00" + strings.Join(message.AttachmentIDs, "\x00")
+	mode := message.Mode
+	if mode == "" {
+		mode = app.AgentMessageDeliveryFollowup
+	}
+	return message.Content + "\x00" + strings.Join(message.AttachmentIDs, "\x00") + "\x00" + string(mode)
 }
 
 func validCloudDSHMessageAttachmentIDs(ids []string) bool {
@@ -1947,6 +1959,8 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		!sameWorkerToolNames(child.AllowedTools, allowedTools) {
 		return errors.New("dsh child Agent could not be durably created")
 	}
+	var settledOutput string
+	hasSettledOutput := false
 	if arguments.RunInBackground {
 		if child.Step.Status == task.StepUnknown && !child.CancelRequested {
 			return errors.New("dsh background job has an unknown outcome")
@@ -1982,9 +1996,12 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		if childState := states[child.SessionID]; childState != nil {
 			childHistory = childState.history
 		}
-		if _, err := recordCloudDSHChildToolResult(parent, frame.CallID, child, childHistory); err != nil {
+		var err error
+		settledOutput, err = recordCloudDSHChildToolResult(parent, frame.CallID, child, childHistory)
+		if err != nil {
 			return err
 		}
+		hasSettledOutput = true
 	}
 	identity := parent.identity
 	identity.SessionID = child.SessionID
@@ -2000,12 +2017,16 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 			states[child.SessionID].background = arguments.RunInBackground
 		}
 	}
-	return writeCloudDSHFrame(ctx, input, map[string]any{"type": "child_session", "call_id": frame.CallID,
+	response := map[string]any{"type": "child_session", "call_id": frame.CallID,
 		"task_id": identity.TaskID, "owner_id": identity.OwnerID, "agent_id": identity.AgentID, "session_id": identity.SessionID,
 		"generation": identity.Generation, "authorization_version": identity.AuthorizationVersion,
 		"parent_session_id": child.ParentSessionID, "objective": arguments.Objective,
 		"tools": cloudDSHToolPayload(definitions), "checkpoint_through_seq": child.CheckpointThrough,
-		"checkpoint_sha256": hex.EncodeToString(child.CheckpointDigest), "step_status": child.Step.Status, "summary": child.Step.Summary})
+		"checkpoint_sha256": hex.EncodeToString(child.CheckpointDigest), "step_status": child.Step.Status, "summary": child.Step.Summary}
+	if hasSettledOutput {
+		response["settled_output"] = settledOutput
+	}
+	return writeCloudDSHFrame(ctx, input, response)
 }
 
 type cloudDSHChildActionRef struct {

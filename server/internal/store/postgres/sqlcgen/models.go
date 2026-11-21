@@ -132,6 +132,50 @@ type AuditLog struct {
 	Ip        string             `json:"ip"`
 }
 
+type BlindEvaluationArbitration struct {
+	PackID          string             `json:"pack_id"`
+	CandidateLabel  string             `json:"candidate_label"`
+	ArbitratorID    string             `json:"arbitrator_id"`
+	Role            string             `json:"role"`
+	ArbitrationJson []byte             `json:"arbitration_json"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
+type BlindEvaluationMapping struct {
+	PackID      string `json:"pack_id"`
+	MappingJson []byte `json:"mapping_json"`
+}
+
+type BlindEvaluationPack struct {
+	PackID       string             `json:"pack_id"`
+	SuiteVersion string             `json:"suite_version"`
+	SuiteJson    []byte             `json:"suite_json"`
+	PackJson     []byte             `json:"pack_json"`
+	CreatedBy    string             `json:"created_by"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
+type BlindEvaluationParticipant struct {
+	PackID string `json:"pack_id"`
+	UserID string `json:"user_id"`
+	Role   string `json:"role"`
+}
+
+type BlindEvaluationReview struct {
+	PackID         string             `json:"pack_id"`
+	CandidateLabel string             `json:"candidate_label"`
+	ReviewerID     string             `json:"reviewer_id"`
+	Role           string             `json:"role"`
+	ReviewJson     []byte             `json:"review_json"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
+}
+
+type BlindEvaluationRunManifest struct {
+	PackID       string `json:"pack_id"`
+	RunID        string `json:"run_id"`
+	ManifestJson []byte `json:"manifest_json"`
+}
+
 type ClientAuthorization struct {
 	ID                    string             `json:"id"`
 	DisplayName           string             `json:"display_name"`
@@ -361,6 +405,7 @@ type ConversationMessage struct {
 	VariantVersion            pgtype.Int8        `json:"variant_version"`
 	VariantAction             pgtype.Text        `json:"variant_action"`
 	VariantOperationID        pgtype.Text        `json:"variant_operation_id"`
+	DeliveryMode              string             `json:"delivery_mode"`
 }
 
 type ConversationMessageAttachment struct {
@@ -1717,6 +1762,22 @@ type TaskAgentInstance struct {
 	HostRuntimeInstanceID         pgtype.Text        `json:"host_runtime_instance_id"`
 	HostControlVersion            pgtype.Int8        `json:"host_control_version"`
 	HostGrantFingerprint          pgtype.Text        `json:"host_grant_fingerprint"`
+}
+
+type TaskAgentMessageDelivery struct {
+	MessageID            string             `json:"message_id"`
+	TaskID               string             `json:"task_id"`
+	OwnerID              string             `json:"owner_id"`
+	InitiatorID          string             `json:"initiator_id"`
+	AgentInstanceID      string             `json:"agent_instance_id"`
+	AgentGeneration      int64              `json:"agent_generation"`
+	AuthorizationVersion int64              `json:"authorization_version"`
+	SessionID            string             `json:"session_id"`
+	Mode                 string             `json:"mode"`
+	EnqueuedThroughSeq   pgtype.Int8        `json:"enqueued_through_seq"`
+	ClaimedThroughSeq    pgtype.Int8        `json:"claimed_through_seq"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 }
 
 type TaskAgentSession struct {

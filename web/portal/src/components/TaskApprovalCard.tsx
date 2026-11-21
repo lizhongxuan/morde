@@ -65,7 +65,7 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
         <dt>替代方案</dt><dd>{alternativesDisclosure(approval.disclosures?.alternatives)}</dd>
         <dt>撤销方式</dt><dd>{textDisclosure(approval.disclosures?.revocation)}</dd></>}
     </dl>
-    {compact && <details className="task-approval-more"><summary>审批详情</summary>
+    {compact && <details className="task-approval-more"><summary>查看操作详情</summary>
       <dl className="task-approval-disclosures" aria-label="其他审批信息">
         <dt>累计费用</dt><dd>{costDisclosure(approval.disclosures?.cumulative_cost)}</dd>
         <dt>替代方案</dt><dd>{alternativesDisclosure(approval.disclosures?.alternatives)}</dd>
@@ -80,7 +80,7 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
           : approval.status === 'cancelled' ? <p role="status">此审批已取消。</p>
             : approval.status === 'approved' || approval.status === 'rejected' ? <p role="status">审批已处理；任务后续状态等待更新。</p>
               : actionable && <div className="chat-approval-actions">
-                <button type="button" className="button button-primary" disabled={submitting} onClick={() => onDecision('approve')}>允许</button>
+                <button type="button" className="button button-primary" disabled={submitting} onClick={() => onDecision('approve')}>允许本次操作</button>
                 <button type="button" className="button button-secondary" disabled={submitting} onClick={() => onDecision('reject')}>拒绝</button>
               </div>}
   </article>;

@@ -1063,7 +1063,6 @@ function UserProjects() {
                           {message.role === 'user' && message.agent_acknowledged === true && <span className="project-message-received" role="img"
                             aria-label="主 Agent 已接下，正在处理" title="主 Agent 已接下，正在处理">👌🏻</span>}
                           {isAgentProcessing && <div className="chat-message-row chat-message-row-assistant chat-thinking-row project-agent-processing" role="status" aria-label="Morde 正在思考">
-                            <span className="thinking-mascot" aria-hidden="true"><i /></span>
                             <div className="thinking-bubble"><div className="thinking-dots" aria-hidden="true"><span /><span /><span /></div></div>
                           </div>}
                           {message.role === 'assistant' && message.output_status !== 'streaming' && message.output_status !== 'interrupted' &&

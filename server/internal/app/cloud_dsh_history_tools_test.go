@@ -293,7 +293,7 @@ func TestCloudDSHCurrentConversationHistorySearchContinuesPast800Messages(t *tes
 		t.Fatal(err)
 	}
 	if next.ScannedMessages != 100 || next.Partial || next.NextCursor != "" || len(next.Matches) != 1 ||
-		next.Matches[0].Content != "the early requirement was to keep cedar private" || authorizer.calls != 9 {
+		next.Matches[0].Content != "the early requirement was to keep cedar private" || authorizer.calls != 11 {
 		t.Fatalf("continuation did not reach the 800th+ message with authorization rechecked: output=%+v checks=%d", next, authorizer.calls)
 	}
 }
@@ -696,8 +696,9 @@ func TestCloudDSHCurrentConversationHistorySchemaRequiresNullableContinuationCur
 	if err := json.Unmarshal(definition.Parameters, &schema); err != nil {
 		t.Fatal(err)
 	}
-	if len(schema.Required) != 3 || schema.Required[0] != "query" || schema.Required[1] != "limit" ||
-		schema.Required[2] != "cursor" || schema.AdditionalProperties ||
+	if len(schema.Required) != 4 || schema.Required[0] != "query" || schema.Required[1] != "limit" ||
+		schema.Required[2] != "cursor" || schema.Required[3] != "message_id" || schema.AdditionalProperties ||
+		schema.Properties["message_id"].MaxLength != 8 ||
 		schema.Properties["cursor"].MaxLength != cloudDSHCurrentHistoryCursorMaxBytes {
 		t.Fatalf("current history cursor schema is not strict-compatible: %s", definition.Parameters)
 	}
@@ -706,6 +707,12 @@ func TestCloudDSHCurrentConversationHistorySchemaRequiresNullableContinuationCur
 	if err != nil || json.Unmarshal(encoded, &cursorTypes) != nil || len(cursorTypes) != 2 ||
 		cursorTypes[0] != "string" || cursorTypes[1] != "null" {
 		t.Fatalf("current history cursor is not nullable: %s", definition.Parameters)
+	}
+	var messageIDTypes []string
+	encoded, err = json.Marshal(schema.Properties["message_id"].Type)
+	if err != nil || json.Unmarshal(encoded, &messageIDTypes) != nil || len(messageIDTypes) != 2 ||
+		messageIDTypes[0] != "string" || messageIDTypes[1] != "null" {
+		t.Fatalf("current history message ID is not nullable: %s", definition.Parameters)
 	}
 }
 

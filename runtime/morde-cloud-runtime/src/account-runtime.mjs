@@ -898,6 +898,10 @@ export class AccountRuntime {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: 'unknown_task' })
       return
     }
+    if (frame.type === 'message_delivery' && fence.session_id !== task.fence.session_id) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'task_fence_mismatch' })
+      return
+    }
     for (const key of accountScope) delete frame[key]
     if (frame.type === 'message_delivery' && !validMessageDelivery(frame, fence)) {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'invalid_message_delivery' })

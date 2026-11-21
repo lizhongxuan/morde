@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
@@ -38,6 +40,56 @@ type ConversationRouteCoordinatorOutputStore interface {
 }
 
 var ErrRouteProjectReservationRequired = errors.New("route project reservation is required")
+
+const conversationRouteRuntimePromptReserveTokens = 800
+
+// ConversationRouteInputFitsContextWindow uses the DSH TokenMeter's fixed
+// four UTF-16 characters-per-token estimate, with a CJK surcharge and room
+// for the Morde SOUL, provider framing and output. DSH includes SOUL in its
+// instructions; remove that copy so the fixed reserve counts it only once.
+func ConversationRouteInputFitsContextWindow(request ModelRequest, contextWindowTokens int) bool {
+	if contextWindowTokens < 4096 || contextWindowTokens > MaxModelContextWindowTokens || request.MaxOutputTokens < 1 {
+		return false
+	}
+	instructions := strings.Replace(request.Instructions, strings.TrimSpace(mordeSoulFile), "", 1)
+	inputTokens := conversationRouteTextTokenEstimate(instructions) + 4
+	for _, input := range request.Input {
+		inputTokens += conversationRouteTextTokenEstimate(input.Text) + 8
+		inputTokens += conversationRouteTextTokenEstimate(input.Arguments) + conversationRouteTextTokenEstimate(input.Output)
+		for _, part := range input.Parts {
+			inputTokens += conversationRouteTextTokenEstimate(part.Text) + 4
+			if part.Image != nil {
+				inputTokens += agentImageTokenReserve
+			}
+		}
+		inputTokens += int64(len(input.Images)) * agentImageTokenReserve
+	}
+	for _, tool := range request.Tools {
+		inputTokens += conversationRouteTextTokenEstimate(tool.Name+tool.Description+string(tool.Parameters)) + 8
+	}
+	headroom := min(4096, max(256, contextWindowTokens/8))
+	return inputTokens+int64(request.MaxOutputTokens+headroom+conversationRouteRuntimePromptReserveTokens) <= int64(contextWindowTokens)
+}
+
+func conversationRouteTextTokenEstimate(value string) int64 {
+	units, cjk := 0, 0
+	for _, r := range value {
+		units += utf16.RuneLen(r)
+		if unicode.Is(unicode.Han, r) || unicode.Is(unicode.Hiragana, r) || unicode.Is(unicode.Katakana, r) || unicode.Is(unicode.Hangul, r) {
+			cjk++
+		}
+	}
+	base := (units + 3) / 4
+	return int64(max(base, base+(cjk*3+3)/4))
+}
+
+func conversationRouteProviderError(err error) error {
+	var clientErr *ModelClientError
+	if errors.As(err, &clientErr) && clientErr.Stage == "provider_status" && clientErr.ProviderCode == "context_length_exceeded" {
+		return domain.NewError(domain.CodeResultTooLarge, "conversation route exceeds the provider context window")
+	}
+	return modelConnectionCheckError(err)
+}
 
 // DSHConversationCoordinatorModelCallID derives a stable route-call identity
 // without inventing or borrowing a Task ID.
@@ -160,6 +212,26 @@ func (s *ModelGatewayService) ResolveConversationSummaryModel(ctx context.Contex
 		return "", 0, domain.NewError(domain.CodeUnsupported, "selected model context capacity is unavailable")
 	}
 	return modelID, *endpoint.ContextWindowTokens, nil
+}
+
+// ResolveConversationRouteContextWindow returns the selected model's configured
+// capacity, or the minimum supported window when the provider has no capacity metadata.
+func (s *ModelGatewayService) ResolveConversationRouteContextWindow(ctx context.Context, claim ConversationRouteClaim,
+	modelID string) (int, bool, error) {
+	if ctx == nil || !domain.ValidUserID(claim.Message.ActorID) || !domain.ValidModelConnectionID(modelID) {
+		return 0, false, domain.InvalidArgument("route_context", "conversation route model capacity request is invalid")
+	}
+	endpoint, err := s.models.ResolveGatewayEndpoint(ctx, claim.Message.ActorID, modelID, false, false)
+	if err != nil {
+		return 0, false, err
+	}
+	if endpoint.ContextWindowTokens == nil {
+		return 4096, false, nil
+	}
+	if *endpoint.ContextWindowTokens < 4096 || *endpoint.ContextWindowTokens > MaxModelContextWindowTokens {
+		return 0, false, domain.NewError(domain.CodeUnsupported, "selected model context capacity is invalid")
+	}
+	return *endpoint.ContextWindowTokens, true, nil
 }
 
 func (s *ModelGatewayService) CompleteConversationSummaryDSHModel(ctx context.Context, fence ConversationSummaryModelFence,
@@ -297,6 +369,18 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 	return request, nil
 }
 
+func useLegacyConversationRouteModelRequest(value ConversationRouteContext) bool {
+	if value.RouteAttempt != 0 || value.ResultReview != nil {
+		return false
+	}
+	for _, candidate := range value.RequestCandidates {
+		if candidate.TaskID != "" && candidate.TaskStatus == "running" {
+			return false
+		}
+	}
+	return true
+}
+
 func (s *ModelGatewayService) routeProjectReservation(ctx context.Context, call ModelCallReservation, request ModelRequest) (*ProjectModelReservation, error) {
 	if call.ProjectID == "" || call.PersonalModel {
 		return nil, nil
@@ -348,7 +432,7 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 	if err != nil {
 		return ConversationRouteDecision{}, err
 	}
-	if value.RouteAttempt == 0 && value.ResultReview == nil {
+	if useLegacyConversationRouteModelRequest(value) {
 		request, err = legacyConversationRouteModelRequest(value, request)
 		if err != nil {
 			return ConversationRouteDecision{}, err
@@ -359,6 +443,13 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 		return ConversationRouteDecision{}, err
 	}
 	s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, true)
+	contextWindow := 4096
+	if endpoint.ContextWindowTokens != nil {
+		contextWindow = *endpoint.ContextWindowTokens
+	}
+	if !ConversationRouteInputFitsContextWindow(request, contextWindow) {
+		return ConversationRouteDecision{}, domain.NewError(domain.CodeResultTooLarge, "conversation routing context exceeds the selected model window")
+	}
 	digest, callID, err := conversationRouteCallDigest(claim, value, request)
 	if err != nil {
 		return ConversationRouteDecision{}, err
@@ -403,7 +494,7 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 		return ConversationRouteDecision{}, fmt.Errorf("settle conversation route model call: %w", err)
 	}
 	if callErr != nil {
-		return ConversationRouteDecision{}, modelConnectionCheckError(callErr)
+		return ConversationRouteDecision{}, conversationRouteProviderError(callErr)
 	}
 	if unknown {
 		return ConversationRouteDecision{}, domain.NewError(domain.CodeInvalidState, "route model result or usage is unknown and requires reconciliation")
@@ -449,11 +540,18 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 		return ModelResponse{}, err
 	}
 	s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, true)
+	contextWindow := 4096
+	if endpoint.ContextWindowTokens != nil {
+		contextWindow = *endpoint.ContextWindowTokens
+	}
+	if !ConversationRouteInputFitsContextWindow(request, contextWindow) {
+		return ModelResponse{}, domain.NewError(domain.CodeResultTooLarge, "coordinator model request exceeds the selected model window")
+	}
 	legacyRequest, err := ConversationRouteModelRequest(value)
 	if err != nil {
 		return ModelResponse{}, err
 	}
-	if value.RouteAttempt == 0 && value.ResultReview == nil {
+	if useLegacyConversationRouteModelRequest(value) {
 		legacyRequest, err = legacyConversationRouteModelRequest(value, legacyRequest)
 		if err != nil {
 			return ModelResponse{}, err
@@ -547,7 +645,7 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 		return ModelResponse{}, fmt.Errorf("settle coordinator model call: %w", err)
 	}
 	if callErr != nil {
-		return ModelResponse{}, modelConnectionCheckError(callErr)
+		return ModelResponse{}, conversationRouteProviderError(callErr)
 	}
 	if unknown {
 		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "coordinator model result or usage is unknown and requires reconciliation")

@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Morde 任务能力：架构与流程</title>
+<style>
+:root{color-scheme:light;--bg:#f8faff;--surface:#fff;--ink:#334155;--muted:#64748b;--line:#dbeafe;--blue:#2563eb;--pale:#eff6ff}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.7 "Yuanti SC","PingFang SC","Microsoft YaHei",system-ui,sans-serif}
+main{width:min(1080px,100%);margin:auto;padding:36px 24px 64px}
+h1{margin:0;font-size:30px;line-height:1.3}h2{margin:0;font-size:21px}p{margin:8px 0 0;color:var(--muted)}
+.intro{max-width:760px}.tag{display:inline-block;margin-bottom:14px;padding:3px 12px;border:1px solid #bfdbfe;border-radius:999px;background:#dbeafe;color:#1d4ed8;font-size:13px;font-weight:700}
+figure{margin:26px 0 0;padding:24px;border:1px solid var(--line);border-radius:24px;background:var(--surface);box-shadow:0 8px 20px rgba(96,165,250,.12)}
+.diagram-container{width:100%;overflow-x:auto}svg.diagram{display:block;width:100%;min-width:960px;margin-top:16px}
+figcaption{margin-top:4px;color:var(--muted);font-size:14px}
+.box{fill:#fff;stroke:#bfdbfe;stroke-width:2}.focus{fill:#eff6ff;stroke:#2563eb;stroke-width:2}
+.line{fill:none;stroke:#64748b;stroke-width:2}.return{stroke-dasharray:7 6}
+.name{fill:#334155;font-size:19px;font-weight:700}.detail{fill:#64748b;font-size:15px}.branch{fill:#1d4ed8;font-size:15px;font-weight:700}
+.scroll-hint{display:none;font-size:13px;color:#1d4ed8}
+@media(max-width:600px){main{padding:24px 16px 48px}figure{padding:18px}h1{font-size:25px}.scroll-hint{display:block}}
+@media print{body{background:#fff}figure{box-shadow:none;break-inside:avoid}.diagram-container{overflow-x:visible}svg.diagram{min-width:0}}
+</style>
+</head>
+<body>
+<main>
+<span class="tag">MORDE · 设计建议</span>
+<h1>让交办的工作有过程、有结果</h1>
+<p class="intro">这两张图说明可复用的任务能力如何接入现有 Morde，以及一次工作如何从对话走到可核查的结果。图中为目标关系，不代表已全部实现。</p>
+
+<figure>
+<h2>一、能力架构</h2>
+<p>服务端负责状态与授权，DSH 负责理解和执行；工具调用仍经过服务端边界。</p>
+<p class="scroll-hint">图示可左右滑动查看。</p>
+<div class="diagram-container" tabindex="0" role="region" aria-label="能力架构图，可横向滚动">
+<svg class="diagram" viewBox="0 0 960 600" role="img" aria-labelledby="architecture-title architecture-desc">
+<title id="architecture-title">Morde 任务能力架构</title>
+<desc id="architecture-desc">PC 和 iOS 经服务端发起任务，服务端协调 DSH、授权工具和持久存储，并将结果回到原会话。</desc>
+<defs><marker id="arch-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker></defs>
+<path class="line" d="M 224 152 H 312" marker-end="url(#arch-arrow)"/>
+<path class="line return" d="M 312 192 H 224" marker-end="url(#arch-arrow)"/>
+<path class="line" d="M 552 152 H 672" marker-end="url(#arch-arrow)"/>
+<path class="line return" d="M 672 192 H 552" marker-end="url(#arch-arrow)"/>
+<path class="line" d="M 432 228 V 388" marker-end="url(#arch-arrow)"/>
+<path class="line" d="M 504 228 V 312 Q 504 320 512 320 H 624 Q 632 320 632 328 V 436 Q 632 444 640 444 H 672" marker-end="url(#arch-arrow)"/>
+<rect class="box" x="32" y="112" width="192" height="116" rx="16"/>
+<text class="name" x="128" y="151" text-anchor="middle">PC / iOS</text>
+<text class="detail" x="128" y="180" text-anchor="middle">对话、进度、结果</text>
+<rect class="focus" x="312" y="112" width="240" height="116" rx="16"/>
+<text class="name" x="432" y="151" text-anchor="middle">Morde 服务端</text>
+<text class="detail" x="432" y="179" text-anchor="middle">任务、授权、预算、验收</text>
+<text class="detail" x="432" y="204" text-anchor="middle">工具代理与模型网关</text>
+<rect class="box" x="672" y="112" width="240" height="116" rx="16"/>
+<text class="name" x="792" y="151" text-anchor="middle">DSH Agent</text>
+<text class="detail" x="792" y="180" text-anchor="middle">主 Agent 按需协调子 Agent</text>
+<rect class="box" x="312" y="388" width="240" height="112" rx="16"/>
+<text class="name" x="432" y="428" text-anchor="middle">现有持久存储</text>
+<text class="detail" x="432" y="459" text-anchor="middle">任务、事件、证据与规则</text>
+<rect class="box" x="672" y="388" width="240" height="112" rx="16"/>
+<text class="name" x="792" y="428" text-anchor="middle">授权工具与环境</text>
+<text class="detail" x="792" y="459" text-anchor="middle">云端电脑、项目文件、终端</text>
+<path class="line" d="M 40 548 H 84"/><text class="detail" x="96" y="553">请求 / 状态保存</text>
+<path class="line return" d="M 280 548 H 324"/><text class="detail" x="336" y="553">结果回传</text>
+</svg>
+</div>
+<figcaption>规则和证据使用现有存储扩展；图中连线表示职责关系，不表示新建一套系统。</figcaption>
+</figure>
+
+<figure>
+<h2>二、任务流转</h2>
+<p>缺信息时等待；结果由证据支撑，不完整时说明缺口。</p>
+<p class="scroll-hint">图示可左右滑动查看。</p>
+<div class="diagram-container" tabindex="0" role="region" aria-label="任务流转图，可横向滚动">
+<svg class="diagram" viewBox="0 0 960 600" role="img" aria-labelledby="workflow-title workflow-desc">
+<title id="workflow-title">一次任务从交代到交付</title>
+<desc id="workflow-desc">用户交代后形成任务卡；信息不足则等待补充，信息齐全后执行、核验证据并在原会话交付结果。</desc>
+<defs><marker id="flow-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker></defs>
+<path class="line" d="M 192 88 V 120" marker-end="url(#flow-arrow)"/>
+<path class="line" d="M 192 184 V 208" marker-end="url(#flow-arrow)"/>
+<path class="line" d="M 192 280 V 324" marker-end="url(#flow-arrow)"/>
+<path class="line" d="M 88 352 H 56 Q 48 352 48 344 V 160 Q 48 152 56 152 H 88" marker-end="url(#flow-arrow)"/>
+<path class="line" d="M 268 244 H 580 Q 588 244 588 252 V 324" marker-end="url(#flow-arrow)"/>
+<path class="line" d="M 588 380 V 420" marker-end="url(#flow-arrow)"/>
+<path class="line" d="M 588 476 V 512" marker-end="url(#flow-arrow)"/>
+<rect class="focus" x="88" y="32" width="208" height="56" rx="24"/>
+<text class="name" x="192" y="68" text-anchor="middle">用户交代工作</text>
+<rect class="box" x="88" y="120" width="208" height="64" rx="16"/>
+<text class="name" x="192" y="148" text-anchor="middle">明确任务卡</text>
+<text class="detail" x="192" y="171" text-anchor="middle">目标、范围、验收条件</text>
+<polygon class="focus" points="192,208 268,244 192,280 116,244"/>
+<text class="name" x="192" y="251" text-anchor="middle">可以执行？</text>
+<text class="branch" x="208" y="307">否</text>
+<text class="branch" x="400" y="232">是</text>
+<rect class="box" x="88" y="324" width="208" height="56" rx="16"/>
+<text class="name" x="192" y="359" text-anchor="middle">补充信息 / 等授权</text>
+<rect class="box" x="472" y="324" width="232" height="56" rx="16"/>
+<text class="name" x="588" y="348" text-anchor="middle">DSH 执行</text>
+<text class="detail" x="588" y="370" text-anchor="middle">必要时委派子 Agent</text>
+<rect class="box" x="472" y="420" width="232" height="56" rx="16"/>
+<text class="name" x="588" y="444" text-anchor="middle">核验证据</text>
+<text class="detail" x="588" y="466" text-anchor="middle">通过 / 失败 / 未验证</text>
+<rect class="focus" x="472" y="512" width="232" height="56" rx="16"/>
+<text class="name" x="588" y="536" text-anchor="middle">回到原会话</text>
+<text class="detail" x="588" y="558" text-anchor="middle">结果、依据和缺口</text>
+</svg>
+</div>
+<figcaption>授权、预算、恢复与去重贯穿执行过程；用户确认的可复用规则可供后续任务使用。</figcaption>
+</figure>
+</main>
+</body>
+</html>

@@ -287,12 +287,12 @@ func TestAgentCheckpointExtractsAndValidatesQueuedAttachmentIDs(t *testing.T) {
 
 func TestAgentCheckpointAllowsAttachmentOnlyMessage(t *testing.T) {
 	const id = "pa_0123456789abcdef0123456789abcdef"
-	payload := []byte(`{"events":[{"type":"user/message","data":{"id":"m1234567","role":"user","content":[{"type":"text","text":""},{"type":"text","text":"[MORDE_TASK_ATTACHMENT_IDS_V1:` + id + `]"}]}}]}`)
+	payload := []byte(`{"events":[{"seq":0,"type":"user/message","data":{"id":"m1234567","role":"user","content":[{"type":"text","text":""},{"type":"text","text":"[MORDE_TASK_ATTACHMENT_IDS_V1:` + id + `]"}]}}]}`)
 	messages, invalid := checkpointConversationMessages(payload)
 	if invalid || len(messages) != 1 || messages[0].Content != "" || !sameCheckpointAttachmentIDs(messages[0].AttachmentIDs, []string{id}) {
 		t.Fatalf("attachment-only message was not mapped: messages=%+v invalid=%t", messages, invalid)
 	}
-	empty := []byte(`{"events":[{"type":"user/message","data":{"id":"m1234567","role":"user","content":[{"type":"text","text":""}]}}]}`)
+	empty := []byte(`{"events":[{"seq":0,"type":"user/message","data":{"id":"m1234567","role":"user","content":[{"type":"text","text":""}]}}]}`)
 	if _, invalid := checkpointConversationMessages(empty); !invalid {
 		t.Fatal("empty message without attachments was accepted")
 	}

@@ -235,6 +235,11 @@ private final class MordeAuthURLProtocol: URLProtocol {
         let revision: Int64
         let body: Data
     }
+    private struct ChatAttachmentFixtureChange {
+        let changeSequence: Int64
+        let objectID: String
+        let revision: Int64
+    }
     private struct ChatAttachmentFixturePersistentState: Codable {
         let sequence: Int64
         let libraryItems: [String: ChatAttachmentFixtureLibraryItem]
@@ -250,6 +255,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static var chatAttachmentFixturePersistenceLoaded = false
     private static var chatAttachmentFixtureSequence: Int64 = 0
     private static var chatAttachmentFixtureLibraryItems: [String: ChatAttachmentFixtureLibraryItem] = [:]
+    private static var chatAttachmentFixtureChanges: [ChatAttachmentFixtureChange] = []
     private static var chatAttachmentFixtureUploads: [String: ChatAttachmentFixtureUpload] = [:]
     private static var chatAttachmentFixtureUploadKeys: [String: String] = [:]
     private static var chatAttachmentFixtureCommittedIDs = Set<String>()
@@ -869,6 +875,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
         chatAttachmentFixtureLock.lock(); defer { chatAttachmentFixtureLock.unlock() }
         chatAttachmentFixtureSequence = 0
         chatAttachmentFixtureLibraryItems = [:]
+        chatAttachmentFixtureChanges = []
         chatAttachmentFixtureUploads = [:]
         chatAttachmentFixtureUploadKeys = [:]
         chatAttachmentFixtureCommittedIDs = []
@@ -889,6 +896,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
               let state = try? JSONDecoder().decode(ChatAttachmentFixturePersistentState.self, from: data) else { return }
         chatAttachmentFixtureSequence = state.sequence
         chatAttachmentFixtureLibraryItems = state.libraryItems
+        chatAttachmentFixtureChanges = []
         chatAttachmentFixtureUploads = state.uploads
         chatAttachmentFixtureUploadKeys = state.uploadKeys
         chatAttachmentFixtureCommittedIDs = state.committedIDs
@@ -1029,6 +1037,46 @@ private final class MordeAuthURLProtocol: URLProtocol {
         if path == "/api/sync/snapshot", request.httpMethod == "GET" {
             return (200, chatAttachmentFixtureSnapshot())
         }
+        if path == "/api/sync/changes", request.httpMethod == "GET" {
+            let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            guard let afterSequence = query.first(where: { $0.name == "after_sequence" })?.value.flatMap(Int64.init),
+                  afterSequence >= 0 else {
+                return response(400, ["error": ["code": "bad_request", "message": "Invalid sync cursor"]])
+            }
+            let requestedThrough = query.first(where: { $0.name == "through_sequence" })?.value.flatMap(Int64.init)
+            chatAttachmentFixtureLock.lock(); defer { chatAttachmentFixtureLock.unlock() }
+            let throughSequence = min(requestedThrough ?? chatAttachmentFixtureSequence, chatAttachmentFixtureSequence)
+            guard afterSequence <= throughSequence else {
+                return response(400, ["error": ["code": "bad_request", "message": "Invalid sync range"]])
+            }
+            let changes = chatAttachmentFixtureChanges.filter {
+                $0.changeSequence > afterSequence && $0.changeSequence <= throughSequence
+            }.sorted { $0.changeSequence < $1.changeSequence }
+            let page = Array(changes.prefix(100))
+            let hasMore = changes.count > page.count
+            let nextSequence = hasMore ? (page.last?.changeSequence ?? afterSequence) : throughSequence
+            return response(200, [
+                "items": page.map { [
+                    "change_sequence": $0.changeSequence, "object_type": "library_item",
+                    "object_id": $0.objectID, "revision": $0.revision, "operation": "upsert",
+                    "mutation_id": NSNull(),
+                ] },
+                "through_sequence": throughSequence, "next_after_sequence": nextSequence, "has_more": hasMore,
+            ])
+        }
+        if path.hasPrefix("/api/personal-data/library_item/"), request.httpMethod == "GET" {
+            let objectID = String(path.dropFirst("/api/personal-data/library_item/".count))
+            guard MordePersonalDataContract.isValidObjectIdentifier(type: "library_item", id: objectID) else {
+                return response(400, ["error": ["code": "bad_request", "message": "Invalid synthetic library item ID"]])
+            }
+            chatAttachmentFixtureLock.lock(); defer { chatAttachmentFixtureLock.unlock() }
+            guard let item = chatAttachmentFixtureLibraryItems[objectID],
+                  let body = try? JSONSerialization.jsonObject(with: item.body) else {
+                return response(404, ["error": ["code": "not_found", "message": "Synthetic library item not found"]])
+            }
+            return response(200, ["object_type": "library_item", "object_id": objectID,
+                "revision": item.revision, "body": body])
+        }
         if path == "/api/personal-data/quota", request.httpMethod == "GET" {
             let ownerID = ProcessInfo.processInfo.arguments.contains(accountIsolationFixtureLaunchArgument)
                 ? (isAccountA(request) ? "u_accounta1" : "u_accountb1")
@@ -1053,6 +1101,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
             let revision = (current?.revision ?? 0) + 1
             chatAttachmentFixtureSequence += 1
             chatAttachmentFixtureLibraryItems[objectID] = ChatAttachmentFixtureLibraryItem(revision: revision, body: body)
+            chatAttachmentFixtureChanges.append(ChatAttachmentFixtureChange(changeSequence: chatAttachmentFixtureSequence,
+                objectID: objectID, revision: revision))
             persistChatAttachmentFixtureStateLocked()
             return response(200, ["object_type": "library_item", "object_id": objectID,
                 "result_revision": revision, "account_change_sequence": chatAttachmentFixtureSequence, "replay": false])
@@ -1163,6 +1213,8 @@ private final class MordeAuthURLProtocol: URLProtocol {
             }
             let revision = item.revision + 1
             chatAttachmentFixtureLibraryItems[upload.objectID] = ChatAttachmentFixtureLibraryItem(revision: revision, body: encodedBody)
+            chatAttachmentFixtureChanges.append(ChatAttachmentFixtureChange(changeSequence: chatAttachmentFixtureSequence,
+                objectID: upload.objectID, revision: revision))
             upload.attachmentID = attachmentID
             chatAttachmentFixtureUploads[uploadID] = upload
             chatAttachmentFixtureCommittedIDs.insert(attachmentID)

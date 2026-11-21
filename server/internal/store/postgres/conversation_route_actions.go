@@ -315,8 +315,9 @@ WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.role='assistant' AND (
 func loadConversationRouteSnapshotInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, lockTasks bool) (app.ConversationRouteSnapshot, error) {
 	value := app.ConversationRouteSnapshot{Context: app.ConversationRouteContext{ActorID: claim.Message.ActorID, RouteAttempt: claim.RouteAttempt,
 		Content: claim.Message.Content, TimeZone: claim.Input.TimeZone, ServerReceivedAt: claim.Message.CreatedAt,
-		ReferenceTaskID: claim.Input.ReferenceTaskID,
-		History:         []app.ConversationRouteHistory{}, Candidates: []app.ConversationRouteCandidate{},
+		ReferenceTaskID: claim.Input.ReferenceTaskID, CurrentMessageHasAttachments: len(claim.Input.ClientAttachmentIDs) != 0,
+		CurrentRequestModelID: claim.Input.ModelID,
+		History:               []app.ConversationRouteHistory{}, Candidates: []app.ConversationRouteCandidate{},
 		RequestCandidates: []app.ConversationRouteRequestCandidate{}, AggregationCandidates: []app.ConversationRouteAggregationCandidate{}}}
 	scopeDigest, err := app.ConversationRouteExecutionScopeDigest(claim.Input)
 	if err != nil {
@@ -394,10 +395,12 @@ SELECT COALESCE(bool_or(c.client_id=$5),false) OR COALESCE(bool_and(c.previous_i
 		return app.ConversationRouteSnapshot{}, err
 	}
 	rows, err := tx.Query(ctx, `SELECT m.id,m.sequence,COALESCE(m.task_id,''),COALESCE(m.output_task_revision,0),
-COALESCE(m.output_result_event_sequence,0),m.role,m.content FROM conversation_messages m
+COALESCE(m.output_result_event_sequence,0),m.role,
+ CASE WHEN octet_length(m.content)<=4096 THEN m.content ELSE left(m.content,1023)||E'\n…\n'||right(m.content,1023) END,
+ octet_length(m.content)>4096 FROM conversation_messages m
 LEFT JOIN tasks t ON t.id=m.task_id AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id
 WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.source_kind NOT IN ('task_result_review','conversation_variant_input')
- AND octet_length(m.content)<=4096 AND m.id<>ALL($7::text[])
+ AND m.id<>ALL($7::text[])
  AND ($8::text='' OR COALESCE(m.variant_group_id,CASE WHEN m.role='user' THEN m.id ELSE (
    SELECT COALESCE(origin.variant_group_id,origin.id) FROM conversation_messages origin
    WHERE origin.owner_id=m.owner_id AND origin.conversation_id=m.conversation_id AND origin.actor_id=m.actor_id
@@ -436,7 +439,8 @@ ORDER BY m.sequence DESC LIMIT 8`, claim.Message.OwnerID, claim.Message.Conversa
 	for rows.Next() {
 		var item app.ConversationRouteHistory
 		var role string
-		if err := rows.Scan(&item.MessageID, &item.Sequence, &item.TaskID, &item.TaskRevision, &item.EventSequence, &role, &item.Content); err != nil {
+		if err := rows.Scan(&item.MessageID, &item.Sequence, &item.TaskID, &item.TaskRevision, &item.EventSequence, &role,
+			&item.Content, &item.Truncated); err != nil {
 			rows.Close()
 			return app.ConversationRouteSnapshot{}, fmt.Errorf("scan route history: %w", err)
 		}
@@ -453,10 +457,12 @@ ORDER BY m.sequence DESC LIMIT 8`, claim.Message.OwnerID, claim.Message.Conversa
 	}
 	// Keep recent published Task results reachable after unrelated turns roll them out of the newest-message window.
 	resultRows, err := tx.Query(ctx, `SELECT m.id,m.sequence,COALESCE(m.task_id,''),COALESCE(m.output_task_revision,0),
-COALESCE(m.output_result_event_sequence,0),m.role,m.content FROM conversation_messages m
+COALESCE(m.output_result_event_sequence,0),m.role,
+ CASE WHEN octet_length(m.content)<=4096 THEN m.content ELSE left(m.content,1023)||E'\n…\n'||right(m.content,1023) END,
+ octet_length(m.content)>4096 FROM conversation_messages m
 WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.role='assistant'
  AND m.source_kind NOT IN ('history_import','legacy_instant') AND m.delivery_status='applied'
- AND octet_length(m.content)<=4096 AND m.id<>ALL($7::text[])
+ AND m.id<>ALL($7::text[])
  AND ($8::text='' OR COALESCE(m.variant_group_id,(
    SELECT COALESCE(origin.variant_group_id,origin.id) FROM conversation_messages origin
    WHERE origin.owner_id=m.owner_id AND origin.conversation_id=m.conversation_id AND origin.actor_id=m.actor_id
@@ -490,7 +496,8 @@ ORDER BY m.sequence DESC LIMIT 4`, claim.Message.OwnerID, claim.Message.Conversa
 	for resultRows.Next() {
 		var item app.ConversationRouteHistory
 		var role string
-		if err := resultRows.Scan(&item.MessageID, &item.Sequence, &item.TaskID, &item.TaskRevision, &item.EventSequence, &role, &item.Content); err != nil {
+		if err := resultRows.Scan(&item.MessageID, &item.Sequence, &item.TaskID, &item.TaskRevision, &item.EventSequence, &role,
+			&item.Content, &item.Truncated); err != nil {
 			resultRows.Close()
 			return app.ConversationRouteSnapshot{}, fmt.Errorf("scan recent published Task result: %w", err)
 		}
@@ -509,7 +516,9 @@ ORDER BY m.sequence DESC LIMIT 4`, claim.Message.OwnerID, claim.Message.Conversa
 	}
 	if len(publishedResultIDs) != 0 {
 		// Reload source requests only for the current actor; project sharing rules for recent history remain unchanged.
-		sourceRows, err := tx.Query(ctx, `SELECT DISTINCT origin.id,origin.sequence,source.task_id,origin.content
+		sourceRows, err := tx.Query(ctx, `SELECT DISTINCT origin.id,origin.sequence,source.task_id,
+ CASE WHEN octet_length(origin.content)<=4096 THEN origin.content ELSE left(origin.content,1023)||E'\n…\n'||right(origin.content,1023) END,
+ octet_length(origin.content)>4096
 FROM conversation_result_sources source
 JOIN conversation_result_batches batch ON batch.message_id=source.batch_message_id
  AND batch.owner_id=source.owner_id AND batch.actor_id=source.actor_id AND batch.conversation_id=source.conversation_id
@@ -523,7 +532,7 @@ WHERE source.batch_message_id=ANY($1::text[]) AND source.owner_id=$2 AND source.
  AND batch.service_instance_id=$5::uuid
  AND origin.delivery_status='applied' AND origin.source_kind NOT IN ('history_import','legacy_instant')
  AND ($7::text='' OR COALESCE(origin.variant_group_id,origin.id)<>$7)
- AND octet_length(origin.content)<=4096 AND origin.id<>ALL($6::text[])
+ AND origin.id<>ALL($6::text[])
  AND (origin.id=source.user_message_id OR origin.sequence=(
    SELECT min(initial.sequence) FROM conversation_messages initial
    WHERE initial.task_id=source.task_id AND initial.owner_id=source.owner_id
@@ -537,7 +546,7 @@ ORDER BY origin.sequence`, publishedResultIDs, claim.Message.OwnerID, claim.Mess
 		}
 		for sourceRows.Next() {
 			var item app.ConversationRouteHistory
-			if err := sourceRows.Scan(&item.MessageID, &item.Sequence, &item.TaskID, &item.Content); err != nil {
+			if err := sourceRows.Scan(&item.MessageID, &item.Sequence, &item.TaskID, &item.Content, &item.Truncated); err != nil {
 				sourceRows.Close()
 				return app.ConversationRouteSnapshot{}, fmt.Errorf("scan published Task source request: %w", err)
 			}
@@ -561,10 +570,12 @@ ORDER BY origin.sequence`, publishedResultIDs, claim.Message.OwnerID, claim.Mess
 		var item app.ConversationRouteHistory
 		var role string
 		err := tx.QueryRow(ctx, `SELECT id,sequence,COALESCE(task_id,''),COALESCE(output_task_revision,0),
-COALESCE(output_result_event_sequence,0),role,content FROM conversation_messages
+COALESCE(output_result_event_sequence,0),role,
+ CASE WHEN octet_length(content)<=4096 THEN content ELSE left(content,1023)||E'\n…\n'||right(content,1023) END,
+ octet_length(content)>4096 FROM conversation_messages
 WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='user'`,
 			value.PreviousMessageID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID).
-			Scan(&item.MessageID, &item.Sequence, &item.TaskID, &item.TaskRevision, &item.EventSequence, &role, &item.Content)
+			Scan(&item.MessageID, &item.Sequence, &item.TaskID, &item.TaskRevision, &item.EventSequence, &role, &item.Content, &item.Truncated)
 		if err == nil {
 			item.Role = conversation.Role(role)
 			value.Context.History = append(value.Context.History, item)
@@ -628,7 +639,10 @@ ORDER BY CASE WHEN id=$9 AND $9<>'' THEN 0 WHEN id=$10 AND $10<>'' THEN 1 ELSE 2
 			return app.ConversationRouteSnapshot{}, err
 		}
 	}
-	requestRows, err := tx.Query(ctx, `SELECT r.message_id,m.sequence,m.content,r.state,COALESCE(m.task_id,''),
+	requestRows, err := tx.Query(ctx, `SELECT r.message_id,m.sequence,
+ CASE WHEN octet_length(m.content)<=4096 THEN m.content ELSE left(m.content,1023)||E'\n…\n'||right(m.content,1023) END,
+ CASE WHEN octet_length(m.content)>4096 THEN sha256(convert_to(m.content,'UTF8')) END,octet_length(m.content)>4096,
+ r.state,COALESCE(m.task_id,''),
 COALESCE(t.status,''),r.aggregation_state IN ('open','waiting'),
 r.aggregation_state IN ('open','waiting') AND $10::timestamptz>r.aggregation_deadline,EXISTS(SELECT 1 FROM conversation_route_model_calls call
  WHERE call.message_id=r.message_id AND call.actor_id=r.actor_id AND call.phase='normal'
@@ -666,14 +680,11 @@ ORDER BY CASE WHEN r.client_message_id=$7 THEN 0 ELSE 1 END,
 		var routeStatus, taskStatus string
 		var directReply, aggregationWaiting, aggregationClosed bool
 		var metadata, authorization []byte
-		if err := requestRows.Scan(&candidate.MessageID, &candidate.Sequence, &candidate.Content, &routeStatus,
+		if err := requestRows.Scan(&candidate.MessageID, &candidate.Sequence, &candidate.Content, &candidate.ContentSHA256,
+			&candidate.ContentTruncated, &routeStatus,
 			&candidate.TaskID, &taskStatus, &aggregationWaiting, &aggregationClosed, &directReply, &metadata, &authorization); err != nil {
 			requestRows.Close()
 			return app.ConversationRouteSnapshot{}, fmt.Errorf("scan prior conversation route candidate: %w", err)
-		}
-		if len(candidate.Content) > 4096 {
-			requestRows.Close()
-			return app.ConversationRouteSnapshot{}, domain.NewError(domain.CodeResultTooLarge, "prior request exceeds routing context limit")
 		}
 		candidate.RoutingStatus = conversation.RoutingStatus(routeStatus)
 		candidate.DirectReply = candidate.TaskID == "" && directReply
@@ -711,7 +722,10 @@ ORDER BY CASE WHEN r.client_message_id=$7 THEN 0 ELSE 1 END,
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read prior conversation route candidates: %w", err)
 	}
 	if claim.AggregationState == "waiting" && claim.Message.TaskID == "" && len(claim.Input.ClientAttachmentIDs) == 0 {
-		linkedRows, err := tx.Query(ctx, `SELECT m.id,m.sequence,m.content,r.request_metadata,r.authorization_snapshot
+		linkedRows, err := tx.Query(ctx, `SELECT m.id,m.sequence,
+ CASE WHEN octet_length(m.content)<=4096 THEN m.content ELSE left(m.content,1023)||E'\n…\n'||right(m.content,1023) END,
+ CASE WHEN octet_length(m.content)>4096 THEN sha256(convert_to(m.content,'UTF8')) END,octet_length(m.content)>4096,
+ r.request_metadata,r.authorization_snapshot
 FROM conversation_message_routes r
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.actor_id=r.actor_id
  AND m.conversation_id=r.conversation_id
@@ -726,14 +740,15 @@ ORDER BY m.sequence,m.id LIMIT $7`, claim.ServiceInstanceID, claim.Message.Owner
 		for linkedRows.Next() {
 			var candidate app.ConversationRouteAggregationCandidate
 			var metadata, authorization []byte
-			if err := linkedRows.Scan(&candidate.MessageID, &candidate.Sequence, &candidate.Content, &metadata, &authorization); err != nil {
+			if err := linkedRows.Scan(&candidate.MessageID, &candidate.Sequence, &candidate.Content, &candidate.ContentSHA256,
+				&candidate.Truncated, &metadata, &authorization); err != nil {
 				linkedRows.Close()
 				return app.ConversationRouteSnapshot{}, fmt.Errorf("scan linked conversation aggregation candidate: %w", err)
 			}
 			var input app.ConversationRoutingInput
 			var auth task.Authorization
 			if json.Unmarshal(metadata, &input) != nil || json.Unmarshal(authorization, &auth) != nil ||
-				!reflect.DeepEqual(auth, claim.Authorization) || len(input.ClientAttachmentIDs) != 0 || len(candidate.Content) > 4096 {
+				!reflect.DeepEqual(auth, claim.Authorization) || len(input.ClientAttachmentIDs) != 0 {
 				continue
 			}
 			digest, err := app.ConversationRouteExecutionScopeDigest(input)
@@ -916,6 +931,11 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 			decision.Action != app.ConversationRouteUpdate && decision.Action != app.ConversationRouteJoin {
 			return domain.InvalidArgument("route_decision", "only background task actions can acknowledge a message")
 		}
+		if decision.Action == app.ConversationRouteSteer && (decision.TaskID == "" || decision.TargetMessageID != "" ||
+			decision.ExpectedRevision < 0 || decision.Question != "" || decision.Reply != "" || decision.ExplicitNew ||
+			len(decision.DependencyTaskIDs) != 0 || len(decision.AggregateMessageIDs) != 0) {
+			return domain.InvalidArgument("route_decision", "task supplement decision is invalid")
+		}
 		if err := recordConversationMessageAcknowledgementDecisionInTx(ctx, tx, claim, decision.Acknowledge); err != nil {
 			return err
 		}
@@ -929,7 +949,13 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 		}
 		pendingRootStop := decision.Action == app.ConversationRouteStop && decision.TargetMessageID != "" && decision.TaskID == "" &&
 			app.ValidConversationRoutePendingRootStop(decision.TargetMessageID, current.Context.RequestCandidates)
-		if decision.Action == app.ConversationRouteUpdate || decision.Action == app.ConversationRouteStatus || decision.Action == app.ConversationRouteStop {
+		if decision.Action == app.ConversationRouteSteer && (current.PreviousCycle ||
+			!app.ValidConversationRouteSteerTarget(decision.TaskID, current.Context)) {
+			decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+				Question: "我无法安全地把这条补充加入该任务。请指定正在运行的任务，或重新发送修改后的完整要求。"}
+		}
+		if decision.Action == app.ConversationRouteUpdate || decision.Action == app.ConversationRouteSteer ||
+			decision.Action == app.ConversationRouteStatus || decision.Action == app.ConversationRouteStop {
 			if !pendingRootStop && (candidate == nil || (claim.Input.ReferenceTaskID != "" && claim.Input.ReferenceTaskID != decision.TaskID)) {
 				question := "无法确认目标任务，请说明要处理哪个任务。"
 				if current.Context.ReferenceUnavailable {
@@ -979,6 +1005,24 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 				return domain.NewError(domain.CodeConflict, "conversation message is no longer awaiting a direct reply")
 			}
 			return finishConversationRoute(ctx, tx, claim, "routed", decision.Reply, "", true)
+		case app.ConversationRouteSteer:
+			if candidate == nil || candidate.Status != task.StatusRunning {
+				return domain.NewError(domain.CodeConflict, "conversation supplement Task is no longer running")
+			}
+			if err := requireConversationRouteScope(ctx, tx, claim, identity.ScopeTaskSubmit); err != nil {
+				return err
+			}
+			result, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_mode='steer'
+WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='user' AND task_id IS NULL
+ AND delivery_status='pending' AND delivery_mode='followup'`, claim.Message.ID, claim.Message.OwnerID,
+				claim.Message.ActorID, claim.Message.ConversationID)
+			if err != nil {
+				return fmt.Errorf("set conversation supplement delivery mode: %w", err)
+			}
+			if result.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeConflict, "conversation supplement changed before routing")
+			}
+			return finishConversationRoute(ctx, tx, claim, "routed", "", candidate.TaskID, false)
 		case app.ConversationRouteUpdate:
 			if err := requireConversationRouteScope(ctx, tx, claim, identity.ScopeTaskControl); err != nil {
 				return err
@@ -1187,13 +1231,11 @@ func lockConversationRouteNewScope(ctx context.Context, tx pgx.Tx, claim app.Con
 }
 
 func exactConversationRouteDuplicate(candidates []app.ConversationRouteRequestCandidate, claim app.ConversationRouteClaim) string {
-	content := strings.TrimSpace(claim.Message.Content)
 	var target string
 	var targetSequence int64
 	for _, candidate := range candidates {
-		if strings.TrimSpace(candidate.Content) == content &&
-			(target == "" || candidate.Sequence < targetSequence) &&
-			app.ValidConversationRouteExactDuplicateTarget(candidate.MessageID, content, candidates) {
+		if (target == "" || candidate.Sequence < targetSequence) &&
+			app.ValidConversationRouteExactDuplicateTarget(candidate.MessageID, claim.Message.Content, candidates) {
 			target, targetSequence = candidate.MessageID, candidate.Sequence
 		}
 	}
@@ -1332,7 +1374,7 @@ ORDER BY m.sequence,m.id FOR UPDATE OF r,m`, claim.ServiceInstanceID, claim.Mess
 		candidate, ok := selected[id]
 		var input app.ConversationRoutingInput
 		var auth task.Authorization
-		if !ok || sequence != candidate.Sequence || content != candidate.Content || acceptedAt.After(claim.AggregationDeadline) ||
+		if !ok || sequence != candidate.Sequence || !conversationRouteAggregationCandidateMatchesContent(candidate, content) || acceptedAt.After(claim.AggregationDeadline) ||
 			json.Unmarshal(metadata, &input) != nil || json.Unmarshal(authorization, &auth) != nil ||
 			!reflect.DeepEqual(auth, claim.Authorization) || len(input.ClientAttachmentIDs) != 0 {
 			rows.Close()
@@ -1457,7 +1499,7 @@ FOR UPDATE OF r,m`, stopClaim.ServiceInstanceID, stopClaim.Message.OwnerID, stop
 			break
 		}
 	}
-	if candidate == nil || candidate.Sequence != root.Message.Sequence || candidate.Content != root.Message.Content ||
+	if candidate == nil || candidate.Sequence != root.Message.Sequence || !conversationRouteRequestCandidateMatchesContent(*candidate, root.Message.Content) ||
 		candidate.RoutingStatus != conversation.RoutingStatus(routeState) || !candidate.SameControlScope || !candidate.SameAuthorization {
 		return requeueConversationRouteForReclassification(ctx, tx, stopClaim)
 	}
@@ -1559,7 +1601,7 @@ func linkDuplicateConversationRouteInTx(ctx context.Context, tx pgx.Tx, claim ap
 		}
 	}
 	validTarget := candidate != nil && app.ValidConversationRouteJoinTarget(targetMessageID, snapshot.Context.RequestCandidates)
-	if candidate != nil && sameConversationRouteContent(candidate.Content, claim.Message.Content) {
+	if candidate != nil && conversationRouteRequestCandidateMatchesContent(*candidate, claim.Message.Content) {
 		validTarget = app.ValidConversationRouteExactDuplicateTarget(targetMessageID, claim.Message.Content, snapshot.Context.RequestCandidates)
 	}
 	if candidate == nil || !validTarget {
@@ -1589,7 +1631,7 @@ FOR UPDATE OF r,m`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Messag
 		return fmt.Errorf("lock conversation join target: %w", err)
 	}
 	var rootInput app.ConversationRoutingInput
-	if json.Unmarshal(rootMetadata, &rootInput) != nil || rootSequence != candidate.Sequence || rootContent != candidate.Content ||
+	if json.Unmarshal(rootMetadata, &rootInput) != nil || rootSequence != candidate.Sequence || !conversationRouteRequestCandidateMatchesContent(*candidate, rootContent) ||
 		rootState != string(candidate.RoutingStatus) || rootTaskID != candidate.TaskID ||
 		!reflect.DeepEqual(rootInput, candidate.RequestInput) {
 		return domain.NewError(domain.CodeConflict, "conversation join target changed")
@@ -1719,6 +1761,22 @@ WHERE service_instance_id=$1::uuid AND owner_id=$3 AND actor_id=$4 AND conversat
 
 func sameConversationRouteContent(first, second string) bool {
 	return strings.TrimSpace(first) == strings.TrimSpace(second)
+}
+
+func conversationRouteRequestCandidateMatchesContent(candidate app.ConversationRouteRequestCandidate, content string) bool {
+	if candidate.ContentTruncated {
+		digest := sha256.Sum256([]byte(content))
+		return len(candidate.ContentSHA256) == sha256.Size && bytes.Equal(candidate.ContentSHA256, digest[:])
+	}
+	return candidate.Content == content
+}
+
+func conversationRouteAggregationCandidateMatchesContent(candidate app.ConversationRouteAggregationCandidate, content string) bool {
+	if candidate.Truncated {
+		digest := sha256.Sum256([]byte(content))
+		return len(candidate.ContentSHA256) == sha256.Size && bytes.Equal(candidate.ContentSHA256, digest[:])
+	}
+	return candidate.Content == content
 }
 
 func requeueDirectConversationReplyForTask(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,

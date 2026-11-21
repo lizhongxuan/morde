@@ -44,6 +44,20 @@ describe('PortalLayout', () => {
     expect(screen.queryByRole('link', { name: '任务与计划' })).not.toBeInTheDocument();
   });
 
+  it('keeps workspace tabs closed by default and opens only the requested task tab', () => {
+    renderPortalLayout('/assistant');
+
+    expect(screen.getByRole('button', { name: '显示工作区侧栏' })).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('navigation', { name: '对话工作区' })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: '显示工作区侧栏' }));
+
+    const workspace = screen.getByRole('navigation', { name: '对话工作区' });
+    const openTabs = within(workspace.querySelector('.morde-workspace-tab-list')!).getAllByRole('button');
+    expect(openTabs).toHaveLength(2);
+    expect(openTabs[0]).toHaveTextContent('任务动态');
+    expect(openTabs.some((tab) => /云端电脑|文件/.test(tab.textContent ?? ''))).toBe(false);
+  });
+
   it('does not fetch approval items or surface approval errors outside the review page', () => {
     renderPortalLayout('/assistant');
 

@@ -24968,28 +24968,196 @@
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Artifact is not verified or its proof is incomplete; metadata only" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "产物尚未核验或证明信息不完整；当前仅显示元数据" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "产物尚未核验或证明信息不完整；当前仅显示元数据" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Artefakt nicht verifiziert oder Nachweis unvollständig; nur Metadaten"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El artefacto no está verificado o la prueba está incompleta; solo metadatos"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L’artefact n’est pas vérifié ou sa preuve est incomplète ; métadonnées uniquement"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "成果物は未検証か証明が不完全です。メタデータのみ表示します"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "산출물이 검증되지 않았거나 증명이 불완전합니다. 메타데이터만 표시합니다"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Артефакт не проверен или подтверждение неполное; только метаданные"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "產物未經驗證或證明不完整；僅顯示中繼資料"
+          }
+        }
       }
     },
     "Media preview is unavailable for this task; metadata only" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Media preview is unavailable for this task; metadata only" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "此任务暂不支持媒体预览；当前仅显示元数据" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "此任务暂不支持媒体预览；当前仅显示元数据" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Medienvorschau für diese Aufgabe nicht verfügbar; nur Metadaten"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La vista previa no está disponible para esta tarea; solo metadatos"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aperçu du média indisponible pour cette tâche ; métadonnées uniquement"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このタスクではメディアをプレビューできません。メタデータのみ表示します"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 작업에서는 미디어 미리보기를 사용할 수 없습니다. 메타데이터만 표시합니다"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Предпросмотр медиа для этой задачи недоступен; только метаданные"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此任務無法預覽媒體；僅顯示中繼資料"
+          }
+        }
       }
     },
     "The matching Workspace file could not be verified; retry or sync the exact version" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "The matching Workspace file could not be verified; retry or sync the exact version" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法在本机核验对应的 Workspace 文件；请重试或同步准确版本" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无法在本机核验对应的 Workspace 文件；请重试或同步准确版本" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die passende Workspace-Datei konnte nicht überprüft werden. Erneut versuchen oder genau diese Version synchronisieren."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No se pudo verificar el archivo correspondiente del Workspace; vuelve a intentarlo o sincroniza esa versión exacta."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le fichier Workspace correspondant n’a pas pu être vérifié ; réessayez ou synchronisez exactement cette version."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "一致する Workspace ファイルを確認できませんでした。再試行するか、同じバージョンを同期してください"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "일치하는 Workspace 파일을 확인할 수 없습니다. 다시 시도하거나 해당 버전을 정확히 동기화하세요"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Не удалось проверить соответствующий файл Workspace; повторите попытку или синхронизируйте именно эту версию"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "無法驗證相符的 Workspace 檔案；請重試或同步完全相同的版本"
+          }
+        }
       }
     },
     "Workspace sync is unavailable; metadata only" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Workspace sync is unavailable; metadata only" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Workspace 同步不可用；当前仅显示元数据" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Workspace 同步不可用；当前仅显示元数据" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace-Synchronisierung nicht verfügbar; nur Metadaten"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La sincronización del Workspace no está disponible; solo metadatos"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Synchronisation du Workspace indisponible ; métadonnées uniquement"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace を同期できません。メタデータのみ表示します"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace 동기화를 사용할 수 없습니다. 메타데이터만 표시합니다"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Синхронизация Workspace недоступна; только метаданные"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Workspace 同步無法使用；僅顯示中繼資料"
+          }
+        }
       }
     },
     "Artifacts" : {
@@ -41458,7 +41626,63 @@
       }
     },
     "Confirming the current account scope…" : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktueller Kontobereich wird bestätigt …"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Confirming the current account scope…"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Confirmando el ámbito de la cuenta actual…"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Vérification du périmètre du compte actuel…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "現在のアカウント範囲を確認中…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "현재 계정 범위를 확인하는 중…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Проверка области текущей учётной записи…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在确认当前账号范围…"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在確認目前帳號範圍…"
+          }
+        }
+      }
     },
     "Connect" : {
       "extractionState" : "manual",
@@ -52385,6 +52609,42 @@
             "state" : "translated",
             "value" : "已刪除"
           }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Gelöscht"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eliminado"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Supprimé"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "削除済み"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "삭제됨"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удалено"
+          }
         }
       }
     },
@@ -52518,6 +52778,42 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "刪除中"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird gelöscht"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eliminando"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Suppression en cours"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "削除中"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "삭제 중"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Удаление"
           }
         }
       }
@@ -60630,6 +60926,48 @@
             "state" : "translated",
             "value" : "事件鏈"
           }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ereigniskette"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Event chain"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cadena de eventos"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chaîne d’événements"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "イベント履歴"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이벤트 기록"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Цепочка событий"
+          }
         }
       }
     },
@@ -60798,7 +61136,7 @@
         "fr" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Chaque appareil connecté à ce compte est un Muse : cet iPhone, vos ordinateurs sous morde Desktop. Chacun peut demander des choses aux autres, sur n’importe quel réseau, via morde Cloud. Sur iOS, les autres peuvent ouvrir des liens ici et envoyer des notifications ; le Muse de l’iPhone lui-même travaille sur l’iPhone."
+            "value" : "Chaque appareil connecté à ce compte est une Muse : cet iPhone et vos ordinateurs sous morde Desktop. Chacun peut demander des choses aux autres, sur n’importe quel réseau, via morde Cloud. Sur iOS, les autres peuvent ouvrir des liens ici et envoyer des notifications ; le Muse de l’iPhone lui-même travaille sur l’iPhone."
           }
         },
         "ja" : {
@@ -60810,25 +61148,25 @@
         "ko" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "이 계정으로 로그인한 모든 기기가 Muse입니다. 이 iPhone, morde Desktop을 실행하는 컴퓨터. 각 기기는 morde Cloud를 통해 어떤 네트워크에서든 서로에게 일을 부탁할 수 있습니다. iOS에서는 다른 기기가 여기서 링크를 열고 알림을 보낼 수 있으며, iPhone 자체의 Muse는 iPhone에서 작동합니다."
+            "value" : "이 계정으로 로그인한 모든 기기가 Muse입니다. 이 iPhone과 morde Desktop을 실행하는 컴퓨터. 각 기기는 morde Cloud를 통해 어떤 네트워크에서든 서로에게 일을 부탁할 수 있습니다. iOS에서는 다른 기기가 여기서 링크를 열고 알림을 보낼 수 있으며, iPhone 자체의 Muse는 iPhone에서 작동합니다."
           }
         },
         "ru" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "Каждое устройство, вошедшее в этот аккаунт, является Muse: этот iPhone, ваши компьютеры с morde Desktop. Каждое может просить другие о чём-то, в любой сети, через morde Cloud. На iOS другие могут открывать здесь ссылки и присылать уведомления; собственный Muse этого iPhone работает на самом iPhone."
+            "value" : "Каждое устройство, вошедшее в этот аккаунт, является Muse: этот iPhone и ваши компьютеры с morde Desktop. Каждое может просить другие о чём-то, в любой сети, через morde Cloud. На iOS другие могут открывать здесь ссылки и присылать уведомления; собственный Muse этого iPhone работает на самом iPhone."
           }
         },
         "zh-Hans" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "登录同一账号的每台设备都是一个 Muse：这台 iPhone、装了 morde 桌面版的电脑。它们之间可以互相交代事情，不必在同一个网络，经由 morde Cloud 传递。在 iOS 上，其他设备可以在这里打开链接、发通知；iPhone 自己的 Muse 在 iPhone 上工作。"
+            "value" : "登录同一账号的每台设备都是一个 Muse：这台 iPhone 和装了 morde 桌面版的电脑。它们之间可以互相交代事情，不必在同一个网络，经由 morde Cloud 传递。在 iOS 上，其他设备可以在这里打开链接、发通知；iPhone 自己的 Muse 在 iPhone 上工作。"
           }
         },
         "zh-Hant" : {
           "stringUnit" : {
             "state" : "translated",
-            "value" : "登入同一帳號的每台裝置都是一個 Muse：這支 iPhone、裝了 morde 桌面版的電腦。它們之間可以互相交代事情，不必在同一個網路，經由 morde Cloud 傳遞。在 iOS 上，其他裝置可以在這裡開啟連結、傳通知；iPhone 自己的 Muse 在 iPhone 上工作。"
+            "value" : "登入同一帳號的每台裝置都是一個 Muse：這支 iPhone 和安裝 morde 桌面版的電腦。它們之間可以互相交代事情，不必在同一個網路，經由 morde Cloud 傳遞。在 iOS 上，其他裝置可以在這裡開啟連結、傳通知；iPhone 自己的 Muse 在 iPhone 上工作。"
           }
         }
       }
@@ -82692,7 +83030,63 @@
 
     },
     "Loading Morde profile…" : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Morde-Profil wird geladen …"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loading Morde profile…"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cargando el perfil de Morde…"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chargement du profil Morde…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Morde プロフィールを読み込み中…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Morde 프로필을 불러오는 중…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка профиля Morde…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在加载 Morde 资料…"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在載入 Morde 個人資料…"
+          }
+        }
+      }
     },
     "Loading personal-data quota…" : {
 
@@ -82875,7 +83269,63 @@
       }
     },
     "Loading task details…" : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aufgabendetails werden geladen …"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Loading task details…"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cargando los detalles de la tarea…"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Chargement des détails de la tâche…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "タスクの詳細を読み込み中…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 세부 정보를 불러오는 중…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Загрузка сведений о задаче…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在加载任务详情…"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在載入任務詳細資料…"
+          }
+        }
+      }
     },
     "Loading tasks…" : {
       "extractionState" : "manual",
@@ -84295,7 +84745,63 @@
       }
     },
     "Long press to reorder" : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Zum Neuanordnen lange drücken"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Long press to reorder"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mantén pulsado para reordenar"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Maintenez appuyé pour réorganiser"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "長押しして並べ替え"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "길게 눌러 순서 변경"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Нажмите и удерживайте, чтобы изменить порядок"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "长按以重新排序"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "長按以重新排序"
+          }
+        }
+      }
     },
     "Long tasks are better placed on a computer that stays on. Your computers run them in full and send the result here." : {
       "extractionState" : "manual",
@@ -90920,7 +91426,63 @@
       }
     },
     "morde is a non-profit open-source community project, free, forever. Nothing is sold; what the relay keeps is in the privacy policy, and Settings → Data controls is yours." : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "morde ist ein gemeinnütziges Open-Source-Communityprojekt und bleibt für immer kostenlos. Wir verkaufen nichts; welche Daten das Relay speichert, steht in der Datenschutzerklärung. Die Datenkontrolle in den Einstellungen liegt bei dir."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "morde is a non-profit open-source community project, free, forever. Nothing is sold; what the relay keeps is in the privacy policy, and Settings → Data controls is yours."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "morde es un proyecto comunitario de código abierto y sin ánimo de lucro, gratuito para siempre. No vendemos nada; la política de privacidad explica qué conserva el relay, y tú controlas tus datos en Ajustes → Control de datos."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "morde est un projet communautaire open source à but non lucratif, gratuit pour toujours. Rien n’est vendu ; la politique de confidentialité indique ce que conserve le relais, et vous gardez le contrôle de vos données dans Réglages → Contrôle des données."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "morde は非営利のオープンソースコミュニティプロジェクトで、今後も無料です。何も販売しません。リレーが保持する情報はプライバシーポリシーに記載され、設定 → データ管理はあなたが操作できます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "morde는 비영리 오픈 소스 커뮤니티 프로젝트이며 영원히 무료입니다. 판매하는 것은 없습니다. 릴레이가 보관하는 정보는 개인정보 처리방침에 안내되어 있고, 설정 → 데이터 관리에서 직접 관리할 수 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "morde — бесплатный навсегда некоммерческий проект сообщества с открытым исходным кодом. Мы ничего не продаём; сведения о данных, которые хранит ретранслятор, приведены в политике конфиденциальности, а раздел «Настройки → Управление данными» доступен вам."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "morde 是永久免费、非营利的开源社区项目。我们不出售任何内容；中继服务保留的数据见隐私政策，你可以在“设置 → 数据控制”中管理自己的数据。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "morde 是永久免費的非營利開源社群專案。我們不販售任何內容；中繼服務保留的資料詳見隱私權政策，你可以在「設定 → 資料控制」中管理自己的資料。"
+          }
+        }
+      }
     },
     "morde is a non-profit open-source community project, free, forever. The model comes with a free allowance paid by the developer; after that, your own key. Nothing is sold; what the relay keeps is in the privacy policy, and Settings → Data controls is yours." : {
       "extractionState" : "manual",
@@ -98244,6 +98806,48 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "目前沒有可用的任務"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Keine aktuelle Aufgabe verfügbar"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No current task is available"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "No hay ninguna tarea actual disponible"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aucune tâche en cours n’est disponible"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "現在利用できるタスクはありません"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "현재 사용할 수 있는 작업이 없습니다"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Текущая задача недоступна"
           }
         }
       }
@@ -114594,7 +115198,63 @@
       }
     },
     "Personal profile" : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Persönliches Profil"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Personal profile"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Perfil personal"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Profil personnel"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "個人プロフィール"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "개인 프로필"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Личный профиль"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "个人资料"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "個人資料"
+          }
+        }
+      }
     },
     "Personal-data quota has not been checked." : {
 
@@ -117810,10 +118470,122 @@
       }
     },
     "Profile change is waiting to sync." : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Profiländerung wartet auf Synchronisierung."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Profile change is waiting to sync."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "El cambio de perfil está pendiente de sincronización."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La modification du profil est en attente de synchronisation."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プロフィールの変更は同期待ちです。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프로필 변경 사항이 동기화를 기다리고 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Изменение профиля ожидает синхронизации."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "资料更改正在等待同步。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "個人資料變更正在等待同步。"
+          }
+        }
+      }
     },
     "Profile change queued for Morde sync." : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Profiländerung für die Morde-Synchronisierung vorgemerkt."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Profile change queued for Morde sync."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cambio de perfil en cola para sincronizar con Morde."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modification du profil mise en attente de synchronisation avec Morde."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プロフィールの変更を Morde 同期用にキューに追加しました。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프로필 변경 사항을 Morde 동기화 대기열에 추가했습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Изменение профиля поставлено в очередь синхронизации Morde."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "资料更改已排队，等待与 Morde 同步。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "個人資料變更已排入佇列，等待與 Morde 同步。"
+          }
+        }
+      }
     },
     "Previous device sign-outs still need server confirmation. Sign in to the same Morde service to retry them." : {
       "extractionState" : "manual",
@@ -122662,7 +123434,63 @@
       }
     },
     "Refreshing task details…" : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aufgabendetails werden aktualisiert …"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Refreshing task details…"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Actualizando los detalles de la tarea…"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Actualisation des détails de la tâche…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "タスクの詳細を更新中…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "작업 세부 정보를 새로고치는 중…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обновление сведений о задаче…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在刷新任务详情…"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "正在重新整理任務詳細資料…"
+          }
+        }
+      }
     },
     "Refreshing…" : {
       "extractionState" : "manual",
@@ -123356,7 +124184,63 @@
       }
     },
     "Reload cloud profile" : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cloud-Profil neu laden"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reload cloud profile"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Volver a cargar el perfil en la nube"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Recharger le profil cloud"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "クラウドプロフィールを再読み込み"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "클라우드 프로필 새로고침"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Перезагрузить облачный профиль"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新加载云端资料"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重新載入雲端個人資料"
+          }
+        }
+      }
     },
     "Remind me later" : {
       "localizations" : {
@@ -129241,7 +130125,63 @@
       }
     },
     "Retry personal data sync" : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Synchronisierung persönlicher Daten erneut versuchen"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Retry personal data sync"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reintentar la sincronización de datos personales"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Réessayer la synchronisation des données personnelles"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "個人データの同期を再試行"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "개인 데이터 동기화 다시 시도"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Повторить синхронизацию личных данных"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重试个人数据同步"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "重試個人資料同步"
+          }
+        }
+      }
     },
     "Retry personal-data sync" : {
 
@@ -130072,7 +131012,63 @@
       }
     },
     "Revision %lld" : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Revision %lld"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Revision %lld"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Revisión %lld"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Révision %lld"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "リビジョン %lld"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "개정 %lld"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Редакция %lld"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "修订版本 %lld"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "修訂版本 %lld"
+          }
+        }
+      }
     },
     "Revoke" : {
       "localizations" : {
@@ -137234,6 +138230,42 @@
             "state" : "translated",
             "value" : "分享控制權"
           }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Steuerung teilen"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Compartir el control"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Partager le contrôle"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "操作を共有"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "제어 공유"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Поделиться управлением"
+          }
         }
       }
     },
@@ -140999,7 +142031,63 @@
       }
     },
     "Sign in with a phone number or an e-mail address to use this separate morde Cloud account." : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Melde dich mit einer Telefonnummer oder E-Mail-Adresse an, um dieses separate morde Cloud-Konto zu nutzen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sign in with a phone number or an e-mail address to use this separate morde Cloud account."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Inicia sesión con un número de teléfono o una dirección de correo electrónico para usar esta cuenta independiente de morde Cloud."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Connectez-vous avec un numéro de téléphone ou une adresse e-mail pour utiliser ce compte morde Cloud distinct."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "この別の morde Cloud アカウントを使うには、電話番号またはメールアドレスでサインインしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "별도의 morde Cloud 계정을 사용하려면 전화번호 또는 이메일 주소로 로그인하세요."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Войдите по номеру телефона или адресу электронной почты, чтобы использовать эту отдельную учётную запись morde Cloud."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用这个独立的 morde Cloud 账号，请通过手机号或电子邮箱登录。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用這個獨立的 morde Cloud 帳號，請透過電話號碼或電子郵件登入。"
+          }
+        }
+      }
     },
     "Sign in with Claude" : {
       "localizations" : {
@@ -147642,6 +148730,42 @@
             "state" : "translated",
             "value" : "停止中"
           }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Wird angehalten"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deteniendo"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Arrêt en cours"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "停止中"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "중지 중"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Останавливается"
+          }
         }
       }
     },
@@ -148969,7 +150093,63 @@
       }
     },
     "Sync is paused; this profile change stays on this device." : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Synchronisierung ist pausiert; diese Profiländerung bleibt auf diesem Gerät."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Sync is paused; this profile change stays on this device."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La sincronización está en pausa; este cambio de perfil solo se guarda en este dispositivo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La synchronisation est en pause ; cette modification du profil reste sur cet appareil."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "同期は一時停止中です。このプロフィール変更はこのデバイス上にのみ保存されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "동기화가 일시 중지되어 이 프로필 변경 사항은 이 기기에만 저장됩니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Синхронизация приостановлена; это изменение профиля останется на устройстве."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "同步已暂停；此资料更改仅保留在这台设备上。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "同步已暫停；此個人資料變更僅保留在這台裝置上。"
+          }
+        }
+      }
     },
     "Sync is paused. New changes will stay on this device." : {
 
@@ -150223,7 +151403,63 @@
       }
     },
     "Tabs" : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tabs"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tabs"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Pestañas"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Onglets"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "タブ"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "탭"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вкладки"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "标签页"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "分頁"
+          }
+        }
+      }
     },
     "Take a screenshot there" : {
       "extractionState" : "manual",
@@ -152328,7 +153564,49 @@
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Execution plan" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "执行计划" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "执行计划" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausführungsplan"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Plan de ejecución"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Plan d’exécution"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "実行計画"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "실행 계획"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "План выполнения"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "執行計畫"
+          }
+        }
       }
     },
     "Execution plan updated" : {
@@ -152342,119 +153620,833 @@
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Revision" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "修订" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "修订" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Revision"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Revisión"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Révision"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "改訂"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "개정"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Редакция"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "修訂"
+          }
+        }
       }
     },
     "Cost estimate" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Cost estimate" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "费用估算" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "费用估算" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kostenschätzung"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Estimación de costos"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Estimation des coûts"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "費用の見積もり"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "비용 추정"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Оценка стоимости"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "費用估算"
+          }
+        }
       }
     },
     "Usage and cost" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Usage and cost" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "用量与费用" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "用量与费用" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Nutzung und Kosten"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Uso y costo"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Utilisation et coût"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "使用量と費用"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "사용량 및 비용"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Использование и стоимость"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用量與費用"
+          }
+        }
       }
     },
     "Model calls" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Model calls" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "模型调用" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "模型调用" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Modellaufrufe"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Llamadas al modelo"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Appels au modèle"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "モデル呼び出し"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "모델 호출"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вызовы модели"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "模型呼叫"
+          }
+        }
       }
     },
     "Tool calls" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Tool calls" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "工具调用" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "工具调用" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tool-Aufrufe"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Llamadas a herramientas"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Appels d’outils"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ツール呼び出し"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "도구 호출"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вызовы инструментов"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "工具呼叫"
+          }
+        }
       }
     },
     "Active time" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Active time" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "活跃时间" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "活跃时间" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktive Zeit"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tiempo activo"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Temps actif"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "アクティブ時間"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "활성 시간"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Активное время"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "活動時間"
+          }
+        }
       }
     },
     "Tokens" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Tokens" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Token" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "Token" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tokens"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tokens"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Jetons"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "トークン"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "토큰"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Токены"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Token"
+          }
+        }
       }
     },
     "Estimated reservation (not actual cost)" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Estimated reservation (not actual cost)" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "预留估算（非实际费用）" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "预留估算（非实际费用）" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Geschätzter Reservierungsbetrag (keine tatsächlichen Kosten)"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reserva estimada (no es el costo real)"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Réservation estimée (pas le coût réel)"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "推定予約額（実際の費用ではありません）"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "예상 예약액(실제 비용 아님)"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Расчётная сумма резерва (не фактическая стоимость)"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "預估預留金額（非實際費用）"
+          }
+        }
       }
     },
     "Cost unknown" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Cost unknown" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "费用未知" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "费用未知" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Kosten unbekannt"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Costo desconocido"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Coût inconnu"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "費用不明"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "비용 알 수 없음"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Стоимость неизвестна"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "費用未知"
+          }
+        }
       }
     },
     "Reserved amount" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Reserved amount" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "预留金额" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "预留金额" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Reservierter Betrag"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Importe reservado"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Montant réservé"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "予約額"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "예약 금액"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Зарезервированная сумма"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "預留金額"
+          }
+        }
       }
     },
     "BYOK · no Morde charge" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "BYOK · no Morde charge" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "自带模型 · Morde 未计费" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "自带模型 · Morde 未计费" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Eigener Schlüssel · keine Morde-Gebühr"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Clave propia · sin cargo de Morde"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Votre clé · sans frais Morde"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "BYOK・Morde の料金なし"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "BYOK · Morde 요금 없음"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Свой ключ · без оплаты Morde"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "自備金鑰 · Morde 不收費"
+          }
+        }
       }
     },
     "Rate snapshots" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Rate snapshots" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "费率快照" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "费率快照" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tarifübersichten"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Instantáneas de tarifas"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Relevés des tarifs"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "料金スナップショット"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "요금 스냅샷"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Снимки тарифов"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "費率快照"
+          }
+        }
       }
     },
     "calls" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "calls" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "次调用" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "次调用" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aufrufe"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "llamadas"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "appels"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "回"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "호출"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вызовы"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "次呼叫"
+          }
+        }
       }
     },
     "No model calls yet" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "No model calls yet" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "尚无模型调用" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "尚无模型调用" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Noch keine Modellaufrufe"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aún no hay llamadas al modelo"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aucun appel au modèle pour le moment"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "モデル呼び出しはまだありません"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "아직 모델 호출이 없습니다"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Вызовов модели пока нет"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "尚無模型呼叫"
+          }
+        }
       }
     },
     "Depends on" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Depends on" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "依赖" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "依赖" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Hängt ab von"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Depende de"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dépend de"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "依存先"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "종속 항목"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Зависит от"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "相依項"
+          }
+        }
       }
     },
     "Outputs" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Outputs" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "产出" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "产出" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ausgaben"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Resultados"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Résultats"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "出力"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "출력"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Результаты"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "輸出"
+          }
+        }
       }
     },
     "Completion criteria" : {
       "extractionState" : "manual",
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "Completion criteria" } },
-        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "完成条件" } }
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "完成条件" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Abschlusskriterien"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Criterios de finalización"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Critères d’achèvement"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "完了条件"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "완료 기준"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Критерии завершения"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "完成條件"
+          }
+        }
       }
     },
     "Task Running" : {
@@ -158344,7 +160336,63 @@
       }
     },
     "The profile fields are outside the allowed limits." : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Profilfelder liegen außerhalb der zulässigen Grenzen."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The profile fields are outside the allowed limits."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Los campos del perfil están fuera de los límites permitidos."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Les champs du profil dépassent les limites autorisées."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "プロフィールの項目が許容範囲を超えています。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "프로필 필드가 허용된 범위를 벗어났습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Поля профиля выходят за допустимые пределы."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "资料字段超出允许的范围。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "個人資料欄位超出允許範圍。"
+          }
+        }
+      }
     },
     "The project or current Task changed; delivery was not recorded." : {
       "extractionState" : "manual",
@@ -160416,7 +162464,63 @@
       }
     },
     "The switch puts the face and the name in the title of side chats; off, they show the model." : {
-
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ist die Option aktiviert, zeigen Seitengespräche im Titel Avatar und Namen; andernfalls wird das Modell angezeigt."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The switch puts the face and the name in the title of side chats; off, they show the model."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Al activar la opción, los chats laterales muestran el avatar y el nombre en el título; al desactivarla, muestran el modelo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Lorsque l’option est activée, les discussions secondaires affichent l’avatar et le nom dans leur titre ; sinon, elles affichent le modèle."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "オンにするとサイドチャットのタイトルにアバターと名前が表示され、オフにするとモデルが表示されます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 옵션을 켜면 사이드 채팅 제목에 아바타와 이름이 표시되고, 끄면 모델이 표시됩니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Если включить параметр, в заголовке боковых чатов будут показаны аватар и имя; если выключить — модель."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "开启后，侧边对话标题显示头像和名称；关闭后则显示模型。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "開啟後，側邊對話標題會顯示頭像和名稱；關閉後則顯示模型。"
+          }
+        }
+      }
     },
     "The synced conversations are removed from morde Cloud. The chats on your devices stay." : {
       "extractionState" : "manual",
@@ -162750,6 +164854,42 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "此文件夹为空。"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieser Ordner ist leer."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Ce dossier est vide."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このフォルダは空です。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 폴더는 비어 있습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Эта папка пуста."
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此資料夾是空的。"
           }
         }
       }
@@ -165102,6 +167242,65 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "這會停止目前的雲端任務，並在你重新啟用前阻止後續雲端任務。"
+          }
+        }
+      }
+    },
+    "This tool did not provide cost, alternatives, or a revocation method." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dieses Tool hat keine Kosten, Alternativen oder Möglichkeit zum Widerruf angegeben."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "This tool did not provide cost, alternatives, or a revocation method."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Esta herramienta no indicó el costo, las alternativas ni cómo revocar la acción."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Cet outil n’a indiqué ni le coût, ni les solutions de remplacement, ni la méthode de révocation."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このツールは、費用、代替手段、取り消し方法を提示していません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "이 도구는 비용, 대안 또는 취소 방법을 제공하지 않았습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Этот инструмент не указал стоимость, альтернативы или способ отмены."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此工具未提供费用、替代方案或撤销方式。"
+          }
+        },
+        "zh-Hant" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "此工具未提供費用、替代方案或撤銷方式。"
           }
         }
       }
@@ -184311,7 +186510,43 @@
       "localizations" : {
         "en" : { "stringUnit" : { "state" : "translated", "value" : "This computer's files are not ready, so it cannot be opened yet." } },
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "电脑文件尚未就绪，暂时无法打开这台电脑。" } },
-        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "電腦檔案尚未就緒，暫時無法開啟這台電腦。" } }
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "電腦檔案尚未就緒，暫時無法開啟這台電腦。" } },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Die Computerdateien sind noch nicht bereit; dieser Computer kann vorerst nicht geöffnet werden."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Los archivos del equipo aún no están listos; por ahora no se puede abrir este equipo."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Les fichiers de cet ordinateur ne sont pas encore prêts ; il est actuellement impossible de l’ouvrir."
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "このコンピュータのファイルはまだ準備できていないため、現在は開けません。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "컴퓨터 파일이 아직 준비되지 않아 현재 이 컴퓨터를 열 수 없습니다."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Файлы компьютера ещё не готовы; пока открыть этот компьютер нельзя."
+          }
+        }
       }
     },
     "此账号范围内没有可用的电脑文件。" : {

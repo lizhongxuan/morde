@@ -1,15 +1,16 @@
 .morde-shell:not(.morde-admin-shell) .reviews-page { width: min(100%, 1120px); margin: 0 auto; }
 .morde-shell:not(.morde-admin-shell) .reviews-heading { align-items: flex-end; margin-bottom: 22px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
 .morde-shell:not(.morde-admin-shell) .reviews-heading h1 { margin: 0; font-size: 28px; letter-spacing: -.025em; }
-.morde-shell:not(.morde-admin-shell) .reviews-heading p { margin: 7px 0 0; color: var(--muted); font-size: 14px; }
+.morde-shell:not(.morde-admin-shell) .reviews-heading p { max-width: 680px; margin: 7px 0 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
 .morde-shell:not(.morde-admin-shell) .reviews-pending-count { padding: 7px 11px; border-color: var(--line); background: var(--pc-blue-bg, #edf5fb); color: var(--pc-blue-text, #315f7b); font-size: 12px; }
-.morde-shell:not(.morde-admin-shell) .reviews-section { margin: 0 0 16px; padding: 18px; border: 1px solid var(--line); border-radius: 14px; background: var(--pc-surface-soft, #f8fafb); }
+.morde-shell:not(.morde-admin-shell) .reviews-section { margin: 0 0 22px; }
 .morde-shell:not(.morde-admin-shell) .reviews-section h2 { margin: 0 0 14px; color: var(--ink); font-size: 15px; font-weight: 700; }
 .morde-shell:not(.morde-admin-shell) .reviews-list { gap: 10px; }
-.morde-shell:not(.morde-admin-shell) .review-item { padding: 15px; border-radius: 11px; background: var(--surface); box-shadow: 0 1px 3px rgb(25 45 60 / 4%); }
-.morde-shell:not(.morde-admin-shell) .review-item-heading > strong { color: var(--ink); font-size: 14px; }
-.morde-shell:not(.morde-admin-shell) .review-item-heading > span { padding: 3px 8px; border-radius: 999px; background: var(--pc-surface-soft, #f1f4f6); }
-.morde-shell:not(.morde-admin-shell) .review-item-context { margin-top: 6px; font-size: 12px; }
+.morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-card { width: 100%; max-width: none; margin: 0; padding: 20px; border-color: var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow-jelly, 0 6px 20px rgb(35 79 145 / 7%)); }
+.morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-card .task-approval-card-heading h3 { font-size: 17px; }
+.morde-shell:not(.morde-admin-shell) .reviews-history { margin: 0 0 20px; }
+.morde-shell:not(.morde-admin-shell) .reviews-history > summary { width: fit-content; padding: 6px 0; color: var(--muted-strong, var(--muted)); font-size: 13px; font-weight: 650; cursor: pointer; }
+.morde-shell:not(.morde-admin-shell) .reviews-history .reviews-section { margin-top: 12px; }
 .morde-shell:not(.morde-admin-shell) .reviews-empty { margin: 0; padding: 24px 14px; border: 1px dashed var(--line); border-radius: 10px; color: var(--muted); background: var(--surface); font-size: 13px; text-align: center; }
 .morde-shell:not(.morde-admin-shell) .reviews-loading { margin: 0; padding: 14px 0; color: var(--muted); font-size: 13px; }
 .morde-shell:not(.morde-admin-shell) .reviews-error { min-width: 0; margin: 0 0 16px; padding: 14px 16px; display: flex; align-items: center; gap: 12px; border: 1px solid #f1c9c5; border-radius: 12px; color: var(--pc-red-text, #8b211a); background: var(--pc-red-bg, #fff8f7); }
@@ -21,14 +22,15 @@
 .morde-shell:not(.morde-admin-shell) .reviews-load-more { padding: 4px 0 18px; }
 
 @media (prefers-color-scheme: dark) {
-  .morde-shell:not(.morde-admin-shell) .review-item { box-shadow: none; }
+  .morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-card { box-shadow: none; }
   .morde-shell:not(.morde-admin-shell) .reviews-error { border-color: #69413d; }
   .morde-shell:not(.morde-admin-shell) .reviews-error-mark { color: var(--pc-red-text); background: var(--pc-red-bg); }
 }
 
 @media (max-width: 680px) {
   .morde-shell:not(.morde-admin-shell) .reviews-heading { align-items: flex-start; }
-  .morde-shell:not(.morde-admin-shell) .reviews-section { padding: 14px; }
+  .morde-shell:not(.morde-admin-shell) .reviews-heading { flex-direction: column; }
+  .morde-shell:not(.morde-admin-shell) .reviews-list > .task-approval-card { padding: 16px; }
   .morde-shell:not(.morde-admin-shell) .reviews-error { align-items: flex-start; flex-wrap: wrap; }
   .morde-shell:not(.morde-admin-shell) .reviews-error-copy { flex-basis: calc(100% - 44px); }
   .morde-shell:not(.morde-admin-shell) .reviews-error > .button { margin-left: 42px; }

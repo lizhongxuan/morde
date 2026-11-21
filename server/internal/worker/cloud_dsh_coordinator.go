@@ -162,7 +162,8 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 		"owner_id": identity.OwnerID, "actor_id": identity.ActorID, "agent_id": identity.AgentID, "generation": identity.Generation,
 		"authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID,
 		"purpose": identity.Purpose, "operation_id": identity.OperationID,
-		"model": value.ModelID, "tools": []any{}, "system_prompt": request.Instructions,
+		"model": value.ModelID, "tools": []any{},
+		"system_prompt": request.Instructions, "max_tokens": request.MaxOutputTokens,
 		"resume": head.Through >= 0,
 	}
 	if head.Through >= 0 {

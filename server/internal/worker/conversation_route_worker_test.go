@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -27,6 +28,9 @@ type routeWorkerStub struct {
 	claim               app.ConversationRouteClaim
 	snapshot            app.ConversationRouteSnapshot
 	decision            app.ConversationRouteDecision
+	contextWindow       int
+	capacityKnown       bool
+	capacityErr         error
 	modelErr            error
 	classifyErr         error
 	applyErr            error
@@ -99,6 +103,12 @@ func (s *routeWorkerStub) ResolveConversationRouteModel(ctx context.Context, _ a
 	}
 	return "p1234567", s.modelErr
 }
+func (s *routeWorkerStub) ResolveConversationRouteContextWindow(context.Context, app.ConversationRouteClaim, string) (int, bool, error) {
+	if s.contextWindow < 4096 {
+		return 4096, false, s.capacityErr
+	}
+	return s.contextWindow, s.capacityKnown, s.capacityErr
+}
 func (s *routeWorkerStub) ClassifyConversationRoute(_ context.Context, _ app.ConversationRouteClaim, value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
 	s.classifies++
 	s.classified = value
@@ -108,7 +118,8 @@ func (s *routeWorkerStub) ClassifyConversationRoute(_ context.Context, _ app.Con
 func newRouteWorkerTest(t *testing.T) (*ConversationRouteWorker, *routeWorkerStub) {
 	t.Helper()
 	stub := &routeWorkerStub{claim: app.ConversationRouteClaim{Message: conversation.Message{ID: "m1234567", CreatedAt: time.Now()},
-		LeaseExpiresAt: time.Now().Add(time.Minute)}, snapshot: app.ConversationRouteSnapshot{Context: app.ConversationRouteContext{ActorID: "u1234567", Content: "hello"}}}
+		LeaseExpiresAt: time.Now().Add(time.Minute)}, contextWindow: 32_768, capacityKnown: true,
+		snapshot: app.ConversationRouteSnapshot{Context: app.ConversationRouteContext{ActorID: "u1234567", Content: "hello"}}}
 	worker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{Queue: stub, Actions: stub, Models: stub,
 		WorkerID: "route-test", LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 2, Logger: zap.NewNop()})
 	if err != nil {
@@ -302,9 +313,20 @@ func TestConversationRouteWorkerWaitsOnlyAfterClassifiedNewAndNeverSlidesTheWind
 					Status: task.StatusRunning, Revision: 1}}
 			}
 			if scenario.name == "stop pending root" {
+				executionScope, err := app.ConversationRouteExecutionScopeDigest(app.ConversationRoutingInput{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				controlScope, err := app.ConversationRouteControlScopeDigest(app.ConversationRoutingInput{})
+				if err != nil {
+					t.Fatal(err)
+				}
+				stub.snapshot.Context.ExecutionScopeDigest = executionScope
+				stub.snapshot.Context.ControlScopeDigest = controlScope
 				stub.snapshot.Context.RequestCandidates = []app.ConversationRouteRequestCandidate{{MessageID: "m2345678",
 					Sequence: 1, Content: "root", RoutingStatus: conversation.RoutingProcessing,
-					SameExecutionScope: true, SameControlScope: true, SameAuthorization: true, AggregationWaiting: true}}
+					SameExecutionScope: true, SameControlScope: true, SameAuthorization: true,
+					ExecutionScopeDigest: executionScope, ControlScopeDigest: controlScope, AggregationWaiting: true}}
 			}
 			actions := &routeAggregationWorkerStub{routeWorkerStub: stub, started: true}
 			worker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{Queue: stub, Actions: actions, Models: stub,
@@ -630,17 +652,19 @@ func TestConversationRouteWorkerDefersExpiredLeaseBeforeModelResolution(t *testi
 
 func TestConversationRouteWorkerRecordsModelFailureWithoutTaskAction(t *testing.T) {
 	for _, scenario := range []struct {
-		name string
-		err  error
+		name        string
+		err         error
+		wantFailure string
 	}{
-		{name: "provider unavailable", err: errors.New("provider unavailable")},
-		{name: "model budget exceeded", err: domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded")},
+		{name: "provider unavailable", err: errors.New("provider unavailable"), wantFailure: "model_unavailable"},
+		{name: "model budget exceeded", err: domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded"), wantFailure: "model_unavailable"},
+		{name: "provider context limit", err: domain.NewError(domain.CodeResultTooLarge, "provider context window exceeded"), wantFailure: "message_too_long"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			worker, stub := newRouteWorkerTest(t)
 			stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1}}
 			stub.classifyErr = scenario.err
-			if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 || stub.failures[0] != "model_unavailable" || len(stub.applied) != 0 {
+			if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 || stub.failures[0] != scenario.wantFailure || len(stub.applied) != 0 {
 				t.Fatalf("model failure affected task routing: failures=%v applied=%v err=%v", stub.failures, stub.applied, err)
 			}
 		})
@@ -663,10 +687,22 @@ func TestConversationRouteWorkerPreservesLongMessagesAndExplainsOversizedInput(t
 	stub.failures = nil
 	stub.snapshot.Context.Content = strings.Repeat("a", 64<<10)
 	stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1, Objective: strings.Repeat("b", 64<<10)}}
-	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || stub.classifies != 1 ||
-		len(stub.classified.Candidates) != 0 || !stub.classified.CandidateSetIncomplete || len(stub.applied) != 1 {
-		t.Fatalf("oversized candidate should be dropped before model dispatch: failures=%v classifications=%d context=%+v err=%v",
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || stub.classifies != 1 || len(stub.applied) != 1 {
+		t.Fatalf("oversized candidate should be bounded before model dispatch: failures=%v classifications=%d context=%+v err=%v",
 			stub.failures, stub.classifies, stub.classified, err)
+	}
+	request, err := app.ConversationRouteModelRequest(stub.classified)
+	var modelInput struct {
+		ActiveTasks []app.ConversationRouteCandidate `json:"active_tasks"`
+	}
+	decodeErr := error(nil)
+	if err == nil {
+		decodeErr = json.Unmarshal([]byte(request.Input[0].Text), &modelInput)
+	}
+	if err != nil || decodeErr != nil || len(modelInput.ActiveTasks) != 1 ||
+		!modelInput.ActiveTasks[0].ObjectiveTruncated || len(modelInput.ActiveTasks[0].Objective) >= 64<<10 {
+		t.Fatalf("oversized task objective was not sent as a bounded preview: request=%+v tasks=%+v err=%v decode=%v",
+			request, modelInput, err, decodeErr)
 	}
 	stub.failures = nil
 	stub.snapshot.Context.Candidates[0].Objective = "short"

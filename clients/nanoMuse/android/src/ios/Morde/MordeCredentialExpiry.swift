@@ -2622,6 +2622,24 @@ enum MordeOutboxScheduling {
             (message.state == .unknown || message.state == .sending || message.submissionUncertain == true)
     }
 
+    private static func waitsForUnconfirmedPredecessor(_ message: MordeOutboxMessage,
+                                                        in messages: [MordeOutboxMessage],
+                                                        inFlight: Set<String>) -> Bool {
+        var predecessorID = message.previousClientMessageID
+        var visited = Set<String>()
+        while let id = predecessorID {
+            guard visited.insert(id).inserted else { return true }
+            guard let predecessor = messages.first(where: { $0.id == id }) else { return false }
+            guard predecessor.scope.hasSameAccount(as: message.scope),
+                  conversation(predecessor) == conversation(message) else { return true }
+            if predecessor.serverMessageID != nil { return false }
+            if predecessor.state == .unknown ||
+                (predecessor.state == .sending && !inFlight.contains(predecessor.id)) { return true }
+            predecessorID = predecessor.previousClientMessageID
+        }
+        return false
+    }
+
     private static func independentRetryBlocks(_ messages: [MordeOutboxMessage]) -> Set<Dependency> {
         var blocked = Set<Dependency>()
         for message in messages where message.serverMessageID == nil {
@@ -2653,9 +2671,11 @@ enum MordeOutboxScheduling {
         var ready: [String] = []
         for message in scoped {
             // Uncertain deliveries are reconciled read-only; only an explicit retry may submit them again.
-            guard !needsReceiptReconciliation(message) else { continue }
+            let explicitRetry = message.state == .sending && !inFlight.contains(message.id)
+            guard !needsReceiptReconciliation(message) || explicitRetry else { continue }
             guard allowsNewSubmissions || message.serverMessageID != nil || message.state != .pending ||
                     message.submissionStarted != false else { continue }
+            guard !waitsForUnconfirmedPredecessor(message, in: scoped, inFlight: inFlight) else { continue }
             if message.serverMessageID == nil {
                 if independentBlocks.contains(Dependency(conversation: conversation(message), predecessorID: message.id)) { continue }
             }

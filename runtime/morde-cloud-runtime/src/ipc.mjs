@@ -236,11 +236,11 @@ export class WorkerIPC {
       this.startFrame = frame
       if (frame.initial_message) {
         this.messageDeliveries.set(frame.initial_message.message_id,
-          JSON.stringify([frame.initial_message.content, frame.initial_message.attachment_ids]))
+          JSON.stringify([frame.initial_message.content, frame.initial_message.attachment_ids ?? [], 'followup']))
       }
       if (Array.isArray(frame.revision_messages)) {
         for (const message of frame.revision_messages) {
-          this.messageDeliveries.set(message.message_id, JSON.stringify([message.content, message.attachment_ids]))
+          this.messageDeliveries.set(message.message_id, JSON.stringify([message.content, message.attachment_ids ?? [], 'followup']))
         }
       }
       this.start.resolve(frame)
@@ -265,14 +265,15 @@ export class WorkerIPC {
         throw new Error('invalid message delivery')
       }
       const attachmentIDs = frame.attachment_ids ?? []
-      const signature = JSON.stringify([frame.content, attachmentIDs])
+      const mode = frame.mode ?? 'followup'
+      const signature = JSON.stringify([frame.content, attachmentIDs, mode])
       const previous = this.messageDeliveries.get(frame.message_id)
       if (previous !== undefined) {
-        if (previous !== signature) throw new Error('message delivery id conflicts with prior content')
+        if (previous !== signature) throw new Error('message delivery id conflicts with prior content or mode')
         return
       }
       this.messageDeliveries.set(frame.message_id, signature)
-      const delivery = { message_id: frame.message_id, content: frame.content, attachment_ids: [...attachmentIDs] }
+      const delivery = { message_id: frame.message_id, content: frame.content, attachment_ids: [...attachmentIDs], mode }
       if (this.messageDeliveryHandler) this.messageDeliveryHandler(delivery)
       else this.pendingMessageDeliveries.push(delivery)
       return

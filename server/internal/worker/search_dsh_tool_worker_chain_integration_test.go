@@ -468,6 +468,9 @@ func runSearchDSHWorkerTask(t *testing.T, objective, idempotencyKey, workerID st
 	if err != nil {
 		t.Fatalf("create Morde DSH tool broker: %v", err)
 	}
+	if err := broker.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatalf("configure task step detail sealing: %v", err)
+	}
 	if err := broker.SetBuiltinSearch(adapter); err != nil {
 		t.Fatalf("install fixed local search adapter: %v", err)
 	}

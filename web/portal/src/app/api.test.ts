@@ -716,6 +716,19 @@ describe('typed Portal API client', () => {
     expect(new URL(request!.url).search).toBe('?limit=100&conversation_id=c1234567&cursor=approval-cursor');
   });
 
+  it('loads user-wide tasks filtered by status without a conversation scope', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(input, init);
+      return Response.json({ items: [], next_cursor: null });
+    }));
+
+    await portalApi.tasks({ status: 'waiting_user' });
+
+    expect(new URL(request!.url).pathname).toBe('/api/tasks');
+    expect(new URL(request!.url).search).toBe('?limit=100&status=waiting_user');
+  });
+
   it('requires explicit confirmation before deleting host-owned storage', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

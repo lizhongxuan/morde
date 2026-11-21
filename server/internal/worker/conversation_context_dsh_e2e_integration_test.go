@@ -638,6 +638,11 @@ func (m *conversationContextE2ERouteModels) ResolveConversationRouteModel(ctx co
 	return m.coordinators[claim.Message.ConversationID].ResolveConversationRouteModel(ctx, claim)
 }
 
+func (m *conversationContextE2ERouteModels) ResolveConversationRouteContextWindow(ctx context.Context,
+	claim app.ConversationRouteClaim, modelID string) (int, bool, error) {
+	return m.gateway.ResolveConversationRouteContextWindow(ctx, claim, modelID)
+}
+
 func (m *conversationContextE2ERouteModels) ClassifyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim,
 	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
 	decision, err := m.coordinators[claim.Message.ConversationID].ClassifyConversationRoute(ctx, claim, value)

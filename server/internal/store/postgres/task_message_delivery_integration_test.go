@@ -281,9 +281,12 @@ func TestPostgresAgentCheckpointAppliesOnlyMatchingRootMessages(t *testing.T) {
 		LeaseVersion: started.Fence.LeaseVersion, EngineVersion: started.Fence.EngineVersion, ProfileVersion: started.Fence.ProfileVersion}
 	first := seedLegacyPendingTaskMessageForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID, "first pending",
 		map[string]string{committedPDF.AttachmentID: attachmentUpload.UploadID})
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_messages SET delivery_mode='steer' WHERE id=$1`, first.ID); err != nil {
+		t.Fatal(err)
+	}
 	pending, err := checkpoints.PendingMessages(ctx, fence)
 	if err != nil || len(pending) != 1 || pending[0].ID != first.ID || pending[0].Content != first.Content ||
-		len(pending[0].AttachmentIDs) != 1 || pending[0].AttachmentIDs[0] != committedPDF.AttachmentID {
+		pending[0].Mode != app.AgentMessageDeliverySteer || len(pending[0].AttachmentIDs) != 1 || pending[0].AttachmentIDs[0] != committedPDF.AttachmentID {
 		t.Fatalf("read pending messages: %#v err=%v", pending, err)
 	}
 	makePayload := func(from int64, events ...any) []byte {
@@ -306,25 +309,121 @@ func TestPostgresAgentCheckpointAppliesOnlyMatchingRootMessages(t *testing.T) {
 		}
 		return map[string]any{"seq": sequence, "type": "user/message", "data": map[string]any{"id": id, "role": "user", "content": checkpointContent}}
 	}
+	makeSpliceEvent := func(sequence int64, target, id, content string, attachmentIDs ...string) map[string]any {
+		var checkpointContent any = content
+		if len(attachmentIDs) != 0 {
+			checkpointContent = []map[string]string{
+				{"type": "text", "text": content},
+				{"type": "text", "text": "[MORDE_TASK_ATTACHMENT_IDS_V1:" + strings.Join(attachmentIDs, ",") + "]"},
+			}
+		}
+		return map[string]any{"seq": sequence, "type": "agent/inbox/spliced", "data": map[string]any{
+			"target": target, "start": 0, "inserted": []any{map[string]any{"id": id, "role": "user",
+				"content": checkpointContent, "source": map[string]string{"kind": "user"}}},
+		}}
+	}
 	makeCheckpoint := func(currentFence app.AgentCheckpointFence, from, through int64, payload []byte) app.AgentCheckpointCommand {
 		digest := sha256.Sum256(payload)
 		return app.AgentCheckpointCommand{Fence: currentFence, From: from, Through: through, Digest: digest[:], Payload: payload}
 	}
-	firstPayload := makePayload(0,
+	enqueuePayload := makePayload(0,
 		makeEvent(0, "2d47aa7b-f4db-4f11-b606-b7102c2c2df2", "initial prompt"),
 		makeEvent(1, created.Message.ID, created.Message.Content),
-		makeEvent(2, first.ID, first.Content, committedPDF.AttachmentID))
-	if _, err := checkpoints.Save(ctx, makeCheckpoint(fence, 0, 2, firstPayload)); err != nil {
-		t.Fatalf("save matching root checkpoint: %v", err)
+		makeSpliceEvent(2, "next-step", first.ID, first.Content, committedPDF.AttachmentID))
+	if _, err := checkpoints.Save(ctx, makeCheckpoint(fence, 0, 2, enqueuePayload)); err != nil {
+		t.Fatalf("save inbox splice checkpoint: %v", err)
+	}
+	if replayed, err := checkpoints.Save(ctx, makeCheckpoint(fence, 0, 2, enqueuePayload)); err != nil || !replayed {
+		t.Fatalf("replay inbox splice checkpoint: replayed=%t err=%v", replayed, err)
+	}
+	pending, err = checkpoints.PendingMessages(ctx, fence)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("checkpointed inbox message was sent again: %#v err=%v", pending, err)
+	}
+	var enqueuedThrough, generation, authorizationVersion int64
+	var storedTaskID, storedOwnerID, storedInitiatorID, storedAgentID, storedSessionID, storedMode string
+	if err := store.pool.QueryRow(ctx, `SELECT task_id,owner_id,initiator_id,agent_instance_id,agent_generation,authorization_version,session_id,mode,enqueued_through_seq
+FROM task_agent_message_deliveries WHERE message_id=$1`, first.ID).Scan(&storedTaskID, &storedOwnerID, &storedInitiatorID,
+		&storedAgentID, &generation, &authorizationVersion, &storedSessionID, &storedMode, &enqueuedThrough); err != nil {
+		t.Fatal(err)
+	}
+	if storedTaskID != created.Task.ID || storedOwnerID != owner.ID || storedInitiatorID != claimed.InitiatorID ||
+		storedAgentID != started.Fence.AgentInstanceID || generation != started.Fence.AgentGeneration ||
+		authorizationVersion != started.Fence.AuthorizationVersion || storedSessionID != started.Fence.AgentSessionID ||
+		storedMode != string(app.AgentMessageDeliverySteer) || enqueuedThrough != 2 {
+		t.Fatalf("persisted delivery fence = task %q owner %q initiator %q agent %q generation %d auth %d session %q mode %q seq %d",
+			storedTaskID, storedOwnerID, storedInitiatorID, storedAgentID, generation, authorizationVersion, storedSessionID, storedMode, enqueuedThrough)
 	}
 	var firstStatus string
+	if err := store.pool.QueryRow(ctx, `SELECT delivery_status FROM conversation_messages WHERE id=$1`, first.ID).Scan(&firstStatus); err != nil || firstStatus != string(conversation.DeliveryPending) {
+		t.Fatalf("inbox splice was reported as claimed: status=%q err=%v", firstStatus, err)
+	}
+	if _, err := instances.ConfirmStopped(ctx, signAgentLifecycleReceipt(t, supervisorKey, started.Fence, nonce)); err != nil {
+		t.Fatalf("confirm old Agent stopped: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, claimed.ID); err != nil {
+		t.Fatal(err)
+	}
+	recoveredTask, ok, err := store.ClaimNextTask(ctx, "delivery-checkpoint-recovery", 20*time.Second)
+	if err != nil || !ok || recoveredTask.ID != claimed.ID {
+		t.Fatalf("claim Task for recovery: claimed=%t id=%q err=%v", ok, recoveredTask.ID, err)
+	}
+	claimed = recoveredTask
+	recoveredNonce := make([]byte, 32)
+	recoveredNonce[0] = 2
+	recovered, replayed, err := instances.Start(ctx, app.AgentInstanceStart{Fence: app.AgentInstanceFence{
+		TaskID: claimed.ID, OwnerID: owner.ID, InitiatorID: claimed.InitiatorID, AgentInstanceID: "agent-delivery-recovered",
+		AgentSessionID: started.Fence.AgentSessionID, SupervisorID: "supervisor-delivery", LeaseOwner: claimed.Lease.Owner,
+		LeaseVersion: claimed.Lease.Version, AuthorizationVersion: 1, EngineVersion: started.Fence.EngineVersion,
+		ProfileVersion: started.Fence.ProfileVersion,
+	}, SupervisorNonce: recoveredNonce, LeaseDuration: 10 * time.Second})
+	if err != nil || replayed || recovered.Fence.AgentGeneration != started.Fence.AgentGeneration+1 {
+		t.Fatalf("recover Agent: recovered=%#v replayed=%t err=%v", recovered, replayed, err)
+	}
+	started = recovered
+	fence = app.AgentCheckpointFence{TaskID: claimed.ID, OwnerID: owner.ID, InitiatorID: claimed.InitiatorID,
+		AgentInstanceID: started.Fence.AgentInstanceID, AgentGeneration: started.Fence.AgentGeneration,
+		AgentSessionID: started.Fence.AgentSessionID, AgentRootSessionID: started.Fence.AgentSessionID,
+		AuthorizationVersion: started.Fence.AuthorizationVersion, LeaseOwner: started.Fence.LeaseOwner,
+		LeaseVersion: started.Fence.LeaseVersion, EngineVersion: started.Fence.EngineVersion, ProfileVersion: started.Fence.ProfileVersion}
+	pending, err = checkpoints.PendingMessages(ctx, fence)
+	if err != nil || len(pending) != 0 {
+		t.Fatalf("recovered Agent resent checkpointed inbox message: %#v err=%v", pending, err)
+	}
+	var rebound bool
+	if err := store.pool.QueryRow(ctx, `SELECT agent_instance_id=$2 AND agent_generation=$3 AND enqueued_through_seq=2 AND claimed_through_seq IS NULL
+FROM task_agent_message_deliveries WHERE message_id=$1`, first.ID, started.Fence.AgentInstanceID, started.Fence.AgentGeneration).Scan(&rebound); err != nil || !rebound {
+		t.Fatalf("recovered delivery fence was not rebound: rebound=%t err=%v", rebound, err)
+	}
+	claimPayload := makePayload(3, makeEvent(3, first.ID, first.Content, committedPDF.AttachmentID))
+	if _, err := checkpoints.Save(ctx, makeCheckpoint(fence, 3, 3, claimPayload)); err != nil {
+		t.Fatalf("save matching root user message: %v", err)
+	}
+	firstStatus = ""
 	if err := store.pool.QueryRow(ctx, `SELECT delivery_status FROM conversation_messages WHERE id=$1`, first.ID).Scan(&firstStatus); err != nil || firstStatus != string(conversation.DeliveryApplied) {
 		t.Fatalf("matched root message status=%q err=%v", firstStatus, err)
 	}
 
+	modeConflict := seedLegacyPendingTaskMessageForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID, "wrong queue mode", nil)
+	if _, err := store.pool.Exec(ctx, `UPDATE conversation_messages SET delivery_mode='steer' WHERE id=$1`, modeConflict.ID); err != nil {
+		t.Fatal(err)
+	}
+	pending, err = checkpoints.PendingMessages(ctx, fence)
+	if err != nil || len(pending) != 1 || pending[0].ID != modeConflict.ID || pending[0].Mode != app.AgentMessageDeliverySteer {
+		t.Fatalf("read mode conflict message: %#v err=%v", pending, err)
+	}
+	wrongModePayload := makePayload(4, makeSpliceEvent(4, "next-turn", modeConflict.ID, modeConflict.Content))
+	if _, err := checkpoints.Save(ctx, makeCheckpoint(fence, 4, 4, wrongModePayload)); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("mode-conflicting inbox checkpoint accepted: %v", err)
+	}
+	var modeConflictStatus string
+	if err := store.pool.QueryRow(ctx, `SELECT delivery_status FROM conversation_messages WHERE id=$1`, modeConflict.ID).Scan(&modeConflictStatus); err != nil || modeConflictStatus != string(conversation.DeliveryUnknown) {
+		t.Fatalf("mode conflict did not become unknown: status=%q err=%v", modeConflictStatus, err)
+	}
+
 	second := seedLegacyPendingTaskMessageForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID, "second pending", nil)
-	wrongPayload := makePayload(3, makeEvent(3, second.ID, "changed content"))
-	if _, err := checkpoints.Save(ctx, makeCheckpoint(fence, 3, 3, wrongPayload)); domain.CodeOf(err) != domain.CodeInvalidState {
+	wrongPayload := makePayload(4, makeEvent(4, second.ID, "changed content"))
+	if _, err := checkpoints.Save(ctx, makeCheckpoint(fence, 4, 4, wrongPayload)); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("mismatched root message checkpoint accepted: %v", err)
 	}
 	var secondStatus string
@@ -333,21 +432,37 @@ func TestPostgresAgentCheckpointAppliesOnlyMatchingRootMessages(t *testing.T) {
 	}
 	var checkpointCount int
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_agent_checkpoints WHERE task_id=$1 AND agent_session_id=$2`,
-		created.Task.ID, fence.AgentSessionID).Scan(&checkpointCount); err != nil || checkpointCount != 1 {
+		created.Task.ID, fence.AgentSessionID).Scan(&checkpointCount); err != nil || checkpointCount != 2 {
 		t.Fatalf("checkpoint count after mismatch=%d err=%v", checkpointCount, err)
 	}
 
 	third := seedLegacyPendingTaskMessageForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID, "third pending", nil)
-	unknownIDPayload := makePayload(3, makeEvent(3, "m9999999", "not a message for this Task"))
-	if _, err := checkpoints.Save(ctx, makeCheckpoint(fence, 3, 3, unknownIDPayload)); domain.CodeOf(err) != domain.CodeInvalidState {
-		t.Fatalf("unmapped root message checkpoint accepted: %v", err)
+	pending, err = checkpoints.PendingMessages(ctx, fence)
+	if err != nil || len(pending) != 1 || pending[0].ID != third.ID {
+		t.Fatalf("bind third message delivery: %#v err=%v", pending, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_agent_message_deliveries SET authorization_version=authorization_version+1 WHERE message_id=$1`, third.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := checkpoints.PendingMessages(ctx, fence); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("stale authorization version was accepted for delivery: %v", err)
 	}
 	var thirdStatus string
 	if err := store.pool.QueryRow(ctx, `SELECT delivery_status FROM conversation_messages WHERE id=$1`, third.ID).Scan(&thirdStatus); err != nil || thirdStatus != string(conversation.DeliveryUnknown) {
-		t.Fatalf("unmapped root message left delivery status=%q err=%v", thirdStatus, err)
+		t.Fatalf("stale authorization version did not become unknown: status=%q err=%v", thirdStatus, err)
+	}
+
+	fourth := seedLegacyPendingTaskMessageForTest(t, ctx, store, owner.ID, created.Conversation.ID, created.Task.ID, "fourth pending", nil)
+	unknownIDPayload := makePayload(4, makeEvent(4, "m9999999", "not a message for this Task"))
+	if _, err := checkpoints.Save(ctx, makeCheckpoint(fence, 4, 4, unknownIDPayload)); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("unmapped root message checkpoint accepted: %v", err)
+	}
+	var fourthStatus string
+	if err := store.pool.QueryRow(ctx, `SELECT delivery_status FROM conversation_messages WHERE id=$1`, fourth.ID).Scan(&fourthStatus); err != nil || fourthStatus != string(conversation.DeliveryUnknown) {
+		t.Fatalf("unmapped root message left delivery status=%q err=%v", fourthStatus, err)
 	}
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_agent_checkpoints WHERE task_id=$1 AND agent_session_id=$2`,
-		created.Task.ID, fence.AgentSessionID).Scan(&checkpointCount); err != nil || checkpointCount != 1 {
+		created.Task.ID, fence.AgentSessionID).Scan(&checkpointCount); err != nil || checkpointCount != 2 {
 		t.Fatalf("checkpoint count after unmapped id=%d err=%v", checkpointCount, err)
 	}
 

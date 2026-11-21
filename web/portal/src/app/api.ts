@@ -222,12 +222,14 @@ export const portalApi = {
     }
     throw new Error('任务页数超过读取上限');
   },
-  tasks: async (): Promise<components['schemas']['TaskPage']> => {
+  tasks: async (options: { status?: components['schemas']['TaskStatus'] } = {}): Promise<components['schemas']['TaskPage']> => {
     const items: components['schemas']['TaskSummary'][] = [];
     const seen = new Set<string>();
     let cursor: string | undefined;
     for (let page = 0; page < 1000; page += 1) {
-      const result = unwrapApiResponse(await api.GET('/api/tasks', { params: { query: { limit: 100, ...(cursor ? { cursor } : {}) } } }));
+      const result = unwrapApiResponse(await api.GET('/api/tasks', { params: { query: {
+        limit: 100, ...(options.status ? { status: options.status } : {}), ...(cursor ? { cursor } : {}),
+      } } }));
       items.push(...result.items);
       if (!result.next_cursor) return { items, next_cursor: null };
       if (seen.has(result.next_cursor)) throw new Error('任务分页游标重复，无法继续读取');

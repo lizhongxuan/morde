@@ -1,0 +1,369 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f8faff">
+  <title>Morde PC · 审核页设计稿</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --brand: #60a5fa;
+      --brand-hover: #3b82f6;
+      --brand-pressed: #2563eb;
+      --brand-soft: #dbeafe;
+      --brand-tint: #bfdbfe;
+      --brand-ink: #2563eb;
+      --bg: #f8faff;
+      --side: #eff6ff;
+      --surface: #fff;
+      --ink: #334155;
+      --muted: #94a3b8;
+      --muted-strong: #64748b;
+      --line: #dbeafe;
+      --line-strong: #bfdbfe;
+      --radius-sm: 12px;
+      --radius-md: 16px;
+      --radius-card: 24px;
+      --radius-pill: 999px;
+      --shadow-jelly: 0 14px 30px rgba(96, 165, 250, .18);
+      --shadow-soft: 0 8px 20px rgba(96, 165, 250, .12);
+      --font: "Yuanti SC", "PingFang SC", "Microsoft YaHei", system-ui, -apple-system, sans-serif;
+      font-family: var(--font);
+      color: var(--ink);
+      background: var(--bg);
+    }
+    * { box-sizing: border-box; }
+    body { min-width: 320px; min-height: 100vh; margin: 0; background: var(--bg); color: var(--ink); font-size: 14px; }
+    button, a { font: inherit; }
+    button { color: inherit; }
+    .preview-note { width: min(1320px, calc(100% - 40px)); margin: 18px auto 10px; color: var(--muted-strong); font-size: 12px; }
+    .preview-note span { display: inline-flex; align-items: center; gap: 7px; padding: 6px 11px; border: 1px solid var(--line); border-radius: var(--radius-pill); background: #fff; }
+    .preview-note i { width: 7px; height: 7px; border-radius: 50%; background: var(--brand); }
+    .window { width: min(1440px, calc(100% - 40px)); min-height: min(920px, calc(100vh - 74px)); margin: 0 auto 28px; overflow: hidden; border: 1px solid #dce8fb; border-radius: 20px; background: var(--bg); box-shadow: var(--shadow-jelly); }
+    .window-bar { height: 42px; padding: 0 16px; display: flex; align-items: center; gap: 10px; border-bottom: 1px solid var(--line); background: #fff; }
+    .traffic { display: flex; gap: 8px; }
+    .traffic i { width: 11px; height: 11px; border-radius: 50%; box-shadow: inset 0 0 0 1px rgba(51, 65, 85, .08); }
+    .traffic i:nth-child(1) { background: #ff766b; }
+    .traffic i:nth-child(2) { background: #ffc344; }
+    .traffic i:nth-child(3) { background: #69ce58; }
+    .window-name { margin-left: 8px; color: #52647e; font-size: 13px; font-weight: 750; letter-spacing: .01em; }
+    .toolbar { height: 56px; padding: 0 20px; display: flex; align-items: center; justify-content: space-between; gap: 18px; border-bottom: 1px solid var(--line); background: #fff; }
+    .toolbar-left, .toolbar-right { display: flex; align-items: center; gap: 10px; }
+    .icon-button { width: 38px; height: 38px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 50%; color: var(--muted-strong); background: transparent; }
+    .icon-button svg, .rail-button svg, .nav-icon svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
+    .toolbar-divider { height: 26px; margin: 0 4px; border-left: 1px solid var(--line); }
+    .toolbar-chip { min-height: 36px; padding: 0 12px; display: inline-flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: var(--radius-pill); color: var(--muted-strong); background: #fff; }
+    .toolbar-chip svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.7; }
+    .avatar { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--brand-tint); border-radius: 12px; color: var(--brand-ink); background: var(--brand-soft); font-size: 13px; font-weight: 750; }
+    .account-name { color: var(--muted-strong); font-size: 12px; }
+    .app-body { height: calc(100vh - 174px); min-height: 480px; display: grid; grid-template-columns: 68px minmax(0, 1fr); }
+    .rail { padding: 16px 10px; display: flex; flex-direction: column; align-items: center; gap: 12px; border-right: 1px solid var(--line); background: var(--side); }
+    .logo { width: 42px; height: 42px; margin-bottom: 12px; padding: 6px; display: grid; place-items: center; border: 1px solid #fff; border-radius: 14px; background: #fff; box-shadow: var(--shadow-soft); }
+    .logo img { width: 100%; height: 100%; object-fit: contain; }
+    .rail-button { width: 42px; height: 42px; display: grid; place-items: center; border: 0; border-radius: 14px; color: #71829c; background: transparent; }
+    .rail-button.active { color: var(--brand-ink); background: var(--brand-soft); }
+    .rail-spacer { flex: 1; }
+    .rail-profile { width: 36px; height: 36px; display: grid; place-items: center; border: 1px solid rgba(255,255,255,.4); border-radius: 50%; color: #fff; background: #4b6ff0; font-weight: 750; }
+    .main { min-width: 0; min-height: 0; overflow: auto; padding: 28px clamp(24px, 5.5vw, 76px) 14px; }
+    .page { width: min(100%, 1030px); min-height: 100%; margin: 0 auto; display: flex; flex-direction: column; }
+    .page-heading { padding-bottom: 16px; border-bottom: 1px solid var(--line); }
+    h1 { margin: 0; color: var(--ink); font-size: clamp(28px, 3vw, 36px); line-height: 1.2; letter-spacing: -.025em; }
+    .intro { max-width: 680px; margin: 6px 0 0; color: var(--muted-strong); font-size: 13px; line-height: 1.5; }
+    .approval-list { display: grid; gap: 8px; margin-top: 16px; }
+    .approval-card { position: relative; padding: 12px 16px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px 20px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow-soft); transition: border-color .16s ease, box-shadow .16s ease; }
+    .approval-card:hover { border-color: var(--brand-tint); box-shadow: var(--shadow-jelly); }
+    .approval-card[hidden] { display: none; }
+    .card-main { min-width: 0; pointer-events: none; }
+    .card-hit-area { position: absolute; inset: 0; z-index: 1; width: 100%; height: 100%; padding: 0; border: 0; border-radius: inherit; background: transparent; cursor: pointer; }
+    .card-heading { min-width: 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px 10px; }
+    .card-type { margin: 0; display: inline-flex; align-items: center; gap: 6px; color: var(--brand-ink); font-size: 10px; font-weight: 750; white-space: nowrap; }
+    .card-type-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--brand); }
+    .card-title { margin: 0; color: var(--ink); font-size: 15px; font-weight: 750; line-height: 1.35; }
+    .card-meta { margin: 4px 0 0; display: flex; align-items: baseline; flex-wrap: wrap; gap: 4px 9px; color: var(--muted-strong); font-size: 12px; line-height: 1.45; }
+    .card-meta code { color: #50627c; font-size: 11px; overflow-wrap: anywhere; }
+    .card-meta .meta-effect { color: #64748b; }
+    .card-hit-area:focus-visible { outline-offset: 3px; }
+    .detail-box { margin-top: 10px; padding: 13px 15px; border: 1px solid #e5efff; border-radius: 14px; color: var(--muted-strong); background: #fbfdff; font-size: 12px; line-height: 1.7; }
+    .detail-row { display: grid; grid-template-columns: 76px minmax(0, 1fr); gap: 12px; }
+    .detail-row + .detail-row { margin-top: 5px; }
+    .detail-row dt { color: var(--muted); }
+    .detail-row dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }
+    .action-buttons { position: relative; z-index: 2; display: flex; align-items: center; justify-content: flex-end; gap: 6px; }
+    .button { min-height: 34px; padding: 0 13px; border: 1px solid var(--brand-tint); border-radius: var(--radius-pill); color: var(--brand-ink); background: #fff; font-size: 12px; font-weight: 700; white-space: nowrap; cursor: pointer; transition: color .16s ease, background .16s ease, box-shadow .16s ease; }
+    .button:hover { background: #f4f8ff; }
+    .button-primary { border-color: var(--brand); color: #fff; background: var(--brand); box-shadow: 0 6px 16px rgba(96, 165, 250, .25); }
+    .button-primary:hover { border-color: var(--brand-hover); background: var(--brand-hover); }
+    .pagination { position: sticky; bottom: 0; z-index: 3; margin-top: auto; padding: 12px 8px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border-top: 1px solid var(--line); background: var(--bg); }
+    .page-summary { margin: 0; color: var(--muted-strong); font-size: 11px; }
+    .page-controls { display: flex; align-items: center; gap: 6px; }
+    .page-button, .page-number { min-width: 32px; height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted-strong); background: #fff; font-size: 12px; cursor: pointer; }
+    .page-number[aria-current="page"] { border-color: var(--brand); color: #fff; background: var(--brand); }
+    .page-button:disabled { opacity: .45; cursor: not-allowed; }
+    .detail-dialog { width: min(540px, calc(100% - 32px)); max-height: calc(100vh - 40px); padding: 22px; overflow: auto; border: 1px solid var(--line-strong); border-radius: 22px; color: var(--ink); background: var(--surface); box-shadow: var(--shadow-jelly); }
+    .detail-dialog::backdrop { background: rgba(51, 65, 85, .32); backdrop-filter: blur(3px); }
+    .dialog-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+    .dialog-type { margin: 0 0 5px; color: var(--brand-ink); font-size: 11px; font-weight: 750; }
+    .dialog-title { margin: 0; color: var(--ink); font-size: 20px; line-height: 1.4; }
+    .dialog-close { width: 34px; height: 34px; flex: 0 0 auto; border: 1px solid var(--line); border-radius: 50%; color: var(--muted-strong); background: #fff; font-size: 20px; cursor: pointer; }
+    .dialog-meta .card-meta { margin-top: 15px; padding: 10px 12px; border-radius: 12px; background: #f4f8ff; }
+    .dialog-content .detail-box { margin-top: 12px; }
+    :focus-visible { outline: 3px solid rgba(96,165,250,.46); outline-offset: 3px; }
+    @media (max-width: 760px) {
+      .preview-note, .window { width: calc(100% - 20px); }
+      .window { min-height: calc(100vh - 55px); border-radius: 15px; }
+      .window-bar { height: 36px; }
+      .toolbar { height: 50px; padding: 0 12px; }
+      .toolbar-chip .chip-label, .account-name { display: none; }
+      .toolbar-right { gap: 5px; }
+      .app-body { height: calc(100vh - 143px); min-height: 480px; grid-template-columns: 54px minmax(0, 1fr); }
+      .rail { padding: 12px 6px; }
+      .logo { width: 38px; height: 38px; }
+      .rail-button { width: 40px; height: 40px; }
+      .main { padding: 24px 17px 12px; }
+      .approval-card { grid-template-columns: minmax(0, 1fr); gap: 8px; padding: 13px 14px; border-radius: 17px; }
+      .card-title { font-size: 15px; }
+      .action-buttons { justify-content: flex-end; }
+      .pagination { flex-wrap: wrap; justify-content: center; }
+      .detail-row { grid-template-columns: 66px minmax(0, 1fr); }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }
+    }
+  </style>
+</head>
+<body>
+  <p class="preview-note"><span><i aria-hidden="true"></i>审核页视觉稿 · 示例内容仅用于展示卡片结构</span></p>
+  <div class="window">
+    <div class="window-bar" aria-label="窗口标题栏">
+      <span class="traffic" aria-hidden="true"><i></i><i></i><i></i></span>
+      <span class="window-name">morde-pc</span>
+    </div>
+    <header class="toolbar">
+      <div class="toolbar-left" aria-label="窗口导航">
+        <button class="icon-button" type="button" aria-label="返回上一页" title="返回上一页">
+          <svg viewBox="0 0 24 24"><path d="m14 18-6-6 6-6M8 12h12"/></svg>
+        </button>
+        <button class="icon-button" type="button" aria-label="前进" title="前进">
+          <svg viewBox="0 0 24 24"><path d="m10 18 6-6-6-6m6 6H4"/></svg>
+        </button>
+        <span class="toolbar-divider" aria-hidden="true"></span>
+        <button class="icon-button" type="button" aria-label="切换侧边栏" title="切换侧边栏">
+          <svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="M9 4v16"/></svg>
+        </button>
+      </div>
+      <div class="toolbar-right">
+        <span class="toolbar-chip"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/></svg><span class="chip-label">云端电脑</span></span>
+        <button class="icon-button" type="button" aria-label="通知" title="通知">
+          <svg viewBox="0 0 24 24"><path d="M18 9a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9m-8 13h4"/></svg>
+        </button>
+        <span class="avatar" aria-label="当前用户">a</span>
+        <span class="account-name">admin</span>
+      </div>
+    </header>
+    <div class="app-body">
+      <nav class="rail" aria-label="主导航">
+        <div class="logo"><img src="../../images/morde-logo-reference.png" alt="Morde"></div>
+        <button class="rail-button" type="button" aria-label="对话" title="对话">
+          <svg viewBox="0 0 24 24"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H6l-3 2v-9.5A7.5 7.5 0 0 1 10.5 4H13a7 7 0 0 1 7 7.5Z"/><path d="M8 10h8m-8 4h5"/></svg>
+        </button>
+        <button class="rail-button active" type="button" aria-current="page" aria-label="审核" title="审核">
+          <svg viewBox="0 0 24 24"><path d="m12 3 8 3v5c0 5-3.4 8.2-8 10-4.6-1.8-8-5-8-10V6l8-3Z"/><path d="m8.5 11.5 2.3 2.3 4.8-5"/></svg>
+        </button>
+        <button class="rail-button" type="button" aria-label="目标" title="目标">
+          <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.5"/><circle cx="12" cy="12" r="1"/></svg>
+        </button>
+        <button class="rail-button" type="button" aria-label="刷新" title="刷新">
+          <svg viewBox="0 0 24 24"><path d="M20 7v5h-5M4.5 9A8 8 0 0 1 18 5l2 2m-16 10v-5h5m10.5 3A8 8 0 0 1 6 19l-2-2"/></svg>
+        </button>
+        <span class="rail-spacer"></span>
+        <span class="rail-profile" aria-label="账号">a</span>
+      </nav>
+      <main class="main">
+        <div class="page">
+          <header class="page-heading">
+            <div>
+              <h1>审核</h1>
+              <p class="intro">只显示需要你允许或拒绝的操作。普通追问、任务等待和异常状态，请在任务动态查看。</p>
+            </div>
+          </header>
+
+          <section class="approval-list" aria-label="待你确认的操作">
+            <article class="approval-card" data-approval-card>
+              <div class="card-main">
+                <div class="card-heading"><p class="card-type"><span class="card-type-dot" aria-hidden="true"></span>文件写入</p><h2 class="card-title">创建周报文件</h2></div>
+                <p class="card-meta"><code>/reports/weekly-summary.md</code><span class="meta-effect">· 创建此文件</span></p>
+                <template class="card-detail"><div class="detail-box"><dl class="detail-row"><dt>文件内容</dt><dd>本周进展、完成事项和下周安排。</dd></dl><dl class="detail-row"><dt>授权范围</dt><dd>仅创建上述文件。</dd></dl></div></template>
+              </div>
+              <button class="card-hit-area" type="button" data-open-detail aria-haspopup="dialog"></button>
+              <div class="action-buttons"><button class="button" type="button">拒绝</button><button class="button button-primary" type="button">允许</button></div>
+            </article>
+
+            <article class="approval-card" data-approval-card>
+              <div class="card-main">
+                <div class="card-heading"><p class="card-type"><span class="card-type-dot" aria-hidden="true"></span>发送消息</p><h2 class="card-title">发布项目进展</h2></div>
+                <p class="card-meta"><code>#项目进展</code><span class="meta-effect">· 频道成员可见</span></p>
+                <template class="card-detail"><div class="detail-box"><dl class="detail-row"><dt>发送内容</dt><dd>项目接口联调已完成，下一步开始回归验证。</dd></dl><dl class="detail-row"><dt>发送至</dt><dd><code>#项目进展</code></dd></dl></div></template>
+              </div>
+              <button class="card-hit-area" type="button" data-open-detail aria-haspopup="dialog"></button>
+              <div class="action-buttons"><button class="button" type="button">拒绝</button><button class="button button-primary" type="button">允许</button></div>
+            </article>
+
+            <article class="approval-card" data-approval-card>
+              <div class="card-main">
+                <div class="card-heading"><p class="card-type"><span class="card-type-dot" aria-hidden="true"></span>文件删除</p><h2 class="card-title">删除旧导出文件</h2></div>
+                <p class="card-meta"><code>/exports/old-report.csv</code><span class="meta-effect">· 删除此文件</span></p>
+                <template class="card-detail"><div class="detail-box"><dl class="detail-row"><dt>删除对象</dt><dd>仅此路径下的 <code>old-report.csv</code>。</dd></dl><dl class="detail-row"><dt>其他文件</dt><dd>不会修改或删除同目录中的其他文件。</dd></dl></div></template>
+              </div>
+              <button class="card-hit-area" type="button" data-open-detail aria-haspopup="dialog"></button>
+              <div class="action-buttons"><button class="button" type="button">拒绝</button><button class="button button-primary" type="button">允许</button></div>
+            </article>
+
+            <article class="approval-card" data-approval-card>
+              <div class="card-main">
+                <div class="card-heading"><p class="card-type"><span class="card-type-dot" aria-hidden="true"></span>终端命令</p><h2 class="card-title">运行项目构建</h2></div>
+                <p class="card-meta"><code>npm run build</code><span class="meta-effect">· 可能生成构建文件</span></p>
+                <template class="card-detail"><div class="detail-box"><dl class="detail-row"><dt>执行位置</dt><dd>当前工作区。</dd></dl><dl class="detail-row"><dt>执行命令</dt><dd><code>npm run build</code></dd></dl></div></template>
+              </div>
+              <button class="card-hit-area" type="button" data-open-detail aria-haspopup="dialog"></button>
+              <div class="action-buttons"><button class="button" type="button">拒绝</button><button class="button button-primary" type="button">允许</button></div>
+            </article>
+
+            <article class="approval-card" data-approval-card>
+              <div class="card-main">
+                <div class="card-heading"><p class="card-type"><span class="card-type-dot" aria-hidden="true"></span>文件上传</p><h2 class="card-title">上传报价表</h2></div>
+                <p class="card-meta"><code>price-list.xlsx</code><span class="meta-effect">· 发送至供应商服务</span></p>
+                <template class="card-detail"><div class="detail-box"><dl class="detail-row"><dt>文件</dt><dd><code>price-list.xlsx</code></dd></dl><dl class="detail-row"><dt>接收方</dt><dd>供应商服务。</dd></dl></div></template>
+              </div>
+              <button class="card-hit-area" type="button" data-open-detail aria-haspopup="dialog"></button>
+              <div class="action-buttons"><button class="button" type="button">拒绝</button><button class="button button-primary" type="button">允许</button></div>
+            </article>
+
+            <article class="approval-card" data-approval-card hidden>
+              <div class="card-main">
+                <div class="card-heading"><p class="card-type"><span class="card-type-dot" aria-hidden="true"></span>远程操作</p><h2 class="card-title">提交采购申请</h2></div>
+                <p class="card-meta"><code>采购申请 #PO-2048</code><span class="meta-effect">· 提交后进入审批流程</span></p>
+                <template class="card-detail"><div class="detail-box"><dl class="detail-row"><dt>申请内容</dt><dd>办公设备采购申请，总额 ¥8,600。</dd></dl><dl class="detail-row"><dt>提交位置</dt><dd>公司采购平台。</dd></dl></div></template>
+              </div>
+              <button class="card-hit-area" type="button" data-open-detail aria-haspopup="dialog"></button>
+              <div class="action-buttons"><button class="button" type="button">拒绝</button><button class="button button-primary" type="button">允许</button></div>
+            </article>
+
+            <article class="approval-card" data-approval-card hidden>
+              <div class="card-main">
+                <div class="card-heading"><p class="card-type"><span class="card-type-dot" aria-hidden="true"></span>权限调整</p><h2 class="card-title">邀请协作者加入项目</h2></div>
+                <p class="card-meta"><code>liwei@example.com</code><span class="meta-effect">· 可访问项目文件</span></p>
+                <template class="card-detail"><div class="detail-box"><dl class="detail-row"><dt>项目</dt><dd>客户端改版。</dd></dl><dl class="detail-row"><dt>权限</dt><dd>可查看和编辑该项目文件。</dd></dl></div></template>
+              </div>
+              <button class="card-hit-area" type="button" data-open-detail aria-haspopup="dialog"></button>
+              <div class="action-buttons"><button class="button" type="button">拒绝</button><button class="button button-primary" type="button">允许</button></div>
+            </article>
+
+            <article class="approval-card" data-approval-card hidden>
+              <div class="card-main">
+                <div class="card-heading"><p class="card-type"><span class="card-type-dot" aria-hidden="true"></span>文件覆盖</p><h2 class="card-title">更新发布说明</h2></div>
+                <p class="card-meta"><code>/release/notes.md</code><span class="meta-effect">· 替换现有内容</span></p>
+                <template class="card-detail"><div class="detail-box"><dl class="detail-row"><dt>目标文件</dt><dd><code>/release/notes.md</code></dd></dl><dl class="detail-row"><dt>变更方式</dt><dd>以新版本内容覆盖当前文件。</dd></dl></div></template>
+              </div>
+              <button class="card-hit-area" type="button" data-open-detail aria-haspopup="dialog"></button>
+              <div class="action-buttons"><button class="button" type="button">拒绝</button><button class="button button-primary" type="button">允许</button></div>
+            </article>
+
+            <article class="approval-card" data-approval-card hidden>
+              <div class="card-main">
+                <div class="card-heading"><p class="card-type"><span class="card-type-dot" aria-hidden="true"></span>日历邀请</p><h2 class="card-title">创建研发评审会议</h2></div>
+                <p class="card-meta"><code>周五 15:00 · 研发评审</code><span class="meta-effect">· 参会人会收到邀请</span></p>
+                <template class="card-detail"><div class="detail-box"><dl class="detail-row"><dt>参会人</dt><dd>项目组成员，共 6 人。</dd></dl><dl class="detail-row"><dt>日历</dt><dd>团队共享日历。</dd></dl></div></template>
+              </div>
+              <button class="card-hit-area" type="button" data-open-detail aria-haspopup="dialog"></button>
+              <div class="action-buttons"><button class="button" type="button">拒绝</button><button class="button button-primary" type="button">允许</button></div>
+            </article>
+
+            <article class="approval-card" data-approval-card hidden>
+              <div class="card-main">
+                <div class="card-heading"><p class="card-type"><span class="card-type-dot" aria-hidden="true"></span>云端电脑</p><h2 class="card-title">关闭测试电脑</h2></div>
+                <p class="card-meta"><code>QA-03</code><span class="meta-effect">· 当前远程会话会结束</span></p>
+                <template class="card-detail"><div class="detail-box"><dl class="detail-row"><dt>目标电脑</dt><dd>QA-03。</dd></dl><dl class="detail-row"><dt>影响</dt><dd>关闭后需要重新启动才能继续操作。</dd></dl></div></template>
+              </div>
+              <button class="card-hit-area" type="button" data-open-detail aria-haspopup="dialog"></button>
+              <div class="action-buttons"><button class="button" type="button">拒绝</button><button class="button button-primary" type="button">允许</button></div>
+            </article>
+          </section>
+
+          <nav class="pagination" aria-label="审核分页">
+            <p class="page-summary" aria-live="polite">1–5 / 10 项</p>
+            <div class="page-controls">
+              <button class="page-button" type="button" data-page-previous disabled>上一页</button>
+              <button class="page-number" type="button" data-page-number="1" aria-current="page">1</button>
+              <button class="page-number" type="button" data-page-number="2">2</button>
+              <button class="page-button" type="button" data-page-next>下一页</button>
+            </div>
+          </nav>
+
+        </div>
+      </main>
+    </div>
+  </div>
+  <dialog class="detail-dialog" id="approval-detail-dialog" aria-labelledby="dialog-title">
+    <div class="dialog-header">
+      <div>
+        <p class="dialog-type"></p>
+        <h2 class="dialog-title" id="dialog-title"></h2>
+      </div>
+      <button class="dialog-close" type="button" aria-label="关闭操作详情">×</button>
+    </div>
+    <div class="dialog-meta"></div>
+    <div class="dialog-content"></div>
+  </dialog>
+  <script>
+    (() => {
+      const pageSize = 5;
+      const cards = [...document.querySelectorAll('[data-approval-card]')];
+      const pageButtons = [...document.querySelectorAll('[data-page-number]')];
+      const previousButton = document.querySelector('[data-page-previous]');
+      const nextButton = document.querySelector('[data-page-next]');
+      const summary = document.querySelector('.page-summary');
+      const dialog = document.querySelector('#approval-detail-dialog');
+      const dialogType = dialog.querySelector('.dialog-type');
+      const dialogTitle = dialog.querySelector('.dialog-title');
+      const dialogMeta = dialog.querySelector('.dialog-meta');
+      const dialogContent = dialog.querySelector('.dialog-content');
+      const dialogClose = dialog.querySelector('.dialog-close');
+      const pageCount = Math.ceil(cards.length / pageSize);
+      let currentPage = 1;
+
+      const renderPage = page => {
+        currentPage = Math.max(1, Math.min(page, pageCount));
+        const start = (currentPage - 1) * pageSize;
+        const end = Math.min(start + pageSize, cards.length);
+        cards.forEach((card, index) => { card.hidden = index < start || index >= end; });
+        pageButtons.forEach(button => {
+          if (Number(button.dataset.pageNumber) === currentPage) button.setAttribute('aria-current', 'page');
+          else button.removeAttribute('aria-current');
+        });
+        previousButton.disabled = currentPage === 1;
+        nextButton.disabled = currentPage === pageCount;
+        summary.textContent = `${start + 1}–${end} / ${cards.length} 项`;
+      };
+
+      previousButton.addEventListener('click', () => renderPage(currentPage - 1));
+      nextButton.addEventListener('click', () => renderPage(currentPage + 1));
+      pageButtons.forEach(button => button.addEventListener('click', () => renderPage(Number(button.dataset.pageNumber))));
+      cards.forEach(card => {
+        const trigger = card.querySelector('[data-open-detail]');
+        trigger.setAttribute('aria-label', `查看操作详情：${card.querySelector('.card-title').textContent}`);
+        trigger.addEventListener('click', () => {
+          dialogType.textContent = card.querySelector('.card-type').textContent.trim();
+          dialogTitle.textContent = card.querySelector('.card-title').textContent.trim();
+          dialogMeta.replaceChildren(card.querySelector('.card-meta').cloneNode(true));
+          dialogContent.replaceChildren(card.querySelector('template.card-detail').content.cloneNode(true));
+          dialog.showModal();
+        });
+      });
+      dialogClose.addEventListener('click', () => dialog.close());
+      dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
+      renderPage(1);
+    })();
+  </script>
+</body>
+</html>

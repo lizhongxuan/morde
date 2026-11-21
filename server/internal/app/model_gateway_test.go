@@ -96,10 +96,11 @@ func (s *modelGatewayStoreTest) ValidateTaskModelDelivery(context.Context, Model
 }
 
 type modelGatewayResolverTest struct {
-	owner, model string
-	tools, image bool
-	personal     bool
-	endpoint     ModelEndpoint
+	owner, model  string
+	tools, image  bool
+	personal      bool
+	endpoint      ModelEndpoint
+	contextWindow *int
 }
 
 func (r *modelGatewayResolverTest) ResolveGatewayEndpoint(_ context.Context, owner, model string, tools, image bool) (ModelGatewayEndpoint, error) {
@@ -108,7 +109,8 @@ func (r *modelGatewayResolverTest) ResolveGatewayEndpoint(_ context.Context, own
 	if endpoint == (ModelEndpoint{}) {
 		endpoint = ModelEndpoint{BaseURL: "https://provider.example/v1", APIKey: "platform-key", ModelID: "test-model"}
 	}
-	return ModelGatewayEndpoint{Endpoint: endpoint, Version: time.Unix(1, 0), Personal: r.personal}, nil
+	return ModelGatewayEndpoint{Endpoint: endpoint, Version: time.Unix(1, 0), Personal: r.personal,
+		ContextWindowTokens: r.contextWindow}, nil
 }
 
 func (r *modelGatewayResolverTest) ResolveProbeEndpoint(_ context.Context, principal identity.Principal, model string) (ModelGatewayEndpoint, error) {
@@ -560,7 +562,10 @@ func TestCoordinatorGatewayPreservesTextOnlyClassificationAndSettledOutput(t *te
 	output := `{"action":"reply","task_id":"","question":"","reply":"Hello"}`
 	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
 	client := &modelGatewayClientTest{response: ModelResponse{Text: output, StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}}
-	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, client)
+	window := 32_768
+	resolver := &modelGatewayResolverTest{contextWindow: &window, endpoint: ModelEndpoint{BaseURL: "https://provider.example/v1",
+		APIKey: "test-key", ModelID: "test-model"}}
+	service, err := NewModelGatewayService(store, resolver, client)
 	if err != nil {
 		t.Fatal(err)
 	}

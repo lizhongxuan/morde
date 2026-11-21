@@ -14,6 +14,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/task"
 )
 
 type ConversationRouteWorkerOptions struct {
@@ -139,6 +140,25 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		return true, w.failRoute(ctx, claim, "model_unavailable", err)
 	}
+	contextWindow, capacityKnown := 4096, false
+	if resolver, ok := w.options.Models.(interface {
+		ResolveConversationRouteContextWindow(context.Context, app.ConversationRouteClaim, string) (int, bool, error)
+	}); ok {
+		resolvedWindow, known, capacityErr := resolver.ResolveConversationRouteContextWindow(routeCtx, claim, modelID)
+		if capacityErr != nil {
+			if routeCtx.Err() != nil && ctx.Err() == nil {
+				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 2*time.Second)
+			}
+			return true, w.failRoute(ctx, claim, "model_unavailable", capacityErr)
+		}
+		if resolvedWindow >= 4096 && resolvedWindow <= app.MaxModelContextWindowTokens {
+			contextWindow, capacityKnown = resolvedWindow, known
+		}
+	}
+	if !capacityKnown {
+		w.options.Logger.Warn("conversation route model capacity is unknown; using minimum supported window",
+			zap.String("job", "conversation_route"))
+	}
 	if snapshot.Context.ResultReview == nil {
 		compacted, err := w.compactConversationSummary(routeCtx, claim, modelID)
 		if err != nil {
@@ -174,30 +194,18 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		classifyContext.SummaryVersion = 0
 		classifyContext.SummarySHA256, classifyContext.SummarySourcesSHA256 = nil, nil
 	}
+	// The snapshot carries at most eight recent history rows.
+	if classifyContext.SummaryVersion == 0 && classifyContext.ResultReview == nil && claim.Message.Sequence > 9 {
+		classifyContext.HistoryIncomplete = true
+	}
 	classifyContext.ModelID = modelID
 	copyConversationRouteCandidates(&classifyContext)
+	if err := fitConversationRouteContext(&classifyContext, contextWindow); err != nil {
+		return true, w.failRoute(ctx, claim, "message_too_long", err)
+	}
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	if classifyContext.Content != "" || len(classifyContext.Candidates) != 0 || classifyContext.ReferenceTaskID != "" ||
 		classifyContext.PreviousUnresolved || classifyContext.SummaryVersion > 0 || classifyContext.ResultReview != nil {
-		for {
-			_, requestErr := app.ConversationRouteModelRequest(classifyContext)
-			if domain.CodeOf(requestErr) != domain.CodeResultTooLarge {
-				break
-			}
-			if classifyContext.SummaryVersion > 0 {
-				classifyContext = snapshot.Context
-				classifyContext.ModelID = modelID
-				copyConversationRouteCandidates(&classifyContext)
-				classifyContext.SummaryVersion = 0
-				classifyContext.SummarySHA256, classifyContext.SummarySourcesSHA256 = nil, nil
-				classifyContext.SummaryText = ""
-				continue
-			}
-			if trimConversationRouteCandidates(&classifyContext) {
-				continue
-			}
-			return true, w.failRoute(ctx, claim, "message_too_long", requestErr)
-		}
 		decision, err = w.options.Models.ClassifyConversationRoute(routeCtx, claim, classifyContext)
 		if err != nil {
 			if snapshot.Context.ResultReview != nil && routeCtx.Err() != nil && ctx.Err() == nil {
@@ -271,6 +279,44 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	}
 	w.observeRouteDecision(claim, decision, "applied")
 	return true, nil
+}
+
+func fitConversationRouteContext(value *app.ConversationRouteContext, contextWindow int) error {
+	for {
+		request, err := app.ConversationRouteModelRequest(*value)
+		if err == nil && app.ConversationRouteInputFitsContextWindow(request, contextWindow) {
+			return nil
+		}
+		if err != nil && domain.CodeOf(err) != domain.CodeResultTooLarge {
+			return err
+		}
+		if trimConversationRouteCandidates(value) {
+			continue
+		}
+		if value.SummaryVersion > 0 {
+			value.SummaryVersion = 0
+			value.SummarySHA256, value.SummarySourcesSHA256, value.SummaryText = nil, nil, ""
+			value.HistoryIncomplete = true
+			continue
+		}
+		trimmedHistory := false
+		for index := range value.History {
+			if value.History[index].Content != "" {
+				value.History[index].Content = ""
+				value.History[index].Truncated = true
+				value.HistoryIncomplete = true
+				trimmedHistory = true
+				break
+			}
+		}
+		if trimmedHistory {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		return domain.NewError(domain.CodeResultTooLarge, "conversation message exceeds the selected model context budget")
+	}
 }
 
 func (w *ConversationRouteWorker) observeRouteDecision(claim app.ConversationRouteClaim, decision app.ConversationRouteDecision, result string) {
@@ -408,6 +454,18 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 		if !decision.Acknowledge && decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 && decision.Question == "" &&
 			len(decision.DependencyTaskIDs) == 0 && len(decision.AggregateMessageIDs) == 0 && app.ValidConversationRouteReply(decision.Reply) {
 			return decision
+		}
+	case app.ConversationRouteSteer:
+		if decision.Acknowledge || decision.TaskID == "" || decision.TargetMessageID != "" || decision.ExplicitNew || decision.Question != "" ||
+			decision.ExpectedRevision < 0 || len(decision.DependencyTaskIDs) != 0 || len(decision.AggregateMessageIDs) != 0 ||
+			!app.ValidConversationRouteSteerTarget(decision.TaskID, value) {
+			return clarify
+		}
+		for _, candidate := range value.Candidates {
+			if candidate.TaskID == decision.TaskID && candidate.InitiatorID == value.ActorID && candidate.Status == task.StatusRunning &&
+				candidate.Revision == decision.ExpectedRevision {
+				return decision
+			}
 		}
 	case app.ConversationRouteClarify:
 		if !decision.Acknowledge && decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew && decision.ExpectedRevision == 0 &&

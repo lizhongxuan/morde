@@ -66,15 +66,32 @@ type StoredAgentCheckpoint struct {
 	Ciphertext                  []byte
 	ConversationMessages        []AgentConversationMessage
 	ConversationMessagesInvalid bool
+	InboxSplices                []AgentInboxSplice
+	InboxSplicesInvalid         bool
 	RootTurnStarted             bool
 }
+
+type AgentMessageDeliveryMode string
+
+const (
+	AgentMessageDeliverySteer    AgentMessageDeliveryMode = "steer"
+	AgentMessageDeliveryFollowup AgentMessageDeliveryMode = "followup"
+)
 
 type AgentConversationMessage struct {
 	ID             string
 	Content        string
 	AttachmentIDs  []string
+	Mode           AgentMessageDeliveryMode
+	Sequence       int64
 	Initial        bool
 	RevisionUpdate bool
+}
+
+type AgentInboxSplice struct {
+	Sequence int64
+	Target   string
+	Messages []AgentConversationMessage
 }
 
 const checkpointAttachmentMarkerPrefix = "[MORDE_TASK_ATTACHMENT_IDS_V1:"
@@ -107,9 +124,12 @@ func (s *AgentCheckpointService) Save(ctx context.Context, command AgentCheckpoi
 	}
 	var messages []AgentConversationMessage
 	var invalidMessages bool
+	var inboxSplices []AgentInboxSplice
+	var invalidInboxSplices bool
 	var turnStarted bool
 	if command.Fence.AgentSessionID == command.Fence.AgentRootSessionID {
 		messages, invalidMessages = checkpointConversationMessages(command.Payload)
+		inboxSplices, invalidInboxSplices = checkpointInboxSplices(command.Payload)
 		var err error
 		turnStarted, err = checkpointRootTurnStarted(command.Payload)
 		if err != nil {
@@ -128,6 +148,7 @@ func (s *AgentCheckpointService) Save(ctx context.Context, command AgentCheckpoi
 		Fence: command.Fence, From: command.From, Through: command.Through,
 		Digest: append([]byte(nil), command.Digest...), Ciphertext: ciphertext,
 		ConversationMessages: messages, ConversationMessagesInvalid: invalidMessages, RootTurnStarted: turnStarted,
+		InboxSplices: inboxSplices, InboxSplicesInvalid: invalidInboxSplices,
 	})
 }
 
@@ -136,8 +157,9 @@ func (s *AgentCheckpointService) Save(ctx context.Context, command AgentCheckpoi
 func checkpointRootTurnStarted(payload []byte) (bool, error) {
 	var body struct {
 		Events []struct {
-			Type string          `json:"type"`
-			Data json.RawMessage `json:"data"`
+			Sequence *int64          `json:"seq"`
+			Type     string          `json:"type"`
+			Data     json.RawMessage `json:"data"`
 		} `json:"events"`
 	}
 	if err := json.Unmarshal(payload, &body); err != nil {
@@ -261,8 +283,9 @@ func validAgentCheckpointFence(fence AgentCheckpointFence) bool {
 func checkpointConversationMessages(payload []byte) ([]AgentConversationMessage, bool) {
 	var body struct {
 		Events []struct {
-			Type string          `json:"type"`
-			Data json.RawMessage `json:"data"`
+			Sequence *int64          `json:"seq"`
+			Type     string          `json:"type"`
+			Data     json.RawMessage `json:"data"`
 		} `json:"events"`
 	}
 	if err := json.Unmarshal(payload, &body); err != nil {
@@ -273,6 +296,9 @@ func checkpointConversationMessages(payload []byte) ([]AgentConversationMessage,
 	for _, event := range body.Events {
 		if event.Type != "user/message" {
 			continue
+		}
+		if event.Sequence == nil || *event.Sequence < 0 {
+			return nil, true
 		}
 		var data struct {
 			ID      string          `json:"id"`
@@ -295,7 +321,7 @@ func checkpointConversationMessages(payload []byte) ([]AgentConversationMessage,
 		if !ok || (strings.TrimSpace(content) == "" && len(attachmentIDs) == 0) || !utf8.ValidString(content) {
 			return nil, true
 		}
-		message := AgentConversationMessage{ID: data.ID, Content: content, AttachmentIDs: attachmentIDs}
+		message := AgentConversationMessage{ID: data.ID, Content: content, AttachmentIDs: attachmentIDs, Sequence: *event.Sequence}
 		if previous, exists := byID[data.ID]; exists {
 			if previous.Content != content || !sameCheckpointAttachmentIDs(previous.AttachmentIDs, attachmentIDs) {
 				return nil, true
@@ -306,6 +332,69 @@ func checkpointConversationMessages(payload []byte) ([]AgentConversationMessage,
 		messages = append(messages, message)
 	}
 	return messages, false
+}
+
+func checkpointInboxSplices(payload []byte) ([]AgentInboxSplice, bool) {
+	var body struct {
+		Events []struct {
+			Sequence *int64          `json:"seq"`
+			Type     string          `json:"type"`
+			Data     json.RawMessage `json:"data"`
+		} `json:"events"`
+	}
+	if err := json.Unmarshal(payload, &body); err != nil {
+		return nil, true
+	}
+	splices := make([]AgentInboxSplice, 0)
+	for _, event := range body.Events {
+		if event.Type != "agent/inbox/spliced" {
+			continue
+		}
+		var data struct {
+			Target   string `json:"target"`
+			Inserted []struct {
+				ID      string          `json:"id"`
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+				Source  struct {
+					Kind string `json:"kind"`
+				} `json:"source"`
+			} `json:"inserted"`
+		}
+		if event.Sequence == nil || *event.Sequence < 0 || json.Unmarshal(event.Data, &data) != nil ||
+			(data.Target != "next-step" && data.Target != "next-turn") {
+			return nil, true
+		}
+		splice := AgentInboxSplice{Sequence: *event.Sequence, Target: data.Target, Messages: make([]AgentConversationMessage, 0, len(data.Inserted))}
+		for _, inserted := range data.Inserted {
+			if inserted.Source.Kind != "user" {
+				continue
+			}
+			if !domain.ValidMessageID(inserted.ID) {
+				if checkpointUUID(inserted.ID) {
+					continue
+				}
+				return nil, true
+			}
+			if inserted.Role != "" && inserted.Role != "user" {
+				return nil, true
+			}
+			content, attachmentIDs, ok := checkpointMessageContent(inserted.Content)
+			if !ok || (strings.TrimSpace(content) == "" && len(attachmentIDs) == 0) || !utf8.ValidString(content) {
+				return nil, true
+			}
+			mode := AgentMessageDeliveryFollowup
+			if data.Target == "next-step" {
+				mode = AgentMessageDeliverySteer
+			}
+			splice.Messages = append(splice.Messages, AgentConversationMessage{ID: inserted.ID, Content: content,
+				AttachmentIDs: attachmentIDs, Mode: mode})
+		}
+		if len(splice.Messages) != 0 {
+			splices = append(splices, splice)
+		}
+	}
+	return splices, false
 }
 
 func checkpointUUID(value string) bool {

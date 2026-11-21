@@ -60,12 +60,14 @@ WHERE task_id=$1 AND state='stopping' ORDER BY expected_revision LIMIT 1`, candi
 	if status == string(task.StatusPaused) && waitingReason != "" {
 		return domain.NewError(domain.CodeConflict, "paused task requires independent recovery before adjustment")
 	}
+	if status != string(task.StatusPausing) {
+		if err := cancelPendingTaskRequest(ctx, tx, candidate.TaskID); err != nil {
+			return err
+		}
+	}
 	if status != string(task.StatusPausing) && status != string(task.StatusPaused) {
 		stopID, err = domain.NewTaskActionID()
 		if err != nil {
-			return err
-		}
-		if err := cancelPendingTaskRequest(ctx, tx, candidate.TaskID); err != nil {
 			return err
 		}
 		var sequence int64

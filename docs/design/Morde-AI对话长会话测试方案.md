@@ -1,0 +1,41 @@
+# Morde AI 对话长会话测试方案
+
+> 范围：验证复杂任务、长历史、连续追问和 DSH 压缩/恢复。原始消息仍以服务端会话记录为准；模型只接收受上下文预算约束的摘要、近期历史和当前输入。本文是可执行验收方案，不表示所有客户端或真实模型场景已经通过。
+
+## 验收规则
+
+- 已受理的消息必须留在对应会话，压缩只改变模型上下文投影，不删除原始消息、任务记录或检查点。
+- 上下文装配按所选模型容量和输出预留计量；旧历史可裁剪或摘要，必须显式标记覆盖不完整，并保留可追溯的原文引用。
+- DSH 压缩须保留完整工具调用/结果组、最新用户输入和可继续对话的助手状态。摘要失败、溢出或取消时不得提交半成品。
+- 长任务期间可以接收追问。相同消息重试不得重复执行，停止一个任务不得连带停止独立任务。
+- 未知模型容量按最小支持窗口做预检。单条输入本身超过所选模型预算时应明确失败并保留原文，不能静默截断后假装完整处理。
+
+## 测试用例
+
+| ID | 场景与步骤 | 通过条件 | 自动化位置 |
+|---|---|---|---|
+| LC-01 | 在同一会话发送约 18 KB 的长要求，随后发送“请用英语回答”；前序消息 ID 指向长要求。 | 短追问仍可分类和回答；模型路由只读取有界预览并带原文 ID/摘要，不因旧正文大小报错；数据库中的完整原文及摘要校验保持不变。 | `server/internal/store/postgres/conversation_route_h01_integration_test.go`；PostgreSQL 路由 E2E。 |
+| LC-02 | 以 4K token 合成窗口连续发送 40 条较长追问，使 DSH 至少压缩两次；最早要求设置唯一锚点，末条追问设置另一锚点。 | 所有 40 条用户消息各持久化一次；压缩后模型仍看到早期要求和最新追问；任务完成，无 Runtime 错误，检查点中仍可查原始消息。 | `runtime/morde-cloud-runtime/test/hermes-compaction-runtime.test.mjs`。 |
+| LC-03 | 发起多步骤工具任务；工具执行期间补充同任务要求，同时创建独立任务；在检查点确认后重启 Runtime。 | 追问进入正确会话/任务；已确认的工具调用不重放；两个任务各自恢复并完成，进度和结果不串线；停止一个任务不停止另一个。 | Runtime 投递/恢复用例；`server/internal/worker/conversation_context_dsh_e2e_integration_test.go`。 |
+| LC-04 | 分别注入空摘要、截断摘要、摘要模型失败、Provider 上下文溢出及用户取消。对失败案例恢复 Runtime 并重试一次。 | 无效摘要不替换活动历史；原始事件和失败记录保留；溢出仅按 DSH 有界恢复策略重试；取消不提交摘要；重启不会重复已确认调用或重复结算。 | `runtime/morde-cloud-runtime/test/compaction-recovery.test.mjs`。 |
+| LC-05 | 建立两个会话及两个账号，分别写入相同格式但不同内容的早期约束；多轮压缩后交叉追问。 | 回答、摘要、历史搜索和检查点只引用当前用户获授权的会话；不同会话/账号内容不串用。 | PostgreSQL 会话权限、摘要来源和历史过滤集成测试。 |
+| LC-06 | 在实际 `morde-pc` 与 iOS 客户端分别继续同一长会话；执行中关闭/重连客户端，再查看消息、进度和最终结果。 | 两端看到同一会话的持久状态；重连不新建重复任务；早期记录可查看；界面如实显示处理中、完成、失败或等待。 | 真实 PC/iOS 客户端验收；不得以独立 Web 页、构建或单元测试替代 PC 验收。 |
+
+## 执行顺序
+
+1. 先跑确定性单元与 Runtime 用例，覆盖预算、选窗、工具结果配对、重复压缩、检查点和失败恢复。
+2. 用隔离 PostgreSQL 跑服务端路由与长历史重启 E2E，核对完整正文、摘要来源范围、幂等和权限。
+3. 最后在实际 PC/iOS 客户端及明确配置的测试模型上验收端到端对话。真实模型用例只使用合成内容，不读取或上传项目文件。
+
+常用本地命令：
+
+```sh
+cd runtime/morde-cloud-runtime && npm test
+cd server && go test ./internal/app ./internal/worker -count=1
+```
+
+PostgreSQL E2E 需设置本地隔离测试 DSN `CH_TEST_DATABASE_URL`，并使用 `go test ./internal/worker -run '^TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart$' -count=1`；不要连接生产数据库。
+
+## 已知边界
+
+长会话的目标是持续推进、保留原文并按需摘要/检索，不承诺把无限历史一次性塞入模型。DSH 压缩无法缩短系统提示、工具定义、会话固定前缀或单条不可拆消息；单条输入超出模型本身容量时，只有在实现了可校验的分块摘要和原文回查后才能自动处理，在此之前应给出明确、可重试的长度错误。见 [DSH compaction-basic 限制](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/compaction/compaction-basic/README.md)。真实 Provider 行为和 PC/iOS 客户端闭环必须单独验收，合成模型通过不能替代这些证据。

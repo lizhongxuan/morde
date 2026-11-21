@@ -102,6 +102,9 @@ func TestDSHSearchTasksInSameConversationKeepResultsAndLedgerSeparated(t *testin
 	if err != nil {
 		t.Fatalf("create Morde DSH tool broker: %v", err)
 	}
+	if err := broker.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatalf("configure task step detail sealing: %v", err)
+	}
 	if err := broker.SetBuiltinSearch(searchAdapter); err != nil {
 		t.Fatalf("install synthetic built-in search adapter: %v", err)
 	}

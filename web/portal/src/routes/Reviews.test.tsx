@@ -1,8 +1,8 @@
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { MemoryRouter, useLocation } from 'react-router';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { portalApi } from '../app/api';
 import type { components } from '../api/schema';
 import { ApiError } from '../api/client';
@@ -33,13 +33,32 @@ function item(id: string, status: components['schemas']['TaskApprovalSnapshot'][
 function renderReviews() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } });
   const rendered = render(<QueryClientProvider client={client}><ToastProvider><ToastNoticeCenter autoOpenErrors />
-    <MemoryRouter initialEntries={['/reviews']}><Reviews /></MemoryRouter>
+    <MemoryRouter initialEntries={['/reviews']}><LocationProbe /><Reviews /></MemoryRouter>
   </ToastProvider></QueryClientProvider>);
   return { ...rendered, client };
 }
 
+function LocationProbe() {
+  const location = useLocation();
+  return <output aria-label="路由状态">{JSON.stringify(location.state)}</output>;
+}
+
 describe('Reviews', () => {
+  beforeEach(() => { vi.spyOn(portalApi, 'tasks').mockResolvedValue({ items: [], next_cursor: null }); });
   afterEach(() => { cleanup(); vi.restoreAllMocks(); });
+
+  it('keeps ordinary waiting tasks out of Review and shows only explicit approval requests', async () => {
+    const waitingTask = { id: 'q7654321', conversation_id: 'c7654321', objective: '旁聊中的待处理任务',
+      status: 'waiting_user', updated_at: timestamp } as components['schemas']['TaskSummary'];
+    vi.mocked(portalApi.tasks).mockResolvedValue({ items: [waitingTask], next_cursor: null });
+    vi.spyOn(portalApi, 'taskApprovals').mockResolvedValue({ items: [], next_cursor: null, pending_count: 0 });
+    renderReviews();
+
+    expect(await screen.findByText('当前没有需要你确认的操作。')).toBeInTheDocument();
+    expect(screen.getByText(/只显示需要你允许或拒绝的操作/u)).toBeInTheDocument();
+    expect(screen.queryByText('旁聊中的待处理任务')).not.toBeInTheDocument();
+    expect(portalApi.tasks).not.toHaveBeenCalled();
+  });
 
   it('groups pending and handled cards, shows the full pending count, and submits the snapshot version', async () => {
     vi.spyOn(portalApi, 'taskApprovals').mockResolvedValue({ items: [item('k1234567', 'pending'), item('k7654321', 'approved')],
@@ -50,13 +69,15 @@ describe('Reviews', () => {
     const user = userEvent.setup();
     renderReviews();
 
-    expect(await screen.findByRole('heading', { name: '待处理 · 5' })).toBeInTheDocument();
-    const pendingSection = screen.getByRole('region', { name: '待处理审核' });
+    expect(await screen.findByRole('heading', { name: '待你确认 · 5' })).toBeInTheDocument();
+    const pendingSection = screen.getByRole('region', { name: '待你确认的操作' });
     const card = within(pendingSection).getByRole('region', { name: '需要批准的操作' });
     expect(card).toHaveTextContent('仅读取已授权目录');
-    expect(card).toHaveTextContent('用户可稍后处理');
+    expect(card.querySelector('.task-approval-more')).toBeInTheDocument();
+    expect(within(card).getAllByRole('button')).toHaveLength(2);
+    await user.click(screen.getByText('已处理的操作 · 1'));
     expect(screen.getByRole('region', { name: '已处理审核' })).toHaveTextContent('已允许');
-    await user.click(within(card).getByRole('button', { name: '允许' }));
+    await user.click(within(card).getByRole('button', { name: '允许本次操作' }));
     await waitFor(() => expect(respond).toHaveBeenCalledWith('q1234567', 'k1234567',
       { version: 3, decision: 'approve' }, expect.any(String)));
     expect(await screen.findByText('审核已受理，任务后续状态等待更新。')).toBeInTheDocument();
@@ -68,8 +89,8 @@ describe('Reviews', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('审核事项暂时无法读取');
     expect(container.querySelector('.reviews-page [role="alert"]')).not.toBeNull();
-    expect(screen.queryByText('当前没有待处理审核。')).not.toBeInTheDocument();
-    expect(screen.queryByText('0 项待处理')).not.toBeInTheDocument();
+    expect(screen.queryByText('当前没有需要你确认的操作。')).not.toBeInTheDocument();
+    expect(screen.queryByText('0 项待你确认')).not.toBeInTheDocument();
   });
 
   it('keeps the last confirmed review cards visible when a refresh fails transiently', async () => {
@@ -77,7 +98,7 @@ describe('Reviews', () => {
       .mockResolvedValueOnce({ items: [item('k1234567', 'pending')], next_cursor: null, pending_count: 1 })
       .mockRejectedValueOnce(new TypeError('Failed to fetch'));
     const { client, container } = renderReviews();
-    expect(await screen.findByRole('heading', { name: '待处理 · 1' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '待你确认 · 1' })).toBeInTheDocument();
     expect(screen.getByRole('region', { name: '需要批准的操作' })).toBeInTheDocument();
 
     await client.invalidateQueries({ queryKey: ['task-approvals', 'all'] });
@@ -106,14 +127,15 @@ describe('Reviews', () => {
     const user = userEvent.setup();
     renderReviews();
 
-    const pending = await screen.findByRole('region', { name: '待处理审核' });
-    await user.click(within(pending).getByRole('button', { name: '允许' }));
+    const pending = await screen.findByRole('region', { name: '待你确认的操作' });
+    await user.click(within(pending).getByRole('button', { name: '允许本次操作' }));
 
-    expect(await screen.findByRole('region', { name: '已处理审核' })).toHaveTextContent('已过期');
-    expect(await screen.findByRole('heading', { name: '待处理 · 0' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '待你确认 · 0' })).toBeInTheDocument();
+    await user.click(screen.getByText('已处理的操作 · 1'));
+    expect(screen.getByRole('region', { name: '已处理审核' })).toHaveTextContent('已过期');
     expect(screen.getByRole('alert')).toHaveTextContent('审核未确认：当前状态已变化，请刷新后核对');
     expect(list).toHaveBeenCalledTimes(2);
-    expect(screen.queryByRole('button', { name: '允许' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '允许本次操作' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '拒绝' })).not.toBeInTheDocument();
   });
 
@@ -127,14 +149,14 @@ describe('Reviews', () => {
     const user = userEvent.setup();
     renderReviews();
 
-    const pending = await screen.findByRole('region', { name: '待处理审核' });
-    await user.click(within(pending).getByRole('button', { name: '允许' }));
+    const pending = await screen.findByRole('region', { name: '待你确认的操作' });
+    await user.click(within(pending).getByRole('button', { name: '允许本次操作' }));
 
-    expect(await screen.findByRole('heading', { name: '待处理 · 0' })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: '待你确认 · 0' })).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveTextContent('审核未确认');
     expect(list).toHaveBeenCalledTimes(2);
     expect(screen.queryByText('审批 k1234567')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '允许' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '允许本次操作' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '拒绝' })).not.toBeInTheDocument();
   });
 
@@ -147,13 +169,13 @@ describe('Reviews', () => {
     const user = userEvent.setup();
     renderReviews();
 
-    const pending = await screen.findByRole('region', { name: '待处理审核' });
+    const pending = await screen.findByRole('region', { name: '待你确认的操作' });
     const card = within(pending).getByRole('region', { name: '需要批准的操作' });
-    await user.click(within(card).getByRole('button', { name: '允许' }));
+    await user.click(within(card).getByRole('button', { name: '允许本次操作' }));
     await waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByRole('button', { name: '允许' })).toBeEnabled());
-    await user.click(screen.getByRole('button', { name: '允许' }));
+    await waitFor(() => expect(screen.getByRole('button', { name: '允许本次操作' })).toBeEnabled());
+    await user.click(screen.getByRole('button', { name: '允许本次操作' }));
     await waitFor(() => expect(respond).toHaveBeenCalledTimes(2));
 
     expect(respond.mock.calls[1]?.[3]).toBe(respond.mock.calls[0]?.[3]);
@@ -168,8 +190,9 @@ describe('Reviews', () => {
     renderReviews();
 
     await user.click(await screen.findByRole('button', { name: '加载更多审核事项' }));
-    expect(await screen.findByRole('region', { name: '已处理的审批' })).toHaveTextContent('审批 k7654321');
-    expect(screen.getByRole('alert')).toHaveTextContent('审核列表分页游标重复，尚未加载的事项状态未确认。');
+    await user.click(screen.getByText('已处理的操作 · 1'));
+    expect(await screen.findByRole('region', { name: '已处理审核' })).toHaveTextContent('审批 k7654321');
+    expect(screen.getByRole('alert')).toHaveTextContent('审核列表需要刷新分页游标重复，尚未加载的事项状态未确认。');
     expect(list).toHaveBeenCalledTimes(2);
   });
 });

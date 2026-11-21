@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><title>Morde 与参考项目 AI 对话流程对比</title>
+<style>
+:root{--bg:#f8faff;--surface:#fff;--side:#eff6ff;--brand:#60a5fa;--brand-deep:#2563eb;--line:#dbeafe;--ink:#334155;--muted:#64748b;--font:"Yuanti SC","PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--font);line-height:1.65}.wrap{max-width:1400px;margin:0 auto;padding:36px 24px 72px}h1{font-size:30px;line-height:1.3;margin:4px 0 10px}h2{font-size:22px;margin:0;line-height:1.4}.intro{max-width:980px;margin:0;color:var(--muted)}.eyebrow{color:var(--brand-deep);font-size:13px;font-weight:700;letter-spacing:.08em}.scope{padding:16px 20px;margin:24px 0 30px;background:var(--side);border:1px solid var(--line);border-radius:16px}.flow-section{background:var(--surface);border:1px solid var(--line);border-radius:24px;padding:24px;margin:0 0 18px}.flow-heading{display:flex;align-items:center;gap:12px;flex-wrap:wrap}.badge{display:inline-block;background:var(--side);color:var(--brand-deep);font-size:12px;font-weight:700;padding:3px 10px;border-radius:999px}.diagram-container{width:100%;max-width:100%;min-width:0;overflow-x:auto}svg{display:block;width:100%;min-width:1280px}.node rect{fill:#fff;stroke:#bfdbfe;stroke-width:1.5}.node.focal rect{fill:#eff6ff;stroke:#60a5fa;stroke-width:2}.node-title{fill:#334155;font:700 16px var(--font)}.node-sub{fill:#64748b;font:13px var(--font)}.path-label{fill:#64748b;font:13px var(--font)}.flow-note{margin:4px 0 0;color:var(--muted);font-size:14px}.legend{font-size:14px;color:var(--muted);margin:8px 0 24px}.findings{padding:24px;background:#fff;border:1px solid var(--line);border-radius:24px}.findings p{margin:14px 0}.findings p:last-child{margin-bottom:0}a{color:var(--brand-deep)}.sources{margin:24px 4px 0;color:var(--muted);font-size:14px}.sources li{margin:6px 0}@media(max-width:700px){.wrap{padding:24px 16px 48px}h1{font-size:26px}.flow-section{padding:18px}.scope{padding:14px 16px}}@media print{.diagram-container{overflow-x:visible}svg{min-width:0}.flow-section{break-inside:avoid}.wrap{max-width:none}}
+</style></head><body><main class="wrap"><div class="eyebrow">MORDE · AI 对话架构</div><h1>四种对话处理流程</h1><p class="intro">Morde 图突出持续会话与多个任务的关系；三个参考项目按消息入口、会话、上下文、Agent、工具和结果交付的顺序展示。</p><div class="scope"><strong>阅读范围：</strong>Morde 是目标设计；Hermes 使用官方公开文档与 main 分支；DS-Bot 与 nanoMuse 使用本地源码。流程经过概括，压缩、授权和并发条件见下方对比与设计文档。</div><section class="flow-section" aria-labelledby="morde-heading">
+  <div class="flow-heading"><h2 id="morde-heading">Morde</h2><span class="badge">目标设计</span></div>
+  <div class="diagram-container"><svg viewBox="0 0 1280 360" role="img" aria-labelledby="morde-title morde-desc">
+    <title id="morde-title">Morde 会话与任务的关系</title>
+    <desc id="morde-desc">用户在持续会话中发送消息，会话协调 Agent 可直接回复、创建独立任务，或处理与已有任务有关的消息；任务 A 和 B 独立运行，结果返回协调 Agent，进度进入任务详情。</desc>
+    <defs>
+      <marker id="morde-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker>
+      <marker id="morde-arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3b82f6"/></marker>
+    </defs>
+    <g fill="none" stroke="#64748b" stroke-width="1.5" marker-end="url(#morde-arrow)">
+      <line x1="208" y1="190" x2="248" y2="190"/>
+      <line x1="416" y1="180" x2="456" y2="180"/>
+      <path d="M 624 160 H 704 Q 712 160 712 152 V 102 Q 712 94 720 94 H 840"/>
+      <path d="M 624 224 H 704 Q 712 224 712 232 V 278 Q 712 286 720 286 H 840"/>
+      <path d="M 1008 94 H 1032 Q 1040 94 1040 102 V 168 Q 1040 176 1048 176 H 1080"/>
+      <path d="M 1008 286 H 1048 Q 1056 286 1056 278 V 212 Q 1056 204 1064 204 H 1080"/>
+    </g>
+    <g fill="none" stroke="#64748b" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#morde-arrow)">
+      <path d="M 840 114 H 776 Q 768 114 768 122 V 172 Q 768 180 760 180 H 624"/>
+      <path d="M 840 266 H 800 Q 792 266 792 258 V 212 Q 792 204 784 204 H 624"/>
+    </g>
+    <line x1="456" y1="204" x2="416" y2="204" fill="none" stroke="#3b82f6" stroke-width="1.7" marker-end="url(#morde-arrow-blue)"/>
+    <text class="path-label" x="746" y="35" text-anchor="middle">创建或关联指定任务</text>
+    <text class="path-label" x="332" y="255" text-anchor="middle">普通回复 / 结果汇总回到会话</text>
+    <g class="node"><rect x="40" y="156" width="168" height="68" rx="10"/><text class="node-title" x="124" y="183" text-anchor="middle">对话入口</text><text class="node-sub" x="124" y="206" text-anchor="middle">PC / iOS</text></g>
+    <g class="node"><rect x="248" y="156" width="168" height="68" rx="10"/><text class="node-title" x="332" y="183" text-anchor="middle">持续会话</text><text class="node-sub" x="332" y="206" text-anchor="middle">消息 · 历史 · 任务归属</text></g>
+    <g class="node focal"><rect x="456" y="144" width="168" height="96" rx="10"/><text class="node-title" x="540" y="174" text-anchor="middle">会话协调 Agent</text><text class="node-sub" x="540" y="198" text-anchor="middle">DSH · 识别消息意图</text><text class="node-sub" x="540" y="219" text-anchor="middle">回复 / 创建 / 修改 / 停止</text></g>
+    <g class="node"><rect x="840" y="60" width="168" height="68" rx="10"/><text class="node-title" x="924" y="87" text-anchor="middle">任务 A</text><text class="node-sub" x="924" y="110" text-anchor="middle">DSH 执行 Agent</text></g>
+    <g class="node"><rect x="840" y="252" width="168" height="68" rx="10"/><text class="node-title" x="924" y="279" text-anchor="middle">任务 B</text><text class="node-sub" x="924" y="302" text-anchor="middle">DSH 执行 Agent</text></g>
+    <g class="node"><rect x="1080" y="156" width="168" height="68" rx="10"/><text class="node-title" x="1164" y="183" text-anchor="middle">任务详情</text><text class="node-sub" x="1164" y="206" text-anchor="middle">独立状态 · 进度 · 产物</text></g>
+  </svg></div>
+  <p class="flow-note"><strong>关系：</strong>一个会话可有零个或多个 Task；一项 Task 可关联多条后续消息。A、B 表示两个可独立运行的任务，每个任务内的 DSH 执行 Agent 可按需调用工具或子 Agent；任务运行期间仍可继续对话。</p>
+  <p class="flow-note"><strong>目标示例：</strong>“整理报告”创建 A；“报告改用英语”关联 A；“讲个笑话”直接回复；“另外整理预算”创建 B。停止 A 不应停止 B。</p>
+  <p class="flow-note">图中的会话协调 Agent 表示逻辑职责；当前每条分类消息使用独立的 DSH coordinator session，任务结果通过事件再次进入协调路径。</p>
+</section>
+<section class="flow-section" aria-labelledby="hermes-heading">
+      <div class="flow-heading"><h2 id="hermes-heading">Hermes Agent</h2><span class="badge">官方文档 / main</span></div>
+      <div class="diagram-container"><svg viewBox="0 0 1280 224" role="img" aria-labelledby="hermes-title hermes-desc">
+        <title id="hermes-title">Hermes Agent AI 对话流程</title>
+        <desc id="hermes-desc">Hermes 的消息经 Gateway 进入 Session，组装上下文后由 AIAgent 调用模型和工具，工具或子 Agent 的结果返回主 Agent。</desc>
+        <defs><marker id="hermes-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker><marker id="hermes-arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3b82f6"/></marker></defs>
+        <g fill="none" stroke="#64748b" stroke-width="1.5" marker-end="url(#hermes-arrow)">
+          <line x1="208" y1="122" x2="248" y2="122"/><line x1="416" y1="122" x2="456" y2="122"/><line x1="624" y1="122" x2="664" y2="122"/><line x1="832" y1="122" x2="872" y2="122"/>
+        </g>
+        <path d="M 748 88 V 58 Q 748 50 756 50 H 1156 Q 1164 50 1164 58 V 88" fill="none" stroke="#3b82f6" stroke-width="1.7" marker-end="url(#hermes-arrow-blue)"/>
+        <path d="M 956 156 V 182 Q 956 190 948 190 H 756 Q 748 190 748 182 V 156" fill="none" stroke="#64748b" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#hermes-arrow)"/>
+        <text class="path-label" x="950" y="38" text-anchor="middle">直接回复 / 最终结果</text>
+        <text class="path-label" x="852" y="212" text-anchor="middle">工具 / 子 Agent 结果</text>
+        <g class="node"><rect x="40" y="88" width="168" height="68" rx="10"/><text class="node-title" x="124" y="115" text-anchor="middle">对话入口</text><text class="node-sub" x="124" y="138" text-anchor="middle">CLI / Desktop / IM 等</text></g><g class="node"><rect x="248" y="88" width="168" height="68" rx="10"/><text class="node-title" x="332" y="115" text-anchor="middle">会话写入</text><text class="node-sub" x="332" y="138" text-anchor="middle">Gateway · SQLite</text></g><g class="node"><rect x="456" y="88" width="168" height="68" rx="10"/><text class="node-title" x="540" y="115" text-anchor="middle">上下文构建</text><text class="node-sub" x="540" y="138" text-anchor="middle">Hygiene · 压缩 · 搜索</text></g><g class="node focal"><rect x="664" y="88" width="168" height="68" rx="10"/><text class="node-title" x="748" y="115" text-anchor="middle">AIAgent</text><text class="node-sub" x="748" y="138" text-anchor="middle">模型 / Agent Loop</text></g><g class="node"><rect x="872" y="88" width="168" height="68" rx="10"/><text class="node-title" x="956" y="115" text-anchor="middle">工具与子 Agent</text><text class="node-sub" x="956" y="138" text-anchor="middle">工具 · delegate_task</text></g><g class="node"><rect x="1080" y="88" width="168" height="68" rx="10"/><text class="node-title" x="1164" y="115" text-anchor="middle">结果交付</text><text class="node-sub" x="1164" y="138" text-anchor="middle">Session · 对话渠道</text></g>
+      </svg></div>
+      <p class="flow-note">官方行为：默认同一 Session 原位压缩并保留可搜索原文；Gateway 对解析后的 Session 使用回合租约。</p>
+    </section>
+<section class="flow-section" aria-labelledby="dsbot-heading">
+      <div class="flow-heading"><h2 id="dsbot-heading">DS-Bot</h2><span class="badge">本地源码</span></div>
+      <div class="diagram-container"><svg viewBox="0 0 1280 224" role="img" aria-labelledby="dsbot-title dsbot-desc">
+        <title id="dsbot-title">DS-Bot AI 对话流程</title>
+        <desc id="dsbot-desc">DS-Bot 将用户消息送入 Bot 的 DSH Session，由 DSH Agent 对话和调用工具，可与其他 Bot 异步协作并交付结果。</desc>
+        <defs><marker id="dsbot-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker><marker id="dsbot-arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3b82f6"/></marker></defs>
+        <g fill="none" stroke="#64748b" stroke-width="1.5" marker-end="url(#dsbot-arrow)">
+          <line x1="208" y1="122" x2="248" y2="122"/><line x1="416" y1="122" x2="456" y2="122"/><line x1="624" y1="122" x2="664" y2="122"/><line x1="832" y1="122" x2="872" y2="122"/>
+        </g>
+        <path d="M 748 88 V 58 Q 748 50 756 50 H 1156 Q 1164 50 1164 58 V 88" fill="none" stroke="#3b82f6" stroke-width="1.7" marker-end="url(#dsbot-arrow-blue)"/>
+        <path d="M 956 156 V 182 Q 956 190 948 190 H 756 Q 748 190 748 182 V 156" fill="none" stroke="#64748b" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#dsbot-arrow)"/>
+        <text class="path-label" x="950" y="38" text-anchor="middle">直接回复 / 最终结果</text>
+        <text class="path-label" x="852" y="212" text-anchor="middle">工具结果 / Bot 回复</text>
+        <g class="node"><rect x="40" y="88" width="168" height="68" rx="10"/><text class="node-title" x="124" y="115" text-anchor="middle">对话入口</text><text class="node-sub" x="124" y="138" text-anchor="middle">用户 / 群聊</text></g><g class="node"><rect x="248" y="88" width="168" height="68" rx="10"/><text class="node-title" x="332" y="115" text-anchor="middle">Bot 会话</text><text class="node-sub" x="332" y="138" text-anchor="middle">DSH Session · 记忆</text></g><g class="node"><rect x="456" y="88" width="168" height="68" rx="10"/><text class="node-title" x="540" y="115" text-anchor="middle">上下文管理</text><text class="node-sub" x="540" y="138" text-anchor="middle">过线后由管家判断</text></g><g class="node focal"><rect x="664" y="88" width="168" height="68" rx="10"/><text class="node-title" x="748" y="115" text-anchor="middle">DSH Agent</text><text class="node-sub" x="748" y="138" text-anchor="middle">模型 / Agent Loop</text></g><g class="node"><rect x="872" y="88" width="168" height="68" rx="10"/><text class="node-title" x="956" y="115" text-anchor="middle">工具与其他 Bot</text><text class="node-sub" x="956" y="138" text-anchor="middle">工具 · message_bot</text></g><g class="node"><rect x="1080" y="88" width="168" height="68" rx="10"/><text class="node-title" x="1164" y="115" text-anchor="middle">结果交付</text><text class="node-sub" x="1164" y="138" text-anchor="middle">DSH 事件 · 客户端</text></g>
+      </svg></div>
+      <p class="flow-note">本地源码：未完成工作倾向原位检查点，适合切换时建立新会话段并交接；其他 Bot 的回复可作为后续消息返回。</p>
+    </section>
+<section class="flow-section" aria-labelledby="nanomuse-heading">
+      <div class="flow-heading"><h2 id="nanomuse-heading">nanoMuse</h2><span class="badge">本地源码</span></div>
+      <div class="diagram-container"><svg viewBox="0 0 1280 224" role="img" aria-labelledby="nanomuse-title nanomuse-desc">
+        <title id="nanomuse-title">nanoMuse AI 对话流程</title>
+        <desc id="nanomuse-desc">nanoMuse 为每个线程维护收件箱和 Worker，MuseAgent 使用消息窗口和记忆调用模型，并经 Sentinel 调用工具后返回结果。</desc>
+        <defs><marker id="nanomuse-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#64748b"/></marker><marker id="nanomuse-arrow-blue" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#3b82f6"/></marker></defs>
+        <g fill="none" stroke="#64748b" stroke-width="1.5" marker-end="url(#nanomuse-arrow)">
+          <line x1="208" y1="122" x2="248" y2="122"/><line x1="416" y1="122" x2="456" y2="122"/><line x1="624" y1="122" x2="664" y2="122"/><line x1="832" y1="122" x2="872" y2="122"/>
+        </g>
+        <path d="M 748 88 V 58 Q 748 50 756 50 H 1156 Q 1164 50 1164 58 V 88" fill="none" stroke="#3b82f6" stroke-width="1.7" marker-end="url(#nanomuse-arrow-blue)"/>
+        <path d="M 956 156 V 182 Q 956 190 948 190 H 756 Q 748 190 748 182 V 156" fill="none" stroke="#64748b" stroke-width="1.5" stroke-dasharray="5 4" marker-end="url(#nanomuse-arrow)"/>
+        <text class="path-label" x="950" y="38" text-anchor="middle">直接回复 / 最终结果</text>
+        <text class="path-label" x="852" y="212" text-anchor="middle">工具结果返回</text>
+        <g class="node"><rect x="40" y="88" width="168" height="68" rx="10"/><text class="node-title" x="124" y="115" text-anchor="middle">对话入口</text><text class="node-sub" x="124" y="138" text-anchor="middle">用户 / 客户端</text></g><g class="node"><rect x="248" y="88" width="168" height="68" rx="10"/><text class="node-title" x="332" y="115" text-anchor="middle">线程收件箱</text><text class="node-sub" x="332" y="138" text-anchor="middle">Thread · Worker</text></g><g class="node"><rect x="456" y="88" width="168" height="68" rx="10"/><text class="node-title" x="540" y="115" text-anchor="middle">消息窗口</text><text class="node-sub" x="540" y="138" text-anchor="middle">近期消息 · 相关记忆</text></g><g class="node focal"><rect x="664" y="88" width="168" height="68" rx="10"/><text class="node-title" x="748" y="115" text-anchor="middle">MuseAgent</text><text class="node-sub" x="748" y="138" text-anchor="middle">模型 / Python Loop</text></g><g class="node"><rect x="872" y="88" width="168" height="68" rx="10"/><text class="node-title" x="956" y="115" text-anchor="middle">Sentinel / 工具</text><text class="node-sub" x="956" y="138" text-anchor="middle">授权检查 · 工具调用</text></g><g class="node"><rect x="1080" y="88" width="168" height="68" rx="10"/><text class="node-title" x="1164" y="115" text-anchor="middle">结果交付</text><text class="node-sub" x="1164" y="138" text-anchor="middle">事件时间线 · 会话文件</text></g>
+      </svg></div>
+      <p class="flow-note">本地源码：同一线程的普通追加入队，可在下次模型调用前进入运行中回合；会话文件在回合收尾时保存。</p>
+    </section><p class="legend">线条含义：实线表示消息、任务操作或进度；蓝线表示回复或交付；虚线表示任务、工具或协作结果回流。</p>
+<section class="findings"><h2>主要差异</h2>
+<p><strong>会话身份：</strong>Hermes 默认在同一 Session 原位压缩；DS-Bot 的长期 Bot 对话可以跨多个 DSH Session 段；Morde 的目标是稳定的产品会话关联零个或多个独立 Task，并为每个 Task 使用自己的 DSH 执行会话。</p>
+<p><strong>长上下文：</strong>Hermes 使用压缩和原文搜索；DS-Bot 由上下文管家选择检查点或换段；本地 nanoMuse 的对话入口按消息数量选择近期窗口，并注入相关记忆。</p>
+<p><strong>执行与协作：</strong>Hermes 运行自己的 AIAgent；DS-Bot 通过 DSH 和 Bot 消息协作；nanoMuse 使用本地 Python MuseAgent；Morde 目标只使用 DSH，任务和工具各自保持授权边界。</p>
+</section><div class="sources"><strong>源码与设计依据</strong><ul>
+<li>Morde：[目标设计和详细对比](../Morde-Hermes会话与上下文机制移植设计方案.md)；[DSH 适配](../../../runtime/morde-cloud-runtime/src/engine.mjs)。</li>
+<li>Hermes：[Session Storage](https://hermes-agent.nousresearch.com/docs/developer-guide/session-storage)、[Context Compression](https://hermes-agent.nousresearch.com/docs/developer-guide/context-compression-and-caching)、[Delegation](https://hermes-agent.nousresearch.com/docs/user-guide/features/delegation)。本地目录目前没有可核对的源码 commit。</li>
+<li>DS-Bot：[上下文管家](../../../project/DS-Bot/ds-bot/src/host/steward.js)、[会话分段](../../../project/DS-Bot/ds-bot/src/host/parts.js)、[历史搜索](../../../project/DS-Bot/ds-bot/src/host/chat-index.js)、[Bot 间消息](../../../project/DS-Bot/ds-bot/src/host/tools.js)。</li>
+<li>nanoMuse：[Agent](../../../clients/desktop/nanomuse/agent/core.py)、[线程 Worker](../../../clients/desktop/nanomuse/server/service.py)。</li>
+</ul></div></main></body></html>

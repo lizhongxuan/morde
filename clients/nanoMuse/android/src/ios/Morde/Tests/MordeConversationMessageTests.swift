@@ -37,6 +37,24 @@ final class MordeConversationMessageTests: XCTestCase {
         XCTAssertEqual(message.agent_acknowledged, true)
     }
 
+    func testMessageReceiptMustMatchOriginalIdentityAndContent() {
+        let receipt = MordeClientMessage(id: "m1234567", conversation_id: "c1234567", role: "user",
+            content: "继续处理", client_message_id: "client-message-1")
+
+        XCTAssertTrue(MordeConversationMessageReceiptPolicy.matches(receipt, clientMessageID: "client-message-1",
+            conversationID: "c1234567", content: "继续处理"))
+        XCTAssertFalse(MordeConversationMessageReceiptPolicy.matches(receipt, clientMessageID: "new-retry-id",
+            conversationID: "c1234567", content: "继续处理"))
+        XCTAssertFalse(MordeConversationMessageReceiptPolicy.matches(receipt, clientMessageID: "client-message-1",
+            conversationID: "c7654321", content: "继续处理"))
+        XCTAssertFalse(MordeConversationMessageReceiptPolicy.matches(receipt, clientMessageID: "client-message-1",
+            conversationID: "c1234567", content: "different request"))
+        XCTAssertFalse(MordeConversationMessageReceiptPolicy.matches(MordeClientMessage(
+            id: "m7654321", conversation_id: "c1234567", role: "assistant", content: "继续处理",
+            client_message_id: "client-message-1"), clientMessageID: "client-message-1",
+            conversationID: "c1234567", content: "继续处理"))
+    }
+
     func testClientMessageDecodesVariantProjection() throws {
         let data = Data(#"{"id":"m1234567","conversation_id":"c1234567","sequence":8,"role":"assistant","content":"second answer","variant_group_id":"m7654321","variant_version":2,"variant_action":"regenerate_text","output_status":"completed","agent_acknowledged":false}"#.utf8)
 
@@ -370,7 +388,9 @@ final class MordeConversationMessageTests: XCTestCase {
         let recoveredFirst = try XCTUnwrap(recovered.first)
         let recoveredSecond = try XCTUnwrap(recovered.last)
         XCTAssertEqual(recoveredFirst.id, first.id)
+        XCTAssertEqual(recoveredFirst.content, "第一条")
         XCTAssertEqual(recoveredSecond.id, second.id)
+        XCTAssertEqual(recoveredSecond.content, "第二条")
         XCTAssertEqual(recoveredSecond.previousClientMessageID, recoveredFirst.id)
         if let timeZone = recoveredSecond.timeZone {
             XCTAssertTrue(TimeZone.knownTimeZoneIdentifiers.contains(timeZone))
@@ -378,6 +398,7 @@ final class MordeConversationMessageTests: XCTestCase {
 
         let payload = MordeConversationMessagePayload.direct(recoveredSecond)
         XCTAssertEqual(payload["client_message_id"] as? String, recoveredSecond.id)
+        XCTAssertEqual(payload["content"] as? String, "第二条")
         XCTAssertEqual(payload["previous_client_message_id"] as? String, recoveredFirst.id)
         XCTAssertEqual(payload["time_zone"] as? String, recoveredSecond.timeZone)
         let uploadPayload = MordeConversationMessagePayload.uploadInitialization(recoveredSecond,
