@@ -8,7 +8,7 @@ process.on('SIGTERM', () => {
 })
 
 try {
-  const allowedEnv = new Set(['PATH', 'LANG', 'LC_ALL', 'TZ', 'NODE_ENV'])
+  const allowedEnv = new Set(['PATH', 'LANG', 'LC_ALL', 'TZ', 'NODE_ENV', 'MORDE_WORKSPACE_DIR'])
   if (process.platform === 'darwin') allowedEnv.add('__CF_USER_TEXT_ENCODING')
   // Node 24 on Linux adds this libuv control to its own process environment.
   if (process.platform === 'linux' && ['0', '1'].includes(process.env.UV_USE_IO_URING)) allowedEnv.add('UV_USE_IO_URING')

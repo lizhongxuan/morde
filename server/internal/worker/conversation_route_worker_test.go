@@ -362,7 +362,10 @@ func TestConversationRouteWorkerWaitsOnlyAfterClassifiedNewAndNeverSlidesTheWind
 		{name: "status", decision: app.ConversationRouteDecision{Action: app.ConversationRouteStatus, TaskID: "q1234567", ExpectedRevision: 1}, wantApply: true},
 		{name: "stop pending root", decision: app.ConversationRouteDecision{Action: app.ConversationRouteStop,
 			TargetMessageID: "m2345678"}, wantApply: true},
-		{name: "unknown model call", modelErr: errors.New("route result or usage is unknown")},
+		// An unknown model call no longer fails the route: the heuristic
+		// fallback asks the user instead, so a clarification is applied
+		// but aggregation is never started.
+		{name: "unknown model call", modelErr: errors.New("route result or usage is unknown"), wantApply: true},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			_, stub := newRouteWorkerTest(t)
@@ -527,14 +530,14 @@ func TestConversationRouteWorkerClassifiesEveryFreeTextMessage(t *testing.T) {
 		stub.snapshot.Context.Content = "帮我整理资料"
 		stub.classifyErr = errors.New("synthetic model is unavailable")
 		if _, err := worker.RunOnce(context.Background()); err != nil || stub.classifies != 1 ||
-			len(stub.failures) != 1 || stub.failures[0] != "model_unavailable" || len(stub.applied) != 0 {
-			t.Fatalf("unclassified free text created a task: classifications=%d failures=%v decisions=%+v err=%v",
+			len(stub.failures) != 0 || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteClarify {
+			t.Fatalf("classifier failure was not clarified: classifications=%d failures=%v decisions=%+v err=%v",
 				stub.classifies, stub.failures, stub.applied, err)
 		}
 	})
 }
 
-func TestConversationRouteWorkerRetriesInvalidOutputOnceWithRepairContext(t *testing.T) {
+func TestConversationRouteWorkerRetriesInvalidOutputOnceThenFallsBack(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "请求暂时无法安全分类，请稍后重试。", InvalidOutput: true}
 	if found, err := worker.RunOnce(context.Background()); err != nil || !found || stub.repairRequeues != 1 ||
@@ -550,9 +553,75 @@ func TestConversationRouteWorkerRetriesInvalidOutputOnceWithRepairContext(t *tes
 	}
 	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "请求暂时无法安全分类，请稍后重试。", InvalidOutput: true}
 	if found, err := worker.RunOnce(context.Background()); err != nil || !found || stub.repairRequeues != 1 ||
-		len(stub.failures) != 1 || stub.failures[0] != "routing_action_unavailable" {
-		t.Fatalf("second invalid output did not fail closed: found=%t err=%v requeues=%d failures=%v",
-			found, err, stub.repairRequeues, stub.failures)
+		len(stub.failures) != 0 || len(stub.applied) != 2 || stub.applied[1].Action != app.ConversationRouteClarify {
+		t.Fatalf("second invalid output did not fall back to clarification: found=%t err=%v requeues=%d failures=%v applied=%+v",
+			found, err, stub.repairRequeues, stub.failures, stub.applied)
+	}
+}
+
+func routeWorkerFallbackSteerContext(stub *routeWorkerStub) {
+	scopeDigest := sha256.Sum256([]byte("fallback steer test scope"))
+	stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{
+		{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1},
+	}
+	stub.snapshot.Context.PreviousTaskID = "q1234567"
+	stub.snapshot.Context.CurrentRequestModelID = "p1234567"
+	stub.snapshot.Context.TimeZone = "Asia/Shanghai"
+	stub.snapshot.Context.ControlScopeDigest = scopeDigest[:]
+	stub.snapshot.Context.RequestCandidates = []app.ConversationRouteRequestCandidate{
+		{MessageID: "m0000001", Sequence: 1, TaskID: "q1234567", TaskStatus: task.StatusRunning,
+			RoutingStatus:    conversation.RoutingRouted,
+			SameControlScope: true, SameAuthorization: true, ControlScopeDigest: scopeDigest[:],
+			RequestInput: app.ConversationRoutingInput{ModelID: "p1234567", TimeZone: "Asia/Shanghai"}},
+	}
+}
+
+func TestConversationRouteWorkerFallsBackToPreviousTaskOnClassifyFailure(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	routeWorkerFallbackSteerContext(stub)
+	stub.snapshot.Context.Content = "补充一点：把标题改成红色"
+	stub.classifyErr = errors.New("provider unavailable")
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteSteer || stub.applied[0].TaskID != "q1234567" ||
+		stub.applied[0].ExpectedRevision != 1 {
+		t.Fatalf("classify failure did not follow the previous task: failures=%v applied=%+v err=%v",
+			stub.failures, stub.applied, err)
+	}
+}
+
+func TestConversationRouteWorkerFallsBackToNewTaskOnExplicitNewSignal(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	routeWorkerFallbackSteerContext(stub)
+	stub.snapshot.Context.Content = "新开一个任务，帮我写个脚本"
+	stub.classifyErr = errors.New("provider unavailable")
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteNew || !stub.applied[0].ExplicitNew {
+		t.Fatalf("explicit new-task signal did not start a new task: failures=%v applied=%+v err=%v",
+			stub.failures, stub.applied, err)
+	}
+}
+
+func TestConversationRouteWorkerAsksUserWhenClassifyFallbackCannotDecide(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	routeWorkerFallbackSteerContext(stub)
+	stub.snapshot.Context.Content = "帮我查一下天气怎么样"
+	stub.classifyErr = errors.New("provider unavailable")
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].Question == "" {
+		t.Fatalf("uncertain message was not clarified: failures=%v applied=%+v err=%v",
+			stub.failures, stub.applied, err)
+	}
+}
+
+func TestConversationRouteWorkerNeverStopsATaskOnClassifyFailure(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	routeWorkerFallbackSteerContext(stub)
+	stub.snapshot.Context.Content = "停止这个任务"
+	stub.classifyErr = errors.New("provider unavailable")
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].TaskID != "" {
+		t.Fatalf("control request was routed to a task without classification: failures=%v applied=%+v err=%v",
+			stub.failures, stub.applied, err)
 	}
 }
 
@@ -680,9 +749,11 @@ func TestConversationRouteWorkerRequeuesOnlySafelyRecoveredPredecessorRace(t *te
 		stub.snapshot.Context.PreviousUnresolved = true
 		stub.classifyErr = domain.NewError(domain.CodeConflict, "routing snapshot changed")
 		stub.requeued = safe
-		if _, err := worker.RunOnce(context.Background()); err != nil || stub.requeueCalls != 1 || len(stub.applied) != 0 ||
-			(safe && len(stub.failures) != 0) || (!safe && (len(stub.failures) != 1 || stub.failures[0] != "model_unavailable")) {
-			t.Fatalf("predecessor race safe=%t requeues=%d failures=%v err=%v", safe, stub.requeueCalls, stub.failures, err)
+		if _, err := worker.RunOnce(context.Background()); err != nil || stub.requeueCalls != 1 ||
+			(safe && (len(stub.failures) != 0 || len(stub.applied) != 0)) ||
+			(!safe && (len(stub.failures) != 0 || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteClarify ||
+				stub.applied[0].Question != "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。")) {
+			t.Fatalf("predecessor race safe=%t requeues=%d failures=%v applied=%+v err=%v", safe, stub.requeueCalls, stub.failures, stub.applied, err)
 		}
 	}
 }
@@ -731,22 +802,31 @@ func TestConversationRouteWorkerDefersExpiredLeaseBeforeModelResolution(t *testi
 	}
 }
 
-func TestConversationRouteWorkerRecordsModelFailureWithoutTaskAction(t *testing.T) {
+func TestConversationRouteWorkerFallsBackWhenModelClassificationFails(t *testing.T) {
 	for _, scenario := range []struct {
 		name        string
 		err         error
 		wantFailure string
 	}{
-		{name: "provider unavailable", err: errors.New("provider unavailable"), wantFailure: "model_unavailable"},
-		{name: "model budget exceeded", err: domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded"), wantFailure: "model_unavailable"},
+		{name: "provider unavailable", err: errors.New("provider unavailable")},
+		{name: "model budget exceeded", err: domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded")},
 		{name: "provider context limit", err: domain.NewError(domain.CodeResultTooLarge, "provider context window exceeded"), wantFailure: "message_too_long"},
 	} {
 		t.Run(scenario.name, func(t *testing.T) {
 			worker, stub := newRouteWorkerTest(t)
 			stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1}}
 			stub.classifyErr = scenario.err
-			if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 || stub.failures[0] != scenario.wantFailure || len(stub.applied) != 0 {
-				t.Fatalf("model failure affected task routing: failures=%v applied=%v err=%v", stub.failures, stub.applied, err)
+			if _, err := worker.RunOnce(context.Background()); err != nil {
+				t.Fatalf("classification failure was not handled: err=%v", err)
+			}
+			if scenario.wantFailure != "" {
+				if len(stub.failures) != 1 || stub.failures[0] != scenario.wantFailure || len(stub.applied) != 0 {
+					t.Fatalf("oversized input did not fail closed: failures=%v applied=%v", stub.failures, stub.applied)
+				}
+				return
+			}
+			if len(stub.failures) != 0 || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].Question == "" {
+				t.Fatalf("model failure was not clarified: failures=%v applied=%v", stub.failures, stub.applied)
 			}
 		})
 	}
@@ -792,8 +872,8 @@ func TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits(t *testing
 					t.Fatalf("rate-limit handling calls=%d delay=%s recovery_ctx_err=%v failures=%v, want one handling with delay %s and a live recovery context",
 						stub.rateLimitHandleCalls, stub.rateLimitRetryDelay, stub.rateLimitContextErr, stub.failures, test.wantDelay)
 				}
-			} else if stub.rateLimitHandleCalls != 0 || len(stub.failures) != 1 || stub.failures[0] != "model_unavailable" {
-				t.Fatalf("unconfirmed rate limit entered recovery: calls=%d failures=%v", stub.rateLimitHandleCalls, stub.failures)
+			} else if stub.rateLimitHandleCalls != 0 || len(stub.failures) != 0 || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteClarify {
+				t.Fatalf("unconfirmed rate limit was not clarified: calls=%d failures=%v applied=%+v", stub.rateLimitHandleCalls, stub.failures, stub.applied)
 			}
 		})
 	}

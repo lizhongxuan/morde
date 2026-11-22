@@ -1244,6 +1244,18 @@ func exactConversationRouteDuplicate(candidates []app.ConversationRouteRequestCa
 	return target
 }
 
+const (
+	// joinedConversationRouteContentBudget bounds one merged routing input.
+	// Supplements that do not fit are routed on their own instead of
+	// failing the current message; see joinedConversationRouteContent.
+	joinedConversationRouteContentBudget           = 32768
+	joinedConversationRouteContentNoteReserveBytes = 128
+)
+
+const joinedConversationRouteContentPrefix = "用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n"
+
+const joinedConversationRouteContentSeparator = "\n\n--- 用户补充 ---\n\n"
+
 func joinedConversationRouteContent(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) (string, error) {
 	var rootMetadata []byte
 	err := tx.QueryRow(ctx, `SELECT r.request_metadata FROM conversation_message_routes r
@@ -1273,7 +1285,7 @@ WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.owner_id=$3 AND r
 	if !bytes.Equal(rootDigest, currentDigest) {
 		return "", domain.NewError(domain.CodeConflict, "conversation root execution scope changed")
 	}
-	rows, err := tx.Query(ctx, `SELECT m.content,r.request_metadata FROM conversation_message_routes r
+	rows, err := tx.Query(ctx, `SELECT r.message_id,m.content,r.request_metadata FROM conversation_message_routes r
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.actor_id=r.actor_id
  AND m.conversation_id=r.conversation_id
 WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
@@ -1286,11 +1298,16 @@ ORDER BY m.sequence,m.id`, claim.ServiceInstanceID, claim.Message.OwnerID, claim
 	defer rows.Close()
 	contents := []string{claim.Message.Content}
 	seen := map[string]struct{}{strings.TrimSpace(claim.Message.Content): {}}
+	// Reserve room for the merged prefix and the omitted-supplements note so
+	// the merged input stays within budget even after they are added.
+	budget := joinedConversationRouteContentBudget - len(joinedConversationRouteContentPrefix) -
+		joinedConversationRouteContentNoteReserveBytes
 	totalBytes := len(claim.Message.Content)
+	var omitted []string
 	for rows.Next() {
-		var content string
+		var messageID, content string
 		var metadata []byte
-		if err := rows.Scan(&content, &metadata); err != nil {
+		if err := rows.Scan(&messageID, &content, &metadata); err != nil {
 			return "", fmt.Errorf("scan joined conversation input: %w", err)
 		}
 		var input app.ConversationRoutingInput
@@ -1309,30 +1326,59 @@ ORDER BY m.sequence,m.id`, claim.ServiceInstanceID, claim.Message.OwnerID, claim
 			continue
 		}
 		seen[key] = struct{}{}
-		contents = append(contents, content)
-		totalBytes += len(content) + len("\n\n--- 用户补充 ---\n\n")
-		if totalBytes > 32768 {
-			return "", domain.NewError(domain.CodeResultTooLarge, "joined conversation input exceeds the routing limit")
+		// Degrade instead of failing the route: keep supplements in order
+		// while they fit, and leave the rest to be routed on their own.
+		// A single oversized supplement must never fail the current message.
+		if totalBytes+len(content)+len(joinedConversationRouteContentSeparator) > budget {
+			omitted = append(omitted, messageID)
+			continue
 		}
+		contents = append(contents, content)
+		totalBytes += len(content) + len(joinedConversationRouteContentSeparator)
 	}
 	if err := rows.Err(); err != nil {
 		return "", fmt.Errorf("read joined conversation inputs: %w", err)
+	}
+	if len(omitted) > 0 {
+		if err := detachJoinedConversationRouteInputs(ctx, tx, claim, omitted); err != nil {
+			return "", err
+		}
 	}
 	if len(contents) == 1 {
 		return claim.Message.Content, nil
 	}
 	var merged strings.Builder
-	merged.WriteString("用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n")
+	merged.WriteString(joinedConversationRouteContentPrefix)
 	for index, content := range contents {
 		if index > 0 {
-			merged.WriteString("\n\n--- 用户补充 ---\n\n")
+			merged.WriteString(joinedConversationRouteContentSeparator)
 		}
 		merged.WriteString(content)
 	}
-	if merged.Len() > 32768 {
-		return "", domain.NewError(domain.CodeResultTooLarge, "joined conversation input exceeds the routing limit")
+	if len(omitted) > 0 {
+		fmt.Fprintf(&merged, "\n\n【注：另有 %d 条补充因过长未合并，将单独处理。】", len(omitted))
 	}
 	return merged.String(), nil
+}
+
+// detachJoinedConversationRouteInputs releases joined supplements that did
+// not fit into the merged routing input so the route worker picks them up as
+// independent messages instead of losing them.
+func detachJoinedConversationRouteInputs(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, messageIDs []string) error {
+	result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET duplicate_of_message_id=NULL,state='pending',
+aggregation_state='settled',available_after=clock_timestamp(),lease_owner='',lease_expires_at=NULL,
+lease_version=lease_version+1,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4
+ AND duplicate_of_message_id=$5 AND state='routed' AND message_id=ANY($6::text[])`,
+		claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID,
+		claim.Message.ConversationID, claim.Message.ID, messageIDs)
+	if err != nil {
+		return fmt.Errorf("detach oversized joined conversation inputs: %w", err)
+	}
+	if result.RowsAffected() != int64(len(messageIDs)) {
+		return domain.NewError(domain.CodeConflict, "joined conversation input changed while merging")
+	}
+	return nil
 }
 
 func prepareConversationRouteAggregation(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,
