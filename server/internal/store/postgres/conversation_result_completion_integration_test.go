@@ -73,7 +73,9 @@ func TestRoutedTaskCompletionPublishesOneCombinedConversationMessage(t *testing.
 			replies = append(replies, message)
 		}
 	}
-	if len(replies) != 1 || replies[0].Content != resultReviewTestReply || len(replies[0].Sources) != 2 ||
+	expectedReceipt := "结果摘要（主助手整理，不代表独立验收）：\n" + resultReviewTestReply +
+		"\n\nTask 执行状态：completed\n服务端验收状态（当前修订）：\n- " + claimed[0].ID + " r0：pending\n- " + claimed[1].ID + " r0：pending"
+	if len(replies) != 1 || replies[0].Content != expectedReceipt || len(replies[0].Sources) != 2 ||
 		replies[0].Sources[0].UserMessageID != taskMessageIDs[claimed[0].ID] || replies[0].Sources[1].UserMessageID != taskMessageIDs[claimed[1].ID] ||
 		replies[0].Sources[0].TaskID != claimed[0].ID || replies[0].Sources[1].TaskID != claimed[1].ID ||
 		replies[0].Sources[0].Content != "first answer" || replies[0].Sources[1].Content != "second answer" {
