@@ -357,6 +357,7 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 		ReferenceTaskID        string                       `json:"reference_task_id,omitempty"`
 		ReferenceUnavailable   bool                         `json:"reference_unavailable,omitempty"`
 		CandidateSetIncomplete bool                         `json:"candidate_set_incomplete,omitempty"`
+		HistoryIncomplete      bool                         `json:"history_incomplete,omitempty"`
 		PreviousUnresolved     bool                         `json:"previous_unresolved,omitempty"`
 		PreviousMissing        bool                         `json:"previous_missing,omitempty"`
 		History                []ConversationRouteHistory   `json:"history"`
@@ -365,6 +366,8 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
 		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request cannot be decoded")
 	}
+	incompleteHistory := strings.Contains(request.Instructions, conversationRouteIncompleteHistoryInstructions)
+	historySearch := strings.Contains(request.Instructions, conversationRouteHistorySearchTaskInstructions)
 	body, err := json.Marshal(input)
 	if err != nil {
 		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request cannot be encoded")
@@ -376,6 +379,12 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 	}
 	if value.CandidateSetIncomplete {
 		request.Instructions += "\n\n" + conversationRouteIncompleteCandidatesInstructions
+	}
+	if incompleteHistory {
+		request.Instructions += "\n\n" + conversationRouteIncompleteHistoryInstructions
+	}
+	if historySearch {
+		request.Instructions += "\n\n" + conversationRouteHistorySearchTaskInstructions
 	}
 	request.Input[0].Text = string(body)
 	return request, nil
