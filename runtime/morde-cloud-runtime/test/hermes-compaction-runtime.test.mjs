@@ -18,7 +18,7 @@ test('passes an 18 KB current message intact to the model within its context bud
     assert.equal(Buffer.byteLength(content), 18 * 1024)
     const start = {
       type: 'start', version: 1, task_id: 'task_long_input', owner_id: 'owner_long_input',
-      agent_id: 'agent_long_input', generation: 1, authorization_version: 1, session_id: 'session_long_input',
+      agent_id: 'agent_long_input', generation: 1, authorization_version: 1, session_id: 'session_long_input', task_revision: 1,
       model: 'test-model', tools: [], context_window_tokens: 32_768, max_tokens: 512,
       initial_message: { message_id: 'm1234567', content, attachment_ids: [] },
     }
@@ -66,7 +66,7 @@ test('long task conversation survives repeated pressure compaction and keeps its
   { timeout: 15_000 }, async t => {
     const start = {
       type: 'start', version: 1, task_id: 'task_hermes_window', owner_id: 'owner_hermes_window',
-      agent_id: 'agent_hermes_window', generation: 1, authorization_version: 1, session_id: 'session_hermes_window',
+      agent_id: 'agent_hermes_window', generation: 1, authorization_version: 1, session_id: 'session_hermes_window', task_revision: 1,
       model: 'test-model', tools: [], context_window_tokens: 4096, max_tokens: 512,
       initial_message: { message_id: 'm1234567', content: `head-anchor ${'history '.repeat(275)}`, attachment_ids: [] },
     }

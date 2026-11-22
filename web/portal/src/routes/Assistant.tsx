@@ -12,7 +12,7 @@ import { useMessageVariantOutbox } from '../app/use-message-variant-outbox';
 import type { MessageVariantOutboxEntry } from '../app/use-message-variant-outbox';
 import { buildMessageVariantTimeline, createMessageVariant, messageVariantActionLabel } from '../app/message-variants';
 import type { VersionableMessage } from '../app/message-variants';
-import { deliveryStatusText, userVisibleRoutingStatusText } from '../app/message-status';
+import { deliveryStatusText, routingFailureText, userVisibleRoutingStatusText } from '../app/message-status';
 import { clearProcessingRetryKey, processingRetryKey } from '../app/message-processing-retry';
 import { maxMessageBytes, needsMessageUpload, uploadMessage } from '../app/message-upload';
 import { conversationTitleFromText, firstOutboxConversationMessage, messageOutbox, outboxReceiptRequest } from '../app/message-outbox';
@@ -3473,6 +3473,10 @@ export function Assistant() {
                     (entry.operation.input.messageID === variantGroup.id || variantGroup.messageIDs.has(entry.operation.input.messageID))) : [];
                   const acceptedRetryStatus = retryAcceptedMessageIDs.has(message.id) &&
                     ['failed', 'pending', 'processing'].includes(message.routing_status ?? '') ? '正在重新处理消息' : null;
+                  const routingFailure = message.role === 'user' && message.routing_status === 'failed' && !message.duplicate_of_message_id && !acceptedRetryStatus
+                    ? routingFailureText(message.routing_failure_reason) : null;
+                  const canRetryRouting = message.role === 'user' && message.routing_status === 'failed' && message.routing_failure_reason !== 'message_too_long'
+                    && !message.related_task_id && !acceptedRetryStatus;
                   const routingStatus = message.role === 'user'
                     ? acceptedRetryStatus ?? (message.routing_status === 'failed' ? null : conversationMessageStatus(message, messageTask)) : null;
                   const previous = displayMessages[index - 1];
@@ -3486,10 +3490,6 @@ export function Assistant() {
                     {message.role === 'assistant' && <strong className="chat-message-author">Morde</strong>}
                     <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}${message.role === 'user' && message.agent_acknowledged === true ? ' chat-message-user-received' : ''}`}
                       aria-label={message.role === 'assistant' ? 'Morde 的回复' : '你的消息'} tabIndex={message.role === 'assistant' ? 0 : undefined}>
-                      {message.role === 'user' && message.routing_status === 'failed' && message.routing_failure_reason !== 'message_too_long'
-                        && !message.related_task_id && !retryAcceptedMessageIDs.has(message.id) && <button type="button" className="message-retry"
-                        aria-label="重新处理这条消息" title="重新处理" disabled={retryProcessing.isPending && retryProcessing.variables?.messageID === message.id}
-                        onClick={() => retryProcessing.mutate({ conversationID: message.conversation_id, messageID: message.id })}>!</button>}
                       {message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <UserMessageContent content={message.content} />}
                       {message.attachment_ids?.length ? <small className="chat-message-attachments">附件 · {message.attachment_ids.length}
                         {message.attachment_ids.map((attachmentID, index) => <span key={attachmentID}> · <a
@@ -3518,6 +3518,12 @@ export function Assistant() {
                           disabled={groupOperations.some((item) => item.operation.status === 'sending')} onClick={() => void sendVariantOperation(entry)}>核对并重试</button>}
                       </div>)}
                     </article>
+                    {(routingFailure || canRetryRouting) && <div className={`chat-message-status${routingFailure ? ' chat-message-status-error' : ''}`} role={routingFailure ? 'alert' : 'status'}>
+                      {routingFailure && <span>{routingFailure}</span>}
+                      {canRetryRouting && <button type="button" className="button button-small button-secondary"
+                        aria-label="重新处理这条消息" disabled={retryProcessing.isPending && retryProcessing.variables?.messageID === message.id}
+                        onClick={() => retryProcessing.mutate({ conversationID: message.conversation_id, messageID: message.id })}>重新处理这条消息</button>}
+                    </div>}
                     {message.role === 'user' && (routingStatus || message.delivery_status === 'unknown') && <div className="chat-message-status" role="status">
                         {routingStatus}
                         {message.delivery_status === 'unknown' && <button type="button" className="button button-small button-secondary"

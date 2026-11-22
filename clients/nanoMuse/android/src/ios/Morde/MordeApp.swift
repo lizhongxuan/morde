@@ -168,6 +168,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private let delayedResponseLock = NSLock()
     private var delayedResponseWorkItem: DispatchWorkItem?
     private static var taskFixtureEventCount = 0
+    private static var taskNoContentRecoveryDelivered = false
     private static var taskApprovalConflictActionCount = 0
     private static var taskSequentialSendContents: [String] = []
     private static var taskSequentialSendKeys: [String] = []
@@ -843,6 +844,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static func resetTaskFixture() {
         taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
         taskFixtureEventCount = 0
+        taskNoContentRecoveryDelivered = false
         taskApprovalConflictActionCount = 0
         taskSequentialSendContents = []
         taskSequentialSendKeys = []
@@ -1632,7 +1634,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
             let decision = taskPagesApprovalDecisionSnapshot
             let isNoContentRecoveryFixture = ProcessInfo.processInfo.arguments.contains(
                 Self.taskPagesTimelineNoContentRecoveryFixtureLaunchArgument)
-            let hasRecoveredAfterNoContent = isNoContentRecoveryFixture && Self.taskFixtureEventCountSnapshot >= 3
+            let hasRecoveredAfterNoContent = isNoContentRecoveryFixture && Self.taskNoContentRecoveryDeliveredSnapshot
             let isOtherWaitReasonFixture = ProcessInfo.processInfo.arguments.contains(
                 Self.taskPagesOtherWaitReasonFixtureLaunchArgument)
             let isEventChainTimelineFixture = ProcessInfo.processInfo.arguments.contains(Self.taskPagesEventChainTimelineFixtureLaunchArgument) ||
@@ -1666,7 +1668,22 @@ private final class MordeAuthURLProtocol: URLProtocol {
                     : NSNull()
                 task["clarification_request"] = NSNull()
                 task["batch_items"] = []
-                task["steps"] = []
+                var steps: [[String: Any]] = []
+                if isNoContentRecoveryFixture && Self.taskFixtureEventCountSnapshot > 0 {
+                    steps.append(["id": "s0000008", "sequence": 8, "kind": "agent", "status": "succeeded",
+                                  "title": "Event before empty response",
+                                  "summary": "The client has advanced its cursor to sequence 8.",
+                                  "created_at": "2026-11-04T00:00:08Z"])
+                }
+                if hasRecoveredAfterNoContent {
+                    steps.append(["id": "s0000009", "sequence": 9, "kind": "agent", "status": "succeeded",
+                                  "title": "Recovered after 204",
+                                  "summary": "The event arrived after an empty response.",
+                                  "created_at": "2026-11-04T00:00:09Z"])
+                }
+                task["steps"] = steps
+                task["step_count"] = steps.count
+                task["completed_step_count"] = steps.filter { $0["status"] as? String == "succeeded" }.count
                 task["artifacts"] = []
                 return task
             }
@@ -1786,6 +1803,16 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static var taskFixtureEventCountSnapshot: Int {
         taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
         return taskFixtureEventCount
+    }
+
+    private static var taskNoContentRecoveryDeliveredSnapshot: Bool {
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        return taskNoContentRecoveryDelivered
+    }
+
+    private static func markTaskNoContentRecoveryDelivered() {
+        taskFixtureLock.lock(); defer { taskFixtureLock.unlock() }
+        taskNoContentRecoveryDelivered = true
     }
 
     private static func markTaskApprovalConflictAction() {
@@ -2946,6 +2973,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 statusCode = 204
                 body = Data()
             } else if requestCount >= 3 && after == "8" {
+                Self.markTaskNoContentRecoveryDelivered()
                 statusCode = 200
                 let event = #"{"task_id":"q0000101","sequence":9,"type":"task.step","created_at":"2026-11-04T00:00:09Z","payload":{"kind":"agent","status":"succeeded","title":"Recovered after 204","summary":"The event arrived after an empty response."}}"#
                 body = Data("id: 9\nevent: task.step\ndata: \(event)\n\n".utf8)

@@ -257,6 +257,7 @@
 | MH-GATE-001 | 规格 09–10；H05 | 未执行 | |
 | MH-ISO-001 | 规格 2.1；H09 | 未执行 | |
 | MH-CLIENT-001 | 规格 2.4；H06 | 部分通过（PC 单次回复；iOS 本地发送 UI 用例通过）；同会话追问及 PC/iOS 接续未验收 | PC 短文本及 42,603 字节合成长文本首轮收到真实回复，但长消息后的历史追问未回复。iOS 本地模拟器用例仅覆盖未知云端模型状态下的消息受理，未连接真实 Provider，也未与 PC 接续同一会话。端到端客户端验收仍未完成。详见下方实际 PC 探测记录和“本地自动化证据”中的 iOS 行。 |
+| S05-PC-001 | 规格 2.2–2.4；H06 | 部分通过（本机实际 `morde-pc` + 合成模型/执行器；失败提示的实际路由注入及超限大文本未验） | PC 发出普通消息并显示合成回复；Task 失败与等待用户授权由本地夹具核验。运行中状态追问和重启后状态恢复已操作，但可访问性读取未确认状态回复全文。`routingFailureText` 展示、原文保留及 `message_too_long` 不允许同内容重试由 Assistant 组件测试覆盖。见“本机 PC S05 客户端验收”。 |
 
 ### 本地自动化及真实 Provider 探针（2026-11-22；不计作完整端到端验收）
 
@@ -278,8 +279,13 @@
 | 租约与子 Agent 恢复 | `go test ./internal/worker -run 'TestCloudDSHExecutor(RunsAndSettlesPersistedChildSession|RecoversChildSessionAfterRuntimeRestartWithoutReplayingTool|CancellationStopsChild|LeaseRenewalFailureStopsChild|ReconcilesEveryPinnedToolCallBeforeSettling)|TestCloudDSHChildSuccessRequiresReconciledHistory|TestCloudDSHDelegateToolsAreRestrictedToParentDefinitions|TestTaskWorkerRenewsLeaseWhileExecuting' -count=1` | 通过；含租约两次续期、子 Session 检查点与重启恢复。 |
 | 双子 Agent 并行 | `node --test --test-name-pattern='runs two background children concurrently and the parent consumes both settled results' test/runtime.test.mjs` | 1 通过；测试证明两个子任务重叠运行、分别结算，主 Agent 再读取两份真实运行结果。未使用真实 Provider。 |
 | 证据验证与原会话发布 | 隔离 PostgreSQL 下执行 `go test ./internal/store/postgres -run 'Test(PostgresTaskValidation|PostgresReviewModelUsage|ConversationResultReview|ConversationResultAggregation|TaskResultReviewMessages)' -count=1` | 通过；覆盖当前修订/证据绑定、重放、过时来源 supersede、一次发布和大结果分批保留。此处的 conversation `ResultReview` 是结果摘要，不是 `TaskValidationSummary` 验收结论。 |
+| H05 回执验收状态门禁（本地集成基线 `fee63a35`） | `go test ./internal/app -run 'TaskValidationVerdict|EvaluateTaskValidationReview|TaskValidationReview' -count=1`；本机 `morde-local-postgres` 上执行 `go test ./internal/store/postgres -run '^(TestCoordinatorRouteRetriesConfirmedRateLimitWithNewMeteredIdentity|TestH01SummaryScopeVersionChangeInvalidatesOldSummaryAndReopensSources|TestCloudDSHStreamStopsAndRetainsSnapshotWhileSameTaskSteerIsPending|TestPostgresTaskAgentActivityIsOrderedAndFenced|TestPostgresTaskAgentActivityHeartbeatsDoNotAdvanceProgress|TestPostgresTaskAgentStallNoticeWaitsForKnownStaleActivityAndClearsOnce|TestPostgresTaskAgentActivityProgressClearsStallNoticeImmediately|TestConversationResultReceiptSeparatesCompletionFromCurrentValidation|TestConversationResultAggregationQueuesHiddenReviewAndReplaysOnce|TestConversationResultAggregationConcurrentRevisionCannotPublishOldResult)$' -count=1 -v` | app verdict/回执格式单测通过，10 项隔离 PostgreSQL 集成用例 10/10 通过。持久回执把主助手摘要、Task completed、当前修订验收状态分开；缺少或不匹配验证记录显示 `pending`。可信执行环境 ID 与 Artifact 内容摘要/版本绑定仍缺失，因此执行类事实不能据此验收 PASS。全量 `go test ./...` 未设置 `CH_TEST_DATABASE_URL`，其中 DB 钩子跳过。 |
+| S01–S06 服务端集成回归 | 在 `codex/harness-h06-integration` 集成工作树执行 `go test ./...`；本机隔离 PostgreSQL 定向组；`TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart` | 全服务端 Go 包通过，worker 全量 53.765 秒通过；本机隔离 PostgreSQL 定向回归 10/10 通过；H09 长历史 DSH 重启 E2E 通过（39.506 秒）。全包 `go test ./...` 未设置 `CH_TEST_DATABASE_URL`，所以全包中的其他 PostgreSQL 钩子跳过。Runtime DSH 与 Portal 验证另见 TODO 中同一集成基线记录。 |
 | Portal Assistant 行为与类型 | `web/portal` 执行 `pnpm vitest run src/routes/Assistant.test.tsx`、`pnpm run typecheck` | 2026-11-22 当前工作树：Assistant 测试 209/209 通过；类型检查通过。覆盖任务状态/进度、追问投递、停止与恢复、结果整理、事件重连和长消息状态展示；仍不替代真实模型与 `morde-pc` / iOS 验收。 |
 | iOS 本地消息受理 UI | `xcodebuild test -quiet -project clients/nanoMuse/android/src/ios/Minis.xcodeproj -scheme morde -destination 'platform=iOS Simulator,id=E4D916C4-5693-4DF4-9403-ED939CF5A394' -only-testing:MinisUITests/MordeChatModelGateUITests/testUnknownCloudModelStatusDoesNotBlockMessageAcceptance -parallel-testing-enabled NO -derivedDataPath /tmp/morde-h06-ios-20261122 -resultBundlePath /tmp/morde-h06-ios-20261122/ios-send-final2.xcresult` | iPhone 18 Pro / iOS 27.2 专用本地模拟器：1 通过、0 失败。仅验证云端模型状态未知时客户端仍受理消息；使用本地 fixture，不证明 Provider 回复、长对话、跨设备接续或实际 iOS 生产配置。结果包保存在本机 `/tmp/morde-h06-ios-20261122/ios-send-final2.xcresult`。 |
+| S06 iOS Task 时间线重连回归 | `Morde` scheme / `MordeUITests`，iPhone 18 Pro / iOS 27.2；结果包 `/tmp/MordeH06S06-regression-rerun2-20261122.xcresult` | 7/7 通过。覆盖顺序发送、失败路由原位重试、断网/重启受理状态恢复、运行任务期间追问与独立消息、服务端 204 后以 `after=8` 重新订阅并取得序号 9。首次回归中的 204 重连用例单独失败，根因为动态任务详情没有启动 `watchTimeline`；复用现有订阅后该用例及全套回归通过。仅为 loopback 合成服务 UI 验收，不证明真实 Provider、服务端 Task 或 PC 创建会话的跨端续接。 |
+| S06 iOS 审批披露单测 | `xcodebuild test -quiet -project clients/nanoMuse/android/src/ios/Minis.xcodeproj -scheme morde -destination 'platform=iOS Simulator,id=F163DF6D-C418-435E-A0DA-DF2D213C59C8' -only-testing:MinisTests/MIFApprovalViewsTests -parallel-testing-enabled NO`；iPhone 18 Pro / iOS 27.2；主工作区 HEAD `e0098153`（含未提交 S06 iOS 改动）；结果包 `/tmp/MordeH06S06-approval-disclosure-corrected-20261122.xcresult` | 19/19 通过。覆盖已知金额、未知/缺省披露、“不适用”状态及审批状态边界；只验证本地呈现/合同 fixture，不证明服务端实际费用或审批请求。构建期间出现既有 Swift/Objective-C 警告，无失败。 |
+| S06 iOS Task UI 主工作区复验 | `xcodebuild test -quiet -project clients/nanoMuse/android/src/ios/Morde.xcodeproj -scheme Morde -destination 'platform=iOS Simulator,id=F163DF6D-C418-435E-A0DA-DF2D213C59C8' -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeChatComposerSendsSequentialPlainTextMessages -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeFailedRouteShowsLeftRetryButtonAndRetriesInPlace -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeChatComposerRecoversPlainTextAfterOfflineRestart -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeChatComposerReconcilesAcceptedMessageAfterAppRestart -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeChatComposerQueuesFollowUpOnActiveTask -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeChatShowsOneStartedAcknowledgementForMessagesInSameTask -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeTaskDetailReconnectsAfter204WhenSnapshotIsStillActive -parallel-testing-enabled NO -derivedDataPath /tmp/MordeH06S06-main-derived-correct-20261122 -resultBundlePath /tmp/MordeH06S06-main-ui-correct-20261122.xcresult`；主工作区 HEAD `e0098153`（含未提交 S06 iOS 改动） | iPhone 18 Pro / iOS 27.2；7/7 通过，0 失败。覆盖顺序发送、失败原位重试、断网与重启恢复、活跃 Task 追问/独立消息，以及 204 后时间线重连。仅为 loopback 合成服务 UI 验收；真实 Provider、服务端执行及 PC 创建会话的跨端接续未验证。存在 `MordeStandaloneApp.swift` 的 UIKit hierarchy runtime warning，未影响测试结果。 |
 | 大结果测试夹具 | 先以未声明窗口的 4K 保守默认值运行 `TestConversationResultAggregationPreservesLargeResultsAcrossReviews`，用例被正确拒绝；随后让该测试模型明确声明 65,536 token 已知窗口并重跑同一用例 | 修正后的用例通过；未改变生产窗口策略，也没有把超预算结果改成可通过。 |
 | `morde-pc` 桌面客户端 | `clients/desktop/harness/desktop` 下执行 `npm test` | 288 通过、0 失败；覆盖桌面主进程、消息/门户桥接、授权及同步等自动化路径，不替代真实服务端与模型验收。 |
 
@@ -310,6 +316,13 @@
 - **测试夹具修正：** 首轮复现中合成 `ModelResponse` 漏设 `StopReason="stop"`。路由网关会把未明确正常结束的响应按协议标为无效，因此修正 `browserAcceptanceModel` 的成功响应，测试随后通过；这是测试夹具缺字段，不是产品路由解析器缺陷。
 - **限制：** 模型和任务执行器均为本地合成替身；长任务只模拟运行状态，没有证明真实 DSH 工具调用、任务完成、真实 Provider 回复、Task 定向追问/停止、iOS 接续或 60 分钟耐久。该结果只证明本机 PC 消息入口在后台 Task 运行期间仍能完成一条普通快速对话。
 
+### 本机 PC S05 客户端验收（2026-11-22；合成模型/执行器，不计作真实模型验收）
+
+- **实现：** S05 分支 `codex/harness-s05` 基于共同本地基线 `e009815383daaa883ec7f2b40fe2ec7cdeb7397a`，只改 PC 内嵌 Portal 的 Assistant 路由、直接样式和测试。此前失败消息只露出无说明的 `!` 重处理按钮；现按 `routingFailureText` 显示安全中文原因及带标签的重处理按钮。重复消息不继承原消息的失败原因；超长消息保留原文、显示缩短建议并禁止同内容重试。未加依赖、改 DTO 或改独立 Web 用户端。
+- **本机验证：** `pnpm exec vitest run src/routes/Assistant.test.tsx` 210/210 通过；`pnpm run typecheck`、`pnpm run build:pc`、桌面端 `npm run build` 通过。使用当前 S05 工作树启动真实 `morde-pc`（内嵌 Portal，而非独立浏览器），单独 `/tmp` profile 指向 loopback-only 测试服务。PC 实际发送普通快速消息，Accessibility 查询到合成回复“本地验收：快速请求直接回复。”；发送“已接单后任务失败”和“等待用户授权”两项后，夹具 API 分别确认 `agent_acknowledged=true/task_status=failed` 与 `agent_acknowledged=true/task_status=waiting_user/pending_request_status=pending`。隔离 PostgreSQL 的 `TestConversationBrowserAcceptance` 使用本机随机端口和随机 DSN，显式选取 `failed,approval`，写入停止标记后通过：测试 126.46 秒，包 127.303 秒；容器随测试结束清理。首次尝试未触发停止标记而超时，未计通过；随后完整重跑通过。
+- **状态/恢复操作：** 另一次同一隔离 profile 的实际 PC 操作提交了运行中 Task、普通状态追问和普通快速问题；关闭并重新启动 PC 后，登录态恢复，客户端重新请求同一会话消息和 Task 状态。该探索使用的长运行 fixture 因遗漏停止标记而超时，因此只记录为 UI/API 操作证据，不替代成功的 PostgreSQL 验收，也未从无障碍树确认状态回复全文。屏幕捕获因 macOS Screen Recording 权限不可用；未生成截图。
+- **未覆盖与边界：** 实际 PC 中未注入单独的 `routing_status=failed` 消息样本；错误文案、重处理入口、重复失败和超长禁重试由 210 项组件测试验证。尝试用 Accessibility 向真实客户端输入 132,305 字节合成文本时操作超过 60 秒无响应，已取消，未确认发送，不计通过。该输入边界另由本地 Worker/PostgreSQL/Runtime 既有回归覆盖。未改同步入口，故未重跑文件夹同步。审批费用合同审计显示既有卡片支持本次/累计费用的已知或未知状态，但服务端当前写入未知，且合同没有通用金额限额字段；PC 本轮没有伪造限额或添加授权逻辑。未访问共享站点、未使用用户提供的远程凭据/API key、未发送文件。H06 的真实 Provider、PC/iOS 接续、累计历史与耐久验收仍未完成。
+
 ### 本机运行中消息投递回归（2026-11-22；分层自动化测试）
 
 - **环境：** 使用 loopback-only 的临时 PostgreSQL 16 容器和本地 Node DSH Runtime；容器及隔离数据库已在测试后删除。模型使用合成响应，没有发送项目文件或访问远程测试服务。
@@ -319,6 +332,18 @@
 - **长历史及推理中补充：** `go test ./internal/worker -run '^TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart$' -count=1 -timeout=8m` 通过（29.80 秒）；使用 840 条连续 predecessor 历史，在本地 Node DSH Runtime 重启后完成授权原文搜索。另在模型调用挂起时向运行中的 Task 投递安全补充，确认旧模型输出及工具调用在执行前被丢弃，DSH 将新消息与授权历史检索纳入后续推理并完成任务；后续并发路由断言也通过。该结果是本地合成模型/隔离 PostgreSQL 证据。
 - **运行时回归：** 在 `runtime/morde-cloud-runtime` 目录执行 `node --test --test-concurrency=1 test/runtime.test.mjs test/compaction-recovery.test.mjs test/hermes-compaction-runtime.test.mjs`，144/144 通过（55.943 秒）；覆盖运行时、压缩恢复及 Hermes 压缩行为。另执行 `node --check src/engine.mjs` 与 `git diff --check`，均通过。
 - **限制：** 以上是数据库路由、Go executor 和 Node Runtime 的分层覆盖，不是一次从真实 PC/iOS 经服务端、Provider 到实际 Task 完成的端到端验收；未覆盖真实模型下定向追问、独立 Task 并行、用户停止、跨端接续或 60 分钟耐久。因此 `MH-MSG-001` 与 `MH-DUR-001` 的整体验收状态不变。
+
+### S02 合并后回归（2026-11-22；本机当前工作树）
+
+| 覆盖 | 命令 | 结果 |
+|---|---|---|
+| Runtime 投递、压缩、恢复与 Hermes 压缩 | `cd runtime/morde-cloud-runtime && node --test --test-concurrency=1 --test-reporter=dot test/runtime.test.mjs test/compaction.test.mjs test/compaction-recovery.test.mjs test/hermes-compaction-window.test.mjs test/hermes-compaction-runtime.test.mjs` | 178 项通过；合并后覆盖 steer 流中作废旧答案/工具调用，以及检查点后、IPC 派发前到达消息的版本栅栏。 |
+| App checkpoint/inbox | `cd server && go test ./internal/app -run 'TestAgentCheckpoint|TestCheckpointInbox' -count=1` | 通过。 |
+| PostgreSQL DSH 流式消息 | `cd server && go test ./internal/store/postgres -run '^TestCloudDSHStream' -count=1` | 全套通过；pending same-Task steer 后旧 delta 被拒，已展示快照保留为 interrupted。 |
+| Worker DSH | `cd server && go test ./internal/worker -run '^TestCloudDSH' -count=1` | 全套通过（67.075 秒）；新协议回归确认 pending steer 先送达 Runtime，旧模型工具调用不执行。 |
+| 840 条长历史重启 E2E | `cd server && go test ./internal/worker -run '^TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart$' -count=1 -timeout=8m` | 通过（45.623 秒）；真实本地 Node DSH Runtime 重启后完成授权历史检索。 |
+
+Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 曾在两次整组运行时于 claim 检查失败；单测复跑和随后整组运行通过。未确认其间歇失败根因，保留为时序风险。测试使用合成模型和本机隔离 PostgreSQL；未调用真实 Provider、测试站点或客户端入口。`node --check src/engine.mjs`、相关 Go 文件 `gofmt -d` 和 `git diff --check` 均无输出。
 
 ### 单次执行信息模板
 

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain/task"
 )
 
@@ -83,6 +84,15 @@ type taskExecutorFunc func(context.Context, task.Task) error
 
 func (f taskExecutorFunc) ExecuteTask(ctx context.Context, value task.Task) error {
 	return f(ctx, value)
+}
+
+type monitoredTaskLeaseStore struct {
+	*taskLeaseStoreStub
+	check func(context.Context, task.Task, time.Duration) error
+}
+
+func (s *monitoredTaskLeaseStore) CheckTaskAgentStall(ctx context.Context, value task.Task, staleAfter time.Duration) error {
+	return s.check(ctx, value, staleAfter)
 }
 
 func newTestTaskWorker(t *testing.T, store TaskLeaseStore, executor TaskExecutor, lease, poll time.Duration) *TaskWorker {
@@ -331,6 +341,54 @@ func TestTaskWorkerRenewsLeaseWhileExecuting(t *testing.T) {
 	_, renewals := store.counts()
 	if renewals < 2 {
 		t.Fatalf("lease renewals = %d, want at least two while execution remained active", renewals)
+	}
+}
+
+func TestTaskWorkerStallMonitorFailureDoesNotCancelTask(t *testing.T) {
+	base := &taskLeaseStoreStub{renewCalls: make(chan struct{}, 1)}
+	base.claim = func(_ context.Context, workerID string, _ time.Duration) (task.Task, bool, error) {
+		claims, _ := base.counts()
+		if claims == 1 {
+			return validTaskClaim(workerID), true, nil
+		}
+		return task.Task{}, false, nil
+	}
+	base.renew = func(_ context.Context, taskID, workerID string, version int64, _ time.Duration) (task.Task, error) {
+		value := validTaskClaim(workerID)
+		value.ID = taskID
+		value.Lease.Version = version
+		return value, nil
+	}
+	monitorCalls := make(chan time.Duration, 1)
+	store := &monitoredTaskLeaseStore{taskLeaseStoreStub: base, check: func(_ context.Context, _ task.Task, staleAfter time.Duration) error {
+		monitorCalls <- staleAfter
+		return errors.New("activity store unavailable")
+	}}
+	executorCanceled := make(chan struct{})
+	worker := newTestTaskWorker(t, store, taskExecutorFunc(func(ctx context.Context, _ task.Task) error {
+		<-ctx.Done()
+		close(executorCanceled)
+		return ctx.Err()
+	}), 60*time.Millisecond, 5*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := startTaskWorker(ctx, worker)
+	select {
+	case staleAfter := <-monitorCalls:
+		if staleAfter != 2*app.MaxAgentLease {
+			t.Fatalf("stall threshold = %s, want %s", staleAfter, 2*app.MaxAgentLease)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Task worker did not check agent activity")
+	}
+	select {
+	case <-executorCanceled:
+		t.Fatal("activity monitor failure canceled the Task")
+	default:
+	}
+	cancel()
+	waitTaskWorkerSignal(t, executorCanceled)
+	if err := waitTaskWorkerResult(t, done); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", err)
 	}
 }
 

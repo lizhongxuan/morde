@@ -2639,7 +2639,7 @@ struct MIFTaskDetailView: View {
                   scope == store.scopeKey, requestedTaskID == self.taskID else { return }
             loadedScopeKey = scope
             isLoadingDetail = false
-            if !taskDynamicsMode {
+            if !store.loadingTimelines.contains(requestedTaskID) {
                 await store.watchTimeline(taskID: requestedTaskID)
                 guard !Task.isCancelled, generation == detailGeneration,
                       scope == store.scopeKey, requestedTaskID == self.taskID else { return }

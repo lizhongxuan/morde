@@ -626,6 +626,57 @@ func TestCloudDSHStreamRevisionAndCancelKeepInterruptedText(t *testing.T) {
 	}
 }
 
+func TestCloudDSHStreamStopsAndRetainsSnapshotWhileSameTaskSteerIsPending(t *testing.T) {
+	f := newCloudDSHStreamFixture(t)
+	ctx := context.Background()
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, f.delta); err != nil || !appended {
+		t.Fatalf("initial stream: appended=%t err=%v", appended, err)
+	}
+
+	supplement := f.route.receive(t, "stream-pending-steer", "Also include a brief introduction", app.ConversationRoutingInput{
+		ReferenceTaskID: f.task.ID,
+	})
+	route, err := f.route.store.LoadConversationRouteSnapshot(ctx, supplement)
+	if err != nil || !app.ValidConversationRouteSteerTarget(f.task.ID, route.Context) {
+		t.Fatalf("pending steer target: context=%+v err=%v", route.Context, err)
+	}
+	route.Context.ModelID = "p1234567"
+	decision := app.ConversationRouteDecision{Action: app.ConversationRouteSteer, TaskID: f.task.ID,
+		ExpectedRevision: route.Context.Candidates[0].Revision,
+		ModelOutput:      `{"action":"steer","task_id":"` + f.task.ID + `","acknowledge":false}`}
+	if !validStoredRouteDecision(decision, route.Context) {
+		t.Fatal("same-Task steer was rejected as a stored route decision")
+	}
+	if err := f.route.store.ApplyConversationRoute(ctx, supplement, route, decision); err != nil {
+		t.Fatal(err)
+	}
+	var deliveryStatus, deliveryMode string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT delivery_status,delivery_mode FROM conversation_messages WHERE id=$1`, supplement.Message.ID).
+		Scan(&deliveryStatus, &deliveryMode); err != nil || deliveryStatus != "pending" || deliveryMode != string(app.AgentMessageDeliverySteer) {
+		t.Fatalf("steer was not persisted pending for the running Task: status=%q mode=%q err=%v", deliveryStatus, deliveryMode, err)
+	}
+
+	stale := f.delta
+	stale.Text = "stale provider delta"
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, stale); err != nil || appended {
+		t.Fatalf("pending same-Task steer did not stop old delta: appended=%t err=%v", appended, err)
+	}
+	var snapshotID, snapshotStatus, snapshotContent string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT message_id,status,content FROM task_assistant_message_snapshots WHERE task_id=$1`, f.task.ID).
+		Scan(&snapshotID, &snapshotStatus, &snapshotContent); err != nil || snapshotID != f.delta.MessageID ||
+		snapshotStatus != "interrupted" || snapshotContent != f.delta.Text {
+		t.Fatalf("stream snapshot was not retained as interrupted: id=%s status=%s content=%q err=%v", snapshotID, snapshotStatus, snapshotContent, err)
+	}
+	var messageStatus, messageContent string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT output_status,content FROM conversation_messages WHERE id=$1`, f.delta.MessageID).
+		Scan(&messageStatus, &messageContent); err != nil || messageStatus != "interrupted" || messageContent != f.delta.Text {
+		t.Fatalf("visible stream message was not preserved: status=%s content=%q err=%v", messageStatus, messageContent, err)
+	}
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, stale); err != nil || appended {
+		t.Fatalf("repeated stale delta was accepted: appended=%t err=%v", appended, err)
+	}
+}
+
 func TestCloudDSHStreamArchivesInterruptedPriorRevision(t *testing.T) {
 	f := newCloudDSHStreamFixture(t)
 	ctx := context.Background()

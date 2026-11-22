@@ -1,6 +1,6 @@
 # S06｜Morde iOS 客户端
 
-**状态：** 未开始（H 项状态见[主 TODO](../Morde_Harness_实施任务_TODO.md)）。
+**状态：** 本地 iOS 实现核对、动态任务进度修复、审批披露单测和模拟器合成 UI 验收完成；真实 Provider 和 PC 创建会话接续待 H06/S07 验证。
 
 **共同开发门禁：** 缺陷必须按[并发总控](00-并发实施总控.md)追到机制根因；复杂方案、取舍和模块/函数边界要留档。不得只绕过失败状态或缩短测试输入。
 
@@ -24,6 +24,15 @@
 ## 验收
 
 按 H06 覆盖 iOS 发出真实请求并收到对应状态、PC 已创建会话的历史/任务续接、后台任务期间快速问答与追问、断网重连和重复发送幂等。运行相关 Xcode 单元/UI 测试；实际目标环境缺失时标待验证，不把 fixture/UI 单测写成真实 Provider 或跨端通过。
+
+## 当前进度（2026-11-22）
+
+- **实现核对：** 现有客户端在清空输入框前先持久化 account-scoped outbox；重启后把中断发送标为 `unknown`，使用原 `client_message_id` 对账并复用幂等身份；切换会话重新加载消息和活跃任务。任务详情重连用例发现，任务列表里的动态详情只读了初始快照、没有订阅 Task 时间线；现已复用 `watchTimeline`，在尚无时间线加载时启动订阅。
+- **本地验收：** 在 S06 隔离工作树的 `Morde` scheme / `MordeUITests` target、iPhone 18 Pro / iOS 27.2 模拟器，以正常模拟器签名运行 7 个实际 App UI fixture 用例，7/7 通过：顺序文本发送、失败路由原位重试、断网重启恢复、重启后受理状态对账、运行任务期间追问、运行任务期间独立消息、服务端 204 后仍活跃时重连并取得后续事件。
+- **主工作区复验：** 在 `Morde.xcodeproj` 的 `Morde` scheme、`MordeUITests/IOS03SimulatorAcceptanceUITests` 中重跑上述 7 个 UI 用例，iPhone 18 Pro / iOS 27.2 模拟器 7/7 通过；主工作区 HEAD `e0098153`，S06 iOS 改动未提交。结果包 `/tmp/MordeH06S06-main-ui-correct-20261122.xcresult`。
+- **复现与证据：** 初始 `testMordeTaskDetailReconnectsAfter204WhenSnapshotIsStillActive` 因动态详情未订阅而失败；结果为 `/tmp/MordeH06S06-task-recovery-20261122.xcresult`。修复后该用例单独 1/1 通过（`/tmp/MordeH06S06-task-recovery-fixed-20261122.xcresult`），并在同一模拟器上回归 7/7（`/tmp/MordeH06S06-regression-rerun2-20261122.xcresult`）。合成事件夹具要求客户端先收到序号 8、204 后以 `after=8` 重连并收到序号 9，随后快照展示两步。
+- **审批披露：** 主工作区 `morde` scheme 的 `MinisTests/MIFApprovalViewsTests` 在 iPhone 18 Pro / iOS 27.2 模拟器上 19/19 通过，覆盖已知金额、未知/缺省值、“不适用”及审批状态边界；结果包为 `/tmp/MordeH06S06-approval-disclosure-corrected-20261122.xcresult`。仅验证客户端合同 fixture，不声称服务端已有通用金额上限或真实费用数值。
+- **边界：** 请求仅到 loopback 合成服务，不证明真实 Provider 回复、PC 创建会话的 iOS 续接或真实服务端 Task 执行；这些 H06 验收继续进行。完整回归还有来自 `MordeStandaloneApp.swift` 的 UIKit hierarchy runtime warning，未导致测试失败。
 
 ## 会话完成回报
 
