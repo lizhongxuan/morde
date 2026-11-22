@@ -444,6 +444,10 @@ VALUES ($1,$2,'agent-1',2,'session-1','engine','profile','supervisor-1',$3,'work
 	}
 	accountCall.Source, accountCall.ProjectID, accountCall.Task, accountCall.Principal = app.ModelCallTask, projectID, &fence, identity.Principal{}
 	accountCall.CallID, accountCall.OwnerID = callID, principal.UserID
+	if err := store.pool.QueryRow(ctx, `SELECT base_url FROM model_connections WHERE id=$1`, accountCall.ModelID).
+		Scan(&accountCall.ProviderEndpoint); err != nil {
+		t.Fatalf("load model endpoint for Task response fixture: %v", err)
+	}
 	accountDigest := sha256.Sum256([]byte("project-task-account-request"))
 	accountCall.RequestDigest = accountDigest[:]
 	accountCall.ReservedTokens = 100

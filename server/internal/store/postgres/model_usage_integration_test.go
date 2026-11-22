@@ -1032,6 +1032,11 @@ func TestPostgresSubmittedTaskRunsMeteredModelAfterRealCheckpoint(t *testing.T) 
 		principal.UserID, callID).Scan(&providerModel); err != nil || providerModel != "task-personal-model" {
 		t.Fatalf("task personal provider model = %q, %v", providerModel, err)
 	}
+	var reportedModelIsNull bool
+	if err := store.pool.QueryRow(ctx, `SELECT provider_reported_model IS NULL FROM task_model_call_responses
+WHERE owner_id=$1 AND source='task' AND call_id=$2`, principal.UserID, callID).Scan(&reportedModelIsNull); err != nil || !reportedModelIsNull {
+		t.Fatalf("empty optional provider-reported model was not stored as NULL: null=%t err=%v", reportedModelIsNull, err)
+	}
 	receipt := signAgentLifecycleReceipt(t, key, started.Fence, nonce)
 	if _, err := agents.ConfirmStopped(ctx, receipt); err != nil {
 		t.Fatal(err)

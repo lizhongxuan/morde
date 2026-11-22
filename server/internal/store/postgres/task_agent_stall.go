@@ -209,8 +209,8 @@ func createTaskAgentStallNotice(ctx context.Context, tx pgx.Tx, value task.Task,
 	}
 	const title = "任务仍在运行"
 	const summary = "检测到待处理消息，Agent 活动状态已超时未更新；任务未被自动取消。"
-	if _, err := tx.Exec(ctx, `INSERT INTO task_steps (id,task_id,sequence,kind,status,title,summary,task_revision)
-VALUES ($1,$2,$3,$4,'running',$5,$6,$7)`, stepID, value.ID, stepSequence, taskAgentStallNoticeKind, title, summary, revision); err != nil {
+	if _, err := tx.Exec(ctx, `INSERT INTO task_steps (id,task_id,sequence,kind,status,title,summary)
+VALUES ($1,$2,$3,$4,'running',$5,$6)`, stepID, value.ID, stepSequence, taskAgentStallNoticeKind, title, summary); err != nil {
 		return fmt.Errorf("persist Task activity notice step: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO task_agent_stall_notices
