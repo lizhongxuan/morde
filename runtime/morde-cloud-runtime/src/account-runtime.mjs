@@ -20,6 +20,8 @@ const MORDE_WORKSPACE_DIR = '/workspace'
 const TASK_START_TIMEOUT_MS = 15_000
 const TASK_STOP_TIMEOUT_MS = 2_000
 const TASK_FENCE_FIELDS = ['task_id', 'owner_id', 'agent_id', 'session_id', 'generation', 'authorization_version']
+const TASK_AGENT_ACTIVITY_PHASES = new Set(['model', 'tool', 'subagent', 'checkpoint'])
+const TASK_AGENT_ACTIVITY_STATES = new Set(['started', 'waiting', 'completed', 'failed', 'cancelled'])
 const COORDINATOR_FENCE_FIELDS = ['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id', 'purpose', 'operation_id']
 const TASK_VALIDATION_REVIEW_FENCE_FIELDS = TASK_VALIDATION_REVIEW_IDENTITY_FIELDS
 const RUNTIME_FIELDS = ['server_instance_id', 'owner_id', 'runtime_id', 'runtime_generation', 'max_concurrent_tasks']
@@ -28,7 +30,7 @@ const RUNTIME_SHUTDOWN_KEYS = ['type', 'version', ...RUNTIME_FIELDS]
 const TASK_PROCESS_ADMIT_KEYS = ['type', 'server_instance_id', 'runtime_id', 'runtime_generation', 'runtime_sequence', ...TASK_FENCE_FIELDS]
 const ACCOUNT_START_KEYS = [
   'type', 'version', ...TASK_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
-  'runtime_sequence', 'model', 'tools', 'prompt', 'initial_message', 'initial_context', 'revision_messages', 'resume', 'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'context_window_tokens', 'background_jobs', 'step_retry',
+  'runtime_sequence', 'task_revision', 'model', 'tools', 'prompt', 'initial_message', 'initial_context', 'revision_messages', 'resume', 'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'context_window_tokens', 'background_jobs', 'step_retry',
 ]
 const COORDINATOR_START_KEYS = [
   'type', 'version', ...COORDINATOR_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
@@ -154,6 +156,30 @@ function validAccountStart(frame, runtime) {
     Number.isSafeInteger(frame.runtime_sequence) && frame.runtime_sequence > 0 &&
     frame.owner_id === runtime.owner_id && frame.server_instance_id === runtime.server_instance_id &&
     frame.runtime_id === runtime.runtime_id && frame.runtime_generation === runtime.runtime_generation
+}
+
+function validTaskAgentObservation(frame, task) {
+  const common = [...TASK_FENCE_FIELDS, 'task_revision', 'observation_sequence']
+  if (!Number.isSafeInteger(frame.task_revision) || frame.task_revision !== task.startFrame.task_revision ||
+      !Number.isSafeInteger(frame.observation_sequence) || frame.observation_sequence < 1 ||
+      frame.observation_sequence <= (task.observationSequences.get(frame.session_id) ?? 0)) return false
+  let expected
+  if (frame.type === 'agent_status') {
+    expected = ['type', ...common, 'status']
+    if (!['idle', 'running'].includes(frame.status)) return false
+  } else if (frame.type === 'agent_activity') {
+    expected = ['type', ...common, 'phase', 'state', 'activity_id']
+    if (!TASK_AGENT_ACTIVITY_PHASES.has(frame.phase) || !TASK_AGENT_ACTIVITY_STATES.has(frame.state) || !ID.test(frame.activity_id ?? '')) return false
+  } else if (frame.type === 'agent_heartbeat') {
+    expected = ['type', ...common, 'phase', 'activity_id']
+    if (!((frame.phase === '' && frame.activity_id === '') ||
+        (TASK_AGENT_ACTIVITY_PHASES.has(frame.phase) && ID.test(frame.activity_id ?? '')))) return false
+  } else {
+    return false
+  }
+  if (Object.keys(frame).sort().join(',') !== expected.sort().join(',')) return false
+  task.observationSequences.set(frame.session_id, frame.observation_sequence)
+  return true
 }
 
 function validAccountCoordinatorStart(frame, runtime) {
@@ -501,7 +527,7 @@ export class AccountRuntime {
       fence, key, runtimeSequence: frame.runtime_sequence, outputBuffer: Buffer.alloc(0),
       outputFrames: Promise.resolve(), ready: deferred(), started: deferred(), spawned: deferred(),
       closed: deferred(), finished: deferred(), accepted: false, terminal: false, terminating: false,
-      terminated: false, startFrame: frame, admitted: false,
+      terminated: false, startFrame: frame, admitted: false, observationSequences: new Map(),
     }
     this.tasks.set(key, task)
     this.activeTaskIDs.add(fence.task_id)
@@ -1345,6 +1371,8 @@ export class AccountRuntime {
           task.terminal = true
           return
         }
+        if (['agent_status', 'agent_activity', 'agent_heartbeat'].includes(frame.type) &&
+            !validTaskAgentObservation(frame, task)) throw new Error('invalid task agent activity observation')
         await this.send({ ...frame, ...runtimeFields(this.runtime), runtime_sequence: task.runtimeSequence, ...task.fence, session_id: frame.session_id })
       }).catch(() => this.terminateTask(task, 'output_failed'))
     }

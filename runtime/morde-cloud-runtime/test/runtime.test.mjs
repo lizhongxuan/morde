@@ -17,7 +17,7 @@ import { WorkerIPC } from '../src/ipc.mjs'
 const start = {
   type: 'start', version: 1, task_id: 'task_123', owner_id: 'user_123',
   agent_id: 'agent_123', generation: 1, authorization_version: 1,
-  session_id: 'session_456', model: 'test-model', prompt: 'Hello from a local test',
+  session_id: 'session_456', task_revision: 1, model: 'test-model', prompt: 'Hello from a local test',
 }
 
 function launch(onFrame, extraEnv = {}, entrypoint = 'bin.mjs') {
@@ -167,6 +167,15 @@ function launchTaskValidationReviewAccount(onFrame) {
 function taskFence(frame) {
   return Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'session_id', 'generation', 'authorization_version']
     .map(key => [key, frame[key]]))
+}
+
+function assertMonotonicAgentObservations(frames) {
+  const sequences = new Map()
+  for (const frame of frames.filter(value => ['agent_status', 'agent_activity', 'agent_heartbeat'].includes(value.type))) {
+    const previous = sequences.get(frame.session_id) ?? 0
+    assert.equal(frame.observation_sequence, previous + 1, `observation sequence for ${frame.session_id}`)
+    sequences.set(frame.session_id, frame.observation_sequence)
+  }
 }
 
 function messageDelivery(identity, messageID = 'm1234567', content = 'Please check this update.', attachmentIDs = []) {
@@ -947,11 +956,20 @@ test('real dsh runs only after worker confirms its events', async () => {
   assert.equal(settled?.state, 'completed_candidate')
   assert.equal(settled.through_seq, through)
   assert.ok(frames.some(frame => frame.type === 'checkpoint' && JSON.parse(frame.payload).events.some(event => event.type === 'assistant/message')))
-  assert.deepEqual(frames.filter(frame => frame.type === 'agent_status'), ['idle', 'running', 'idle'].map((status, index) => ({
-    type: 'agent_status', ...taskFence(start), status, observation_sequence: index + 1,
-  })))
-  assert.ok(frames.findIndex(frame => frame.type === 'agent_status' && frame.status === 'idle' && frame.observation_sequence === 3) <
-    frames.findIndex(frame => frame.type === 'settled'))
+  assert.deepEqual(frames.filter(frame => frame.type === 'agent_status').map(frame => frame.status), ['idle', 'running', 'idle'])
+  const observations = frames.filter(frame => ['agent_status', 'agent_activity', 'agent_heartbeat'].includes(frame.type))
+  assertMonotonicAgentObservations(frames)
+  assert.ok(observations.every(frame => frame.session_id === start.session_id && frame.task_revision === start.task_revision))
+  assert.ok(observations.some(frame => frame.type === 'agent_activity' && frame.phase === 'model' && frame.state === 'started'))
+  assert.ok(observations.some(frame => frame.type === 'agent_activity' && frame.phase === 'checkpoint' && frame.state === 'completed'))
+  assert.ok(observations.some(frame => frame.type === 'agent_heartbeat' && frame.phase === '' && frame.activity_id === ''))
+  for (const frame of observations) {
+    const keys = ['type', 'task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id',
+      'task_revision', 'observation_sequence', ...(frame.type === 'agent_status' ? ['status'] :
+        frame.type === 'agent_activity' ? ['phase', 'state', 'activity_id'] : ['phase', 'activity_id'])]
+    assert.deepEqual(Object.keys(frame).sort(), keys.sort())
+  }
+  assert.ok(frames.indexOf(frames.filter(frame => frame.type === 'agent_status').at(-1)) < frames.findIndex(frame => frame.type === 'settled'))
 })
 
 test('runs a no-tool coordinator turn with its JSON instruction and Morde SOUL', async () => {
@@ -1342,6 +1360,158 @@ test('accepts strict Morde tool schemas with nullable JSON Schema types', () => 
     name: 'duplicate_union', description: 'Has a duplicate type.',
     parameters: { type: 'object', properties: { value: { type: ['integer', 'integer'] } }, additionalProperties: false },
   }] }), false)
+})
+
+test('discards a streamed model response when a steer arrives between chunks and keeps its usage', { timeout: 15_000 }, async t => {
+  const tool = {
+    name: 'file_write', description: 'Write a file in the task workspace.',
+    parameters: {
+      type: 'object', properties: { workspace_id: { type: 'string' }, path: { type: 'string' }, content: { type: 'string' } },
+      required: ['workspace_id', 'path', 'content'], additionalProperties: false,
+    },
+  }
+  const delivery = messageDeliveryV3(start, 'm7654321', 'Use the updated request.', [], 'steer')
+  const pages = []
+  const modelRequests = []
+  let modelCalls = 0
+  let deliveryCheckpointed = false
+  let toolCalls = 0
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [tool] })
+    if (frame.type === 'checkpoint') {
+      const page = JSON.parse(frame.payload)
+      pages.push(page)
+      send(proc, { type: 'checkpoint_ack', ...taskFence(frame), id: frame.id, ok: true,
+        through_seq: frame.through_seq, sha256: frame.sha256 })
+      if (page.events.some(event => event.type === 'agent/inbox/spliced' &&
+          event.data.inserted.some(message => message.id === delivery.message_id))) deliveryCheckpointed = true
+    }
+    if (frame.type === 'model') {
+      modelCalls++
+      modelRequests.push(frame.request)
+      if (modelCalls === 1) {
+        const first = { type: 'text-delta', index: 0, text: 'stale answer' }
+        send(proc, { type: 'model_chunk', id: frame.id, index: 0,
+          chunk: { type: 'block-start', index: 0, blockType: 'text' } })
+        send(proc, { type: 'model_chunk', id: frame.id, index: 1, chunk: first })
+        send(proc, delivery)
+        send(proc, { type: 'model_chunk', id: frame.id, index: 2,
+          chunk: { type: 'block-end', index: 0, block: { type: 'text', text: 'stale answer' } } })
+        send(proc, { type: 'model_chunk', id: frame.id, index: 3,
+          chunk: { type: 'tool-call-delta', index: 1, id: 'call_stale_1', name: tool.name,
+            argumentsDelta: '{"workspace_id":"w1234567","path":"stale.txt","content":"must not write"}' } })
+        send(proc, { type: 'model_chunk', id: frame.id, index: 4,
+          chunk: { type: 'usage', usage: { inputTokens: 31, outputTokens: 7 } } })
+        send(proc, { type: 'model_chunk', id: frame.id, index: 5,
+          chunk: { type: 'finish', reason: { kind: 'tool-calls' } } })
+        send(proc, { type: 'model_end', id: frame.id, ok: true })
+      } else {
+        assert.ok(frame.request.messages.some(message => message.id === delivery.message_id),
+          'the model re-evaluates after the queued steer')
+        replyWithText(proc, frame, 'Updated answer')
+      }
+    }
+    if (frame.type === 'tool_call') {
+      toolCalls++
+      send(proc, { type: 'tool_result', id: frame.id, ...taskFence(frame), call_id: frame.call_id,
+        status: 'succeeded', output: '{"bytes_written":15}' })
+    }
+  })
+  t.after(() => child.kill())
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(modelCalls, 2)
+  assert.equal(toolCalls, 0, 'the stale tool call must never reach the parent executor')
+  assert.equal(deliveryCheckpointed, true)
+  const events = pages.flatMap(page => page.events)
+  const superseded = events.find(event => event.type === 'assistant/message' &&
+    event.data.message?.content?.some(block => block.type === 'text' &&
+      block.text.includes('new task input arrived during this model call')))
+  assert.ok(superseded, 'the stale response is replaced with an internal re-evaluation notice')
+  assert.equal(JSON.stringify(superseded).includes('stale answer'), false)
+  assert.equal(JSON.stringify(superseded).includes('call_stale_1'), false)
+  assert.deepEqual(superseded.data.usage, { inputTokens: 31, outputTokens: 7 },
+    'usage from the discarded provider response remains available for reconciliation')
+  assert.equal(events.some(event => event.type === 'tool/call' && event.data.callId === 'call_stale_1'), false)
+  assert.equal(JSON.stringify(modelRequests.at(-1).messages).includes('Updated answer'), false)
+  assert.equal(events.some(event => event.type === 'assistant/message' &&
+    event.data.message?.content?.some(block => block.type === 'text' && block.text === 'Updated answer')), true)
+  assert.ok(frames.some(frame => frame.type === 'settled' && frame.state === 'completed_candidate'))
+})
+
+test('fences stale tool dispatch when delivery arrives after the tool checkpoint', { timeout: 15_000 }, async t => {
+  const tool = {
+    name: 'file_write', description: 'Write a file in the task workspace.',
+    parameters: {
+      type: 'object', properties: { workspace_id: { type: 'string' }, path: { type: 'string' }, content: { type: 'string' } },
+      required: ['workspace_id', 'path', 'content'], additionalProperties: false,
+    },
+  }
+  const delivery = messageDeliveryV3(start, 'm7654321', 'Use the updated request.', [], 'steer')
+  const pages = []
+  const modelRequests = []
+  let deliveredAfterResponseCheckpoint = false
+  let modelCalls = 0
+  let toolCalls = 0
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [tool] })
+    if (frame.type === 'checkpoint') {
+      const page = JSON.parse(frame.payload)
+      pages.push(page)
+      if (!deliveredAfterResponseCheckpoint && page.events.some(event => event.type === 'tool/call' &&
+          event.data.callId === 'call_late_1')) {
+        deliveredAfterResponseCheckpoint = true
+        send(proc, delivery)
+      }
+      send(proc, { type: 'checkpoint_ack', ...taskFence(frame), id: frame.id, ok: true,
+        through_seq: frame.through_seq, sha256: frame.sha256 })
+    }
+    if (frame.type === 'model') {
+      modelCalls++
+      modelRequests.push(frame.request)
+      if (modelCalls === 1) {
+        const chunks = [
+          { type: 'block-start', index: 0, blockType: 'text' },
+          { type: 'text-delta', index: 0, text: 'stale plan' },
+          { type: 'block-end', index: 0, block: { type: 'text', text: 'stale plan' } },
+          { type: 'tool-call-delta', index: 1, id: 'call_late_1', name: tool.name,
+            argumentsDelta: '{"workspace_id":"w1234567","path":"stale.txt","content":"must not write"}' },
+          { type: 'usage', usage: { inputTokens: 12, outputTokens: 4 } },
+          { type: 'finish', reason: { kind: 'tool-calls' } },
+        ]
+        chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+        send(proc, { type: 'model_end', id: frame.id, ok: true })
+      } else {
+        assert.ok(frame.request.messages.some(message => message.id === delivery.message_id),
+          'the updated input is included before the task settles')
+        replyWithText(proc, frame, 'Updated answer')
+      }
+    }
+    if (frame.type === 'tool_call') {
+      toolCalls++
+      send(proc, { type: 'tool_result', id: frame.id, ...taskFence(frame), call_id: frame.call_id,
+        status: 'succeeded', output: '{"bytes_written":15}' })
+    }
+  })
+  t.after(() => child.kill())
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(deliveredAfterResponseCheckpoint, true)
+  assert.equal(toolCalls, 0, `a new input must fence stale actions at the final pre-dispatch gate; frame order: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.ok(modelCalls >= 2)
+  const events = pages.flatMap(page => page.events)
+  const staleReply = events.find(event => event.type === 'assistant/message' &&
+    event.data.message?.content?.some(block => block.type === 'text' && block.text === 'stale plan'))
+  assert.deepEqual(staleReply?.data.usage, { inputTokens: 12, outputTokens: 4 },
+    'the superseded response remains available for usage reconciliation')
+  const finalReply = events.findLast(event => event.type === 'assistant/message')
+  assert.equal(finalReply?.data.message.content.find(block => block.type === 'text')?.text, 'Updated answer')
+  const claimedDelivery = events.find(event => event.type === 'user/message' && event.data.id === delivery.message_id)
+  assert.ok(claimedDelivery && claimedDelivery.seq < finalReply.seq,
+    'the settled answer follows the delivered update')
+  assert.ok(events.some(event => event.type === 'tool/result' && event.data.message?.content?.some(block =>
+    block.type === 'text' && block.text.includes('new task input arrived before this tool call'))))
+  assert.ok(frames.some(frame => frame.type === 'settled' && frame.state === 'completed_candidate'))
 })
 
 test('runs an authorized dsh tool through the parent and persists its result before the next model call', async () => {
@@ -2104,6 +2274,8 @@ test('runs dsh_delegate in an isolated child session and waits for settlement be
   const statusFrames = frames.filter(frame => frame.type === 'agent_status')
   assert.ok(statusFrames.length > 0)
   assert.ok(statusFrames.every(frame => frame.session_id === start.session_id))
+  const observations = frames.filter(frame => ['agent_status', 'agent_activity', 'agent_heartbeat'].includes(frame.type))
+  assertMonotonicAgentObservations(frames)
   assert.ok(pagesBySession.get(start.session_id)?.length > 0)
   assert.ok(pagesBySession.get(childIdentity.session_id)?.length > 0)
 })
@@ -3377,10 +3549,9 @@ test('restores a completed dsh session from verified pages without replaying the
   assert.equal(result.frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
   assert.equal(result.frames.find(frame => frame.type === 'settled')?.session_id, start.session_id)
   assert.equal(result.frames.some(frame => frame.type === 'model'), false)
-  assert.deepEqual(result.frames.filter(frame => frame.type === 'agent_status'), [{
-    type: 'agent_status', ...taskFence({ ...start, agent_id: 'agent_recovered', generation: 2 }),
-    status: 'idle', observation_sequence: 1,
-  }])
+  assert.deepEqual(result.frames.filter(frame => frame.type === 'agent_status').map(frame => frame.status), ['idle'])
+  const observations = result.frames.filter(frame => ['agent_status', 'agent_activity', 'agent_heartbeat'].includes(frame.type))
+  assertMonotonicAgentObservations(result.frames)
 })
 
 test('runs a trusted background-job continuation after restoring a completed task session', async () => {
@@ -4537,6 +4708,46 @@ test('account runtime rejects a message delivery addressed to another Task sessi
   assert.equal(writes.length, 0)
 })
 
+test('account runtime forwards only exact task activity observations with the admitted revision', async () => {
+  const runtime = new AccountRuntime(new PassThrough(), new PassThrough())
+  runtime.runtime = account
+  const startFrame = accountTask('task_activity_fence')
+  const forwarded = []
+  const failures = []
+  runtime.send = async frame => forwarded.push(frame)
+  runtime.terminateTask = (_task, reason) => failures.push(reason)
+  const newTaskState = () => ({
+    fence: taskFence(startFrame), runtimeSequence: startFrame.runtime_sequence,
+    startFrame, terminated: false, outputBuffer: Buffer.alloc(0), outputFrames: Promise.resolve(),
+    readyReceived: true, started: { promise: Promise.resolve() }, startDispatchFailed: false,
+    observationSequences: new Map(),
+  })
+  const emit = async (task, frame) => {
+    runtime.receiveTaskOutput(task, Buffer.from(`${JSON.stringify(frame)}\n`))
+    await task.outputFrames
+  }
+  const common = { ...taskFence(startFrame), task_revision: startFrame.task_revision, observation_sequence: 1 }
+  const accepted = newTaskState()
+  await emit(accepted, { type: 'agent_status', ...common, status: 'idle' })
+  await emit(accepted, { type: 'agent_activity', ...taskFence(startFrame), task_revision: startFrame.task_revision,
+    observation_sequence: 2, phase: 'model', state: 'started', activity_id: 'mdl_123' })
+  await emit(accepted, { type: 'agent_heartbeat', ...taskFence(startFrame), task_revision: startFrame.task_revision,
+    observation_sequence: 3, phase: 'model', activity_id: 'mdl_123' })
+  assert.deepEqual(forwarded.map(frame => frame.type), ['agent_status', 'agent_activity', 'agent_heartbeat'])
+  assert.ok(forwarded.every(frame => frame.task_revision === startFrame.task_revision && frame.server_instance_id === account.server_instance_id))
+
+  for (const frame of [
+    { type: 'agent_status', ...common, status: 'idle', extra: true },
+    { type: 'agent_activity', ...common, task_revision: startFrame.task_revision + 1,
+      phase: 'model', state: 'started', activity_id: 'mdl_123' },
+    { type: 'agent_heartbeat', ...common, phase: 'tool' },
+  ]) {
+    const rejected = newTaskState()
+    await emit(rejected, frame)
+  }
+  assert.deepEqual(failures, ['output_failed', 'output_failed', 'output_failed'])
+})
+
 test('account runtime forwards fenced running message delivery to the task agent', async t => {
   const task = accountTask('task_account_message', 'Start the account-scoped task.', 1)
   const deliveryID = 'm7654321'
@@ -4598,8 +4809,14 @@ test('account runtime forwards fenced running message delivery to the task agent
     assert.equal(status.server_instance_id, account.server_instance_id)
     assert.equal(status.runtime_id, account.runtime_id)
     assert.equal(status.runtime_generation, account.runtime_generation)
-    assert.equal(status.observation_sequence, index + 1)
+    if (index > 0) assert.ok(status.observation_sequence > statusFrames[index - 1].observation_sequence)
   }
+  const observations = frames.filter(frame => ['agent_status', 'agent_activity', 'agent_heartbeat'].includes(frame.type))
+  assertMonotonicAgentObservations(frames)
+  assert.ok(observations.every(frame => frame.task_revision === task.task_revision))
+  assert.ok(observations.some(frame => frame.type === 'agent_activity' && frame.phase === 'model'))
+  assert.ok(observations.some(frame => frame.type === 'agent_activity' && frame.phase === 'checkpoint'))
+  assert.ok(observations.some(frame => frame.type === 'agent_heartbeat'))
 })
 
 test('account runtime strips account fences before forwarding a tool result to dsh', async t => {
@@ -4953,6 +5170,10 @@ test('account runtime rejects wrong owner, missing or unknown fences, and over-q
       send(proc, accountTask('task_A', 'prompt task_A', 2))
       send(proc, { ...accountTask('task_C', 'prompt task_C', 3), owner_id: 'another_user' })
       send(proc, { ...accountTask('task_D', 'prompt task_D', 4), runtime_generation: account.runtime_generation + 1 })
+      const missingRevision = accountTask('task_missing_revision', 'missing revision', 5)
+      delete missingRevision.task_revision
+      send(proc, missingRevision)
+      send(proc, { ...accountTask('task_negative_revision', 'negative revision', 6), task_revision: -1 })
       send(proc, { type: 'model_end', task_id: 'task_A', id: 'missing-fence', ok: true })
       send(proc, { ...taskFence(accountTask('task_unknown')), type: 'model_end', id: 'unknown', ok: true })
       send(proc, {

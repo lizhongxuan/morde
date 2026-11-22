@@ -350,8 +350,8 @@ func cloudDSHResultEvidenceTool() app.AgentToolDefinition {
 								"before":           map[string]any{"type": "number"},
 								"after":            map[string]any{"type": "number"},
 								"environment":      map[string]any{"type": "string", "minLength": 1, "maxLength": 512},
-				"baseline_call_id": map[string]any{"type": "string", "maxLength": 128, "description": "Root-session tool call whose reconciled output is a morde.performance_measurement.v1 JSON object."},
-				"after_call_id":    map[string]any{"type": "string", "maxLength": 128, "description": "Root-session tool call whose reconciled output is a morde.performance_measurement.v1 JSON object."},
+								"baseline_call_id": map[string]any{"type": "string", "maxLength": 128, "description": "Root-session tool call whose reconciled output is a morde.performance_measurement.v1 JSON object."},
+								"after_call_id":    map[string]any{"type": "string", "maxLength": 128, "description": "Root-session tool call whose reconciled output is a morde.performance_measurement.v1 JSON object."},
 							},
 							"required":             []string{"metric", "unit", "before", "after", "environment", "baseline_call_id", "after_call_id"},
 							"additionalProperties": false,
@@ -758,6 +758,7 @@ type cloudDSHFrame struct {
 	From                *int64          `json:"from_seq,omitempty"`
 	Through             *int64          `json:"through_seq,omitempty"`
 	ObservationSequence *int64          `json:"observation_sequence,omitempty"`
+	TaskRevision        *int64          `json:"task_revision,omitempty"`
 	Payload             string          `json:"payload,omitempty"`
 	SHA256              string          `json:"sha256,omitempty"`
 	Request             json.RawMessage `json:"request,omitempty"`
@@ -766,6 +767,8 @@ type cloudDSHFrame struct {
 	Arguments           json.RawMessage `json:"arguments,omitempty"`
 	State               string          `json:"state,omitempty"`
 	Status              string          `json:"status,omitempty"`
+	Phase               string          `json:"phase,omitempty"`
+	ActivityID          string          `json:"activity_id,omitempty"`
 	Code                string          `json:"code,omitempty"`
 	Summary             string          `json:"summary,omitempty"`
 	JobID               string          `json:"job_id,omitempty"`
@@ -833,7 +836,9 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 	}
 	fields := map[string][]string{
 		"ready":             {"type", "version", "engine", "engine_version"},
-		"agent_status":      {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "status", "observation_sequence"},
+		"agent_status":      {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "task_revision", "status", "observation_sequence"},
+		"agent_activity":    {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "task_revision", "observation_sequence", "phase", "state", "activity_id"},
+		"agent_heartbeat":   {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "task_revision", "observation_sequence", "phase", "activity_id"},
 		"checkpoint":        {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq", "through_seq", "payload", "sha256"},
 		"checkpoint_read":   {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq"},
 		"model":             {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "request", "sha256"},
@@ -859,7 +864,53 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 			return cloudDSHFrame{}, errors.New("missing dsh frame field")
 		}
 	}
+	if !validCloudDSHObservationFrame(frame, keys) {
+		return cloudDSHFrame{}, errors.New("invalid dsh agent observation frame")
+	}
 	return frame, nil
+}
+
+func validCloudDSHObservationFrame(frame cloudDSHFrame, fields map[string]json.RawMessage) bool {
+	if frame.Type != "agent_status" && frame.Type != "agent_activity" && frame.Type != "agent_heartbeat" {
+		return true
+	}
+	if frame.TaskRevision == nil || *frame.TaskRevision < 0 || *frame.TaskRevision > 1<<53-1 ||
+		frame.ObservationSequence == nil || *frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 {
+		return false
+	}
+	switch frame.Type {
+	case "agent_status":
+		return validCloudDSHJSONStringField(fields, "status") && (frame.Status == "idle" || frame.Status == "running")
+	case "agent_activity":
+		return validCloudDSHJSONStringField(fields, "phase") && validCloudDSHActivityPhase(frame.Phase) &&
+			validCloudDSHJSONStringField(fields, "state") && validCloudDSHActivityState(frame.State) &&
+			validCloudDSHJSONStringField(fields, "activity_id") && cloudDSHID.MatchString(frame.ActivityID)
+	case "agent_heartbeat":
+		if !validCloudDSHJSONStringField(fields, "phase") || !validCloudDSHJSONStringField(fields, "activity_id") {
+			return false
+		}
+		return frame.Phase == "" && frame.ActivityID == "" ||
+			validCloudDSHActivityPhase(frame.Phase) && cloudDSHID.MatchString(frame.ActivityID)
+	default:
+		return false
+	}
+}
+
+func validCloudDSHJSONStringField(fields map[string]json.RawMessage, name string) bool {
+	raw, exists := fields[name]
+	if !exists {
+		return false
+	}
+	raw = bytes.TrimSpace(raw)
+	return len(raw) > 0 && raw[0] == '"'
+}
+
+func validCloudDSHActivityPhase(phase string) bool {
+	return phase == "model" || phase == "tool" || phase == "subagent" || phase == "checkpoint"
+}
+
+func validCloudDSHActivityState(state string) bool {
+	return state == "started" || state == "waiting" || state == "completed" || state == "failed" || state == "cancelled"
 }
 
 // Reject duplicate keys at every depth before either side interprets a frame.

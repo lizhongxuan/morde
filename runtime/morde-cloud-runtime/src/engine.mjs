@@ -48,6 +48,10 @@ const MAX_CHILD_SUMMARY_BYTES = 1024 * 1024
 const MAX_USER_MESSAGE_BYTES = 128 * 1024
 const MAX_COMPACTION_INPUT_BYTES = 128 * 1024
 const MAX_COMPACTION_SUMMARY_BYTES = 256 * 1024
+const STALE_MODEL_TOOL_MESSAGE = 'A new task input arrived before this tool call was dispatched. Re-evaluate the updated request first.'
+const AGENT_HEARTBEAT_INTERVAL_MS = 15_000
+const ACTIVITY_PHASES = new Set(['model', 'tool', 'subagent', 'checkpoint'])
+const ACTIVITY_STATES = new Set(['started', 'waiting', 'completed', 'failed', 'cancelled'])
 const SOUL = readFileSync(new URL('./SOUL.md', import.meta.url), 'utf8')
 const COMPACTION_END_MARKER = 'End of the authorized conversation sources. This marker is not source content.'
 const COMPACTION_SUMMARY_PROMPT = [
@@ -127,10 +131,19 @@ function mordeMCPToolDefinition(sessionDurable, tool, onError) {
     async execute(args, execution) {
       try {
         if (!isObject(args)) throw new Error('Morde MCP tool arguments are invalid')
-        const result = await sessionDurable.ipc.toolCall(
-          sessionDurable.identity, sessionDurable.through, execution.callId, tool.name, args, execution.signal,
-        )
-        if (!validMordeMCPToolResult(result)) throw new Error('Morde MCP broker returned an invalid result')
+        if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
+          return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
+        }
+        const result = await sessionDurable.runActivity('tool', execution.callId, execution.signal, async () => {
+          if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
+            return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
+          }
+          const response = await sessionDurable.ipc.toolCall(
+            sessionDurable.identity, sessionDurable.through, execution.callId, tool.name, args, execution.signal,
+          )
+          if (!validMordeMCPToolResult(response)) throw new Error('Morde MCP broker returned an invalid result')
+          return response
+        })
         return result
       } catch (error) {
         onError?.(error, execution)
@@ -574,6 +587,7 @@ export function validStart(frame) {
   } else if (!taskValidationReview && !['task_id', 'owner_id', 'agent_id', 'session_id'].every(key => typeof frame[key] === 'string' && ID.test(frame[key]))) return false
   if (!taskValidationReview && !['generation', 'authorization_version'].every(key => Number.isSafeInteger(frame[key]) && frame[key] > 0)) return false
   if (typeof frame.model !== 'string' || !frame.model.trim() || Buffer.byteLength(frame.model) > 256) return false
+  if (!coordinator && !taskValidationReview && (!Number.isSafeInteger(frame.task_revision) || frame.task_revision < 0)) return false
   if (!coordinator && !taskValidationReview && frame.context_window_tokens !== undefined && (!Number.isSafeInteger(frame.context_window_tokens) ||
       frame.context_window_tokens < 4096 || frame.context_window_tokens > 2_000_000)) return false
   if (!validTools(frame.tools)) return false
@@ -806,7 +820,16 @@ class DurableSession {
     this.stepRetryDispatched = false
     this.recoveryHasInbox = false
     this.messageDeliveryVersion = 0
+    this.modelDeliveryVersion = 0
     this.messageDeliveryCheckpoints = new Set()
+    this.taskRevision = Number.isSafeInteger(start.task_revision) && start.task_revision >= 0 ? start.task_revision : undefined
+    this.observationsEnabled = this.taskRevision !== undefined && start.context_role !== 'coordinator' &&
+      start.context_role !== 'task_validation_review'
+    this.observationSequence = 0
+    this.observationWrites = Promise.resolve()
+    this.observationFailure = undefined
+    this.activeActivities = new Map()
+    this.heartbeatTimer = undefined
     this.firstCheckpoint = deferred()
     void this.firstCheckpoint.promise.catch(() => {})
   }
@@ -845,6 +868,80 @@ class DurableSession {
     return result
   }
 
+  observeStatus(status) {
+    if (!this.observationsEnabled) return Promise.resolve()
+    if (!['idle', 'running'].includes(status)) return this.failObservation('invalid agent status')
+    return this.sendObservation({ type: 'agent_status', status })
+  }
+
+  observeActivity(phase, state, activityID) {
+    if (!this.observationsEnabled) return Promise.resolve()
+    if (!ACTIVITY_PHASES.has(phase) || !ACTIVITY_STATES.has(state) || !ID.test(activityID ?? '')) {
+      return this.failObservation('invalid agent activity')
+    }
+    if (state === 'started' || state === 'waiting') {
+      this.activeActivities.delete(activityID)
+      this.activeActivities.set(activityID, { phase, activityID })
+    } else {
+      this.activeActivities.delete(activityID)
+    }
+    return this.sendObservation({ type: 'agent_activity', phase, state, activity_id: activityID })
+  }
+
+  observeHeartbeat() {
+    if (!this.observationsEnabled) return Promise.resolve()
+    const current = [...this.activeActivities.values()].at(-1)
+    return this.sendObservation({ type: 'agent_heartbeat', phase: current?.phase ?? '', activity_id: current?.activityID ?? '' })
+  }
+
+  startHeartbeats() {
+    if (!this.observationsEnabled || this.heartbeatTimer) return
+    void this.observeHeartbeat().catch(() => {})
+    this.heartbeatTimer = setInterval(() => { void this.observeHeartbeat().catch(() => {}) }, AGENT_HEARTBEAT_INTERVAL_MS)
+    this.heartbeatTimer.unref?.()
+  }
+
+  stopHeartbeats() {
+    if (this.heartbeatTimer) clearInterval(this.heartbeatTimer)
+    this.heartbeatTimer = undefined
+  }
+
+  async runActivity(phase, activityID, signal, action) {
+    await this.observeActivity(phase, 'started', activityID)
+    try {
+      const result = await action()
+      await this.observeActivity(phase, 'completed', activityID)
+      return result
+    } catch (error) {
+      const state = signal?.aborted || this.ipc.cancelled ? 'cancelled' : 'failed'
+      await this.observeActivity(phase, state, activityID)
+      throw error
+    }
+  }
+
+  sendObservation(fields) {
+    if (this.observationFailure) return Promise.reject(this.observationFailure)
+    if (this.observationSequence >= Number.MAX_SAFE_INTEGER) return this.failObservation('agent observation sequence exhausted')
+    const sequence = ++this.observationSequence
+    const frame = { ...fields, ...this.identity, task_revision: this.taskRevision, observation_sequence: sequence }
+    const pending = this.observationWrites.then(() => {
+      if (this.observationFailure) throw this.observationFailure
+      return this.ipc.send(frame)
+    })
+    this.observationWrites = pending.catch(error => {
+      this.observationFailure = error
+      this.ipc.fail?.('agent observation dispatch failed')
+    })
+    return pending
+  }
+
+  failObservation(message) {
+    const error = new Error(message)
+    this.observationFailure = error
+    this.ipc.fail?.(message)
+    return Promise.reject(error)
+  }
+
   async write(header, events) {
     if (header.id !== this.identity.session_id) throw new Error('session identity mismatch')
     let cursor = 0
@@ -866,7 +963,8 @@ class DurableSession {
       }
       const through = from + batch.length - 1
       const digest = createHash('sha256').update(payload, 'utf8').digest('hex')
-      await this.ipc.checkpoint(this.identity, from, through, payload, digest)
+      await this.runActivity('checkpoint', `checkpoint_${through}`, undefined,
+        () => this.ipc.checkpoint(this.identity, from, through, payload, digest))
       this.through = through
       this.digest = digest
       this.firstCheckpoint.resolve()
@@ -1344,14 +1442,8 @@ export async function runAgent(ipc, frame) {
       sessionDurable.agentState = state
       agentCtx.on('agent/error', () => { state.failed = true })
       if (!coordinator && !taskValidationReview && sessionDurable === durable) {
-        let observationSequence = 0
         const observeStatus = status => {
-          if (!['idle', 'running'].includes(status) || observationSequence >= Number.MAX_SAFE_INTEGER) {
-            ipc.fail('invalid agent status')
-            return
-          }
-          void ipc.send({ type: 'agent_status', ...sessionDurable.identity, status,
-            observation_sequence: ++observationSequence }).catch(() => ipc.fail('agent status dispatch failed'))
+          void sessionDurable.observeStatus(status).catch(() => ipc.fail('agent status dispatch failed'))
         }
         agentCtx.on('agent/status', ({ agent: subject, status }) => {
           if (subject === agent) observeStatus(status)
@@ -1372,10 +1464,15 @@ export async function runAgent(ipc, frame) {
           agent.cancel({ kind: 'hook', reason: 'clarification must be the only tool call in its model turn' })
           return { kind: 'deny', reason: 'clarification must be the only tool call in its model turn' }
         }
-        if (toolNames.has(exec.name)) return { kind: 'allow' }
-        state.toolFailure = true
-        agent.cancel({ kind: 'hook', reason: 'tool authorization is unavailable' })
-        return { kind: 'deny', reason: 'tool authorization is unavailable' }
+        if (!toolNames.has(exec.name)) {
+          state.toolFailure = true
+          agent.cancel({ kind: 'hook', reason: 'tool authorization is unavailable' })
+          return { kind: 'deny', reason: 'tool authorization is unavailable' }
+        }
+        if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
+          return { kind: 'deny', reason: STALE_MODEL_TOOL_MESSAGE }
+        }
+        return { kind: 'allow' }
       })
       for (const tool of tools) {
         const onError = (_error, exec) => {
@@ -1401,11 +1498,20 @@ export async function runAgent(ipc, frame) {
           },
           async execute(args, exec) {
             if (!args || typeof args !== 'object' || Array.isArray(args)) throw new Error('tool arguments must be an object')
+            if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
+              return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
+            }
             try {
               if (tool.name === DELEGATE_TOOL) {
-                return await runDelegation(sessionDurable, agent, exec.callId, args, exec.signal)
+                return await sessionDurable.runActivity('subagent', exec.callId, exec.signal,
+                  () => runDelegation(sessionDurable, agent, exec.callId, args, exec.signal))
               }
-              return await ipc.toolCall(sessionDurable.identity, sessionDurable.through, exec.callId, tool.name, args, exec.signal)
+              return await sessionDurable.runActivity('tool', exec.callId, exec.signal, () => {
+                if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
+                  return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
+                }
+                return ipc.toolCall(sessionDurable.identity, sessionDurable.through, exec.callId, tool.name, args, exec.signal)
+              })
             } catch (error) {
               onError(error, exec)
               throw error
@@ -1420,13 +1526,19 @@ export async function runAgent(ipc, frame) {
       : ctx.agents.create({ ...options, sessionId: SessionId(sessionDurable.identity.session_id) })
     return pending.then(handle => {
       liveHandles.add(handle)
+      sessionDurable.startHeartbeats()
+      const dispose = handle.dispose.bind(handle)
+      handle.dispose = async (...args) => {
+        sessionDurable.stopHeartbeats()
+        return dispose(...args)
+      }
       return handle
     })
   }
 
   async function runChildSession(child, callID, argumentsValue, parentAgent, signal, job) {
     const childStart = {
-      type: 'start', version: 1, ...child.identity, model: frame.model, tools: child.tools,
+      type: 'start', version: 1, ...child.identity, task_revision: frame.task_revision, model: frame.model, tools: child.tools,
       ...(child.through < 0 ? { prompt: `# ${argumentsValue.title}\n\n${argumentsValue.objective}` } : {
         resume: true, checkpoint_through_seq: child.through, checkpoint_sha256: child.digest,
       }),
@@ -1543,6 +1655,9 @@ export async function runAgent(ipc, frame) {
     const run = delegateQueue.then(async () => {
       signal?.throwIfAborted()
       if (ipc.cancelled) throw new Error('delegated task was cancelled')
+      if (parentAgent && parentDurable.modelDeliveryVersion !== parentDurable.messageDeliveryVersion) {
+        return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
+      }
       const response = await ipc.createChild(parentDurable.identity, parentDurable.through, callID, argumentsValue, signal)
       const child = validateChildSession(response, parentDurable.identity, callID, argumentsValue, appTools)
       if (argumentsValue.run_in_background === true) {
@@ -1619,6 +1734,7 @@ export async function runAgent(ipc, frame) {
       if (sessionDurable.through <= sessionDurable.lastModelThrough) throw new Error('model request has no new durable prefix')
       const requestThrough = sessionDurable.through
       const deliveryVersion = sessionDurable.messageDeliveryVersion
+      sessionDurable.modelDeliveryVersion = deliveryVersion
       sessionDurable.lastModelThrough = requestThrough
       const request = {
         provider: options.provider,
@@ -1640,7 +1756,9 @@ export async function runAgent(ipc, frame) {
             sessionDurable.identity.session_id, requestThrough)
         : modelCallID(sessionDurable.identity.task_id, sessionDurable.identity.session_id, requestThrough)
       const chunks = []
-      for await (const chunk of ipc.streamModel(sessionDurable.identity, id, requestThrough, request, options.signal)) chunks.push(chunk)
+      await sessionDurable.runActivity('model', id, options.signal, async () => {
+        for await (const chunk of ipc.streamModel(sessionDurable.identity, id, requestThrough, request, options.signal)) chunks.push(chunk)
+      })
       if (deliveryVersion !== sessionDurable.messageDeliveryVersion) {
         const text = 'A new task input arrived during this model call. Re-evaluate the current task before taking action.'
         yield { type: 'block-start', index: 0, blockType: 'text' }

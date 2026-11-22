@@ -1,6 +1,6 @@
 # S02｜DSH Runtime、运行中消息与子会话
 
-**状态：** 未开始（H 项状态见[主 TODO](../Morde_Harness_实施任务_TODO.md)）。
+**状态：** 已完成（本地 S02 范围，2026-11-22；PC/iOS 真实入口、真实模型和耐久验收仍待 H06；H 项状态见[主 TODO](../Morde_Harness_实施任务_TODO.md)）。
 
 **共同开发门禁：** 缺陷必须按[并发总控](00-并发实施总控.md)追到机制根因；复杂方案、取舍和模块/函数边界要留档。不得只增大测试阈值或缩短上下文绕过失败。
 
@@ -12,7 +12,7 @@
 
 ## 文件所有权
 
-独占[总控表](00-并发实施总控.md)中 S02 的文件。唯一拥有 `runtime/morde-cloud-runtime/src/engine.mjs`、`hermes-compaction-window.mjs` 及对应 Node 测试；并拥有 Go DSH executor/session-tree、app/store agent checkpoint 适配及对应测试。
+独占[总控表](00-并发实施总控.md)中 S02 的文件。唯一拥有 `runtime/morde-cloud-runtime/src/engine.mjs`、`account-runtime.mjs`（仅 Task Agent status/activity/heartbeat 帧校验）、`hermes-compaction-window.mjs` 及对应 Node 测试；并拥有 Go DSH executor/session-tree、app/store agent checkpoint 适配及对应测试。为保证已持久化但尚未进入 DSH checkpoint 的 steer 不继续发布旧文本，S02 另拥有 `server/internal/store/postgres/task_stream.go` 与 `task_stream_integration_test.go` 的对应栅栏改动。Task Agent 活动协议的生产和 Runtime 帧校验属于 S02；持久化 observation、Task 快照投影及停滞提示属于 S03。
 
 不编辑 `conversation_route_*.go`、服务端摘要/路由文件、Broker、`task_worker*.go`、客户端或共享文档。S01 决定服务端 route state/目标合同；S03 决定授权/预算合同；如果缺口需要改对方文件，提交接口提案，由文件 owner 实施。
 
@@ -27,6 +27,27 @@
 ## 验收
 
 运行 Runtime 的投递、compaction、recovery 与子会话 Node 测试，及 Go DSH executor/session-tree/checkpoint 测试。覆盖模型调用期间投递、序列顺序、回执丢失重放、领取后重启不重复、Session 隔离、至少两个子 Agent 并行与主 Agent据实汇总。长历史 PostgreSQL/Node DSH E2E 属于本域；实际 PC/iOS、真实模型与耐久验收交 S07。
+
+## 本轮实施与验证（2026-11-22）
+
+### 实施结果
+
+- 沿用锁定 DSH `0.2.2-rc.1` 的 AgentLoop、Session、checkpoint、TokenMeter、ToolResultPruner 和现有 Morde `WorkerModel` provider。`dsh-mcp-client` 虽在锁文件中但 Runtime 未注册，实际 MCP 仍经 Morde Broker；锁定依赖没有满足 Morde 子 Agent 身份、工具子集、预算、账本和恢复边界的专用插件，因此沿用持久化 `dsh_delegate` 子 Session，不增加依赖或另建 Agent 循环。
+- Hermes 按固定 SHA `0d49d6d9d20e461155d49ba9d188687079c811af` 对照。Morde 复用 DSH `BasicCompactionEngine`、TokenMeter 与 ToolResultPruner，只在窗口选择处保留 Hermes 行为映射；`hermes-compaction-window.mjs` 保留 MIT notice。Morde 用 Task/Agent generation/authorization/session/lease 栅栏管理运行，不宣称与 Hermes resolved-session alias 的跨进程租约完全等价。
+- 运行中收到 steer 时，Runtime 在工具预执行门和实际 IPC/子 Agent 派发前复核消息版本；旧模型响应被抑制并保留 usage。PostgreSQL 在已有 Task/会话栅栏内发现同 Task 的 pending steer 后，中止旧文本增量并保留已展示快照。Worker 在把模型结果送回 Runtime 前先投递 pending steer，再将旧结果替换成重新评估提示。
+- 长历史集成 fixture 为各 Runtime manager 启动、取消并检查 Run 生命周期；回收候选按测试 LeaseOwner 隔离，模拟 main Runtime 重启前先停止并 join 旧 manager。
+
+### 验证结果
+
+- Node Runtime、compaction、recovery 与 Hermes compaction 五组测试全部通过；`node --check src/engine.mjs`、`gofmt -d` 和 `git diff --check` 无输出。
+- Go app checkpoint/inbox 定向测试通过；PostgreSQL `^TestCloudDSHStream` 全套通过，新回归确认 pending steer 后不再追加旧 delta，原可见文本保留为 interrupted。
+- Worker `^TestCloudDSH` 全套通过；新协议回归确认 pending steer 先送达 Runtime，旧模型工具调用不执行。840 条长历史重启与授权历史检索 E2E 通过。
+- 真实 PostgreSQL 路由与 `runCloudDSH` 协议分别由 Store 集成测试和 Worker 协议测试覆盖，本轮未将它们拼成一个跨层端到端测试。
+
+### 未覆盖范围
+
+本轮未运行真实模型调用、PC/iOS 客户端入口、跨端接续或 60 分钟耐久任务；这些仍由 H06 验收。完整 Worker 回归中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 曾间歇性在领取断言失败，单独重跑和后续完整重跑通过；该时序波动记录在[验证记录](../验证记录/Morde_Harness_最终流程测试用例.md)中，仍需留意。
+未运行 Hermes 上游 Python 测试；本轮上游比对基于固定 SHA 源码/测试审阅，自动回归使用 Morde 当前锁定的 Node DSH Runtime。
 
 ## 会话完成回报
 

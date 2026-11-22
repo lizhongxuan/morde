@@ -25,6 +25,40 @@ import (
 	storepostgres "morde/server/internal/store/postgres"
 )
 
+type conversationContextScopedRuntimeControl struct {
+	CloudDSHAccountRuntimeControl
+	leaseOwner string
+}
+
+func (c conversationContextScopedRuntimeControl) ListAccountAgentRuntimeStopCandidates(ctx context.Context, limit int) ([]app.AccountAgentRuntimeStopIdentity, error) {
+	candidates, err := c.CloudDSHAccountRuntimeControl.ListAccountAgentRuntimeStopCandidates(ctx, limit)
+	if err != nil {
+		return nil, err
+	}
+	scoped := candidates[:0]
+	for _, candidate := range candidates {
+		if candidate.Fence.LeaseOwner == c.leaseOwner {
+			scoped = append(scoped, candidate)
+		}
+	}
+	return scoped, nil
+}
+
+func (c conversationContextScopedRuntimeControl) ListPendingAccountAgentRuntimeStopAttestations(ctx context.Context, limit int,
+	verifier app.AccountAgentRuntimeStopVerifier) ([]app.AccountAgentRuntimeStopAttestation, error) {
+	attestations, err := c.CloudDSHAccountRuntimeControl.ListPendingAccountAgentRuntimeStopAttestations(ctx, limit, verifier)
+	if err != nil {
+		return nil, err
+	}
+	scoped := attestations[:0]
+	for _, attestation := range attestations {
+		if attestation.Fence.LeaseOwner == c.leaseOwner {
+			scoped = append(scoped, attestation)
+		}
+	}
+	return scoped, nil
+}
+
 func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
@@ -137,6 +171,34 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 		t.Fatal(err)
 	}
 	supervisors := make(map[string]*f01RecoveringNodeAccountSupervisor, len(conversationIDs)+1)
+	managerRunCancels := make(map[string]context.CancelFunc, len(conversationIDs)+1)
+	managerRunDone := make(map[string]<-chan struct{}, len(conversationIDs)+1)
+	var managerRunWG sync.WaitGroup
+	managerRunErrors := make(chan error, len(conversationIDs)+1)
+	defer func() {
+		for _, cancelManagerRun := range managerRunCancels {
+			cancelManagerRun()
+		}
+		managerRunWG.Wait()
+		close(managerRunErrors)
+		for err := range managerRunErrors {
+			t.Errorf("account Agent Runtime manager failed: %v", err)
+		}
+		for _, supervisor := range supervisors {
+			if command := supervisor.cmd; command != nil && command.Process != nil && command.ProcessState == nil {
+				_ = command.Process.Kill()
+				_ = command.Wait()
+			}
+		}
+	}()
+	stopManagerRun := func(leaseOwner string) {
+		if cancelManagerRun := managerRunCancels[leaseOwner]; cancelManagerRun != nil {
+			cancelManagerRun()
+			if done := managerRunDone[leaseOwner]; done != nil {
+				<-done
+			}
+		}
+	}
 	makeCoordinator := func(conversationID, leaseOwner string) *CloudDSHConversationCoordinator {
 		t.Helper()
 		supervisor := &f01RecoveringNodeAccountSupervisor{
@@ -145,12 +207,28 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 		}
 		supervisors[leaseOwner] = supervisor
 		manager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
-			Control: accountRuntimes, Supervisor: supervisor, Guardian: &f01NodeTaskGuardian{}, StopVerifier: stopVerifier,
+			Control:    conversationContextScopedRuntimeControl{CloudDSHAccountRuntimeControl: accountRuntimes, leaseOwner: leaseOwner},
+			Supervisor: supervisor, Guardian: &f01NodeTaskGuardian{}, StopVerifier: stopVerifier,
 			TaskStopper: &accountRuntimeTaskStopperStub{}, LeaseOwner: leaseOwner, MaxTasks: 4,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
+		managerRunCtx, cancelManagerRun := context.WithCancel(ctx)
+		managerRunCancels[leaseOwner] = cancelManagerRun
+		done := make(chan struct{})
+		managerRunDone[leaseOwner] = done
+		managerRunWG.Add(1)
+		go func() {
+			defer managerRunWG.Done()
+			defer close(done)
+			if err := manager.Run(managerRunCtx); managerRunCtx.Err() == nil {
+				if err == nil {
+					err = errors.New("manager stopped before fixture cleanup")
+				}
+				managerRunErrors <- fmt.Errorf("run account Agent Runtime manager %s: %w", leaseOwner, err)
+			}
+		}()
 		coordinator, err := NewCloudDSHConversationCoordinator(CloudDSHConversationCoordinatorOptions{
 			AccountRuntimes: manager, Models: gateway, Checkpoints: checkpoints, SummaryStore: store,
 		})
@@ -172,14 +250,6 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		for _, supervisor := range supervisors {
-			if command := supervisor.cmd; command != nil && command.Process != nil && command.ProcessState == nil {
-				_ = command.Process.Kill()
-				_ = command.Wait()
-			}
-		}
-	}()
 	lastClientMessageIDs := make(map[string]string, len(conversationIDs))
 	acceptAndRoute := func(conversationID, content, clientID string) string {
 		t.Helper()
@@ -255,6 +325,22 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, oldMainFence.ServiceInstanceID, owner.ID, oldMainFence.RuntimeID); err != nil {
 		t.Fatal(err)
 	}
+	stopped := false
+	for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); {
+		current, found, err := accountRuntimes.Get(ctx, mainConversation.ConversationID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if found && current.Fence == oldMainFence && current.State == app.AccountAgentRuntimeStopped {
+			stopped = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !stopped {
+		t.Fatal("old main account Runtime was not reaped by its lifecycle manager")
+	}
+	stopManagerRun("context-e2e-runtime-0")
 	var bulkMessageIDs []string
 	for index := 0; index < 840; index++ {
 		prefix := fmt.Sprintf("Archive history row=%04d ", index)
