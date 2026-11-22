@@ -824,6 +824,17 @@ func TestCloudTaskWithCancelledPersonalChildFailsClosedAfterNodeRestart(t *testi
 		submitted.Task.ID, fence.AgentGeneration).Scan(&oldState); err != nil || oldState != "stopped" {
 		t.Fatalf("old Agent stop proof state=%q err=%v interrupted=%v", oldState, err, interruptedErr)
 	}
+	shutdownRoot, err := store.GetTask(ctx, submitted.Task.ID, owner.ID)
+	if err != nil {
+		t.Fatalf("read final parent checkpoint after old Executor and Node stopped: %v", err)
+	}
+	finalRootCheckpointThrough := shutdownRoot.Task.CheckpointThroughSequence
+	finalRootCheckpointDigest := append([]byte(nil), shutdownRoot.Task.CheckpointDigest...)
+	if finalRootCheckpointThrough < oldRootCheckpointThrough || len(finalRootCheckpointDigest) != 32 ||
+		finalRootCheckpointThrough == oldRootCheckpointThrough && !bytes.Equal(finalRootCheckpointDigest, oldRootCheckpointDigest) {
+		t.Fatalf("parent checkpoint regressed while old Executor and Node stopped: before=%d/%x after=%d/%x",
+			oldRootCheckpointThrough, oldRootCheckpointDigest, finalRootCheckpointThrough, finalRootCheckpointDigest)
+	}
 	var parentStatus, parentLeaseOwner string
 	var pendingStopRequests int
 	if err := pool.QueryRow(ctx, `SELECT status,lease_owner FROM tasks WHERE id=$1`, submitted.Task.ID).
@@ -856,7 +867,7 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3 AND runtime
 	}
 	recovered, found, err := store.ClaimNextTask(ctx, "f01-child-cancel-worker-new", 5*time.Minute)
 	if err != nil || !found || recovered.ID != submitted.Task.ID || recovered.AgentSessionID != fence.AgentSessionID ||
-		recovered.CheckpointThroughSequence != oldRootCheckpointThrough || !bytes.Equal(recovered.CheckpointDigest, oldRootCheckpointDigest) {
+		recovered.CheckpointThroughSequence != finalRootCheckpointThrough || !bytes.Equal(recovered.CheckpointDigest, finalRootCheckpointDigest) {
 		t.Fatalf("claim recoverable parent session: task=%#v found=%t err=%v", recovered, found, err)
 	}
 	secondRuntimeSupervisor := makeSupervisor()
@@ -901,7 +912,7 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3`, submitted.Task.ID, ow
 	}
 	parent, err := store.GetTask(ctx, submitted.Task.ID, owner.ID)
 	if err != nil || parent.Task.AgentGeneration != fence.AgentGeneration+1 || parent.Task.AgentSessionID != fence.AgentSessionID ||
-		parent.Task.CheckpointThroughSequence != oldRootCheckpointThrough || !bytes.Equal(parent.Task.CheckpointDigest, oldRootCheckpointDigest) {
+		parent.Task.CheckpointThroughSequence != finalRootCheckpointThrough || !bytes.Equal(parent.Task.CheckpointDigest, finalRootCheckpointDigest) {
 		t.Fatalf("failed-closed recovery changed the pinned parent checkpoint: task=%#v err=%v", parent.Task, err)
 	}
 }
@@ -1141,6 +1152,17 @@ func TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatalf("first Node Runtime did not exit: %v", ctx.Err())
 	}
+	shutdownDetails, err := store.GetTask(ctx, taskID, owner.ID)
+	if err != nil {
+		t.Fatalf("read final parent checkpoint after old Executor and Node stopped: %v", err)
+	}
+	finalRootCheckpointThrough := shutdownDetails.Task.CheckpointThroughSequence
+	finalRootCheckpointDigest := append([]byte(nil), shutdownDetails.Task.CheckpointDigest...)
+	if finalRootCheckpointThrough < rootThroughBeforeRestart || len(finalRootCheckpointDigest) != 32 ||
+		finalRootCheckpointThrough == rootThroughBeforeRestart && !bytes.Equal(finalRootCheckpointDigest, rootDigestBeforeRestart) {
+		t.Fatalf("parent checkpoint regressed while old Executor and Node stopped: before=%d/%x after=%d/%x",
+			rootThroughBeforeRestart, rootDigestBeforeRestart, finalRootCheckpointThrough, finalRootCheckpointDigest)
+	}
 	firstManager.mu.Lock()
 	firstRuntimeSession := firstManager.sessions[claimed.ConversationID]
 	firstManager.mu.Unlock()
@@ -1159,7 +1181,7 @@ WHERE id=$1 AND lease_owner=$2 AND lease_version=$3`, taskID, claimed.Lease.Owne
 	}
 	recovered, found, err := store.ClaimNextTask(ctx, "f07-background-output-worker-two", 5*time.Minute)
 	if err != nil || !found || recovered.ID != taskID || recovered.AgentSessionID != rootSessionID ||
-		recovered.CheckpointThroughSequence != rootThroughBeforeRestart || !bytes.Equal(recovered.CheckpointDigest, rootDigestBeforeRestart) {
+		recovered.CheckpointThroughSequence != finalRootCheckpointThrough || !bytes.Equal(recovered.CheckpointDigest, finalRootCheckpointDigest) {
 		t.Fatalf("claim parent after first lease expiry: task=%#v found=%t err=%v", recovered, found, err)
 	}
 
