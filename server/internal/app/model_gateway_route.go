@@ -668,8 +668,10 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 	}
 	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancelSettle()
-	if err := store.SettleConversationRouteModelCall(settleCtx, call, decision, response.Usage, unknown); err != nil {
-		return ModelResponse{}, fmt.Errorf("settle coordinator model call: %w", err)
+	if !confirmedConversationRouteRejection(callErr) {
+		if err := store.SettleConversationRouteModelCall(settleCtx, call, decision, response.Usage, unknown); err != nil {
+			return ModelResponse{}, fmt.Errorf("settle coordinator model call: %w", err)
+		}
 	}
 	if callErr != nil {
 		return ModelResponse{}, conversationRouteProviderError(callErr)
