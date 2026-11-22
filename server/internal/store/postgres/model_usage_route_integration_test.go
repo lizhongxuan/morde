@@ -33,6 +33,32 @@ type routeModelClientTest struct {
 	allowRepeated bool
 }
 
+type coordinatorRouteGatewayTest struct {
+	t       *testing.T
+	gateway *app.ModelGatewayService
+}
+
+func (m coordinatorRouteGatewayTest) ResolveConversationRouteModel(ctx context.Context, claim app.ConversationRouteClaim) (string, error) {
+	return m.gateway.ResolveConversationRouteModel(ctx, claim)
+}
+
+func (m coordinatorRouteGatewayTest) ClassifyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim,
+	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
+	request, err := app.ConversationRouteModelRequest(value)
+	if err != nil {
+		return app.ConversationRouteDecision{}, err
+	}
+	raw := routeCoordinatorRequestRaw(m.t, value.ModelID, request.Instructions, request.Input[0].Text)
+	response, err := m.gateway.CompleteConversationCoordinatorModel(ctx, claim, value,
+		fmt.Sprintf("coord_session_%08d", claim.RouteAttempt), 0, raw)
+	if err != nil {
+		return app.ConversationRouteDecision{}, err
+	}
+	decision := app.ParseConversationRouteDecisionForContext(response.Text, value)
+	decision.ModelOutput = response.Text
+	return decision, nil
+}
+
 func TestConversationRouteRepairsOneInvalidOutputWithSeparateMeteredCall(t *testing.T) {
 	for _, test := range []struct {
 		name          string
@@ -366,6 +392,101 @@ context_window_tokens=32768,context_window_override_tokens=32768,context_window_
 		t.Fatal(err)
 	}
 	return store, gateway, principal, claim, snapshot.Context
+}
+
+func TestCoordinatorRouteRetriesConfirmedRateLimitWithNewMeteredIdentity(t *testing.T) {
+	client := &routeModelClientTest{err: &app.ModelClientError{Kind: app.ModelErrorRateLimited,
+		Stage: "provider_status", RetryAfter: time.Second}}
+	store, gateway, _, initialClaim, _ := routeModelFixture(t, true, client)
+	ctx := context.Background()
+	if err := store.ReleaseConversationRoute(ctx, initialClaim); err != nil {
+		t.Fatal(err)
+	}
+	routeWorker, err := worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
+		Queue: store, Actions: store, Models: coordinatorRouteGatewayTest{t: t, gateway: gateway},
+		WorkerID: "coordinator-route-rate-limit-test", LeaseDuration: time.Minute,
+		PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	callIDs := make(map[string]struct{}, 3)
+	for attempt := int64(0); attempt < 3; attempt++ {
+		if attempt > 0 {
+			if _, err := store.pool.Exec(ctx, `UPDATE conversation_message_routes SET available_after=clock_timestamp() WHERE message_id=$1`,
+				initialClaim.Message.ID); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if found, err := routeWorker.RunOnce(ctx); err != nil || !found {
+			t.Fatalf("coordinator rate-limit attempt %d: found=%t err=%v", attempt+1, found, err)
+		}
+
+		modelAttempt := initialClaim.RouteAttempt + attempt
+		var callID, routeCallState, accountState, projectState string
+		var personal bool
+		if err := store.pool.QueryRow(ctx, `SELECT c.call_id,c.state,l.state,l.personal_model,
+COALESCE((SELECT p.status FROM project_budget_ledger p WHERE p.source='route' AND p.call_id=c.call_id),'missing')
+FROM conversation_route_model_calls c JOIN model_call_ledger l
+ ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+WHERE c.message_id=$1 AND c.attempt=$2 AND c.phase='normal'`, initialClaim.Message.ID, modelAttempt).
+			Scan(&callID, &routeCallState, &accountState, &personal, &projectState); err != nil ||
+			routeCallState != "rejected" || accountState != "rejected" || personal || projectState != "rejected" {
+			t.Fatalf("coordinator rejected call attempt=%d id=%q states=%s/%s personal=%t project=%s err=%v",
+				modelAttempt, callID, routeCallState, accountState, personal, projectState, err)
+		}
+		if _, exists := callIDs[callID]; exists {
+			t.Fatalf("coordinator retry reused call identity %q", callID)
+		}
+		callIDs[callID] = struct{}{}
+
+		var accountUsed int64
+		var accountUnknown bool
+		if err := store.pool.QueryRow(ctx, `SELECT COALESCE(SUM(CASE WHEN state='settled' THEN input_tokens+output_tokens
+WHEN state='rejected' THEN 0 ELSE reserved_tokens END),0),COALESCE(bool_or(state='unknown'),false)
+FROM model_call_ledger WHERE owner_id=$1 AND source='route' AND call_id=$2 AND NOT personal_model`,
+			initialClaim.Message.ActorID, callID).Scan(&accountUsed, &accountUnknown); err != nil || accountUsed != 0 || accountUnknown {
+			t.Fatalf("rejected coordinator account hold remains: used=%d unknown=%t err=%v", accountUsed, accountUnknown, err)
+		}
+		var projectSpent, projectReserved int64
+		var projectUnknown bool
+		if err := store.pool.QueryRow(ctx, `SELECT COALESCE(SUM(actual_micros) FILTER (WHERE status='settled'),0),
+COALESCE(SUM(reserved_micros) FILTER (WHERE status IN ('reserved','unknown')),0),COALESCE(bool_or(status='unknown'),false)
+FROM project_budget_ledger WHERE source='route' AND call_id=$1`, callID).
+			Scan(&projectSpent, &projectReserved, &projectUnknown); err != nil || projectSpent != 0 || projectReserved != 0 || projectUnknown {
+			t.Fatalf("rejected coordinator project hold remains: spent=%d reserved=%d unknown=%t err=%v",
+				projectSpent, projectReserved, projectUnknown, err)
+		}
+
+		var routeState, failureReason string
+		var persistedAttempt int64
+		if err := store.pool.QueryRow(ctx, `SELECT state,route_attempt,failure_reason FROM conversation_message_routes WHERE message_id=$1`,
+			initialClaim.Message.ID).Scan(&routeState, &persistedAttempt, &failureReason); err != nil {
+			t.Fatal(err)
+		}
+		wantState, wantAttempt := "pending", initialClaim.RouteAttempt+attempt+1
+		if attempt == 2 {
+			wantState, wantAttempt = "failed", initialClaim.RouteAttempt+attempt
+		}
+		if routeState != wantState || persistedAttempt != wantAttempt || (attempt == 2 && failureReason != "model_unavailable") {
+			t.Fatalf("coordinator route after attempt %d: state=%q attempt=%d reason=%q, want %q/%d",
+				attempt+1, routeState, persistedAttempt, failureReason, wantState, wantAttempt)
+		}
+	}
+
+	var calls, rejected, distinctCalls int64
+	var routeState string
+	if err := store.pool.QueryRow(ctx, `SELECT r.state,
+(SELECT count(*) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.phase='normal'),
+(SELECT count(*) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.phase='normal' AND c.state='rejected'),
+(SELECT count(DISTINCT c.call_id) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.phase='normal')
+FROM conversation_message_routes r WHERE r.message_id=$1`, initialClaim.Message.ID).
+		Scan(&routeState, &calls, &rejected, &distinctCalls); err != nil || routeState != "failed" ||
+		calls != 3 || rejected != 3 || distinctCalls != 3 || len(callIDs) != 3 || client.calls.Load() != 3 {
+		t.Fatalf("coordinator rate-limit cap state=%q calls=%d rejected=%d distinct=%d provider=%d ids=%d err=%v",
+			routeState, calls, rejected, distinctCalls, client.calls.Load(), len(callIDs), err)
+	}
 }
 
 func TestConversationRouteModelFenceAllowsPrunedCandidateSubset(t *testing.T) {
