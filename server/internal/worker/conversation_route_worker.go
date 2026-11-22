@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -274,7 +275,17 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 					}
 				}
 			}
-			return true, w.failRoute(ctx, claim, "model_unavailable", err)
+			// Classification failed after every model-side recovery. Fall
+			// back to the keyword + last-route heuristic instead of
+			// failing the route: follow the previous task on a clear
+			// continuation, start a new task on an explicit new-task
+			// signal, and ask the user when uncertain. An ambiguous
+			// message is never silently dropped into a task.
+			w.options.Logger.Warn("conversation route classification failed; applying heuristic fallback",
+				zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
+				zap.String("failure_code", string(domain.CodeOf(err))))
+			decision = conversationRouteClassifyFallback(classifyContext)
+			err = nil
 		}
 	}
 	if decision.InvalidOutput {
@@ -289,7 +300,12 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 				}
 			}
 		}
-		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("route model output is invalid"))
+		// The model answered but its output is not valid routing JSON,
+		// even after the repair retry. Use the same heuristic fallback
+		// instead of failing the route.
+		w.options.Logger.Warn("conversation route model output is invalid; applying heuristic fallback",
+			zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID))
+		decision = conversationRouteClassifyFallback(classifyContext)
 	}
 	decision = safeConversationRouteDecision(classifyContext, decision)
 	if decision.InvalidOutput {
@@ -691,4 +707,73 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 		}
 	}
 	return clarify
+}
+
+// conversationRouteClassifyFallback routes a message whose model
+// classification failed, using only keywords and the last route. It never
+// guesses: an explicit control request asks the user which task it targets,
+// an explicit new-task signal starts a new task, a clear continuation
+// follows the previous task, and anything else asks the user whether to
+// continue the previous task or start a new one. An ambiguous message is
+// never silently dropped into a task.
+func conversationRouteClassifyFallback(value app.ConversationRouteContext) app.ConversationRouteDecision {
+	if app.ConversationRouteHasExplicitControlIntent(value.Content) {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+			Question: "分类暂时不可用，请说明要操作哪个任务。"}
+	}
+	if !value.PreviousMissing && !value.PreviousUnresolved && !value.ReferenceUnavailable &&
+		app.ConversationRouteHasExplicitNewIntent(value.Content) {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}
+	}
+	target := value.ReferenceTaskID
+	if target == "" {
+		target = value.PreviousTaskID
+	}
+	if target != "" && app.ValidConversationRouteSteerTarget(target, value) &&
+		conversationRouteLooksLikeContinuation(value.Content) {
+		for _, candidate := range value.Candidates {
+			if candidate.TaskID == target {
+				return app.ConversationRouteDecision{Action: app.ConversationRouteSteer, TaskID: target,
+					ExpectedRevision: candidate.Revision}
+			}
+		}
+	}
+	// When the previous context cannot be confirmed, do not offer to
+	// continue it: ask the user to supply the missing context instead.
+	// This reuses the wording the safety check uses for the same state.
+	if value.PreviousMissing || value.PreviousUnresolved {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+			Question: "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。"}
+	}
+	return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+		Question: "分类暂时不可用，请说明是继续上一个任务，还是开始一个新任务。"}
+}
+
+// conversationRouteLooksLikeContinuation reports whether the message text
+// reads as an addition or correction to the previous task rather than an
+// independent request. Only narrow, high-precision signals count: a bare
+// acknowledgement, or a leading addition/correction marker. Anything else
+// is treated as uncertain and ends in a clarification question.
+func conversationRouteLooksLikeContinuation(content string) bool {
+	var normalized strings.Builder
+	for _, char := range strings.ToLower(content) {
+		if unicode.IsSpace(char) || unicode.IsPunct(char) || unicode.IsSymbol(char) {
+			continue
+		}
+		normalized.WriteRune(char)
+	}
+	value := normalized.String()
+	if value == "" {
+		return false
+	}
+	switch value {
+	case "好", "好的", "可以", "行", "嗯", "对", "就这样", "没问题", "ok", "yes", "接着":
+		return true
+	}
+	for _, marker := range []string{"补充", "追加", "再加", "加上", "改成", "换成", "调整一下", "修改一下"} {
+		if strings.HasPrefix(value, marker) {
+			return true
+		}
+	}
+	return false
 }
