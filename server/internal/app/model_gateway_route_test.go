@@ -373,6 +373,7 @@ func TestConversationRouteGatewayRejectsOversizeBeforeReservation(t *testing.T) 
 	claim, value := routeGatewayFixture()
 	claim.Message.Content = strings.Repeat("界", maxAgentInputBytes)
 	value.Content = claim.Message.Content
+	value.CurrentMessageID = claim.Message.ID
 	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
 	client := &modelGatewayClientTest{}
 	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, client)

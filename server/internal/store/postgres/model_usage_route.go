@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -172,6 +173,8 @@ func conversationRouteHistoryProjectionMatches(expected, actual []app.Conversati
 func checkConversationRouteModelFence(ctx context.Context, tx pgx.Tx, fence app.ConversationRouteModelFence, modelID string) error {
 	claim, value := fence.Claim, fence.Context
 	if value.ActorID != claim.Message.ActorID || value.ReferenceTaskID != claim.Input.ReferenceTaskID ||
+		(value.ContentTruncated && len(value.ContentSources) == 0 && value.CurrentMessageID != claim.Message.ID) ||
+		(value.ContentTruncated && len(value.ContentSources) != 0 && value.CurrentMessageID != "") ||
 		value.ModelID != modelID || len(value.History) > 100 || len(value.Candidates) > 100 {
 		return domain.InvalidArgument("route_context", "route model context is invalid")
 	}
@@ -191,6 +194,9 @@ func checkConversationRouteModelFence(ctx context.Context, tx pgx.Tx, fence app.
 	}
 	expected := snapshot.Context
 	expected.ModelID = modelID
+	if !conversationRouteModelContentProjectionMatches(&expected, value, claim) {
+		return domain.NewError(domain.CodeConflict, "authorized route message source changed")
+	}
 	if claim.Input.ResultReviewID == "" && claim.RouteAttempt > 0 {
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls
 WHERE message_id=$1 AND actor_id=$2 AND state='settled' AND attempt=$3
@@ -328,6 +334,45 @@ WHERE m.id=$1 FOR SHARE OF m`, item.MessageID, claim.Message.ConversationID, cla
 		}
 	}
 	return nil
+}
+
+func conversationRouteModelContentProjectionMatches(expected *app.ConversationRouteContext, actual app.ConversationRouteContext,
+	claim app.ConversationRouteClaim) bool {
+	if expected == nil {
+		return false
+	}
+	if !actual.ContentTruncated {
+		return actual.Content == expected.Content
+	}
+	digest := sha256.Sum256([]byte(expected.Content))
+	if expected.ContentTruncated || expected.Content == "" || actual.ContentBytes != int64(len(expected.Content)) ||
+		len(actual.ContentSHA256) != sha256.Size || !bytes.Equal(actual.ContentSHA256, digest[:]) {
+		return false
+	}
+	if len(expected.ContentSources) == 0 {
+		if actual.CurrentMessageID != claim.Message.ID || len(actual.ContentSources) != 0 {
+			return false
+		}
+	} else if actual.CurrentMessageID != "" || !reflect.DeepEqual(expected.ContentSources, actual.ContentSources) {
+		return false
+	}
+	previewMatched := false
+	for _, budget := range []int{app.ConversationRouteCurrentMessagePreviewBytes, 1024} {
+		preview, truncated := app.ConversationRouteTextPreview(expected.Content, budget)
+		if truncated && actual.Content == preview {
+			previewMatched = true
+			break
+		}
+	}
+	if !previewMatched {
+		return false
+	}
+	expected.Content = actual.Content
+	expected.ContentSHA256 = append([]byte(nil), actual.ContentSHA256...)
+	expected.ContentBytes = actual.ContentBytes
+	expected.ContentTruncated = true
+	expected.CurrentMessageID = actual.CurrentMessageID
+	return true
 }
 
 func conversationRouteModelPhase(value app.ConversationRouteContext) string {

@@ -783,6 +783,10 @@ func (s *cloudDSHAccountRuntimeSession) routeCoordinatorFrame(kind string, frame
 	if !validCloudDSHCoordinatorRuntimeFrame(kind, frame) {
 		return errors.New("account Agent Runtime coordinator frame fields are invalid")
 	}
+	var sequence int64
+	if json.Unmarshal(frame["runtime_sequence"], &sequence) != nil || sequence < 1 {
+		return errors.New("account Agent Runtime coordinator sequence is invalid")
+	}
 	identity, err := decodeCloudDSHCoordinatorIdentity(frame)
 	if err != nil {
 		return err
@@ -790,9 +794,9 @@ func (s *cloudDSHAccountRuntimeSession) routeCoordinatorFrame(kind string, frame
 	identity.ServiceInstanceID = s.runtime.Fence.ServiceInstanceID
 	s.mu.Lock()
 	coordinator := s.coordinators[identity.SessionID]
-	if coordinator == nil || coordinator.identity != identity {
+	if coordinator == nil || coordinator.identity != identity || coordinator.sequence != sequence {
 		s.mu.Unlock()
-		return errors.New("account Agent Runtime frame names an unknown coordinator")
+		return errors.New("account Agent Runtime coordinator attempt does not match")
 	}
 	if coordinator.terminal {
 		s.mu.Unlock()
@@ -802,10 +806,8 @@ func (s *cloudDSHAccountRuntimeSession) routeCoordinatorFrame(kind string, frame
 
 	switch kind {
 	case "coordinator_process_ready":
-		var sequence int64
 		var pid int
-		if json.Unmarshal(frame["runtime_sequence"], &sequence) != nil || sequence != coordinator.sequence ||
-			json.Unmarshal(frame["container_pid"], &pid) != nil || pid < 1 {
+		if json.Unmarshal(frame["container_pid"], &pid) != nil || pid < 1 {
 			return errors.New("account Agent Runtime coordinator process identity is invalid")
 		}
 		coordinator.mu.Lock()
@@ -991,7 +993,7 @@ func (s *cloudDSHAccountRuntimeSession) StartCoordinator(ctx context.Context, cl
 		return nil, errors.New("account Agent Runtime coordinator ended before readiness")
 	case <-ctx.Done():
 		cancelCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-		_ = s.writeCoordinatorFrame(cancelCtx, identity, map[string]any{"type": "coordinator_cancel",
+		_ = s.writeCoordinatorFrameForAttempt(cancelCtx, coordinator, identity, coordinator.sequence, map[string]any{"type": "coordinator_cancel",
 			"context_role": "coordinator", "conversation_id": identity.ConversationID, "message_id": identity.MessageID,
 			"owner_id": identity.OwnerID, "actor_id": identity.ActorID, "agent_id": identity.AgentID,
 			"generation": identity.Generation, "authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID,
@@ -1002,14 +1004,13 @@ func (s *cloudDSHAccountRuntimeSession) StartCoordinator(ctx context.Context, cl
 	}
 }
 
-func (s *cloudDSHAccountRuntimeSession) writeCoordinatorFrame(ctx context.Context,
-	identity app.ConversationCoordinatorIdentity, frame map[string]any) error {
-	if ctx == nil {
+func (s *cloudDSHAccountRuntimeSession) writeCoordinatorFrameForAttempt(ctx context.Context, coordinator *cloudDSHAccountCoordinator,
+	identity app.ConversationCoordinatorIdentity, sequence int64, frame map[string]any) error {
+	if ctx == nil || coordinator == nil || sequence < 1 || coordinator.sequence != sequence || coordinator.identity != identity {
 		return errors.New("coordinator runtime frame identity is invalid")
 	}
 	s.mu.Lock()
-	coordinator := s.coordinators[identity.SessionID]
-	valid := coordinator != nil && coordinator.identity == identity
+	valid := s.coordinators[identity.SessionID] == coordinator
 	s.mu.Unlock()
 	if !valid || frame["context_role"] != "coordinator" || frame["conversation_id"] != identity.ConversationID ||
 		frame["message_id"] != identity.MessageID || frame["owner_id"] != identity.OwnerID || frame["actor_id"] != identity.ActorID ||
@@ -1019,7 +1020,7 @@ func (s *cloudDSHAccountRuntimeSession) writeCoordinatorFrame(ctx context.Contex
 	}
 	for key, value := range map[string]any{"server_instance_id": s.runtime.Fence.ServiceInstanceID,
 		"owner_id": s.runtime.Fence.OwnerID, "runtime_id": s.runtime.Fence.RuntimeID,
-		"runtime_generation": s.runtime.Fence.RuntimeGeneration} {
+		"runtime_generation": s.runtime.Fence.RuntimeGeneration, "runtime_sequence": sequence} {
 		frame[key] = value
 	}
 	return s.input.WriteFrame(ctx, frame)
@@ -1188,6 +1189,14 @@ func (p *cloudDSHAccountTaskPipes) send(raw []byte) error {
 		identity.AuthorizationVersion != p.task.fence.AuthorizationVersion {
 		return errors.New("account Task frame fence is invalid")
 	}
+	if frame["type"] == "tool_result" {
+		p.session.mu.Lock()
+		terminal := p.task.terminal
+		p.session.mu.Unlock()
+		if terminal {
+			return nil
+		}
+	}
 	if identity.SessionID == p.task.fence.AgentSessionID && frame["type"] == "start" {
 		frame["type"] = "task_start"
 		frame["server_instance_id"] = p.session.runtime.Fence.ServiceInstanceID
@@ -1207,6 +1216,7 @@ func (p *cloudDSHAccountTaskPipes) send(raw []byte) error {
 	frame["server_instance_id"] = p.session.runtime.Fence.ServiceInstanceID
 	frame["runtime_id"] = p.session.runtime.Fence.RuntimeID
 	frame["runtime_generation"] = p.session.runtime.Fence.RuntimeGeneration
+	frame["runtime_sequence"] = p.task.sequence
 	return p.session.input.WriteFrame(p.ctx, frame)
 }
 

@@ -14,6 +14,11 @@ const MAX_TOOL_IMAGES = 4
 const MAX_TASK_ATTACHMENT_IMAGE_BYTES = 2 * 1024 * 1024
 // shortcut: retain at most 8 MiB for task recovery; use durable bounded attachments if tasks need longer image histories.
 const MAX_TOOL_IMAGE_CACHE_BYTES = 8 * 1024 * 1024
+// shortcut: keep a bounded window for late backend replies; expired tombstones fail closed when their reply arrives.
+const MAX_ABANDONED_RESPONSES = 4096
+const MAX_DELEGATE_TITLE_BYTES = 256
+const MAX_DELEGATE_OBJECTIVE_BYTES = 32 * 1024
+const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/
 const CHECKPOINT_TIMEOUT_MS = 30_000
 const TOOL_RESULT_TIMEOUT_MS = 6 * 60_000
 const CHILD_RESULT_TIMEOUT_MS = 6 * 60_000
@@ -39,6 +44,17 @@ function exactKeys(value, expected) {
   return Object.keys(value).sort().join(',') === [...expected].sort().join(',')
 }
 
+function digestNames(names) {
+  return createHash('sha256').update(JSON.stringify([...names].sort())).digest('hex')
+}
+
+function returnedChildToolsDigest(tools) {
+  if (!Array.isArray(tools) || tools.length > 64) return undefined
+  const names = tools.map(tool => isObject(tool) ? tool.name : undefined)
+  if (names.some(name => typeof name !== 'string' || !TOOL_NAME.test(name)) || new Set(names).size !== names.length) return undefined
+  return digestNames(names)
+}
+
 function validModelEndFrame(frame, identity) {
   const fence = identity.context_role === 'coordinator'
     ? COORDINATOR_IDENTITY_FIELDS
@@ -60,6 +76,57 @@ function matchesCoordinatorIdentity(frame, identity) {
 function matchesTaskValidationReviewIdentity(frame, identity) {
   return identity?.context_role === 'task_validation_review' &&
     TASK_VALIDATION_REVIEW_IDENTITY_FIELDS.every(key => frame[key] === identity[key])
+}
+
+function matchesIdentity(frame, identity) {
+  return Object.entries(identity).every(([key, value]) => frame[key] === value)
+}
+
+function validAbandonedCheckpointAck(frame, id, pending) {
+  return exactKeys(frame, ['type', ...Object.keys(pending.identity), 'id', 'ok', 'through_seq', 'sha256']) &&
+    frame.id === id && typeof frame.ok === 'boolean' && frame.through_seq === pending.through &&
+    frame.sha256 === pending.digest && matchesIdentity(frame, pending.identity)
+}
+
+function validAbandonedCheckpointPage(frame, id, pending) {
+  return exactKeys(frame, ['type', ...Object.keys(pending.identity), 'id', 'ok', 'from_seq', 'through_seq', 'payload', 'sha256']) &&
+    frame.id === id && typeof frame.ok === 'boolean' && frame.from_seq === pending.from &&
+    Number.isSafeInteger(frame.through_seq) && frame.through_seq >= frame.from_seq &&
+    typeof frame.payload === 'string' && Buffer.byteLength(frame.payload) <= MAX_FRAME_BYTES / 2 &&
+    /^[a-f0-9]{64}$/.test(frame.sha256) && createHash('sha256').update(frame.payload).digest('hex') === frame.sha256 &&
+    matchesIdentity(frame, pending.identity)
+}
+
+function validAbandonedChildSession(frame, callID, pending) {
+  const keys = ['type', ...Object.keys(pending.identity), 'call_id', 'parent_session_id', 'objective', 'tools',
+    'checkpoint_through_seq', 'checkpoint_sha256', 'step_status', 'summary']
+  const hasSettledOutput = Object.hasOwn(frame, 'settled_output')
+  const parent = pending.identity
+  return exactKeys(frame, hasSettledOutput ? [...keys, 'settled_output'] : keys) && frame.call_id === callID &&
+    frame.task_id === parent.task_id && frame.owner_id === parent.owner_id && frame.agent_id === parent.agent_id &&
+    frame.generation === parent.generation && frame.authorization_version === parent.authorization_version &&
+    typeof frame.session_id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(frame.session_id) &&
+    frame.session_id !== parent.session_id && frame.parent_session_id === parent.session_id &&
+    typeof frame.objective === 'string' && createHash('sha256').update(frame.objective).digest('hex') === pending.objectiveDigest &&
+    returnedChildToolsDigest(frame.tools) === pending.toolNamesDigest &&
+    Number.isSafeInteger(frame.checkpoint_through_seq) && frame.checkpoint_through_seq >= -1 &&
+    (frame.checkpoint_through_seq === -1 ? frame.checkpoint_sha256 === '' :
+      typeof frame.checkpoint_sha256 === 'string' && /^[a-f0-9]{64}$/.test(frame.checkpoint_sha256)) &&
+    ['running', 'succeeded', 'failed', 'unknown'].includes(frame.step_status) &&
+    typeof frame.summary === 'string' && Buffer.byteLength(frame.summary) <= MAX_TOOL_OUTPUT_BYTES &&
+    (!hasSettledOutput || pending.runInBackground !== true &&
+      ['succeeded', 'failed'].includes(frame.step_status) && typeof frame.settled_output === 'string' &&
+      Buffer.byteLength(frame.settled_output) <= MAX_TOOL_OUTPUT_BYTES)
+}
+
+function validAbandonedChildSettleAck(frame, callID, pending) {
+  const keys = ['type', ...Object.keys(pending.identity), 'call_id', 'ok', 'status', 'summary']
+  const hasOutput = Object.hasOwn(frame, 'output')
+  return exactKeys(frame, hasOutput ? [...keys, 'output'] : keys) && frame.call_id === callID && frame.ok === true &&
+    ['succeeded', 'failed'].includes(frame.status) && frame.status === pending.status &&
+    typeof frame.summary === 'string' && Buffer.byteLength(frame.summary) <= 2048 &&
+    (!hasOutput || typeof frame.output === 'string' && Buffer.byteLength(frame.output) <= MAX_TOOL_OUTPUT_BYTES) &&
+    matchesIdentity(frame, pending.identity)
 }
 
 function validTaskValidationReviewIdentity(identity) {
@@ -115,7 +182,7 @@ function toolImageLimit(name) {
   return 0
 }
 
-function decodeToolImages(images, toolName) {
+export function decodeToolImages(images, toolName) {
   const limit = toolImageLimit(toolName)
   if (!Array.isArray(images) || images.length > limit) throw new Error('invalid tool images')
   let totalBytes = 0
@@ -206,6 +273,27 @@ export class WorkerIPC {
     })
     this.writes = writing.catch(() => {})
     return writing
+  }
+
+  abandonPending(map, id, pending) {
+    if (map.get(id) !== pending) return
+    const value = { kind: pending.kind, identity: { ...pending.identity }, abandoned: true }
+    if (pending.kind === 'checkpoint_ack') Object.assign(value, { through: pending.through, digest: pending.digest })
+    if (pending.kind === 'checkpoint_page') Object.assign(value, { from: pending.from })
+    if (pending.kind === 'tool_result') Object.assign(value, { callID: pending.callID, name: pending.name })
+    if (pending.kind === 'child_session') Object.assign(value, {
+      callID: pending.callID,
+      objectiveDigest: createHash('sha256').update(pending.arguments.objective).digest('hex'),
+      toolNamesDigest: digestNames(pending.arguments.tool_names),
+      runInBackground: pending.arguments.run_in_background,
+    })
+    if (pending.kind === 'child_settle_ack') Object.assign(value, { callID: pending.callID, status: pending.status })
+    map.set(id, value)
+    let retained = 0
+    for (const [key, entry] of map) {
+      if (!entry.abandoned) continue
+      if (++retained > MAX_ABANDONED_RESPONSES) map.delete(key)
+    }
   }
 
   receive(chunk) {
@@ -336,6 +424,11 @@ export class WorkerIPC {
     if (frame.type === 'checkpoint_ack') {
       const pending = this.pending.get(frame.id)
       if (!pending || pending.kind !== 'checkpoint_ack') throw new Error('unknown checkpoint response')
+      if (pending.abandoned) {
+        this.pending.delete(frame.id)
+        if (!validAbandonedCheckpointAck(frame, frame.id, pending)) throw new Error('invalid late checkpoint acknowledgment')
+        return
+      }
       if (pending.identity.context_role === 'coordinator' &&
           (!exactKeys(frame, ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok', 'through_seq', 'sha256']) ||
             !matchesCoordinatorIdentity(frame, pending.identity))) throw new Error('invalid coordinator checkpoint acknowledgment')
@@ -355,6 +448,11 @@ export class WorkerIPC {
     if (frame.type === 'checkpoint_page') {
       const pending = this.pending.get(frame.id)
       if (!pending || pending.kind !== 'checkpoint_page') throw new Error('unknown checkpoint page')
+      if (pending.abandoned) {
+        this.pending.delete(frame.id)
+        if (!validAbandonedCheckpointPage(frame, frame.id, pending)) throw new Error('invalid late checkpoint page')
+        return
+      }
       if (pending.identity.context_role === 'coordinator' &&
           (!exactKeys(frame, ['type', ...COORDINATOR_IDENTITY_FIELDS, 'id', 'ok', 'from_seq', 'through_seq', 'payload', 'sha256']) ||
             !matchesCoordinatorIdentity(frame, pending.identity))) throw new Error('invalid coordinator checkpoint page')
@@ -382,14 +480,15 @@ export class WorkerIPC {
       const actualKeyList = actualKeys.join(',')
       const validKeys = actualKeyList === expectedKeys.join(',') || actualKeyList === [...expectedKeys, 'images'].sort().join(',')
       const addedBytes = images?.reduce((total, item) => total + (this.images.has(item.attachment.attachmentId) ? 0 : item.bytes.length), 0)
-      const valid = validKeys && images !== undefined && addedBytes !== undefined && this.imageCacheBytes + addedBytes <= MAX_TOOL_IMAGE_CACHE_BYTES &&
+      const valid = validKeys && images !== undefined && (pending.abandoned || addedBytes !== undefined && this.imageCacheBytes + addedBytes <= MAX_TOOL_IMAGE_CACHE_BYTES) &&
         Object.entries(pending.identity).every(([key, value]) => frame[key] === value) &&
         frame.call_id === pending.callID && ['succeeded', 'failed'].includes(frame.status) &&
         typeof frame.output === 'string' && Buffer.byteLength(frame.output) <= MAX_TOOL_OUTPUT_BYTES
       if (!valid) {
-        pending.reject(new Error('tool result not authorized'))
+        pending.reject?.(new Error('tool result not authorized'))
         throw new Error('invalid tool response')
       }
+      if (pending.abandoned) return
       for (const item of images) {
         const id = item.attachment.attachmentId
         if (!this.images.has(id)) {
@@ -403,6 +502,11 @@ export class WorkerIPC {
     if (frame.type === 'child_session') {
       const pending = this.childPending.get(frame.call_id)
       if (!pending || pending.kind !== 'child_session') throw new Error('unknown child session response')
+      if (pending.abandoned) {
+        this.childPending.delete(frame.call_id)
+        if (!validAbandonedChildSession(frame, frame.call_id, pending)) throw new Error('invalid late child session response')
+        return
+      }
       this.childPending.delete(frame.call_id)
       clearTimeout(pending.timer)
       pending.resolve(frame)
@@ -411,6 +515,11 @@ export class WorkerIPC {
     if (frame.type === 'child_settle_ack') {
       const pending = this.childPending.get(frame.call_id)
       if (!pending || pending.kind !== 'child_settle_ack') throw new Error('unknown child settlement response')
+      if (pending.abandoned) {
+        this.childPending.delete(frame.call_id)
+        if (!validAbandonedChildSettleAck(frame, frame.call_id, pending)) throw new Error('invalid late child settlement response')
+        return
+      }
       this.childPending.delete(frame.call_id)
       clearTimeout(pending.timer)
       const hasOutput = Object.hasOwn(frame, 'output')
@@ -471,7 +580,7 @@ export class WorkerIPC {
       identity.generation === root.generation && identity.generation === frame.generation &&
       identity.authorization_version === root.authorization_version && identity.authorization_version === frame.authorization_version
     for (const [id, pending] of this.pending) {
-      if (pending.kind !== 'tool_result' || pending.recovering !== true || !matchesRoot(pending.identity) ||
+      if (pending.kind !== 'tool_result' || pending.abandoned || pending.recovering !== true || !matchesRoot(pending.identity) ||
           pending.identity.session_id !== frame.supersede_session_id || pending.callID !== frame.supersede_call_id) continue
       queueMicrotask(() => {
         // An already delivered tool result is authoritative if both frames
@@ -509,13 +618,20 @@ export class WorkerIPC {
     this.cancelled = true
     for (const [id, pending] of this.pending) {
       if (pending.kind !== 'checkpoint_page' && pending.kind !== 'tool_result') continue
-      this.pending.delete(id)
+      if (pending.abandoned) continue
       clearTimeout(pending.timer)
+      if (pending.kind === 'tool_result') {
+        this.abandonToolResult(id, pending)
+        pending.reject(abortError())
+        continue
+      }
+      this.abandonPending(this.pending, id, pending)
       pending.reject(abortError())
     }
     for (const [callID, pending] of this.childPending) {
-      this.childPending.delete(callID)
+      if (pending.abandoned) continue
       clearTimeout(pending.timer)
+      this.abandonPending(this.childPending, callID, pending)
       pending.reject(abortError())
     }
     this.onCancel?.()
@@ -524,17 +640,19 @@ export class WorkerIPC {
   async checkpoint(identity, from, through, payload, digest) {
     const id = randomUUID()
     const result = deferred()
+    const pending = { ...result, timer: undefined, kind: 'checkpoint_ack', through, digest, identity: { ...identity } }
     const timer = setTimeout(() => {
-      this.pending.delete(id)
+      this.abandonPending(this.pending, id, pending)
       result.reject(new Error('checkpoint confirmation timed out'))
     }, CHECKPOINT_TIMEOUT_MS)
-    this.pending.set(id, { ...result, timer, kind: 'checkpoint_ack', through, digest, identity: { ...identity } })
+    pending.timer = timer
+    this.pending.set(id, pending)
     try {
       await this.send({ type: 'checkpoint', id, ...identity, from_seq: from, through_seq: through, payload, sha256: digest })
       await result.promise
     } finally {
       clearTimeout(timer)
-      this.pending.delete(id)
+      if (this.pending.get(id) === pending) this.pending.delete(id)
     }
   }
 
@@ -544,18 +662,24 @@ export class WorkerIPC {
     const id = randomUUID()
     const result = deferred()
     void result.promise.catch(() => {})
+    const pending = { ...result, timer: undefined, kind: 'checkpoint_page', identity: { ...identity }, from }
     const timer = setTimeout(() => {
-      this.pending.delete(id)
+      this.abandonPending(this.pending, id, pending)
       result.reject(new Error('checkpoint read timed out'))
     }, CHECKPOINT_TIMEOUT_MS)
-    this.pending.set(id, { ...result, timer, kind: 'checkpoint_page', identity })
+    pending.timer = timer
+    this.pending.set(id, pending)
     try {
       await this.send({ type: 'checkpoint_read', id, ...identity, from_seq: from })
       return await result.promise
     } finally {
       clearTimeout(timer)
-      this.pending.delete(id)
+      if (this.pending.get(id) === pending) this.pending.delete(id)
     }
+  }
+
+  abandonToolResult(id, pending) {
+    this.abandonPending(this.pending, id, pending)
   }
 
   async toolCall(identity, through, callID, name, args, signal, { recovering = false } = {}) {
@@ -568,58 +692,81 @@ export class WorkerIPC {
     const id = randomUUID()
     const result = deferred()
     void result.promise.catch(() => {})
+    const pending = { ...result, timer: undefined, kind: 'tool_result', identity, callID, name, recovering }
     const timer = setTimeout(() => {
-      this.pending.delete(id)
+      this.abandonToolResult(id, pending)
       result.reject(new Error('tool result timed out'))
     }, TOOL_RESULT_TIMEOUT_MS)
     const abort = () => {
-      this.pending.delete(id)
+      this.abandonToolResult(id, pending)
       clearTimeout(timer)
       result.reject(abortError())
     }
-    this.pending.set(id, { ...result, timer, kind: 'tool_result', identity, callID, name, recovering })
+    pending.timer = timer
+    this.pending.set(id, pending)
     signal?.addEventListener('abort', abort, { once: true })
     try {
       await this.send({ type: 'tool_call', id, ...identity, through_seq: through, call_id: callID, name, arguments: args })
       return await result.promise
     } catch (error) {
-      if (this.pending.delete(id)) clearTimeout(timer)
+      if (this.pending.get(id) === pending) {
+        this.pending.delete(id)
+        clearTimeout(timer)
+      }
       throw error
     } finally {
       signal?.removeEventListener('abort', abort)
-      if (this.pending.delete(id)) clearTimeout(timer)
+      if (this.pending.get(id) === pending) {
+        this.pending.delete(id)
+        clearTimeout(timer)
+      }
     }
   }
 
   async createChild(identity, through, callID, args, signal, { recovering = false } = {}) {
     if (this.cancelled) throw abortError()
     if (!Number.isSafeInteger(through) || through < 0 || typeof callID !== 'string' || !callID ||
-        Buffer.byteLength(callID) > 256 || !isObject(args) || this.childPending.has(callID)) {
+        Buffer.byteLength(callID) > 256 || !isObject(args) ||
+        !['objective,title,tool_names', 'objective,run_in_background,title,tool_names'].includes(Object.keys(args).sort().join(',')) ||
+        typeof args.title !== 'string' || !args.title.trim() || Buffer.byteLength(args.title) > MAX_DELEGATE_TITLE_BYTES ||
+        typeof args.objective !== 'string' || !args.objective.trim() || Buffer.byteLength(args.objective) > MAX_DELEGATE_OBJECTIVE_BYTES ||
+        !Array.isArray(args.tool_names) || args.tool_names.length > 64 ||
+        args.tool_names.some(name => typeof name !== 'string' || !TOOL_NAME.test(name)) ||
+        new Set(args.tool_names).size !== args.tool_names.length || this.childPending.has(callID)) {
       throw new Error('invalid child session request')
     }
     signal?.throwIfAborted()
     const result = deferred()
     void result.promise.catch(() => {})
+    const pending = { ...result, timer: undefined, kind: 'child_session', identity: { ...identity }, callID,
+      arguments: { ...args }, recovering }
     const timer = setTimeout(() => {
-      this.childPending.delete(callID)
+      this.abandonPending(this.childPending, callID, pending)
       result.reject(new Error('child session response timed out'))
     }, CHILD_RESULT_TIMEOUT_MS)
     const abort = () => {
-      this.childPending.delete(callID)
+      this.abandonPending(this.childPending, callID, pending)
       clearTimeout(timer)
       result.reject(abortError())
     }
-    this.childPending.set(callID, { ...result, timer, kind: 'child_session', identity, callID, recovering })
+    pending.timer = timer
+    this.childPending.set(callID, pending)
     signal?.addEventListener('abort', abort, { once: true })
     try {
       await this.send({ type: 'child_create', ...identity, through_seq: through, call_id: callID, arguments: args })
       return await result.promise
     } catch (error) {
-      if (this.childPending.delete(callID)) clearTimeout(timer)
+      if (this.childPending.get(callID) === pending) {
+        this.childPending.delete(callID)
+        clearTimeout(timer)
+      }
       throw error
     } finally {
       signal?.removeEventListener('abort', abort)
-      if (this.childPending.delete(callID)) clearTimeout(timer)
+      if (this.childPending.get(callID) === pending) {
+        this.childPending.delete(callID)
+        clearTimeout(timer)
+      }
     }
   }
 
@@ -634,16 +781,18 @@ export class WorkerIPC {
     signal?.throwIfAborted()
     const result = deferred()
     void result.promise.catch(() => {})
+    const pending = { ...result, timer: undefined, kind: 'child_settle_ack', identity: { ...identity }, callID, status, summary }
     const timer = setTimeout(() => {
-      this.childPending.delete(callID)
+      this.abandonPending(this.childPending, callID, pending)
       result.reject(new Error('child settlement response timed out'))
     }, CHILD_RESULT_TIMEOUT_MS)
     const abort = () => {
-      this.childPending.delete(callID)
+      this.abandonPending(this.childPending, callID, pending)
       clearTimeout(timer)
       result.reject(abortError())
     }
-    this.childPending.set(callID, { ...result, timer, kind: 'child_settle_ack', identity: { ...identity } })
+    pending.timer = timer
+    this.childPending.set(callID, pending)
     signal?.addEventListener('abort', abort, { once: true })
     try {
       await this.send({
@@ -652,11 +801,17 @@ export class WorkerIPC {
       })
       return await result.promise
     } catch (error) {
-      if (this.childPending.delete(callID)) clearTimeout(timer)
+      if (this.childPending.get(callID) === pending) {
+        this.childPending.delete(callID)
+        clearTimeout(timer)
+      }
       throw error
     } finally {
       signal?.removeEventListener('abort', abort)
-      if (this.childPending.delete(callID)) clearTimeout(timer)
+      if (this.childPending.get(callID) === pending) {
+        this.childPending.delete(callID)
+        clearTimeout(timer)
+      }
     }
   }
 
@@ -773,7 +928,7 @@ export class WorkerIPC {
     this.start.reject(new Error(reason))
     for (const pending of this.pending.values()) {
       clearTimeout(pending.timer)
-      pending.reject(new Error(reason))
+      pending.reject?.(new Error(reason))
     }
     this.pending.clear()
     for (const pending of this.childPending.values()) {

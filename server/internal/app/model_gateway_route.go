@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -223,7 +224,10 @@ func (s *ModelGatewayService) ResolveConversationSummaryModel(ctx context.Contex
 	if err != nil {
 		return "", 0, err
 	}
-	if endpoint.ContextWindowTokens == nil || *endpoint.ContextWindowTokens < 4096 || *endpoint.ContextWindowTokens > MaxModelContextWindowTokens {
+	if endpoint.ContextWindowTokens == nil {
+		return modelID, 4096, nil
+	}
+	if *endpoint.ContextWindowTokens < 4096 || *endpoint.ContextWindowTokens > MaxModelContextWindowTokens {
 		return "", 0, domain.NewError(domain.CodeUnsupported, "selected model context capacity is unavailable")
 	}
 	return modelID, *endpoint.ContextWindowTokens, nil
@@ -281,6 +285,9 @@ func (s *ModelGatewayService) RecoverConversationCoordinatorModelOutput(ctx cont
 		value.ReferenceTaskID != claim.Input.ReferenceTaskID || !domain.ValidModelConnectionID(value.ModelID) {
 		return ModelResponse{}, domain.InvalidArgument("route_context", "coordinator recovery context is invalid")
 	}
+	if !value.ContentTruncated && value.Content == claim.Message.Content {
+		value.CurrentMessageID = claim.Message.ID
+	}
 	return store.RecoverConversationCoordinatorModelOutput(ctx, ConversationRouteModelFence{Claim: claim, Context: value})
 }
 
@@ -334,17 +341,40 @@ func conversationRouteCallAttempt(value ConversationRouteContext) int64 {
 }
 
 func conversationRouteContextMatchesClaim(value ConversationRouteContext, claim ConversationRouteClaim) bool {
+	if len(value.ContentSources) != 0 {
+		rootDigest := sha256.Sum256([]byte(claim.Message.Content))
+		if !validConversationRouteMessageSources(value.ContentSources) || value.ContentSources[0].MessageID != claim.Message.ID ||
+			value.ContentSources[0].Sequence != claim.Message.Sequence || value.ContentSources[0].ContentBytes != int64(len(claim.Message.Content)) ||
+			!bytes.Equal(value.ContentSources[0].ContentSHA256, rootDigest[:]) ||
+			value.CurrentMessageID != "" || !strings.HasPrefix(value.Content, "用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n") {
+			return false
+		}
+		if value.ContentTruncated {
+			return value.ContentBytes > int64(len(value.Content)) && len(value.ContentSHA256) == sha256.Size
+		}
+		digest := sha256.Sum256([]byte(value.Content))
+		const aggregateSeparator = "\n\n--- 用户补充 ---\n\n"
+		body := strings.TrimPrefix(value.Content, "用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n")
+		first, _, hasMore := strings.Cut(body, aggregateSeparator)
+		return hasMore && first == claim.Message.Content && value.ContentBytes == int64(len(value.Content)) &&
+			len(value.ContentSHA256) == sha256.Size && bytes.Equal(digest[:], value.ContentSHA256)
+	}
 	if value.Content == claim.Message.Content {
 		return true
 	}
-	const aggregatePrefix = "用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n"
-	const aggregateSeparator = "\n\n--- 用户补充 ---\n\n"
-	if !strings.HasPrefix(value.Content, aggregatePrefix) {
-		return false
+	if value.ContentTruncated && value.CurrentMessageID == claim.Message.ID && value.ContentBytes == int64(len(claim.Message.Content)) &&
+		len(value.ContentSHA256) == sha256.Size {
+		digest := sha256.Sum256([]byte(claim.Message.Content))
+		if bytes.Equal(value.ContentSHA256, digest[:]) {
+			for _, previewBytes := range []int{ConversationRouteCurrentMessagePreviewBytes, 1024} {
+				preview, truncated := ConversationRouteTextPreview(claim.Message.Content, previewBytes)
+				if truncated && value.Content == preview {
+					return true
+				}
+			}
+		}
 	}
-	content := strings.TrimPrefix(value.Content, aggregatePrefix)
-	first := strings.SplitN(content, aggregateSeparator, 2)[0]
-	return first == claim.Message.Content
+	return false
 }
 
 func legacyConversationRouteModelRequest(value ConversationRouteContext, request ModelRequest) (ModelRequest, error) {
@@ -394,7 +424,7 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 }
 
 func useLegacyConversationRouteModelRequest(value ConversationRouteContext) bool {
-	if value.RouteAttempt != 0 || value.ResultReview != nil {
+	if value.RouteAttempt != 0 || value.ResultReview != nil || value.ContentTruncated || len(value.Content) > ConversationRouteCurrentMessagePreviewBytes {
 		return false
 	}
 	for _, candidate := range value.RequestCandidates {
@@ -451,6 +481,9 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 		claim.LeaseOwner == "" || claim.LeaseVersion < 1 || value.ActorID != claim.Message.ActorID || !conversationRouteContextMatchesClaim(value, claim) ||
 		value.ReferenceTaskID != claim.Input.ReferenceTaskID || !domain.ValidModelConnectionID(value.ModelID) {
 		return ConversationRouteDecision{}, domain.InvalidArgument("route_context", "routing identity or content is invalid")
+	}
+	if !value.ContentTruncated && value.Content == claim.Message.Content {
+		value.CurrentMessageID = claim.Message.ID
 	}
 	request, err := ConversationRouteModelRequest(value)
 	if err != nil {
@@ -560,6 +593,9 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 		value.ReferenceTaskID != claim.Input.ReferenceTaskID || !domain.ValidModelConnectionID(value.ModelID) ||
 		!dshModelIdentityPattern.MatchString(sessionID) || throughSequence < 0 || throughSequence > 1<<53-1 {
 		return ModelResponse{}, domain.InvalidArgument("route_context", "coordinator model identity or content is invalid")
+	}
+	if !value.ContentTruncated && value.Content == claim.Message.Content {
+		value.CurrentMessageID = claim.Message.ID
 	}
 	request, err := parseDSHModelRequest(ctx, ModelTaskFence{}, value.ModelID, raw, nil)
 	if err != nil || len(request.Tools) != 0 || len(request.Input) == 0 {

@@ -114,10 +114,14 @@ func (c *CloudDSHConversationCoordinator) EstimateConversationSummaryTokenPressu
 	if err != nil {
 		return nil, err
 	}
+	sequence := stream.runtimeSequence()
+	if sequence < 1 {
+		return nil, errors.New("DSH compaction coordinator runtime sequence is invalid")
+	}
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
-		_ = runtime.StopCoordinator(stopCtx, identity)
+		_ = runtime.StopCoordinator(stopCtx, identity, sequence)
 	}()
 	frame, err := stream.read(ctx)
 	if err != nil {
@@ -251,12 +255,16 @@ func (c *CloudDSHConversationCoordinator) CompactConversationSummary(ctx context
 	if err != nil {
 		return CloudDSHConversationSummaryResult{}, err
 	}
+	sequence := stream.runtimeSequence()
+	if sequence < 1 {
+		return CloudDSHConversationSummaryResult{}, errors.New("DSH compaction coordinator runtime sequence is invalid")
+	}
 	session := &cloudDSHCoordinatorTurn{stream: stream, through: head.Through,
 		checkpointIDs: make(map[string]struct{}), readThrough: -1, pageReadIDs: make(map[string]struct{})}
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
-		_ = runtime.StopCoordinator(stopCtx, coordinatorIdentity)
+		_ = runtime.StopCoordinator(stopCtx, coordinatorIdentity, sequence)
 	}()
 	var lastModel *app.ModelResponse
 	for {
@@ -288,7 +296,7 @@ func (c *CloudDSHConversationCoordinator) CompactConversationSummary(ctx context
 				return CloudDSHConversationSummaryResult{}, err
 			}
 			session.checkpointIDs[frame.ID], session.through = struct{}{}, *frame.Through
-			if err := runtime.WriteCoordinatorFrame(ctx, coordinatorIdentity, cloudDSHCoordinatorResponseIdentity(coordinatorIdentity, map[string]any{
+			if err := runtime.WriteCoordinatorFrame(ctx, coordinatorIdentity, sequence, cloudDSHCoordinatorResponseIdentity(coordinatorIdentity, map[string]any{
 				"type": "checkpoint_ack", "id": frame.ID, "ok": true, "through_seq": session.through, "sha256": frame.SHA256,
 			})); err != nil {
 				return CloudDSHConversationSummaryResult{}, err
@@ -310,7 +318,7 @@ func (c *CloudDSHConversationCoordinator) CompactConversationSummary(ctx context
 			if page.Through == head.Through && !cloudDSHDigest(page.Payload, hex.EncodeToString(head.Digest)) {
 				return CloudDSHConversationSummaryResult{}, errors.New("DSH compaction checkpoint digest is invalid")
 			}
-			if err := runtime.WriteCoordinatorFrame(ctx, coordinatorIdentity, cloudDSHCoordinatorResponseIdentity(coordinatorIdentity, map[string]any{
+			if err := runtime.WriteCoordinatorFrame(ctx, coordinatorIdentity, sequence, cloudDSHCoordinatorResponseIdentity(coordinatorIdentity, map[string]any{
 				"type": "checkpoint_page", "id": frame.ID, "ok": true, "from_seq": page.From,
 				"through_seq": page.Through, "payload": string(page.Payload), "sha256": hex.EncodeToString(page.Digest),
 			})); err != nil {
@@ -341,7 +349,7 @@ func (c *CloudDSHConversationCoordinator) CompactConversationSummary(ctx context
 			}
 			operation.ModelCallID = callID
 			lastModel = &response
-			if err := writeCloudDSHCoordinatorModel(ctx, runtime, coordinatorIdentity, frame.ID, response,
+			if err := writeCloudDSHCoordinatorModel(ctx, runtime, coordinatorIdentity, sequence, frame.ID, response,
 				app.MaxConversationSummaryBytes); err != nil {
 				return CloudDSHConversationSummaryResult{}, err
 			}

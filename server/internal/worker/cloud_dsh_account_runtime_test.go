@@ -1233,6 +1233,58 @@ func TestAccountAgentRuntimeTaskStartWaitsForGuardianAdmission(t *testing.T) {
 	}
 }
 
+func TestAccountAgentRuntimeTaskPipeTagsSequenceAndDropsLateToolResult(t *testing.T) {
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	session := &cloudDSHAccountRuntimeSession{
+		runtime: app.AccountAgentRuntime{Fence: app.AccountAgentRuntimeFence{ServiceInstanceID: "server_123",
+			RuntimeID: "runtime_123", RuntimeGeneration: 4}},
+		input: &cloudDSHRuntimeInput{target: writer},
+	}
+	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", AgentInstanceID: "agent_123",
+		AgentGeneration: 1, AgentSessionID: "session_123", AuthorizationVersion: 2}
+	task := &cloudDSHAccountTask{ctx: context.Background(), fence: fence, sequence: 9}
+	pipes := &cloudDSHAccountTaskPipes{session: session, task: task, ctx: context.Background()}
+	readDone := make(chan []byte, 1)
+	go func() {
+		data, _ := io.ReadAll(reader)
+		readDone <- data
+	}()
+	frame := map[string]any{"type": "tool_result", "task_id": fence.TaskID, "owner_id": fence.OwnerID,
+		"agent_id": fence.AgentInstanceID, "session_id": fence.AgentSessionID, "generation": fence.AgentGeneration,
+		"authorization_version": fence.AuthorizationVersion, "call_id": "call_123", "status": "succeeded",
+		"output": "done", "images": []any{}}
+	writeFrame := func() error {
+		raw, err := json.Marshal(frame)
+		if err != nil {
+			return err
+		}
+		_, err = pipes.Write(append(raw, '\n'))
+		return err
+	}
+	if err := writeFrame(); err != nil {
+		t.Fatal(err)
+	}
+	session.mu.Lock()
+	task.terminal = true
+	session.mu.Unlock()
+	if err := writeFrame(); err != nil {
+		t.Fatalf("late tool result should be harmless after terminal: %v", err)
+	}
+	_ = writer.Close()
+	data := <-readDone
+	var forwarded map[string]any
+	if err := json.Unmarshal(data, &forwarded); err != nil {
+		t.Fatalf("decode forwarded Task frame %q: %v", data, err)
+	}
+	if got := forwarded["runtime_sequence"]; got != float64(9) {
+		t.Fatalf("forwarded runtime_sequence = %v, want 9", got)
+	}
+	if strings.Count(string(data), "\n") != 1 {
+		t.Fatalf("terminal Task received a late frame: %q", data)
+	}
+}
+
 func TestAccountAgentRuntimeUnarmedTaskStopDoesNotStopSibling(t *testing.T) {
 	control := &accountRuntimeControlStub{}
 	supervisor := &accountRuntimeSupervisorStub{recoverErr: errors.New("Runtime is still running")}

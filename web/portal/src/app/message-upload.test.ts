@@ -9,8 +9,15 @@ afterEach(() => vi.unstubAllGlobals());
 describe('resumable message upload', () => {
   it('retries missing UTF-8 chunks using the original identity and verifies the full receipt', async () => {
     vi.stubGlobal('crypto', webcrypto);
-    const content = '中文a'.repeat(9000);
+    const targetBytes = 200 * 1024 + 1;
+    const prefix = '开头 anchor\n';
+    const suffix = '\n结尾 anchor';
+    const pattern = '中文a🙂';
+    const availableBytes = targetBytes - Buffer.byteLength(prefix) - Buffer.byteLength(suffix);
+    const repeated = pattern.repeat(Math.floor(availableBytes / Buffer.byteLength(pattern)));
+    const content = `${prefix}${repeated}${'x'.repeat(availableBytes - Buffer.byteLength(repeated))}${suffix}`;
     const bytes = new TextEncoder().encode(content);
+    expect(bytes.length).toBe(targetBytes);
     const received = new Map<number, Uint8Array>();
     const requests: { path: string; method: string; headers: Headers; body?: Record<string, unknown> }[] = [];
     let interrupted = false;

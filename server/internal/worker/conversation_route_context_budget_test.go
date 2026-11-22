@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"morde/server/internal/app"
-	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/task"
 )
@@ -164,19 +163,46 @@ func TestConversationRouteWorkerFitsReferencedLongTaskAtUnknownCapacity(t *testi
 	}
 }
 
-func TestConversationRouteWorkerUsesMinimumWindowWhenCapacityIsUnknown(t *testing.T) {
-	worker, stub := newRouteWorkerTest(t)
-	stub.contextWindow, stub.capacityKnown = 4096, false
-	stub.claim.Message = conversation.Message{ID: "m1234567", Role: conversation.RoleUser, Sequence: 1,
-		CreatedAt: time.Now(), Content: strings.Repeat("汉", 3200)}
-	stub.snapshot.Context.Content = stub.claim.Message.Content
-	if found, err := worker.RunOnce(context.Background()); err != nil || !found || stub.classifies != 0 ||
-		len(stub.failures) != 1 || stub.failures[0] != "message_too_long" {
-		t.Fatalf("unknown capacity did not fail safely at the minimum window: found=%t classifications=%d failures=%v err=%v",
-			found, stub.classifies, stub.failures, err)
-	}
-	if domain.CodeOf(fitConversationRouteContext(&stub.snapshot.Context, 4096)) != domain.CodeResultTooLarge {
-		t.Fatal("minimum supported window unexpectedly accepted the current message")
+func TestConversationRouteWorkerPreviewsCurrentMessageAtMinimumWindowWhenCapacityIsUnknown(t *testing.T) {
+	for _, size := range []int{8<<10 + 1, 16<<10 + 1, 200<<10 + 1} {
+		t.Run(fmt.Sprintf("%d_bytes", size), func(t *testing.T) {
+			worker, stub := newRouteWorkerTest(t)
+			stub.contextWindow, stub.capacityKnown = 4096, false
+			prefix, middle, suffix := "START-ANCHOR\n", "MIDDLE-ANCHOR\n", "END-ANCHOR"
+			padding := size - len(prefix) - len(middle) - len(suffix)
+			content := prefix + strings.Repeat("x", padding/2) + middle + strings.Repeat("y", padding-padding/2) + suffix
+			stub.claim.Message = conversation.Message{ID: "m1234567", Role: conversation.RoleUser, Sequence: 1,
+				CreatedAt: time.Now(), Content: content}
+			stub.snapshot.Context.Content = content
+			stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteNew}
+			if found, err := worker.RunOnce(context.Background()); err != nil || !found || stub.classifies != 1 ||
+				len(stub.failures) != 0 || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteNew ||
+				!stub.classified.ContentTruncated || stub.classified.CurrentMessageID != stub.claim.Message.ID ||
+				stub.classified.ContentBytes != int64(len(stub.claim.Message.Content)) {
+				t.Fatalf("unknown capacity did not route the full source through a verified preview: found=%t classifications=%d classified=%+v failures=%v err=%v",
+					found, stub.classifies, stub.classified, stub.failures, err)
+			}
+			request, err := app.ConversationRouteModelRequest(stub.classified)
+			var routed struct {
+				Message          string `json:"message"`
+				MessageBytes     int64  `json:"message_bytes"`
+				MessageTruncated bool   `json:"message_truncated"`
+			}
+			if err == nil {
+				err = json.Unmarshal([]byte(request.Input[0].Text), &routed)
+			}
+			digest := sha256.Sum256([]byte(content))
+			context := stub.snapshot.Context
+			context.CurrentMessageID = stub.claim.Message.ID
+			fitErr := fitConversationRouteContext(&context, 4096)
+			if err != nil || fitErr != nil || !context.ContentTruncated || !bytes.Equal(context.ContentSHA256, digest[:]) ||
+				context.CurrentMessageID != stub.claim.Message.ID || routed.MessageBytes != int64(size) || !routed.MessageTruncated ||
+				len(routed.Message) >= size || !strings.Contains(routed.Message, "START-ANCHOR") ||
+				!strings.Contains(routed.Message, "END-ANCHOR") || !app.ConversationRouteInputFitsContextWindow(request, 4096) {
+				t.Fatalf("minimum-window preview lost its source proof or exceeded 4K: context=%+v routed=%+v requestBytes=%d err=%v fitErr=%v",
+					context, routed, len(request.Input[0].Text), err, fitErr)
+			}
+		})
 	}
 }
 

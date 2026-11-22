@@ -56,6 +56,14 @@ function send(child, frame) {
     frame = { ...fence, ...frame }
     if (!['model_chunk'].includes(frame.type)) child.responseFences.delete(frame.id)
   }
+  const coordinatorFence = child.coordinatorFences?.get(frame.session_id)
+  const coordinatorResponse = child.coordinatorResponseFences?.get(frame.id)
+  if (coordinatorResponse && ['checkpoint_ack', 'checkpoint_page'].includes(frame.type)) {
+    frame = { ...coordinatorResponse, ...frame }
+    child.coordinatorResponseFences.delete(frame.id)
+  } else if (coordinatorFence && frame.type === 'coordinator_cancel' && !Object.hasOwn(frame, 'runtime_sequence')) {
+    frame = { ...coordinatorFence, ...frame }
+  }
   child.stdin.write(`${JSON.stringify(frame)}\n`)
 }
 
@@ -151,6 +159,22 @@ function taskValidationReviewAccountResponse(startFrame, frame) {
 
 function launchCoordinatorAccount(onFrame) {
   return launch((frame, proc) => {
+    if (frame.context_role === 'coordinator' && Number.isSafeInteger(frame.runtime_sequence)) {
+      const fence = {
+        server_instance_id: frame.server_instance_id, runtime_id: frame.runtime_id,
+        runtime_generation: frame.runtime_generation, runtime_sequence: frame.runtime_sequence,
+        ...coordinatorFence(frame),
+      }
+      proc.coordinatorFences ??= new Map()
+      proc.coordinatorFences.set(frame.session_id, fence)
+      if (['checkpoint', 'checkpoint_read', 'model'].includes(frame.type)) {
+        proc.responseFences.set(frame.id, fence)
+      }
+      if (['checkpoint', 'checkpoint_read'].includes(frame.type)) {
+        proc.coordinatorResponseFences ??= new Map()
+        proc.coordinatorResponseFences.set(frame.id, fence)
+      }
+    }
     onFrame(frame, proc)
     if (frame.type === 'coordinator_process_ready') send(proc, coordinatorProcessAdmission(frame))
     if (frame.type === 'task_process_ready') send(proc, taskProcessAdmission(frame))
@@ -567,6 +591,125 @@ test('coordinator checkpoint acknowledgements require the complete actor fence',
   input.write(`${JSON.stringify({ type: 'checkpoint_ack', ...identity, actor_id: 'other_actor', id: checkpoint.id,
     ok: true, through_seq: 0, sha256: digest })}\n`)
   await assert.rejects(request, /checkpoint not confirmed|invalid worker frame/)
+  assert.equal(ipc.failed, true)
+  input.destroy()
+  output.destroy()
+})
+
+test('a late tool result after timeout is ignored only for its exact abandoned call', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  const identity = { task_id: 'task_123', owner_id: 'user_123', agent_id: 'agent_123', generation: 1,
+    authorization_version: 1, session_id: 'session_456' }
+  input.write(`${JSON.stringify(start)}\n`)
+  await ipc.start.promise
+  const originalSetTimeout = globalThis.setTimeout
+  const originalClearTimeout = globalThis.clearTimeout
+  const forcedTimer = { forcedToolTimeout: true }
+  const outputReceived = once(output, 'data').then(([bytes]) => JSON.parse(bytes.toString().trim()))
+  globalThis.setTimeout = (callback, delay, ...args) => delay === 6 * 60_000
+    ? (queueMicrotask(() => callback(...args)), forcedTimer)
+    : originalSetTimeout(callback, delay, ...args)
+  globalThis.clearTimeout = timer => timer === forcedTimer ? undefined : originalClearTimeout(timer)
+  let outputFrame
+  let call
+  try {
+    call = ipc.toolCall(identity, 0, 'call_timeout', 'test.tool', {}, undefined)
+    outputFrame = await outputReceived
+    await assert.rejects(call, /tool result timed out/)
+  } finally {
+    globalThis.setTimeout = originalSetTimeout
+    globalThis.clearTimeout = originalClearTimeout
+  }
+
+  input.write(`${JSON.stringify({ type: 'tool_result', ...identity, id: outputFrame.id, call_id: 'call_timeout',
+    status: 'succeeded', output: 'late result', images: [] })}\n`)
+  assert.equal(ipc.failed, false, 'the exact late result must not poison the Task IPC')
+  assert.equal(ipc.pending.has(outputFrame.id), false)
+  input.write(`${JSON.stringify({ type: 'tool_result', ...identity, id: 'unknown_late_result', call_id: 'call_timeout',
+    status: 'succeeded', output: 'unknown result', images: [] })}\n`)
+  assert.equal(ipc.failed, true, 'unknown tool responses must still fail closed')
+  input.destroy()
+  output.destroy()
+})
+
+test('late checkpoint and child responses after IPC cancellation are consumed only for their exact pending request', async t => {
+  const taskIdentity = taskFence(start)
+  const childIdentity = { ...taskIdentity, session_id: 'child_789' }
+  const digest = createHash('sha256').update('{}').digest('hex')
+  const cases = [
+    { name: 'checkpoint acknowledgment', identity: taskIdentity,
+      call: (ipc, identity) => ipc.checkpoint(identity, 0, 1, '{}', digest),
+      response: request => ({ type: 'checkpoint_ack', ...taskIdentity, id: request.id, ok: true, through_seq: 1, sha256: digest }),
+      map: 'pending', timeout: true },
+    { name: 'checkpoint page', identity: taskIdentity,
+      call: (ipc, identity) => ipc.readCheckpoint(identity, 0),
+      response: request => ({ type: 'checkpoint_page', ...taskIdentity, id: request.id, ok: true,
+        from_seq: 0, through_seq: 0, payload: '{}', sha256: digest }), map: 'pending' },
+    { name: 'child session', identity: taskIdentity,
+      call: (ipc, identity) => ipc.createChild(identity, 0, 'child_call_1', { objective: 'Do work', title: 'Work', tool_names: [] }),
+      response: () => ({ type: 'child_session', ...childIdentity, call_id: 'child_call_1', parent_session_id: taskIdentity.session_id,
+        objective: 'Do work', tools: [], checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' }),
+      map: 'childPending' },
+    { name: 'child settlement', identity: childIdentity,
+      call: (ipc, identity) => ipc.settleChild(identity, 'child_call_2', 'succeeded', 0, digest, 'Done'),
+      response: () => ({ type: 'child_settle_ack', ...childIdentity, call_id: 'child_call_2', ok: true,
+        status: 'succeeded', summary: 'Done' }), map: 'childPending' },
+  ]
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const input = new PassThrough()
+      const output = new PassThrough()
+      const ipc = new WorkerIPC(input, output)
+      input.write(`${JSON.stringify(start)}\n`)
+      await ipc.start.promise
+      const requestFrame = once(output, 'data').then(([bytes]) => JSON.parse(bytes.toString().trim()))
+      const pending = scenario.call(ipc, scenario.identity)
+      const request = await requestFrame
+      if (scenario.timeout) {
+        const entry = ipc.pending.get(request.id)
+        clearTimeout(entry.timer)
+        ipc.abandonPending(ipc.pending, request.id, entry)
+        entry.reject(new Error('checkpoint confirmation timed out'))
+        await assert.rejects(pending, /timed out/)
+      } else {
+        ipc.cancel()
+        await assert.rejects(pending, /request cancelled/)
+      }
+      if (scenario.name === 'child session') {
+        const abandoned = ipc.childPending.get(request.call_id)
+        assert.equal(Object.hasOwn(abandoned, 'arguments'), false, 'abandoned metadata must not retain the full child request')
+        assert.equal(typeof abandoned.objectiveDigest, 'string')
+        assert.equal(typeof abandoned.toolNamesDigest, 'string')
+      }
+      input.write(`${JSON.stringify(scenario.response(request))}\n`)
+      assert.equal(ipc.failed, false, 'an exact late backend response is safely consumed')
+      assert.equal(ipc[scenario.map].has(request.id ?? request.call_id), false, 'the tombstone is consumed once')
+      input.write(`${JSON.stringify(scenario.response(request))}\n`)
+      assert.equal(ipc.failed, true, 'a duplicate response is still rejected')
+      input.destroy()
+      output.destroy()
+    })
+  }
+})
+
+test('late child session with a tool outside its original allowlist remains a protocol error', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  input.write(`${JSON.stringify(start)}\n`)
+  await ipc.start.promise
+  const requestFrame = once(output, 'data').then(([bytes]) => JSON.parse(bytes.toString().trim()))
+  const pending = ipc.createChild(taskFence(start), 0, 'child_allowlist_1',
+    { objective: 'Do work', title: 'Work', tool_names: ['test.read'] })
+  const request = await requestFrame
+  ipc.cancel()
+  await assert.rejects(pending, /request cancelled/)
+  input.write(`${JSON.stringify({ type: 'child_session', ...taskFence(start), session_id: 'child_789',
+    call_id: 'child_allowlist_1', parent_session_id: start.session_id, objective: 'Do work', tools: [{ name: 'test.write' }],
+    checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })}\n`)
   assert.equal(ipc.failed, true)
   input.destroy()
   output.destroy()
@@ -5507,6 +5650,182 @@ test('account runtime preserves child session identity on task output and reject
   await invalidTask.outputFrames
   assert.equal(sent.length, 1)
   assert.equal(invalidTask.terminateReason, 'output_failed')
+})
+
+test('account runtime drops one exact late tool result after Task exit without affecting a resumed Task or sibling', async () => {
+  const runtime = new AccountRuntime(new PassThrough(), new PassThrough())
+  runtime.runtime = account
+  const errors = []
+  runtime.send = async frame => { if (frame.type === 'protocol_error') errors.push(frame.code) }
+  const fields = ['task_id', 'owner_id', 'agent_id', 'session_id', 'generation', 'authorization_version']
+  const keyOf = fence => JSON.stringify(fields.map(key => fence[key]))
+  const fence = taskFence(accountTask('task_late_result', 'Late result', 4))
+  const terminalWrites = []
+  const task = {
+    fence, key: keyOf(fence), runtimeSequence: 4, outputBuffer: Buffer.alloc(0), outputFrames: Promise.resolve(),
+    readyReceived: true, started: { promise: Promise.resolve() }, startDispatchFailed: false,
+    terminalFrame: undefined, terminal: false, terminated: false, pendingToolCalls: new Map(),
+    child: { stdin: { destroyed: false, write(bytes, callback) { terminalWrites.push(bytes); callback() } } },
+  }
+  runtime.tasks.set(task.key, task)
+  for (const [id, callID] of [['ipc_late_1', 'call_late_1'], ['ipc_late_2', 'call_late_2']]) {
+    runtime.receiveTaskOutput(task, `${JSON.stringify({ type: 'tool_call', ...fence, id, call_id: callID, name: 'test.tool' })}\n`)
+  }
+  await task.outputFrames
+  const result = (id, callID, runtimeSequence, resultFence = fence) => ({
+    type: 'tool_result', ...resultFence, server_instance_id: account.server_instance_id,
+    runtime_id: account.runtime_id, runtime_generation: account.runtime_generation,
+    runtime_sequence: runtimeSequence, id, call_id: callID, status: 'succeeded', output: 'done', images: [],
+  })
+
+  task.terminalFrame = { type: 'settled' }
+  await runtime.routeTaskFrame(result('ipc_late_1', 'call_late_1', 4))
+  assert.equal(task.pendingToolCalls.has('ipc_late_1'), false, 'a result is acknowledged while the child can still receive it')
+  assert.equal(terminalWrites.length, 1, 'a terminal frame alone does not discard an in-flight tool result')
+  task.exit = { code: 0 }
+  runtime.finishTask(task, false)
+
+  const resumedWrites = []
+  runtime.tasks.set(task.key, { fence, key: task.key, runtimeSequence: 5, terminal: false,
+    child: { stdin: { destroyed: false, write(bytes, callback) { resumedWrites.push(bytes); callback() } } } })
+  await runtime.routeTaskFrame(result('ipc_late_2', 'wrong_call', 4))
+  await runtime.routeTaskFrame(result('ipc_late_2', 'call_late_2', 99))
+  await runtime.routeTaskFrame(result('ipc_late_2', 'call_late_2', 4, { ...fence, authorization_version: 3 }))
+  await runtime.routeTaskFrame({ ...result('ipc_late_2', 'call_late_2', 4), images: [{}] })
+  await runtime.routeTaskFrame(result('ipc_late_2', 'call_late_2', 4))
+  await runtime.routeTaskFrame(result('ipc_late_2', 'call_late_2', 4))
+
+  const sibling = accountTask('task_late_sibling', 'Still running', 6)
+  const siblingWrites = []
+  runtime.tasks.set(keyOf(taskFence(sibling)), { fence: taskFence(sibling), key: keyOf(taskFence(sibling)),
+    runtimeSequence: 6, terminal: false,
+    child: { stdin: { destroyed: false, write(bytes, callback) { siblingWrites.push(bytes); callback() } } } })
+  await runtime.routeTaskFrame(result('ipc_sibling', 'call_sibling', 6, taskFence(sibling)))
+
+  assert.deepEqual(errors, ['late_tool_result_mismatch', 'late_tool_result_mismatch', 'late_tool_result_mismatch',
+    'late_tool_result_mismatch', 'task_runtime_sequence_mismatch'])
+  assert.equal(runtime.lateToolResults.size, 0, 'an exact late result consumes its tombstone once')
+  assert.equal(resumedWrites.length, 0, 'a prior run result never reaches a resumed child')
+  assert.equal(siblingWrites.length, 1, 'the sibling still receives its own result')
+  assert.equal(Object.hasOwn(JSON.parse(siblingWrites[0].toString()), 'runtime_sequence'), false,
+    'the runtime fence is stripped before forwarding into DSH')
+})
+
+test('account runtime drops exact late checkpoint and child replies during Task exit and after retirement', async () => {
+  const runtime = new AccountRuntime(new PassThrough(), new PassThrough())
+  runtime.runtime = account
+  const sent = []
+  runtime.send = async frame => sent.push(frame)
+  const fence = taskFence(accountTask('task_late_responses', 'Late replies', 7))
+  const key = JSON.stringify(['task_id', 'owner_id', 'agent_id', 'session_id', 'generation', 'authorization_version']
+    .map(field => fence[field]))
+  const task = { fence, key, runtimeSequence: 7, outputBuffer: Buffer.alloc(0), outputFrames: Promise.resolve(),
+    readyReceived: true, started: { promise: Promise.resolve() }, startDispatchFailed: false, terminal: false,
+    terminated: false, pendingToolCalls: new Map(), pendingResponses: new Map(),
+    child: { stdin: { destroyed: false, write(_bytes, callback) { callback() } } } }
+  runtime.tasks.set(key, task)
+  const payload = '{}'
+  const digest = createHash('sha256').update(payload).digest('hex')
+  const requests = [
+    { type: 'checkpoint', ...fence, id: 'checkpoint_late', from_seq: 0, through_seq: 1, payload, sha256: digest },
+    { type: 'checkpoint_read', ...fence, id: 'page_late', from_seq: 0 },
+    { type: 'child_create', ...fence, call_id: 'child_late', arguments: { objective: 'Do work', title: 'Work', tool_names: [] } },
+    { type: 'child_settle', ...{ ...fence, session_id: 'child_123' }, call_id: 'settle_late', status: 'succeeded',
+      through_seq: 1, sha256: digest, summary: 'Done' },
+  ]
+  for (const request of requests) runtime.receiveTaskOutput(task, `${JSON.stringify(request)}\n`)
+  await task.outputFrames
+  assert.equal(task.pendingResponses.size, 4)
+  const backend = (type, identity, correlation, data, sequence = 7) => ({ type, ...identity,
+    server_instance_id: account.server_instance_id, runtime_id: account.runtime_id,
+    runtime_generation: account.runtime_generation, runtime_sequence: sequence, ...correlation, ...data })
+  const ack = backend('checkpoint_ack', fence, { id: 'checkpoint_late' }, { ok: true, through_seq: 1, sha256: digest })
+  task.exit = { code: 0 }
+  await runtime.routeTaskFrame(ack)
+  assert.equal(task.pendingResponses.size, 3, 'a reply in the close-to-retirement window is consumed exactly')
+  runtime.finishTask(task, false)
+  const retiredChild = [...runtime.lateTaskResponses.values()].find(pending => pending.responseType === 'child_session')
+  assert.equal(Object.hasOwn(retiredChild, 'objective'), false, 'retired metadata stores only bounded objective evidence')
+  assert.equal(typeof retiredChild.objectiveDigest, 'string')
+
+  const page = backend('checkpoint_page', fence, { id: 'page_late' }, {
+    ok: true, from_seq: 0, through_seq: 0, payload, sha256: digest,
+  })
+  await runtime.routeTaskFrame({ ...page, from_seq: 1 })
+  await runtime.routeTaskFrame({ ...page, agent_id: 'other_agent' })
+  await runtime.routeTaskFrame(page)
+  const childSession = backend('child_session', { ...fence, session_id: 'child_456' }, { call_id: 'child_late' }, {
+    parent_session_id: fence.session_id, objective: 'Do work', tools: [], checkpoint_through_seq: -1,
+    checkpoint_sha256: '', step_status: 'running', summary: '',
+  })
+  await runtime.routeTaskFrame({ ...childSession, tools: [{ name: 'unexpected_tool' }] })
+  await runtime.routeTaskFrame(childSession)
+  const childSettle = backend('child_settle_ack', { ...fence, session_id: 'child_123' }, { call_id: 'settle_late' }, {
+    ok: true, status: 'succeeded', summary: 'Done',
+  })
+  await runtime.routeTaskFrame(childSettle)
+  await runtime.routeTaskFrame(page)
+
+  assert.deepEqual(sent.filter(frame => frame.type === 'protocol_error').map(frame => frame.code), [
+    'late_task_response_mismatch', 'late_task_response_mismatch', 'late_task_response_mismatch', 'unknown_task',
+  ])
+  assert.equal(runtime.lateTaskResponses.size, 0, 'each exact retired response consumes one tombstone')
+})
+
+test('account runtime consumes only exact late coordinator replies during exit and after retirement', async () => {
+  const runtime = new AccountRuntime(new PassThrough(), new PassThrough())
+  runtime.runtime = account
+  const sent = []
+  runtime.send = async frame => sent.push(frame)
+  const startFrame = coordinatorStart('m8765432', 9)
+  const fence = coordinatorFence(startFrame)
+  const payload = '{}'
+  const digest = createHash('sha256').update(payload).digest('hex')
+  const coordinator = {
+    fence, key: fence.session_id, messageKey: 'late-coordinator-message', runtimeSequence: startFrame.runtime_sequence,
+    outputBuffer: Buffer.alloc(0), outputFrames: Promise.resolve(), readyReceived: true,
+    started: { promise: Promise.resolve() }, startDispatchFailed: false, pendingResponses: new Map(),
+    finished: { promise: Promise.resolve(), resolve() {} },
+  }
+  runtime.coordinators.set(coordinator.key, coordinator)
+  const checkpoint = (id, through = 1) => ({ type: 'checkpoint', ...fence, id, from_seq: 0,
+    through_seq: through, payload, sha256: digest })
+  const backendAck = (id, through = 1, sha = digest) => ({ type: 'checkpoint_ack', ...fence, id, ok: true,
+    through_seq: through, sha256: sha, server_instance_id: account.server_instance_id,
+    runtime_id: account.runtime_id, runtime_generation: account.runtime_generation,
+    runtime_sequence: coordinator.runtimeSequence })
+  const backendPage = (id, from = 0, sha = digest) => ({ type: 'checkpoint_page', ...fence, id, ok: true,
+    from_seq: from, through_seq: 1, payload, sha256: sha, server_instance_id: account.server_instance_id,
+    runtime_id: account.runtime_id, runtime_generation: account.runtime_generation,
+    runtime_sequence: coordinator.runtimeSequence })
+
+  runtime.receiveCoordinatorOutput(coordinator, `${JSON.stringify(checkpoint('checkpoint_exit_window'))}\n`)
+  await coordinator.outputFrames
+  assert.equal(coordinator.pendingResponses.size, 1)
+  coordinator.exit = { code: 0 }
+  await runtime.routeCoordinatorFrame(backendAck('checkpoint_exit_window', 2))
+  assert.equal(coordinator.pendingResponses.size, 1, 'a mismatched exit-window reply remains pending')
+  await runtime.routeCoordinatorFrame(backendAck('checkpoint_exit_window'))
+  assert.equal(coordinator.pendingResponses.size, 0, 'an exact reply is consumed while the exited coordinator remains registered')
+  assert.deepEqual(sent.filter(frame => frame.type === 'protocol_error').map(frame => frame.code), ['late_coordinator_response_mismatch'])
+  await runtime.finishClosedCoordinator(coordinator)
+  assert.equal(runtime.coordinators.has(coordinator.key), false)
+
+  const retired = { ...coordinator, exit: { code: 0 }, finishing: false, terminated: false,
+    pendingResponses: new Map(), finished: { promise: Promise.resolve(), resolve() {} } }
+  runtime.coordinators.set(retired.key, retired)
+  runtime.receiveCoordinatorOutput(retired, `${JSON.stringify({ type: 'checkpoint_read', ...fence, id: 'page_retired', from_seq: 0 })}\n`)
+  await retired.outputFrames
+  await runtime.finishClosedCoordinator(retired)
+  assert.equal(runtime.lateCoordinatorResponses.size, 1)
+  await runtime.routeCoordinatorFrame(backendPage('page_retired', 1))
+  assert.equal(runtime.lateCoordinatorResponses.size, 1, 'a mismatched retired response does not consume the tombstone')
+  await runtime.routeCoordinatorFrame(backendPage('page_retired'))
+  assert.equal(runtime.lateCoordinatorResponses.size, 0, 'an exact retired reply consumes its tombstone once')
+  await runtime.routeCoordinatorFrame(backendPage('page_retired'))
+  assert.deepEqual(sent.filter(frame => frame.type === 'protocol_error').map(frame => frame.code), [
+    'late_coordinator_response_mismatch', 'late_coordinator_response_mismatch', 'unknown_coordinator',
+  ])
 })
 
 test('account runtime rejects a cancel frame with a different session fence', async () => {

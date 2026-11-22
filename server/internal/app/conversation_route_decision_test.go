@@ -87,6 +87,24 @@ func TestConversationRouteAcknowledgementIsExplicitAndLimitedToBackgroundWork(t 
 	}
 }
 
+func TestTruncatedAggregateClarificationDoesNotAskToResendSavedSources(t *testing.T) {
+	root, supplement := "root source", "supplement source"
+	rootSHA := sha256.Sum256([]byte(root))
+	supplementSHA := sha256.Sum256([]byte(supplement))
+	full := "用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n" + root + "\n\n--- 用户补充 ---\n\n" + supplement
+	fullSHA := sha256.Sum256([]byte(full))
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "saved aggregate preview",
+		ContentBytes: int64(len(full)), ContentSHA256: fullSHA[:], ContentTruncated: true, ContentSources: []ConversationRouteMessageSource{
+			{MessageID: "m1234567", Sequence: 1, ContentBytes: int64(len(root)), ContentSHA256: rootSHA[:]},
+			{MessageID: "m2345678", Sequence: 2, ContentBytes: int64(len(supplement)), ContentSHA256: supplementSHA[:]},
+		}}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"这是一个简单问题。"}`, value)
+	if decision.Action != ConversationRouteClarify || !strings.Contains(decision.Question, "完整消息已保存") ||
+		strings.Contains(decision.Question, "重新说明") || decision.ModelOutput == "" {
+		t.Fatalf("aggregate preview clarification asked for unavailable input: %+v", decision)
+	}
+}
+
 func TestConversationRouteModelRequestNormalizesUnresolvedCandidateState(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "帮我查一个新问题", RequestCandidates: []ConversationRouteRequestCandidate{{
 		MessageID: "m1234567", Sequence: 1, Content: "前一条独立请求", RoutingStatus: conversation.RoutingProcessing,
@@ -516,9 +534,19 @@ func TestConversationRouteRequestUsesOnlyAuthorizedTaskContext(t *testing.T) {
 		t.Fatalf("unordered history evidence was accepted: %v", err)
 	}
 	value.History = value.History[:1]
+	value.CurrentMessageID = "m1234567"
 	value.Content = strings.Repeat("中", maxAgentInputBytes)
-	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeResultTooLarge {
-		t.Fatalf("oversized routing context should fail without truncation: %v", err)
+	request, err = ConversationRouteModelRequest(value)
+	var largeInput struct {
+		MessageID        string `json:"message_id"`
+		MessageBytes     int64  `json:"message_bytes"`
+		MessageTruncated bool   `json:"message_truncated"`
+	}
+	if err == nil {
+		err = json.Unmarshal([]byte(request.Input[0].Text), &largeInput)
+	}
+	if err != nil || !largeInput.MessageTruncated || largeInput.MessageID != value.CurrentMessageID || largeInput.MessageBytes != int64(len(value.Content)) {
+		t.Fatalf("oversized routing context was not converted to a verifiable source reference: input=%+v err=%v", largeInput, err)
 	}
 }
 

@@ -114,6 +114,8 @@ func (s *coordinatorTestStream) read(context.Context) (cloudDSHCoordinatorFrame,
 	return frame, nil
 }
 
+func (*coordinatorTestStream) runtimeSequence() int64 { return 1 }
+
 type coordinatorTestRuntimeManager struct {
 	runtime      *coordinatorTestRuntime
 	acquireCalls int
@@ -140,12 +142,18 @@ func (r *coordinatorTestRuntime) StartCoordinator(_ context.Context, _ app.Conve
 	return r.stream, nil
 }
 
-func (r *coordinatorTestRuntime) WriteCoordinatorFrame(context.Context, app.ConversationCoordinatorIdentity, map[string]any) error {
+func (r *coordinatorTestRuntime) WriteCoordinatorFrame(_ context.Context, _ app.ConversationCoordinatorIdentity, sequence int64, _ map[string]any) error {
+	if sequence != 1 {
+		return errors.New("unexpected coordinator runtime sequence")
+	}
 	r.writeCalls++
 	return nil
 }
 
-func (r *coordinatorTestRuntime) StopCoordinator(context.Context, app.ConversationCoordinatorIdentity) error {
+func (r *coordinatorTestRuntime) StopCoordinator(_ context.Context, _ app.ConversationCoordinatorIdentity, sequence int64) error {
+	if sequence != 1 {
+		return errors.New("unexpected coordinator stop sequence")
+	}
 	r.stopCalls++
 	return nil
 }

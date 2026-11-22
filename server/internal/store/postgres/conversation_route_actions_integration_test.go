@@ -1263,19 +1263,43 @@ FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.messag
 	}
 }
 
-func TestConversationRouteOversizedMessageIsKeptWithVisibleReason(t *testing.T) {
+func TestConversationRoute200KiBMessageCreatesBoundedSourceReference(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
-	content := strings.Repeat("a", app.MaxConversationAgentInputBytes+1)
-	claim := f.receive(t, "route-too-long-001", content, app.ConversationRoutingInput{})
-	if err := f.store.FailConversationRoute(ctx, claim, "message_too_long"); err != nil {
+	const totalBytes = 200<<10 + 1
+	prefix, middle, suffix := "START-ANCHOR", "MIDDLE-ANCHOR", "END-ANCHOR"
+	padding := totalBytes - len(prefix) - len(middle) - len(suffix)
+	content := prefix + strings.Repeat("a", padding/2) + middle + strings.Repeat("b", padding-padding/2) + suffix
+	claim := f.receive(t, "route-long-source-001", content, app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
 		t.Fatal(err)
 	}
-	message, found, err := f.store.FindConversationMessageByClientID(ctx, f.ownerID, "", f.conversation.ID, "route-too-long-001", f.instanceID)
-	if err != nil || !found || message.Content != content || message.RoutingStatus != conversation.RoutingFailed ||
-		message.RoutingFailureReason != "message_too_long" || message.TaskID != "" {
-		t.Fatalf("oversized message was not retained with a visible reason: found=%t bytes=%d state=%s reason=%s task=%s err=%v",
-			found, len(message.Content), message.RoutingStatus, message.RoutingFailureReason, message.TaskID, err)
+	if snapshot.Context.CurrentMessageID != claim.Message.ID {
+		t.Fatalf("snapshot did not bind the raw current message: context=%+v message=%s", snapshot.Context, claim.Message.ID)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	request, err := app.ConversationRouteModelRequest(snapshot.Context)
+	if err != nil || len(request.Input) != 1 || len(request.Input[0].Text) > 12<<10 ||
+		!strings.Contains(request.Input[0].Text, `"message_truncated":true`) ||
+		!strings.Contains(request.Input[0].Text, `"message_id":"`+claim.Message.ID+`"`) ||
+		!strings.Contains(request.Input[0].Text, `"message_bytes":204801`) {
+		t.Fatalf("200 KiB source was not projected to a bounded route pointer: requestBytes=%d err=%v", len(request.Input[0].Text), err)
+	}
+	if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatal(err)
+	}
+	message, found, err := f.store.FindConversationMessageByClientID(ctx, f.ownerID, "", f.conversation.ID, "route-long-source-001", f.instanceID)
+	if err != nil || !found || message.Content != content || message.RoutingStatus != conversation.RoutingRouted || !domain.ValidTaskID(message.TaskID) {
+		t.Fatalf("200 KiB message was not preserved and routed: found=%t bytes=%d state=%s task=%s err=%v",
+			found, len(message.Content), message.RoutingStatus, message.TaskID, err)
+	}
+	details, err := f.store.GetTask(ctx, message.TaskID, f.ownerID)
+	digest := sha256.Sum256([]byte(content))
+	if err != nil || !strings.Contains(details.Task.Objective, "message_id="+message.ID) ||
+		!strings.Contains(details.Task.Objective, fmt.Sprintf("sha256=%x", digest)) || len(details.Task.Objective) > 8<<10 ||
+		strings.Contains(details.Task.Objective, middle) {
+		t.Fatalf("Task objective did not keep a bounded, verifiable original-source pointer: objectiveBytes=%d err=%v", len(details.Task.Objective), err)
 	}
 }
 

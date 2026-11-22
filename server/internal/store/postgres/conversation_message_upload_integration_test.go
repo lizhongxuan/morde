@@ -66,7 +66,10 @@ func TestConversationMessageUploadHTTPProtocolPersistsAndReplays(t *testing.T) {
 		t.Fatal(err)
 	}
 	clientMessageID := "upload-http-message-0001"
-	content := []byte(strings.Repeat("中文abc🙂", 5000) + "末尾完整")
+	content := []byte(strings.Repeat("中文abc🙂", 15753) + "末尾完整")
+	if len(content) != 200<<10+1 {
+		t.Fatalf("upload fixture bytes=%d, want %d", len(content), 200<<10+1)
+	}
 	contentDigest := sha256.Sum256(content)
 	totalChunks := (len(content) + app.ConversationMessageChunkBytes - 1) / app.ConversationMessageChunkBytes
 	basePath := "/api/conversations/" + conversationValue.ID + "/message-uploads/" + clientMessageID

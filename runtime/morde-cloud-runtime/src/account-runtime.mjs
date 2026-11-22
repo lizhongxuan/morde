@@ -4,13 +4,22 @@ import { fileURLToPath } from 'node:url'
 import {
   ENGINE_VERSION, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, validMessageDelivery, validStart,
 } from './engine.mjs'
-import { MAX_FRAME_BYTES } from './ipc.mjs'
+import { decodeToolImages, MAX_FRAME_BYTES } from './ipc.mjs'
 
 const ID = /^[A-Za-z0-9_-]{1,128}$/
 const MAX_CONCURRENT_TASKS = 16
 const MAX_CONCURRENT_COORDINATORS = 16
 const MAX_CONCURRENT_TASK_VALIDATION_REVIEWS = 16
 const MAX_COORDINATOR_MESSAGE_HISTORY = 4096
+// shortcut: retain at most 4096 outstanding tool identities from retired Tasks; raise only if measured Task churn needs a larger late-result window.
+const MAX_LATE_TOOL_RESULTS = 4096
+// shortcut: retain at most 4096 outstanding checkpoint/child replies from retired Tasks; older replies fail closed.
+const MAX_LATE_TASK_RESPONSES = 4096
+// shortcut: retain at most 4096 outstanding checkpoint replies from retired Coordinators; older replies fail closed.
+const MAX_LATE_COORDINATOR_RESPONSES = 4096
+const MAX_DELEGATE_OBJECTIVE_BYTES = 32 * 1024
+const MAX_TOOL_OUTPUT_BYTES = 1024 * 1024
+const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/
 const SHUTDOWN_TIMEOUT_MS = 5_000
 const RUNTIME_CWD = fileURLToPath(new URL('..', import.meta.url))
 const MORDE_WORKSPACE_DIR = '/workspace'
@@ -123,6 +132,166 @@ function validTaskFence(fence) {
 
 function taskKey(fence) {
   return JSON.stringify(TASK_FENCE_FIELDS.map(key => fence[key]))
+}
+
+function matchesLateToolResult(frame, late) {
+  let images
+  try { images = decodeToolImages(frame.images, late.name) } catch {}
+  return images !== undefined && exactKeys(frame, ['type', ...TASK_FENCE_FIELDS, 'id', 'call_id', 'status', 'output', 'images',
+    'server_instance_id', 'runtime_id', 'runtime_generation', 'runtime_sequence']) &&
+    frame.type === 'tool_result' && ID.test(frame.id) && ID.test(frame.call_id) && late.id === frame.id &&
+    late.callID === frame.call_id && late.runtimeSequence === frame.runtime_sequence && late.sessionID === frame.session_id &&
+    TASK_FENCE_FIELDS.filter(key => key !== 'session_id').every(key => frame[key] === late.fence[key]) &&
+    ['succeeded', 'failed'].includes(frame.status) && typeof frame.output === 'string' &&
+    Buffer.byteLength(frame.output) <= MAX_TOOL_OUTPUT_BYTES && Array.isArray(frame.images) && frame.images.length <= 4
+}
+
+function taskResponseKey(type, correlationID, runtimeSequence) {
+  return JSON.stringify([runtimeSequence, type, correlationID])
+}
+
+function taskResponseCorrelation(frame) {
+  if (frame.type === 'checkpoint_ack' || frame.type === 'checkpoint_page') return frame.id
+  if (frame.type === 'child_session' || frame.type === 'child_settle_ack') return frame.call_id
+  return undefined
+}
+
+function digestNames(names) {
+  return createHash('sha256').update(JSON.stringify([...names].sort())).digest('hex')
+}
+
+function returnedChildToolsDigest(tools) {
+  if (!Array.isArray(tools) || tools.length > 64) return undefined
+  const names = tools.map(tool => tool && typeof tool === 'object' && !Array.isArray(tool) ? tool.name : undefined)
+  if (names.some(name => typeof name !== 'string' || !TOOL_NAME.test(name)) || new Set(names).size !== names.length) return undefined
+  return digestNames(names)
+}
+
+function pendingTaskResponse(frame, task) {
+  const responseType = ({ checkpoint: 'checkpoint_ack', checkpoint_read: 'checkpoint_page',
+    child_create: 'child_session', child_settle: 'child_settle_ack' })[frame.type]
+  if (!responseType) return undefined
+  if (!Number.isSafeInteger(task.runtimeSequence) || task.runtimeSequence < 1) return undefined
+  const correlationID = frame.id ?? frame.call_id
+  if (typeof correlationID !== 'string' || !ID.test(correlationID) || typeof frame.session_id !== 'string' || !ID.test(frame.session_id)) {
+    throw new Error('invalid task response identity')
+  }
+  const pending = { responseType, correlationID, runtimeSequence: task.runtimeSequence,
+    identity: { ...task.fence, session_id: frame.session_id } }
+  if (frame.type === 'checkpoint') {
+    if (!Number.isSafeInteger(frame.through_seq) || frame.through_seq < 0 || typeof frame.sha256 !== 'string' || !/^[a-f0-9]{64}$/.test(frame.sha256)) {
+      throw new Error('invalid task checkpoint response identity')
+    }
+    pending.through = frame.through_seq
+    pending.digest = frame.sha256
+  } else if (frame.type === 'checkpoint_read') {
+    if (!Number.isSafeInteger(frame.from_seq) || frame.from_seq < 0) throw new Error('invalid task checkpoint read identity')
+    pending.from = frame.from_seq
+  } else if (frame.type === 'child_create') {
+    const args = frame.arguments
+    if (!args || typeof args !== 'object' || Array.isArray(args) ||
+        !['objective,title,tool_names', 'objective,run_in_background,title,tool_names'].includes(Object.keys(args).sort().join(',')) ||
+        typeof args.title !== 'string' || !args.title.trim() || Buffer.byteLength(args.title) > 256 ||
+        typeof args.objective !== 'string' || !args.objective.trim() || Buffer.byteLength(args.objective) > MAX_DELEGATE_OBJECTIVE_BYTES ||
+        (Object.hasOwn(args, 'run_in_background') && typeof args.run_in_background !== 'boolean') ||
+        !Array.isArray(args.tool_names) || args.tool_names.length > 64 ||
+        args.tool_names.some(name => typeof name !== 'string' || !TOOL_NAME.test(name)) ||
+        new Set(args.tool_names).size !== args.tool_names.length) throw new Error('invalid task child request identity')
+    pending.objectiveDigest = createHash('sha256').update(args.objective).digest('hex')
+    pending.toolNamesDigest = digestNames(args.tool_names)
+    pending.runInBackground = args.run_in_background
+  } else {
+    pending.status = frame.status
+  }
+  pending.key = taskResponseKey(responseType, correlationID, task.runtimeSequence)
+  return pending
+}
+
+function matchesLateTaskResponse(frame, pending, runtime) {
+  const accountKeys = ['server_instance_id', 'runtime_id', 'runtime_generation', 'runtime_sequence']
+  const common = frame.type === pending.responseType && frame.runtime_sequence === pending.runtimeSequence &&
+    frame.server_instance_id === runtime.server_instance_id && frame.runtime_id === runtime.runtime_id &&
+    frame.runtime_generation === runtime.runtime_generation &&
+    frame.task_id === pending.identity.task_id && frame.owner_id === pending.identity.owner_id &&
+    frame.agent_id === pending.identity.agent_id && frame.generation === pending.identity.generation &&
+    frame.authorization_version === pending.identity.authorization_version
+  if (!common) return false
+  if (frame.type === 'checkpoint_ack') {
+    return exactKeys(frame, ['type', ...TASK_FENCE_FIELDS, 'id', 'ok', 'through_seq', 'sha256', ...accountKeys]) &&
+      frame.session_id === pending.identity.session_id && frame.id === pending.correlationID && typeof frame.ok === 'boolean' &&
+      frame.through_seq === pending.through && frame.sha256 === pending.digest
+  }
+  if (frame.type === 'checkpoint_page') {
+    return exactKeys(frame, ['type', ...TASK_FENCE_FIELDS, 'id', 'ok', 'from_seq', 'through_seq', 'payload', 'sha256', ...accountKeys]) &&
+      frame.session_id === pending.identity.session_id && frame.id === pending.correlationID && typeof frame.ok === 'boolean' &&
+      frame.from_seq === pending.from && Number.isSafeInteger(frame.through_seq) && frame.through_seq >= frame.from_seq &&
+      typeof frame.payload === 'string' && Buffer.byteLength(frame.payload) <= MAX_FRAME_BYTES / 2 &&
+      /^[a-f0-9]{64}$/.test(frame.sha256) && createHash('sha256').update(frame.payload).digest('hex') === frame.sha256
+  }
+  if (frame.type === 'child_session') {
+    const keys = ['type', ...TASK_FENCE_FIELDS, 'call_id', 'parent_session_id', 'objective', 'tools', 'checkpoint_through_seq',
+      'checkpoint_sha256', 'step_status', 'summary', ...accountKeys]
+    const hasSettledOutput = Object.hasOwn(frame, 'settled_output')
+    return exactKeys(frame, hasSettledOutput ? [...keys, 'settled_output'] : keys) && frame.call_id === pending.correlationID &&
+      frame.parent_session_id === pending.identity.session_id && typeof frame.objective === 'string' &&
+      createHash('sha256').update(frame.objective).digest('hex') === pending.objectiveDigest &&
+      typeof frame.session_id === 'string' && ID.test(frame.session_id) && frame.session_id !== pending.identity.session_id &&
+      returnedChildToolsDigest(frame.tools) === pending.toolNamesDigest && Number.isSafeInteger(frame.checkpoint_through_seq) && frame.checkpoint_through_seq >= -1 &&
+      (frame.checkpoint_through_seq === -1 ? frame.checkpoint_sha256 === '' :
+        typeof frame.checkpoint_sha256 === 'string' && /^[a-f0-9]{64}$/.test(frame.checkpoint_sha256)) &&
+      ['running', 'succeeded', 'failed', 'unknown'].includes(frame.step_status) &&
+      typeof frame.summary === 'string' && Buffer.byteLength(frame.summary) <= MAX_TOOL_OUTPUT_BYTES &&
+      (!hasSettledOutput || pending.runInBackground !== true && ['succeeded', 'failed'].includes(frame.step_status) && typeof frame.settled_output === 'string' &&
+        Buffer.byteLength(frame.settled_output) <= MAX_TOOL_OUTPUT_BYTES)
+  }
+  if (frame.type === 'child_settle_ack') {
+    const keys = ['type', ...TASK_FENCE_FIELDS, 'call_id', 'ok', 'status', 'summary', 'output', ...accountKeys]
+    const hasOutput = Object.hasOwn(frame, 'output')
+    return exactKeys(frame, hasOutput ? keys : keys.filter(key => key !== 'output')) &&
+      frame.call_id === pending.correlationID && frame.session_id === pending.identity.session_id &&
+      frame.ok === true && ['succeeded', 'failed'].includes(frame.status) && frame.status === pending.status &&
+      typeof frame.summary === 'string' && Buffer.byteLength(frame.summary) <= 2048 &&
+      (!hasOutput || typeof frame.output === 'string' && Buffer.byteLength(frame.output) <= MAX_TOOL_OUTPUT_BYTES)
+  }
+  return false
+}
+
+function coordinatorResponseKey(type, id, runtimeSequence) {
+  return JSON.stringify([runtimeSequence, type, id])
+}
+
+function pendingCoordinatorResponse(frame, coordinator) {
+  const responseType = ({ checkpoint: 'checkpoint_ack', checkpoint_read: 'checkpoint_page' })[frame.type]
+  if (!responseType) return undefined
+  if (!ID.test(frame.id ?? '') || !Number.isSafeInteger(coordinator.runtimeSequence) || coordinator.runtimeSequence < 1) {
+    throw new Error('invalid coordinator response identity')
+  }
+  const pending = { responseType, id: frame.id, runtimeSequence: coordinator.runtimeSequence, fence: coordinator.fence }
+  if (frame.type === 'checkpoint') {
+    pending.through = frame.through_seq
+    pending.digest = frame.sha256
+  } else {
+    pending.from = frame.from_seq
+  }
+  pending.key = coordinatorResponseKey(responseType, frame.id, coordinator.runtimeSequence)
+  return pending
+}
+
+function matchesLateCoordinatorResponse(frame, pending, runtime) {
+  const accountKeys = ['server_instance_id', 'runtime_id', 'runtime_generation', 'runtime_sequence']
+  if (frame.type !== pending.responseType || frame.id !== pending.id || frame.runtime_sequence !== pending.runtimeSequence ||
+      frame.server_instance_id !== runtime.server_instance_id || frame.runtime_id !== runtime.runtime_id ||
+      frame.runtime_generation !== runtime.runtime_generation ||
+      COORDINATOR_FENCE_FIELDS.some(key => frame[key] !== pending.fence[key])) return false
+  const base = ['type', ...COORDINATOR_FENCE_FIELDS, 'id', 'ok', ...accountKeys]
+  if (frame.type === 'checkpoint_ack') {
+    return exactKeys(frame, [...base, 'through_seq', 'sha256']) && typeof frame.ok === 'boolean' &&
+      frame.through_seq === pending.through && frame.sha256 === pending.digest
+  }
+  return exactKeys(frame, [...base, 'from_seq', 'through_seq', 'payload', 'sha256']) && typeof frame.ok === 'boolean' &&
+    frame.from_seq === pending.from && Number.isSafeInteger(frame.through_seq) && frame.through_seq >= frame.from_seq &&
+    typeof frame.payload === 'string' && Buffer.byteLength(frame.payload) <= MAX_FRAME_BYTES / 2 &&
+    /^[a-f0-9]{64}$/.test(frame.sha256) && createHash('sha256').update(frame.payload).digest('hex') === frame.sha256
 }
 
 function coordinatorFence(frame) {
@@ -355,6 +524,9 @@ export class AccountRuntime {
     this.workspaceCwd = workspaceWorkingDirectory(process.env.MORDE_WORKSPACE_DIR)
     this.runtime = undefined
     this.tasks = new Map()
+    this.lateToolResults = new Map()
+    this.lateTaskResponses = new Map()
+    this.lateCoordinatorResponses = new Map()
     this.coordinators = new Map()
     this.taskValidationReviews = new Map()
     this.coordinatorMessages = new Map()
@@ -540,7 +712,7 @@ export class AccountRuntime {
       fence, key, runtimeSequence: frame.runtime_sequence, outputBuffer: Buffer.alloc(0),
       outputFrames: Promise.resolve(), ready: deferred(), started: deferred(), spawned: deferred(),
       closed: deferred(), finished: deferred(), accepted: false, terminal: false, terminating: false,
-      terminated: false, startFrame: frame, admitted: false, observationSequences: new Map(),
+      terminated: false, startFrame: frame, admitted: false, observationSequences: new Map(), pendingToolCalls: new Map(), pendingResponses: new Map(),
     }
     this.tasks.set(key, task)
     this.activeTaskIDs.add(fence.task_id)
@@ -608,7 +780,7 @@ export class AccountRuntime {
         await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'coordinator_start_already_settled' })
         return
       }
-      await this.send({ type: 'coordinator_started', ...runtimeFields(this.runtime), ...fence })
+      await this.send({ type: 'coordinator_started', ...runtimeFields(this.runtime), runtime_sequence: frame.runtime_sequence, ...fence })
       return
     }
     const active = this.coordinators.get(key)
@@ -617,7 +789,7 @@ export class AccountRuntime {
         this.lastCoordinatorSequence = frame.runtime_sequence
         active.runtimeSequence = frame.runtime_sequence
         this.lastAcceptedCoordinatorStart = { digest, key, messageKey, runtimeSequence: frame.runtime_sequence }
-        await this.send({ type: 'coordinator_started', ...runtimeFields(this.runtime), ...fence })
+        await this.send({ type: 'coordinator_started', ...runtimeFields(this.runtime), runtime_sequence: frame.runtime_sequence, ...fence })
       } else {
         await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'coordinator_session_busy' })
       }
@@ -643,7 +815,7 @@ export class AccountRuntime {
       fence, key, messageKey, contentDigest, runtimeSequence: frame.runtime_sequence,
       outputBuffer: Buffer.alloc(0), outputFrames: Promise.resolve(), ready: deferred(), started: deferred(),
       spawned: deferred(), closed: deferred(), finished: deferred(), accepted: false, terminal: false,
-      terminating: false, terminated: false, startFrame: frame, admitted: false,
+      terminating: false, terminated: false, startFrame: frame, admitted: false, pendingResponses: new Map(),
     }
     this.coordinators.set(key, coordinator)
     this.rememberCoordinatorMessage(messageKey, { contentDigest, state: 'starting' })
@@ -852,7 +1024,7 @@ export class AccountRuntime {
       }
       coordinator.accepted = true
       this.coordinatorMessages.get(coordinator.messageKey).state = 'active'
-      await this.send({ type: 'coordinator_started', ...runtimeFields(this.runtime), ...coordinator.fence })
+      await this.send({ type: 'coordinator_started', ...runtimeFields(this.runtime), runtime_sequence: coordinator.runtimeSequence, ...coordinator.fence })
       coordinator.started.resolve()
     } catch {
       coordinator.startFailed = !coordinator.accepted
@@ -927,6 +1099,32 @@ export class AccountRuntime {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: 'runtime_fence_mismatch' })
       return
     }
+    if (Object.hasOwn(frame, 'runtime_sequence') &&
+        (!Number.isSafeInteger(frame.runtime_sequence) || frame.runtime_sequence < 1)) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: 'invalid_task_runtime_sequence' })
+      return
+    }
+    const correlationID = taskResponseCorrelation(frame)
+    const responseKey = typeof correlationID === 'string' && Number.isSafeInteger(frame.runtime_sequence)
+      ? taskResponseKey(frame.type, correlationID, frame.runtime_sequence) : undefined
+    if (responseKey && this.lateTaskResponses.has(responseKey)) {
+      const late = this.lateTaskResponses.get(responseKey)
+      if (!matchesLateTaskResponse(frame, late, this.runtime)) {
+        await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: 'late_task_response_mismatch' })
+        return
+      }
+      this.lateTaskResponses.delete(responseKey)
+      return
+    }
+    if (frame.type === 'tool_result' && this.lateToolResults.has(frame.id)) {
+      const late = this.lateToolResults.get(frame.id)
+      if (!matchesLateToolResult(frame, late)) {
+        await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: 'late_tool_result_mismatch' })
+        return
+      }
+      this.lateToolResults.delete(frame.id)
+      return
+    }
     const task = [...this.tasks.values()].find(item => item.fence.task_id === fence.task_id)
     if (task && (task.fence.owner_id !== fence.owner_id || task.fence.agent_id !== fence.agent_id ||
         task.fence.generation !== fence.generation || task.fence.authorization_version !== fence.authorization_version)) {
@@ -937,11 +1135,36 @@ export class AccountRuntime {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), code: 'unknown_task' })
       return
     }
+    if (Object.hasOwn(frame, 'runtime_sequence') && frame.runtime_sequence !== task.runtimeSequence) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'task_runtime_sequence_mismatch' })
+      return
+    }
+    if (frame.type === 'tool_result' && task.exit) {
+      const pending = task.pendingToolCalls?.get(frame.id)
+      if (pending && matchesLateToolResult(frame, {
+        id: frame.id, callID: pending.callID, sessionID: pending.sessionID, fence: task.fence,
+        runtimeSequence: task.runtimeSequence,
+      })) {
+        task.pendingToolCalls.delete(frame.id)
+        return
+      }
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'late_tool_result_mismatch' })
+      return
+    }
+    if (task.exit && responseKey) {
+      const pending = task.pendingResponses?.get(responseKey)
+      if (pending && matchesLateTaskResponse(frame, pending, this.runtime)) {
+        task.pendingResponses.delete(responseKey)
+        return
+      }
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'late_task_response_mismatch' })
+      return
+    }
     if (frame.type === 'message_delivery' && fence.session_id !== task.fence.session_id) {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'task_fence_mismatch' })
       return
     }
-    for (const key of accountScope) delete frame[key]
+    for (const key of [...accountScope, 'runtime_sequence']) delete frame[key]
     if (frame.type === 'message_delivery' && !validMessageDelivery(frame, fence)) {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'invalid_message_delivery' })
       return
@@ -955,6 +1178,14 @@ export class AccountRuntime {
       return
     }
     await this.writeTaskInput(task, frame)
+    if (responseKey) {
+      const pending = task.pendingResponses?.get(responseKey)
+      if (pending && matchesLateTaskResponse(frame, pending, this.runtime)) task.pendingResponses.delete(responseKey)
+    }
+    if (frame.type === 'tool_result') {
+      const pending = task.pendingToolCalls?.get(frame.id)
+      if (pending && pending.callID === frame.call_id && pending.sessionID === frame.session_id) task.pendingToolCalls.delete(frame.id)
+    }
   }
 
   async routeCoordinatorFrame(frame) {
@@ -974,9 +1205,13 @@ export class AccountRuntime {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'runtime_fence_mismatch' })
       return
     }
+    if (!Number.isSafeInteger(frame.runtime_sequence) || frame.runtime_sequence < 1) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'coordinator_runtime_sequence_required' })
+      return
+    }
     const accountKeysPresent = accountScope.filter(key => Object.hasOwn(frame, key))
     const cleanFrame = { ...frame }
-    for (const key of accountScope) delete cleanFrame[key]
+    for (const key of [...accountScope, 'runtime_sequence']) delete cleanFrame[key]
     const expectedResponse = ['checkpoint_ack', 'checkpoint_page', 'model_chunk', 'model_end'].includes(frame.type)
     const validShape = accountKeysPresent.length === 0 || accountKeysPresent.length === accountScope.length
     const validFrame = frame.type === 'coordinator_cancel'
@@ -986,6 +1221,17 @@ export class AccountRuntime {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'invalid_coordinator_frame' })
       return
     }
+    const responseKey = ['checkpoint_ack', 'checkpoint_page'].includes(frame.type)
+      ? coordinatorResponseKey(frame.type, frame.id, frame.runtime_sequence) : undefined
+    if (responseKey && this.lateCoordinatorResponses.has(responseKey)) {
+      const late = this.lateCoordinatorResponses.get(responseKey)
+      if (!matchesLateCoordinatorResponse(frame, late, this.runtime)) {
+        await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'late_coordinator_response_mismatch' })
+        return
+      }
+      this.lateCoordinatorResponses.delete(responseKey)
+      return
+    }
     const coordinator = this.coordinators.get(fence.session_id)
     if (!coordinator) {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'unknown_coordinator' })
@@ -993,6 +1239,24 @@ export class AccountRuntime {
     }
     if (COORDINATOR_FENCE_FIELDS.some(key => coordinator.fence[key] !== fence[key])) {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'coordinator_fence_mismatch' })
+      return
+    }
+    if (frame.runtime_sequence !== coordinator.runtimeSequence) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'coordinator_runtime_sequence_mismatch' })
+      return
+    }
+    const pending = responseKey ? coordinator.pendingResponses.get(responseKey) : undefined
+    if (coordinator.exit) {
+      if (pending && matchesLateCoordinatorResponse(frame, pending, this.runtime)) {
+        coordinator.pendingResponses.delete(responseKey)
+        return
+      }
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence,
+        code: pending ? 'late_coordinator_response_mismatch' : 'coordinator_process_exited' })
+      return
+    }
+    if (responseKey && (!pending || !matchesLateCoordinatorResponse(frame, pending, this.runtime))) {
+      await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'coordinator_response_mismatch' })
       return
     }
     if (frame.type === 'coordinator_cancel') {
@@ -1014,7 +1278,16 @@ export class AccountRuntime {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'coordinator_not_running' })
       return
     }
-    await this.writeCoordinatorInput(coordinator, cleanFrame)
+    try {
+      await this.writeCoordinatorInput(coordinator, cleanFrame)
+    } catch (error) {
+      if (coordinator.exit && pending && matchesLateCoordinatorResponse(frame, pending, this.runtime)) {
+        coordinator.pendingResponses.delete(responseKey)
+        return
+      }
+      throw error
+    }
+    if (pending) coordinator.pendingResponses.delete(responseKey)
   }
 
   async routeTaskValidationReviewFrame(frame) {
@@ -1259,7 +1532,15 @@ export class AccountRuntime {
           coordinator.terminal = true
           return
         }
-        await this.send({ ...frame, ...runtimeFields(this.runtime), ...coordinator.fence })
+        const pending = pendingCoordinatorResponse(frame, coordinator)
+        if (pending) {
+          if (coordinator.pendingResponses.has(pending.key) || this.lateCoordinatorResponses.has(pending.key) ||
+              coordinator.pendingResponses.size >= MAX_LATE_COORDINATOR_RESPONSES) {
+            throw new Error('duplicate or excessive coordinator response identity')
+          }
+          coordinator.pendingResponses.set(pending.key, pending)
+        }
+        await this.send({ ...frame, ...runtimeFields(this.runtime), runtime_sequence: coordinator.runtimeSequence, ...coordinator.fence })
       }).catch(() => this.terminateCoordinator(coordinator, 'output_failed'))
     }
   }
@@ -1268,24 +1549,33 @@ export class AccountRuntime {
     if (coordinator.finishing) return coordinator.finished.promise
     coordinator.finishing = true
     await coordinator.outputFrames
+    for (const [key, pending] of coordinator.pendingResponses) {
+      this.lateCoordinatorResponses.set(key, pending)
+      while (this.lateCoordinatorResponses.size > MAX_LATE_COORDINATOR_RESPONSES) {
+        this.lateCoordinatorResponses.delete(this.lateCoordinatorResponses.keys().next().value)
+      }
+    }
+    coordinator.pendingResponses.clear()
     clearTimeout(coordinator.cancelTimer)
     const message = this.coordinatorMessages.get(coordinator.messageKey)
     if (coordinator.startFailed) {
-      await this.send({ type: 'coordinator_failed', ...runtimeFields(this.runtime), ...coordinator.fence, code: 'runtime_unavailable' }).catch(() => {})
+      await this.send({ type: 'coordinator_failed', ...runtimeFields(this.runtime), runtime_sequence: coordinator.runtimeSequence,
+        ...coordinator.fence, code: 'runtime_unavailable' }).catch(() => {})
       if (message) message.state = 'failed'
     } else if (coordinator.terminalFrame?.type === 'coordinator_settled') {
-      await this.send({ ...coordinator.terminalFrame, state: 'completed', ...runtimeFields(this.runtime), ...coordinator.fence }).catch(() => {})
+      await this.send({ ...coordinator.terminalFrame, state: 'completed', ...runtimeFields(this.runtime),
+        runtime_sequence: coordinator.runtimeSequence, ...coordinator.fence }).catch(() => {})
       if (message) { message.state = 'settled'; message.terminal = coordinator.terminalFrame }
     } else if (coordinator.terminalFrame?.type === 'coordinator_cancelled' || coordinator.terminating) {
-      await this.send({ type: 'coordinator_terminated', ...runtimeFields(this.runtime), ...coordinator.fence,
+      await this.send({ type: 'coordinator_terminated', ...runtimeFields(this.runtime), runtime_sequence: coordinator.runtimeSequence, ...coordinator.fence,
         reason: coordinator.terminateReason ?? 'cancelled', state: 'cancelled', process_exited: true }).catch(() => {})
       if (message) message.state = 'settled'
     } else if (coordinator.terminalFrame?.type === 'coordinator_failed') {
-      await this.send({ type: 'coordinator_failed', ...runtimeFields(this.runtime), ...coordinator.fence,
+      await this.send({ type: 'coordinator_failed', ...runtimeFields(this.runtime), runtime_sequence: coordinator.runtimeSequence, ...coordinator.fence,
         code: coordinator.terminalFrame.code }).catch(() => {})
       if (message) message.state = 'failed'
     } else {
-      await this.send({ type: 'coordinator_failed', ...runtimeFields(this.runtime), ...coordinator.fence,
+      await this.send({ type: 'coordinator_failed', ...runtimeFields(this.runtime), runtime_sequence: coordinator.runtimeSequence, ...coordinator.fence,
         code: 'runtime_unavailable', reason: 'child_exited_without_result', process_exited: true }).catch(() => {})
       if (message) message.state = 'failed'
     }
@@ -1386,6 +1676,20 @@ export class AccountRuntime {
         }
         if (['agent_status', 'agent_activity', 'agent_heartbeat'].includes(frame.type) &&
             !validTaskAgentObservation(frame, task)) throw new Error('invalid task agent activity observation')
+        if (frame.type === 'tool_call') {
+          if (!ID.test(frame.id) || !ID.test(frame.call_id) || typeof frame.name !== 'string' ||
+              !TOOL_NAME.test(frame.name) || task.pendingToolCalls.has(frame.id) || this.lateToolResults.has(frame.id)) {
+            throw new Error('invalid task tool call identity')
+          }
+          task.pendingToolCalls.set(frame.id, { callID: frame.call_id, sessionID: frame.session_id, name: frame.name })
+        }
+        const pendingResponse = pendingTaskResponse(frame, task)
+        if (pendingResponse) {
+          task.pendingResponses ??= new Map()
+          if (task.pendingResponses.has(pendingResponse.key) || this.lateTaskResponses.has(pendingResponse.key) ||
+              task.pendingResponses.size >= MAX_LATE_TASK_RESPONSES) throw new Error('duplicate or excessive task response identity')
+          task.pendingResponses.set(pendingResponse.key, pendingResponse)
+        }
         await this.send({ ...frame, ...runtimeFields(this.runtime), runtime_sequence: task.runtimeSequence, ...task.fence, session_id: frame.session_id })
       }).catch(() => this.terminateTask(task, 'output_failed'))
     }
@@ -1454,6 +1758,20 @@ export class AccountRuntime {
 
   finishTask(task, checkShutdown = true) {
     if (this.tasks.get(task.key) !== task) return
+    for (const [id, pending] of task.pendingToolCalls ?? []) {
+      this.lateToolResults.set(id, { id, callID: pending.callID, sessionID: pending.sessionID,
+        name: pending.name, fence: task.fence, runtimeSequence: task.runtimeSequence })
+      while (this.lateToolResults.size > MAX_LATE_TOOL_RESULTS) {
+        this.lateToolResults.delete(this.lateToolResults.keys().next().value)
+      }
+    }
+    for (const [key, pending] of task.pendingResponses ?? []) {
+      this.lateTaskResponses.set(key, pending)
+      while (this.lateTaskResponses.size > MAX_LATE_TASK_RESPONSES) {
+        this.lateTaskResponses.delete(this.lateTaskResponses.keys().next().value)
+      }
+    }
+    task.pendingResponses?.clear()
     this.tasks.delete(task.key)
     this.activeTaskIDs.delete(task.fence.task_id)
     if (checkShutdown) this.finishShutdownIfIdle()

@@ -815,10 +815,10 @@ func cloudDSHExactFrameKeys(frame map[string]json.RawMessage, expected []string)
 }
 
 func validCloudDSHCoordinatorRuntimeFrame(kind string, frame map[string]json.RawMessage) bool {
-	base := cloudDSHCoordinatorFrameBaseKeys()
+	base := append(cloudDSHCoordinatorFrameBaseKeys(), "runtime_sequence")
 	switch kind {
 	case "coordinator_process_ready":
-		return cloudDSHExactFrameKeys(frame, append(append([]string(nil), base...), "runtime_sequence", "container_pid"))
+		return cloudDSHExactFrameKeys(frame, append(append([]string(nil), base...), "container_pid"))
 	case "coordinator_started":
 		return cloudDSHExactFrameKeys(frame, base)
 	case "checkpoint":
@@ -1046,27 +1046,26 @@ func (s *cloudDSHAccountRuntimeSession) removeCoordinator(identity app.Conversat
 }
 
 func (m *CloudDSHAccountRuntimeManager) StopCoordinator(ctx context.Context, session *cloudDSHAccountRuntimeSession,
-	identity app.ConversationCoordinatorIdentity) error {
-	if ctx == nil || session == nil {
+	coordinator *cloudDSHAccountCoordinator, identity app.ConversationCoordinatorIdentity, sequence int64) error {
+	if ctx == nil || session == nil || coordinator == nil || sequence < 1 || coordinator.sequence != sequence ||
+		!coordinator.identityMatches(identity) {
 		return errors.New("coordinator stop context and runtime are required")
 	}
 	session.mu.Lock()
-	coordinator := session.coordinators[identity.SessionID]
+	current := session.coordinators[identity.SessionID] == coordinator
 	session.mu.Unlock()
-	if coordinator == nil {
+	if !current {
 		return nil
-	}
-	if !coordinator.identityMatches(identity) {
-		return errors.New("coordinator stop identity does not match")
 	}
 	coordinator.mu.Lock()
 	terminal := coordinator.terminal
 	coordinator.mu.Unlock()
 	if !terminal {
-		if err := session.writeCoordinatorFrame(ctx, identity, map[string]any{"type": "coordinator_cancel",
+		if err := session.writeCoordinatorFrameForAttempt(ctx, coordinator, identity, sequence, map[string]any{"type": "coordinator_cancel",
 			"context_role": "coordinator", "conversation_id": identity.ConversationID, "message_id": identity.MessageID,
 			"owner_id": identity.OwnerID, "actor_id": identity.ActorID, "agent_id": identity.AgentID, "generation": identity.Generation,
-			"authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID}); err != nil {
+			"authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID,
+			"purpose": identity.Purpose, "operation_id": identity.OperationID}); err != nil {
 			return err
 		}
 		select {

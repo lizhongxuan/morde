@@ -635,10 +635,18 @@ ORDER BY CASE WHEN id=$9 AND $9<>'' THEN 0 WHEN id=$10 AND $10<>'' THEN 1 ELSE 2
 		value.AggregationCanWait = progress.unresolved > 0 && progress.attention == 0 && !progress.waitExpired
 		value.Context.Content = claim.Message.Content
 	} else {
-		value.Context.Content, err = joinedConversationRouteContent(ctx, tx, claim)
+		value.Context.Content, value.Context.ContentSources, err = joinedConversationRouteContent(ctx, tx, claim)
 		if err != nil {
 			return app.ConversationRouteSnapshot{}, err
 		}
+		if len(value.Context.ContentSources) > 0 {
+			digest := sha256.Sum256([]byte(value.Context.Content))
+			value.Context.ContentBytes = int64(len(value.Context.Content))
+			value.Context.ContentSHA256 = digest[:]
+		}
+	}
+	if value.Context.Content == claim.Message.Content {
+		value.Context.CurrentMessageID = claim.Message.ID
 	}
 	requestRows, err := tx.Query(ctx, `SELECT r.message_id,m.sequence,
  CASE WHEN octet_length(m.content)<=4096 THEN m.content ELSE left(m.content,1023)||E'\n…\n'||right(m.content,1023) END,
@@ -1244,7 +1252,10 @@ func exactConversationRouteDuplicate(candidates []app.ConversationRouteRequestCa
 	return target
 }
 
-func joinedConversationRouteContent(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) (string, error) {
+func joinedConversationRouteContent(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) (string, []app.ConversationRouteMessageSource, error) {
+	if len(claim.Input.ClientAttachmentIDs) != 0 {
+		return claim.Message.Content, nil, nil
+	}
 	var rootMetadata []byte
 	err := tx.QueryRow(ctx, `SELECT r.request_metadata FROM conversation_message_routes r
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.actor_id=r.actor_id
@@ -1253,27 +1264,27 @@ WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.owner_id=$3 AND r
  AND r.conversation_id=$5 AND r.duplicate_of_message_id IS NULL AND m.task_id IS NULL`,
 		claim.ServiceInstanceID, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID).Scan(&rootMetadata)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return claim.Message.Content, nil
+		return claim.Message.Content, nil, nil
 	}
 	if err != nil {
-		return "", fmt.Errorf("read conversation root before merging joined input: %w", err)
+		return "", nil, fmt.Errorf("read conversation root before merging joined input: %w", err)
 	}
 	var rootInput app.ConversationRoutingInput
 	if err := json.Unmarshal(rootMetadata, &rootInput); err != nil {
-		return "", fmt.Errorf("decode conversation root input before merging joined input: %w", err)
+		return "", nil, fmt.Errorf("decode conversation root input before merging joined input: %w", err)
 	}
 	rootDigest, err := app.ConversationRouteExecutionScopeDigest(rootInput)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	currentDigest, err := app.ConversationRouteExecutionScopeDigest(claim.Input)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	if !bytes.Equal(rootDigest, currentDigest) {
-		return "", domain.NewError(domain.CodeConflict, "conversation root execution scope changed")
+		return "", nil, domain.NewError(domain.CodeConflict, "conversation root execution scope changed")
 	}
-	rows, err := tx.Query(ctx, `SELECT m.content,r.request_metadata FROM conversation_message_routes r
+	rows, err := tx.Query(ctx, `SELECT m.id,m.sequence,m.content,r.request_metadata,r.authorization_snapshot FROM conversation_message_routes r
 JOIN conversation_messages m ON m.id=r.message_id AND m.owner_id=r.owner_id AND m.actor_id=r.actor_id
  AND m.conversation_id=r.conversation_id
 WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
@@ -1281,28 +1292,37 @@ WHERE r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$3 AND r.c
 ORDER BY m.sequence,m.id`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID,
 		claim.Message.ConversationID, claim.Message.ID)
 	if err != nil {
-		return "", fmt.Errorf("read joined conversation inputs: %w", err)
+		return "", nil, fmt.Errorf("read joined conversation inputs: %w", err)
 	}
 	defer rows.Close()
 	contents := []string{claim.Message.Content}
 	seen := map[string]struct{}{strings.TrimSpace(claim.Message.Content): {}}
+	rootSHA := sha256.Sum256([]byte(claim.Message.Content))
+	sources := []app.ConversationRouteMessageSource{{MessageID: claim.Message.ID, Sequence: claim.Message.Sequence,
+		ContentBytes: int64(len(claim.Message.Content)), ContentSHA256: rootSHA[:]}}
 	totalBytes := len(claim.Message.Content)
 	for rows.Next() {
-		var content string
-		var metadata []byte
-		if err := rows.Scan(&content, &metadata); err != nil {
-			return "", fmt.Errorf("scan joined conversation input: %w", err)
+		var messageID, content string
+		var sequence int64
+		var metadata, authorization []byte
+		if err := rows.Scan(&messageID, &sequence, &content, &metadata, &authorization); err != nil {
+			return "", nil, fmt.Errorf("scan joined conversation input: %w", err)
 		}
 		var input app.ConversationRoutingInput
+		var auth task.Authorization
 		if err := json.Unmarshal(metadata, &input); err != nil {
-			return "", fmt.Errorf("decode joined conversation input: %w", err)
+			return "", nil, fmt.Errorf("decode joined conversation input: %w", err)
+		}
+		if err := json.Unmarshal(authorization, &auth); err != nil || !reflect.DeepEqual(auth, claim.Authorization) ||
+			len(input.ClientAttachmentIDs) != 0 || sequence < 1 {
+			return "", nil, domain.NewError(domain.CodeConflict, "joined conversation authorization changed")
 		}
 		digest, err := app.ConversationRouteExecutionScopeDigest(input)
 		if err != nil {
-			return "", err
+			return "", nil, err
 		}
 		if !bytes.Equal(digest, currentDigest) {
-			return "", domain.NewError(domain.CodeConflict, "joined conversation input changed execution scope")
+			return "", nil, domain.NewError(domain.CodeConflict, "joined conversation input changed execution scope")
 		}
 		key := strings.TrimSpace(content)
 		if _, ok := seen[key]; ok {
@@ -1312,14 +1332,17 @@ ORDER BY m.sequence,m.id`, claim.ServiceInstanceID, claim.Message.OwnerID, claim
 		contents = append(contents, content)
 		totalBytes += len(content) + len("\n\n--- 用户补充 ---\n\n")
 		if totalBytes > 32768 {
-			return "", domain.NewError(domain.CodeResultTooLarge, "joined conversation input exceeds the routing limit")
+			return "", nil, domain.NewError(domain.CodeResultTooLarge, "joined conversation input exceeds the routing limit")
 		}
+		contentSHA := sha256.Sum256([]byte(content))
+		sources = append(sources, app.ConversationRouteMessageSource{MessageID: messageID, Sequence: sequence,
+			ContentBytes: int64(len(content)), ContentSHA256: contentSHA[:]})
 	}
 	if err := rows.Err(); err != nil {
-		return "", fmt.Errorf("read joined conversation inputs: %w", err)
+		return "", nil, fmt.Errorf("read joined conversation inputs: %w", err)
 	}
 	if len(contents) == 1 {
-		return claim.Message.Content, nil
+		return claim.Message.Content, nil, nil
 	}
 	var merged strings.Builder
 	merged.WriteString("用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n")
@@ -1330,9 +1353,9 @@ ORDER BY m.sequence,m.id`, claim.ServiceInstanceID, claim.Message.OwnerID, claim
 		merged.WriteString(content)
 	}
 	if merged.Len() > 32768 {
-		return "", domain.NewError(domain.CodeResultTooLarge, "joined conversation input exceeds the routing limit")
+		return "", nil, domain.NewError(domain.CodeResultTooLarge, "joined conversation input exceeds the routing limit")
 	}
-	return merged.String(), nil
+	return merged.String(), sources, nil
 }
 
 func prepareConversationRouteAggregation(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,
@@ -1863,6 +1886,9 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 		return err
 	}
 	objective := routedContent
+	if routedContent == claim.Message.Content {
+		objective = app.ConversationRouteTaskMessageObjective(claim.Message.ID, routedContent)
+	}
 	if strings.TrimSpace(objective) == "" {
 		objective = app.ConversationAttachmentOnlyObjective
 	}

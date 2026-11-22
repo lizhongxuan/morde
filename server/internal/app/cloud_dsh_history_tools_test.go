@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -35,6 +36,36 @@ type cloudDSHHistoryTaskStore struct {
 	pageCalls             int
 	afterPage             func()
 	suppressionBatchSizes []int
+}
+
+type cloudDSHCurrentMessageChunkTestStore struct {
+	TaskStore
+	messageID string
+	taskID    string
+	content   string
+	runes     []rune
+}
+
+func (s *cloudDSHCurrentMessageChunkTestStore) ReadCurrentConversationMessageChunk(_ context.Context, current task.Task,
+	messageID string, runeOffset int64, maxRunes int) (CurrentConversationMessageChunk, error) {
+	if current.ID != s.taskID || messageID != s.messageID || current.ConversationContext == nil ||
+		runeOffset < 0 || runeOffset > int64(len(s.runes)) || maxRunes < 1 || maxRunes > MaxConversationMessageChunkRunes {
+		return CurrentConversationMessageChunk{}, domain.NewError(domain.CodeNotFound, "current conversation message is unavailable")
+	}
+	start, end, bytes := int(runeOffset), int(runeOffset), 0
+	for end < len(s.runes) && end-start < maxRunes {
+		nextBytes := utf8.RuneLen(s.runes[end])
+		if bytes+nextBytes > MaxConversationMessageChunkBytes {
+			break
+		}
+		bytes += nextBytes
+		end++
+	}
+	digest := sha256.Sum256([]byte(s.content))
+	content := string(s.runes[start:end])
+	return CurrentConversationMessageChunk{MessageID: s.messageID, TaskID: current.ID,
+		Sequence: current.ConversationContext.ThroughSequence + 1, Role: conversation.RoleUser,
+		RuneOffset: runeOffset, NextRuneOffset: int64(end), TotalRunes: int64(len(s.runes)), SHA256: digest[:], Content: content}, nil
 }
 
 type cloudDSHProjectHistoryReplayStore struct {
@@ -386,6 +417,90 @@ func TestCloudDSHCurrentConversationHistorySearchReturnsMiddleOfLongMessage(t *t
 		utf8.RuneCountInString(output.Matches[0].Content) > cloudDSHHistoryContentRunes ||
 		strings.Contains(output.Matches[0].Content, "记录0001：") {
 		t.Fatalf("long-message search did not return a bounded excerpt around the match: %+v", output.Matches)
+	}
+}
+
+func TestCloudDSHCurrentMessageReaderReconstructsMoreThan200KiBExactly(t *testing.T) {
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	claimed.ConversationContext.ThroughSequence = 0
+	configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const totalBytes = 200<<10 + 1
+	prefix, middle, suffix := "START-ANCHOR", "MIDDLE-ANCHOR", "END-ANCHOR"
+	firstRun := strings.Repeat("a", 8179)
+	remaining := totalBytes - len(prefix) - len(firstRun) - len("汉") - len(middle) - len(suffix)
+	content := prefix + firstRun + "汉" + strings.Repeat("b", remaining/2) + middle +
+		strings.Repeat("c", remaining-remaining/2) + suffix
+	if len(content) != totalBytes {
+		t.Fatalf("fixture bytes=%d, want %d", len(content), totalBytes)
+	}
+	digest := sha256.Sum256([]byte(content))
+	objective := ConversationRouteTaskMessageObjective(messageID, content)
+	if !strings.Contains(objective, "sha256="+hex.EncodeToString(digest[:])) {
+		t.Fatal("long-message Task objective did not carry the expected source digest")
+	}
+	store := &cloudDSHCurrentMessageChunkTestStore{TaskStore: broker.store, messageID: messageID, taskID: claimed.ID,
+		content: content, runes: []rune(content)}
+	broker.store = store
+	var rebuilt strings.Builder
+	var offset int64
+	for calls := 0; ; calls++ {
+		if calls >= 100 || offset > int64(len(store.runes)) {
+			t.Fatalf("chunk reader did not make bounded forward progress: calls=%d offset=%d/%d", calls, offset, len(store.runes))
+		}
+		arguments, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(digest[:]),
+			"rune_offset": offset, "max_runes": MaxConversationMessageChunkRunes})
+		if err != nil {
+			t.Fatal(err)
+		}
+		result, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: fmt.Sprintf("long_read_%03d", calls),
+			Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}, false, nil)
+		if err != nil || result.Status != AgentToolSucceeded || len(result.Output) > maxAgentToolOutputBytes {
+			t.Fatalf("read chunk %d at %d: status=%s outputBytes=%d err=%v", calls, offset, result.Status, len(result.Output), err)
+		}
+		var chunk cloudDSHCurrentMessageReadResult
+		if err := json.Unmarshal([]byte(result.Output), &chunk); err != nil {
+			t.Fatal(err)
+		}
+		if chunk.MessageID != messageID || chunk.Role != conversation.RoleUser || chunk.RuneOffset != offset ||
+			chunk.NextRuneOffset <= offset || chunk.TotalRunes != int64(len(store.runes)) ||
+			chunk.SHA256 != hex.EncodeToString(digest[:]) || !utf8.ValidString(chunk.Content) ||
+			len(chunk.Content) > MaxConversationMessageChunkBytes ||
+			chunk.NextRuneOffset-offset != int64(utf8.RuneCountInString(chunk.Content)) {
+			t.Fatalf("reader returned a discontinuous or oversized chunk: %+v", chunk)
+		}
+		if calls == 0 {
+			if len(chunk.Content) != 8179+len(prefix) {
+				t.Fatalf("first chunk split the boundary rune: bytes=%d, want before the three-byte rune", len(chunk.Content))
+			}
+			replay, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_replay",
+				Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}, true, cloudDSHTestStringPointer(result.Output))
+			if err != nil || replay.Output != result.Output || len(baseStore.events) != 1 {
+				t.Fatalf("checkpoint replay changed or recommitted the same source chunk: replay=%+v events=%d err=%v", replay, len(baseStore.events), err)
+			}
+			store.content += "changed"
+			store.runes = []rune(store.content)
+			if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_changed_source",
+				Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState || len(baseStore.events) != 1 {
+				t.Fatalf("changed source was mixed into a multi-chunk read: events=%d err=%v", len(baseStore.events), err)
+			}
+			store.content = content
+			store.runes = []rune(content)
+		}
+		rebuilt.WriteString(chunk.Content)
+		offset = chunk.NextRuneOffset
+		if chunk.Complete {
+			break
+		}
+	}
+	if rebuilt.String() != content || !strings.HasPrefix(rebuilt.String(), prefix) ||
+		!strings.Contains(rebuilt.String(), middle) || !strings.HasSuffix(rebuilt.String(), suffix) ||
+		baseStore.details.Task.Usage.ToolCalls == 0 {
+		t.Fatalf("bounded reads did not reconstruct the immutable source and all anchors: bytes=%d want=%d toolCalls=%d",
+			rebuilt.Len(), len(content), baseStore.details.Task.Usage.ToolCalls)
 	}
 }
 

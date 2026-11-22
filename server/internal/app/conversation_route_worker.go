@@ -6,6 +6,8 @@ import (
 )
 
 const ConversationAttachmentOnlyObjective = "请处理本条消息中的附件。"
+const MaxConversationMessageChunkRunes = 32768
+const MaxConversationMessageChunkBytes = 8 << 10
 const ConversationRouteAggregationWindow = 350 * time.Millisecond
 const ConversationRouteAggregationMaxWait = 30 * time.Second
 

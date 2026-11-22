@@ -414,9 +414,15 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			return ModelResponse{}, err
 		}
 	}
-	if call.Source == ModelCallCompaction && (call.Summary == nil || endpoint.ContextWindowTokens == nil ||
-		*endpoint.ContextWindowTokens != call.Summary.ContextWindowTokens) {
-		return ModelResponse{}, domain.NewError(domain.CodeConflict, "conversation summary model capacity changed")
+	if call.Source == ModelCallCompaction {
+		contextWindow := 4096
+		if endpoint.ContextWindowTokens != nil {
+			contextWindow = *endpoint.ContextWindowTokens
+		}
+		if call.Summary == nil || contextWindow < 4096 || contextWindow > MaxModelContextWindowTokens ||
+			call.Summary.ContextWindowTokens > contextWindow {
+			return ModelResponse{}, domain.NewError(domain.CodeConflict, "conversation summary model capacity changed")
+		}
 	}
 	if projectID != "" && !endpoint.Personal && s.projectBudget == nil {
 		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "project model budget is unavailable")
@@ -813,6 +819,7 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 	case ModelCallCompaction:
 		if call.Task != nil || call.Review != nil || call.Summary == nil || ownerID != call.Summary.Claim.Message.ActorID ||
 			call.Summary.Identity.ActorID != ownerID || call.Summary.BaselineVersion < 0 ||
+			call.Summary.ContextWindowTokens < 4096 || call.Summary.ContextWindowTokens > MaxModelContextWindowTokens ||
 			len(call.Summary.InputSHA256) != sha256.Size || len(call.Request.Tools) != 0 || call.Request.RequiredTool != "" {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid conversation summary model fence")
 		}

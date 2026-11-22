@@ -74,7 +74,7 @@
 
 ### MH-CTX-001｜单条当前输入超过 8K tokens（P0；流程 01A）
 
-**前置条件**：目标模型和窗口已记录；模型窗口扣除系统提示、工具定义、历史与输出预留后，仍能容纳整条输入。输入还须在当前 128 KiB 路由/DSH 单条消息协议预算内；8 MiB 分片上传额度只是暂存限制。若模型窗口不满足，换用合适的测试模型；若协议预算不满足，转到超限保护子项，不得静默截断或把协议拒绝记作模型上下文通过。
+**前置条件**：目标模型、窗口和 tokenizer 已记录；原文不超过当前 8 MiB 持久化上限。客户端超过 32 KiB UTF-8 字节时使用可恢复分片上传；直接 JSON 接口保留其 32,768 Unicode 字符校验。长原文不会整条放入路由/DSH 请求：路由只带有界预览和来源指针，Task 按授权分段读取；每段连同系统提示、工具定义、工作状态和输出预留必须放入模型窗口，且总 Task/工具预算足以处理完整原文。若单段或累计执行预算不满足，应如实失败并保留原文，不得静默截断或把失败记作完整处理。
 
 **步骤**
 
@@ -84,7 +84,7 @@
 
 **预期**：在满足窗口预算的前提下，消息被完整处理；回复能准确覆盖开头、中间和末尾锚点，并遵守开头约束；记录证明完整输入进入模型请求，没有在受理后被静默截断。消息、会话及回复只各有一份。若当前请求自身实际超预算，系统应保留已受理原文并明确报告长度限制；该结果只能通过“超限保护”子项，不能替代本用例的可处理通过结果。
 
-**超限保护子项**：分别在隔离测试中验证三种边界：(a) 请求在消息受理前超过 API 硬限制，明确拒绝且没有“已受理”状态或半条消息/Task；(b) 分片上传消息已受理但超过当前 128 KiB 路由/DSH 协议预算，完整原文保留并标记 `message_too_long`，不派发模型调用；(c) 消息在协议预算内但超过模型可用 Token 预算，返回明确限制，完整原文可查，不伪称完成、不自动丢弃尾部或派发超预算模型调用。三种边界及其重试均不得产生重复消息或任务。
+**超限保护子项**：分别在隔离测试中验证三种边界：(a) 请求在消息受理前超过 API 硬限制，明确拒绝且没有“已受理”状态或半条消息/Task；(b) 原文超过 128 KiB 但不超过 8 MiB 时保留原文，路由使用来源指针，DSH 每次只经授权读取最多 8 KiB，并校验连续 Unicode 字符偏移和相同 SHA-256；超过 8 MiB 时在受理/分片上传层明确拒绝；(c) 单段、系统提示、工具定义或累计处理超过模型/Task/工具预算时，明确报告未完整处理，保留原文且不派发超预算模型请求。三种边界及其重试均不得产生重复消息或任务。
 
 ### MH-CTX-002｜累计历史超过窗口并经多轮压缩（P0；流程 01A、06）
 
@@ -305,7 +305,7 @@
 
 | 范围 | 执行 | 结果与边界 |
 |---|---|---|
-| DSH 长会话 | `runtime/morde-cloud-runtime` 下执行 `pnpm test` | 155 通过、0 失败；先构建锁定 DSH compaction 包，再覆盖 40 轮/多次 Session 压缩、早期与最新锚点、Token/源事件覆盖进展、无进展摘要不提交及 18 KiB 字节级当前输入合成用例。此用例不证明真实模型收到超过 8,192 tokens；真实模型累计历史窗口仍未测。 |
+| DSH 长会话 | `cd runtime/morde-cloud-runtime && npm test` | 191 通过、0 失败；包含构建锁定 DSH compaction 包、40 轮/多次 Session 压缩、早期与最新锚点、Token/源事件覆盖进展及 18 KiB 字节级当前输入合成用例；另有 4K/8K/100K/200K DSH TokenMeter 估算的多消息累计历史预算回归。单条消息上传/分段由 Portal/App/Worker 用例覆盖；这些合成用例不证明真实模型的 tokenizer/Provider 用量。 |
 | Provider 限流恢复 | `go test ./internal/app ./internal/worker -count=1`；隔离 PostgreSQL 16 下执行 `go test -v ./internal/store/postgres -run '^TestConversationRouteRetriesConfirmedRateLimitWithNewMeteredIdentity$' -count=1` | 单测和 PostgreSQL 端到端通过；覆盖 429 拒绝、账号/项目预留释放、新调用 ID、Retry-After 延迟、最多三次及终止失败。`Retry-After` 秒数/HTTP 日期解析、缺失/非法/超长边界由模型响应单测覆盖。服务端 `go test ./...` 在账本修复后通过。完整 PostgreSQL 包测试触及 10 分钟仓库超时，在 `TestPostgresTaskFileFetchTransferResumeContentLifecycleAndCancel` 的迁移初始化期间退出；定向限流集成通过。无真实 Provider 验收。 |
 | DeepSeek Provider 长输入直连 | 本地临时测试仅向官方 Responses API 提交合成对话文本，没有发送项目文件 | 51,842 字节、800 条记录首轮由 Provider 报告 18,502 输入 tokens，准确返回总数和首/中/尾锚点；完整前轮 user/assistant 历史的普通文本追问报告 18,575 输入 tokens，准确返回记录 0400。两次 JSON 模式全历史追问返回 `completed` 但正文空白，不能记作答对。直连证明 Provider 能处理超 8,192 tokens 的输入；不证明 Morde 网关、路由/Task 检索、原文持久化、PC/iOS 或累计历史压缩。 |
 | Morde 网关 DeepSeek 长输入/路由实测 | `cd server && go test ./internal/app -run '^TestDeepSeekFlashDialogueThroughMordeModelGateway$' -count=1 -v`；本机显式设置 `MORDE_TEST_MODEL_PROXY` 并使用授权测试凭据 | 全套 live suite 通过：中文问答、格式输出、4 种工作量路由、短多轮、长输入、截断历史追问路由、完整历史续问、流式回复、工具调用与结果续接。长输入 51,842 字节由 Provider 报告 18,502 tokens，首/中/尾锚点和总数准确；不完整历史追问返回 `new` Task 决策；完整历史续问由 Provider 报告 18,575 tokens 并准确回答 0400。初次不配代理时失败原因为系统 DNS 将 `api.deepseek.com` 映射到保留测试地址 `198.18.0.62`；已为显式代理下固定白名单 DeepSeek 域名添加与 OpenAI 一致的代理 DNS 路径，并验证主机白名单和 TLS 校验保持开启。此测试只覆盖 Morde Model Gateway 与路由分类器，不是服务端持久化/DSH 工具执行/PC/iOS 的完整端到端验收。 |
@@ -314,7 +314,7 @@
 | 路由、消息恢复、上下文预算 | `go test ./internal/app ./internal/worker -count=1`；隔离 PostgreSQL 下运行 `TestConversationRouteRepairsOneInvalidOutputWithSeparateMeteredCall`、`TestConversationRouteContextChangesReclassifyUpToWorkerConcurrencyLimit` 和 `TestConversationResultAggregation` | 通过；覆盖结构非法/截断/工具响应被拒后最多一次独立计量的无工具修复、第二次非法输出失败关闭、租约/上下文冲突、取消恢复和结果聚合。只证明 Go/本地 PostgreSQL 行为，不证明实际模型回复或 PC/iOS 入口。 |
 | 长历史后的短追问路由与检索 | `go test ./internal/app -run '^TestH09LongHistoryFollowupIsMarkedForAuthorizedSearch$' -count=1`；`CH_TEST_DATABASE_URL=<本机临时 PostgreSQL> go test ./internal/store/postgres -run '^TestH01LongPriorMessageUsesBoundedHistoryAndRequestPreviews$' -count=1`；`CH_TEST_DATABASE_URL=<本机临时 PostgreSQL> go test ./internal/worker -run '^TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart$' -count=1` | 单条长历史用例先保存首轮直接回复，再受理短追问；确认前序已完成，快照包含该助手答复并将用户原文标为截断，路由请求要求调用授权历史搜索，且提示摘要、历史和任务文本均是不可信数据。Worker E2E 将 840 条旧消息组成连续 `PreviousClientMessageID` 链，并断言从末条回溯恰好找到 840 条；随后在真实 Node DSH Runtime 重启后继续路由、调用授权历史搜索并完成回复。两项 PostgreSQL 用例均连接本机临时 PostgreSQL 16 并通过；Worker E2E 用时 33.58 秒。均为本地/合成模型证据，不替代真实 Provider 或 PC 追问验收。 |
 | 聊天请求体超限 | `cd server && go test ./internal/api -run '^TestOversizedConversationMessageIsRejectedBeforeAcceptance$' -count=1` | 通过；超过 API 请求体上限时返回 413，证明聊天消息受理/建单服务没有被调用。受理后的模型 Token 预算限制由路由预算和长消息集成用例覆盖。 |
-| 路由/DSH 单条输入上限 | `go test ./internal/worker -run '^TestConversationRouteWorkerPreservesLongMessagesAndExplainsOversizedInput$' -count=1`；隔离 PostgreSQL 执行 `go test ./internal/store/postgres -run '^TestConversationRouteOversizedMessageIsKeptWithVisibleReason$' -count=1`；Node 运行时边界测试 | 通过；40 KiB 纯文本仍进入路由，超过 128 KiB 的消息在模型派发前以 `message_too_long` 结束；PostgreSQL 保留完整原文和可见失败原因；DSH 接受恰好 128 KiB 的投递并拒绝超限内容。此协议边界不是模型窗口 Token 数。 |
+| 单条 8/16/200 KiB 长消息机制 | `cd server && go test ./internal/app -count=1`、`go test ./internal/worker -count=1`；`cd web/portal && pnpm vitest run src/app/message-upload.test.ts`；PostgreSQL 定向上传/来源读取集成见说明 | App 与 Worker 全量单测通过：8 KiB+1、16 KiB+1、200 KiB+1 输入在 4K 未知窗口下仍使用有界路由预览和消息 ID/长度/SHA-256 指针；200 KiB+1 混合 ASCII/UTF-8 原文按不超过 8 KiB 的片段连续读取并精确重建，覆盖 Unicode 边界、摘要不匹配失败及 checkpoint 重放。Portal 上传单测覆盖 200 KiB+1 UTF-8 消息、断线续传和字节精确重组。PostgreSQL HTTP 上传用例扩至 200 KiB+1，但本轮未配置 `CH_TEST_DATABASE_URL`，数据库断言未执行；PostgreSQL package 定向测试可编译通过。8 MiB 是原文持久化上限；128 KiB 仍限制单次 DSH 协议载荷，不限制持久化原文总长。 |
 | PC 对话路由失败提示 | `cd web/portal && pnpm vitest run src/routes/Assistant.test.tsx`、`pnpm run typecheck` | Assistant 测试 210/210 通过、类型检查通过。`message_too_long` 显示原文已保留和缩短建议，且不提供相同内容重试；其他已受理路由失败也显示安全中文原因，同时保留既有重处理入口。实际 `morde-pc` 重启并打开同一测试旁聊后，失败原因已在消息气泡内可见；该客户端仍收到失败状态，未通过追问成功验收。 |
 | DSH 当前消息长度 | `node --test --test-name-pattern='passes an 18 KB current message intact to the model within its context budget' test/hermes-compaction-runtime.test.mjs`；`node --test --test-name-pattern='validates message delivery Unicode characters' test/runtime.test.mjs` | 两项通过；证明约 18 KiB 当前输入完整进入合成模型请求，且 DSH 投递严格守住 128 KiB 边界。不代表真实模型 Token 统计或回复。 |
 | Broker 授权、审批、预算、操作对账 | `go test ./internal/app -run 'TestCloudDSHToolBroker(SensitiveApprovalResumesExactCallOnce|ReconcilesApprovedActionAfterLostRuntimeReceipt|ChangedApprovedPayloadDoesNotDispatch|RejectedApprovalReturnsWithoutDispatch|ExpiredApprovalReturnsWithoutDispatch|PausesClarificationAtToolCallBudget|UsesAuthorizedHostOperationLedger|ReconcilesCheckpointedResultWithoutMoreToolBudget|QueriesUnknownOperationAtExhaustedBudget|PausesUnresolvedRecoveryDurably)|TestBuiltinSearchRequiresCurrentTaskAuthorization|TestCloudDSHWorkspaceWrite(RequiresApprovalAndCommitsOnlyTheApprovedCall|ExpiredApprovalDoesNotCommit|ApprovalCannotAuthorizeChangedContent)' -count=1`；另跑 `go test ./internal/app -run 'TestCloudDSHHubTaskAuthorizationRevocationFailsClosed|TestProjectBudget' -count=1`、`go test ./internal/worker -run '^TestCloudTaskAuthorizationRevocationFencesHostDispatch$' -count=1` 和 PostgreSQL `TestProjectBudgetPersistenceAndLedgerPagination` / `TestProjectRouteBudgetFailureDoesNotReserveEitherLedger` | 全部通过；验证的是服务端拒绝、撤权、额度持久化和未知结果恢复。 |
@@ -587,6 +587,38 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **Runtime 回归：** `cd runtime/morde-cloud-runtime && npm run build:dsh-compaction && node --test --test-concurrency=1 test/runtime.test.mjs` 通过，157/157，55.119 秒；新增/加强的 H11 并行取消隔离场景包含在内。
 - **静态检查：** `git diff --check`、所有修改 Go 文件的 `gofmt -d`、`node --check runtime/morde-cloud-runtime/test/runtime.test.mjs` 均通过。
 - **未覆盖：** 本轮未重跑整个 PostgreSQL 包（完整包此前达到 10 分钟仓库超时上限并停在迁移初始化）；未调用真实 Provider，也未重试远端 `dsh_recovery_unresolved` Task。未提交/推送这些本地开发改动。
+
+### S00 H01/H04/H09 本地实现与回归（2026-11-23；真实模型验收待轮换凭据）
+
+- **基线：** 工作区位于 `main`，`HEAD` 与 `origin/main` 均为 `e9414668fa6c9e822af6e7f1cb9d4a9de00c3705`；`git ls-remote --heads origin` 仅返回 `main`。本轮代码和文档改动留在本地，未提交或推送。DSH 包及锁文件版本为 `0.2.2-rc.1`，Node `v26.13.0`，Go `1.27.1 darwin/arm64`。
+- **H04 改动：** WorkerIPC 与 AccountRuntime 对 Task IPC 的超时/取消、Task 退役边界增加有界迟到回复 tombstone。`tool_result`、checkpoint ack/page、child session/settlement ack 只在 runtime sequence、完整 Task/session fence、请求关联值一致时被消费一次；重复、未知或不匹配回复仍失败关闭。child tombstone 只保留 objective/tool allowlist 摘要，不保留完整正文；可选 settlement `output` 与既有合同一致；迟到图片复用 IPC 的既有解码/大小/媒体验证。本轮进一步把 Coordinator runtime sequence 贯穿 Go/Node 双向协议；checkpoint ack/page 在进程退出窗口与退役后按完整身份、请求 ID、通过序号或页面 payload digest 精确消费一次，Coordinator 重试/重放的 `coordinator_started` 也带 sequence。Coordinator 是零工具执行环境，不存在 Coordinator child tool replies。
+- **H01/H09 改动：** 对混合 Unicode 的长消息，来源 fence 依据固定 2,048/1,024 字节预览预算重新验证，避免 rune-safe 边界导致实际预览短于预算后被误拒。Worker 对未知模型容量使用 4,096-token 最小窗口并保留当前消息 ID/字节数/SHA-256；摘要网关在模型计费预留和派发前复核实际容量。当前消息 reader 按授权 Task 会话、message ID、SHA-256 与连续 rune offset 提供最多 8 KiB 的分页片段；200 KiB 原文 PostgreSQL 重建回归纳入下方临时库用例。对已关联的多条补充消息，route context 新增有序 source manifest（消息 ID、sequence、原文字节数、SHA-256）；PostgreSQL 派发 fence 从原始行重新组合并核对每项授权/执行范围、总内容摘要及 2,048/1,024 预览。模型请求不把 root ID 冒充聚合内容 ID，Task 目标保留完整 root 与选中补充；聚合上限为 32 KiB，超限返回 `result_too_large` 且不建 Task。聚合内容仍只向分类器提供有界预览，不新增独立多源分页 API。
+- **自动化验证：**
+
+  ```text
+  cd runtime/morde-cloud-runtime && npm run build:dsh-compaction
+  cd runtime/morde-cloud-runtime && node --test --test-concurrency=1 test/runtime.test.mjs
+  # 167/167 通过，70.692 秒
+  cd server && go test ./internal/worker -count=1
+  # 通过，57.375 秒
+  cd server && go test ./internal/app -count=1
+  # 通过，20.752 秒
+  CH_TEST_DATABASE_URL=<本机临时 PostgreSQL DSN，仅绑定 127.0.0.1:55434> \
+    go test ./internal/store/postgres -run '^(TestReadCurrentConversationMessageChunkReconstructs200KiBSource|TestH01Long.*|TestConversationRouteSnapshotBoundsCandidateSetsWithoutBlockingRouting)$' -count=1 -timeout=5m
+  # TestH01Long 四项、200 KiB 原文读取及候选集回归通过；包用时 9.008 秒
+  git diff --check
+  git diff --name-only -- '*.go' | xargs gofmt -d
+  node --check runtime/morde-cloud-runtime/src/ipc.mjs
+  node --check runtime/morde-cloud-runtime/src/account-runtime.mjs
+  node --check runtime/morde-cloud-runtime/test/runtime.test.mjs
+  # 以上静态检查通过
+  ```
+
+  PostgreSQL 使用本机已缓存 `postgres:16.15-bookworm`，临时容器无持久卷且端口仅绑定 loopback；测试完成后已删除。全量 Runtime 用例包括 8 项迟到回复定向断言。App/Worker 全量包括最小窗口长消息预览、混合 Unicode fence 和未知 summary capacity 测试。
+- **本轮追加验证（2026-11-23）：** `cd runtime/morde-cloud-runtime && npm test`（含 DSH compaction 构建）通过，192/192，79.408 秒；随后扩展迟到 Coordinator 定向回归，覆盖退出窗口 ack、退役后的 page、错误 page 与重复 page，`node --test --test-concurrency=1 --test-name-pattern='exact late coordinator replies' test/runtime.test.mjs` 通过 1/1。`cd server && go test ./internal/app -count=1` 通过（最终版本 20.864 秒），`cd server && go test ./internal/worker -count=1` 通过（58.612 秒）。临时 PostgreSQL 16 上 `CH_TEST_DATABASE_URL=<仅绑定 127.0.0.1:55434 的临时 DSN> go test ./internal/store/postgres -run '^(TestConversationRouteJoinedMessageSources(FenceAndPreviews|FailClosedAboveLimit)|TestConversationRouteApplyKeepsLongRootAndSelectedSupplementInTaskObjective|TestConversationRouteJoinWaitsOnOriginalRequestWithoutCreatingTask|TestPostgresConversationRouteAggregationUsesWindowAndExplicitMessageSelection|TestH01Long.*)$' -count=1 -timeout=5m` 通过，包用时 12.143 秒。覆盖来源顺序/摘要、预览与派发 fence、授权/范围变化拒绝、32 KiB 超限不建 Task，以及长 root 和所选补充完整进入 Task objective；容器测试后已删除。
+- **首次失败及修正：** Runtime 全量首次发现 account Coordinator 测试 helper 未把 `runtime_sequence` 回显到 model/checkpoint 响应；更新夹具携带该 fence 后全量通过。PostgreSQL 新用例修正为“正在处理的 root 被补充后重新分类”路径，并补齐所选模型 ID；超限检查在 Apply 的事务边界断言，确认不建 Task。新增 aggregate preview 的分类澄清说明已保存完整源，不要求用户重复发送。
+- **首次尝试及修正：** 新 Runtime 定向测试最初错误地假设 Task 取消会取消尚未超时的 checkpoint ack；后改为让该请求走既有超时语义。另一个 AccountRuntime 合成 Task 未带 runtime sequence；response tracking 现只在有效正 sequence 下启用，旧测试形态不误登记退役响应。最终 Runtime 全量 167 项通过。Worker 预览测试首次因一个不再使用的 import 编译失败；删除 import 后，测试暴露了它对预览中段锚点位置的额外断言。现改为核对本功能合同：内容受限、原文长度/ID/SHA 保留、首尾锚点在预览、模型窗口预算可容纳；独立 app 请求用例继续验证直接预览的首尾布局。Worker 全量 57.375 秒通过。
+- **已知缺口与未验范围：** 多消息聚合仍受 32 KiB 上限约束，超限安全失败；本轮未新增独立聚合原文分页 API，也未验证超限提示的客户端展示。工具、子 Agent 与 Task checkpoint 的请求级停滞期限仍未补齐。用户选择等轮换凭据配置到本机后继续真实模型验收；本轮未调用真实模型、测试站或客户端，旧聊天 key 未使用。真实 tokenizer/Provider 窗口、跨账号长历史、双端 Task 状态、真实 Host 工具和 60 分钟耐久验收均未执行，H01/H04/H09 保持未完成。
 
 ### 单次执行信息模板
 

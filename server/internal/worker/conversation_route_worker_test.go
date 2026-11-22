@@ -799,21 +799,39 @@ func TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits(t *testing
 	}
 }
 
-func TestConversationRouteWorkerPreservesLongMessagesAndExplainsOversizedInput(t *testing.T) {
+func TestConversationRouteWorkerRoutesLongMessagesAndExplainsStorageLimit(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	stub.snapshot.Context.Content = strings.Repeat("a", 40<<10)
+	stub.claim.Message.Content = stub.snapshot.Context.Content
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 || len(stub.failures) != 0 {
 		t.Fatalf("40 KiB request should be routed intact: failures=%v actions=%v err=%v", stub.failures, stub.applied, err)
 	}
+	if stub.snapshot.Context.Content != strings.Repeat("a", 40<<10) || !stub.classified.ContentTruncated ||
+		stub.classified.CurrentMessageID != stub.claim.Message.ID {
+		t.Fatalf("routing preview changed the accepted message source: snapshot=%+v classified=%+v", stub.snapshot.Context, stub.classified)
+	}
 	stub.applied = nil
 	stub.classifies = 0
-	stub.snapshot.Context.Content = strings.Repeat("a", app.MaxConversationAgentInputBytes+1)
+	stub.failures = nil
+	stub.snapshot.Context.Content = strings.Repeat("a", 200<<10+1)
+	stub.claim.Message.Content = stub.snapshot.Context.Content
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 || len(stub.failures) != 0 ||
+		stub.classifies != 1 || !stub.classified.ContentTruncated {
+		t.Fatalf("200 KiB input should route through a bounded source reference: failures=%v actions=%v context=%+v err=%v",
+			stub.failures, stub.applied, stub.classified, err)
+	}
+	stub.applied = nil
+	stub.classifies = 0
+	stub.failures = nil
+	stub.snapshot.Context.Content = strings.Repeat("a", app.MaxConversationMessageBytes+1)
+	stub.claim.Message.Content = stub.snapshot.Context.Content
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 || stub.failures[0] != "message_too_long" || len(stub.applied) != 0 || stub.classifies != 0 {
-		t.Fatalf("oversized input should fail before model dispatch: failures=%v actions=%v err=%v", stub.failures, stub.applied, err)
+		t.Fatalf("input above the durable message limit should fail before model dispatch: failures=%v actions=%v err=%v", stub.failures, stub.applied, err)
 	}
 	stub.failures = nil
 	stub.snapshot.Context.Content = strings.Repeat("a", 64<<10)
+	stub.claim.Message.Content = stub.snapshot.Context.Content
 	stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1, Objective: strings.Repeat("b", 64<<10)}}
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || stub.classifies != 1 || len(stub.applied) != 1 {
 		t.Fatalf("oversized candidate should be bounded before model dispatch: failures=%v classifications=%d context=%+v err=%v",
@@ -834,6 +852,7 @@ func TestConversationRouteWorkerPreservesLongMessagesAndExplainsOversizedInput(t
 	}
 	stub.failures = nil
 	stub.snapshot.Context.Candidates[0].Objective = "short"
+	stub.claim.Message.Content = stub.snapshot.Context.Content
 	stub.classifies = 0
 	stub.applied = nil
 	stub.classifyErr = domain.NewError(domain.CodeResultTooLarge, "input exceeds limit")

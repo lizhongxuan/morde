@@ -2,8 +2,11 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -22,6 +25,77 @@ func TestConversationRouteInputFitsMinimumWindowAndAccountsForCJK(t *testing.T) 
 	}
 	if ConversationRouteInputFitsContextWindow(request, 2048) {
 		t.Fatal("unsupported model capacity was accepted")
+	}
+}
+
+func TestConversationRouteModelRequestFitsMinimumWindowForShortMessages(t *testing.T) {
+	for _, message := range []string{"你好", "???"} {
+		t.Run(message, func(t *testing.T) {
+			request, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: message})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !ConversationRouteInputFitsContextWindow(request, 4096) {
+				t.Fatalf("short conversation route request does not fit the minimum window (output=%d)", request.MaxOutputTokens)
+			}
+		})
+	}
+}
+
+func TestConversationRouteModelRequestProjectsLargeCurrentMessages(t *testing.T) {
+	for _, size := range []int{8<<10 + 1, 16<<10 + 1, 200<<10 + 1} {
+		t.Run(fmt.Sprintf("%d_bytes", size), func(t *testing.T) {
+			prefix, middle, suffix := "START-ANCHOR\n", "MIDDLE-ANCHOR\n", "END-ANCHOR"
+			padding := size - len(prefix) - len(middle) - len(suffix)
+			content := prefix + strings.Repeat("x", padding/2) + middle + strings.Repeat("y", padding-padding/2) + suffix
+			digest := sha256.Sum256([]byte(content))
+			request, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", CurrentMessageID: "m1234567", Content: content})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var input struct {
+				Message          string `json:"message"`
+				MessageID        string `json:"message_id"`
+				MessageBytes     int64  `json:"message_bytes"`
+				MessageSHA256    string `json:"message_sha256"`
+				MessageTruncated bool   `json:"message_truncated"`
+			}
+			if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
+				t.Fatal(err)
+			}
+			if !input.MessageTruncated || input.MessageID != "m1234567" || input.MessageBytes != int64(len(content)) ||
+				input.MessageSHA256 != hex.EncodeToString(digest[:]) || len(request.Input[0].Text) > 12<<10 ||
+				!strings.Contains(input.Message, "START-ANCHOR") || !strings.Contains(input.Message, "END-ANCHOR") ||
+				strings.Contains(input.Message, "MIDDLE-ANCHOR") || !strings.Contains(request.Instructions, "morde_read_current_conversation_message") {
+				t.Fatalf("large route input was not represented by a bounded, verifiable source reference: bytes=%d input=%+v requestBytes=%d",
+					size, input, len(request.Input[0].Text))
+			}
+		})
+	}
+}
+
+func TestConversationRouteContextMatchesRuneSafeCurrentMessagePreviews(t *testing.T) {
+	claim, _ := routeGatewayFixture()
+	claim.Message.Content = strings.Repeat("a汉", 1024)
+	for _, previewBytes := range []int{ConversationRouteCurrentMessagePreviewBytes, 1024} {
+		value := ConversationRouteContext{ActorID: claim.Message.ActorID, CurrentMessageID: claim.Message.ID, Content: claim.Message.Content}
+		ProjectConversationRouteMessage(&value, previewBytes)
+		if len(value.Content) >= previewBytes || !conversationRouteContextMatchesClaim(value, claim) {
+			t.Fatalf("rune-safe %d-byte preview did not match its original source: actual=%d", previewBytes, len(value.Content))
+		}
+	}
+}
+
+func TestConversationRouteTaskObjectiveReferencesLargeSource(t *testing.T) {
+	content := "START-ANCHOR\n" + strings.Repeat("x", 200<<10) + "\nEND-ANCHOR"
+	digest := sha256.Sum256([]byte(content))
+	objective := ConversationRouteTaskMessageObjective("m1234567", content)
+	if len(objective) > 8<<10 || !strings.Contains(objective, "message_id=m1234567") ||
+		!strings.Contains(objective, "sha256="+hex.EncodeToString(digest[:])) ||
+		!strings.Contains(objective, "morde_read_current_conversation_message") ||
+		!strings.Contains(objective, "START-ANCHOR") || !strings.Contains(objective, "END-ANCHOR") ||
+		strings.Contains(objective, strings.Repeat("x", 4096)) {
+		t.Fatalf("large Task objective did not retain a bounded source pointer: objectiveBytes=%d", len(objective))
 	}
 }
 
@@ -58,9 +132,23 @@ func TestResolveConversationRouteContextWindowFallsBackToMinimumWhenUnknown(t *t
 	}
 }
 
+func TestResolveConversationSummaryModelUsesMinimumWindowWhenCapacityIsUnknown(t *testing.T) {
+	claim, _ := routeGatewayFixture()
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, &modelGatewayClientTest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	modelID, window, err := service.ResolveConversationSummaryModel(context.Background(), claim)
+	if err != nil || modelID != "p1234567" || window != 4096 {
+		t.Fatalf("unknown-capacity summary model = %q, %d, %v; want selected model at safe 4K minimum", modelID, window, err)
+	}
+}
+
 func TestConversationRouteGatewayRejectsOverBudgetBeforeReservation(t *testing.T) {
 	claim, value := routeGatewayFixture()
 	claim.Message.Content, value.Content = strings.Repeat("汉", 3200), strings.Repeat("汉", 3200)
+	value.CurrentMessageID = claim.Message.ID
 	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
 	client := &modelGatewayClientTest{}
 	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, client)

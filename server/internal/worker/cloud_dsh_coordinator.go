@@ -35,6 +35,7 @@ type CloudDSHCoordinatorCheckpoints interface {
 
 type cloudDSHCoordinatorStream interface {
 	read(context.Context) (cloudDSHCoordinatorFrame, error)
+	runtimeSequence() int64
 }
 
 type cloudDSHCoordinatorTurn struct {
@@ -51,8 +52,8 @@ func (t *cloudDSHCoordinatorTurn) read(ctx context.Context) (cloudDSHCoordinator
 
 type cloudDSHCoordinatorRuntime interface {
 	StartCoordinator(context.Context, app.ConversationRouteClaim, app.ConversationCoordinatorIdentity, map[string]any) (cloudDSHCoordinatorStream, error)
-	WriteCoordinatorFrame(context.Context, app.ConversationCoordinatorIdentity, map[string]any) error
-	StopCoordinator(context.Context, app.ConversationCoordinatorIdentity) error
+	WriteCoordinatorFrame(context.Context, app.ConversationCoordinatorIdentity, int64, map[string]any) error
+	StopCoordinator(context.Context, app.ConversationCoordinatorIdentity, int64) error
 }
 
 type cloudDSHCoordinatorRuntimeManager interface {
@@ -64,8 +65,9 @@ type cloudDSHCoordinatorAccountRuntimeManager struct {
 }
 
 type cloudDSHCoordinatorAccountRuntime struct {
-	manager *CloudDSHAccountRuntimeManager
-	session *cloudDSHAccountRuntimeSession
+	manager     *CloudDSHAccountRuntimeManager
+	session     *cloudDSHAccountRuntimeSession
+	coordinator *cloudDSHAccountCoordinator
 }
 
 type cloudDSHCoordinatorAccountStream struct {
@@ -86,22 +88,25 @@ func (r *cloudDSHCoordinatorAccountRuntime) StartCoordinator(ctx context.Context
 	if err != nil {
 		return nil, err
 	}
+	r.coordinator = coordinator
 	return cloudDSHCoordinatorAccountStream{coordinator: coordinator}, nil
 }
 
 func (r *cloudDSHCoordinatorAccountRuntime) WriteCoordinatorFrame(ctx context.Context,
-	identity app.ConversationCoordinatorIdentity, frame map[string]any) error {
-	return r.session.writeCoordinatorFrame(ctx, identity, frame)
+	identity app.ConversationCoordinatorIdentity, sequence int64, frame map[string]any) error {
+	return r.session.writeCoordinatorFrameForAttempt(ctx, r.coordinator, identity, sequence, frame)
 }
 
 func (r *cloudDSHCoordinatorAccountRuntime) StopCoordinator(ctx context.Context,
-	identity app.ConversationCoordinatorIdentity) error {
-	return r.manager.StopCoordinator(ctx, r.session, identity)
+	identity app.ConversationCoordinatorIdentity, sequence int64) error {
+	return r.manager.StopCoordinator(ctx, r.session, r.coordinator, identity, sequence)
 }
 
 func (s cloudDSHCoordinatorAccountStream) read(ctx context.Context) (cloudDSHCoordinatorFrame, error) {
 	return s.coordinator.read(ctx)
 }
+
+func (s cloudDSHCoordinatorAccountStream) runtimeSequence() int64 { return s.coordinator.sequence }
 
 type CloudDSHConversationCoordinatorOptions struct {
 	AccountRuntimes *CloudDSHAccountRuntimeManager
@@ -200,13 +205,17 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 	if err != nil {
 		return app.ConversationRouteDecision{}, err
 	}
+	sequence := stream.runtimeSequence()
+	if sequence < 1 {
+		return app.ConversationRouteDecision{}, errors.New("DSH coordinator runtime sequence is invalid")
+	}
 	session := &cloudDSHCoordinatorTurn{stream: stream, through: head.Through,
 		checkpointIDs: make(map[string]struct{}),
 		readThrough:   -1, pageReadIDs: make(map[string]struct{})}
 	defer func() {
 		stopCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 		defer cancel()
-		_ = runtime.StopCoordinator(stopCtx, identity)
+		_ = runtime.StopCoordinator(stopCtx, identity, sequence)
 	}()
 
 	var lastModel *app.ModelResponse
@@ -234,7 +243,7 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 			}
 			session.checkpointIDs[frame.ID] = struct{}{}
 			session.through = *frame.Through
-			if err := runtime.WriteCoordinatorFrame(ctx, identity, map[string]any{"type": "checkpoint_ack", "context_role": "coordinator",
+			if err := runtime.WriteCoordinatorFrame(ctx, identity, sequence, map[string]any{"type": "checkpoint_ack", "context_role": "coordinator",
 				"conversation_id": identity.ConversationID, "message_id": identity.MessageID, "owner_id": identity.OwnerID, "actor_id": identity.ActorID,
 				"agent_id": identity.AgentID, "generation": identity.Generation, "authorization_version": identity.AuthorizationVersion,
 				"session_id": identity.SessionID, "purpose": identity.Purpose, "operation_id": identity.OperationID,
@@ -258,7 +267,7 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 			if page.Through == head.Through && !cloudDSHDigest(page.Payload, hex.EncodeToString(head.Digest)) {
 				return app.ConversationRouteDecision{}, errors.New("DSH coordinator checkpoint digest is invalid")
 			}
-			if err := runtime.WriteCoordinatorFrame(ctx, identity, map[string]any{"type": "checkpoint_page", "context_role": "coordinator",
+			if err := runtime.WriteCoordinatorFrame(ctx, identity, sequence, map[string]any{"type": "checkpoint_page", "context_role": "coordinator",
 				"conversation_id": identity.ConversationID, "message_id": identity.MessageID, "owner_id": identity.OwnerID, "actor_id": identity.ActorID,
 				"agent_id": identity.AgentID, "generation": identity.Generation, "authorization_version": identity.AuthorizationVersion,
 				"session_id": identity.SessionID, "purpose": identity.Purpose, "operation_id": identity.OperationID,
@@ -285,7 +294,7 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 				return app.ConversationRouteDecision{}, err
 			}
 			lastModel = &response
-			if err := writeCloudDSHCoordinatorModel(ctx, runtime, identity, frame.ID, response,
+			if err := writeCloudDSHCoordinatorModel(ctx, runtime, identity, sequence, frame.ID, response,
 				app.MaxConversationRouteModelOutputBytes); err != nil {
 				return app.ConversationRouteDecision{}, err
 			}
@@ -354,7 +363,7 @@ func validCoordinatorModelResponse(response app.ModelResponse, maxOutputBytes in
 }
 
 func writeCloudDSHCoordinatorModel(ctx context.Context, runtime cloudDSHCoordinatorRuntime,
-	identity app.ConversationCoordinatorIdentity, id string, response app.ModelResponse, maxOutputBytes int) error {
+	identity app.ConversationCoordinatorIdentity, sequence int64, id string, response app.ModelResponse, maxOutputBytes int) error {
 	if !validCoordinatorModelResponse(response, maxOutputBytes) || id == "" {
 		return errors.New("DSH coordinator model response cannot be encoded")
 	}
@@ -374,7 +383,7 @@ func writeCloudDSHCoordinatorModel(ctx context.Context, runtime cloudDSHCoordina
 		for key, value := range base {
 			frame[key] = value
 		}
-		if err := runtime.WriteCoordinatorFrame(ctx, identity, frame); err != nil {
+		if err := runtime.WriteCoordinatorFrame(ctx, identity, sequence, frame); err != nil {
 			return err
 		}
 	}
@@ -382,5 +391,5 @@ func writeCloudDSHCoordinatorModel(ctx context.Context, runtime cloudDSHCoordina
 	for key, value := range base {
 		frame[key] = value
 	}
-	return runtime.WriteCoordinatorFrame(ctx, identity, frame)
+	return runtime.WriteCoordinatorFrame(ctx, identity, sequence, frame)
 }

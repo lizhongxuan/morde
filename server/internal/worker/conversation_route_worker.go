@@ -123,9 +123,9 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		return true, w.failRoute(ctx, claim, "routing_context_unavailable", errors.New("conversation aggregation contains unresolved messages"))
 	}
-	if len(snapshot.Context.Content) > app.MaxConversationAgentInputBytes {
-		err := domain.NewError(domain.CodeResultTooLarge, "message exceeds the model input budget")
-		err.Details["stage"] = "route_protocol_input_limit"
+	if len(snapshot.Context.Content) > app.MaxConversationMessageBytes {
+		err := domain.NewError(domain.CodeResultTooLarge, "message exceeds the accepted conversation message limit")
+		err.Details["stage"] = "route_message_storage_limit"
 		return true, w.failRoute(ctx, claim, "message_too_long", err)
 	}
 	if snapshot.PreviousCycle {
@@ -181,6 +181,9 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	}
 	snapshot.Context.ModelID = modelID
 	classifyContext := snapshot.Context
+	if !classifyContext.ContentTruncated && classifyContext.Content == claim.Message.Content {
+		classifyContext.CurrentMessageID = claim.Message.ID
+	}
 	if snapshot.Summary != nil {
 		document, openErr := app.OpenConversationSummary(w.options.SummarySealer, *snapshot.Summary)
 		if openErr == nil && document.Identity == snapshot.Summary.Identity && document.Version == classifyContext.SummaryVersion &&
@@ -295,7 +298,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if snapshot.Context.ResultReview != nil && decision.Action != app.ConversationRouteReply {
 		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("task result review did not produce a reply"))
 	}
-	if decision.Action == app.ConversationRouteNew {
+	if decision.Action == app.ConversationRouteNew && !classifyContext.ContentTruncated {
 		if aggregation, ok := w.options.Actions.(app.ConversationRouteAggregation); ok {
 			started, err := aggregation.BeginConversationRouteAggregation(routeCtx, claim, snapshot, decision)
 			if err != nil {
@@ -343,6 +346,7 @@ func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error
 }
 
 func fitConversationRouteContext(value *app.ConversationRouteContext, contextWindow int) error {
+	app.ProjectConversationRouteMessage(value, app.ConversationRouteCurrentMessagePreviewBytes)
 	for {
 		request, err := app.ConversationRouteModelRequest(*value)
 		if err == nil && app.ConversationRouteInputFitsContextWindow(request, contextWindow) {
@@ -371,6 +375,9 @@ func fitConversationRouteContext(value *app.ConversationRouteContext, contextWin
 			}
 		}
 		if trimmedHistory {
+			continue
+		}
+		if app.ShortenConversationRouteMessage(value) {
 			continue
 		}
 		if err != nil {
@@ -542,6 +549,11 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 	if !app.ValidConversationRouteModelOutput(decision.ModelOutput) ||
 		decision.Action != app.ConversationRouteReply && decision.Reply != "" {
 		return clarify
+	}
+	if value.ContentTruncated && decision.Action != app.ConversationRouteNew && decision.Action != app.ConversationRouteClarify {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+			Question:    "这条消息的完整原文尚未用于判断，暂不能安全关联到已有任务。请明确它是一项新工作，还是要修改/停止哪项任务。",
+			ModelOutput: decision.ModelOutput}
 	}
 	if (decision.Action == app.ConversationRouteNew || decision.Action == app.ConversationRouteReply) &&
 		app.ConversationRouteHasExplicitControlIntent(value.Content) {
