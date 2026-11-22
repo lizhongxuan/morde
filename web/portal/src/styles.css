@@ -1093,6 +1093,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .chat-message-author { min-height: 26px; margin: 0; color: #607089; font-size: 11px; }
 .assistant-page .chat-message-user .chat-message-author { display: none; }
 .assistant-page .chat-message-status { margin: 4px 10px 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #68778d; font-size: 11px; line-height: 1.4; }
+.assistant-page .chat-message-status-error { color: var(--danger); flex-wrap: wrap; }
 .assistant-page .message-variant-controls:empty { display: none; }
 .assistant-page .chat-message-user .message-variant-controls { margin-top: 6px; padding-top: 0; border-top: 0; }
 .project-message-received { width: 28px; height: 25px; margin-top: 6px; display: inline-grid; place-items: center; border: 2px solid #fff; border-radius: 14px; color: inherit; background: #eff6ff; font-size: 14px; line-height: 1; }

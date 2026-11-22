@@ -3014,7 +3014,7 @@ describe('Assistant durable tasks', () => {
   });
 
   const routingStatusCases: Array<[NonNullable<ConversationMessage['routing_status']>, string | null]> = [
-    ['pending', null], ['processing', null], ['waiting_user', null], ['failed', null],
+    ['pending', null], ['processing', null], ['waiting_user', null], ['failed', '消息上下文暂时无法读取'],
   ];
 
   it.each(routingStatusCases)('renders routing status %s without exposing internal details', async (routingStatus, label) => {
@@ -3024,7 +3024,7 @@ describe('Assistant durable tasks', () => {
     if (routingStatus === 'waiting_user') {
       expect(screen.queryByText(/等待你补充任务信息/)).not.toBeInTheDocument();
     } else if (routingStatus === 'failed') {
-      expect(screen.queryByText('消息上下文暂时无法读取')).not.toBeInTheDocument();
+      expect(await screen.findByText(label!)).toBeInTheDocument();
       expect(await screen.findByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
     } else if (label) {
       const status = await screen.findByText(label);
@@ -3146,7 +3146,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
     expect(screen.queryByText('此消息 · 处理失败')).not.toBeInTheDocument();
     expect(await screen.findByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
-    expect(screen.queryByText('模型暂时不可用或用量待核对')).not.toBeInTheDocument();
+    expect(screen.getByText('模型暂时不可用或用量待核对')).toBeInTheDocument();
     await user.click(await screen.findByRole('button', { name: '重新处理这条消息' }));
     await screen.findByText('连接中断');
     await user.click(screen.getByRole('button', { name: '重新处理这条消息' }));
@@ -3231,14 +3231,14 @@ describe('Assistant durable tasks', () => {
     expect(retry.mock.calls[1]![2]).toBe(key);
   });
 
-  it('keeps an oversized message without showing a routing failure label', async () => {
+  it('keeps an oversized message, explains the limit, and does not retry identical content', async () => {
     mockCommon({ conversations: [conversation], messages: [{ ...message, task_id: undefined,
       routing_status: 'failed', routing_failure_reason: 'message_too_long', delivery_status: 'pending' }] });
     renderPage();
     await screen.findByText(message.content);
     const article = document.querySelector<HTMLElement>('.chat-message-row-user .chat-message')!;
     expect(within(article).getByText(message.content)).toBeInTheDocument();
-    expect(within(article).queryByText('消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。')).not.toBeInTheDocument();
+    expect(await screen.findByText('消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
   });
 
