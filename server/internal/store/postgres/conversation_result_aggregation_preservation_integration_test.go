@@ -88,7 +88,9 @@ FROM conversation_result_sources s JOIN conversation_messages m ON m.id=s.batch_
 JOIN task_assistant_message_snapshots snapshot ON snapshot.task_id=s.task_id
 WHERE s.task_id=$1 AND s.state='published'`, value.ID).
 		Scan(&newMessageID, &content, &replyContent, &revision, &snapshotID, &snapshotText, &snapshotStatus, &snapshotRevision)
-	if err != nil || newMessageID == oldMessageID || content != "new revision result" || replyContent != resultReviewTestReply || revision != 1 ||
+	expectedReceipt := "结果摘要（主助手整理，不代表独立验收）：\n" + resultReviewTestReply +
+		"\n\nTask 执行状态：completed\n服务端验收状态（当前修订）：\n- " + value.ID + " r1：pending"
+	if err != nil || newMessageID == oldMessageID || content != "new revision result" || replyContent != expectedReceipt || revision != 1 ||
 		snapshotID != oldMessageID || snapshotText != "visible older fragment" || snapshotStatus != "interrupted" || snapshotRevision != 0 {
 		t.Fatalf("new result or previous snapshot was lost: new=%s revision=%d reply=%q snapshot=%s snapshot_revision=%d status=%s err=%v",
 			newMessageID, revision, replyContent, snapshotID, snapshotRevision, snapshotStatus, err)

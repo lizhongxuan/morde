@@ -56,6 +56,21 @@ func TestEvaluateTaskValidationReviewDerivesNAButKeepsUnknownExecutionFactsPendi
 	if got := SummarizeTaskValidationEvaluations(evaluations); got.State != TaskValidationPending {
 		t.Fatalf("tool Task verdict = %q, want pending", got.State)
 	}
+
+	// The current evidence contract has no server-attested environment identity.
+	// Even if all visible evidence checks are supported, a model claim cannot
+	// fill the missing execution/action facts and produce PASS.
+	unverifiedEnvironmentFacts := TaskValidationVerdictFacts{
+		TaskExecution:             TaskValidationFactPresent,
+		IrreversibleAction:        TaskValidationFactUnknown,
+		RepeatedError:             TaskValidationFactUnknown,
+		EvidenceContentVerified:   true,
+		ClarificationHistoryKnown: true,
+		ReplayVerified:            true,
+	}
+	if got := SummarizeTaskValidationEvaluations(EvaluateTaskValidationReview(report, unverifiedEnvironmentFacts)); got.State != TaskValidationPending {
+		t.Fatalf("Task with unverified execution environment = %q, want pending", got.State)
+	}
 }
 
 func TestEvaluateTaskValidationReviewRequiresVerifiedEvidenceContentForH02(t *testing.T) {
