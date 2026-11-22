@@ -990,6 +990,31 @@ func TestCloudDSHToolBrokerPausesClarificationAtToolCallBudget(t *testing.T) {
 	}
 }
 
+func TestCloudDSHToolBrokerExhaustedBudgetDoesNotDispatchHostAction(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "shell.exec", action: "run",
+		result: `{"exit_code":0,"stdout":"should not run","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
+	}})
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	store.details.Task.Budget.ToolCalls = 1
+	store.details.Task.Usage.ToolCalls = 1
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := broker.Execute(context.Background(), store.details.Task, ModelToolCall{
+		CallID: "call_dsh_no_budget", Name: runtimeToolShellExec,
+		Arguments: `{"workspace_id":"w1234567","command":"echo should not run"}`,
+	})
+	if err != nil || result.Status != AgentToolNeedsUser || store.details.Task.Status != task.StatusWaitingUser ||
+		store.details.Task.WaitingReason != "tool_call_budget" || store.details.Task.Usage.ToolCalls != 1 ||
+		len(fixture.store.operations) != 0 || fixture.handlers["shell.exec"].calls.Load() != 0 {
+		t.Fatalf("exhausted-budget Host action = %#v, err=%v; task=%#v operations=%d dispatches=%d",
+			result, err, store.details.Task, len(fixture.store.operations), fixture.handlers["shell.exec"].calls.Load())
+	}
+}
+
 func TestCloudDSHToolBrokerPausesForWorkspaceInputChange(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
 		capability: "file.read", action: "read", result: `{"path":"README.md","text":"hello"}`,
@@ -1196,6 +1221,36 @@ func TestCloudDSHToolBrokerUsesAuthorizedHostOperationLedger(t *testing.T) {
 	}
 }
 
+func TestCloudDSHToolBrokerDoesNotMergeDifferentAuthorizedCallsWithSameArguments(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "window.list", action: "list", result: `{"windows":[]}`,
+	}})
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	session, err := fixture.executor.connect(context.Background(), store.details.Task, fixture.fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.fences.fence = agentFenceFromRuntime(session.Fence)
+	session.Close()
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, callID := range []string{"call_dsh_window_a", "call_dsh_window_b"} {
+		result, err := broker.Execute(context.Background(), store.details.Task, ModelToolCall{
+			CallID: callID, Name: runtimeToolWindowList, Arguments: `{}`,
+		})
+		if err != nil || result.Status != AgentToolSucceeded {
+			t.Fatalf("authorized call %s = %#v, err=%v", callID, result, err)
+		}
+	}
+	if fixture.handlers["window.list"].calls.Load() != 2 || len(fixture.store.operations) != 2 {
+		t.Fatalf("different authorized call IDs were merged: dispatches=%d operations=%d",
+			fixture.handlers["window.list"].calls.Load(), len(fixture.store.operations))
+	}
+}
+
 func TestCloudDSHToolBrokerReconcilesCheckpointedResultWithoutMoreToolBudget(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
 		capability: "window.list", action: "list",
@@ -1295,6 +1350,38 @@ func TestCloudDSHToolBrokerReconcilesOnlyTerminalWorkspaceOperationsAfterCheckpo
 				t.Fatalf("unresolved operation crossed a changed Workspace checkpoint: result=%#v task=%#v", recovered, store.details.Task)
 			}
 		})
+	}
+}
+
+type failingCloudDSHOperationStore struct {
+	*cloudDSHBrokerTaskStore
+	err   error
+	calls int
+}
+
+func (s *failingCloudDSHOperationStore) CreateOperation(context.Context, task.Operation, string) (task.Operation, bool, error) {
+	s.calls++
+	return task.Operation{}, false, s.err
+}
+
+func TestCloudDSHToolBrokerDoesNotDispatchWhenOperationIntentCannotPersist(t *testing.T) {
+	fixture, baseStore, _, call := newCloudDSHApprovalFixture(t)
+	store := &failingCloudDSHOperationStore{cloudDSHBrokerTaskStore: baseStore, err: errors.New("simulated operation store failure")}
+	fixture.executor.store = store
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := broker.Execute(context.Background(), baseStore.details.Task, call)
+	if err != nil || first.Status != AgentToolNeedsUser {
+		t.Fatalf("initial sensitive call = %#v, %v; want approval pause", first, err)
+	}
+	resumeCloudDSHApproval(fixture, baseStore, task.PendingRequestApproved, task.PendingDecisionApprove)
+	result, err := broker.Reconcile(context.Background(), baseStore.details.Task, call, nil)
+	if err != nil || result.Status != AgentToolFailed || store.calls != 1 || fixture.handlers["shell.exec"].calls.Load() != 0 ||
+		len(fixture.store.operations) != 0 {
+		t.Fatalf("operation intent persistence failure = %#v, err=%v, persistence attempts=%d dispatches=%d operations=%d",
+			result, err, store.calls, fixture.handlers["shell.exec"].calls.Load(), len(fixture.store.operations))
 	}
 }
 

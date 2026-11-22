@@ -294,9 +294,9 @@ func listTaskAgentExecutions(ctx context.Context, tx pgx.Tx, taskID, ownerID str
 	rows, err := tx.Query(ctx, `SELECT s.session_id,COALESCE(s.parent_session_id,''),COALESCE(s.step_id,''),
 CASE WHEN s.parent_session_id IS NULL THEN t.current_revision ELSE s.task_revision END,
 CASE WHEN s.parent_session_id IS NULL THEN 'main' ELSE 'subagent' END,
-CASE WHEN live.valid AND s.activity_generation=t.agent_generation AND s.activity_sequence IS NOT NULL
+CASE WHEN live.valid AND s.activity_generation=t.agent_generation AND s.activity_revision=t.current_revision AND s.activity_sequence IS NOT NULL
   AND (s.parent_session_id IS NULL OR s.task_revision=t.current_revision) THEN s.activity_status ELSE 'unknown' END,
-CASE WHEN live.valid AND s.activity_generation=t.agent_generation AND s.activity_sequence IS NOT NULL
+CASE WHEN live.valid AND s.activity_generation=t.agent_generation AND s.activity_revision=t.current_revision AND s.activity_sequence IS NOT NULL
   AND (s.parent_session_id IS NULL OR s.task_revision=t.current_revision) THEN s.activity_observed_at ELSE NULL END
 FROM task_agent_sessions s JOIN tasks t ON t.id=s.task_id AND t.owner_id=s.owner_id
 LEFT JOIN LATERAL (SELECT true AS valid FROM task_agent_instances ai

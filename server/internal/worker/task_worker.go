@@ -23,6 +23,12 @@ type TaskLeaseStore interface {
 	RenewTaskLease(context.Context, string, string, int64, time.Duration) (task.Task, error)
 }
 
+type TaskAgentStallMonitor interface {
+	CheckTaskAgentStall(context.Context, task.Task, time.Duration) error
+}
+
+const taskAgentStallNoticeAfter = 2 * app.MaxAgentLease
+
 // TaskApprovalExpiryStore advances one due approval without requiring a client
 // to read the Task. Implementations coordinate competing workers in storage.
 type TaskApprovalExpiryStore interface {
@@ -308,6 +314,16 @@ func (w *TaskWorker) runClaimed(ctx context.Context, claimed task.Task) error {
 			if err == nil && !w.validRenewal(renewed, claimed) {
 				err = errors.New("renewed task lease is invalid")
 			}
+			if err == nil {
+				if monitor, ok := w.store.(TaskAgentStallMonitor); ok {
+					checkCtx, cancelCheck := context.WithTimeout(ctx, w.renewInterval)
+					if checkErr := checkTaskAgentStallSafely(checkCtx, monitor, renewed, taskAgentStallNoticeAfter); checkErr != nil && ctx.Err() == nil {
+						w.logger.Warn("observe Task agent activity failed", zap.String("task_id", claimed.ID),
+							zap.String("error_type", fmt.Sprintf("%T", checkErr)))
+					}
+					cancelCheck()
+				}
+			}
 			if err != nil {
 				cause := error(context.Canceled)
 				if witness, ok := w.store.(CloudDSHRevisionStopWitness); ok && ctx.Err() == nil {
@@ -327,6 +343,15 @@ func (w *TaskWorker) runClaimed(ctx context.Context, claimed task.Task) error {
 			}
 		}
 	}
+}
+
+func checkTaskAgentStallSafely(ctx context.Context, monitor TaskAgentStallMonitor, value task.Task, staleAfter time.Duration) (err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			err = errors.New("Task agent activity monitor panicked")
+		}
+	}()
+	return monitor.CheckTaskAgentStall(ctx, value, staleAfter)
 }
 
 func (w *TaskWorker) renewTaskSafely(ctx context.Context, taskID, workerID string, version int64, lease time.Duration) (renewed task.Task, err error) {

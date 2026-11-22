@@ -148,9 +148,21 @@ type TaskAgentExecution struct {
 	ObservedAt   *time.Time
 }
 
+const (
+	TaskAgentActivityKindStatus    = "status"
+	TaskAgentActivityKindActivity  = "activity"
+	TaskAgentActivityKindHeartbeat = "heartbeat"
+)
+
 type TaskAgentActivityObservation struct {
 	Fence               AgentInstanceFence
+	AgentSessionID      string
+	TaskRevision        int64
+	Kind                string
 	Status              string
+	Phase               string
+	State               string
+	ActivityID          string
 	ObservationSequence int64
 }
 
