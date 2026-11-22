@@ -524,11 +524,34 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		t.Fatalf("task event stream status = %d: %s", streamResponse.StatusCode, body)
 	}
 	streamReader := bufio.NewReader(streamResponse.Body)
-	resumeIDLine, err := streamReader.ReadString('\n')
+	var resumeIDLine, resumeEventLine, resumeDataLine string
+	for resumeIDLine == "" || resumeEventLine == "" || resumeDataLine == "" {
+		line, readErr := streamReader.ReadString('\n')
+		if readErr != nil {
+			err = readErr
+			break
+		}
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+		if line == "" {
+			resumeIDLine, resumeEventLine, resumeDataLine = "", "", ""
+			continue
+		}
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(line, "id:"):
+			resumeIDLine = line
+		case strings.HasPrefix(line, "event:"):
+			resumeEventLine = line
+		case strings.HasPrefix(line, "data:"):
+			resumeDataLine = line
+		}
+	}
 	if err != nil {
 		_ = streamResponse.Body.Close()
 		cancelStream()
-		t.Fatalf("read resumed task event id: %v", err)
+		t.Fatalf("read resumed task event frame: %v", err)
 	}
 	var resumedSequence int64
 	if _, err := fmt.Sscanf(resumeIDLine, "id: %d", &resumedSequence); err != nil || resumedSequence <= resumedTask.EventSequence {
@@ -536,19 +559,17 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		cancelStream()
 		t.Fatalf("resumed event id %q is not after cursor %d: %v", resumeIDLine, resumedTask.EventSequence, err)
 	}
-	resumeEventLine, eventErr := streamReader.ReadString('\n')
-	resumeDataLine, dataErr := streamReader.ReadString('\n')
 	var resumedFrame struct {
 		TaskID   string `json:"task_id"`
 		Sequence int64  `json:"sequence"`
 	}
 	decodeErr := json.Unmarshal([]byte(strings.TrimSpace(strings.TrimPrefix(resumeDataLine, "data:"))), &resumedFrame)
-	if eventErr != nil || dataErr != nil || !strings.HasPrefix(resumeEventLine, "event: ") ||
-		!strings.HasPrefix(resumeDataLine, "data:") || decodeErr != nil || resumedFrame.TaskID != acceptedTaskID || resumedFrame.Sequence != resumedSequence {
+	if !strings.HasPrefix(resumeEventLine, "event: ") || !strings.HasPrefix(resumeDataLine, "data:") ||
+		decodeErr != nil || resumedFrame.TaskID != acceptedTaskID || resumedFrame.Sequence != resumedSequence {
 		_ = streamResponse.Body.Close()
 		cancelStream()
-		t.Fatalf("resumed event does not belong to Task %s: id=%q event=%q data=%q decoded=%+v errors=%v/%v/%v",
-			acceptedTaskID, resumeIDLine, resumeEventLine, resumeDataLine, resumedFrame, eventErr, dataErr, decodeErr)
+		t.Fatalf("resumed event does not belong to Task %s: id=%q event=%q data=%q decoded=%+v decode_error=%v",
+			acceptedTaskID, resumeIDLine, resumeEventLine, resumeDataLine, resumedFrame, decodeErr)
 	}
 	cancelStream()
 	_ = streamResponse.Body.Close()
