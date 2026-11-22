@@ -190,9 +190,10 @@ function messageDeliveryV3(identity, messageID = 'm1234567', content = 'Please c
   return { type: 'message_delivery', version: 3, ...taskFence(identity), message_id: messageID, content, attachment_ids: attachmentIDs, mode }
 }
 
-function messageDeliveryV4(identity, messageID = 'm1234567', content = 'Please check this update.', attachmentIDs = []) {
+function messageDeliveryV4(identity, messageID = 'm1234567', content = 'Please check this update.', attachmentIDs = [],
+  supersedeSessionID = identity.session_id, supersedeCallID = 'call_superseded_1') {
   return { type: 'message_delivery', version: 4, ...taskFence(identity), message_id: messageID, content, attachment_ids: attachmentIDs,
-    mode: 'steer', supersede_active: true }
+    mode: 'steer', supersede_active: true, supersede_session_id: supersedeSessionID, supersede_call_id: supersedeCallID }
 }
 
 function acknowledgeCheckpoint(proc, frame) {
@@ -605,6 +606,8 @@ test('validates v4 superseding delivery only for a steer', () => {
   assert.equal(validMessageDelivery(messageDeliveryV4(start), start), true)
   assert.equal(validMessageDelivery({ ...messageDeliveryV4(start), mode: 'followup' }, start), false)
   assert.equal(validMessageDelivery({ ...messageDeliveryV4(start), supersede_active: false }, start), false)
+  assert.equal(validMessageDelivery({ ...messageDeliveryV4(start), supersede_session_id: '' }, start), false)
+  assert.equal(validMessageDelivery({ ...messageDeliveryV4(start), supersede_call_id: 'contains space' }, start), false)
   const missingFlag = messageDeliveryV4(start)
   delete missingFlag.supersede_active
   assert.equal(validMessageDelivery(missingFlag, start), false)
@@ -854,6 +857,9 @@ test('upgrades the same steer from v3 delivery to v4 superseding delivery once',
   assert.equal(deliveries.length, 2)
   assert.equal(deliveries[0].supersede_active, undefined)
   assert.equal(deliveries[1].supersede_active, true)
+  assert.equal(deliveries[1].supersede_session_id, start.session_id)
+  assert.equal(deliveries[1].supersede_call_id, 'call_superseded_1')
+  assert.equal(deliveries[1].supersede_root, true)
   assert.equal(ipc.failed, false)
   input.destroy()
   output.destroy()
@@ -871,9 +877,84 @@ test('upgrades a queued v3 steer before the delivery handler is installed', () =
   assert.equal(deliveries.length, 2)
   assert.equal(deliveries[0].supersede_active, undefined)
   assert.equal(deliveries[1].supersede_active, true)
+  assert.equal(deliveries[1].supersede_root, true)
   assert.equal(ipc.failed, false)
   input.destroy()
   output.destroy()
+})
+
+test('v4 delivery can target multiple stale child sessions without re-cancelling the root', () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  const deliveries = []
+  ipc.setMessageDeliveryHandler(delivery => deliveries.push(delivery))
+  const steer = messageDeliveryV3(start, 'm1234567', 'same steer', [], 'steer')
+  const firstChild = messageDeliveryV4(start, 'm1234567', 'same steer', [], 'child_old_1', 'call_child_old_1')
+  const secondChild = messageDeliveryV4(start, 'm1234567', 'same steer', [], 'child_old_2', 'call_child_old_2')
+  input.write(`${JSON.stringify(start)}\n${JSON.stringify(steer)}\n${JSON.stringify(firstChild)}\n${JSON.stringify(firstChild)}\n${JSON.stringify(secondChild)}\n`)
+  assert.equal(deliveries.length, 3)
+  assert.equal(deliveries[1].supersede_session_id, 'child_old_1')
+  assert.equal(deliveries[1].supersede_root, true)
+  assert.equal(deliveries[2].supersede_session_id, 'child_old_2')
+  assert.equal(deliveries[2].supersede_root, false)
+  assert.equal(ipc.failed, false)
+  input.destroy()
+  output.destroy()
+})
+
+test('v4 delivery target call identity cannot change for the same child session', () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  const deliveries = []
+  ipc.setMessageDeliveryHandler(delivery => deliveries.push(delivery))
+  const steer = messageDeliveryV3(start, 'm1234567', 'same steer', [], 'steer')
+  const first = messageDeliveryV4(start, 'm1234567', 'same steer', [], 'child_old_1', 'call_old_1')
+  const changedCall = messageDeliveryV4(start, 'm1234567', 'same steer', [], 'child_old_1', 'call_old_2')
+  input.write(`${JSON.stringify(start)}\n${JSON.stringify(steer)}\n${JSON.stringify(first)}\n${JSON.stringify(changedCall)}\n`)
+  assert.equal(deliveries.length, 2)
+  assert.equal(ipc.failed, true)
+  input.destroy()
+  output.destroy()
+})
+
+test('seeded message delivery identities initialize supersede target tracking', () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  const seeded = { ...start, initial_message: { message_id: 'm1234567', content: 'initial input', attachment_ids: [] } }
+  input.write(`${JSON.stringify(seeded)}\n`)
+  const delivery = ipc.messageDeliveries.get('m1234567')
+  assert.ok(delivery?.supersedeTargets instanceof Map)
+  assert.equal(delivery.supersedeTargets.size, 0)
+  input.destroy()
+  output.destroy()
+})
+
+test('child_abort is restricted to the active task fence and one child identity', () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  const aborted = []
+  ipc.onChildAbort = value => aborted.push(value)
+  const frame = { type: 'child_abort', task_id: start.task_id, owner_id: start.owner_id, agent_id: start.agent_id,
+    generation: start.generation, authorization_version: start.authorization_version,
+    session_id: 'child_abort_1', call_id: 'call_abort_1', reason: 'The legacy child baseline is unverifiable.' }
+  input.write(`${JSON.stringify(start)}\n${JSON.stringify(frame)}\n`)
+  assert.deepEqual(aborted, [{ session_id: 'child_abort_1', call_id: 'call_abort_1', reason: frame.reason }])
+  assert.equal(ipc.failed, false)
+  input.destroy()
+  output.destroy()
+
+  const badInput = new PassThrough()
+  const badOutput = new PassThrough()
+  const badIPC = new WorkerIPC(badInput, badOutput)
+  badIPC.onChildAbort = () => assert.fail('root session cannot be targeted as a child')
+  badInput.write(`${JSON.stringify(start)}\n${JSON.stringify({ ...frame, session_id: start.session_id })}\n`)
+  assert.equal(badIPC.failed, true)
+  badInput.destroy()
+  badOutput.destroy()
 })
 
 test('content or mode cannot change while upgrading a steer to v4', () => {
@@ -2571,6 +2652,243 @@ test('runs a background child beside the parent and exposes durable job status t
   assert.equal(frames.filter(frame => frame.type === 'tool_call').length, 1)
   assert.equal(frames.find(frame => frame.type === 'child_settle')?.call_id, 'call_background_1')
   assert.equal(frames.filter(frame => frame.type === 'settled').at(-1)?.state, 'completed_candidate')
+})
+
+test('targeted v4 supersede cancels only its stale background child and reruns the root steer', { timeout: 15_000 }, async t => {
+  const staleIdentity = {
+    task_id: start.task_id, owner_id: start.owner_id, agent_id: start.agent_id,
+    generation: start.generation, authorization_version: start.authorization_version,
+    session_id: 'child_background_stale',
+  }
+  const freshIdentity = { ...staleIdentity, session_id: 'child_after_steer' }
+  const tools = [delegateTool, fileReadTool, ...jobTools].sort((left, right) => left.name.localeCompare(right.name))
+  const throughBySession = new Map([[start.session_id, -1], [staleIdentity.session_id, -1], [freshIdentity.session_id, -1]])
+  const steer = messageDeliveryV3(start, 'm6543210', 'Use the revised approach.', [], 'steer')
+  let rootModels = 0
+  let staleChildModels = 0
+  let freshChildModels = 0
+  let staleChildToolCall = false
+  let rootSecondModel
+  let supersedeSent = false
+  let staleChildSettled = false
+  const sendModel = (proc, frame, text, call) => {
+    const chunks = call ? [
+      { type: 'tool-call-delta', index: 0, id: call.id, name: call.name, argumentsDelta: JSON.stringify(call.arguments) },
+      { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ] : [
+      { type: 'block-start', index: 0, blockType: 'text' },
+      { type: 'text-delta', index: 0, text },
+      { type: 'block-end', index: 0, block: { type: 'text', text } },
+      { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+      { type: 'finish', reason: { kind: 'stop' } },
+    ]
+    chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+    send(proc, { type: 'model_end', id: frame.id, ok: true })
+  }
+  const triggerSupersede = proc => {
+    if (supersedeSent || !rootSecondModel || !staleChildToolCall) return
+    supersedeSent = true
+    send(proc, steer)
+    send(proc, messageDeliveryV4(start, steer.message_id, steer.content, [], staleIdentity.session_id, 'call_stale_child_1'))
+  }
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools })
+    if (frame.type === 'checkpoint') {
+      assert.equal(frame.from_seq, (throughBySession.get(frame.session_id) ?? -1) + 1, `checkpoint sequence for ${frame.session_id}`)
+      throughBySession.set(frame.session_id, frame.through_seq)
+      acknowledgeCheckpoint(proc, frame)
+    }
+    if (frame.type === 'model' && frame.session_id === start.session_id) {
+      rootModels++
+      if (rootModels === 1) {
+        sendModel(proc, frame, '', { id: 'call_background_stale', name: delegateTool.name, arguments: {
+          title: 'Old delegated plan', objective: 'Complete the old request.', tool_names: [fileReadTool.name], run_in_background: true,
+        } })
+      } else if (rootModels === 2) {
+        rootSecondModel = frame
+        triggerSupersede(proc)
+      } else if (rootModels === 3) {
+        assert.ok(frame.request.messages.some(message => message.id === steer.message_id &&
+          message.content.some(block => block.type === 'text' && block.text === steer.content)),
+        'root re-inference must receive the new steer')
+        sendModel(proc, frame, '', { id: 'call_after_steer', name: delegateTool.name, arguments: {
+          title: 'Updated delegated check', objective: 'Check the revised request.', tool_names: [fileReadTool.name],
+        } })
+      } else {
+        assert.equal(rootModels, 4)
+        assert.ok(frame.request.messages.some(message => message.id === steer.message_id))
+        const result = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_after_steer')
+        assert.equal(result?.content[0].text, 'Updated child report with the requested check.')
+        sendModel(proc, frame, 'Updated answer after the steer.', undefined)
+      }
+    }
+    if (frame.type === 'model' && frame.session_id === staleIdentity.session_id) {
+      staleChildModels++
+      assert.equal(staleChildModels, 1)
+      sendModel(proc, frame, '', { id: 'call_stale_child_1', name: fileReadTool.name, arguments: { path: 'old.txt' } })
+    }
+    if (frame.type === 'model' && frame.session_id === freshIdentity.session_id) {
+      freshChildModels++
+      assert.deepEqual(frame.request.tools, [fileReadTool])
+      if (freshChildModels === 1) {
+        sendModel(proc, frame, '', { id: 'call_fresh_child_read', name: fileReadTool.name, arguments: { path: 'current.txt' } })
+      } else {
+        const result = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_fresh_child_read')
+        assert.equal(result?.content[0].text, 'current notes')
+        replyWithText(proc, frame, 'Updated child report with the requested check.')
+      }
+    }
+    if (frame.type === 'child_create') {
+      const stale = frame.call_id === 'call_background_stale'
+      assert.ok(stale || frame.call_id === 'call_after_steer')
+      const selected = stale ? staleIdentity : freshIdentity
+      send(proc, { type: 'child_session', call_id: frame.call_id, ...selected,
+        parent_session_id: frame.session_id, objective: frame.arguments.objective, tools: [fileReadTool],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'tool_call') {
+      if (frame.session_id === staleIdentity.session_id) {
+        assert.equal(frame.call_id, 'call_stale_child_1')
+        staleChildToolCall = true
+        triggerSupersede(proc)
+      } else {
+        assert.equal(frame.session_id, freshIdentity.session_id)
+        assert.equal(frame.call_id, 'call_fresh_child_read')
+        send(proc, { type: 'tool_result', id: frame.id, task_id: frame.task_id, owner_id: frame.owner_id,
+          agent_id: frame.agent_id, generation: frame.generation, authorization_version: frame.authorization_version,
+          session_id: frame.session_id, call_id: frame.call_id, status: 'succeeded', output: 'current notes' })
+      }
+    }
+    if (frame.type === 'model_cancel') send(proc, { type: 'model_end', id: frame.id, ...taskFence(frame), ok: false })
+    if (frame.type === 'child_settle') {
+      if (frame.session_id === staleIdentity.session_id) {
+        assert.equal(frame.call_id, 'call_background_stale')
+        assert.equal(frame.status, 'failed')
+        assert.equal(frame.summary, 'A newer task input superseded this child Agent call.')
+        staleChildSettled = true
+        send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+      } else {
+        assert.equal(frame.session_id, freshIdentity.session_id)
+        assert.equal(frame.call_id, 'call_after_steer')
+        assert.equal(frame.status, 'succeeded')
+        send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true,
+          output: 'Updated child report with the requested check.' })
+      }
+    }
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => `${frame.type}:${frame.session_id ?? ''}`).join(', ')}`)
+  assert.equal(supersedeSent, true)
+  assert.equal(rootModels, 4)
+  assert.equal(staleChildModels, 1, 'the stale child must not start another model turn after its target supersede')
+  assert.equal(freshChildModels, 2, 'the child created after the steer remains active')
+  assert.equal(frames.filter(frame => frame.type === 'tool_call' && frame.session_id === staleIdentity.session_id).length, 1)
+  assert.equal(frames.filter(frame => frame.type === 'tool_call' && frame.session_id === freshIdentity.session_id).length, 1)
+  assert.equal(frames.some(frame => frame.type === 'model_cancel' && frame.session_id === start.session_id), true,
+    'the root is cancelled once to apply the user steer')
+  assert.equal(frames.findLast(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
+test('child_abort settles only its matching legacy child and leaves the root steer active', { timeout: 15_000 }, async t => {
+  const childIdentity = {
+    task_id: start.task_id, owner_id: start.owner_id, agent_id: start.agent_id,
+    generation: start.generation, authorization_version: start.authorization_version,
+    session_id: 'child_legacy_baseline',
+  }
+  const tools = [delegateTool, fileReadTool, ...jobTools].sort((left, right) => left.name.localeCompare(right.name))
+  const throughBySession = new Map([[start.session_id, -1], [childIdentity.session_id, -1]])
+  const steer = messageDeliveryV3(start, 'm7654321', 'Use only the verified checkpoint.', [], 'steer')
+  const reason = 'This delegated Agent session predates checkpoint fencing and cannot safely continue after newer user input.'
+  let parentModels = 0
+  let childModels = 0
+  let rootActiveModel
+  let childToolPending = false
+  let childAbortSent = false
+  let childSettled = false
+  const finishAbortRace = proc => {
+    if (childAbortSent || !rootActiveModel || !childToolPending) return
+    childAbortSent = true
+    send(proc, { type: 'child_abort', task_id: start.task_id, owner_id: start.owner_id, agent_id: start.agent_id,
+      generation: start.generation, authorization_version: start.authorization_version,
+      session_id: childIdentity.session_id, call_id: 'call_legacy_child_read', reason })
+    send(proc, steer)
+    replyWithText(proc, rootActiveModel, 'I will use the revised checkpoint.')
+  }
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools })
+    if (frame.type === 'checkpoint') {
+      assert.equal(frame.from_seq, (throughBySession.get(frame.session_id) ?? -1) + 1, `checkpoint sequence for ${frame.session_id}`)
+      throughBySession.set(frame.session_id, frame.through_seq)
+      acknowledgeCheckpoint(proc, frame)
+    }
+    if (frame.type === 'model' && frame.session_id === start.session_id) {
+      parentModels++
+      if (parentModels === 1) {
+        const chunks = [
+          { type: 'tool-call-delta', index: 0, id: 'call_legacy_background', name: delegateTool.name,
+            argumentsDelta: JSON.stringify({ title: 'Legacy child', objective: 'Inspect the old checkpoint.',
+              tool_names: [fileReadTool.name], run_in_background: true }) },
+          { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+          { type: 'finish', reason: { kind: 'tool-calls' } },
+        ]
+        chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+        send(proc, { type: 'model_end', id: frame.id, ok: true })
+      } else if (parentModels === 2) {
+        rootActiveModel = frame
+        finishAbortRace(proc)
+      } else {
+        assert.equal(parentModels, 3)
+        assert.ok(frame.request.messages.some(message => message.id === steer.message_id &&
+          message.content.some(block => block.type === 'text' && block.text === steer.content)),
+        'root continues its active turn with the delivered steer')
+        replyWithText(proc, frame, 'Updated answer from the root.')
+      }
+    }
+    if (frame.type === 'model' && frame.session_id === childIdentity.session_id) {
+      childModels++
+      assert.equal(childModels, 1)
+      const chunks = [
+        { type: 'tool-call-delta', index: 0, id: 'call_legacy_child_read', name: fileReadTool.name,
+          argumentsDelta: JSON.stringify({ path: 'old.txt' }) },
+        { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ]
+      chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+      send(proc, { type: 'model_end', id: frame.id, ok: true })
+    }
+    if (frame.type === 'child_create') send(proc, {
+      type: 'child_session', call_id: frame.call_id, ...childIdentity,
+      parent_session_id: frame.session_id, objective: frame.arguments.objective,
+      tools: [fileReadTool], checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '',
+    })
+    if (frame.type === 'tool_call') {
+      assert.equal(frame.session_id, childIdentity.session_id)
+      assert.equal(frame.call_id, 'call_legacy_child_read')
+      childToolPending = true
+      finishAbortRace(proc)
+    }
+    if (frame.type === 'child_settle') {
+      assert.equal(frame.session_id, childIdentity.session_id)
+      assert.equal(frame.status, 'failed')
+      assert.equal(frame.summary, reason)
+      childSettled = true
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+    }
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => `${frame.type}:${frame.session_id ?? ''}`).join(', ')}`)
+  assert.equal(childAbortSent, true)
+  assert.equal(childSettled, true)
+  assert.equal(parentModels, 3)
+  assert.equal(childModels, 1)
+  assert.equal(frames.some(frame => frame.type === 'tool_result' && frame.session_id === childIdentity.session_id), false,
+    'baseline-unverifiable child call is terminated without a fabricated tool result')
+  assert.equal(frames.some(frame => frame.type === 'model_cancel' && frame.session_id === start.session_id), false,
+    'targeting a legacy child must not cancel the root that is handling the steer')
+  assert.equal(frames.findLast(frame => frame.type === 'settled')?.state, 'completed_candidate')
 })
 
 test('runs two background children concurrently and the parent consumes both settled results', async () => {

@@ -76,7 +76,7 @@ func TestCloudDSHSupersedingDeliveryUpgradesTheSameSnapshotWithoutRequery(t *tes
 	}
 	checkpointReads := len(checkpoints.pendingFences)
 	if err := executor.deliverSupersedingMessages(context.Background(), fence, writer,
-		[]app.AgentConversationMessage{message}, seen); err != nil {
+		[]app.AgentConversationMessage{message}, seen, fence.AgentSessionID, "call_supersede_1"); err != nil {
 		t.Fatal(err)
 	}
 	if len(checkpoints.pendingFences) != checkpointReads {
@@ -87,11 +87,13 @@ func TestCloudDSHSupersedingDeliveryUpgradesTheSameSnapshotWithoutRequery(t *tes
 		t.Fatalf("delivery frame count = %d, want v3 then v4: %q", len(lines), writer.String())
 	}
 	var first, second struct {
-		Version         int    `json:"version"`
-		MessageID       string `json:"message_id"`
-		Content         string `json:"content"`
-		Mode            string `json:"mode"`
-		SupersedeActive bool   `json:"supersede_active"`
+		Version          int    `json:"version"`
+		MessageID        string `json:"message_id"`
+		Content          string `json:"content"`
+		Mode             string `json:"mode"`
+		SupersedeActive  bool   `json:"supersede_active"`
+		SupersedeSession string `json:"supersede_session_id"`
+		SupersedeCall    string `json:"supersede_call_id"`
 	}
 	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
 		t.Fatal(err)
@@ -100,7 +102,42 @@ func TestCloudDSHSupersedingDeliveryUpgradesTheSameSnapshotWithoutRequery(t *tes
 		t.Fatal(err)
 	}
 	if first.Version != 3 || first.MessageID != message.ID || first.Content != message.Content || first.Mode != string(message.Mode) ||
-		second.Version != 4 || second.MessageID != first.MessageID || second.Content != first.Content || second.Mode != first.Mode || !second.SupersedeActive {
+		second.Version != 4 || second.MessageID != first.MessageID || second.Content != first.Content || second.Mode != first.Mode ||
+		!second.SupersedeActive || second.SupersedeSession != fence.AgentSessionID || second.SupersedeCall != "call_supersede_1" {
 		t.Fatalf("message identity changed during superseding upgrade: first=%+v second=%+v", first, second)
+	}
+}
+
+func TestCloudDSHChildAbortFrameTargetsOnlyTheValidatedChildCall(t *testing.T) {
+	executor := &CloudDSHExecutor{}
+	fence := app.AgentInstanceFence{TaskID: "task_123", OwnerID: "user_123", AgentInstanceID: "agent_123",
+		AgentGeneration: 2, AgentSessionID: "root_session", AuthorizationVersion: 3}
+	writer := &cloudDSHFrameBuffer{}
+	const reason = "This delegated Agent session predates checkpoint fencing and cannot safely continue after newer user input."
+	if err := executor.writeCloudDSHChildAbort(context.Background(), fence, writer, "child_session", "child_call_1", reason); err != nil {
+		t.Fatal(err)
+	}
+	var frame struct {
+		Type                 string `json:"type"`
+		TaskID               string `json:"task_id"`
+		OwnerID              string `json:"owner_id"`
+		AgentID              string `json:"agent_id"`
+		Generation           int64  `json:"generation"`
+		AuthorizationVersion int64  `json:"authorization_version"`
+		SessionID            string `json:"session_id"`
+		CallID               string `json:"call_id"`
+		Reason               string `json:"reason"`
+	}
+	if err := json.Unmarshal(writer.Bytes(), &frame); err != nil {
+		t.Fatal(err)
+	}
+	if frame.Type != "child_abort" || frame.TaskID != fence.TaskID || frame.OwnerID != fence.OwnerID ||
+		frame.AgentID != fence.AgentInstanceID || frame.Generation != fence.AgentGeneration ||
+		frame.AuthorizationVersion != fence.AuthorizationVersion || frame.SessionID != "child_session" ||
+		frame.CallID != "child_call_1" || frame.Reason != reason {
+		t.Fatalf("child abort frame lost its target identity or reason: %+v", frame)
+	}
+	if err := executor.writeCloudDSHChildAbort(context.Background(), fence, writer, fence.AgentSessionID, "child_call_1", reason); err == nil {
+		t.Fatal("root session was accepted as a child abort target")
 	}
 }

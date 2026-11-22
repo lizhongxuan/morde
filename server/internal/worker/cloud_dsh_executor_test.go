@@ -2934,7 +2934,8 @@ createInterface({ input: process.stdin }).on('line', raw => {
       name: toolName, arguments: args })
   } else if (frame.type === 'message_delivery') {
     if (frame.version !== 4 || frame.supersede_active !== true || frame.mode !== 'steer' ||
-        frame.message_id !== 'm7654321' || frame.content !== 'Use the new heading.') process.exit(91)
+        frame.message_id !== 'm7654321' || frame.content !== 'Use the new heading.' ||
+        frame.supersede_session_id !== start.session_id || frame.supersede_call_id !== 'call_gate_1') process.exit(91)
     emit({ type: 'failed', ...identity(start), code: 'snapshot_received' })
     setImmediate(() => process.exit(0))
   } else if (frame.type === 'tool_result') process.exit(92)
@@ -3113,7 +3114,7 @@ func TestCloudDSHChildCreateSupersedesBeforeCreatingPendingSpawn(t *testing.T) {
 	writer := &cloudDSHFrameBuffer{}
 	seen := make(map[string]string)
 	supersede := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
-		return executor.deliverSupersedingMessages(deliveryCtx, fence, writer, messages, seen)
+		return executor.deliverSupersedingMessages(deliveryCtx, fence, writer, messages, seen, parent.identity.SessionID, frame.CallID)
 	}
 
 	superseded, err := executor.createCloudDSHChildSession(context.Background(), value, fence, frame,
@@ -3127,6 +3128,8 @@ func TestCloudDSHChildCreateSupersedesBeforeCreatingPendingSpawn(t *testing.T) {
 			children.creates, tools.admissionCalls, tools.admissionRecovery)
 	}
 	if !strings.Contains(writer.String(), `"version":4`) || !strings.Contains(writer.String(), `"supersede_active":true`) ||
+		!strings.Contains(writer.String(), `"supersede_session_id":"session_123"`) ||
+		!strings.Contains(writer.String(), `"supersede_call_id":"delegate_call_1"`) ||
 		!strings.Contains(writer.String(), message.ID) || strings.Contains(writer.String(), `"type":"child_session"`) {
 		t.Fatalf("pending child spawn was not superseded from the admission snapshot: %s", writer.String())
 	}
@@ -3146,7 +3149,7 @@ func TestCloudDSHChildCreateReconcilesExistingSpawnAfterSteer(t *testing.T) {
 	writer := &cloudDSHFrameBuffer{}
 	seen := make(map[string]string)
 	supersede := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
-		return executor.deliverSupersedingMessages(deliveryCtx, fence, writer, messages, seen)
+		return executor.deliverSupersedingMessages(deliveryCtx, fence, writer, messages, seen, parent.identity.SessionID, frame.CallID)
 	}
 
 	superseded, err := executor.createCloudDSHChildSession(context.Background(), value, fence, frame,
@@ -3172,7 +3175,7 @@ func TestCloudDSHChildCreatePersistsTheRootCheckpointBaseline(t *testing.T) {
 	writer := &cloudDSHFrameBuffer{}
 	seen := make(map[string]string)
 	supersede := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
-		return executor.deliverSupersedingMessages(deliveryCtx, fence, writer, messages, seen)
+		return executor.deliverSupersedingMessages(deliveryCtx, fence, writer, messages, seen, parent.identity.SessionID, frame.CallID)
 	}
 	states := map[string]*cloudDSHSessionState{parent.identity.SessionID: parent}
 

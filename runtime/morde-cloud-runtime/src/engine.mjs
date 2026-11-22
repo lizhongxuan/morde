@@ -49,6 +49,7 @@ const MAX_USER_MESSAGE_BYTES = 128 * 1024
 const MAX_COMPACTION_INPUT_BYTES = 128 * 1024
 const MAX_COMPACTION_SUMMARY_BYTES = 256 * 1024
 const STALE_MODEL_TOOL_MESSAGE = 'A new task input arrived before this tool call was dispatched. Re-evaluate the updated request first.'
+const CHILD_ABORT_REASON_MAX_BYTES = 1024
 const AGENT_HEARTBEAT_INTERVAL_MS = 15_000
 const ACTIVITY_PHASES = new Set(['model', 'tool', 'subagent', 'checkpoint'])
 const ACTIVITY_STATES = new Set(['started', 'waiting', 'completed', 'failed', 'cancelled'])
@@ -70,7 +71,7 @@ const MESSAGE_DELIVERY_KEYS_V1 = [
 ]
 const MESSAGE_DELIVERY_KEYS_V2 = [...MESSAGE_DELIVERY_KEYS_V1, 'attachment_ids']
 const MESSAGE_DELIVERY_KEYS_V3 = [...MESSAGE_DELIVERY_KEYS_V2, 'mode']
-const MESSAGE_DELIVERY_KEYS_V4 = [...MESSAGE_DELIVERY_KEYS_V3, 'supersede_active']
+const MESSAGE_DELIVERY_KEYS_V4 = [...MESSAGE_DELIVERY_KEYS_V3, 'supersede_active', 'supersede_session_id', 'supersede_call_id']
 const MESSAGE_ID = /^m[a-z0-9]{7}$/
 const MESSAGE_ATTACHMENT_ID = /^(?:pa|pca)_[a-f0-9]{32}$/
 const MAX_MESSAGE_ATTACHMENTS = 16
@@ -174,6 +175,7 @@ export function validMessageDelivery(frame, identity) {
   if (!isObject(frame) || (!legacy && !current && !modeAware && !superseding) || frame.type !== 'message_delivery' ||
       modeAware && !['steer', 'followup'].includes(frame.mode) ||
       superseding && (frame.mode !== 'steer' || frame.supersede_active !== true) ||
+      superseding && (!ID.test(frame.supersede_session_id ?? '') || !ID.test(frame.supersede_call_id ?? '')) ||
       !identity || !['task_id', 'owner_id', 'agent_id', 'session_id'].every(key => frame[key] === identity[key]) ||
       !['generation', 'authorization_version'].every(key => Number.isSafeInteger(frame[key]) && frame[key] > 0 && frame[key] === identity[key]) ||
       !MESSAGE_ID.test(frame.message_id ?? '') || typeof frame.content !== 'string' || !frame.content.isWellFormed() ||
@@ -824,6 +826,7 @@ class DurableSession {
     this.recoveryHasInbox = false
     this.messageDeliveryVersion = 0
     this.modelDeliveryVersion = 0
+    this.terminalFailureReason = undefined
     this.messageDeliveryCheckpoints = new Set()
     this.taskRevision = Number.isSafeInteger(start.task_revision) && start.task_revision >= 0 ? start.task_revision : undefined
     this.observationsEnabled = this.taskRevision !== undefined && start.context_role !== 'coordinator' &&
@@ -1475,6 +1478,9 @@ export async function runAgent(ipc, frame) {
         if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
           return { kind: 'deny', reason: STALE_MODEL_TOOL_MESSAGE }
         }
+        if (sessionDurable.superseded || sessionDurable.terminalFailureReason) {
+          return { kind: 'deny', reason: sessionDurable.terminalFailureReason ?? sessionDurable.supersedeReason ?? STALE_MODEL_TOOL_MESSAGE }
+        }
         return { kind: 'allow' }
       })
       for (const tool of tools) {
@@ -1504,6 +1510,9 @@ export async function runAgent(ipc, frame) {
             if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
               return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
             }
+            if (sessionDurable.superseded || sessionDurable.terminalFailureReason) {
+              return { status: 'failed', output: sessionDurable.terminalFailureReason ?? sessionDurable.supersedeReason ?? STALE_MODEL_TOOL_MESSAGE, images: [] }
+            }
             try {
               if (tool.name === DELEGATE_TOOL) {
                 return await sessionDurable.runActivity('subagent', exec.callId, exec.signal,
@@ -1512,6 +1521,9 @@ export async function runAgent(ipc, frame) {
               return await sessionDurable.runActivity('tool', exec.callId, exec.signal, () => {
                 if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
                   return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
+                }
+                if (sessionDurable.superseded || sessionDurable.terminalFailureReason) {
+                  return { status: 'failed', output: sessionDurable.terminalFailureReason ?? sessionDurable.supersedeReason ?? STALE_MODEL_TOOL_MESSAGE, images: [] }
                 }
                 return ipc.toolCall(sessionDurable.identity, sessionDurable.through, exec.callId, tool.name, args, exec.signal)
               })
@@ -1530,6 +1542,9 @@ export async function runAgent(ipc, frame) {
     return pending.then(handle => {
       liveHandles.add(handle)
       sessionDurable.startHeartbeats()
+      if (sessionDurable.superseded || sessionDurable.terminalFailureReason) {
+        handle.agent.cancel({ kind: 'hook', reason: sessionDurable.terminalFailureReason ?? sessionDurable.supersedeReason })
+      }
       const dispose = handle.dispose.bind(handle)
       handle.dispose = async (...args) => {
         sessionDurable.stopHeartbeats()
@@ -1537,6 +1552,46 @@ export async function runAgent(ipc, frame) {
       }
       return handle
     })
+  }
+
+  function requireSupersedingActivity(sessionDurable, callID) {
+    const activity = sessionDurable.activeActivities.get(callID)
+    if (!activity || !['tool', 'subagent'].includes(activity.phase)) {
+      throw new Error('superseding call does not match an active DSH tool')
+    }
+  }
+
+  function supersedeChildSession(sessionID, callID) {
+    if (sessionID === durable.identity.session_id) {
+      requireSupersedingActivity(durable, callID)
+      return
+    }
+    const childDurable = durables.get(sessionID)
+    if (!childDurable || !childOwners.has(sessionID)) throw new Error('superseding child session is unavailable')
+    if (childDurable.superseded) return
+    if (childDurable.agent) requireSupersedingActivity(childDurable, callID)
+    childDurable.superseded = true
+    childDurable.supersededCallID = callID
+    childDurable.supersedeReason = 'A newer task input superseded this child Agent call.'
+    childDurable.agent?.cancel({ kind: 'hook', reason: childDurable.supersedeReason })
+  }
+
+  function abortChildSession({ session_id, call_id, reason }) {
+    const childDurable = durables.get(session_id)
+    if (!childDurable || !childOwners.has(session_id)) throw new Error('terminal child session is unavailable')
+    if (childDurable.terminalFailureReason) {
+      if (childDurable.terminalFailureCallID !== call_id || childDurable.terminalFailureReason !== reason) {
+        throw new Error('terminal child failure identity changed')
+      }
+      return
+    }
+    const activity = childDurable.activeActivities.get(call_id)
+    if (!activity || activity.phase !== 'tool' || Buffer.byteLength(reason, 'utf8') > CHILD_ABORT_REASON_MAX_BYTES) {
+      throw new Error('terminal child failure does not match an active tool')
+    }
+    childDurable.terminalFailureReason = reason
+    childDurable.terminalFailureCallID = call_id
+    childDurable.agent?.cancel({ kind: 'hook', reason })
   }
 
   async function runChildSession(child, callID, argumentsValue, parentAgent, signal, job) {
@@ -1560,6 +1615,14 @@ export async function runAgent(ipc, frame) {
       const agent = handle.agent
       const state = durableChild.agentState
       if (ipc.cancelled) throw new Error('child agent was cancelled')
+      if (durableChild.superseded || durableChild.terminalFailureReason) {
+        agent.cancel({ kind: 'hook', reason: durableChild.terminalFailureReason ?? durableChild.supersedeReason })
+        await agent.whenIdle()
+        if (!await ctx.sessions.flush(agent.session)) throw new Error('child terminal checkpoint listener unavailable')
+        const reason = durableChild.terminalFailureReason ?? durableChild.supersedeReason
+        const output = await ipc.settleChild(durableChild.identity, callID, 'failed', durableChild.through, durableChild.digest, reason, signal)
+        return { status: 'failed', output: output ?? reason, images: [] }
+      }
       if (childStart.resume === true) {
         const recovery = durableChild.recoveryHistory
         if (!recovery || (!recovery.completed && recovery.openTurn === null)) throw new Error('child session checkpoint is not safely resumable')
@@ -1568,8 +1631,10 @@ export async function runAgent(ipc, frame) {
         await agent.whenIdle()
         if (!await ctx.sessions.flush(agent.session)) throw new Error('child checkpoint listener unavailable')
         signal?.throwIfAborted()
-        if (ipc.cancelled || state.failed || state.toolFailure) throw new Error('child session recovery did not remain idle')
-        if (!recovery.completed) {
+        if (ipc.cancelled || !durableChild.terminalFailureReason && (state.failed || state.toolFailure)) {
+          throw new Error('child session recovery did not remain idle')
+        }
+        if (!durableChild.terminalFailureReason && !recovery.completed) {
           agent.followup(createUserMessage({
             content: [{ type: 'text', text: 'Continue this delegated task from the last verified checkpoint. Do not repeat completed tool actions; use their recorded results.' }],
             source: { kind: 'user' },
@@ -1577,7 +1642,9 @@ export async function runAgent(ipc, frame) {
           await agent.whenIdle()
           if (!await ctx.sessions.flush(agent.session)) throw new Error('child checkpoint listener unavailable')
           signal?.throwIfAborted()
-          if (ipc.cancelled || state.failed || state.toolFailure) throw new Error('child session continuation did not complete')
+          if (ipc.cancelled || !durableChild.terminalFailureReason && (state.failed || state.toolFailure)) {
+            throw new Error('child session continuation did not complete')
+          }
         }
       } else {
         agent.followup(createUserMessage({
@@ -1593,8 +1660,9 @@ export async function runAgent(ipc, frame) {
       }
       const end = agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')
       if (ipc.cancelled || signal?.aborted) throw new Error('child agent was cancelled')
-      const status = job?.cancelRequested ? 'failed' : !state.failed && !state.toolFailure && end?.data?.reason?.kind === 'completed' ? 'succeeded' : 'failed'
-      let summary = delegatedSummary(agent)
+      const terminalFailureReason = durableChild.terminalFailureReason ?? durableChild.supersedeReason
+      const status = job?.cancelRequested || terminalFailureReason ? 'failed' : !state.failed && !state.toolFailure && end?.data?.reason?.kind === 'completed' ? 'succeeded' : 'failed'
+      let summary = terminalFailureReason ?? delegatedSummary(agent)
       if (job?.cancelRequested) summary = 'Background job cancelled.'
       else if (!summary) summary = status === 'succeeded' ? 'Child agent completed without a text summary.' : 'Child agent did not complete successfully.'
       if (Buffer.byteLength(summary) > MAX_CHILD_SUMMARY_BYTES) throw new Error('child summary exceeds limit')
@@ -1721,6 +1789,9 @@ export async function runAgent(ipc, frame) {
       if (!sessionDurable || sessionDurable.start.resume === true && !sessionDurable.recoveryReady) {
         throw new Error('model execution requires an authorized session checkpoint')
       }
+      if (sessionDurable.superseded || sessionDurable.terminalFailureReason) {
+        throw new Error(sessionDurable.terminalFailureReason ?? sessionDurable.supersedeReason ?? 'child Agent was superseded')
+      }
       if (options.provider !== 'morde' || options.model !== frame.model) {
         throw new Error('model route is not authorized')
       }
@@ -1780,6 +1851,7 @@ export async function runAgent(ipc, frame) {
     for (const handle of liveHandles) handle.agent.cancel(cause)
   }
   ipc.onJobCancel = cancelBackgroundJob
+  ipc.onChildAbort = abortChildSession
   ipc.onCancel = () => cancelAgents({ kind: 'user' })
   ipc.onFailure = () => cancelAgents({ kind: 'hook', reason: 'worker connection unavailable' })
   let handle
@@ -1843,7 +1915,8 @@ export async function runAgent(ipc, frame) {
         throw error
       }
     }
-    const installMessageDeliveryHandler = () => ipc.setMessageDeliveryHandler(({ message_id, content, attachment_ids, mode = 'followup', supersede_active = false }) => {
+    const installMessageDeliveryHandler = () => ipc.setMessageDeliveryHandler(({ message_id, content, attachment_ids, mode = 'followup',
+      supersede_active = false, supersede_session_id, supersede_call_id, supersede_root = false }) => {
       const attachmentIDs = attachment_ids ?? []
       let found = false
       const check = message => {
@@ -1860,6 +1933,8 @@ export async function runAgent(ipc, frame) {
       for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) check(message)
       if (supersede_active) {
         if (mode !== 'steer') throw new Error('only a steer may supersede an active tool')
+        supersedeChildSession(supersede_session_id, supersede_call_id)
+        if (!supersede_root) return
         durable.messageDeliveryVersion++
         agent.cancel({ kind: 'hook', reason: 'a newer task input superseded this unstarted tool call' }, { keepInbox: true })
         if (!found) {
@@ -2014,6 +2089,12 @@ export async function runAgent(ipc, frame) {
       if (coordinator) return coordinatorSettled(identity, agent, durable)
       if (taskValidationReview) return taskValidationReviewSettled(identity, agent, durable)
       await waitForBackgroundJobs()
+      await agent.whenIdle()
+      if (!await ctx.sessions.flush(agent.session)) throw new Error('checkpoint listener unavailable after background jobs')
+      if (state.failed || state.toolFailure || ipc.cancelled) throw new Error('session did not remain idle after background jobs')
+      if (agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')?.data?.reason?.kind !== 'completed') {
+        throw new Error('session steer after background jobs did not complete')
+      }
       return { type: 'settled', ...identity, state: 'completed_candidate', through_seq: durable.through }
     }
     if (frame.initial_message) {
@@ -2048,13 +2129,22 @@ export async function runAgent(ipc, frame) {
       if (resultState !== 'completed_candidate') throw new Error('Task validation review turn did not complete')
       return taskValidationReviewSettled(identity, agent, durable)
     }
-    if (resultState === 'completed_candidate') await waitForBackgroundJobs()
+    if (resultState === 'completed_candidate') {
+      await waitForBackgroundJobs()
+      await agent.whenIdle()
+      if (!await ctx.sessions.flush(agent.session)) throw new Error('checkpoint listener unavailable after background jobs')
+      if (state.failed || state.toolFailure || ipc.cancelled) throw new Error('session did not remain idle after background jobs')
+      if (agent.session.snapshotEvents().findLast(event => event.type === 'turn/end')?.data?.reason?.kind !== 'completed') {
+        throw new Error('session steer after background jobs did not complete')
+      }
+    }
     return { type: 'settled', ...identity, state: resultState, through_seq: durable.through }
   } finally {
     ipc.closeMessageDelivery()
     ipc.onCancel = undefined
     ipc.onFailure = undefined
     ipc.onJobCancel = undefined
+    ipc.onChildAbort = undefined
     if (handle) {
       liveHandles.delete(handle)
       await handle.dispose().catch(() => {})
