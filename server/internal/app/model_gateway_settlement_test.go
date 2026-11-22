@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,6 +29,10 @@ func (s *revisionSettlementStoreTest) BeginModelCallDispatch(ctx context.Context
 	return nil
 }
 
+func (s *revisionSettlementStoreTest) BeginModelCallDispatchWithTextStreaming(ctx context.Context, call ModelCallReservation) (bool, error) {
+	return true, s.BeginModelCallDispatch(ctx, call)
+}
+
 func (s *revisionSettlementStoreTest) CheckRevisionSettlement(context.Context, ModelTaskFence) (bool, error) {
 	select {
 	case s.checks <- struct{}{}:
@@ -44,13 +49,19 @@ func (s *revisionSettlementStoreTest) ValidateTaskModelRecoveryConfiguration(con
 }
 
 type revisionSettlementClientTest struct {
-	started chan struct{}
-	release chan struct{}
-	calls   atomic.Int32
+	started      chan struct{}
+	release      chan struct{}
+	initialDelta string
+	calls        atomic.Int32
 }
 
 func (c *revisionSettlementClientTest) Complete(ctx context.Context, request ModelRequest) (ModelResponse, error) {
 	c.calls.Add(1)
+	if c.initialDelta != "" && request.OnTextDelta != nil {
+		if err := request.OnTextDelta(c.initialDelta); err != nil {
+			return ModelResponse{}, err
+		}
+	}
 	close(c.started)
 	select {
 	case <-ctx.Done():
@@ -127,6 +138,41 @@ func TestTaskModelRevisionCancellationSettlesUsageWithoutDeliveringOutput(t *tes
 		store.settleN != 1 || store.settlement.Unknown || !store.settlement.Usage.Known ||
 		store.settlement.Usage.InputTokens != 8 || store.settlement.Usage.OutputTokens != 3 {
 		t.Fatalf("revision result = %#v, settlement=%#v, delivered=%d err=%v", result.response, store.settlement, delivered.Load(), result.err)
+	}
+}
+
+func TestTaskModelCancellationPreservesAlreadyDeliveredStreamText(t *testing.T) {
+	service, store, client, call := revisionSettlementFixture(t)
+	client.initialDelta = "visible partial"
+	lifecycle, stopService := context.WithCancel(context.Background())
+	defer stopService()
+	taskCtx, cancelTask := context.WithCancelCause(context.Background())
+	defer cancelTask(context.Canceled)
+	explicit, cancelExplicit := context.WithCancel(context.Background())
+	defer cancelExplicit()
+	ctx := WithModelExplicitCancellation(WithModelTaskLifecycle(taskCtx, lifecycle), explicit)
+	var visible strings.Builder
+	call.Request.OnTextDelta = func(delta string) error { _, _ = visible.WriteString(delta); return nil }
+	type outcome struct {
+		response ModelResponse
+		err      error
+	}
+	done := make(chan outcome, 1)
+	go func() { response, err := service.Complete(ctx, call); done <- outcome{response, err} }()
+	<-client.started
+	if visible.String() != "visible partial" {
+		t.Fatalf("initial visible text = %q", visible.String())
+	}
+	cancelExplicit()
+	select {
+	case result := <-done:
+		if !errors.Is(result.err, context.Canceled) || result.response.Text != "" || visible.String() != "visible partial" ||
+			store.settleN != 1 || !store.settlement.Unknown || client.calls.Load() != 1 {
+			t.Fatalf("cancelled stream response=%#v visible=%q settlement=%#v calls=%d err=%v",
+				result.response, visible.String(), store.settlement, client.calls.Load(), result.err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("provider stream did not stop after explicit cancellation")
 	}
 }
 

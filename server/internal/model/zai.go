@@ -475,7 +475,7 @@ func readZAIStream(body io.Reader, onTextDelta func(string) error) (app.ModelRes
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return app.ModelResponse{}, err
+		return app.ModelResponse{}, &streamReadError{err: err}
 	}
 	if err := dispatch(); err != nil {
 		return app.ModelResponse{}, err

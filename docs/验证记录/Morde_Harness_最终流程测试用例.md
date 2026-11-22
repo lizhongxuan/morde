@@ -634,6 +634,19 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
   ```
 
   首次 PostgreSQL 运行发现新用例直接切换 `state='routed'` 时未清除模拟租约，触发既有数据库状态约束；夹具改为与完成路由一致地结清聚合状态和租约，重跑通过。另一次未配置 `CH_TEST_DATABASE_URL` 的调用只跳过集成用例，不计入通过。当前本轮仅本地代码合并和自动化回归；未调用真实 Provider、测试站或客户端。
+- **本轮 H02 流错误分类与已显示增量保留（2026-11-23）：** `ResponsesClient.complete` 过去将流读超时和底层 I/O 中断统一归为 `invalid_response`。现在区分 caller deadline（`timeout`）、流读取 `net.Error` 超时（`timeout`）、scanner I/O 中断（`transport`）、畸形协议/缺少终止事件（`invalid_response`）；caller cancellation 仍原样返回，不把用户取消记成 Provider timeout。OpenAI Responses 与 Z.ai 两条流分别通过合成 SSE delta 后 `io.ErrUnexpectedEOF` 的测试，确认已回调文本保留、模型调用不被误报成功；10ms deadline 测试确认已回调文本之后超时仍分类为 `timeout`。App 侧显式取消回归确认取消前已回调的增量仍可见、之后 Provider 停止、Task 响应为空、账本为 `unknown` 且调用次数为一。首次 App 全量回归中的新用例因测试 store 未声明流式派发能力而未触发 delta；补齐 fixture 的流能力后通过，生产流式授权门禁未改。
+
+  ```text
+  cd server && go test ./internal/app -run '^TestTaskModelCancellationPreservesAlreadyDeliveredStreamText$' -count=1
+  # 通过，0.620 秒
+  cd server && go test ./internal/model ./internal/app -count=1
+  # model 通过，1.619 秒；app 通过，21.769 秒
+  gofmt -w server/internal/model/responses.go server/internal/model/zai.go server/internal/model/responses_stream_errors_test.go server/internal/app/model_gateway_settlement_test.go
+  git diff --check
+  # gofmt 与 diff 检查通过
+  ```
+
+  以上均为本机合成 HTTP/流响应；deadline 使用 10ms 夹具以验证分类，不表示实际 Provider 超过 45 秒、真实网络流中断或客户端 UI 已验收。轮换后的实时 Provider 凭据尚未配置到当前进程，因此没有调用真实 Provider、测试站或客户端；H02 保持进行中。
 - **已知缺口与未验范围：** 单次聚合仍受 32 KiB 限制；超限补充按已验证路径单独排队，但客户端如何呈现这些独立消息未实测，也没有聚合原文分页读取接口。工具、子 Agent 与 Task checkpoint 的请求级停滞期限仍未补齐。用户选择等轮换凭据配置到本机后继续真实模型验收；本轮未调用真实模型、测试站或客户端，旧聊天 key 未使用。真实 tokenizer/Provider 窗口、跨账号长历史、双端 Task 状态、真实 Host 工具和 60 分钟耐久验收均未执行，H01/H04/H09 保持未完成。
 
 ### 单次执行信息模板

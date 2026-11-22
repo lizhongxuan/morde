@@ -165,6 +165,9 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 			response, err = readStreamingResponse(resp.Body, request.OnTextDelta)
 		}
 		if err != nil {
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return app.ModelResponse{}, modelClientError(app.ModelErrorTimeout)
+			}
 			if ctx.Err() != nil {
 				return app.ModelResponse{}, ctx.Err()
 			}
@@ -175,7 +178,7 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 			if errors.Is(err, errResponseTooLarge) {
 				return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidResponse)
 			}
-			return app.ModelResponse{}, modelClientError(app.ModelErrorInvalidResponse)
+			return app.ModelResponse{}, classifyStreamReadFailure(err)
 		}
 		return response, nil
 	}
@@ -492,6 +495,23 @@ type streamCallbackError struct{ err error }
 func (e *streamCallbackError) Error() string { return "persist model text delta" }
 func (e *streamCallbackError) Unwrap() error { return e.err }
 
+type streamReadError struct{ err error }
+
+func (e *streamReadError) Error() string { return "read model provider stream" }
+func (e *streamReadError) Unwrap() error { return e.err }
+
+func classifyStreamReadFailure(err error) error {
+	var networkErr net.Error
+	if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &networkErr) && networkErr.Timeout()) {
+		return modelClientError(app.ModelErrorTimeout)
+	}
+	var readErr *streamReadError
+	if errors.As(err, &readErr) {
+		return modelClientError(app.ModelErrorTransport)
+	}
+	return modelClientError(app.ModelErrorInvalidResponse)
+}
+
 type responseStreamEvent struct {
 	Type     string          `json:"type"`
 	Delta    string          `json:"delta"`
@@ -580,7 +600,7 @@ func readStreamingResponse(body io.Reader, onTextDelta func(string) error) (app.
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return app.ModelResponse{}, err
+		return app.ModelResponse{}, &streamReadError{err: err}
 	}
 	if err := dispatch(); err != nil {
 		return app.ModelResponse{}, err
