@@ -26,8 +26,10 @@ import (
 
 type cloudDSHBrokerTaskStore struct {
 	*runtimeToolTaskStore
-	events    []task.Event
-	toolCalls []TaskToolCallProgress
+	events                  []task.Event
+	toolCalls               []TaskToolCallProgress
+	commitTaskProgressError error
+	committedTaskProgress   []TaskProgress
 }
 
 func TestValidCloudDSHToolImagesAllowsBoundedTaskAttachmentImages(t *testing.T) {
@@ -273,6 +275,10 @@ func (s *cloudDSHBrokerTaskStore) CommitTaskProgress(ctx context.Context, progre
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.committedTaskProgress = append(s.committedTaskProgress, progress)
+	if s.commitTaskProgressError != nil {
+		return task.Event{}, s.commitTaskProgressError
+	}
 	current := &s.details.Task
 	if current.ID != progress.TaskID || current.Lease.Owner != progress.LeaseOwner || current.Lease.Version != progress.LeaseVersion {
 		return task.Event{}, errors.New("stale task progress")
@@ -1557,6 +1563,46 @@ func TestCloudDSHToolBrokerCompletesHostlessTaskWithMatchingCheckpoint(t *testin
 	if store.details.Task.Status != task.StatusCompleted || store.details.Task.Result != "Cloud task finished." ||
 		len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepSucceeded {
 		t.Fatalf("completed task = %#v, steps = %#v", store.details.Task, store.details.Steps)
+	}
+}
+
+func TestCloudDSHToolBrokerCompletePreservesAppliedSteerOnCheckpointMismatch(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	store.details.Task.HostID = ""
+	store.details.Task.Objective = "Explain the answer in chat."
+	setCloudDSHCompletionFence(&store.details.Task)
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := store.details.Task
+	completion := cloudDSHCompletionFor(claimed, "Stale result from before the steer.", nil)
+	pending := []AgentConversationMessage{{ID: "m1234567", Content: "Use the updated requirement.", Sequence: 9, Mode: AgentMessageDeliverySteer}}
+	store.mu.Lock()
+	store.details.Task.CheckpointThroughSequence = 4
+	store.details.Task.CheckpointDigest = bytes.Repeat([]byte{8}, 32)
+	store.commitTaskProgressError = NewTaskInputPendingError(pending)
+	store.mu.Unlock()
+
+	err = broker.Complete(context.Background(), claimed, completion)
+	var pendingError *TaskInputPendingError
+	if !errors.As(err, &pendingError) || !errors.Is(err, ErrTaskInputPending) || len(pendingError.PendingMessages) != 1 ||
+		pendingError.PendingMessages[0].ID != pending[0].ID {
+		t.Fatalf("Complete() checkpoint mismatch error = %v pending=%+v; want typed steer snapshot", err, pendingError)
+	}
+	if len(store.committedTaskProgress) != 1 {
+		t.Fatalf("completion progress commits = %d; want exactly one final fenced commit", len(store.committedTaskProgress))
+	}
+	progress := store.committedTaskProgress[0]
+	if progress.Status != task.StatusCompleted || progress.Result != completion.Result || progress.AgentCompletionFence == nil ||
+		progress.AgentCompletionFence.CheckpointThroughSequence != completion.CheckpointThroughSequence ||
+		!bytes.Equal(progress.AgentCompletionFence.CheckpointDigest, completion.CheckpointDigest) {
+		t.Fatalf("final completion progress did not preserve candidate fence: %+v", progress)
+	}
+	if store.details.Task.Status != task.StatusRunning || store.details.Task.Result != "" {
+		t.Fatalf("stale completion changed task state: status=%s result=%q", store.details.Task.Status, store.details.Task.Result)
 	}
 }
 

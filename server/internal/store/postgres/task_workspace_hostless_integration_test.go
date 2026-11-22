@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -238,7 +239,7 @@ func TestHostlessWorkspaceTaskSubmitPublishReceiptAndRecovery(t *testing.T) {
 			t.Fatal("receipt replay requested block bytes")
 			return nil, nil
 		})
-	if err != nil || replayed != committed {
+	if err != nil || !reflect.DeepEqual(replayed, committed) {
 		t.Fatalf("restart receipt replay = %#v, %v; original=%#v", replayed, err, committed)
 	}
 	currentRoot, err := filepath.EvalSymlinks(t.TempDir())

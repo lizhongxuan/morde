@@ -280,20 +280,28 @@ agent_engine_version=$5,agent_profile_version=$6,updated_at=clock_timestamp() WH
 			return fmt.Errorf("bind agent instance to task: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `INSERT INTO task_agent_sessions
-(task_id,owner_id,session_id,checkpoint_through_seq,checkpoint_digest)
-VALUES ($1,$2,$3,$4,$5) ON CONFLICT (task_id,session_id) DO NOTHING`,
+(task_id,owner_id,session_id,checkpoint_through_seq,checkpoint_digest,root_checkpoint_through_seq,root_checkpoint_baseline_known)
+VALUES ($1,$2,$3,$4,$5,$4,true) ON CONFLICT (task_id,session_id) DO NOTHING`,
 			fence.TaskID, fence.OwnerID, fence.AgentSessionID, current.CheckpointThrough, current.CheckpointDigest); err != nil {
 			return fmt.Errorf("register root agent session: %w", err)
 		}
+		if _, err := tx.Exec(ctx, `UPDATE task_agent_sessions SET root_checkpoint_through_seq=$4,root_checkpoint_baseline_known=true
+WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 AND parent_session_id IS NULL`,
+			fence.TaskID, fence.OwnerID, fence.AgentSessionID, current.CheckpointThrough); err != nil {
+			return fmt.Errorf("advance root Agent checkpoint baseline: %w", err)
+		}
 		var rootSession bool
 		var registeredThrough int64
+		var registeredRootThrough int64
+		var registeredRootBaselineKnown bool
 		var registeredDigest []byte
-		if err := tx.QueryRow(ctx, `SELECT parent_session_id IS NULL,checkpoint_through_seq,checkpoint_digest FROM task_agent_sessions
+		if err := tx.QueryRow(ctx, `SELECT parent_session_id IS NULL,checkpoint_through_seq,root_checkpoint_through_seq,root_checkpoint_baseline_known,checkpoint_digest FROM task_agent_sessions
 WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR UPDATE`, fence.TaskID, fence.OwnerID, fence.AgentSessionID).
-			Scan(&rootSession, &registeredThrough, &registeredDigest); err != nil {
+			Scan(&rootSession, &registeredThrough, &registeredRootThrough, &registeredRootBaselineKnown, &registeredDigest); err != nil {
 			return fmt.Errorf("verify root agent session registration: %w", err)
 		}
-		if !rootSession || registeredThrough != current.CheckpointThrough || !bytes.Equal(registeredDigest, current.CheckpointDigest) {
+		if !rootSession || registeredThrough != current.CheckpointThrough || registeredRootThrough != current.CheckpointThrough ||
+			!registeredRootBaselineKnown || !bytes.Equal(registeredDigest, current.CheckpointDigest) {
 			return domain.NewError(domain.CodeInvalidState, "agent root session checkpoint head changed")
 		}
 		result = app.AgentInstanceLease{Fence: fence, RuntimeFence: copyAccountAgentRuntimeFence(runtimeFence),

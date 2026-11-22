@@ -696,6 +696,8 @@ func TestPostgresTaskValidationEvidenceResolvesFinalResultAndDelegatedStep(t *te
 	}
 	child, _, err := children.Create(ctx, app.AgentChildSessionCommand{
 		Fence: lease.Fence, ParentSessionID: lease.Fence.AgentSessionID, SpawnKey: callID,
+		RootCheckpointThroughSequence: rootAgentCheckpointBaselineForTest(t, f.store, current.Task.ID,
+			current.Task.OwnerID, lease.Fence.AgentSessionID),
 		Arguments: []byte(`{"title":"Record child step","objective":"Verify provenance mapping"}`),
 		Title:     "Record child step", Summary: "Record provenance mapping",
 	})

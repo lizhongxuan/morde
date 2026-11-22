@@ -268,7 +268,8 @@ func TestPostgresAgentCheckpointPagesRequireCurrentRecoveredLease(t *testing.T) 
 		t.Fatal(err)
 	}
 	spawn := app.AgentChildSessionCommand{Fence: firstLease.Fence, ParentSessionID: firstLease.Fence.AgentSessionID,
-		SpawnKey: "call_spawn_1", Arguments: []byte(`{"instruction":"inspect one file"}`), Title: "Inspect a file", Summary: "Read-only child task",
+		SpawnKey: "call_spawn_1", RootCheckpointThroughSequence: rootAgentCheckpointBaselineForTest(t, store, firstTask.ID, owner.ID, firstLease.Fence.AgentSessionID),
+		Arguments: []byte(`{"instruction":"inspect one file"}`), Title: "Inspect a file", Summary: "Read-only child task",
 		AllowedTools: []string{"file_read", "workspace_search"}}
 	childSession, replayed, err := childSessions.Create(ctx, spawn)
 	if err != nil || replayed {
@@ -409,22 +410,28 @@ func TestPostgresAgentCheckpointPagesRequireCurrentRecoveredLease(t *testing.T) 
 		t.Fatalf("invalid pinned digest = %v", err)
 	}
 	cancelledChild, replayed, err := childSessions.Create(ctx, app.AgentChildSessionCommand{Fence: secondLease.Fence,
-		ParentSessionID: secondLease.Fence.AgentSessionID, SpawnKey: "call_spawn_2",
-		Arguments: []byte(`{"instruction":"cancel child"}`), Title: "Cancelable child", Summary: "Will be stopped with the parent."})
+		ParentSessionID:               secondLease.Fence.AgentSessionID,
+		RootCheckpointThroughSequence: rootAgentCheckpointBaselineForTest(t, store, firstTask.ID, owner.ID, secondLease.Fence.AgentSessionID),
+		SpawnKey:                      "call_spawn_2",
+		Arguments:                     []byte(`{"instruction":"cancel child"}`), Title: "Cancelable child", Summary: "Will be stopped with the parent."})
 	if err != nil || replayed {
 		t.Fatalf("create child for cancellation settlement = %#v replayed=%t err=%v", cancelledChild, replayed, err)
 	}
 	for index := 0; index < 14; index++ {
 		_, replayed, err := childSessions.Create(ctx, app.AgentChildSessionCommand{Fence: secondLease.Fence,
-			ParentSessionID: secondLease.Fence.AgentSessionID, SpawnKey: fmt.Sprintf("call_spawn_fill_%d", index),
-			Arguments: []byte(fmt.Sprintf(`{"instruction":"fill child slot %d"}`, index)), Title: fmt.Sprintf("Child %d", index)})
+			ParentSessionID:               secondLease.Fence.AgentSessionID,
+			RootCheckpointThroughSequence: rootAgentCheckpointBaselineForTest(t, store, firstTask.ID, owner.ID, secondLease.Fence.AgentSessionID),
+			SpawnKey:                      fmt.Sprintf("call_spawn_fill_%d", index),
+			Arguments:                     []byte(fmt.Sprintf(`{"instruction":"fill child slot %d"}`, index)), Title: fmt.Sprintf("Child %d", index)})
 		if err != nil || replayed {
 			t.Fatalf("create bounded child session %d: replayed=%t err=%v", index, replayed, err)
 		}
 	}
 	if _, _, err := childSessions.Create(ctx, app.AgentChildSessionCommand{Fence: secondLease.Fence,
-		ParentSessionID: secondLease.Fence.AgentSessionID, SpawnKey: "call_spawn_over_limit",
-		Arguments: []byte(`{"instruction":"exceed child limit"}`), Title: "Over limit"}); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		ParentSessionID:               secondLease.Fence.AgentSessionID,
+		RootCheckpointThroughSequence: rootAgentCheckpointBaselineForTest(t, store, firstTask.ID, owner.ID, secondLease.Fence.AgentSessionID),
+		SpawnKey:                      "call_spawn_over_limit",
+		Arguments:                     []byte(`{"instruction":"exceed child limit"}`), Title: "Over limit"}); domain.CodeOf(err) != domain.CodeQuotaExceeded {
 		t.Fatalf("Task accepted more than its child Agent limit: %v", err)
 	}
 	cancelID := mustID(t, domain.NewTaskActionID)

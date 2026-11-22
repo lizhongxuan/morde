@@ -276,13 +276,20 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3`, fence.TaskID, fence.OwnerID
 WHERE id=$1`, fence.TaskID, value.Through, value.Digest); err != nil {
 				return fmt.Errorf("advance task checkpoint: %w", err)
 			}
+			if _, err := tx.Exec(ctx, `UPDATE task_agent_sessions SET root_checkpoint_through_seq=$3,root_checkpoint_baseline_known=true
+WHERE task_id=$1 AND owner_id=$2 AND session_id=$4 AND parent_session_id IS NULL`,
+				fence.TaskID, fence.OwnerID, value.Through, rootSessionID); err != nil {
+				return fmt.Errorf("advance root Agent Session checkpoint baseline: %w", err)
+			}
 			for _, messageID := range pendingMessageIDs {
 				sequence, ok := claimedSequences[messageID]
 				if !ok {
 					return domain.NewError(domain.CodeInvalidState, "checkpoint user message sequence is unavailable")
 				}
-				deliveryResult, err := tx.Exec(ctx, `UPDATE task_agent_message_deliveries SET claimed_through_seq=$2,updated_at=clock_timestamp()
-WHERE message_id=$1 AND claimed_through_seq IS NULL AND (enqueued_through_seq IS NULL OR enqueued_through_seq<$2)`, messageID, sequence)
+				deliveryResult, err := tx.Exec(ctx, `UPDATE task_agent_message_deliveries SET claimed_through_seq=$2,
+claimed_checkpoint_through_seq=$3,updated_at=clock_timestamp()
+WHERE message_id=$1 AND claimed_through_seq IS NULL AND (enqueued_through_seq IS NULL OR enqueued_through_seq<$2)`,
+					messageID, sequence, value.Through)
 				if err != nil {
 					return fmt.Errorf("record checkpointed task message claim: %w", err)
 				}

@@ -471,7 +471,8 @@ FROM task_agent_message_deliveries WHERE message_id=$1`, first.ID, started.Fence
 		t.Fatal(err)
 	}
 	child, replayed, err := children.Create(ctx, app.AgentChildSessionCommand{Fence: started.Fence, ParentSessionID: fence.AgentSessionID,
-		SpawnKey: "delivery-child", Arguments: []byte(`{"objective":"inspect"}`), Title: "Inspect", Summary: "inspect safely",
+		SpawnKey: "delivery-child", RootCheckpointThroughSequence: rootAgentCheckpointBaselineForTest(t, store, created.Task.ID, owner.ID, fence.AgentSessionID),
+		Arguments: []byte(`{"objective":"inspect"}`), Title: "Inspect", Summary: "inspect safely",
 		AllowedTools: []string{"workspace_read"}})
 	if err != nil || replayed {
 		t.Fatalf("create child session: child=%#v replayed=%t err=%v", child, replayed, err)

@@ -40,6 +40,74 @@ type CloudDSHToolBroker struct {
 	stepDetailSealer         *Sealer
 }
 
+// AgentToolCallAdmissionStatus reports whether a DSH call may begin under the
+// current Task inbox fence. Superseded is a successful no-dispatch outcome.
+type AgentToolCallAdmissionStatus string
+
+const (
+	AgentToolCallAdmitted   AgentToolCallAdmissionStatus = "admitted"
+	AgentToolCallSuperseded AgentToolCallAdmissionStatus = "superseded"
+	// AgentToolCallBaselineUnverifiable is terminal for a legacy child Agent
+	// whose root checkpoint baseline predates durable fence evidence. The caller
+	// must settle that child as failed instead of restarting it against an
+	// unverifiable history boundary.
+	AgentToolCallBaselineUnverifiable AgentToolCallAdmissionStatus = "baseline_unverifiable"
+)
+
+type AgentToolCallAdmission struct {
+	Status          AgentToolCallAdmissionStatus
+	PendingMessages []AgentConversationMessage
+	Reason          string
+}
+
+// CloudDSHToolCallAdmitter is called by the Worker before executing each
+// DSH tool_call frame, including read-only and internal tools.
+type CloudDSHToolCallAdmitter interface {
+	AdmitToolCall(context.Context, task.Task, ModelToolCall, bool) (AgentToolCallAdmission, error)
+}
+
+// AgentToolCallAdmissionStore serializes call admission with steer acceptance
+// through the Task row lock.
+type AgentToolCallAdmissionStore interface {
+	AdmitAgentToolCall(context.Context, ModelToolCall, bool) (AgentToolCallAdmission, error)
+}
+
+// ErrTaskInputPending identifies a final dispatch gate that committed a
+// terminal zero-dispatch marker because a steer was accepted first.
+var ErrTaskInputPending = errors.New("task input superseded the tool call")
+
+type TaskInputPendingError struct {
+	PendingMessages []AgentConversationMessage
+}
+
+func (e *TaskInputPendingError) Error() string { return ErrTaskInputPending.Error() }
+
+func (e *TaskInputPendingError) Is(target error) bool { return target == ErrTaskInputPending }
+
+func (e *TaskInputPendingError) Unwrap() error { return ErrTaskInputPending }
+
+func NewTaskInputPendingError(messages []AgentConversationMessage) error {
+	return &TaskInputPendingError{PendingMessages: append([]AgentConversationMessage(nil), messages...)}
+}
+
+const TaskAgentToolSupersededOperationResult = `{"morde_dispatch":"superseded","version":1}`
+
+const AgentToolSuperseded AgentToolResultStatus = "superseded"
+
+func (b *CloudDSHToolBroker) AdmitToolCall(ctx context.Context, claimed task.Task, call ModelToolCall,
+	recovering bool) (AgentToolCallAdmission, error) {
+	if ctx == nil || call.CallID == "" || len(call.CallID) > 256 || len(call.Name) == 0 || len(call.Name) > 128 ||
+		call.TaskFence == nil || call.TaskFence.TaskID != claimed.ID || call.TaskFence.OwnerID != claimed.OwnerID ||
+		call.TaskFence.InitiatorID != claimed.InitiatorID {
+		return AgentToolCallAdmission{}, domain.InvalidArgument("tool_call", "dsh tool call admission identity is invalid")
+	}
+	store, ok := b.store.(AgentToolCallAdmissionStore)
+	if !ok {
+		return AgentToolCallAdmission{}, domain.NewError(domain.CodeInvalidState, "task tool-call admission storage is unavailable")
+	}
+	return store.AdmitAgentToolCall(ctx, call, recovering)
+}
+
 func (b *CloudDSHToolBroker) SetTaskStepDetailSealer(sealer *Sealer) error {
 	if b == nil || sealer == nil {
 		return domain.NewError(domain.CodeInvalidArgument, "task step detail sealer is required")
@@ -380,12 +448,27 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		return err
 	}
 	current := details.Task
+	completionFence := &TaskAgentCompletionFence{
+		AgentSessionID: completion.AgentSessionID, AgentInstanceID: completion.AgentInstanceID,
+		AgentGeneration: completion.AgentGeneration, AuthorizationVersion: completion.AuthorizationVersion,
+		CheckpointThroughSequence: completion.CheckpointThroughSequence,
+		CheckpointDigest:          append([]byte(nil), completion.CheckpointDigest...),
+	}
 	if current.Status != task.StatusRunning || current.ExecutionLocation != "server" ||
 		current.AgentInstanceID != completion.AgentInstanceID || current.AgentGeneration != completion.AgentGeneration ||
 		current.Authorization.Version != completion.AuthorizationVersion || current.AgentSessionID != completion.AgentSessionID ||
-		current.CheckpointThroughSequence != completion.CheckpointThroughSequence ||
-		!bytes.Equal(current.CheckpointDigest, completion.CheckpointDigest) {
+		current.AgentSessionID == "" {
 		return domain.NewError(domain.CodeInvalidState, "cloud dsh completion checkpoint changed")
+	}
+	if current.CheckpointThroughSequence != completion.CheckpointThroughSequence || !bytes.Equal(current.CheckpointDigest, completion.CheckpointDigest) {
+		step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "result", task.StepSucceeded,
+			"Complete cloud task", "The cloud dsh completion checkpoint changed before result commit.")
+		if err != nil {
+			return err
+		}
+		useCloudDSHStreamResultStep(&step, details, completion)
+		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result, completion.ValidationClaims,
+			map[string]any{"source": "cloud_dsh"}, "", nil, completionFence)
 	}
 	fileIntent := current.FileDeliveryIntent
 	if !fileIntent.Valid() {
@@ -417,7 +500,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 			return err
 		}
 		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result, completion.ValidationClaims,
-			map[string]any{"source": "cloud_dsh"}, "", artifacts)
+			map[string]any{"source": "cloud_dsh"}, "", artifacts, completionFence)
 	}
 
 	evidence, evidenceErr := agentFileWriteEvidence(completion.Inputs)
@@ -436,7 +519,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 			}
 			useCloudDSHStreamResultStep(&step, details, completion)
 			return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result, completion.ValidationClaims,
-				map[string]any{"source": "cloud_dsh"}, "", nil)
+				map[string]any{"source": "cloud_dsh"}, "", nil, completionFence)
 		}
 	}
 	step, err := cloudDSHCompletionVerificationStep(current, details.Steps)
@@ -468,6 +551,10 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+	var pendingInput *TaskInputPendingError
+	if errors.As(verifyErr, &pendingInput) {
+		return verifyErr
+	}
 	if verifyErr == nil && verification.Status == AgentVerifyUnknown && verification.WaitingReason == "workspace_input_changed" &&
 		len(verification.Artifacts) == 0 {
 		_, err := b.pauseForWorkspaceInputChange(ctx, current, step, current.Usage, "file.verify")
@@ -488,7 +575,7 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	step.Status = task.StepSucceeded
 	step.Summary = safeStepSummary(verification.Summary, "Host and committed Workspace verified the task output.")
 	return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result, completion.ValidationClaims,
-		map[string]any{"source": "cloud_dsh", "verification": verification.Summary}, "", artifacts)
+		map[string]any{"source": "cloud_dsh", "verification": verification.Summary}, "", artifacts, completionFence)
 }
 
 func (b *CloudDSHToolBroker) pauseForUnverifiedFileClaim(ctx context.Context, current task.Task, details TaskDetails) error {
@@ -561,7 +648,8 @@ func prepareCloudDSHVerifiedArtifacts(details TaskDetails, step task.Step, verif
 }
 
 func (b *CloudDSHToolBroker) completeWithRecordCapture(ctx context.Context, current task.Task, step task.Step,
-	usage task.Usage, result string, validationClaims []TaskResultClaim, detail any, observationFingerprint string, artifacts []task.Artifact) error {
+	usage task.Usage, result string, validationClaims []TaskResultClaim, detail any, observationFingerprint string,
+	artifacts []task.Artifact, completionFence *TaskAgentCompletionFence) error {
 	if len(result) > agentUserVisibleResultBytes || !validUTF8(result) {
 		step.Status = task.StepFailed
 		step.Summary = "The cloud task returned invalid text output."
@@ -573,7 +661,8 @@ func (b *CloudDSHToolBroker) completeWithRecordCapture(ctx context.Context, curr
 		_, err = b.store.CommitTaskProgress(ctx, TaskProgress{
 			TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 			Status: task.StatusFailed, CurrentStep: step.ID, Result: "Task stopped: invalid_model_output", Usage: usage,
-			Steps: []task.Step{step}, Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: payload},
+			Steps: []task.Step{step}, AgentCompletionFence: completionFence,
+			Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: payload},
 		})
 		return err
 	}
@@ -587,8 +676,9 @@ func (b *CloudDSHToolBroker) completeWithRecordCapture(ctx context.Context, curr
 		Status: task.StatusCompleted, CurrentStep: step.ID, Result: result, Usage: usage,
 		PublishResultMessage:   strings.TrimSpace(result) != "",
 		ObservationFingerprint: observationFingerprint, Steps: []task.Step{step}, Artifacts: artifacts,
-		ValidationClaims: validationClaims,
-		Event:            task.Event{TaskID: current.ID, Type: "task.result", Payload: payload},
+		ValidationClaims:     validationClaims,
+		AgentCompletionFence: completionFence,
+		Event:                task.Event{TaskID: current.ID, Type: "task.result", Payload: payload},
 	}
 	_, err = b.store.CommitTaskProgress(ctx, progress)
 	if isOptionalTaskValidationEvidenceError(err) {
@@ -838,7 +928,8 @@ func (b *CloudDSHToolBroker) pauseCompletion(ctx context.Context, current task.T
 
 func (b *CloudDSHToolBroker) Execute(ctx context.Context, claimed task.Task, call ModelToolCall) (AgentToolResult, error) {
 	ctx = b.toolActivityContext(ctx, claimed, call)
-	return b.execute(ctx, claimed, call, false, nil)
+	result, err := b.execute(ctx, claimed, call, false, nil)
+	return mapTaskInputPendingResult(result, err)
 }
 
 // Reconcile handles a tool call reconstructed from a pinned dsh session. An
@@ -847,7 +938,17 @@ func (b *CloudDSHToolBroker) Execute(ctx context.Context, claimed task.Task, cal
 // operation exists; a checkpointed result must match a terminal ledger result.
 func (b *CloudDSHToolBroker) Reconcile(ctx context.Context, claimed task.Task, call ModelToolCall, checkpointOutput *string) (AgentToolResult, error) {
 	ctx = b.toolActivityContext(ctx, claimed, call)
-	return b.execute(ctx, claimed, call, true, checkpointOutput)
+	result, err := b.execute(ctx, claimed, call, true, checkpointOutput)
+	return mapTaskInputPendingResult(result, err)
+}
+
+func mapTaskInputPendingResult(result AgentToolResult, err error) (AgentToolResult, error) {
+	var pending *TaskInputPendingError
+	if !errors.As(err, &pending) {
+		return result, err
+	}
+	return AgentToolResult{Status: AgentToolSuperseded,
+		SupersedingMessages: append([]AgentConversationMessage(nil), pending.PendingMessages...)}, nil
 }
 
 func (b *CloudDSHToolBroker) toolActivityContext(ctx context.Context, claimed task.Task, call ModelToolCall) context.Context {
