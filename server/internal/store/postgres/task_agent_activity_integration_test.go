@@ -115,7 +115,7 @@ func TestPostgresTaskAgentActivityHeartbeatsDoNotAdvanceProgress(t *testing.T) {
 	var revision int64
 	read := func() {
 		t.Helper()
-		if err := f.store.pool.QueryRow(ctx, `SELECT activity_phase,activity_state,activity_id,activity_revision,
+		if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(activity_phase,''),COALESCE(activity_state,''),COALESCE(activity_id,''),activity_revision,
 activity_progressed_at,activity_heartbeat_at IS NOT NULL,activity_observed_at FROM task_agent_sessions
 WHERE task_id=$1 AND session_id=$2`, lease.Fence.TaskID, lease.Fence.AgentSessionID).
 			Scan(&phase, &state, &activityID, &revision, &progressAt, &heartbeatPresent, &observedAt); err != nil {
