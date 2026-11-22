@@ -346,7 +346,7 @@ func f01RunNodeAccountTaskControlled(ctx context.Context, manager *CloudDSHAccou
 	}
 	identity := map[string]any{"task_id": fence.TaskID, "owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID,
 		"session_id": fence.AgentSessionID, "generation": fence.AgentGeneration, "authorization_version": fence.AuthorizationVersion}
-	start := map[string]any{"type": "start", "version": 1, "model": "f01-local-model", "tools": []any{}, "prompt": "Answer with one sentence."}
+	start := map[string]any{"type": "start", "version": 1, "task_revision": 1, "model": "f01-local-model", "tools": []any{}, "prompt": "Answer with one sentence."}
 	for key, value := range identity {
 		start[key] = value
 	}
@@ -366,8 +366,8 @@ func f01RunNodeAccountTaskControlled(ctx context.Context, manager *CloudDSHAccou
 			return fmt.Errorf("read Task frame: %w", err)
 		}
 		switch frame.Type {
-		case "agent_status":
-			// Agent activity frames are observations; they do not change the Task protocol.
+		case "agent_status", "agent_activity", "agent_heartbeat":
+			// Agent status, activity, and heartbeat frames are observations; they do not change the Task protocol.
 			continue
 		case "checkpoint":
 			ack := map[string]any{"type": "checkpoint_ack", "id": frame.ID, "ok": true,
