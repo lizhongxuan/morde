@@ -1003,6 +1003,15 @@ func (s *f01WorkspaceSyncCompletionGateTaskStore) CommitTaskProgress(ctx context
 	return s.TaskStore.CommitTaskProgress(ctx, progress)
 }
 
+func (s *f01WorkspaceSyncCompletionGateTaskStore) AdmitAgentToolCall(ctx context.Context, call app.ModelToolCall,
+	recovering bool) (app.AgentToolCallAdmission, error) {
+	store, ok := s.TaskStore.(app.AgentToolCallAdmissionStore)
+	if !ok {
+		return app.AgentToolCallAdmission{}, errors.New("Task tool-call admission storage is unavailable")
+	}
+	return store.AdmitAgentToolCall(ctx, call, recovering)
+}
+
 func (s *f01WorkspaceSyncCompletionGateTaskStore) LoadDeferredTaskTarget(ctx context.Context,
 	value task.Task) (app.DeferredTaskTarget, bool, error) {
 	store, ok := s.TaskStore.(app.DeferredTaskTargetStore)
