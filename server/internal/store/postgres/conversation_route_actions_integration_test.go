@@ -1337,3 +1337,42 @@ func TestConversationTaskRevisionFenceBlocksProgressAndStreaming(t *testing.T) {
 		t.Fatalf("unapplied revision was claimed: found=%t err=%v", found, err)
 	}
 }
+
+func TestPostgresJoinedConversationRouteContentDetachesOversizedSupplements(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	input := app.ConversationRoutingInput{HostID: "h1234567"}
+	root := f.receive(t, "route-join-oversized-root", "short follow-up", input)
+	first := f.receive(t, "route-join-oversized-first", strings.Repeat("a", 20<<10), input)
+	second := f.receive(t, "route-join-oversized-second", strings.Repeat("b", 20<<10), input)
+	for _, supplement := range []app.ConversationRouteClaim{first, second} {
+		if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_message_routes SET duplicate_of_message_id=$1,state='routed',
+aggregation_state='settled',lease_owner='',lease_expires_at=NULL,lease_version=lease_version+1
+WHERE message_id=$2 AND service_instance_id=$3::uuid`, root.Message.ID, supplement.Message.ID, f.instanceID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	tx, err := f.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	merged, sources, err := joinedConversationRouteContent(ctx, tx, root)
+	if err != nil {
+		t.Fatalf("oversized joined input failed the route: %v", err)
+	}
+	if len(merged) > joinedConversationRouteContentBudget || !strings.Contains(merged, "short follow-up") ||
+		!strings.Contains(merged, strings.Repeat("a", 20<<10)) || !strings.Contains(merged, "另有 1 条补充") ||
+		len(sources) != 2 || sources[0].MessageID != root.Message.ID || sources[1].MessageID != first.Message.ID {
+		t.Fatalf("joined input did not keep the fitting supplement with an omission note: bytes=%d merged=%.120s", len(merged), merged)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	var duplicateOf *string
+	var state string
+	if err := f.store.pool.QueryRow(ctx, `SELECT duplicate_of_message_id,state FROM conversation_message_routes
+WHERE message_id=$1`, second.Message.ID).Scan(&duplicateOf, &state); err != nil || duplicateOf != nil || state != "pending" {
+		t.Fatalf("oversized supplement was not released for its own route: duplicate_of=%v state=%s err=%v", duplicateOf, state, err)
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -126,6 +127,9 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if len(snapshot.Context.Content) > app.MaxConversationMessageBytes {
 		err := domain.NewError(domain.CodeResultTooLarge, "message exceeds the accepted conversation message limit")
 		err.Details["stage"] = "route_message_storage_limit"
+		contentBytes, historyBytes := conversationRouteContextSizeDetails(snapshot.Context)
+		err.Details["content_bytes"] = contentBytes
+		err.Details["history_bytes"] = historyBytes
 		return true, w.failRoute(ctx, claim, "message_too_long", err)
 	}
 	if snapshot.PreviousCycle {
@@ -218,7 +222,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	copyConversationRouteCandidates(&classifyContext)
 	if err := fitConversationRouteContext(&classifyContext, contextWindow); err != nil {
 		return true, w.failRoute(ctx, claim, "message_too_long",
-			conversationRouteBudgetDiagnostic(err, "worker_context_fit", contextWindow, capacityKnown))
+			conversationRouteBudgetDiagnostic(err, "worker_context_fit", contextWindow, capacityKnown, classifyContext))
 	}
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	if classifyContext.Content != "" || len(classifyContext.Candidates) != 0 || classifyContext.ReferenceTaskID != "" ||
@@ -230,7 +234,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 			}
 			if domain.CodeOf(err) == domain.CodeResultTooLarge {
 				return true, w.failRoute(ctx, claim, "message_too_long",
-					conversationRouteBudgetDiagnostic(err, "model_request", contextWindow, capacityKnown))
+					conversationRouteBudgetDiagnostic(err, "model_request", contextWindow, capacityKnown, classifyContext))
 			}
 			if snapshot.PreviousMissing && domain.CodeOf(err) == domain.CodeConflict && ctx.Err() == nil {
 				if recovery, ok := w.options.Actions.(app.ConversationRoutePredecessorRecovery); ok {
@@ -274,7 +278,17 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 					}
 				}
 			}
-			return true, w.failRoute(ctx, claim, "model_unavailable", err)
+			// Classification failed after every model-side recovery. Fall
+			// back to the keyword + last-route heuristic instead of
+			// failing the route: follow the previous task on a clear
+			// continuation, start a new task on an explicit new-task
+			// signal, and ask the user when uncertain. An ambiguous
+			// message is never silently dropped into a task.
+			w.options.Logger.Warn("conversation route classification failed; applying heuristic fallback",
+				zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
+				zap.String("failure_code", string(domain.CodeOf(err))))
+			decision = conversationRouteClassifyFallback(classifyContext)
+			err = nil
 		}
 	}
 	if decision.InvalidOutput {
@@ -289,7 +303,12 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 				}
 			}
 		}
-		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("route model output is invalid"))
+		// The model answered but its output is not valid routing JSON,
+		// even after the repair retry. Use the same heuristic fallback
+		// instead of failing the route.
+		w.options.Logger.Warn("conversation route model output is invalid; applying heuristic fallback",
+			zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID))
+		decision = conversationRouteClassifyFallback(classifyContext)
 	}
 	decision = safeConversationRouteDecision(classifyContext, decision)
 	if decision.InvalidOutput {
@@ -345,6 +364,11 @@ func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error
 	return time.Second << shift, true
 }
 
+// conversationRouteHistoryPreviewBytes bounds one history entry when the
+// route context is shrunk to fit the model window. A preview keeps the
+// entry's identity plus its head and tail instead of blanking it outright.
+const conversationRouteHistoryPreviewBytes = 2048
+
 func fitConversationRouteContext(value *app.ConversationRouteContext, contextWindow int) error {
 	app.ProjectConversationRouteMessage(value, app.ConversationRouteCurrentMessagePreviewBytes)
 	for {
@@ -358,23 +382,19 @@ func fitConversationRouteContext(value *app.ConversationRouteContext, contextWin
 		if trimConversationRouteCandidates(value) {
 			continue
 		}
+		// Shrink history to previews before dropping the summary: the
+		// summary is the compressed form of older history, so it is the
+		// last thing to go, not the first.
+		if previewConversationRouteHistory(value) {
+			continue
+		}
+		if blankConversationRouteHistory(value) {
+			continue
+		}
 		if value.SummaryVersion > 0 {
 			value.SummaryVersion = 0
 			value.SummarySHA256, value.SummarySourcesSHA256, value.SummaryText = nil, nil, ""
 			value.HistoryIncomplete = true
-			continue
-		}
-		trimmedHistory := false
-		for index := range value.History {
-			if value.History[index].Content != "" {
-				value.History[index].Content = ""
-				value.History[index].Truncated = true
-				value.HistoryIncomplete = true
-				trimmedHistory = true
-				break
-			}
-		}
-		if trimmedHistory {
 			continue
 		}
 		if app.ShortenConversationRouteMessage(value) {
@@ -385,6 +405,42 @@ func fitConversationRouteContext(value *app.ConversationRouteContext, contextWin
 		}
 		return domain.NewError(domain.CodeResultTooLarge, "conversation message exceeds the selected model context budget")
 	}
+}
+
+// previewConversationRouteHistory replaces the oldest oversized history
+// entry with a head-and-tail preview. Entries already marked truncated are
+// left alone; blanking them is the next step.
+func previewConversationRouteHistory(value *app.ConversationRouteContext) bool {
+	for index := range value.History {
+		item := &value.History[index]
+		if item.Truncated || len(item.Content) <= conversationRouteHistoryPreviewBytes {
+			continue
+		}
+		preview, truncated := app.ConversationRouteTextPreview(item.Content, conversationRouteHistoryPreviewBytes)
+		if !truncated {
+			continue
+		}
+		item.Content = preview
+		item.Truncated = true
+		value.HistoryIncomplete = true
+		return true
+	}
+	return false
+}
+
+// blankConversationRouteHistory removes the oldest remaining history text,
+// keeping its identity (message id, sequence, task) so the model still sees
+// the reference.
+func blankConversationRouteHistory(value *app.ConversationRouteContext) bool {
+	for index := range value.History {
+		if value.History[index].Content != "" {
+			value.History[index].Content = ""
+			value.History[index].Truncated = true
+			value.HistoryIncomplete = true
+			return true
+		}
+	}
+	return false
 }
 
 func (w *ConversationRouteWorker) observeRouteDecision(claim app.ConversationRouteClaim, decision app.ConversationRouteDecision, result string) {
@@ -519,6 +575,12 @@ func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.Conve
 		if known, ok := routeErr.Details["context_window_known"].(bool); ok {
 			fields = append(fields, zap.Bool("context_window_known", known))
 		}
+		if contentBytes, ok := routeErr.Details["content_bytes"].(int); ok {
+			fields = append(fields, zap.Int("content_bytes", contentBytes))
+		}
+		if historyBytes, ok := routeErr.Details["history_bytes"].(int); ok {
+			fields = append(fields, zap.Int("history_bytes", historyBytes))
+		}
 	}
 	w.options.Logger.Warn("conversation route failed", fields...)
 	if err := w.options.Actions.FailConversationRoute(ctx, claim, reason); err != nil {
@@ -527,7 +589,7 @@ func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.Conve
 	return nil
 }
 
-func conversationRouteBudgetDiagnostic(err error, stage string, contextWindow int, capacityKnown bool) error {
+func conversationRouteBudgetDiagnostic(err error, stage string, contextWindow int, capacityKnown bool, value app.ConversationRouteContext) error {
 	var routeErr *domain.Error
 	if !errors.As(err, &routeErr) {
 		return err
@@ -540,7 +602,21 @@ func conversationRouteBudgetDiagnostic(err error, stage string, contextWindow in
 	}
 	routeErr.Details["context_window_tokens"] = contextWindow
 	routeErr.Details["context_window_known"] = capacityKnown
+	contentBytes, historyBytes := conversationRouteContextSizeDetails(value)
+	routeErr.Details["content_bytes"] = contentBytes
+	routeErr.Details["history_bytes"] = historyBytes
 	return err
+}
+
+// conversationRouteContextSizeDetails records the byte sizes that decide
+// whether a route context fits, so a size failure can be diagnosed from the
+// log alone instead of re-reading the database.
+func conversationRouteContextSizeDetails(value app.ConversationRouteContext) (int, int) {
+	historyBytes := 0
+	for _, item := range value.History {
+		historyBytes += len(item.Content)
+	}
+	return len(value.Content), historyBytes
 }
 
 func safeConversationRouteDecision(value app.ConversationRouteContext, decision app.ConversationRouteDecision) app.ConversationRouteDecision {
@@ -643,4 +719,73 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 		}
 	}
 	return clarify
+}
+
+// conversationRouteClassifyFallback routes a message whose model
+// classification failed, using only keywords and the last route. It never
+// guesses: an explicit control request asks the user which task it targets,
+// an explicit new-task signal starts a new task, a clear continuation
+// follows the previous task, and anything else asks the user whether to
+// continue the previous task or start a new one. An ambiguous message is
+// never silently dropped into a task.
+func conversationRouteClassifyFallback(value app.ConversationRouteContext) app.ConversationRouteDecision {
+	if app.ConversationRouteHasExplicitControlIntent(value.Content) {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+			Question: "分类暂时不可用，请说明要操作哪个任务。"}
+	}
+	if !value.PreviousMissing && !value.PreviousUnresolved && !value.ReferenceUnavailable &&
+		app.ConversationRouteHasExplicitNewIntent(value.Content) {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}
+	}
+	target := value.ReferenceTaskID
+	if target == "" {
+		target = value.PreviousTaskID
+	}
+	if target != "" && app.ValidConversationRouteSteerTarget(target, value) &&
+		conversationRouteLooksLikeContinuation(value.Content) {
+		for _, candidate := range value.Candidates {
+			if candidate.TaskID == target {
+				return app.ConversationRouteDecision{Action: app.ConversationRouteSteer, TaskID: target,
+					ExpectedRevision: candidate.Revision}
+			}
+		}
+	}
+	// When the previous context cannot be confirmed, do not offer to
+	// continue it: ask the user to supply the missing context instead.
+	// This reuses the wording the safety check uses for the same state.
+	if value.PreviousMissing || value.PreviousUnresolved {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+			Question: "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。"}
+	}
+	return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+		Question: "分类暂时不可用，请说明是继续上一个任务，还是开始一个新任务。"}
+}
+
+// conversationRouteLooksLikeContinuation reports whether the message text
+// reads as an addition or correction to the previous task rather than an
+// independent request. Only narrow, high-precision signals count: a bare
+// acknowledgement, or a leading addition/correction marker. Anything else
+// is treated as uncertain and ends in a clarification question.
+func conversationRouteLooksLikeContinuation(content string) bool {
+	var normalized strings.Builder
+	for _, char := range strings.ToLower(content) {
+		if unicode.IsSpace(char) || unicode.IsPunct(char) || unicode.IsSymbol(char) {
+			continue
+		}
+		normalized.WriteRune(char)
+	}
+	value := normalized.String()
+	if value == "" {
+		return false
+	}
+	switch value {
+	case "好", "好的", "可以", "行", "嗯", "对", "就这样", "没问题", "ok", "yes", "接着":
+		return true
+	}
+	for _, marker := range []string{"补充", "追加", "再加", "加上", "改成", "换成", "调整一下", "修改一下"} {
+		if strings.HasPrefix(value, marker) {
+			return true
+		}
+	}
+	return false
 }

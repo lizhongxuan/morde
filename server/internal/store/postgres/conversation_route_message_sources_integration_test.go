@@ -12,7 +12,6 @@ import (
 	"github.com/jackc/pgx/v5"
 
 	"morde/server/internal/app"
-	"morde/server/internal/domain"
 )
 
 func conversationRouteMessageSourcesFenceError(ctx context.Context, f routeActionsTestFixture,
@@ -170,16 +169,18 @@ WHERE message_id=$1`, child.Message.ID); err != nil {
 	}
 }
 
-func TestConversationRouteJoinedMessageSourcesFailClosedAboveLimit(t *testing.T) {
+func TestConversationRouteJoinedMessageSourcesDetachOversizedSupplement(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
-	root := f.receive(t, "route-source-limit-root", strings.Repeat("r", 17000), app.ConversationRoutingInput{})
+	rootText := "ROOT-OVERSIZED-AGGREGATE\n" + strings.Repeat("r", 17000)
+	childText := "DETACHED-OVERSIZED-SUPPLEMENT\n" + strings.Repeat("s", 17000)
+	root := f.receive(t, "route-source-limit-root", rootText, app.ConversationRoutingInput{})
 	rootSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, root)
 	if err != nil {
 		t.Fatal(err)
 	}
 	rootSnapshot.Context.ModelID = "p1234567"
-	child := f.receive(t, "route-source-limit-child", strings.Repeat("s", 17000), app.ConversationRoutingInput{})
+	child := f.receive(t, "route-source-limit-child", childText, app.ConversationRoutingInput{})
 	childSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, child)
 	if err != nil || !app.ValidConversationRouteJoinTarget(root.Message.ID, childSnapshot.Context.RequestCandidates) {
 		t.Fatalf("large same-scope supplement is not joinable: snapshot=%+v err=%v", childSnapshot.Context, err)
@@ -190,15 +191,34 @@ func TestConversationRouteJoinedMessageSourcesFailClosedAboveLimit(t *testing.T)
 		t.Fatalf("join large supplement to root: %v", err)
 	}
 	if err := f.store.ApplyConversationRoute(ctx, root, rootSnapshot,
-		app.ConversationRouteDecision{Action: app.ConversationRouteNew}); domain.CodeOf(err) != domain.CodeResultTooLarge {
-		t.Fatalf("oversized aggregate apply error = %v, want %s", err, domain.CodeResultTooLarge)
+		app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatalf("oversized supplement should not fail the root route: %v", err)
 	}
 	var taskCount int
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM tasks WHERE conversation_id=$1`, f.conversation.ID).Scan(&taskCount); err != nil {
 		t.Fatal(err)
 	}
-	if taskCount != 0 {
-		t.Fatalf("oversized aggregate created %d Tasks", taskCount)
+	if taskCount != 1 {
+		t.Fatalf("root route created %d Tasks, want 1", taskCount)
+	}
+	var objective string
+	if err := f.store.pool.QueryRow(ctx, `SELECT objective FROM tasks WHERE conversation_id=$1`, f.conversation.ID).Scan(&objective); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(objective, "message_id="+root.Message.ID) || !strings.Contains(objective, "ROOT-OVERSIZED-AGGREGATE") ||
+		strings.Contains(objective, "DETACHED-OVERSIZED-SUPPLEMENT") {
+		t.Fatalf("root Task objective lost its long-message source or included the detached supplement: %s", objective)
+	}
+	var duplicateOf *string
+	var routeState, deliveryStatus string
+	if err := f.store.pool.QueryRow(ctx, `SELECT r.duplicate_of_message_id,r.state,m.delivery_status
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id WHERE r.message_id=$1`, child.Message.ID).
+		Scan(&duplicateOf, &routeState, &deliveryStatus); err != nil {
+		t.Fatal(err)
+	}
+	if duplicateOf != nil || routeState != "pending" || deliveryStatus != "pending" {
+		t.Fatalf("oversized supplement was not independently requeued: duplicate=%v route=%s delivery=%s",
+			duplicateOf, routeState, deliveryStatus)
 	}
 }
 

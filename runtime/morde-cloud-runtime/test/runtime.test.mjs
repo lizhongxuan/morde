@@ -6234,6 +6234,38 @@ test('account runtime accepts the fixed Workspace mount and rejects arbitrary pa
   assert.ok(invalid.frames.some(frame => frame.type === 'failed'))
 })
 
+test('bin.mjs accepts MORDE_WORKSPACE_DIR and still rejects unknown variables', async t => {
+  const accepted = launch(() => {}, { MORDE_WORKSPACE_DIR: '/workspace' })
+  t.after(() => accepted.child.kill())
+  const ready = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('bin.mjs ready frame timed out')), 5_000)
+    const poll = () => {
+      const frame = accepted.frames.find(frame => frame.type === 'ready')
+      if (frame) {
+        clearTimeout(timer)
+        resolve(frame)
+        return
+      }
+      if (accepted.child.exitCode !== null) {
+        clearTimeout(timer)
+        reject(new Error('bin.mjs exited before sending ready'))
+        return
+      }
+      setTimeout(poll, 10)
+    }
+    poll()
+  })
+  assert.equal(ready.type, 'ready')
+  assert.equal(ready.engine, 'dsh')
+
+  const rejected = launch(() => {}, { MORDE_WORKSPACE_DIR: '/workspace', MORDE_UNEXPECTED_VAR: 'x' })
+  t.after(() => rejected.child.kill())
+  const [code] = await once(rejected.child, 'close')
+  assert.equal(code, 1)
+  assert.equal(rejected.frames.some(frame => frame.type === 'ready'), false)
+  assert.ok(rejected.frames.some(frame => frame.type === 'failed'))
+})
+
 test('account runtime forwards the bounded task context capacity to DSH', async t => {
   const child = launchAccount((frame, proc) => {
     if (frame.type === 'runtime_ready') send(proc, { ...accountTask('task_context_window'), context_window_tokens: 1_048_576 })

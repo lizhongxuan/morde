@@ -1252,6 +1252,15 @@ func exactConversationRouteDuplicate(candidates []app.ConversationRouteRequestCa
 	return target
 }
 
+const (
+	joinedConversationRouteContentBudget           = 32768
+	joinedConversationRouteContentNoteReserveBytes = 128
+)
+
+const joinedConversationRouteContentPrefix = "用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n"
+
+const joinedConversationRouteContentSeparator = "\n\n--- 用户补充 ---\n\n"
+
 func joinedConversationRouteContent(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) (string, []app.ConversationRouteMessageSource, error) {
 	if len(claim.Input.ClientAttachmentIDs) != 0 {
 		return claim.Message.Content, nil, nil
@@ -1300,7 +1309,12 @@ ORDER BY m.sequence,m.id`, claim.ServiceInstanceID, claim.Message.OwnerID, claim
 	rootSHA := sha256.Sum256([]byte(claim.Message.Content))
 	sources := []app.ConversationRouteMessageSource{{MessageID: claim.Message.ID, Sequence: claim.Message.Sequence,
 		ContentBytes: int64(len(claim.Message.Content)), ContentSHA256: rootSHA[:]}}
+	// Reserve room for the merged prefix and the omitted-supplements note so
+	// the merged input stays within budget even after they are added.
+	budget := joinedConversationRouteContentBudget - len(joinedConversationRouteContentPrefix) -
+		joinedConversationRouteContentNoteReserveBytes
 	totalBytes := len(claim.Message.Content)
+	var omitted []string
 	for rows.Next() {
 		var messageID, content string
 		var sequence int64
@@ -1328,12 +1342,16 @@ ORDER BY m.sequence,m.id`, claim.ServiceInstanceID, claim.Message.OwnerID, claim
 		if _, ok := seen[key]; ok {
 			continue
 		}
+		// Keep the message limit and source manifest limit aligned. Anything
+		// that cannot be represented safely is detached and routed separately.
+		if len(sources) >= app.MaxConversationRouteAggregateMessages+1 ||
+			totalBytes+len(content)+len(joinedConversationRouteContentSeparator) > budget {
+			omitted = append(omitted, messageID)
+			continue
+		}
 		seen[key] = struct{}{}
 		contents = append(contents, content)
-		totalBytes += len(content) + len("\n\n--- 用户补充 ---\n\n")
-		if totalBytes > 32768 {
-			return "", nil, domain.NewError(domain.CodeResultTooLarge, "joined conversation input exceeds the routing limit")
-		}
+		totalBytes += len(content) + len(joinedConversationRouteContentSeparator)
 		contentSHA := sha256.Sum256([]byte(content))
 		sources = append(sources, app.ConversationRouteMessageSource{MessageID: messageID, Sequence: sequence,
 			ContentBytes: int64(len(content)), ContentSHA256: contentSHA[:]})
@@ -1341,21 +1359,85 @@ ORDER BY m.sequence,m.id`, claim.ServiceInstanceID, claim.Message.OwnerID, claim
 	if err := rows.Err(); err != nil {
 		return "", nil, fmt.Errorf("read joined conversation inputs: %w", err)
 	}
+	if len(omitted) > 0 {
+		if err := detachJoinedConversationRouteInputs(ctx, tx, claim, omitted); err != nil {
+			return "", nil, err
+		}
+	}
 	if len(contents) == 1 {
 		return claim.Message.Content, nil, nil
 	}
 	var merged strings.Builder
-	merged.WriteString("用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\n")
+	merged.WriteString(joinedConversationRouteContentPrefix)
 	for index, content := range contents {
 		if index > 0 {
-			merged.WriteString("\n\n--- 用户补充 ---\n\n")
+			merged.WriteString(joinedConversationRouteContentSeparator)
 		}
 		merged.WriteString(content)
 	}
-	if merged.Len() > 32768 {
+	if len(omitted) > 0 {
+		note := fmt.Sprintf("\n\n【注：另有 %d 条补充因过长未合并，将单独处理。】", len(omitted))
+		if len(note) > joinedConversationRouteContentNoteReserveBytes {
+			return "", nil, domain.NewError(domain.CodeResultTooLarge, "joined conversation omission note exceeds its reserved budget")
+		}
+		merged.WriteString(note)
+	}
+	if merged.Len() > joinedConversationRouteContentBudget {
 		return "", nil, domain.NewError(domain.CodeResultTooLarge, "joined conversation input exceeds the routing limit")
 	}
 	return merged.String(), sources, nil
+}
+
+// detachJoinedConversationRouteInputs releases joined supplements that did
+// not fit into the merged routing input so the route worker picks them up as
+// independent messages instead of losing them.
+func detachJoinedConversationRouteInputs(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, messageIDs []string) error {
+	rows, err := tx.Query(ctx, `UPDATE conversation_message_routes SET duplicate_of_message_id=NULL,state='pending',
+aggregation_state='settled',available_after=clock_timestamp(),lease_owner='',lease_expires_at=NULL,
+lease_version=lease_version+1,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4
+ AND duplicate_of_message_id=$5 AND state='routed' AND message_id=ANY($6::text[])
+RETURNING message_id,client_message_id`,
+		claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID,
+		claim.Message.ConversationID, claim.Message.ID, messageIDs)
+	if err != nil {
+		return fmt.Errorf("detach oversized joined conversation inputs: %w", err)
+	}
+	type detachedMessage struct{ id, clientMessageID string }
+	detached := make([]detachedMessage, 0, len(messageIDs))
+	for rows.Next() {
+		var item detachedMessage
+		if err := rows.Scan(&item.id, &item.clientMessageID); err != nil {
+			rows.Close()
+			return fmt.Errorf("read detached joined conversation input: %w", err)
+		}
+		detached = append(detached, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("read detached joined conversation inputs: %w", err)
+	}
+	rows.Close()
+	if len(detached) != len(messageIDs) {
+		return domain.NewError(domain.CodeConflict, "joined conversation input changed while merging")
+	}
+	result, err := tx.Exec(ctx, `UPDATE conversation_messages SET delivery_status='pending'
+WHERE id=ANY($1::text[]) AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='user'
+ AND task_id IS NULL AND delivery_status IN ('pending','applied','unknown')`, messageIDs,
+		claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID)
+	if err != nil {
+		return fmt.Errorf("mark detached joined conversation inputs pending: %w", err)
+	}
+	if result.RowsAffected() != int64(len(messageIDs)) {
+		return domain.NewError(domain.CodeConflict, "detached conversation message changed while merging")
+	}
+	for _, item := range detached {
+		if err := recordAccountObjectChanges(ctx, tx, accountObjectChange{OwnerID: claim.Message.OwnerID,
+			ObjectType: "message", ObjectID: item.id, Operation: "upsert", MutationID: item.clientMessageID}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func prepareConversationRouteAggregation(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,
