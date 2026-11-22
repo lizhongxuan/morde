@@ -363,6 +363,24 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 
 这些均为合成模型/本机数据库证据；未访问共享测试站、未配置或调用真实 Provider、未运行当前代码的 PC→iOS 实际入口或 60 分钟耐久验收。H01/H05/H06/H09/H10 及 P0 仍按 TODO 保持未完成。
 
+### S00 主工作区整包失败复核与定向补测（2026-11-22；本机隔离环境）
+
+- **基线与范围：** 本地 `main` 已整合 S01–S04 的测试/实现修复及 S02/S03 child checkpoint、admission 和 SSE 测试适配，当前 HEAD `acbdfb67`。本轮 S00 另修复路由分类请求在最小 4K 模型窗口下的提示预算和 history slice 别名问题；只在本机工作区修改，未部署、未访问共享站点或外发文件。
+- **整包初次结果：** `CH_TEST_DATABASE_URL=<本机隔离 PostgreSQL> make it` 失败退出，耗时 962.341 秒；日志保存在本机 `/tmp/morde-s00-make-it-20261122.log`。初始失败为 PostgreSQL 包 15 项、Worker 包 5 项。S03 修复可空 Provider model SQL NULL、Task activity/stall notice 持久化及相关测试 fixture/断言；S04 修正 validation receipt 和 project-scoped fixture；S02 修复 child replay 使用持久 root checkpoint baseline，并修正重启测试夹具；S03 修正生命周期测试 store admission 透传和 SSE keepalive reader。没有因失败放宽数据库约束、权限、回执门禁或审批断言。
+
+| 覆盖 | 命令/用例 | 结果 |
+|---|---|---|
+| App 全量 | `cd server && go test ./internal/app -count=1` | PASS，20.739 秒。 |
+| 路由最小窗口 | `cd server && go test ./internal/worker -run '^(TestFitConversationRouteContextFitsMinimumWindowWithIncompleteHistoryAndCandidates|TestFitConversationRouteContextDropsHistoryTextButKeepsReferences|TestFitConversationRouteContextDropsOversizedSummary)$' -count=1` | PASS，3 项。大候选/不完整历史在 4096 token 窗口 fixture 中被安全收缩，候选集合标记不完整，模型输入预算仍在界内。 |
+| PostgreSQL 初始失败复验 | 隔离 PostgreSQL 下重跑初始失败中除修订重启 E2E 外的 14 项：回执、项目模型派发/预留、共享项目历史、streaming、task activity/stall 及 pending-input completion | PASS，14 项，15.263 秒。 |
+| Worker / Node 恢复与长历史 | 隔离 PostgreSQL 下 `TestCloudTaskWithCancelledPersonalChildFailsClosedAfterNodeRestart`、`TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim`、`TestCloudTaskHostGenerationFencePreservesAgentChildCheckpoint`、`TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge`、`TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart` | PASS，5 项，41.020 秒。 |
+| 会话修订重启 | `TestConversationRevisionStopsRealAgentAndRestartsWithLatestMessages` | FAIL：新版 Task Runtime 退出但没有结果，报告 `child_exited_without_result`。测试 supervisor 丢弃 stderr；本轮只读检查未证实子进程退出的具体原因。 |
+| 运行中任务生命周期 | `CH_TEST_DATABASE_URL='postgres://s07triage:s07-local-test-only@127.0.0.1:55435/s07test?sslmode=disable' go test ./internal/worker -run '^TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView$' -count=1 -v` | PASS，S02 在当前 HEAD `acbdfb67e38cdaecc20d87669c21b482cc84c76a` 的私有 PostgreSQL 上复验，用例 7.28 秒、Worker 包 8.083 秒。命令输出通过 `2>&1 | tail -n 12` 截尾，使用 `set -o pipefail` 保留退出码；容器已删除。先前 handshake/`deferred task agent changed` 失败未在本次复现，不作为共同根因证据。 |
+
+- **S00 路由根因与机制：** 不完整 history 同时带有截断候选时，路由提示重复声明了 history-incomplete/no-inference 规则，和较大的候选列表一起可能使短消息在未知模型容量时无法装入保守的 4096-token 窗口。S00 压缩候选边界说明，并在历史检索任务提示中合并不完整历史规则；一般不完整历史仍保留 no-inference 提示。另在 context fitting 前复制 history slice，避免 fit 对共享底层数组的修剪污染用于 Apply 快照校验的原始 snapshot。定向单测证明代表性大候选输入可以在 4096 token 预算内完成；尚未以真实 Provider 复验。
+- **修订重启 E2E 根因边界：** S02 在同一 HEAD 的隔离 PostgreSQL 上连续两次复现 `TestConversationRevisionStopsRealAgentAndRestartsWithLatestMessages` 失败。可证实新 Account Runtime 的 DSH 子进程关闭前没有发送 `settled` 或 `failed`；`account-runtime.mjs` 将无终态退出记录为 `child_exited_without_result`，而 `recordCloudDSHE2ESupervisor` 丢弃 stderr、终止帧也没有 child exit code/signal。Runtime 恢复路径先调用 checkpoint Agent 的 `whenIdle()`，之后才注入 revision 消息；这可能让旧轮次先恢复，但目前只是待验证假设。最小下一步是保留关闭前帧序列和子进程退出码/信号，再决定是否修改 `engine.mjs`。不把此失败与先前已通过的生命周期用例混为一谈。
+- **未覆盖与结论：** 本轮没有重跑 962 秒整包；定向复验后仍有会话修订重启 E2E 一项失败，且其退出根因未证实。没有使用聊天中暴露的 Provider key，也没有访问测试站、登录管理员或改远程数据库。真实模型、PC→iOS 同会话、账号隔离、指定远程环境和 60 分钟耐久验收仍未执行；H06 与 P0 不标完成。原始整包失败数不能替代这些定向 PASS 的范围声明。
+
 ### H10 工具接纳与最终完成栅栏（2026-11-22；本机隔离 PostgreSQL）
 
 - **实现：** S03 提交 `8d66e8326601ed36682412d0f6ce57406c095ccb`，已 cherry-pick 到主工作树为 `9d3ffac7`。迁移 `00227_task_tool_supersession_fences.sql` 持久化 tool-call admission 与 superseding message IDs；root checkpoint 在 steer 标记 `applied` 的同一事务写入 delivery；工具及 child/Workspace/Task 完成的最终副作用门按 Task 行锁核对 pending 与 applied steer。新 child 保存创建时 root checkpoint baseline；无法证明历史 child baseline 且已有后续 applied steer 时，admission 终态失败关闭，避免错误比较 child-local/root 序号或无界重试。Task 完成候选携带 root Session、Agent instance/代次、授权版本、checkpoint through 和 digest；命中较新 applied steer 时保留 Task running，不创建旧结果事件或 assistant 回执。
