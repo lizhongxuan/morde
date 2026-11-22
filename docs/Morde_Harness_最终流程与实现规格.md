@@ -12,37 +12,7 @@
 
 ## 1. 最终总流程图
 
-```mermaid
-flowchart TD
-    U["PC / iOS：用户消息"] --> I["01 Portal 持久收件：身份、会话、消息 ID、幂等"]
-    I --> K["01A 按模型窗口装配摘要、近期历史与当前消息"]
-    K --> R{"02 Harness：识别意图和任务目标"}
-    S[("会话原文与跨 Task 摘要")] -.-> K
-    R -->|普通聊天| C["03 前台对话：真实文本回复，不启动云电脑"]
-    R -->|查已有任务| Q["读取已确认状态，不重建任务"]
-    R -->|修改或停止原任务| M["只作用于匹配任务；校验当前版本和权限"]
-    R -->|简单有界工具| T["04 选择获准工具；沿用现有执行载体"]
-    R -->|复杂、后台或独立验收| A["05 一个主 Task：范围、验收、预算、回传位置"]
-    R -->|输出非法或指代不明| X["有界修复；仍不明则澄清或明确失败"]
-    A --> D["06 DSH 执行：上下文、检查点、按需子会话"]
-    CP["DSH Session 内压缩与检查点"] -.-> D
-    T --> B{"07 Go Broker：权限、预算和审批"}
-    D --> B
-    B -->|拒绝、待批或预算不足| H["保存状态；不执行；需要用户时回原会话"]
-    H -->|得到有效批准| B
-    B -->|通过| O["08 副作用前持久写入意图；执行并保存回执"]
-    O -->|有明确结果| J{"回到哪个服务端路径"}
-    O -->|回执丢失| Y["先查外部是否已生效；无法确认就待对账"]
-    Y -->|取得确定证据| J
-    J -->|普通工具操作| C
-    J -->|主 Task 当前产物| V{"09 硬门禁：必需证据、版本、环境是否相符"}
-    V -->|可修且仍获准| D
-    V -->|失败或证据不足| N["未通过或未验证，回传具体缺口"]
-    V -->|通过| P["10 持久化最终回执，再发回原会话"]
-    P --> L["11 提取真实纠正候选；验证和批准后才给未来任务复用"]
-```
-
-**读图顺序：** 问答、查单走上半部，不能被下面的任务阻塞。工具执行都走受控入口。后台任务才走独立验收。若现有工具 Broker 需要 Task 作为安全执行载体，先保留技术记录并保持界面轻量；不要为追求「零 Task 行」跳过 Broker。是否可以真正在无 Task 下完成一次有界工具调用，要单独验收。
+总图和逐步说明集中维护在[《Morde Harness 最终总流程图》](Morde_Harness_最终总流程图.md)，作为流程调整的持续维护入口。本文从第 2 节起说明各步骤的实现规则、代码落点和验收约束；修改流程时须同步检查两份文档，避免总览、实现合同和 TODO 不一致。
 
 ## 2. 每一步为什么这样设计、落到哪里
 
@@ -60,7 +30,7 @@ flowchart TD
 | **07 授权与预算** | **复用并检验** app/`cloud_dsh_tool_broker.go` 的服务端授权/审批，以及已有用量和预算机制。模型路由与真实工具动作分开授权。批准绑定目标、版本和动作；变更重新核验。按适用额度原子预留、按请求结算并可恢复；未知用量明确标记。 | 隔离、授权、预算各管一件事。不能把容器隔离当授权，不能让模型授予权限，也不能因进程重启就恢复额度。 |
 | **08 执行和对账** | **复用** `CloudDSHToolBroker.Execute`、`Reconcile` 和 `reconcileCheckpointedCall`，及现有 operation ledger。为新写适配器定义稳定操作身份、外部查询方式、响应未知时的状态。按稳定 ID 去重，不按工具名与参数一律合并。 | 已收到审批不等于已经执行；请求超时也不等于没执行。没有查询能力的外部动作必须能停在待对账，不能承诺外部严格一次。 |
 | **09 证据门禁** | **扩展** worker/`task_validation_review_worker.go`、现有证据与判定。将证据绑定当前 Task 修订、尝试、产物版本及实际环境。先核对异步验证和会话发布的现有时序；本规格要求的通过门禁尚需验证接通。独立复核只能补判断，不能覆盖硬门禁。 | 编码看真实候选上的测试；部署看实际运行版本和真实对话；调研看来源。任务执行完和验收通过是两件事，验证未完成不能误报已通过。 |
-| **10 交付** | **复用** pg/`conversation_result_review.go` 与原会话发布机制；持久化最终结果后再投递。任务回执包含产物、证据、未验项和下一人动作；重连按回执恢复，不用流片段判成功。 | 用户不必去找子 Agent 或日志。任务等待、普通聊天流式文本和正式交付要有不同状态。 |
+| **10 交付** | **复用** pg/`conversation_result_review.go` 与原会话发布机制；Task 完成事务在 Task 行锁下重检 pending steer，并按完成候选携带的 root Session/Agent instance/代次/授权/checkpoint through+digest fence 检查候选之后已 applied 的 steer，只有 fence 仍匹配且没有更新输入时才持久化最终结果及 assistant 回执。若新输入先到，不提交旧 result/completed 状态，Task 保持 running 并由 lease recovery 恢复同一 DSH Session 处理 inbox，再生成当前结果。任务回执包含产物、证据、未验项和下一人动作；重连按回执恢复，不用流片段判成功。 | 用户不必去找子 Agent 或日志。任务等待、普通聊天流式文本和正式交付要有不同状态。 |
 | **11 经验与观测** | **扩展** app/`cloud_dsh_skills.go` 现有只读加载及记忆、修订模式。仅授权用户可把经过验证的候选批准为启用版本；恢复原文时重新验范围。观测记录经脱敏的阶段、诊断码和时长，先不用整套 Phoenix。 | 下一次少教来自可验证规则，不是永久保存整段聊天。学习不能自己扩大权限、改动门禁或把过期规则用在另一环境。 |
 
 ### DSH 插件与扩展点核对门禁
@@ -101,7 +71,7 @@ flowchart TD
 - 每条消息先持久化，并沿用会话内服务端 `sequence` 作为跨 PC/iOS 的确定顺序；并发到达或路由完成先后不同，不能改变已受理用户消息在历史投影和同任务修订中的顺序。目标明确且低风险的在线补充使用现有 `message_delivery` 的 `steer`，下一安全步骤领取；等待下一轮的消息使用 `followup`。更改目标、计划、授权、审批或已派发的副作用走受控修改/等待路径，先停止并栅栏旧代次，再启动新修订。新修订批次中的多条消息可按顺序进入 DSH 的 `next-step` / `next-turn` 队列，但账本 `mode` 必须与对应检查点目标一致；这条路径不能跳过修订版本、授权或副作用检查。目标不明时澄清，不中断其他任务。
 - 对照 Hermes 忙碌会话 `queue` / `steer` / `redirect` 的语义映射到 Morde 现有的 `followup` / `steer` / 受控修订：没有可领取消息的活动 Agent 时，已受理消息仍须保留为可恢复的待处理状态，不能丢弃或误报 `applied`。只移植消息投递和代次校验行为，不增加 CLI 忙碌设置或把普通追问当作停止命令。
 - 若安全补充在模型推理期间到达，该轮输出可能基于旧输入；在任何工具调用执行或结果交付前，必须核对消息投递版本。版本已变化时丢弃该轮文本及工具调用（保留用量记录），让 DSH 将待处理消息纳入下一轮重新推理；不得执行旧工具调用，也不得把旧回复当作最终结果。
-- 现有 v3 投递帧绑定 Task、Owner、Session、Agent 代次、授权版本、消息 ID、内容/附件与 `mode`。根 Session 的 `agent/inbox/spliced` 检查点只能证明入队；相应 `user/message` 被领取并持久化后，才能将该任务消息标为 `delivery_status=applied`。入队或领取均不表示工作完成；无法确认时保留 `unknown`。普通直接回复沿用既有 `applied` 语义。
+- 现有 v3 投递帧绑定 Task、Owner、Session、Agent 代次、授权版本、消息 ID、内容/附件与 `mode`。根 Session 的 `agent/inbox/spliced` 检查点只能证明入队；相应 `user/message` 被领取并持久化后，才能将该任务消息标为 `delivery_status=applied`，并原子记录包含该消息的 checkpoint through sequence。工具调用接纳与最终派发门禁须将该值和模型调用的 `ThroughSequence` 比较：若 steer 已 applied 且其 checkpoint 晚于当前 tool call，仍须作废该旧调用，即使消息状态已不再是 pending。入队或领取均不表示工作完成；无法确认时保留 `unknown`。普通直接回复沿用既有 `applied` 语义。
 - 恢复时按消息身份、内容/附件、模式、检查点和现有操作账本对账，回执丢失不等于没有投递或没有执行。只保护同一可变 Session/摘要的写入，不把整个产品会话或账号全局串行化。
 - Session 租约只覆盖同一解析后稳定 DSH `session_id` 的 `[读取历史 → 执行 → 写回检查点]` 临界区；不同 Session/独立 Task 可并行。租约超时或代次变化只能阻止冲突写入，不能撤销已持久化消息或阻止其排队；释放时必须核对租约 token/代次。Morde 多 Worker 部署使用跨进程有效的存储栅栏，不能把 Hermes 进程内 `asyncio` 锁当作最终并发保证。
 - 独立 Task 可以并行；停止或修改 A 不影响 B。复杂任务按授权可委派两个互不冲突的 DSH 子 Agent，并基于两个子任务的真实完成或失败状态汇总，委派不等于完成。
@@ -189,7 +159,7 @@ flowchart TD
 | Hermes 行为 | Morde 的映射与边界 | 验收落点 |
 |---|---|---|
 | Drain redirect | 用持久化 `steer`、`followup` 和受控修订表达；消息先受理，目标不清或需改权限/副作用时澄清或走版本切换，不复制 CLI redirect。 | H01/H10：无 Agent 可领取时消息仍可恢复；旧代次不能继续写入。 |
-| 将 steer 作为新 user 行放到最新 tool result 后 | 用服务端 `sequence` 和 DSH `next-step`/`next-turn` inbox 表达，不手改 transcript；若新输入在模型推理期间到达，旧轮次文本和工具调用在交付/派发前作废，再按新输入推理。 | H10：检查消息顺序、领取确认、旧工具调用零派发及新输入重推理。 |
+| 将 steer 作为新 user 行放到最新 tool result 后 | 用服务端 `sequence` 和 DSH `next-step`/`next-turn` inbox 表达，不手改 transcript；若新输入在模型推理期间到达，旧轮次文本和工具调用在交付/派发前作废，再按新输入推理。DSH Task 工具调用、`child_create` 及 `dsh_job_cancel` 以 Task 行锁下的 pending-steer 或“已 applied 且 claimed checkpoint through 晚于该调用根 Session fence”检查作为接纳线性化点；根 Session 调用使用其 `ThroughSequence`，child 调用使用创建 child 时持久化的 root checkpoint baseline，不能把 child-local sequence 与 root sequence 比较。旧 child 若缺少可证明 baseline，工具调用必须以终态失败关闭并零派发，不能用 `-1` 反复 supersede 或把当前 checkpoint 当成创建时 baseline。各副作用路径和持久 child-cancel 请求在最终派发/提交事务再检查。派发前命中时持久标记旧调用为 `superseded` 并保存 steer 消息 ID，按锁内快照重推理；恢复可按 ID 从授权消息表重建正文和附件。已创建的 child 按原 `spawn_key` 继续对账、已持久请求取消的 child 按真实取消状态恢复，不被后续 steer 撤销。最终 Task 完成事务用完成候选携带的 root Session/Agent instance/代次/授权/checkpoint through+digest fence，再检查 pending 和候选后已 applied 的 steer；命中时不发布旧结果，Task 保持 running 并恢复同一 DSH Session 处理 inbox。 | H10/H11/H04：检查 admission 与 final-gate 并发顺序、checkpoint 先标 applied 后旧调用到达时的失效、重启后消息已 applied 时的精确恢复、child 创建零副作用及已创建 child 恢复，以及尚未派发调用零副作用；已进入 `dispatched`/`unknown` 的操作必须继续对账真实结果，再处理 steer，不可伪报取消。完成门命中时旧 Task result/assistant receipt 零发布，同一 Session 恢复后处理新输入。 |
 | 重置 checkpoint dedup | 沿用 DSH 检查点和消息 ID 去重；恢复时按已持久化的领取/回执状态对账，不能无条件清空去重状态来“允许新一轮”。 | H10：回执丢失及重启时同一消息只生效一次，状态未知不标 `applied`。 |
 | 检查中断和预算；grace call 不消费预算 | 在模型调用和工具副作用边界重核取消、授权代次和持久预算；不引入绕过 Morde 账本的免费 grace call。 | H02/H03/H04/H10：预算耗尽或代次变化不得发起新副作用，取消仅影响指定 Task。 |
 | 预算达 80% 时向最新 tool result 注入提醒 | 不把未定义的 Hermes 提醒文本注入模型上下文。若产品要对用户提示预算接近上限，应通过持久 Task 状态和既有进度交付定义，单独验收去重及剩余预算。 | H04/H06：只在相应产品行为纳入范围后验收，不计作当前已覆盖。 |

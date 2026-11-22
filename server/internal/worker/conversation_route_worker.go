@@ -208,6 +208,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 			classifyContext.Repair = repair
 		}
 	}
+	classifyContext.History = append([]app.ConversationRouteHistory(nil), classifyContext.History...)
 	copyConversationRouteCandidates(&classifyContext)
 	if err := fitConversationRouteContext(&classifyContext, contextWindow); err != nil {
 		return true, w.failRoute(ctx, claim, "message_too_long", err)

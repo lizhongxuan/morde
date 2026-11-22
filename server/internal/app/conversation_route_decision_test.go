@@ -136,8 +136,10 @@ func TestConversationRouteModelRequestMarksIncompleteCandidates(t *testing.T) {
 	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
 		t.Fatal(err)
 	}
-	if input["candidate_set_incomplete"] != true || !strings.Contains(request.Instructions, "candidate_set_incomplete is true") ||
-		!strings.Contains(request.Instructions, "Never invent an omitted task or message ID") {
+	if input["candidate_set_incomplete"] != true || !strings.Contains(request.Instructions, "lists are partial") ||
+		!strings.Contains(request.Instructions, "Use supplied IDs only") ||
+		!strings.Contains(request.Instructions, "never infer omitted Task/message IDs") ||
+		!strings.Contains(request.Instructions, "history search required by incomplete history") {
 		t.Fatalf("incomplete candidate boundary missing from model request: input=%+v instructions=%s", input, request.Instructions)
 	}
 	legacy, err := legacyConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: "处理这个独立问题",
@@ -149,7 +151,8 @@ func TestConversationRouteModelRequestMarksIncompleteCandidates(t *testing.T) {
 	if err := json.Unmarshal([]byte(legacy.Input[0].Text), &legacyInput); err != nil {
 		t.Fatal(err)
 	}
-	if legacyInput["candidate_set_incomplete"] != true || !strings.Contains(legacy.Instructions, "candidate_set_incomplete is true") {
+	if legacyInput["candidate_set_incomplete"] != true || !strings.Contains(legacy.Instructions, "lists are partial") ||
+		!strings.Contains(legacy.Instructions, "Use supplied IDs only") {
 		t.Fatalf("legacy model request lost incomplete candidate boundary: input=%+v instructions=%s", legacyInput, legacy.Instructions)
 	}
 }

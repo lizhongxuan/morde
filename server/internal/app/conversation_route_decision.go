@@ -190,11 +190,11 @@ const conversationRouteRepairInstructions = `The previous response to this exact
 
 const conversationRouteUnresolvedReplyInstructions = `Even if a previous message is unresolved or missing, use reply for a complete conversational request you can answer from the current message alone, such as a greeting or a self-contained calculation. When previous_missing is true, use new for complete independent work that needs execution, and clarify when the request depends on missing context. Never guess the missing message or claim to act on an existing Task.`
 
-const conversationRouteIncompleteCandidatesInstructions = `When candidate_set_incomplete is true, the supplied task or prior-request candidates are only a bounded subset. Continue with direct replies and clearly independent, self-contained new work. For update, status, stop, join, or dependencies, use only supplied candidate IDs; if the intended target or whether this repeats omitted work is unclear, ask the user instead of guessing. Never invent an omitted task or message ID.`
+const conversationRouteIncompleteCandidatesInstructions = `When candidate_set_incomplete is true, lists are partial. Use supplied IDs only for update/status/stop/join/dependencies; never infer omitted Task/message IDs. Start new only for clearly independent, self-contained work or the history search required by incomplete history. Clarify ambiguous targets or repeats.`
 
-const conversationRouteIncompleteHistoryInstructions = `When history_incomplete is true or content_truncated is true, the supplied history is incomplete. Do not infer omitted details or present excerpts as complete; if an answer depends on missing history, create a Task to search authorized original messages, or explain that the necessary history is unavailable.`
+const conversationRouteIncompleteHistoryInstructions = `When history_incomplete or content_truncated is true, supplied history is incomplete. Never infer omitted details or present excerpts as complete.`
 
-const conversationRouteHistorySearchTaskInstructions = `When the latest request asks for a specific prior fact or requirement that is absent from incomplete or truncated history, do not reply that it is unavailable based only on the preview. Apply the existing Task association rules; if no supplied Task or prior request is the clear target, use action "new" with explicit_new=false so the Task Agent searches authorized original messages in this conversation with morde_current_conversation_history_search. Only report the detail unavailable after that search returns no match or is blocked by authorization; do not claim it was found before the search.`
+const conversationRouteHistorySearchTaskInstructions = `Incomplete/truncated history is partial; never infer omitted details or present excerpts as complete. If a request depends on a prior detail or requirement missing from it, do not report it unavailable from a preview. Apply Task association; if no supplied Task or prior_request clearly matches, use action "new" with explicit_new=false so the Task Agent searches authorized conversation originals via morde_current_conversation_history_search. Report unavailable only after no match or an authorization block; never claim a match before search.`
 
 func conversationRouteTextPreview(value string) (string, bool) {
 	if len(value) <= conversationRoutePreviewBytes {
@@ -432,11 +432,10 @@ func ConversationRouteModelRequest(value ConversationRouteContext) (ModelRequest
 	if value.CandidateSetIncomplete {
 		request.Instructions += "\n\n" + conversationRouteIncompleteCandidatesInstructions
 	}
-	if value.HistoryIncomplete || truncated {
-		request.Instructions += "\n\n" + conversationRouteIncompleteHistoryInstructions
-	}
 	if historyIncompleteForSearch {
 		request.Instructions += "\n\n" + conversationRouteHistorySearchTaskInstructions
+	} else if value.HistoryIncomplete || truncated {
+		request.Instructions += "\n\n" + conversationRouteIncompleteHistoryInstructions
 	}
 	if modelRequestInputTokenReservation(request) > maxAgentInputBytes {
 		return ModelRequest{}, domain.NewError(domain.CodeResultTooLarge, "message exceeds model routing context limit")

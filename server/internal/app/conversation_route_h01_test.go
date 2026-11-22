@@ -122,9 +122,9 @@ func assertH09HistorySearchPolicy(t *testing.T, instructions string) {
 	if !strings.Contains(instructions, conversationRouteHistorySearchTaskInstructions) {
 		t.Fatalf("history search policy missing: %q", instructions)
 	}
-	const noInferenceRule = "Never infer omitted details or present excerpts as complete"
-	if strings.Contains(conversationRouteHistorySearchTaskInstructions, noInferenceRule) {
-		if !strings.Contains(instructions, noInferenceRule) {
+	const noInferenceRule = "never infer omitted details or present excerpts as complete"
+	if strings.Contains(strings.ToLower(conversationRouteHistorySearchTaskInstructions), noInferenceRule) {
+		if !strings.Contains(strings.ToLower(instructions), noInferenceRule) {
 			t.Fatalf("history search policy lost its no-inference rule: %q", instructions)
 		}
 		return

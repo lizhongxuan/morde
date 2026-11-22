@@ -12,6 +12,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/task"
 )
 
 func TestFitConversationRouteContextDropsHistoryTextButKeepsReferences(t *testing.T) {
@@ -76,6 +77,32 @@ func TestFitConversationRouteContextDropsOversizedSummary(t *testing.T) {
 	if value.Content != "short current message" || value.SummaryVersion != 0 || value.SummaryText != "" ||
 		len(value.SummarySHA256) != 0 || len(value.SummarySourcesSHA256) != 0 || !value.HistoryIncomplete {
 		t.Fatalf("oversized summary was not removed with an incomplete-history marker: %+v", value)
+	}
+}
+
+func TestFitConversationRouteContextFitsMinimumWindowWithIncompleteHistoryAndCandidates(t *testing.T) {
+	value := app.ConversationRouteContext{ActorID: "u1234567", Content: "A30 path traversal: A30_TRAVERSAL_FETCH ../outside.pdf",
+		HistoryIncomplete: true, ServerReceivedAt: time.Now(), RequestCandidates: []app.ConversationRouteRequestCandidate{{
+			MessageID: "m8765432", Sequence: 9, Content: strings.Repeat("previous request ", 400), RoutingStatus: conversation.RoutingPending,
+		}}, Candidates: []app.ConversationRouteCandidate{{
+			TaskID: "q1234567", InitiatorID: "u1234567", Objective: strings.Repeat("task objective ", 400),
+			Status: task.StatusRunning, Revision: 1,
+		}}}
+	for sequence := int64(1); sequence <= 7; sequence++ {
+		value.History = append(value.History, app.ConversationRouteHistory{
+			MessageID: fmt.Sprintf("m%07d", sequence), Sequence: sequence, TaskID: "t1234567",
+			TaskRevision: 1, EventSequence: sequence, Role: "assistant", Truncated: true,
+		})
+	}
+	if err := fitConversationRouteContext(&value, 4096); err != nil {
+		t.Fatalf("short message with bounded history and task candidates did not fit minimum window: %v", err)
+	}
+	if !value.CandidateSetIncomplete || len(value.RequestCandidates) != 0 || len(value.Candidates) != 0 || !value.HistoryIncomplete {
+		t.Fatalf("oversized candidates/history were not safely marked and trimmed: %+v", value)
+	}
+	request, err := app.ConversationRouteModelRequest(value)
+	if err != nil || !app.ConversationRouteInputFitsContextWindow(request, 4096) {
+		t.Fatalf("fitted incomplete-history request exceeds minimum window: err=%v", err)
 	}
 }
 
