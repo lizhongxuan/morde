@@ -428,8 +428,8 @@ VALUES ('p1234567',$1,'completion race test','http://127.0.0.1','test',decode(re
 			firstTask.Task.Status, firstTask.Task.Result, firstTask.Task.AgentSessionID, err)
 	}
 	var staleReceipts int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE task_id=$1 AND role='assistant' AND content=$2`,
-		submitted.Task.ID, "STALE COMPLETION RESULT").Scan(&staleReceipts); err != nil || staleReceipts != 0 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant'
+AND strpos(content,$2)>0`, submitted.Conversation.ID, "STALE COMPLETION RESULT").Scan(&staleReceipts); err != nil || staleReceipts != 0 {
 		t.Fatalf("stale assistant receipt escaped the completion gate: count=%d err=%v", staleReceipts, err)
 	}
 	firstSessionID := firstTask.Task.AgentSessionID
@@ -507,14 +507,23 @@ VALUES ('p1234567',$1,'completion race test','http://127.0.0.1','test',decode(re
 	if err := pool.QueryRow(ctx, `SELECT delivery_status FROM conversation_messages WHERE id=$1`, steer.ID).Scan(&deliveryStatus); err != nil || deliveryStatus != "applied" {
 		t.Fatalf("recovered Session did not claim the steer: status=%q err=%v", deliveryStatus, err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant' AND content=$2`,
-		submitted.Conversation.ID, "STALE COMPLETION RESULT").Scan(&staleReceipts); err != nil || staleReceipts != 0 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant'
+AND strpos(content,$2)>0`, submitted.Conversation.ID, "STALE COMPLETION RESULT").Scan(&staleReceipts); err != nil || staleReceipts != 0 {
 		t.Fatalf("stale assistant receipt was committed during recovery: count=%d err=%v", staleReceipts, err)
 	}
 	var revisedReceipts int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant' AND content=$2`,
-		submitted.Conversation.ID, "The revised answer includes BLUE.").Scan(&revisedReceipts); err != nil || revisedReceipts != 1 {
-		t.Fatalf("revised assistant receipt count=%d err=%v; want exactly one", revisedReceipts, err)
+	if submitted.Task.CurrentRevision == nil {
+		t.Fatal("completion-race Task has no current revision")
+	}
+	expectedReceiptStatus := fmt.Sprintf("- %s r%d：pending", submitted.Task.ID, *submitted.Task.CurrentRevision)
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant'
+AND strpos(content,$2)>0
+AND strpos(content,'结果摘要（主助手整理，不代表独立验收）：')>0
+AND strpos(content,'Task 执行状态：completed')>0
+AND strpos(content,'服务端验收状态（当前修订）：')>0
+AND strpos(content,$3)>0`, submitted.Conversation.ID, "The revised answer includes BLUE.", expectedReceiptStatus).
+		Scan(&revisedReceipts); err != nil || revisedReceipts != 1 {
+		t.Fatalf("revised assistant result receipt count=%d err=%v; want exactly one wrapped receipt with Task status", revisedReceipts, err)
 	}
 	var publishedSources int
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_result_sources WHERE task_id=$1 AND state='published'`,
