@@ -44,7 +44,7 @@ func (s *agentChildSessionStoreStub) ListAgentChildSessions(_ context.Context, f
 	}, nil
 }
 
-func (s *agentChildSessionStoreStub) RequestAgentChildSessionCancel(_ context.Context, fence AgentInstanceFence, sessionID string) (AgentChildSession, bool, error) {
+func (s *agentChildSessionStoreStub) RequestAgentChildSessionCancel(_ context.Context, fence AgentInstanceFence, sessionID, _ string) (AgentChildSession, bool, error) {
 	s.cancelCalls++
 	return AgentChildSession{TaskID: fence.TaskID, SessionID: sessionID, ParentSessionID: fence.AgentSessionID, SpawnKey: "call_1",
 		Background: true, CancelRequested: true, Step: task.Step{ID: "step_1", TaskID: fence.TaskID, Status: task.StepRunning}}, s.cancelCalls > 1, nil
@@ -131,7 +131,7 @@ func TestAgentChildSessionListingAndCancelFenceRoot(t *testing.T) {
 		t.Fatalf("child session listed sessions outside root: calls=%d err=%v", store.listCalls, err)
 	}
 	job, replayed, err := service.RequestCancel(context.Background(), AgentChildSessionCancelCommand{
-		Fence: fence, ActorSessionID: fence.AgentSessionID, SessionID: "child_1",
+		Fence: fence, ActorSessionID: fence.AgentSessionID, SessionID: "child_1", CallID: "call_cancel_1",
 	})
 	if err != nil || replayed || !job.Background || !job.CancelRequested || job.Step.Status != task.StepRunning || store.cancelCalls != 1 {
 		t.Fatalf("request cancel = %#v replayed=%t calls=%d err=%v", job, replayed, store.cancelCalls, err)

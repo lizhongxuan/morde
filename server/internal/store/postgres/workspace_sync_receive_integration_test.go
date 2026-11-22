@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -69,7 +70,7 @@ func TestWorkspaceSyncReceiveReservationSettlesIdempotently(t *testing.T) {
 		t.Fatalf("active owners after settlement = %#v, err=%v", owners, err)
 	}
 	replayed, err := store.CommitWorkspaceSyncReceive(ctx, owner.ID, value.ID, reservation.ID, &file, nil)
-	if err != nil || replayed != receipt {
+	if err != nil || !reflect.DeepEqual(replayed, receipt) {
 		t.Fatalf("replay receive settlement = %#v, err=%v; want %#v", replayed, err, receipt)
 	}
 	retriedReservation := reserveTestWorkspaceReceive(t, ctx, store, request)

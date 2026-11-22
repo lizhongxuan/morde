@@ -14,54 +14,58 @@ import (
 )
 
 type AgentChildSession struct {
-	TaskID            string
-	SessionID         string
-	ParentSessionID   string
-	SpawnKey          string
-	Step              task.Step
-	CheckpointThrough int64
-	CheckpointDigest  []byte
-	AllowedTools      []string
-	Background        bool
-	CancelRequested   bool
+	TaskID                        string
+	SessionID                     string
+	ParentSessionID               string
+	SpawnKey                      string
+	Step                          task.Step
+	CheckpointThrough             int64
+	RootCheckpointThroughSequence int64
+	CheckpointDigest              []byte
+	AllowedTools                  []string
+	Background                    bool
+	CancelRequested               bool
 }
 
 type AgentChildSessionCreate struct {
-	Fence           AgentInstanceFence
-	ParentSessionID string
-	SpawnKey        string
-	RequestHash     []byte
-	StepID          string
-	SessionID       string
-	Title           string
-	Summary         string
-	AllowedTools    []string
-	Background      bool
+	Fence                         AgentInstanceFence
+	ParentSessionID               string
+	SpawnKey                      string
+	RequestHash                   []byte
+	StepID                        string
+	SessionID                     string
+	RootCheckpointThroughSequence int64
+	Title                         string
+	Summary                       string
+	AllowedTools                  []string
+	Background                    bool
 }
 
 type AgentChildSessionStore interface {
 	CreateAgentChildSession(context.Context, AgentChildSessionCreate) (AgentChildSession, bool, error)
 	GetAgentChildSession(context.Context, AgentInstanceFence, string, string) (AgentChildSession, error)
 	ListAgentChildSessions(context.Context, AgentInstanceFence) ([]AgentChildSession, error)
-	RequestAgentChildSessionCancel(context.Context, AgentInstanceFence, string) (AgentChildSession, bool, error)
+	RequestAgentChildSessionCancel(context.Context, AgentInstanceFence, string, string) (AgentChildSession, bool, error)
 	SettleAgentChildSession(context.Context, AgentInstanceFence, string, string, task.StepStatus, int64, []byte, string) (AgentChildSession, bool, error)
 }
 
 type AgentChildSessionCommand struct {
-	Fence           AgentInstanceFence
-	ParentSessionID string
-	SpawnKey        string
-	Arguments       []byte
-	Title           string
-	Summary         string
-	AllowedTools    []string
-	Background      bool
+	Fence                         AgentInstanceFence
+	ParentSessionID               string
+	SpawnKey                      string
+	RootCheckpointThroughSequence int64
+	Arguments                     []byte
+	Title                         string
+	Summary                       string
+	AllowedTools                  []string
+	Background                    bool
 }
 
 type AgentChildSessionCancelCommand struct {
 	Fence          AgentInstanceFence
 	ActorSessionID string
 	SessionID      string
+	CallID         string
 }
 
 type AgentChildSessionSettleCommand struct {
@@ -92,6 +96,7 @@ func (s *AgentChildSessionService) Create(ctx context.Context, command AgentChil
 	if err := command.Fence.Validate(); err != nil ||
 		!agentCheckpointIDPattern.MatchString(command.ParentSessionID) ||
 		!agentCheckpointIDPattern.MatchString(command.SpawnKey) ||
+		command.RootCheckpointThroughSequence < -1 ||
 		len(command.Arguments) == 0 || len(command.Arguments) > 64*1024 || !argumentsValid ||
 		invalidCheckpointLabel(strings.TrimSpace(command.Title), 120) || len(command.Summary) > 2048 || !utf8.ValidString(command.Summary) ||
 		!validAgentChildToolNames(command.AllowedTools) {
@@ -107,7 +112,8 @@ func (s *AgentChildSessionService) Create(ctx context.Context, command AgentChil
 	return s.store.CreateAgentChildSession(ctx, AgentChildSessionCreate{
 		Fence: command.Fence, ParentSessionID: command.ParentSessionID, SpawnKey: command.SpawnKey,
 		RequestHash: requestHash[:], StepID: stepID, SessionID: "child_" + stepID,
-		Title: strings.TrimSpace(command.Title), Summary: strings.TrimSpace(command.Summary), AllowedTools: allowedTools,
+		RootCheckpointThroughSequence: command.RootCheckpointThroughSequence,
+		Title:                         strings.TrimSpace(command.Title), Summary: strings.TrimSpace(command.Summary), AllowedTools: allowedTools,
 		Background: command.Background,
 	})
 }
@@ -123,10 +129,14 @@ func (s *AgentChildSessionService) List(ctx context.Context, fence AgentInstance
 func (s *AgentChildSessionService) RequestCancel(ctx context.Context, command AgentChildSessionCancelCommand) (AgentChildSession, bool, error) {
 	if err := command.Fence.Validate(); err != nil || command.ActorSessionID != command.Fence.AgentSessionID ||
 		!agentCheckpointIDPattern.MatchString(command.ActorSessionID) || !agentCheckpointIDPattern.MatchString(command.SessionID) ||
-		command.SessionID == command.ActorSessionID {
+		command.SessionID == command.ActorSessionID || command.CallID != "" && !agentCheckpointIDPattern.MatchString(command.CallID) {
 		return AgentChildSession{}, false, domain.InvalidArgument("child_session", "background job cancellation is invalid")
 	}
-	return s.store.RequestAgentChildSessionCancel(ctx, command.Fence, command.SessionID)
+	callID := command.CallID
+	if callID == "" {
+		callID = "dsh_job_cancel:" + command.SessionID
+	}
+	return s.store.RequestAgentChildSessionCancel(ctx, command.Fence, command.SessionID, AgentOperationKey(callID))
 }
 
 func validAgentChildToolNames(names []string) bool {

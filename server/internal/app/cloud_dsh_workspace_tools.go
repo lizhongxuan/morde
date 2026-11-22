@@ -855,12 +855,23 @@ func cloudDSHWorkspaceReceiptResult(receipt TaskWorkspacePublishReceipt, operati
 		return AgentToolResult{Status: AgentToolFailed, Output: "The Workspace quota does not allow this write."}
 	case TaskWorkspacePublishPending:
 		return AgentToolResult{Status: AgentToolUnknown, WaitingReason: "workspace_publish_pending"}
+	case TaskWorkspacePublishSuperseded:
+		if len(receipt.SupersedingMessages) == 0 {
+			return AgentToolResult{Status: AgentToolUnknown}
+		}
+		return AgentToolResult{Status: AgentToolSuperseded,
+			SupersedingMessages: append([]AgentConversationMessage(nil), receipt.SupersedingMessages...)}
 	default:
 		return AgentToolResult{Status: AgentToolUnknown}
 	}
 }
 
 func cloudDSHWorkspaceFailure(err error) AgentToolResult {
+	var pending *TaskInputPendingError
+	if errors.As(err, &pending) {
+		return AgentToolResult{Status: AgentToolSuperseded,
+			SupersedingMessages: append([]AgentConversationMessage(nil), pending.PendingMessages...)}
+	}
 	switch domain.CodeOf(err) {
 	case domain.CodeInvalidArgument:
 		return AgentToolResult{Status: AgentToolFailed, Output: "Use a normalized Workspace-relative path to a regular UTF-8 file."}

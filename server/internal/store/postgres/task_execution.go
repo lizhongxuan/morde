@@ -1484,6 +1484,13 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 	if progress.TaskID == "" || progress.LeaseOwner == "" || progress.LeaseVersion < 1 || !validTaskStatus(progress.Status) {
 		return task.Event{}, domain.InvalidArgument("progress", "task progress fields are invalid")
 	}
+	if fence := progress.AgentCompletionFence; fence != nil && ((progress.Status != task.StatusCompleted && progress.Status != task.StatusFailed) ||
+		progress.Event.Type != "task.result" ||
+		!agentToolAdmissionIdentifier(fence.AgentSessionID) || !agentToolAdmissionIdentifier(fence.AgentInstanceID) ||
+		fence.AgentGeneration < 1 || fence.AuthorizationVersion < 1 || fence.CheckpointThroughSequence < 0 ||
+		fence.CheckpointThroughSequence > 1<<53-1 || len(fence.CheckpointDigest) != 32) {
+		return task.Event{}, domain.InvalidArgument("agent_completion_fence", "Task Agent completion fence is invalid")
+	}
 	if progress.Usage.ActiveSeconds < 0 || progress.Usage.ToolCalls < 0 ||
 		(progress.Usage.ModelTokens != nil && *progress.Usage.ModelTokens < 0) {
 		return task.Event{}, domain.InvalidArgument("usage", "task usage must be non-negative")
@@ -1680,7 +1687,7 @@ WHERE t.id=$1 FOR UPDATE OF c`, progress.TaskID).Scan(&locked)
 budget_active_seconds, budget_tool_calls, budget_model_tokens, usage_active_seconds, usage_tool_calls, usage_model_tokens, lease_owner,
 lease_version, lease_expires_at, event_seq, current_step, result, waiting_reason, created_at, updated_at, finished_at, application_id,
 execution_location, agent_session_id, auth_version, auth_expires_at, workspace_id, input_revision, workspace_checkpoint_revision,
-agent_instance_id,agent_generation,
+agent_instance_id,agent_generation,checkpoint_through_seq,checkpoint_digest,
 workspace_owner_id,workspace_project_resource_version
 FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 			&current.ID, &current.OwnerID, &current.ConversationID, &current.ProjectID, &current.InitiatorID, &current.HostID, &current.ModelID, &current.Objective, &current.Status,
@@ -1689,7 +1696,7 @@ FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 			&current.LeaseOwner, &current.LeaseVersion, &current.LeaseExpiresAt, &current.EventSeq, &current.CurrentStep,
 			&current.Result, &current.WaitingReason, &current.CreatedAt, &current.UpdatedAt, &current.FinishedAt, &current.ApplicationID,
 			&current.ExecutionLocation, &current.AgentSessionID, &current.AuthVersion, &current.AuthExpiresAt, &current.WorkspaceID, &current.InputRevision, &current.WorkspaceCheckpointRevision,
-			&current.AgentInstanceID, &current.AgentGeneration,
+			&current.AgentInstanceID, &current.AgentGeneration, &current.CheckpointThroughSeq, &current.CheckpointDigest,
 			&current.WorkspaceOwnerID, &current.WorkspaceProjectResourceVersion)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
@@ -1713,6 +1720,33 @@ FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 			return taskLeaseConflict()
 		}
 		currentTask := rowTaskDomain(current)
+		if fence := progress.AgentCompletionFence; fence != nil {
+			if current.ExecutionLocation != "server" || current.AgentSessionID != fence.AgentSessionID ||
+				current.AgentInstanceID != fence.AgentInstanceID || current.AgentGeneration != fence.AgentGeneration ||
+				current.AuthVersion != fence.AuthorizationVersion {
+				return domain.NewError(domain.CodeInvalidState, "cloud dsh completion checkpoint changed")
+			}
+			if current.CheckpointThroughSeq != fence.CheckpointThroughSequence || !bytes.Equal(current.CheckpointDigest, fence.CheckpointDigest) {
+				pendingMessages, err := pendingTaskAgentInputMessages(ctx, tx, current.ID, current.OwnerID, current.InitiatorID,
+					current.ProjectID.String, current.ConversationID)
+				if err != nil {
+					return fmt.Errorf("load pending user messages after Task completion checkpoint changed: %w", err)
+				}
+				appliedMessages, err := appliedTaskAgentSteersAfterCheckpoint(ctx, tx, app.ModelTaskFence{
+					TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+					AgentSessionID: fence.AgentSessionID, AgentRootSessionID: fence.AgentSessionID,
+					ThroughSequence: fence.CheckpointThroughSequence,
+				}, fence.AgentSessionID, current.CheckpointThroughSeq)
+				if err != nil {
+					return err
+				}
+				supersedingMessages := mergeAgentToolSupersedingMessages(pendingMessages, appliedMessages)
+				if len(supersedingMessages) != 0 {
+					return app.NewTaskInputPendingError(supersedingMessages)
+				}
+				return domain.NewError(domain.CodeInvalidState, "cloud dsh completion checkpoint changed")
+			}
+		}
 		if call := progress.ToolCall; call != nil {
 			var currentRevision int64
 			if err := tx.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, current.ID).Scan(&currentRevision); err != nil {
@@ -1956,17 +1990,25 @@ WHERE host_id=$1 AND workspace_id=$2 FOR SHARE`, current.HostID.String, current.
 		}
 		switch progress.Status {
 		case task.StatusCompleted:
-			var pendingMessages bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS (
-SELECT 1 FROM conversation_messages
-WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='user' AND delivery_status='pending'
-)`, current.ID, current.OwnerID, current.ConversationID).Scan(&pendingMessages); err != nil {
-				return fmt.Errorf("check pending user messages before task completion: %w", err)
+			pendingMessages, err := pendingTaskAgentInputMessages(ctx, tx, current.ID, current.OwnerID, current.InitiatorID,
+				current.ProjectID.String, current.ConversationID)
+			if err != nil {
+				return fmt.Errorf("load pending user messages before task completion: %w", err)
 			}
-			if pendingMessages {
-				return domain.NewError(domain.CodeConflict, "task has pending user messages")
+			if len(pendingMessages) != 0 {
+				return app.NewTaskInputPendingError(pendingMessages)
 			}
 		case task.StatusFailed, task.StatusCancelled:
+			if progress.AgentCompletionFence != nil {
+				pendingMessages, err := pendingTaskAgentInputMessages(ctx, tx, current.ID, current.OwnerID, current.InitiatorID,
+					current.ProjectID.String, current.ConversationID)
+				if err != nil {
+					return fmt.Errorf("load pending user messages before Task Agent failure: %w", err)
+				}
+				if len(pendingMessages) != 0 {
+					return app.NewTaskInputPendingError(pendingMessages)
+				}
+			}
 			if err := markPendingTaskConversationMessagesUnknown(ctx, tx, current.ID, current.OwnerID, current.ConversationID); err != nil {
 				return fmt.Errorf("mark undelivered user messages unknown on Task stop: %w", err)
 			}
@@ -3059,6 +3101,8 @@ func (s *Store) UpdateOperation(ctx context.Context, update app.OperationUpdate)
 	}
 	var result task.Operation
 	var authorizationDenied bool
+	var inputPending bool
+	var supersedingMessages []app.AgentConversationMessage
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		var projectWorkspaceFence projectTaskWorkspaceFence
 		if update.Status != task.OperationUnknown {
@@ -3193,6 +3237,26 @@ FROM tasks WHERE id=$1 FOR UPDATE`, update.TaskID).Scan(
 				}
 			}
 		}
+		if dispatching {
+			supersedingMessages, err = pendingTaskAgentToolMessagesForOperation(ctx, tx, row.ID, row.OwnerID, update.OperationKey)
+			if err != nil {
+				return err
+			}
+			if len(supersedingMessages) != 0 {
+				if err := persistTaskAgentToolSupersession(ctx, tx, row.ID, row.OwnerID, update.OperationKey, supersedingMessages); err != nil {
+					return err
+				}
+				if err := failPreparedAgentToolOperations(ctx, tx, row.ID, row.OwnerID, update.OperationKey); err != nil {
+					return err
+				}
+				result, err = loadOperationByKey(ctx, tx, update.TaskID, update.OperationKey)
+				if err != nil {
+					return fmt.Errorf("read superseded task operation: %w", err)
+				}
+				inputPending = true
+				return nil
+			}
+		}
 		if adoptingPrepared || rearming || update.Status == task.OperationDispatched {
 			if err := requireRunningTaskApplication(ctx, tx, row); err != nil {
 				return err
@@ -3256,6 +3320,9 @@ WHERE id=$1 AND task_id=$2 AND lease_version=$6`, operation.ID, update.TaskID, s
 		}
 		return nil
 	})
+	if err == nil && inputPending {
+		return result, app.NewTaskInputPendingError(supersedingMessages)
+	}
 	if err == nil && authorizationDenied {
 		return task.Operation{}, taskLeaseConflict()
 	}

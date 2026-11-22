@@ -254,6 +254,21 @@ FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`, tas
 		if publishedRevision.Valid {
 			receipt.PublishedRevision = publishedRevision.Int64
 		}
+		if receipt.State == app.TaskWorkspacePublishSuperseded {
+			var initiatorID string
+			if err := tx.QueryRow(ctx, `SELECT initiator_id FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).Scan(&initiatorID); err != nil {
+				return fmt.Errorf("read Task actor for superseded Workspace publish: %w", err)
+			}
+			messages, found, err := readTaskAgentToolSupersession(ctx, tx, app.ModelTaskFence{TaskID: taskID,
+				OwnerID: ownerID, InitiatorID: initiatorID}, operationKey)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return domain.NewError(domain.CodeInternal, "superseded Workspace publish has no Task input receipt")
+			}
+			receipt.SupersedingMessages = messages
+		}
 		return nil
 	})
 	return receipt, err
@@ -290,6 +305,17 @@ FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`+lock
 	}
 	if publishedRevision.Valid {
 		receipt.PublishedRevision = publishedRevision.Int64
+	}
+	if receipt.State == app.TaskWorkspacePublishSuperseded {
+		messages, found, err := readTaskAgentToolSupersession(ctx, tx, app.ModelTaskFence{TaskID: value.TaskID,
+			OwnerID: value.OwnerID, InitiatorID: value.InitiatorID}, value.OperationKey)
+		if err != nil {
+			return app.TaskWorkspacePublishReceipt{}, err
+		}
+		if !found {
+			return app.TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeInternal, "superseded Workspace publish has no Task input receipt")
+		}
+		receipt.SupersedingMessages = messages
 	}
 	return receipt, nil
 }
@@ -363,6 +389,17 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		case app.TaskWorkspacePublishQuotaRejected:
 			rejected = domain.NewError(domain.CodeQuotaExceeded, "Workspace storage quota would be exceeded")
 			return nil
+		case app.TaskWorkspacePublishSuperseded:
+			messages, found, err := readTaskAgentToolSupersession(ctx, tx, app.ModelTaskFence{TaskID: value.TaskID,
+				OwnerID: value.OwnerID, InitiatorID: value.InitiatorID}, value.OperationKey)
+			if err != nil {
+				return err
+			}
+			if !found {
+				return domain.NewError(domain.CodeInternal, "superseded Workspace publish has no Task input receipt")
+			}
+			rejected = app.NewTaskInputPendingError(messages)
+			return nil
 		case app.TaskWorkspacePublishPending:
 		default:
 			return domain.NewError(domain.CodeInternal, "Task Workspace publish receipt state is invalid")
@@ -377,6 +414,22 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		}
 		if err := ensureNoPendingTaskWorkspacePublishOperation(ctx, tx, value.TaskID); err != nil {
 			return err
+		}
+		supersedingMessages, err := pendingTaskAgentToolMessagesForOperation(ctx, tx, value.TaskID, value.OwnerID, value.OperationKey)
+		if err != nil {
+			return err
+		}
+		if len(supersedingMessages) != 0 {
+			if err := persistTaskAgentToolSupersession(ctx, tx, value.TaskID, value.OwnerID, value.OperationKey, supersedingMessages); err != nil {
+				return err
+			}
+			if err := failPreparedAgentToolOperations(ctx, tx, value.TaskID, value.OwnerID, value.OperationKey); err != nil {
+				return err
+			}
+			receipt.State = app.TaskWorkspacePublishSuperseded
+			receipt.SupersedingMessages = append([]app.AgentConversationMessage(nil), supersedingMessages...)
+			rejected = app.NewTaskInputPendingError(supersedingMessages)
+			return nil
 		}
 		if value.HostID != "" {
 			var hostOwner, hostState, hostControl string

@@ -94,6 +94,8 @@ func (s *Store) DispatchTaskFileFetch(ctx context.Context, operation app.TaskHub
 		return false, domain.InvalidArgument("file_fetch", "Task file fetch dispatch fields are invalid")
 	}
 	var dispatched bool
+	var inputPending bool
+	var supersedingMessages []app.AgentConversationMessage
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		if _, err := lockTaskHubOperationLease(ctx, tx, operation, leaseOwner); err != nil {
 			return err
@@ -109,6 +111,20 @@ func (s *Store) DispatchTaskFileFetch(ctx context.Context, operation app.TaskHub
 			return idempotencyConflict()
 		}
 		if storedOperation.Status != task.OperationPrepared {
+			return nil
+		}
+		supersedingMessages, err = pendingTaskAgentToolMessagesForOperation(ctx, tx, operation.TaskID, operation.OwnerID, operation.Key)
+		if err != nil {
+			return err
+		}
+		if len(supersedingMessages) != 0 {
+			if err := persistTaskAgentToolSupersession(ctx, tx, operation.TaskID, operation.OwnerID, operation.Key, supersedingMessages); err != nil {
+				return err
+			}
+			if err := failPreparedAgentToolOperations(ctx, tx, operation.TaskID, operation.OwnerID, operation.Key); err != nil {
+				return err
+			}
+			inputPending = true
 			return nil
 		}
 		storedFetch, err := getTaskFileFetchByIDForUpdate(ctx, tx, operation.OwnerID, operation.TaskID, fetchID)
@@ -166,6 +182,9 @@ WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 AND status='prepared'`, op
 		dispatched = true
 		return nil
 	})
+	if err == nil && inputPending {
+		return false, app.NewTaskInputPendingError(supersedingMessages)
+	}
 	return dispatched, err
 }
 

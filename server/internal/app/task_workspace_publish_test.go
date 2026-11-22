@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -103,7 +104,7 @@ func TestTaskWorkspacePublishPersistsOutputAndReplaysReceipt(t *testing.T) {
 		t.Fatal("idempotent publish replay fetched Runtime block bytes")
 		return nil, nil
 	})
-	if err != nil || replayed != receipt || reads != 1 {
+	if err != nil || !reflect.DeepEqual(replayed, receipt) || reads != 1 {
 		t.Fatalf("idempotent CommitTaskWorkspacePublish() = %#v, reads=%d, err=%v", replayed, reads, err)
 	}
 }
