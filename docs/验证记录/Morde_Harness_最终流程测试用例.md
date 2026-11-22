@@ -381,11 +381,13 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **修订重启 E2E 根因边界：** S02 在同一 HEAD 的隔离 PostgreSQL 上连续两次复现 `TestConversationRevisionStopsRealAgentAndRestartsWithLatestMessages` 失败。可证实新 Account Runtime 的 DSH 子进程关闭前没有发送 `settled` 或 `failed`；`account-runtime.mjs` 将无终态退出记录为 `child_exited_without_result`，而 `recordCloudDSHE2ESupervisor` 丢弃 stderr、终止帧也没有 child exit code/signal。Runtime 恢复路径先调用 checkpoint Agent 的 `whenIdle()`，之后才注入 revision 消息；这可能让旧轮次先恢复，但目前只是待验证假设。最小下一步是保留关闭前帧序列和子进程退出码/信号，再决定是否修改 `engine.mjs`。不把此失败与先前已通过的生命周期用例混为一谈。
 - **未覆盖与结论：** 本轮没有重跑 962 秒整包；定向复验后仍有会话修订重启 E2E 一项失败，且其退出根因未证实。没有使用聊天中暴露的 Provider key，也没有访问测试站、登录管理员或改远程数据库。真实模型、PC→iOS 同会话、账号隔离、指定远程环境和 60 分钟耐久验收仍未执行；H06 与 P0 不标完成。原始整包失败数不能替代这些定向 PASS 的范围声明。
 
-### S00 本地分支代码整合核对（2026-11-22）
+### S00 用户指定 Harness 分支合并与验证（2026-11-22）
 
-- **范围：** 检查 `git branch -avv`、Harness 各 S01–S06 worktree 状态、patch 等价关系及当前 HEAD 的源码差异。所有现存 Harness worktree 均干净。
-- **结果：** 当前 `main` 已包含各 Harness 分支的代码，或包含比分支 head 更新的同域实现；S01/S02/S03/S04/S06 分支差异没有待移入的有效源码改动。比如当前 S02 child baseline/admission、S03 task activity/steer fence、S04 validation receipt 和 S06 task timeline 都在 `main`，而旧分支在这些文件中缺少后来整合的 fence 或回归修正。`workspace-1` 与 `codex/client-login-ordering-20261105` 均为 `main` 的祖先（当前 main 分别领先 75 和 71 个提交）；不需要再合并。
-- **处置：** 没有创建无内容的 merge commit，也没有把陈旧分支树合回去覆盖 main 上较新的安全 fence。分支引用保留；本轮没有发现尚未合入 main 的 Harness 代码。这个结果表示代码已在 main，不表示所有分支 ref 都已删除。
+- **起点与范围：** 从本地 `main` / `origin/main` 相同提交 `ada69312946a235b9aa58577dcb754f7f7ae36ba` 建立隔离集成 worktree `codex/harness-merge-all`。按截图逐一合并以下 19 个分支：`codex/harness-h06-integration`、`codex/harness-s01`、`codex/harness-s01-coordinator-rate-limit`、`codex/harness-s01-history`、`codex/harness-s01-main`、`codex/harness-s02-go`、`codex/harness-s02-integration`、`codex/harness-s02-node`、`codex/harness-s02-receipt-fix`、`codex/harness-s02-review`、`codex/harness-s03-integration`、`codex/harness-s03-review`、`codex/harness-s04-integration`、`codex/harness-s04-main`、`codex/harness-s05`、`codex/harness-s05-review`、`codex/harness-s05-review-2`、`codex/harness-s06`、`codex/harness-s06-regression`。
+- **冲突处理：** H06/S01/S02/S03/S04/S06 合并中出现的冲突，均通过对照两侧实现和提交历史解决，保留当前集成树中的较新安全约束与回归覆盖。冲突文件为 `docs/Morde_Harness_并发实施/04-结果验证与交付.md`、`docs/Morde_Harness_并发实施/06-iOS客户端.md`、`server/internal/app/conversation_route_h01_test.go`、`runtime/morde-cloud-runtime/src/engine.mjs`、`server/internal/store/postgres/conversation_result_aggregation_integration_test.go`、`server/internal/store/postgres/conversation_result_review.go`、`server/internal/store/postgres/task_agent_stall_integration_test.go`、`server/internal/worker/cloud_dsh_executor_test.go`、`server/internal/worker/cloud_dsh_session_tree.go`、`server/internal/worker/conversation_context_dsh_e2e_integration_test.go`。例如保留了收据发布事务对 review/task/event 的共享锁、已应用 steer 的 admission fence、最新的 child checkpoint/restart 覆盖和完整 validation/UI 回归记录；没有将旧分支中缺少这些更新的文件版本覆盖进来。
+- **Git 验证：** 19 个分支 tip 对集成分支执行 `git merge-base --is-ancestor` 均成功；无冲突分支使用正常 merge，冲突按文件比较后解决，未使用 `git merge -s ours`。合并树相对起点只有 S01 交接文档一处内容差异（42 行新增、2 行删除）；随后增加本 TODO、总控和本验证记录三处管理文档，产品源码 diff 仍为空。`origin/main` 在集成时仍为起点提交。
+- **测试范围：** 本次分支整合没有改变产品源码，因此未机械重跑代码测试。复用上方同一产品源码快照已有的 App、路由预算、14 项 PostgreSQL、5 项 Worker/Node 及生命周期 E2E 定向结果；已知会话修订重启 E2E 失败保持未解决，H06/H00 不因此标完成。对合并后的文档与 Git diff 执行 `git diff --check main` 通过，冲突标记扫描无匹配；新提交对象中的 API key/私钥常见格式扫描无匹配。
+- **分支 ref：** 本轮将分支提交纳入 `main` 的历史，不删除源分支引用；合并历史本身不代表真实 Provider、PC/iOS、云端电脑或耐久验收通过。
 
 ### H10 工具接纳与最终完成栅栏（2026-11-22；本机隔离 PostgreSQL）
 
