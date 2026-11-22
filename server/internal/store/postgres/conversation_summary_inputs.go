@@ -69,9 +69,12 @@ func (s *Store) LoadConversationSummaryInputPage(ctx context.Context, request ap
 		if request.Cursor == nil && head.Version > 0 {
 			stored, err := readConversationSummaryForInputPage(ctx, tx, head)
 			if err != nil {
-				return err
+				if domain.CodeOf(err) != domain.CodeConflict {
+					return err
+				}
+			} else {
+				page.Summary = &stored
 			}
-			page.Summary = &stored
 		}
 
 		previousMessageID, err := conversationSummaryPredecessorMessageID(ctx, tx, request.Claim, identity)
@@ -91,7 +94,8 @@ func (s *Store) LoadConversationSummaryInputPage(ctx context.Context, request ap
 		rows, err := tx.Query(ctx, conversationSummaryInputPageSQL, identity.OwnerID, identity.ConversationID, boundary,
 			identity.ActorID, identity.ServiceInstanceID, identity.ScopeID, descendants, previousMessageID, head.Version,
 			budget, request.Cursor != nil, cursorSequence(request.Cursor), cursorKindOrder(request.Cursor),
-			cursorID(request.Cursor), cursorSourceOrder(request.Cursor), cursorByteOffset(request.Cursor), conversationSummaryInputSourceLimit+1)
+			cursorID(request.Cursor), cursorSourceOrder(request.Cursor), cursorByteOffset(request.Cursor), conversationSummaryInputSourceLimit+1,
+			identity.AuthorizationVersion, identity.ScopeVersion)
 		if err != nil {
 			return fmt.Errorf("read authorized conversation summary sources: %w", err)
 		}
@@ -312,7 +316,12 @@ const conversationSummaryInputPageSQL = `WITH source_rows AS (
       WHERE covered.service_instance_id=$5::uuid AND covered.owner_id=$1 AND covered.actor_id=$4 AND covered.conversation_id=$2
         AND covered.scope_kind=CASE WHEN $6='' THEN 'personal' ELSE 'project' END AND covered.scope_id=$6
         AND covered.summary_version=$9 AND covered.source_kind='message' AND covered.source_id=m.id
-        AND covered.source_sequence=m.sequence))
+        AND covered.source_sequence=m.sequence AND EXISTS (SELECT 1 FROM conversation_summary_versions summary
+          WHERE summary.service_instance_id=covered.service_instance_id AND summary.owner_id=covered.owner_id
+            AND summary.actor_id=covered.actor_id AND summary.conversation_id=covered.conversation_id
+            AND summary.scope_kind=covered.scope_kind AND summary.scope_id=covered.scope_id
+            AND summary.version=covered.summary_version AND summary.authorization_version=$18
+            AND summary.scope_version=$19 AND summary.state='valid')))
     AND (
       (m.actor_id=$4 AND (m.task_id IS NULL OR t.initiator_id=$4) AND (m.role='user' OR (m.role='assistant' AND (
         (m.output_status IS NULL AND ((m.source_kind='conversation' AND m.task_id IS NULL) OR t.status='completed' OR EXISTS (
@@ -365,7 +374,13 @@ const conversationSummaryInputPageSQL = `WITH source_rows AS (
       WHERE covered.service_instance_id=$5::uuid AND covered.owner_id=$1 AND covered.actor_id=$4 AND covered.conversation_id=$2
         AND covered.scope_kind=CASE WHEN $6='' THEN 'personal' ELSE 'project' END AND covered.scope_id=$6
         AND covered.summary_version=$9 AND covered.source_kind='task_result' AND covered.source_id=result.task_id
-        AND covered.source_version=result.task_revision AND covered.source_sequence=result.event_sequence))
+        AND covered.source_version=result.task_revision AND covered.source_sequence=result.event_sequence
+        AND EXISTS (SELECT 1 FROM conversation_summary_versions summary
+          WHERE summary.service_instance_id=covered.service_instance_id AND summary.owner_id=covered.owner_id
+            AND summary.actor_id=covered.actor_id AND summary.conversation_id=covered.conversation_id
+            AND summary.scope_kind=covered.scope_kind AND summary.scope_id=covered.scope_id
+            AND summary.version=covered.summary_version AND summary.authorization_version=$18
+            AND summary.scope_version=$19 AND summary.state='valid')))
 )
 SELECT sort_sequence,kind_order,sort_id,source_order,source_kind,source_id,source_object_type,source_version,source_sequence,
   role,octet_length(content),source_digest,

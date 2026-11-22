@@ -144,3 +144,62 @@ AND conversation_id=$3 AND scope_kind='project' AND scope_id=$4`, f.owner.UserID
 		t.Fatalf("revoked source was changed or lost: %q err=%v", raw, err)
 	}
 }
+
+func TestH01SummaryScopeVersionChangeInvalidatesOldSummaryAndReopensSources(t *testing.T) {
+	f := newProjectAttachmentFixture(t)
+	ctx := context.Background()
+	prior := projectHistoryClaim(t, f, "h01-summary-scope-prior")
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, prior)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, prior, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteReply, Reply: "已记录。",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	current := projectHistoryClaim(t, f, "h01-summary-scope-current")
+	source := conversationSummaryMessageSource(prior.Message.ID, prior.Message.Content, prior.Message.Sequence)
+	commitProjectRouteTestSummary(t, f.store, current, "此前已授权的摘要。", []app.ConversationSummarySource{source})
+	operation := h01PrepareSummaryOperation(t, f.store, current, 1, "h01-summary-scope-stale")
+	if _, err := f.store.pool.Exec(ctx, `UPDATE project_members SET version=version+1 WHERE project_id=$1 AND user_id=$2`,
+		f.projectID, f.member.UserID); err != nil {
+		t.Fatal(err)
+	}
+	page, err := f.store.LoadConversationSummaryInputPage(ctx, app.ConversationSummaryInputPageRequest{
+		Claim: current, ContextWindowTokens: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if page.Summary != nil || page.Head.Version != 1 || page.Identity.ScopeVersion != 2 {
+		t.Fatalf("changed scope reused old summary: summary=%+v head=%+v identity=%+v", page.Summary, page.Head, page.Identity)
+	}
+	foundPrior := false
+	for _, item := range page.Sources {
+		if item.Source.ID == prior.Message.ID && item.Role == string(conversation.RoleUser) {
+			foundPrior = true
+		}
+	}
+	if !foundPrior {
+		t.Fatalf("old summary coverage hid authorized history after scope change: sources=%+v", page.Sources)
+	}
+	var summaryState, invalidReason, operationState string
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,invalid_reason FROM conversation_summary_versions
+WHERE owner_id=$1 AND actor_id=$2 AND conversation_id=$3 AND scope_kind='project' AND scope_id=$4 AND version=1`,
+		f.owner.UserID, f.member.UserID, f.conversationID, f.projectID).Scan(&summaryState, &invalidReason); err != nil {
+		t.Fatal(err)
+	}
+	if summaryState != "invalid" || invalidReason != "scope_revoked" {
+		t.Fatalf("stale summary state=%q reason=%q", summaryState, invalidReason)
+	}
+	if err := f.store.pool.QueryRow(ctx, `SELECT state FROM conversation_compaction_operations
+WHERE owner_id=$1 AND actor_id=$2 AND conversation_id=$3 AND scope_kind='project' AND scope_id=$4 AND operation_id=$5`,
+		f.owner.UserID, f.member.UserID, f.conversationID, f.projectID, operation.OperationID).Scan(&operationState); err != nil {
+		t.Fatal(err)
+	}
+	if operationState != "invalidated" {
+		t.Fatalf("stale summary operation state=%q", operationState)
+	}
+}
