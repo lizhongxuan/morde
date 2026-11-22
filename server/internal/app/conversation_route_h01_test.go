@@ -58,6 +58,8 @@ func TestH01TruncatedRouteCandidateUsesFullContentDigestForExactDuplicate(t *tes
 func TestH09LongHistoryFollowupIsMarkedForAuthorizedSearch(t *testing.T) {
 	_, value := routeGatewayFixture()
 	value.Content = "历史里的第 400 条记录数值和校验值是什么？"
+	value.RouteAttempt = 0
+	value.HistoryIncomplete = true
 	value.History = []ConversationRouteHistory{{MessageID: "m7654321", Sequence: 1, Role: conversation.RoleUser,
 		Content: strings.Repeat("前文记录 ", 1_600) + "记录0400：数值=842；校验=167600" + strings.Repeat(" 后文记录", 1_600)}}
 	request, err := ConversationRouteModelRequest(value)
@@ -68,7 +70,8 @@ func TestH09LongHistoryFollowupIsMarkedForAuthorizedSearch(t *testing.T) {
 		t.Fatalf("built %d route inputs, want one", len(request.Input))
 	}
 	var input struct {
-		History []struct {
+		HistoryIncomplete bool `json:"history_incomplete"`
+		History           []struct {
 			Content   string `json:"content"`
 			Truncated bool   `json:"content_truncated"`
 		} `json:"history"`
@@ -76,12 +79,34 @@ func TestH09LongHistoryFollowupIsMarkedForAuthorizedSearch(t *testing.T) {
 	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
 		t.Fatal(err)
 	}
-	if len(input.History) != 1 || !input.History[0].Truncated || strings.Contains(input.History[0].Content, "167600") ||
-		!strings.Contains(request.Instructions, conversationRouteIncompleteHistoryInstructions) ||
-		!strings.Contains(request.Instructions, conversationRouteHistorySearchTaskInstructions) {
+	if !input.HistoryIncomplete || len(input.History) != 1 || !input.History[0].Truncated || strings.Contains(input.History[0].Content, "167600") {
 		t.Fatalf("long history follow-up must request authorized source search rather than guess: input=%+v instructions=%q",
 			input, request.Instructions)
 	}
+	assertH09HistorySearchPolicy(t, request.Instructions)
+	if !useLegacyConversationRouteModelRequest(value) {
+		t.Fatal("first route attempt with no running prior-request task did not select the legacy fallback")
+	}
+	legacyRequest, err := legacyConversationRouteModelRequest(value, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacyInput struct {
+		HistoryIncomplete bool `json:"history_incomplete"`
+		History           []struct {
+			Content   string `json:"content"`
+			Truncated bool   `json:"content_truncated"`
+		} `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(legacyRequest.Input[0].Text), &legacyInput); err != nil {
+		t.Fatal(err)
+	}
+	if !legacyInput.HistoryIncomplete || len(legacyInput.History) != 1 || !legacyInput.History[0].Truncated ||
+		strings.Contains(legacyInput.History[0].Content, "167600") {
+		t.Fatalf("legacy fallback did not preserve the incomplete-history marker and authorized search policy: input=%+v instructions=%q",
+			legacyInput, legacyRequest.Instructions)
+	}
+	assertH09HistorySearchPolicy(t, legacyRequest.Instructions)
 	review := value
 	review.ResultReview = &ConversationTaskResultReview{Sources: []ConversationTaskResultSource{{TaskID: "q1234567",
 		TaskRevision: 1, EventSequence: 1, AuthorizationVersion: 1, Objective: "review", Content: "synthetic result"}}}
@@ -89,5 +114,24 @@ func TestH09LongHistoryFollowupIsMarkedForAuthorizedSearch(t *testing.T) {
 	if err != nil || !strings.Contains(reviewRequest.Instructions, conversationRouteIncompleteHistoryInstructions) ||
 		strings.Contains(reviewRequest.Instructions, conversationRouteHistorySearchTaskInstructions) {
 		t.Fatalf("result review did not keep its no-Task incomplete-history behavior: request=%+v err=%v", reviewRequest, err)
+	}
+}
+
+func assertH09HistorySearchPolicy(t *testing.T, instructions string) {
+	t.Helper()
+	if !strings.Contains(instructions, conversationRouteHistorySearchTaskInstructions) {
+		t.Fatalf("history search policy missing: %q", instructions)
+	}
+	const noInferenceRule = "Never infer omitted details or present excerpts as complete"
+	if strings.Contains(conversationRouteHistorySearchTaskInstructions, noInferenceRule) {
+		if !strings.Contains(instructions, noInferenceRule) {
+			t.Fatalf("history search policy lost its no-inference rule: %q", instructions)
+		}
+		return
+	}
+	const legacyNoInferenceRule = "Do not infer omitted details or present excerpts as complete"
+	if !strings.Contains(instructions, legacyNoInferenceRule) ||
+		!strings.Contains(instructions, conversationRouteIncompleteHistoryInstructions) {
+		t.Fatalf("history search policy or its separate no-inference safeguard missing: %q", instructions)
 	}
 }
