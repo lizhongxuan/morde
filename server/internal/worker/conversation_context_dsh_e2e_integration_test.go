@@ -257,11 +257,13 @@ func TestCloudDSHCompletionRaceRecoversPendingSteerOnSameSession(t *testing.T) {
 		t.Fatal(err)
 	}
 	const supervisorID = "completion-gate-supervisor"
+	var supervisorStopKey [32]byte
+	supervisorStopKey[0] = 1
 	runtimeStopVerifier, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	supervisorAuth, err := app.NewAgentStopAuthenticator(supervisorID, make([]byte, 32))
+	supervisorAuth, err := app.NewAgentStopAuthenticator(supervisorID, supervisorStopKey[:])
 	if err != nil {
 		t.Fatal(err)
 	}
