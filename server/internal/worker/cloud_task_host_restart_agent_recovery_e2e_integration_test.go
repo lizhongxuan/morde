@@ -142,6 +142,7 @@ func TestCloudTaskHostGenerationFencePreservesAgentChildCheckpoint(t *testing.T)
 		Fence: firstAgent.Fence, ParentSessionID: firstAgent.Fence.AgentSessionID,
 		SpawnKey: "f01-host-generation-child-spawn", Arguments: []byte(`{"objective":"inspect one file"}`),
 		Title: "Inspect one file", Summary: "Persisted child job", AllowedTools: []string{"file_read"}, Background: true,
+		RootCheckpointThroughSequence: -1,
 	})
 	if err != nil || replayed || !child.Background || child.SpawnKey != "f01-host-generation-child-spawn" {
 		t.Fatalf("create persisted child job: child=%#v replayed=%t err=%v", child, replayed, err)
