@@ -377,6 +377,9 @@ func (s *cloudDSHTestCheckpoints) PendingMessages(_ context.Context, fence app.A
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.pendingFences = append(s.pendingFences, fence)
+	if s.err != nil {
+		return nil, s.err
+	}
 	return append([]app.AgentConversationMessage(nil), s.pending...), nil
 }
 
@@ -410,6 +413,10 @@ func (cloudDSHUnavailableTestTools) Execute(context.Context, task.Task, app.Mode
 	return app.AgentToolResult{}, errors.New("tool must not execute")
 }
 
+func (cloudDSHUnavailableTestTools) AdmitToolCall(context.Context, task.Task, app.ModelToolCall, bool) (app.AgentToolCallAdmission, error) {
+	return app.AgentToolCallAdmission{Status: app.AgentToolCallAdmitted}, nil
+}
+
 func (m *cloudDSHTestModels) Complete(ctx context.Context, call app.ModelCall) (app.ModelResponse, error) {
 	m.calls = append(m.calls, call)
 	if m.complete != nil {
@@ -424,6 +431,11 @@ func (m *cloudDSHTestModels) Complete(ctx context.Context, call app.ModelCall) (
 type cloudDSHTestTools struct {
 	definitions       []app.AgentToolDefinition
 	result            app.AgentToolResult
+	admissionStatus   app.AgentToolCallAdmissionStatus
+	admissionMessages []app.AgentConversationMessage
+	admissionCalls    []app.ModelToolCall
+	admissionRecovery []bool
+	afterAdmit        func()
 	calls             []app.ModelToolCall
 	claimed           []task.Task
 	recoveryCalls     []app.ModelToolCall
@@ -542,7 +554,7 @@ func (s *cloudDSHTestChildSessions) Create(_ context.Context, command app.AgentC
 		return s.child, true, nil
 	}
 	s.child = app.AgentChildSession{TaskID: command.Fence.TaskID, SessionID: "child_test", ParentSessionID: command.ParentSessionID,
-		SpawnKey: command.SpawnKey, Background: command.Background,
+		SpawnKey: command.SpawnKey, Background: command.Background, RootCheckpointThroughSequence: command.RootCheckpointThroughSequence,
 		Step:              task.Step{ID: "step_child", TaskID: command.Fence.TaskID, Sequence: 1, Kind: "subagent", Status: task.StepRunning, Title: command.Title},
 		CheckpointThrough: -1, AllowedTools: append([]string{}, command.AllowedTools...)}
 	return s.child, false, nil
@@ -597,6 +609,21 @@ func (t *cloudDSHTestTools) Execute(_ context.Context, claimed task.Task, call a
 	return t.result, nil
 }
 
+func (t *cloudDSHTestTools) AdmitToolCall(_ context.Context, _ task.Task, call app.ModelToolCall,
+	recovering bool) (app.AgentToolCallAdmission, error) {
+	t.admissionCalls = append(t.admissionCalls, call)
+	t.admissionRecovery = append(t.admissionRecovery, recovering)
+	if t.afterAdmit != nil {
+		t.afterAdmit()
+	}
+	status := t.admissionStatus
+	if status == "" {
+		status = app.AgentToolCallAdmitted
+	}
+	return app.AgentToolCallAdmission{Status: status,
+		PendingMessages: append([]app.AgentConversationMessage(nil), t.admissionMessages...)}, nil
+}
+
 func (t *cloudDSHTestTools) Reconcile(_ context.Context, _ task.Task, call app.ModelToolCall, expected *string) (app.AgentToolResult, error) {
 	t.recoveryCalls = append(t.recoveryCalls, call)
 	if expected == nil {
@@ -620,6 +647,7 @@ type cloudDSHTestCompleter struct {
 	instances  *cloudDSHTestInstanceStore
 	completion app.CloudDSHTaskCompletion
 	calls      int
+	err        error
 }
 
 type cloudDSHAckCrashTestCompleter struct {
@@ -649,7 +677,7 @@ func (c *cloudDSHTestCompleter) Complete(_ context.Context, _ task.Task, complet
 	}
 	c.calls++
 	c.completion = completion
-	return nil
+	return c.err
 }
 
 func cloudDSHReadTool() app.AgentToolDefinition {
@@ -888,6 +916,24 @@ func TestCloudDSHExecutorRunsHostlessServerTaskWithoutCompletingIt(t *testing.T)
 	}
 	if supervisor.launch.Fence.TaskID != value.ID || supervisor.launch.ExpiresAt.IsZero() {
 		t.Fatal("supervisor lease fence missing")
+	}
+}
+
+func TestCloudDSHExecutorTreatsPendingTaskInputAtCompletionAsRecoverable(t *testing.T) {
+	executor, _, store, _, _, value := cloudDSHFixture(t)
+	tools := &cloudDSHTestTools{}
+	executor.options.Tools = tools
+	completer := &cloudDSHTestCompleter{instances: store,
+		err: app.NewTaskInputPendingError([]app.AgentConversationMessage{{ID: "m7654321", Content: "Use the revised answer.",
+			Mode: app.AgentMessageDeliverySteer}})}
+	executor.options.Completion = completer
+
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("pending-input completion should leave a recoverable completion candidate: %v", err)
+	}
+	if completer.calls != 1 || store.stopped != 1 || tools.pauseRecoveryCall != 0 {
+		t.Fatalf("completion calls=%d runtime stops=%d recovery pauses=%d; want one final gate, clean stop, and no failure pause",
+			completer.calls, store.stopped, tools.pauseRecoveryCall)
 	}
 }
 
@@ -2841,6 +2887,384 @@ setInterval(() => {}, 1000)`
 	}
 	if len(models.calls) != 1 || len(tools.calls) != 0 || store.stopped != 1 {
 		t.Fatalf("model calls=%d old tool executions=%d stopped=%d", len(models.calls), len(tools.calls), store.stopped)
+	}
+}
+
+func TestCloudDSHExecutorSupersedesToolFromAppliedSteerAdmissionSnapshot(t *testing.T) {
+	executor, supervisor, store, checkpoints, models, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	arguments := `{"workspace_id":"w1234567","path":"README.md"}`
+	// The message is already applied at the store boundary, but its claimed
+	// checkpoint is newer than this tool frame's original through sequence.
+	// Admission must return that immutable snapshot so the old call is dropped.
+	message := app.AgentConversationMessage{ID: "m7654321", Sequence: 3, Content: "Use the new heading.", Mode: app.AgentMessageDeliverySteer}
+	tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}, admissionStatus: app.AgentToolCallSuperseded,
+		admissionMessages: []app.AgentConversationMessage{message}}
+	tools.afterAdmit = func() {
+		checkpoints.mu.Lock()
+		checkpoints.err = errors.New("superseding delivery must use the admission snapshot")
+		checkpoints.mu.Unlock()
+	}
+	executor.options.Tools = tools
+	checkpoints.pending = nil
+	script := filepath.Join(t.TempDir(), "superseded-admission.mjs")
+	source := fmt.Sprintf(`import { createHash } from 'node:crypto'
+import { createInterface } from 'node:readline'
+const emit = frame => process.stdout.write(JSON.stringify(frame) + '\n')
+const digest = value => createHash('sha256').update(value).digest('hex')
+const identity = frame => ({ task_id: frame.task_id, owner_id: frame.owner_id, agent_id: frame.agent_id,
+  generation: frame.generation, authorization_version: frame.authorization_version, session_id: frame.session_id })
+const toolName = %q, argumentsText = %q, args = JSON.parse(argumentsText)
+emit({ type: 'ready', version: 1, engine: 'dsh', engine_version: '0.2.0-rc.2' })
+let start
+createInterface({ input: process.stdin }).on('line', raw => {
+  const frame = JSON.parse(raw)
+  if (frame.type === 'start') {
+    start = frame
+    const payload = JSON.stringify({ header: { id: frame.session_id }, from_seq: 0, events: [
+      { seq: 0, type: 'turn/start', data: { turn: 1 } },
+      { seq: 1, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
+        message: { role: 'assistant', content: [{ type: 'tool-call', id: 'call_gate_1', name: toolName, arguments: argumentsText }] } } },
+      { seq: 2, type: 'tool/call', data: { turn: 1, step: 1, callId: 'call_gate_1', name: toolName, arguments: argumentsText } },
+    ] })
+    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_gate', from_seq: 0, through_seq: 2,
+      payload, sha256: digest(payload) })
+  } else if (frame.type === 'checkpoint_ack') {
+    emit({ type: 'tool_call', id: 'tool_gate', ...identity(start), through_seq: 2, call_id: 'call_gate_1',
+      name: toolName, arguments: args })
+  } else if (frame.type === 'message_delivery') {
+    if (frame.version !== 4 || frame.supersede_active !== true || frame.mode !== 'steer' ||
+        frame.message_id !== 'm7654321' || frame.content !== 'Use the new heading.') process.exit(91)
+    emit({ type: 'failed', ...identity(start), code: 'snapshot_received' })
+    setImmediate(() => process.exit(0))
+  } else if (frame.type === 'tool_result') process.exit(92)
+})
+setInterval(() => {}, 1000)`, tool.Name, arguments)
+	if err := os.WriteFile(script, []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cloudDSHUseTestTaskScript(t, supervisor, script)
+	err := executor.ExecuteTask(context.Background(), value)
+	if err == nil || !strings.Contains(err.Error(), "unavailable runtime") {
+		t.Fatalf("runtime stop after admission snapshot = %v", err)
+	}
+	if len(tools.admissionCalls) != 1 || len(tools.calls) != 0 || len(models.calls) != 0 || store.stopped != 1 {
+		t.Fatalf("admissions=%d tool executions=%d model calls=%d stopped=%d",
+			len(tools.admissionCalls), len(tools.calls), len(models.calls), store.stopped)
+	}
+}
+
+func TestCloudDSHChildToolAdmissionRetainsChildCheckpointFence(t *testing.T) {
+	message := app.AgentConversationMessage{ID: "m7654321", Sequence: 4, Content: "Use the new section.",
+		Mode: app.AgentMessageDeliverySteer}
+	tools := &cloudDSHTestTools{admissionStatus: app.AgentToolCallSuperseded,
+		admissionMessages: []app.AgentConversationMessage{message}}
+	executor := &CloudDSHExecutor{options: CloudDSHExecutorOptions{Tools: tools}}
+	fence := app.AgentInstanceFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567",
+		AgentInstanceID: "agent_root", AgentGeneration: 2, AgentSessionID: "root_session", AuthorizationVersion: 1,
+		LeaseOwner: "worker-test", LeaseVersion: 3, EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+	value := task.Task{ID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID}
+	call := app.ModelToolCall{CallID: "child_read_1", Name: "file_read",
+		Arguments: `{"workspace_id":"w1234567","path":"README.md"}`,
+		TaskFence: cloudDSHModelFencePointer(fence, "child_session", 6)}
+
+	admission, err := executor.admitToolCall(context.Background(), value, call, fence, false)
+	if err != nil || admission.Status != app.AgentToolCallSuperseded || len(admission.PendingMessages) != 1 ||
+		admission.PendingMessages[0].ID != message.ID || len(tools.admissionCalls) != 1 ||
+		tools.admissionCalls[0].TaskFence == nil || tools.admissionCalls[0].TaskFence.AgentSessionID != "child_session" ||
+		tools.admissionCalls[0].TaskFence.AgentRootSessionID != fence.AgentSessionID || tools.admissionCalls[0].TaskFence.ThroughSequence != 6 {
+		t.Fatalf("child tool admission did not preserve its local checkpoint fence and applied steer snapshot: admission=%+v err=%v calls=%+v",
+			admission, err, tools.admissionCalls)
+	}
+}
+
+func TestCloudDSHExecutorKeepsDispatchedToolResultWhenSteerArrives(t *testing.T) {
+	executor, supervisor, store, checkpoints, models, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	const callID = "call_dispatched_before_steer"
+	const output = `{"path":"README.md","text":"actual dispatched result"}`
+	const messageID = "m7654321"
+	const steerContent = "Use the revised heading."
+	steer := app.AgentConversationMessage{ID: messageID, Content: steerContent, Mode: app.AgentMessageDeliverySteer}
+	deliverySeenPath := filepath.Join(t.TempDir(), "v3-delivery-seen.json")
+	resultSeenPath := filepath.Join(filepath.Dir(deliverySeenPath), "tool-result-seen.json")
+	deliverySeenJSON, err := json.Marshal(deliverySeenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resultSeenJSON, err := json.Marshal(resultSeenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}, result: app.AgentToolResult{
+		Status: app.AgentToolSucceeded, Output: output,
+	}}
+	tools.afterExecute = func() {
+		// Reaching Execute means the worker crossed admission and dispatched this
+		// call. Keep it in flight until the Runtime has observed the normal v3
+		// steer delivery, then return its real result for reconciliation.
+		checkpoints.mu.Lock()
+		checkpoints.pending = []app.AgentConversationMessage{steer}
+		checkpoints.mu.Unlock()
+		deadline := time.Now().Add(8 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(deliverySeenPath); err == nil {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Errorf("Runtime did not receive the v3 steer while the dispatched tool was in flight")
+	}
+	executor.options.Tools = tools
+	checkpoints.pending = nil
+
+	script := filepath.Join(t.TempDir(), "dispatched-steer.mjs")
+	source := fmt.Sprintf(`import { createHash } from 'node:crypto'
+import { createInterface } from 'node:readline'
+import { writeFileSync } from 'node:fs'
+const emit = frame => process.stdout.write(JSON.stringify(frame) + '\n')
+const digest = value => createHash('sha256').update(value).digest('hex')
+const identity = frame => ({ task_id: frame.task_id, owner_id: frame.owner_id, agent_id: frame.agent_id,
+  generation: frame.generation, authorization_version: frame.authorization_version, session_id: frame.session_id })
+const deliverySeenPath = %s, resultSeenPath = %s
+const toolName = %q, callID = %q, messageID = %q, steerContent = %q
+const argumentsText = %q, args = JSON.parse(argumentsText)
+emit({ type: 'ready', version: 1, engine: 'dsh', engine_version: '0.2.0-rc.2' })
+let start
+createInterface({ input: process.stdin }).on('line', raw => {
+  const frame = JSON.parse(raw)
+  if (frame.type === 'start') {
+    start = frame
+    const payload = JSON.stringify({ header: { id: frame.session_id }, from_seq: 0, events: [
+      { seq: 0, type: 'turn/start', data: { turn: 1 } },
+      { seq: 1, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
+        message: { role: 'assistant', content: [{ type: 'tool-call', id: callID, name: toolName, arguments: argumentsText }] } } },
+      { seq: 2, type: 'tool/call', data: { turn: 1, step: 1, callId: callID, name: toolName, arguments: argumentsText } },
+    ] })
+    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_dispatched', from_seq: 0, through_seq: 2,
+      payload, sha256: digest(payload) })
+  } else if (frame.type === 'checkpoint_ack') {
+    emit({ type: 'tool_call', id: 'tool_dispatched', ...identity(start), through_seq: 2, call_id: callID,
+      name: toolName, arguments: args })
+  } else if (frame.type === 'message_delivery') {
+    if (frame.version !== 3 || frame.supersede_active === true || frame.mode !== 'steer' ||
+        frame.message_id !== messageID || frame.content !== steerContent) process.exit(91)
+    writeFileSync(deliverySeenPath, JSON.stringify(frame))
+  } else if (frame.type === 'tool_result') {
+    if (frame.status !== 'succeeded' || frame.output !== %q || frame.call_id !== callID) process.exit(92)
+    writeFileSync(resultSeenPath, JSON.stringify(frame))
+    emit({ type: 'failed', ...identity(start), code: 'test_finished' })
+    setImmediate(() => process.exit(0))
+  }
+})
+setInterval(() => {}, 1000)`, string(deliverySeenJSON), string(resultSeenJSON), tool.Name, callID, messageID, steerContent,
+		`{"workspace_id":"w1234567","path":"README.md"}`, output)
+	if err := os.WriteFile(script, []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cloudDSHUseTestTaskScript(t, supervisor, script)
+	err = executor.ExecuteTask(context.Background(), value)
+	if err == nil || !strings.Contains(err.Error(), "unavailable runtime") {
+		t.Fatalf("runtime stop after dispatched result = %v", err)
+	}
+	if len(tools.calls) != 1 || tools.calls[0].CallID != callID || len(tools.admissionCalls) != 2 ||
+		tools.admissionRecovery[0] || !tools.admissionRecovery[1] || tools.admissionCalls[0].CallID != callID ||
+		tools.admissionCalls[1].CallID != callID || len(models.calls) != 0 || store.stopped != 1 {
+		t.Fatalf("dispatched call was not admitted, reconciled and delivered once: calls=%+v admissions=%+v recovery=%v models=%d stopped=%d",
+			tools.calls, tools.admissionCalls, tools.admissionRecovery, len(models.calls), store.stopped)
+	}
+	deliveryBytes, err := os.ReadFile(deliverySeenPath)
+	if err != nil {
+		t.Fatalf("Runtime did not observe pending steer: %v", err)
+	}
+	var delivery struct {
+		Version         int    `json:"version"`
+		SupersedeActive bool   `json:"supersede_active"`
+		MessageID       string `json:"message_id"`
+		Mode            string `json:"mode"`
+	}
+	if err := json.Unmarshal(deliveryBytes, &delivery); err != nil || delivery.Version != 3 || delivery.SupersedeActive ||
+		delivery.MessageID != messageID || delivery.Mode != string(app.AgentMessageDeliverySteer) {
+		t.Fatalf("dispatched call steer delivery = %+v, err %v; want non-cancelling v3", delivery, err)
+	}
+	resultBytes, err := os.ReadFile(resultSeenPath)
+	if err != nil {
+		t.Fatalf("Runtime did not receive the dispatched tool result: %v", err)
+	}
+	var result struct {
+		CallID string `json:"call_id"`
+		Status string `json:"status"`
+		Output string `json:"output"`
+	}
+	if err := json.Unmarshal(resultBytes, &result); err != nil || result.CallID != callID ||
+		result.Status != string(app.AgentToolSucceeded) || result.Output != output {
+		t.Fatalf("Runtime tool result = %+v, err %v", result, err)
+	}
+}
+
+func TestCloudDSHChildCreateSupersedesBeforeCreatingPendingSpawn(t *testing.T) {
+	const callID = "delegate_call_1"
+	arguments := `{"title":"Inspect","objective":"Read the project","tool_names":["file_read"],"run_in_background":true}`
+	message := app.AgentConversationMessage{ID: "m7654321", Content: "Use the revised title.", Mode: app.AgentMessageDeliverySteer}
+	tools := &cloudDSHTestTools{admissionStatus: app.AgentToolCallSuperseded, admissionMessages: []app.AgentConversationMessage{message}}
+	children := &cloudDSHTestChildSessions{}
+	executor := &CloudDSHExecutor{options: CloudDSHExecutorOptions{Tools: tools, Children: children}}
+	fence, parent, frame, value := cloudDSHChildCreateFixture(t, arguments, false)
+	writer := &cloudDSHFrameBuffer{}
+	seen := make(map[string]string)
+	supersede := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
+		return executor.deliverSupersedingMessages(deliveryCtx, fence, writer, messages, seen)
+	}
+
+	superseded, err := executor.createCloudDSHChildSession(context.Background(), value, fence, frame,
+		map[string]*cloudDSHSessionState{parent.identity.SessionID: parent}, []app.AgentToolDefinition{cloudDSHReadTool()}, writer, supersede)
+	if err != nil || !superseded {
+		t.Fatalf("child create with pending steer = superseded %t, err %v", superseded, err)
+	}
+	if children.creates != 0 || len(tools.admissionCalls) != 1 || tools.admissionCalls[0].Name != cloudDSHDelegateToolName ||
+		tools.admissionCalls[0].CallID != callID || tools.admissionRecovery[0] {
+		t.Fatalf("pending child spawn crossed admission: creates=%d admissions=%+v recovery=%v",
+			children.creates, tools.admissionCalls, tools.admissionRecovery)
+	}
+	if !strings.Contains(writer.String(), `"version":4`) || !strings.Contains(writer.String(), `"supersede_active":true`) ||
+		!strings.Contains(writer.String(), message.ID) || strings.Contains(writer.String(), `"type":"child_session"`) {
+		t.Fatalf("pending child spawn was not superseded from the admission snapshot: %s", writer.String())
+	}
+}
+
+func TestCloudDSHChildCreateReconcilesExistingSpawnAfterSteer(t *testing.T) {
+	const callID = "delegate_call_1"
+	arguments := `{"title":"Inspect","objective":"Read the project","tool_names":["file_read"],"run_in_background":true}`
+	tools := &cloudDSHTestTools{admissionStatus: app.AgentToolCallAdmitted}
+	children := &cloudDSHTestChildSessions{child: app.AgentChildSession{TaskID: "q1234567", SessionID: "child_test",
+		ParentSessionID: "session_123", SpawnKey: callID, Background: true,
+		RootCheckpointThroughSequence: 2,
+		Step:                          task.Step{ID: "step_child", TaskID: "q1234567", Sequence: 1, Kind: "subagent", Status: task.StepRunning},
+		CheckpointThrough:             -1, AllowedTools: []string{"file_read"}}}
+	executor := &CloudDSHExecutor{options: CloudDSHExecutorOptions{Tools: tools, Children: children}}
+	fence, parent, frame, value := cloudDSHChildCreateFixture(t, arguments, true)
+	writer := &cloudDSHFrameBuffer{}
+	seen := make(map[string]string)
+	supersede := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
+		return executor.deliverSupersedingMessages(deliveryCtx, fence, writer, messages, seen)
+	}
+
+	superseded, err := executor.createCloudDSHChildSession(context.Background(), value, fence, frame,
+		map[string]*cloudDSHSessionState{parent.identity.SessionID: parent}, []app.AgentToolDefinition{cloudDSHReadTool()}, writer, supersede)
+	if err != nil || superseded {
+		t.Fatalf("existing child spawn recovery = superseded %t, err %v", superseded, err)
+	}
+	if children.creates != 1 || children.createCommand.SpawnKey != callID || children.createCommand.RootCheckpointThroughSequence != 2 ||
+		len(tools.admissionCalls) != 1 ||
+		!tools.admissionRecovery[0] || !strings.Contains(writer.String(), `"type":"child_session"`) {
+		t.Fatalf("existing child spawn was not reconciled: creates=%d key=%q admissions=%+v recovery=%v response=%s",
+			children.creates, children.createCommand.SpawnKey, tools.admissionCalls, tools.admissionRecovery, writer.String())
+	}
+}
+
+func TestCloudDSHChildCreatePersistsTheRootCheckpointBaseline(t *testing.T) {
+	const callID = "delegate_call_1"
+	arguments := `{"title":"Inspect","objective":"Read the project","tool_names":["file_read"],"run_in_background":true}`
+	tools := &cloudDSHTestTools{admissionStatus: app.AgentToolCallAdmitted}
+	children := &cloudDSHTestChildSessions{}
+	executor := &CloudDSHExecutor{options: CloudDSHExecutorOptions{Tools: tools, Children: children}}
+	fence, parent, frame, value := cloudDSHChildCreateFixture(t, arguments, false)
+	writer := &cloudDSHFrameBuffer{}
+	seen := make(map[string]string)
+	supersede := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
+		return executor.deliverSupersedingMessages(deliveryCtx, fence, writer, messages, seen)
+	}
+	states := map[string]*cloudDSHSessionState{parent.identity.SessionID: parent}
+
+	superseded, err := executor.createCloudDSHChildSession(context.Background(), value, fence, frame,
+		states, []app.AgentToolDefinition{cloudDSHReadTool()}, writer, supersede)
+	if err != nil || superseded {
+		t.Fatalf("child create = superseded %t, err %v", superseded, err)
+	}
+	childState := states[children.child.SessionID]
+	if children.createCommand.SpawnKey != callID || children.createCommand.RootCheckpointThroughSequence != parent.through ||
+		children.child.RootCheckpointThroughSequence != parent.through || childState == nil ||
+		childState.rootCheckpointThrough != parent.through {
+		t.Fatalf("child root checkpoint baseline was not persisted/restored: command=%+v child=%+v state=%+v",
+			children.createCommand, children.child, childState)
+	}
+}
+
+func cloudDSHChildCreateFixture(t *testing.T, arguments string, recovering bool) (app.AgentInstanceFence, *cloudDSHSessionState,
+	cloudDSHFrame, task.Task) {
+	t.Helper()
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "a1234567", Generation: 1,
+		AuthorizationVersion: 1, SessionID: "session_123"}
+	fence := app.AgentInstanceFence{TaskID: identity.TaskID, OwnerID: identity.OwnerID, InitiatorID: identity.OwnerID,
+		AgentInstanceID: identity.AgentID, AgentGeneration: identity.Generation, AgentSessionID: identity.SessionID,
+		SupervisorID: "supervisor-test", LeaseOwner: "worker-test", LeaseVersion: 1, AuthorizationVersion: identity.AuthorizationVersion,
+		EngineVersion: cloudDSHEngineVersion, ProfileVersion: cloudDSHProfileVersion}
+	value := task.Task{ID: identity.TaskID, OwnerID: identity.OwnerID, InitiatorID: identity.OwnerID, Status: task.StatusRunning}
+	canonical, ok := canonicalCloudDSHJSON([]byte(arguments))
+	if !ok {
+		t.Fatal("child create arguments did not canonicalize")
+	}
+	history := newCloudDSHCheckpointHistory(identity.SessionID)
+	history.calls["delegate_call_1"] = &cloudDSHToolCall{name: cloudDSHDelegateToolName,
+		arguments: canonical, callSeen: true, historical: recovering}
+	parent := newCloudDSHSessionState(fence, identity, "", "", []app.AgentToolDefinition{cloudDSHReadTool()}, true,
+		recovering, 2, bytes.Repeat([]byte{3}, sha256.Size))
+	parent.history = history
+	parent.readThrough = 2
+	parent.restoreThrough = 2
+	through := int64(2)
+	frame := cloudDSHFrame{Type: "child_create", cloudDSHIdentity: identity, Through: &through,
+		CallID: "delegate_call_1", Arguments: json.RawMessage(arguments)}
+	return fence, parent, frame, value
+}
+
+func TestCloudDSHExecutorRejectsOldToolFrameAfterSteerClaimed(t *testing.T) {
+	executor, supervisor, store, _, models, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	arguments := `{"workspace_id":"w1234567","path":"README.md"}`
+	tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}}
+	executor.options.Tools = tools
+	script := filepath.Join(t.TempDir(), "stale-through.mjs")
+	source := fmt.Sprintf(`import { createHash } from 'node:crypto'
+import { createInterface } from 'node:readline'
+const emit = frame => process.stdout.write(JSON.stringify(frame) + '\n')
+const digest = value => createHash('sha256').update(value).digest('hex')
+const identity = frame => ({ task_id: frame.task_id, owner_id: frame.owner_id, agent_id: frame.agent_id,
+  generation: frame.generation, authorization_version: frame.authorization_version, session_id: frame.session_id })
+const toolName = %q, argumentsText = %q, args = JSON.parse(argumentsText)
+emit({ type: 'ready', version: 1, engine: 'dsh', engine_version: '0.2.0-rc.2' })
+let start
+createInterface({ input: process.stdin }).on('line', raw => {
+  const frame = JSON.parse(raw)
+  if (frame.type === 'start') {
+    start = frame
+    const payload = JSON.stringify({ header: { id: frame.session_id }, from_seq: 0, events: [
+      { seq: 0, type: 'turn/start', data: { turn: 1 } },
+      { seq: 1, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
+        message: { role: 'assistant', content: [{ type: 'tool-call', id: 'call_stale_1', name: toolName, arguments: argumentsText }] } } },
+      { seq: 2, type: 'tool/call', data: { turn: 1, step: 1, callId: 'call_stale_1', name: toolName, arguments: argumentsText } },
+      { seq: 3, type: 'user/message', surfaceOp: 'append', data: { id: 'm7654321', role: 'user',
+        content: [{ type: 'text', text: 'Use the new heading.' }], source: { kind: 'user' } } },
+    ] })
+    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_stale', from_seq: 0, through_seq: 3,
+      payload, sha256: digest(payload) })
+  } else if (frame.type === 'checkpoint_ack') {
+    emit({ type: 'tool_call', id: 'tool_stale', ...identity(start), through_seq: 2, call_id: 'call_stale_1',
+      name: toolName, arguments: args })
+  }
+})
+setInterval(() => {}, 1000)`, tool.Name, arguments)
+	if err := os.WriteFile(script, []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cloudDSHUseTestTaskScript(t, supervisor, script)
+	err := executor.ExecuteTask(context.Background(), value)
+	if err == nil || !strings.Contains(err.Error(), "tool call frame is invalid") {
+		t.Fatalf("stale tool frame result = %v", err)
+	}
+	if len(tools.admissionCalls) != 0 || len(tools.calls) != 0 || len(models.calls) != 0 || store.stopped != 1 {
+		t.Fatalf("stale frame reached admission/execution: admissions=%d tools=%d models=%d stopped=%d",
+			len(tools.admissionCalls), len(tools.calls), len(models.calls), store.stopped)
 	}
 }
 

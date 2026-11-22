@@ -70,6 +70,7 @@ const MESSAGE_DELIVERY_KEYS_V1 = [
 ]
 const MESSAGE_DELIVERY_KEYS_V2 = [...MESSAGE_DELIVERY_KEYS_V1, 'attachment_ids']
 const MESSAGE_DELIVERY_KEYS_V3 = [...MESSAGE_DELIVERY_KEYS_V2, 'mode']
+const MESSAGE_DELIVERY_KEYS_V4 = [...MESSAGE_DELIVERY_KEYS_V3, 'supersede_active']
 const MESSAGE_ID = /^m[a-z0-9]{7}$/
 const MESSAGE_ATTACHMENT_ID = /^(?:pa|pca)_[a-f0-9]{32}$/
 const MAX_MESSAGE_ATTACHMENTS = 16
@@ -169,8 +170,10 @@ export function validMessageDelivery(frame, identity) {
   const legacy = isObject(frame) && frame.version === 1 && exactKeys(frame, MESSAGE_DELIVERY_KEYS_V1)
   const current = isObject(frame) && frame.version === 2 && exactKeys(frame, MESSAGE_DELIVERY_KEYS_V2)
   const modeAware = isObject(frame) && frame.version === 3 && exactKeys(frame, MESSAGE_DELIVERY_KEYS_V3)
-  if (!isObject(frame) || (!legacy && !current && !modeAware) || frame.type !== 'message_delivery' ||
+  const superseding = isObject(frame) && frame.version === 4 && exactKeys(frame, MESSAGE_DELIVERY_KEYS_V4)
+  if (!isObject(frame) || (!legacy && !current && !modeAware && !superseding) || frame.type !== 'message_delivery' ||
       modeAware && !['steer', 'followup'].includes(frame.mode) ||
+      superseding && (frame.mode !== 'steer' || frame.supersede_active !== true) ||
       !identity || !['task_id', 'owner_id', 'agent_id', 'session_id'].every(key => frame[key] === identity[key]) ||
       !['generation', 'authorization_version'].every(key => Number.isSafeInteger(frame[key]) && frame[key] > 0 && frame[key] === identity[key]) ||
       !MESSAGE_ID.test(frame.message_id ?? '') || typeof frame.content !== 'string' || !frame.content.isWellFormed() ||
@@ -1840,7 +1843,7 @@ export async function runAgent(ipc, frame) {
         throw error
       }
     }
-    const installMessageDeliveryHandler = () => ipc.setMessageDeliveryHandler(({ message_id, content, attachment_ids, mode = 'followup' }) => {
+    const installMessageDeliveryHandler = () => ipc.setMessageDeliveryHandler(({ message_id, content, attachment_ids, mode = 'followup', supersede_active = false }) => {
       const attachmentIDs = attachment_ids ?? []
       let found = false
       const check = message => {
@@ -1855,6 +1858,36 @@ export async function runAgent(ipc, frame) {
         else check(event.data?.message)
       }
       for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) check(message)
+      if (supersede_active) {
+        if (mode !== 'steer') throw new Error('only a steer may supersede an active tool')
+        durable.messageDeliveryVersion++
+        agent.cancel({ kind: 'hook', reason: 'a newer task input superseded this unstarted tool call' }, { keepInbox: true })
+        if (!found) {
+          const message = freezeMessage({
+            id: MessageId(message_id), role: 'user', content: deliveredMessageBlocks(content, attachmentIDs),
+            source: { kind: 'user', morde_delivery_mode: mode },
+          })
+          agent.steer(message)
+        } else {
+          // The steer is already in the checkpoint or inbox. Wake a fresh turn
+          // without inserting the same user message twice.
+          const wakeID = `morde_supersede_${message_id}`
+          const wakeText = 'Re-evaluate the current task using all user input already in this session.'
+          const hasWake = [...agent.session.snapshotEvents()].some(event =>
+            event.type === 'user/message' && event.data?.id === wakeID) ||
+            [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => message?.id === wakeID)
+          if (!hasWake) agent.followup(freezeMessage({ id: MessageId(wakeID), role: 'user',
+            content: [{ type: 'text', text: wakeText }], source: { kind: 'plugin', plugin: 'morde-task-input' } }))
+        }
+        const checkpoint = durable.trackMessageDeliveryCheckpoint(ctx.sessions.flush(agent.session).then(ok => {
+          if (!ok) throw new Error('message delivery checkpoint listener unavailable')
+        }))
+        void checkpoint.catch(() => {
+          state.failed = true
+          agent.cancel({ kind: 'hook', reason: 'message delivery checkpoint failed' })
+        })
+        return
+      }
       if (!found) {
         durable.messageDeliveryVersion++
         const message = freezeMessage({

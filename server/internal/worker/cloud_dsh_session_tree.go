@@ -27,6 +27,7 @@ type cloudDSHSessionState struct {
 	identity                cloudDSHIdentity
 	parentSessionID         string
 	spawnKey                string
+	rootCheckpointThrough   int64
 	definitions             []app.AgentToolDefinition
 	canDelegate             bool
 	background              bool
@@ -77,7 +78,8 @@ func newCloudDSHSessionState(fence app.AgentInstanceFence, identity cloudDSHIden
 		history.beginRestore()
 	}
 	return &cloudDSHSessionState{identity: identity, parentSessionID: parentSessionID, spawnKey: spawnKey,
-		definitions: definitions, canDelegate: canDelegate, resume: resume, through: through, restoreThrough: through, lastModel: -1, readThrough: -1,
+		rootCheckpointThrough: through,
+		definitions:           definitions, canDelegate: canDelegate, resume: resume, through: through, restoreThrough: through, lastModel: -1, readThrough: -1,
 		checkpointDigest: append([]byte(nil), digest...), restoreDigest: append([]byte(nil), digest...),
 		checkpointIDs: make(map[string]struct{}), pageReadIDs: make(map[string]struct{}),
 		history: history, images: newCloudDSHImageRegistry(cloudDSHModelFence(fence, identity.SessionID, through)),
@@ -787,6 +789,11 @@ func (e *CloudDSHExecutor) deliverPendingMessagesOnce(ctx context.Context, fence
 	if err != nil {
 		return err
 	}
+	return e.deliverPendingConversationMessages(ctx, fence, input, messages, seen)
+}
+
+func (e *CloudDSHExecutor) deliverPendingConversationMessages(ctx context.Context, fence app.AgentInstanceFence, input io.WriteCloser,
+	messages []app.AgentConversationMessage, seen map[string]string) error {
 	for _, message := range messages {
 		if !cloudDSHID.MatchString(message.ID) || (strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) || len(message.Content) > app.MaxConversationAgentInputBytes ||
 			!utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) {
@@ -820,12 +827,98 @@ func (e *CloudDSHExecutor) deliverPendingMessagesOnce(ctx context.Context, fence
 	return nil
 }
 
+func (e *CloudDSHExecutor) deliverSupersedingMessages(ctx context.Context, fence app.AgentInstanceFence, input io.WriteCloser,
+	messages []app.AgentConversationMessage, seen map[string]string) error {
+	foundSteer := false
+	for _, message := range messages {
+		if !cloudDSHID.MatchString(message.ID) || (strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) ||
+			len(message.Content) > app.MaxConversationAgentInputBytes || !utf8.ValidString(message.Content) ||
+			strings.ContainsRune(message.Content, '\x00') || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) {
+			return errors.New("pending conversation message is invalid")
+		}
+		mode := message.Mode
+		if mode == "" {
+			mode = app.AgentMessageDeliveryFollowup
+		}
+		if mode != app.AgentMessageDeliverySteer && mode != app.AgentMessageDeliveryFollowup {
+			return errors.New("pending conversation message delivery mode is invalid")
+		}
+		fingerprint := cloudDSHMessageDeliveryFingerprint(message)
+		if existing, ok := seen[message.ID]; ok && existing != fingerprint {
+			return errors.New("pending conversation message identity changed")
+		}
+		frame := map[string]any{"type": "message_delivery", "version": 3,
+			"task_id": fence.TaskID, "owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID,
+			"generation": fence.AgentGeneration, "authorization_version": fence.AuthorizationVersion,
+			"session_id": fence.AgentSessionID, "message_id": message.ID, "content": message.Content,
+			"attachment_ids": append([]string{}, message.AttachmentIDs...), "mode": string(mode)}
+		if mode == app.AgentMessageDeliverySteer {
+			foundSteer = true
+			frame["version"] = 4
+			frame["supersede_active"] = true
+		}
+		if err := writeCloudDSHFrame(ctx, input, frame); err != nil {
+			return err
+		}
+		seen[message.ID] = fingerprint
+	}
+	if !foundSteer {
+		return errors.New("superseded tool admission has no pending steer")
+	}
+	return nil
+}
+
+func (e *CloudDSHExecutor) admitToolCall(ctx context.Context, value task.Task, call app.ModelToolCall,
+	fence app.AgentInstanceFence, recovering bool) (app.AgentToolCallAdmission, error) {
+	if admitter, ok := e.options.Tools.(app.CloudDSHToolCallAdmitter); ok {
+		return admitter.AdmitToolCall(ctx, value, call, recovering)
+	}
+	// Legacy/test brokers may not expose the atomic admission capability. Their
+	// normal execution path still gets a best-effort pending-input fence; durable
+	// recovery is delegated to their Reconcile implementation.
+	if recovering {
+		return app.AgentToolCallAdmission{Status: app.AgentToolCallAdmitted}, nil
+	}
+	messages, err := e.options.Checkpoints.PendingMessages(ctx, checkpointFence(fence))
+	if err != nil {
+		return app.AgentToolCallAdmission{}, err
+	}
+	steers := make([]app.AgentConversationMessage, 0, len(messages))
+	for _, message := range messages {
+		if !message.Initial && !message.RevisionUpdate && message.Mode == app.AgentMessageDeliverySteer {
+			steers = append(steers, message)
+		}
+	}
+	if len(steers) != 0 {
+		return app.AgentToolCallAdmission{Status: app.AgentToolCallSuperseded, PendingMessages: steers}, nil
+	}
+	return app.AgentToolCallAdmission{Status: app.AgentToolCallAdmitted}, nil
+}
+
+func cloudDSHTaskInputPendingMessages(err error) ([]app.AgentConversationMessage, bool) {
+	var pending *app.TaskInputPendingError
+	if !errors.As(err, &pending) || pending == nil {
+		return nil, false
+	}
+	return append([]app.AgentConversationMessage(nil), pending.PendingMessages...), true
+}
+
 func cloudDSHMessageDeliveryFingerprint(message app.AgentConversationMessage) string {
 	mode := message.Mode
 	if mode == "" {
 		mode = app.AgentMessageDeliveryFollowup
 	}
 	return message.Content + "\x00" + strings.Join(message.AttachmentIDs, "\x00") + "\x00" + string(mode)
+}
+
+func rootCheckpointThroughSequence(parent *cloudDSHSessionState, rootSessionID string) int64 {
+	if parent == nil {
+		return -1
+	}
+	if parent.identity.SessionID == rootSessionID {
+		return parent.through
+	}
+	return parent.rootCheckpointThrough
 }
 
 func validCloudDSHMessageAttachmentIDs(ids []string) bool {
@@ -1075,6 +1168,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			identity.SessionID = child.SessionID
 			state := newCloudDSHSessionState(fence, identity, rootIdentity.SessionID, child.SpawnKey, definitions,
 				false, true, child.CheckpointThrough, child.CheckpointDigest)
+			state.rootCheckpointThrough = child.RootCheckpointThroughSequence
 			state.background = true
 			states[child.SessionID] = state
 			backgroundJobs = append(backgroundJobs, map[string]any{"task_id": identity.TaskID, "owner_id": identity.OwnerID,
@@ -1238,6 +1332,17 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		seenDeliveriesMu.Lock()
 		defer seenDeliveriesMu.Unlock()
 		return e.deliverPendingMessagesOnce(deliveryCtx, fence, input, seenDeliveries)
+	}
+	deliverSupersedingMessages := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
+		seenDeliveriesMu.Lock()
+		defer seenDeliveriesMu.Unlock()
+		return e.deliverSupersedingMessages(deliveryCtx, fence, input, messages, seenDeliveries)
+	}
+	supersedeToolCall := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
+		if err := deliverSupersedingMessages(deliveryCtx, messages); err != nil {
+			return errors.New("superseded dsh tool call could not deliver its task input")
+		}
+		return nil
 	}
 	for {
 		var item cloudDSHRead
@@ -1573,8 +1678,12 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return errCloudDSHPersonalMemoryChanged
 				}
 			}
-			if err := e.createCloudDSHChildSession(ctx, value, fence, frame, states, baseDefinitions, input); err != nil {
+			superseded, err := e.createCloudDSHChildSession(ctx, value, fence, frame, states, baseDefinitions, input, supersedeToolCall)
+			if err != nil {
 				return err
+			}
+			if superseded {
+				continue
 			}
 			continue
 		}
@@ -1836,6 +1945,22 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err != nil || child.Step.Status == task.StepRunning || cloudDSHJobStatus(child) != frame.Status {
 				return errors.New("dsh job cancellation was not durably confirmed")
 			}
+			call := app.ModelToolCall{Name: cloudDSHJobCancelToolName, CallID: pending.frame.CallID,
+				Arguments: string(pending.arguments), TaskFence: cloudDSHModelFencePointer(pending.fence, pending.identity.SessionID,
+					*pending.frame.Through)}
+			admission, err := e.admitToolCall(ctx, value, call, pending.fence, true)
+			if err != nil {
+				return errors.New("dsh job cancel result admission could not be confirmed")
+			}
+			if admission.Status == app.AgentToolCallSuperseded {
+				if err := supersedeToolCall(ctx, admission.PendingMessages); err != nil {
+					return err
+				}
+				continue
+			}
+			if admission.Status != app.AgentToolCallAdmitted {
+				return errors.New("dsh job cancel result admission returned an unsupported result")
+			}
 			result := app.AgentToolResult{Status: app.AgentToolSucceeded, Output: cloudDSHJobResult(child)}
 			if err := pending.session.history.noteToolResult(pending.frame.CallID, cloudDSHJobCancelToolName,
 				pending.arguments, result.Status, result.Output, nil); err != nil {
@@ -1913,6 +2038,26 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				(!retryCall && !recoveryCall && (!state.history.allHistoricalCallsReconciled() || state.history.validateToolCall(frame.CallID, frame.Name, arguments) != nil)) {
 				return errors.New("dsh tool arguments are invalid")
 			}
+			toolCallID := frame.CallID
+			if state.identity.SessionID != rootIdentity.SessionID {
+				toolCallID = cloudDSHNamespacedToolCallID(value.ID, state.identity.SessionID, frame.CallID)
+			}
+			call := app.ModelToolCall{CallID: toolCallID, Name: frame.Name, Arguments: string(arguments),
+				TaskFence: cloudDSHModelFencePointer(fence, state.identity.SessionID, state.through)}
+			admission, err := e.admitToolCall(ctx, value, call, fence, recoveryCall)
+			if err != nil {
+				return errors.New("dsh tool call admission could not be confirmed")
+			}
+			switch admission.Status {
+			case app.AgentToolCallAdmitted:
+			case app.AgentToolCallSuperseded:
+				if err := supersedeToolCall(ctx, admission.PendingMessages); err != nil {
+					return err
+				}
+				continue
+			default:
+				return errors.New("dsh tool call admission returned an unsupported result")
+			}
 			cancelRequested, err := e.cloudDSHJobCancelRequested(ctx, fence, state)
 			if err != nil {
 				return errors.New("dsh background job authorization changed")
@@ -1923,12 +2068,6 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				}
 				continue
 			}
-			toolCallID := frame.CallID
-			if state.identity.SessionID != rootIdentity.SessionID {
-				toolCallID = cloudDSHNamespacedToolCallID(value.ID, state.identity.SessionID, frame.CallID)
-			}
-			call := app.ModelToolCall{CallID: toolCallID, Name: frame.Name, Arguments: string(arguments),
-				TaskFence: cloudDSHModelFencePointer(fence, state.identity.SessionID, state.through)}
 			if retryCall {
 				consumer, ok := e.options.Checkpoints.(app.TaskStepRetryIntentConsumer)
 				if !ok || !app.MatchesTaskStepRetryCall(*value.StepRetry, call) {
@@ -1958,8 +2097,14 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				}
 				if result.Status == "" {
 					if frame.Name == cloudDSHJobCancelToolName {
-						immediate, pending, jobID, cancelErr := e.cancelCloudDSHJob(ctx, fence, rootIdentity.SessionID, frame.Arguments)
+						immediate, pending, jobID, cancelErr := e.cancelCloudDSHJob(ctx, fence, rootIdentity.SessionID, frame.CallID, frame.Arguments)
 						if cancelErr != nil {
+							if messages, superseded := cloudDSHTaskInputPendingMessages(cancelErr); superseded {
+								if err := supersedeToolCall(ctx, messages); err != nil {
+									return err
+								}
+								continue
+							}
 							return errors.New("dsh background job cancellation could not be authorized")
 						}
 						if pending {
@@ -2001,11 +2146,30 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err != nil {
 				return errors.New("dsh tool execution could not be confirmed")
 			}
+			if result.Status == app.AgentToolSuperseded {
+				if err := supersedeToolCall(ctx, result.SupersedingMessages); err != nil {
+					return err
+				}
+				continue
+			}
 			if result.Status == app.AgentToolUnknown || result.Status == app.AgentToolNeedsUser {
 				if result.Status == app.AgentToolNeedsUser {
 					return ErrCloudDSHWaitingForUser
 				}
 				return errors.New("dsh tool execution requires user attention")
+			}
+			resultAdmission, err := e.admitToolCall(ctx, value, call, fence, true)
+			if err != nil {
+				return errors.New("dsh tool result admission could not be confirmed")
+			}
+			if resultAdmission.Status == app.AgentToolCallSuperseded {
+				if err := supersedeToolCall(ctx, resultAdmission.PendingMessages); err != nil {
+					return err
+				}
+				continue
+			}
+			if resultAdmission.Status != app.AgentToolCallAdmitted {
+				return errors.New("dsh tool result admission returned an unsupported result")
 			}
 			if result.Status != app.AgentToolSucceeded && result.Status != app.AgentToolFailed {
 				return errors.New("dsh tool returned an unsupported result")
@@ -2040,11 +2204,12 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 }
 
 func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
-	frame cloudDSHFrame, states map[string]*cloudDSHSessionState, parentDefinitions []app.AgentToolDefinition, input io.WriteCloser) error {
+	frame cloudDSHFrame, states map[string]*cloudDSHSessionState, parentDefinitions []app.AgentToolDefinition,
+	input io.WriteCloser, supersede func(context.Context, []app.AgentConversationMessage) error) (bool, error) {
 	parent := states[frame.SessionID]
 	if e.options.Children == nil || parent == nil || !parent.canDelegate || parent.identity.SessionID != fence.AgentSessionID ||
 		frame.cloudDSHIdentity != parent.identity || frame.Through == nil || *frame.Through != parent.through || !cloudDSHID.MatchString(frame.CallID) {
-		return errors.New("dsh child Agent request identity is invalid")
+		return false, errors.New("dsh child Agent request identity is invalid")
 	}
 	arguments, definitions, err := validateCloudDSHDelegateArguments(frame.Arguments, parentDefinitions)
 	canonical, canonicalOK := canonicalCloudDSHJSON(frame.Arguments)
@@ -2053,7 +2218,27 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		parent.history.validateRecoveryToolCall(frame.CallID, cloudDSHDelegateToolName, canonical) != nil)) ||
 		(!recoveryCall && (!parent.history.allHistoricalCallsReconciled() ||
 			parent.history.validateToolCall(frame.CallID, cloudDSHDelegateToolName, canonical) != nil)) {
-		return errors.New("dsh child Agent request does not match the checkpointed tool call")
+		return false, errors.New("dsh child Agent request does not match the checkpointed tool call")
+	}
+	callID := frame.CallID
+	call := app.ModelToolCall{Name: cloudDSHDelegateToolName, CallID: callID, Arguments: string(canonical),
+		TaskFence: cloudDSHModelFencePointer(fence, parent.identity.SessionID, parent.through)}
+	admission, err := e.admitToolCall(ctx, value, call, fence, recoveryCall)
+	if err != nil {
+		return false, errors.New("dsh child Agent call admission could not be confirmed")
+	}
+	switch admission.Status {
+	case app.AgentToolCallAdmitted:
+	case app.AgentToolCallSuperseded:
+		if supersede == nil {
+			return false, errors.New("dsh child Agent superseding delivery is unavailable")
+		}
+		if err := supersede(ctx, admission.PendingMessages); err != nil {
+			return false, err
+		}
+		return true, nil
+	default:
+		return false, errors.New("dsh child Agent call admission returned an unsupported result")
 	}
 	allowedTools := make([]string, 0, len(definitions))
 	for _, definition := range definitions {
@@ -2061,23 +2246,32 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 	}
 	child, _, err := e.options.Children.Create(ctx, app.AgentChildSessionCommand{Fence: fence, ParentSessionID: fence.AgentSessionID,
 		SpawnKey: frame.CallID, Arguments: canonical, Title: strings.TrimSpace(arguments.Title), AllowedTools: allowedTools,
-		Background: arguments.RunInBackground})
+		Background: arguments.RunInBackground, RootCheckpointThroughSequence: rootCheckpointThroughSequence(parent, fence.AgentSessionID)})
+	if messages, superseded := cloudDSHTaskInputPendingMessages(err); superseded {
+		if supersede == nil {
+			return false, errors.New("dsh child Agent superseding delivery is unavailable")
+		}
+		if err := supersede(ctx, messages); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
 	if err != nil || child.TaskID != value.ID || child.ParentSessionID != fence.AgentSessionID || child.SessionID == "" ||
 		!sameWorkerToolNames(child.AllowedTools, allowedTools) {
-		return errors.New("dsh child Agent could not be durably created")
+		return false, errors.New("dsh child Agent could not be durably created")
 	}
 	var settledOutput string
 	hasSettledOutput := false
 	if arguments.RunInBackground {
 		if child.Step.Status == task.StepUnknown && !child.CancelRequested {
-			return errors.New("dsh background job has an unknown outcome")
+			return false, errors.New("dsh background job has an unknown outcome")
 		}
 		output, err := json.Marshal(struct {
 			JobID  string `json:"job_id"`
 			Status string `json:"status"`
 		}{JobID: child.SessionID, Status: cloudDSHJobStatus(child)})
 		if err != nil {
-			return errors.New("dsh background job handle was not durably reconciled")
+			return false, errors.New("dsh background job handle was not durably reconciled")
 		}
 		handle := string(output)
 		if recoveryCall {
@@ -2086,7 +2280,7 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 					JobID string `json:"job_id"`
 				}
 				if json.Unmarshal([]byte(*recorded), &previous) != nil || previous.JobID != child.SessionID {
-					return errors.New("dsh background job recovery handle changed")
+					return false, errors.New("dsh background job recovery handle changed")
 				}
 				// Keep the handle recorded by the previous generation, then
 				// reconcile it against the checkpoint. A following job_get returns
@@ -2096,7 +2290,7 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		}
 		if parent.history.noteToolResult(frame.CallID, cloudDSHDelegateToolName, canonical,
 			app.AgentToolSucceeded, handle, nil) != nil {
-			return errors.New("dsh background job handle was not durably reconciled")
+			return false, errors.New("dsh background job handle was not durably reconciled")
 		}
 	} else if child.Step.Status == task.StepSucceeded || child.Step.Status == task.StepFailed {
 		var childHistory *cloudDSHCheckpointHistory
@@ -2106,7 +2300,7 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		var err error
 		settledOutput, err = recordCloudDSHChildToolResult(parent, frame.CallID, child, childHistory)
 		if err != nil {
-			return err
+			return false, err
 		}
 		hasSettledOutput = true
 	}
@@ -2115,12 +2309,13 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 	if child.Step.Status == task.StepRunning {
 		if existing := states[child.SessionID]; existing != nil {
 			if existing.spawnKey != frame.CallID || existing.identity != identity || existing.background != arguments.RunInBackground {
-				return errors.New("dsh child Agent session identity was reused")
+				return false, errors.New("dsh child Agent session identity was reused")
 			}
 		} else {
 			resume := child.CheckpointThrough >= 0
 			states[child.SessionID] = newCloudDSHSessionState(fence, identity, fence.AgentSessionID, frame.CallID,
 				definitions, false, resume, child.CheckpointThrough, child.CheckpointDigest)
+			states[child.SessionID].rootCheckpointThrough = child.RootCheckpointThroughSequence
 			states[child.SessionID].background = arguments.RunInBackground
 		}
 	}
@@ -2133,7 +2328,7 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 	if hasSettledOutput {
 		response["settled_output"] = settledOutput
 	}
-	return writeCloudDSHFrame(ctx, input, response)
+	return false, writeCloudDSHFrame(ctx, input, response)
 }
 
 type cloudDSHChildActionRef struct {
