@@ -3023,6 +3023,9 @@ describe('Assistant durable tasks', () => {
     renderPage();
     if (routingStatus === 'waiting_user') {
       expect(screen.queryByText(/等待你补充任务信息/)).not.toBeInTheDocument();
+    } else if (routingStatus === 'failed') {
+      expect(screen.queryByText('消息上下文暂时无法读取')).not.toBeInTheDocument();
+      expect(await screen.findByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
     } else if (label) {
       const status = await screen.findByText(label);
       expect(status).toBeInTheDocument();
