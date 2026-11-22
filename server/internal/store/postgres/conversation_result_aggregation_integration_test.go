@@ -32,6 +32,7 @@ type resultAggregationTask struct {
 	ActorID       string
 	UserMessageID string
 	TurnID        string
+	TaskRevision  int64
 	EventSequence int64
 	Content       string
 }
@@ -103,20 +104,18 @@ func (f resultAggregationFixture) complete(t *testing.T, value *resultAggregatio
 			return err
 		}
 		if err := tx.QueryRow(ctx, `UPDATE tasks SET status='completed',result=$2,current_step=$3,event_seq=event_seq+1
-WHERE id=$1 RETURNING event_seq`, value.ID, content, value.TurnID).Scan(&value.EventSequence); err != nil {
+WHERE id=$1 RETURNING event_seq,current_revision`, value.ID, content, value.TurnID).Scan(&value.EventSequence, &value.TaskRevision); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO task_events(task_id,sequence,event_type,payload) VALUES ($1,$2,'task.result','{}'::jsonb)`,
-			value.ID, value.EventSequence); err != nil {
-			return err
-		}
-		var revision int64
-		if err := tx.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, value.ID).Scan(&revision); err != nil {
+		digest := sha256.Sum256([]byte(content))
+		if _, err := tx.Exec(ctx, `INSERT INTO task_events(task_id,sequence,event_type,payload,task_revision,result_content_sha256)
+VALUES ($1,$2,'task.result','{"status":"completed"}'::jsonb,$3,$4)`,
+			value.ID, value.EventSequence, value.TaskRevision, digest[:]); err != nil {
 			return err
 		}
 		value.Content = content
 		var err error
-		handled, err = queueConversationResultInTx(ctx, tx, value.ID, revision, value.EventSequence, content, 2*time.Second)
+		handled, err = queueConversationResultInTx(ctx, tx, value.ID, value.TaskRevision, value.EventSequence, content, 2*time.Second)
 		return err
 	})
 	if err != nil {
@@ -158,6 +157,79 @@ func (f resultAggregationFixture) runNextReview(t *testing.T) *resultReviewRoute
 	return model
 }
 
+func seedConversationResultValidationReview(t *testing.T, f resultAggregationFixture, value resultAggregationTask,
+	revision, sequence int64, resultDigest []byte, validationState app.TaskValidationState) {
+	t.Helper()
+	ctx := context.Background()
+	eventDigest := sha256.Sum256([]byte(value.Content))
+	if sequence == value.EventSequence && revision == value.TaskRevision {
+		result, err := f.store.pool.Exec(ctx, `UPDATE task_events SET result_content_sha256=$3
+WHERE task_id=$1 AND sequence=$2 AND task_revision=$4 AND event_type='task.result'`, value.ID, sequence, eventDigest[:], revision)
+		if err != nil || result.RowsAffected() != 1 {
+			t.Fatalf("bind validation review to current result event: %v", err)
+		}
+	} else {
+		if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_events(task_id,sequence,event_type,payload,task_revision,result_content_sha256)
+		VALUES ($1,$2,'task.result','{"status":"completed"}'::jsonb,$3,$4)`, value.ID, sequence, revision, eventDigest[:]); err != nil {
+			t.Fatalf("insert stale validation result event: %v", err)
+		}
+	}
+	_, err := f.store.pool.Exec(ctx, `INSERT INTO task_validation_reviews
+(task_id,owner_id,task_revision,result_event_sequence,result_sha256,state,reviewer_session_id,
+ execution_model_id,execution_connection_version,execution_endpoint,execution_configured_model,execution_reported_model,
+ execution_model_family,execution_catalog_version,reviewer_model_id,reviewer_connection_version,reviewer_endpoint,
+ reviewer_configured_model,reviewer_reported_model,reviewer_model_family,reviewer_catalog_version,review_report,
+ reviewed_at,execution_model_call_id,validation_state)
+SELECT $1,task.owner_id,$2,$3,$4,'reviewed',$5,
+ 'p1234567',clock_timestamp(),'https://example.test/v1','fixture-execution','fixture-execution',
+ 'fixture-execution-family','fixture-catalog','p2234567',clock_timestamp(),'https://example.test/v1',
+ 'fixture-reviewer','fixture-reviewer','fixture-reviewer-family','fixture-catalog','{"summary":"fixture"}'::jsonb,
+ clock_timestamp(),$6,$7
+FROM tasks task WHERE task.id=$1`, value.ID, revision, sequence, resultDigest, "review_"+value.ID, "execution_"+value.ID, validationState)
+	if err != nil {
+		t.Fatalf("seed persisted validation review: %v", err)
+	}
+}
+
+func resultReviewTestReceipt(tasks []resultAggregationTask, states ...app.TaskValidationState) string {
+	sources := make([]app.ConversationTaskResultSource, 0, len(tasks))
+	for _, value := range tasks {
+		sources = append(sources, app.ConversationTaskResultSource{TaskID: value.ID, TaskRevision: value.TaskRevision})
+	}
+	return conversationTaskResultReceipt(resultReviewTestReply, sources, states)
+}
+
+func TestConversationTaskResultReceiptLabelsValidationAndBoundsSummary(t *testing.T) {
+	sources := []app.ConversationTaskResultSource{
+		{TaskID: "task1234", TaskRevision: 2},
+		{TaskID: "task5678", TaskRevision: 4},
+		{TaskID: "task9012", TaskRevision: 1},
+	}
+	receipt := conversationTaskResultReceipt("主助手整理的结果摘要。", sources,
+		[]app.TaskValidationState{app.TaskValidationPending, app.TaskValidationPass, app.TaskValidationFail})
+	for _, want := range []string{
+		"结果摘要（主助手整理，不代表独立验收）：\n主助手整理的结果摘要。",
+		"Task 执行状态：completed",
+		"- task1234 r2：pending",
+		"- task5678 r4：PASS",
+		"- task9012 r1：FAIL",
+	} {
+		if !strings.Contains(receipt, want) {
+			t.Errorf("receipt missing %q: %q", want, receipt)
+		}
+	}
+	if !app.ValidConversationRouteReply(receipt) {
+		t.Fatalf("receipt is not a valid durable route reply: %q", receipt)
+	}
+
+	large := conversationTaskResultReceipt(strings.Repeat("长", app.MaxConversationRouteReplyRunes+100), sources,
+		[]app.TaskValidationState{app.TaskValidationPending, app.TaskValidationPending, app.TaskValidationPending})
+	if !app.ValidConversationRouteReply(large) || !strings.HasSuffix(large, "- task9012 r1：pending") {
+		t.Fatalf("bounded summary lost its authoritative validation footer: runes=%d receipt=%q",
+			len([]rune(large)), large)
+	}
+}
+
 func TestConversationResultReviewUsesLatestSourceTaskModel(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	ctx := context.Background()
@@ -194,6 +266,74 @@ FROM now WHERE b.state='pending' AND b.owner_id=$1`, f.ownerID); err != nil {
 	selected, err := f.store.ResolveConversationRouteModel(ctx, claim)
 	if err != nil || selected != "p2345678" {
 		t.Fatalf("result review selected model = %q, want latest source Task model p2345678: %v", selected, err)
+	}
+}
+
+func TestConversationResultReceiptSeparatesCompletionFromCurrentValidation(t *testing.T) {
+	f := newResultAggregationFixture(t)
+	ctx := context.Background()
+	noEvidence := f.createTask(t, f.ownerID, "no validation evidence")
+	staleDigest := f.createTask(t, f.ownerID, "stale result digest")
+	oldRevision := f.createTask(t, f.ownerID, "old validation revision")
+	passed := f.createTask(t, f.ownerID, "current passing review")
+	failed := f.createTask(t, f.ownerID, "current failing review")
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET current_revision=1,desired_revision=1 WHERE id=$1`, oldRevision.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		task    *resultAggregationTask
+		content string
+	}{
+		{&noEvidence, "completed without review"},
+		{&staleDigest, "review bound to different bytes"},
+		{&oldRevision, "current revision one result"},
+		{&passed, "current result with pass evidence"},
+		{&failed, "current result with fail evidence"},
+	} {
+		if !f.complete(t, item.task, item.content) {
+			t.Fatalf("result was not queued for task %s", item.task.ID)
+		}
+	}
+	wrongDigest := sha256.Sum256([]byte("different result bytes"))
+	seedConversationResultValidationReview(t, f, staleDigest, staleDigest.TaskRevision, staleDigest.EventSequence,
+		wrongDigest[:], app.TaskValidationPass)
+	oldDigest := sha256.Sum256([]byte(oldRevision.Content))
+	seedConversationResultValidationReview(t, f, oldRevision, 0, oldRevision.EventSequence+100, oldDigest[:], app.TaskValidationPass)
+	passedDigest := sha256.Sum256([]byte(passed.Content))
+	seedConversationResultValidationReview(t, f, passed, passed.TaskRevision, passed.EventSequence, passedDigest[:], app.TaskValidationPass)
+	failedDigest := sha256.Sum256([]byte(failed.Content))
+	seedConversationResultValidationReview(t, f, failed, failed.TaskRevision, failed.EventSequence, failedDigest[:], app.TaskValidationFail)
+	f.runNextReview(t)
+
+	var messageID, content string
+	if err := f.store.pool.QueryRow(ctx, `SELECT published_message_id FROM conversation_result_batches WHERE state='published'`).Scan(&messageID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.pool.QueryRow(ctx, `SELECT content FROM conversation_messages WHERE id=$1 AND role='assistant'`, messageID).Scan(&content); err != nil {
+		t.Fatal(err)
+	}
+	for _, check := range []struct {
+		task  resultAggregationTask
+		state app.TaskValidationState
+	}{
+		{noEvidence, app.TaskValidationPending},
+		{staleDigest, app.TaskValidationPending},
+		{oldRevision, app.TaskValidationPending},
+		{passed, app.TaskValidationPass},
+		{failed, app.TaskValidationFail},
+	} {
+		want := fmt.Sprintf("- %s r%d：%s", check.task.ID, check.task.TaskRevision, check.state)
+		if !strings.Contains(content, want) {
+			t.Errorf("persisted result receipt missing current state %q: %q", want, content)
+		}
+	}
+	if !strings.HasPrefix(content, "结果摘要（主助手整理，不代表独立验收）：\n") ||
+		!strings.Contains(content, "Task 执行状态：completed\n服务端验收状态（当前修订）：") {
+		t.Fatalf("result receipt does not distinguish completion summary from server validation: %q", content)
+	}
+	var receiptCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE id=$1 AND role='assistant'`, messageID).Scan(&receiptCount); err != nil || receiptCount != 1 {
+		t.Fatalf("receipt count=%d err=%v; want one persisted receipt", receiptCount, err)
 	}
 }
 
@@ -282,7 +422,7 @@ JOIN conversation_message_routes route ON route.message_id=batch.trigger_message
 			replies = append(replies, message)
 		}
 	}
-	if len(replies) != 1 || replies[0].ID != batchID || replies[0].Content != resultReviewTestReply || len(replies[0].Sources) != 2 {
+	if len(replies) != 1 || replies[0].ID != batchID || replies[0].Content != resultReviewTestReceipt([]resultAggregationTask{first, second}, app.TaskValidationPending, app.TaskValidationPending) || len(replies[0].Sources) != 2 {
 		t.Fatalf("reviewed reply = %#v", replies)
 	}
 	for _, value := range []resultAggregationTask{first, second} {
@@ -339,7 +479,7 @@ VALUES ('p1234567',NULL,'result history model','http://127.0.0.1','test',decode(
 	history := f.routeHistoryForActor(t, f.ownerID)
 	resultFound, requestFound := false, false
 	for _, message := range history {
-		if message.MessageID == resultMessageID && message.Content == resultReviewTestReply {
+		if message.MessageID == resultMessageID && message.Content == resultReviewTestReceipt([]resultAggregationTask{result}, app.TaskValidationPending) {
 			resultFound = true
 		}
 		if message.MessageID == result.UserMessageID && message.Content == "summarize the synthetic launch risks" {
@@ -722,7 +862,7 @@ func TestConversationResultAggregationPreservesLargeResultsAcrossReviews(t *test
 	if err := f.store.pool.QueryRow(ctx, `SELECT
  (SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant' AND content=$2),
  (SELECT count(*) FROM conversation_result_sources WHERE conversation_id=$3 AND octet_length(content)=20000)`,
-		f.conversation.ID, resultReviewTestReply, f.conversation.ID).Scan(&messages, &exactResults); err != nil || messages != 2 || exactResults != 2 {
+		f.conversation.ID, "结果摘要（主助手整理，不代表独立验收）：%", f.conversation.ID).Scan(&messages, &exactResults); err != nil || messages != 2 || exactResults != 2 {
 		t.Fatalf("large results were not kept separate from reviewed replies: replies=%d exact sources=%d err=%v", messages, exactResults, err)
 	}
 }
