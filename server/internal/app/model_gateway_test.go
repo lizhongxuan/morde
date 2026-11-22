@@ -588,6 +588,68 @@ func TestCoordinatorGatewayPreservesTextOnlyClassificationAndSettledOutput(t *te
 	}
 }
 
+type coordinatorRouteSettlementStoreTest struct {
+	*routeGatewayStoreTest
+	settleCalls int
+}
+
+func (s *coordinatorRouteSettlementStoreTest) SettleConversationRouteModelCall(ctx context.Context,
+	call ModelCallReservation, decision *ConversationRouteDecision, usage ModelUsage, unknown bool) error {
+	s.settleCalls++
+	return s.routeGatewayStoreTest.SettleConversationRouteModelCall(ctx, call, decision, usage, unknown)
+}
+
+func TestCoordinatorGatewayLeavesConfirmedRateLimitForAtomicRecovery(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	route, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame := dshModelRequest{Provider: "morde", Model: value.ModelID, MaxTokens: &route.MaxOutputTokens,
+		Messages: []dshModelMessage{
+			{Role: "system", Content: []dshModelBlock{{Type: "text", Text: strings.TrimSpace(mordeSoulFile) + "\n\n" + route.Instructions}}},
+			{Role: "user", Content: []dshModelBlock{{Type: "text", Text: route.Input[0].Text}}},
+		}, Tools: []dshModelTool{}}
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name            string
+		callErr         error
+		wantRateLimited bool
+		wantSettleCalls int
+		wantUnknown     bool
+	}{
+		{name: "confirmed provider rejection", callErr: &ModelClientError{Kind: ModelErrorRateLimited,
+			Stage: "provider_status", RetryAfter: 5 * time.Second}, wantRateLimited: true},
+		{name: "uncertain transport failure", callErr: errors.New("provider unavailable"),
+			wantSettleCalls: 1, wantUnknown: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &coordinatorRouteSettlementStoreTest{routeGatewayStoreTest: &routeGatewayStoreTest{
+				modelGatewayStoreTest: &modelGatewayStoreTest{},
+			}}
+			client := &modelGatewayClientTest{err: test.callErr}
+			service, err := NewModelGatewayService(store, &modelGatewayResolverTest{personal: true}, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = service.CompleteConversationCoordinatorModel(context.Background(), claim, value,
+				"coord_session_12345678", 0, raw)
+			if err == nil || (test.wantRateLimited && domain.CodeOf(err) != domain.CodeRateLimited) {
+				t.Fatalf("coordinator model error = %v, want rate-limited=%t", err, test.wantRateLimited)
+			}
+			if client.calls != 1 || store.begins != 1 || store.settleCalls != test.wantSettleCalls ||
+				store.unknown != test.wantUnknown {
+				t.Fatalf("coordinator settlement calls=%d unknown=%t begins=%d, want calls=%d unknown=%t begins=1",
+					store.settleCalls, store.unknown, store.begins, test.wantSettleCalls, test.wantUnknown)
+			}
+		})
+	}
+}
+
 func TestCoordinatorGatewaySettlesKnownIncompleteOutputForBoundedRepair(t *testing.T) {
 	for _, test := range []struct {
 		name     string
