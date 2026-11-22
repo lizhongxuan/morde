@@ -828,7 +828,10 @@ func (e *CloudDSHExecutor) deliverPendingConversationMessages(ctx context.Contex
 }
 
 func (e *CloudDSHExecutor) deliverSupersedingMessages(ctx context.Context, fence app.AgentInstanceFence, input io.WriteCloser,
-	messages []app.AgentConversationMessage, seen map[string]string) error {
+	messages []app.AgentConversationMessage, seen map[string]string, supersedeSessionID, supersedeCallID string) error {
+	if !cloudDSHID.MatchString(supersedeSessionID) || !cloudDSHID.MatchString(supersedeCallID) {
+		return errors.New("superseding dsh call identity is invalid")
+	}
 	foundSteer := false
 	for _, message := range messages {
 		if !cloudDSHID.MatchString(message.ID) || (strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) ||
@@ -856,6 +859,8 @@ func (e *CloudDSHExecutor) deliverSupersedingMessages(ctx context.Context, fence
 			foundSteer = true
 			frame["version"] = 4
 			frame["supersede_active"] = true
+			frame["supersede_session_id"] = supersedeSessionID
+			frame["supersede_call_id"] = supersedeCallID
 		}
 		if err := writeCloudDSHFrame(ctx, input, frame); err != nil {
 			return err
@@ -866,6 +871,17 @@ func (e *CloudDSHExecutor) deliverSupersedingMessages(ctx context.Context, fence
 		return errors.New("superseded tool admission has no pending steer")
 	}
 	return nil
+}
+
+func (e *CloudDSHExecutor) writeCloudDSHChildAbort(ctx context.Context, fence app.AgentInstanceFence, input io.WriteCloser,
+	sessionID, callID, reason string) error {
+	if !cloudDSHID.MatchString(sessionID) || sessionID == fence.AgentSessionID || !cloudDSHID.MatchString(callID) ||
+		!utf8.ValidString(reason) || strings.ContainsRune(reason, '\x00') || strings.TrimSpace(reason) == "" || len(reason) > 1024 {
+		return errors.New("terminal dsh child failure is invalid")
+	}
+	return writeCloudDSHFrame(ctx, input, map[string]any{"type": "child_abort", "task_id": fence.TaskID,
+		"owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID, "generation": fence.AgentGeneration,
+		"authorization_version": fence.AuthorizationVersion, "session_id": sessionID, "call_id": callID, "reason": reason})
 }
 
 func (e *CloudDSHExecutor) admitToolCall(ctx context.Context, value task.Task, call app.ModelToolCall,
@@ -1333,13 +1349,15 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		defer seenDeliveriesMu.Unlock()
 		return e.deliverPendingMessagesOnce(deliveryCtx, fence, input, seenDeliveries)
 	}
-	deliverSupersedingMessages := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
+	deliverSupersedingMessages := func(deliveryCtx context.Context, messages []app.AgentConversationMessage,
+		supersedeSessionID, supersedeCallID string) error {
 		seenDeliveriesMu.Lock()
 		defer seenDeliveriesMu.Unlock()
-		return e.deliverSupersedingMessages(deliveryCtx, fence, input, messages, seenDeliveries)
+		return e.deliverSupersedingMessages(deliveryCtx, fence, input, messages, seenDeliveries, supersedeSessionID, supersedeCallID)
 	}
-	supersedeToolCall := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
-		if err := deliverSupersedingMessages(deliveryCtx, messages); err != nil {
+	supersedeToolCall := func(deliveryCtx context.Context, messages []app.AgentConversationMessage,
+		supersedeSessionID, supersedeCallID string) error {
+		if err := deliverSupersedingMessages(deliveryCtx, messages, supersedeSessionID, supersedeCallID); err != nil {
 			return errors.New("superseded dsh tool call could not deliver its task input")
 		}
 		return nil
@@ -1678,7 +1696,10 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return errCloudDSHPersonalMemoryChanged
 				}
 			}
-			superseded, err := e.createCloudDSHChildSession(ctx, value, fence, frame, states, baseDefinitions, input, supersedeToolCall)
+			supersedeChildCreate := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
+				return supersedeToolCall(deliveryCtx, messages, frame.SessionID, frame.CallID)
+			}
+			superseded, err := e.createCloudDSHChildSession(ctx, value, fence, frame, states, baseDefinitions, input, supersedeChildCreate)
 			if err != nil {
 				return err
 			}
@@ -1953,7 +1974,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return errors.New("dsh job cancel result admission could not be confirmed")
 			}
 			if admission.Status == app.AgentToolCallSuperseded {
-				if err := supersedeToolCall(ctx, admission.PendingMessages); err != nil {
+				if err := supersedeToolCall(ctx, admission.PendingMessages, pending.session.identity.SessionID, pending.frame.CallID); err != nil {
 					return err
 				}
 				continue
@@ -2051,7 +2072,15 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			switch admission.Status {
 			case app.AgentToolCallAdmitted:
 			case app.AgentToolCallSuperseded:
-				if err := supersedeToolCall(ctx, admission.PendingMessages); err != nil {
+				if err := supersedeToolCall(ctx, admission.PendingMessages, state.identity.SessionID, frame.CallID); err != nil {
+					return err
+				}
+				continue
+			case app.AgentToolCallBaselineUnverifiable:
+				if state.identity.SessionID == rootIdentity.SessionID || admission.Reason == "" {
+					return errors.New("dsh baseline-unverifiable admission is not a child call")
+				}
+				if err := e.writeCloudDSHChildAbort(ctx, fence, input, state.identity.SessionID, frame.CallID, admission.Reason); err != nil {
 					return err
 				}
 				continue
@@ -2100,7 +2129,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 						immediate, pending, jobID, cancelErr := e.cancelCloudDSHJob(ctx, fence, rootIdentity.SessionID, frame.CallID, frame.Arguments)
 						if cancelErr != nil {
 							if messages, superseded := cloudDSHTaskInputPendingMessages(cancelErr); superseded {
-								if err := supersedeToolCall(ctx, messages); err != nil {
+								if err := supersedeToolCall(ctx, messages, state.identity.SessionID, frame.CallID); err != nil {
 									return err
 								}
 								continue
@@ -2147,7 +2176,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return errors.New("dsh tool execution could not be confirmed")
 			}
 			if result.Status == app.AgentToolSuperseded {
-				if err := supersedeToolCall(ctx, result.SupersedingMessages); err != nil {
+				if err := supersedeToolCall(ctx, result.SupersedingMessages, state.identity.SessionID, frame.CallID); err != nil {
 					return err
 				}
 				continue
@@ -2163,12 +2192,16 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return errors.New("dsh tool result admission could not be confirmed")
 			}
 			if resultAdmission.Status == app.AgentToolCallSuperseded {
-				if err := supersedeToolCall(ctx, resultAdmission.PendingMessages); err != nil {
+				if err := supersedeToolCall(ctx, resultAdmission.PendingMessages, state.identity.SessionID, frame.CallID); err != nil {
 					return err
 				}
 				continue
 			}
-			if resultAdmission.Status != app.AgentToolCallAdmitted {
+			terminalChildFailure := ""
+			if resultAdmission.Status == app.AgentToolCallBaselineUnverifiable && state.identity.SessionID != rootIdentity.SessionID {
+				terminalChildFailure = resultAdmission.Reason
+			}
+			if resultAdmission.Status != app.AgentToolCallAdmitted && terminalChildFailure == "" {
 				return errors.New("dsh tool result admission returned an unsupported result")
 			}
 			if result.Status != app.AgentToolSucceeded && result.Status != app.AgentToolFailed {
@@ -2196,6 +2229,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				"generation": state.identity.Generation, "authorization_version": state.identity.AuthorizationVersion,
 				"session_id": state.identity.SessionID, "call_id": frame.CallID, "status": result.Status, "output": result.Output, "images": toolImages}); err != nil {
 				return err
+			}
+			if terminalChildFailure != "" {
+				if err := e.writeCloudDSHChildAbort(ctx, fence, input, state.identity.SessionID, frame.CallID, terminalChildFailure); err != nil {
+					return err
+				}
 			}
 		default:
 			return errors.New("unsupported dsh frame")

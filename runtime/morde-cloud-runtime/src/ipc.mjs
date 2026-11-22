@@ -237,12 +237,13 @@ export class WorkerIPC {
       if (frame.initial_message) {
         this.messageDeliveries.set(frame.initial_message.message_id,
           { signature: JSON.stringify([frame.initial_message.content, frame.initial_message.attachment_ids ?? [], 'followup']),
-            supersedeActive: false })
+            supersedeActive: false, supersedeTargets: new Map() })
       }
       if (Array.isArray(frame.revision_messages)) {
         for (const message of frame.revision_messages) {
           this.messageDeliveries.set(message.message_id,
-            { signature: JSON.stringify([message.content, message.attachment_ids ?? [], 'followup']), supersedeActive: false })
+            { signature: JSON.stringify([message.content, message.attachment_ids ?? [], 'followup']),
+              supersedeActive: false, supersedeTargets: new Map() })
         }
       }
       this.start.resolve(frame)
@@ -273,20 +274,46 @@ export class WorkerIPC {
       const previous = this.messageDeliveries.get(frame.message_id)
       if (previous !== undefined) {
         if (previous.signature !== signature) throw new Error('message delivery id conflicts with prior content or mode')
-        if (supersedeActive && !previous.supersedeActive) {
+        const priorTargetCallID = previous.supersedeTargets.get(frame.supersede_session_id)
+        if (supersedeActive && priorTargetCallID !== undefined && priorTargetCallID !== frame.supersede_call_id) {
+          throw new Error('superseding message target call identity changed')
+        }
+        const newSupersedeTarget = supersedeActive && priorTargetCallID === undefined
+        if (newSupersedeTarget) {
+          const supersedeRoot = !previous.supersedeActive
           previous.supersedeActive = true
+          previous.supersedeTargets.set(frame.supersede_session_id, frame.supersede_call_id)
           const delivery = { message_id: frame.message_id, content: frame.content, attachment_ids: [...attachmentIDs], mode,
-            supersede_active: true }
+            supersede_active: true, supersede_session_id: frame.supersede_session_id,
+            supersede_call_id: frame.supersede_call_id, supersede_root: supersedeRoot }
           if (this.messageDeliveryHandler) this.messageDeliveryHandler(delivery)
           else this.pendingMessageDeliveries.push(delivery)
         }
         return
       }
-      this.messageDeliveries.set(frame.message_id, { signature, supersedeActive })
+      this.messageDeliveries.set(frame.message_id, { signature, supersedeActive,
+        supersedeTargets: supersedeActive ? new Map([[frame.supersede_session_id, frame.supersede_call_id]]) : new Map() })
       const delivery = { message_id: frame.message_id, content: frame.content, attachment_ids: [...attachmentIDs], mode,
-        ...(supersedeActive ? { supersede_active: true } : {}) }
+        ...(supersedeActive ? { supersede_active: true, supersede_session_id: frame.supersede_session_id,
+          supersede_call_id: frame.supersede_call_id, supersede_root: true } : {}) }
       if (this.messageDeliveryHandler) this.messageDeliveryHandler(delivery)
       else this.pendingMessageDeliveries.push(delivery)
+      return
+    }
+    if (frame.type === 'child_abort') {
+      const keys = ['agent_id', 'authorization_version', 'call_id', 'generation', 'owner_id', 'reason', 'session_id', 'task_id', 'type']
+      const rootFence = Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version']
+        .map(key => [key, this.startFrame[key]]))
+      if (this.cancelled || this.startFrame.context_role || !exactKeys(frame, keys) ||
+          !Object.entries(rootFence).every(([key, value]) => frame[key] === value) ||
+          typeof frame.session_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(frame.session_id) ||
+          frame.session_id === this.startFrame.session_id || typeof frame.call_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(frame.call_id) ||
+          typeof frame.reason !== 'string' || !frame.reason.isWellFormed() || frame.reason.includes('\0') ||
+          Buffer.byteLength(frame.reason, 'utf8') < 1 || Buffer.byteLength(frame.reason, 'utf8') > 1024) {
+        throw new Error('invalid child cancellation request')
+      }
+      if (typeof this.onChildAbort !== 'function') throw new Error('child cancellation is unavailable')
+      this.onChildAbort({ session_id: frame.session_id, call_id: frame.call_id, reason: frame.reason })
       return
     }
     if (frame.type === 'job_cancel') {
