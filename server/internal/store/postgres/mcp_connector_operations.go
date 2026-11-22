@@ -133,6 +133,8 @@ func (s *Store) MarkMCPConnectorOperationDispatched(ctx context.Context, value a
 		return app.MCPConnectorOperation{}, domain.InvalidArgument("operation", "MCP connector operation fields are invalid")
 	}
 	var result app.MCPConnectorOperation
+	var inputPending bool
+	var supersedingMessages []app.AgentConversationMessage
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := lockMCPConnectorTaskLease(ctx, tx, value, leaseOwner); err != nil {
 			return err
@@ -159,6 +161,23 @@ func (s *Store) MarkMCPConnectorOperationDispatched(ctx context.Context, value a
 		if stored.Status != task.OperationPrepared {
 			return domain.NewError(domain.CodeConflict, "MCP connector operation is no longer prepared")
 		}
+		supersedingMessages, err = pendingTaskAgentToolMessagesForOperation(ctx, tx, value.TaskID, value.OwnerID, value.Key)
+		if err != nil {
+			return err
+		}
+		if len(supersedingMessages) != 0 {
+			if err := persistTaskAgentToolSupersession(ctx, tx, value.TaskID, value.OwnerID, value.Key, supersedingMessages); err != nil {
+				return err
+			}
+			if err := failPreparedAgentToolOperations(ctx, tx, value.TaskID, value.OwnerID, value.Key); err != nil {
+				return err
+			}
+			stored.Status = task.OperationFailed
+			stored.Result = app.TaskAgentToolSupersededOperationResult
+			result = stored
+			inputPending = true
+			return nil
+		}
 		if err := tx.QueryRow(ctx, `UPDATE task_mcp_connector_operations SET status='dispatched', updated_at=clock_timestamp()
 WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND COALESCE(connector_id, 'builtin:' || builtin_service)=$4 AND operation_key=$5 AND status='prepared' RETURNING updated_at`,
 			stored.ID, stored.TaskID, stored.OwnerID, stored.ConnectorID, stored.Key).Scan(&stored.UpdatedAt); err != nil {
@@ -171,6 +190,9 @@ WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND COALESCE(connector_id, 'builtin:'
 		result = stored
 		return nil
 	})
+	if err == nil && inputPending {
+		return result, app.NewTaskInputPendingError(supersedingMessages)
+	}
 	return result, err
 }
 

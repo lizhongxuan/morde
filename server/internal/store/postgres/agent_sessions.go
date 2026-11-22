@@ -33,17 +33,27 @@ func (s *Store) CreateAgentChildSession(ctx context.Context, request app.AgentCh
 	}
 	var result app.AgentChildSession
 	var replayed bool
+	var inputPending bool
+	var supersedingMessages []app.AgentConversationMessage
 	err = s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := lockCurrentAgentChildSessionTask(ctx, tx, fence); err != nil {
 			return err
 		}
 		var parentOfParent, parentStepID string
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(parent_session_id,''),COALESCE(step_id,'') FROM task_agent_sessions
+		if request.RootCheckpointThroughSequence < -1 {
+			return domain.InvalidArgument("child_session", "child root checkpoint baseline is invalid")
+		}
+		var parentRootThroughSequence int64
+		var parentRootBaselineKnown bool
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(parent_session_id,''),COALESCE(step_id,''),root_checkpoint_through_seq,root_checkpoint_baseline_known FROM task_agent_sessions
 WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR UPDATE`, fence.TaskID, fence.OwnerID, request.ParentSessionID).
-			Scan(&parentOfParent, &parentStepID); errors.Is(err, pgx.ErrNoRows) {
+			Scan(&parentOfParent, &parentStepID, &parentRootThroughSequence, &parentRootBaselineKnown); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeUnauthenticated, "parent Agent Session is unavailable")
 		} else if err != nil {
 			return fmt.Errorf("lock parent Agent Session: %w", err)
+		}
+		if request.RootCheckpointThroughSequence != parentRootThroughSequence {
+			return domain.NewError(domain.CodeConflict, "child root checkpoint baseline changed before spawn")
 		}
 		if request.ParentSessionID == fence.AgentSessionID {
 			if parentOfParent != "" {
@@ -68,13 +78,13 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR UPDATE`, fence.TaskID, fe
 		}
 		var existingStepID string
 		var existingRequestHash, existingAllowedTools []byte
-		if err := tx.QueryRow(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.step_id,s.checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
+		if err := tx.QueryRow(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.step_id,s.checkpoint_through_seq,s.root_checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
 s.is_background,s.cancel_requested_at IS NOT NULL,
 st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
 WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 AND s.spawn_key=$4
 			FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, request.ParentSessionID, request.SpawnKey).Scan(
-			&result.TaskID, &result.SessionID, &result.ParentSessionID, &result.SpawnKey, &existingStepID, &result.CheckpointThrough, &result.CheckpointDigest, &existingAllowedTools,
+			&result.TaskID, &result.SessionID, &result.ParentSessionID, &result.SpawnKey, &existingStepID, &result.CheckpointThrough, &result.RootCheckpointThroughSequence, &result.CheckpointDigest, &existingAllowedTools,
 			&result.Background, &result.CancelRequested,
 			&result.Step.Sequence, &result.Step.Kind, &result.Step.Status, &result.Step.Title, &result.Step.Summary,
 			&result.Step.CreatedAt); err == nil {
@@ -94,11 +104,39 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 AND s.spawn_key=
 			if result.Background != request.Background {
 				return domain.NewError(domain.CodeIdempotencyConflict, "child spawn key changed its execution mode")
 			}
+			if result.RootCheckpointThroughSequence != request.RootCheckpointThroughSequence {
+				return domain.NewError(domain.CodeIdempotencyConflict, "child spawn key changed its root checkpoint baseline")
+			}
 			result.Step.ID, result.Step.TaskID = existingStepID, fence.TaskID
 			replayed = true
 			return nil
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read existing child Agent Session: %w", err)
+		}
+		operationKey := app.AgentOperationKey(request.SpawnKey)
+		storedMessages, hasStoredSupersession, err := readTaskAgentToolSupersession(ctx, tx,
+			app.ModelTaskFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID}, operationKey)
+		if err != nil {
+			return err
+		}
+		if hasStoredSupersession {
+			inputPending = true
+			supersedingMessages = storedMessages
+			return nil
+		}
+		supersedingMessages, err = pendingTaskAgentToolMessagesForOperation(ctx, tx, fence.TaskID, fence.OwnerID, operationKey)
+		if err != nil {
+			return err
+		}
+		if len(supersedingMessages) != 0 {
+			if err := persistTaskAgentToolSupersession(ctx, tx, fence.TaskID, fence.OwnerID, operationKey, supersedingMessages); err != nil {
+				return err
+			}
+			inputPending = true
+			return nil
+		}
+		if !parentRootBaselineKnown {
+			return domain.NewError(domain.CodeInvalidState, "parent Agent Session has no trustworthy root checkpoint baseline")
 		}
 		var childCount int
 		if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_agent_sessions WHERE task_id=$1 AND parent_session_id IS NOT NULL`,
@@ -121,9 +159,9 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 AND s.spawn_key=
 VALUES ($1,$2,$3,'subagent','running',$4,$5) RETURNING created_at`, request.StepID, fence.TaskID, sequence, request.Title, request.Summary).Scan(&result.Step.CreatedAt); err != nil {
 			return fmt.Errorf("create child TaskStep: %w", err)
 		}
-		if _, err := tx.Exec(ctx, `INSERT INTO task_agent_sessions(task_id,owner_id,session_id,parent_session_id,step_id,spawn_key,request_hash,allowed_tools,is_background,task_revision)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,(SELECT current_revision FROM tasks WHERE id=$1))`, fence.TaskID, fence.OwnerID, request.SessionID, request.ParentSessionID,
-			request.StepID, request.SpawnKey, request.RequestHash, string(allowedTools), request.Background); err != nil {
+		if _, err := tx.Exec(ctx, `INSERT INTO task_agent_sessions(task_id,owner_id,session_id,parent_session_id,step_id,spawn_key,request_hash,allowed_tools,is_background,task_revision,root_checkpoint_through_seq,root_checkpoint_baseline_known)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,(SELECT current_revision FROM tasks WHERE id=$1),$10,true)`, fence.TaskID, fence.OwnerID, request.SessionID, request.ParentSessionID,
+			request.StepID, request.SpawnKey, request.RequestHash, string(allowedTools), request.Background, request.RootCheckpointThroughSequence); err != nil {
 			return fmt.Errorf("create child Agent Session: %w", err)
 		}
 		sequenceNumber, err := incrementTaskEventSequence(ctx, tx, fence.TaskID)
@@ -142,9 +180,13 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,(SELECT current_revision FROM tasks WH
 		result = app.AgentChildSession{TaskID: fence.TaskID, SessionID: request.SessionID, ParentSessionID: request.ParentSessionID, SpawnKey: request.SpawnKey,
 			Step: task.Step{ID: request.StepID, TaskID: fence.TaskID, Sequence: sequence, Kind: "subagent", Status: task.StepRunning,
 				Title: request.Title, Summary: request.Summary, CreatedAt: result.Step.CreatedAt},
-			CheckpointThrough: -1, AllowedTools: toolNames, Background: request.Background}
+			CheckpointThrough: -1, RootCheckpointThroughSequence: request.RootCheckpointThroughSequence,
+			AllowedTools: toolNames, Background: request.Background}
 		return nil
 	})
+	if err == nil && inputPending {
+		return app.AgentChildSession{}, false, app.NewTaskInputPendingError(supersedingMessages)
+	}
 	return result, replayed, err
 }
 
@@ -163,13 +205,13 @@ func (s *Store) GetAgentChildSession(ctx context.Context, fence app.AgentInstanc
 		var parentSessionID string
 		var stepStatus string
 		var allowedTools []byte
-		if err := tx.QueryRow(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
+		if err := tx.QueryRow(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.root_checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
 s.is_background,s.cancel_requested_at IS NOT NULL,
 st.id,st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
 WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3 AND s.parent_session_id=$4
 FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, actorSessionID).Scan(
-			&result.TaskID, &result.SessionID, &parentSessionID, &result.SpawnKey, &result.CheckpointThrough, &result.CheckpointDigest, &allowedTools,
+			&result.TaskID, &result.SessionID, &parentSessionID, &result.SpawnKey, &result.CheckpointThrough, &result.RootCheckpointThroughSequence, &result.CheckpointDigest, &allowedTools,
 			&result.Background, &result.CancelRequested,
 			&result.Step.ID, &result.Step.Sequence, &result.Step.Kind, &stepStatus, &result.Step.Title, &result.Step.Summary,
 			&result.Step.CreatedAt); errors.Is(err, pgx.ErrNoRows) {
@@ -203,7 +245,7 @@ func (s *Store) ListAgentChildSessions(ctx context.Context, fence app.AgentInsta
 		if err := lockCurrentAgentChildSessionTask(ctx, tx, fence); err != nil {
 			return err
 		}
-		rows, err := tx.Query(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
+		rows, err := tx.Query(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.root_checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
 s.is_background,s.cancel_requested_at IS NOT NULL,
 st.id,st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
@@ -217,7 +259,7 @@ ORDER BY st.sequence FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, fence.Age
 			var child app.AgentChildSession
 			var status string
 			var allowedTools []byte
-			if err := rows.Scan(&child.TaskID, &child.SessionID, &child.ParentSessionID, &child.SpawnKey, &child.CheckpointThrough, &child.CheckpointDigest,
+			if err := rows.Scan(&child.TaskID, &child.SessionID, &child.ParentSessionID, &child.SpawnKey, &child.CheckpointThrough, &child.RootCheckpointThroughSequence, &child.CheckpointDigest,
 				&allowedTools, &child.Background, &child.CancelRequested, &child.Step.ID, &child.Step.Sequence, &child.Step.Kind,
 				&status, &child.Step.Title, &child.Step.Summary, &child.Step.CreatedAt); err != nil {
 				return fmt.Errorf("scan child Agent Session: %w", err)
@@ -236,25 +278,27 @@ ORDER BY st.sequence FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, fence.Age
 	return result, err
 }
 
-func (s *Store) RequestAgentChildSessionCancel(ctx context.Context, fence app.AgentInstanceFence, sessionID string) (app.AgentChildSession, bool, error) {
-	if err := fence.Validate(); err != nil || sessionID == "" || sessionID == fence.AgentSessionID {
+func (s *Store) RequestAgentChildSessionCancel(ctx context.Context, fence app.AgentInstanceFence, sessionID, operationKey string) (app.AgentChildSession, bool, error) {
+	if err := fence.Validate(); err != nil || sessionID == "" || sessionID == fence.AgentSessionID || !validAgentToolOperationKey(operationKey) {
 		return app.AgentChildSession{}, false, domain.InvalidArgument("child_session", "background job cancellation is invalid")
 	}
 	var result app.AgentChildSession
 	var replayed bool
+	var inputPending bool
+	var supersedingMessages []app.AgentConversationMessage
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := lockCurrentAgentChildSessionTask(ctx, tx, fence); err != nil {
 			return err
 		}
 		var parentSessionID, stepStatus string
 		var allowedTools []byte
-		if err := tx.QueryRow(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
+		if err := tx.QueryRow(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.root_checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
 s.is_background,s.cancel_requested_at IS NOT NULL,
 st.id,st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
 WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3 AND s.parent_session_id=$4
 FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, fence.AgentSessionID).Scan(
-			&result.TaskID, &result.SessionID, &parentSessionID, &result.SpawnKey, &result.CheckpointThrough, &result.CheckpointDigest, &allowedTools,
+			&result.TaskID, &result.SessionID, &parentSessionID, &result.SpawnKey, &result.CheckpointThrough, &result.RootCheckpointThroughSequence, &result.CheckpointDigest, &allowedTools,
 			&result.Background, &result.CancelRequested, &result.Step.ID, &result.Step.Sequence, &result.Step.Kind, &stepStatus,
 			&result.Step.Title, &result.Step.Summary, &result.Step.CreatedAt); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeUnauthenticated, "background Agent Session is unavailable")
@@ -268,20 +312,54 @@ FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, fence.AgentSessionI
 		if !result.Background {
 			return domain.NewError(domain.CodeInvalidState, "Agent Session is not a background job")
 		}
-		if result.Step.Status != task.StepRunning {
-			if result.CancelRequested {
-				replayed = true
-				return nil
-			}
-			return domain.NewError(domain.CodeInvalidState, "background Agent Session is terminal")
+		mappedSessionID, mappingErr := taskAgentChildCancelOperationSession(ctx, tx, fence.TaskID, fence.OwnerID, operationKey)
+		if mappingErr != nil && !errors.Is(mappingErr, pgx.ErrNoRows) {
+			return mappingErr
 		}
-		if result.CancelRequested {
+		if mappingErr == nil {
+			if mappedSessionID != sessionID {
+				return domain.NewError(domain.CodeIdempotencyConflict, "background job cancel call was reused for a different job")
+			}
 			replayed = true
 			return nil
+		}
+		storedMessages, hasStoredSupersession, err := readTaskAgentToolSupersession(ctx, tx,
+			app.ModelTaskFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID}, operationKey)
+		if err != nil {
+			return err
+		}
+		if hasStoredSupersession {
+			inputPending = true
+			supersedingMessages = storedMessages
+			return nil
+		}
+		if result.CancelRequested {
+			if err := persistTaskAgentChildCancelOperation(ctx, tx, fence.TaskID, fence.OwnerID, operationKey, sessionID); err != nil {
+				return err
+			}
+			replayed = true
+			return nil
+		}
+		supersedingMessages, err = pendingTaskAgentToolMessagesForOperation(ctx, tx, fence.TaskID, fence.OwnerID, operationKey)
+		if err != nil {
+			return err
+		}
+		if len(supersedingMessages) != 0 {
+			if err := persistTaskAgentToolSupersession(ctx, tx, fence.TaskID, fence.OwnerID, operationKey, supersedingMessages); err != nil {
+				return err
+			}
+			inputPending = true
+			return nil
+		}
+		if result.Step.Status != task.StepRunning {
+			return domain.NewError(domain.CodeInvalidState, "background Agent Session is terminal")
 		}
 		if _, err := tx.Exec(ctx, `UPDATE task_agent_sessions SET cancel_requested_at=clock_timestamp()
 WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 AND cancel_requested_at IS NULL`, fence.TaskID, fence.OwnerID, sessionID); err != nil {
 			return fmt.Errorf("request background Agent cancellation: %w", err)
+		}
+		if err := persistTaskAgentChildCancelOperation(ctx, tx, fence.TaskID, fence.OwnerID, operationKey, sessionID); err != nil {
+			return err
 		}
 		result.CancelRequested = true
 		sequenceNumber, err := incrementTaskEventSequence(ctx, tx, fence.TaskID)
@@ -299,7 +377,35 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 AND cancel_requested_at IS NU
 		}
 		return nil
 	})
+	if err == nil && inputPending {
+		return app.AgentChildSession{}, false, app.NewTaskInputPendingError(supersedingMessages)
+	}
 	return result, replayed, err
+}
+
+func taskAgentChildCancelOperationSession(ctx context.Context, tx pgx.Tx, taskID, ownerID, operationKey string) (string, error) {
+	var sessionID string
+	if err := tx.QueryRow(ctx, `SELECT session_id FROM task_agent_child_cancel_operations
+WHERE task_id=$1 AND owner_id=$2 AND operation_key=$3`, taskID, ownerID, operationKey).Scan(&sessionID); err != nil {
+		return "", err
+	}
+	return sessionID, nil
+}
+
+func persistTaskAgentChildCancelOperation(ctx context.Context, tx pgx.Tx, taskID, ownerID, operationKey, sessionID string) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO task_agent_child_cancel_operations(task_id,owner_id,operation_key,session_id)
+VALUES ($1,$2,$3,$4) ON CONFLICT (task_id,operation_key) DO NOTHING`, taskID, ownerID, operationKey, sessionID); err != nil {
+		return fmt.Errorf("record durable background Agent cancellation call: %w", err)
+	}
+	var storedSessionID string
+	if err := tx.QueryRow(ctx, `SELECT session_id FROM task_agent_child_cancel_operations
+WHERE task_id=$1 AND owner_id=$2 AND operation_key=$3`, taskID, ownerID, operationKey).Scan(&storedSessionID); err != nil {
+		return fmt.Errorf("verify durable background Agent cancellation call: %w", err)
+	}
+	if storedSessionID != sessionID {
+		return domain.NewError(domain.CodeIdempotencyConflict, "background job cancel call was reused for a different job")
+	}
+	return nil
 }
 
 // requestActiveTaskAgentChildCancellations records cancellation intent for all
@@ -429,13 +535,13 @@ func (s *Store) SettleAgentChildSession(ctx context.Context, fence app.AgentInst
 		}
 		var parentSessionID, stepStatus string
 		var allowedTools []byte
-		if err := tx.QueryRow(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
+		if err := tx.QueryRow(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.root_checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
 s.is_background,s.cancel_requested_at IS NOT NULL,
 st.id,st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
 WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3 AND s.parent_session_id=$4
 FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, actorSessionID).Scan(
-			&result.TaskID, &result.SessionID, &parentSessionID, &result.SpawnKey, &result.CheckpointThrough, &result.CheckpointDigest, &allowedTools,
+			&result.TaskID, &result.SessionID, &parentSessionID, &result.SpawnKey, &result.CheckpointThrough, &result.RootCheckpointThroughSequence, &result.CheckpointDigest, &allowedTools,
 			&result.Background, &result.CancelRequested,
 			&result.Step.ID, &result.Step.Sequence, &result.Step.Kind, &stepStatus, &result.Step.Title, &result.Step.Summary,
 			&result.Step.CreatedAt); errors.Is(err, pgx.ErrNoRows) {

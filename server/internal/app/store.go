@@ -186,6 +186,7 @@ const (
 	TaskWorkspacePublishSucceeded     TaskWorkspacePublishState = "succeeded"
 	TaskWorkspacePublishConflict      TaskWorkspacePublishState = "conflict"
 	TaskWorkspacePublishQuotaRejected TaskWorkspacePublishState = "quota_rejected"
+	TaskWorkspacePublishSuperseded    TaskWorkspacePublishState = "superseded"
 )
 
 type TaskWorkspacePublishCommand struct {
@@ -206,6 +207,7 @@ type TaskWorkspacePublishReceipt struct {
 	ManifestSHA256        string
 	RequestHash           string
 	DirectDirectorySource bool
+	SupersedingMessages   []AgentConversationMessage
 }
 
 // WorkspaceSyncStore owns durable manifests, change cursors, and resumable

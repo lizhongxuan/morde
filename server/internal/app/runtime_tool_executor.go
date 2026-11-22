@@ -872,6 +872,8 @@ func (e *RuntimeToolExecutor) Verify(ctx context.Context, request AgentVerificat
 				return workspaceInputChangedVerification(), nil
 			case TaskWorkspacePublishQuotaRejected:
 				return workspacePublishQuotaVerification(), nil
+			case TaskWorkspacePublishSuperseded:
+				return AgentVerificationResult{}, taskWorkspacePublishReceiptPendingError(receipt)
 			case TaskWorkspacePublishPending:
 			default:
 				return unknownAgentVerification("The Task Workspace publish receipt is invalid."), nil
@@ -887,7 +889,10 @@ func (e *RuntimeToolExecutor) Verify(ctx context.Context, request AgentVerificat
 			}
 			return unknownAgentVerification("The file evidence belongs to an inactive or changed Workspace binding."), nil
 		}
-		result := e.verifyFileEvidenceGroup(ctx, session, current, fence, request.StepID, group)
+		result, verifyErr := e.verifyFileEvidenceGroup(ctx, session, current, fence, request.StepID, group)
+		if verifyErr != nil {
+			return AgentVerificationResult{}, verifyErr
+		}
 		if result.Status != AgentVerified {
 			return result, nil
 		}
@@ -1028,6 +1033,8 @@ func (e *RuntimeToolExecutor) VerifyTaskWorkspaceOutput(ctx context.Context, cla
 			return workspaceInputChangedVerification(), nil
 		case TaskWorkspacePublishQuotaRejected:
 			return workspacePublishQuotaVerification(), nil
+		case TaskWorkspacePublishSuperseded:
+			return AgentVerificationResult{}, taskWorkspacePublishReceiptPendingError(receipt)
 		case TaskWorkspacePublishPending:
 			if receipt.BaseRevision != *current.WorkspaceCheckpointRevision {
 				return unknownAgentVerification("The pending Task Workspace receipt no longer matches the active checkpoint."), nil
@@ -1057,7 +1064,7 @@ func (e *RuntimeToolExecutor) VerifyTaskWorkspaceOutput(ctx context.Context, cla
 		return AgentVerificationResult{Status: AgentNotVerified, Summary: "The Host Task Workspace has no new or modified deliverable files."}, nil
 	}
 	result := AgentVerificationResult{Status: AgentVerified, Artifacts: artifacts}
-	return e.publishWorkspaceArtifacts(ctx, session, current, fence, stepID, group, result), nil
+	return e.publishWorkspaceArtifacts(ctx, session, current, fence, stepID, group, result)
 }
 
 func (e *RuntimeToolExecutor) successfulShellExecCompletion(ctx context.Context, current task.Task, inputs []ModelInput, expectedBaseRevision int64) (int64, bool) {
@@ -1128,21 +1135,21 @@ func (e *RuntimeToolExecutor) successfulShellExecCompletion(ctx context.Context,
 	return bindingVersion, bindingVersion > 0
 }
 
-func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, session *RuntimeSession, current task.Task, fence AgentHostFence, stepID string, group runtimeFileEvidenceGroup) AgentVerificationResult {
+func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, session *RuntimeSession, current task.Task, fence AgentHostFence, stepID string, group runtimeFileEvidenceGroup) (AgentVerificationResult, error) {
 	arguments, err := json.Marshal(struct {
 		Files []AgentFileEvidence `json:"files"`
 	}{Files: group.files})
 	if err != nil {
-		return unknownAgentVerification("The Workspace file verification request is invalid.")
+		return unknownAgentVerification("The Workspace file verification request is invalid."), nil
 	}
 	operationKey := runtimeVerificationOperationKey(stepID, group.workspaceID, group.bindingVersion)
 	requestHash, err := agentOperationHash(runtimeFileVerifyCapability+"/"+runtimeFileVerifyAction, arguments)
 	if err != nil || operationKey == "" {
-		return unknownAgentVerification("The Workspace file verification identity is invalid.")
+		return unknownAgentVerification("The Workspace file verification identity is invalid."), nil
 	}
 	operationID, err := domain.NewOperationID()
 	if err != nil {
-		return unknownAgentVerification("The file verification operation could not be registered.")
+		return unknownAgentVerification("The file verification operation could not be registered."), nil
 	}
 	persisted, replayed, err := e.store.CreateOperation(ctx, task.Operation{
 		ID: operationID, TaskID: current.ID, Key: operationKey, RequestHash: requestHash[:], HostID: current.HostID,
@@ -1155,20 +1162,20 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 	if err != nil {
 		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
 			return AgentVerificationResult{Status: AgentVerifyUnknown, WaitingReason: "workspace_input_changed",
-				Summary: "Workspace changed after this task was submitted."}
+				Summary: "Workspace changed after this task was submitted."}, nil
 		}
-		return unknownAgentVerification("The file verification operation could not be registered.")
+		return unknownAgentVerification("The file verification operation could not be registered."), nil
 	}
 	if persisted.TaskID != current.ID || persisted.Key != operationKey || persisted.HostID != current.HostID ||
 		persisted.WorkspaceID != group.workspaceID || persisted.BindingVersion != group.bindingVersion ||
 		!bytes.Equal(persisted.RequestHash, requestHash[:]) {
-		return unknownAgentVerification("The registered file verification operation does not match this Workspace binding.")
+		return unknownAgentVerification("The registered file verification operation does not match this Workspace binding."), nil
 	}
 	if replayed {
 		if persisted.Status == task.OperationSucceeded || persisted.Status == task.OperationFailed {
 			if persisted.RuntimeGeneration != fence.RuntimeGeneration || persisted.RuntimeInstanceID != fence.RuntimeInstanceID ||
 				persisted.ControlVersion != fence.ControlVersion {
-				return unknownAgentVerification("The verification result belongs to a different Host control fence.")
+				return unknownAgentVerification("The verification result belongs to a different Host control fence."), nil
 			}
 			return e.publishWorkspaceArtifacts(ctx, session, current, fence, stepID, group, mapFileVerificationOperation(persisted, group.files))
 		}
@@ -1178,22 +1185,22 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 				LeaseVersion: current.Lease.Version, Status: task.OperationUnknown,
 			})
 			if err != nil {
-				return unknownAgentVerification("The dispatched file verification result could not be safely reconciled.")
+				return unknownAgentVerification("The dispatched file verification result could not be safely reconciled."), nil
 			}
 		}
 		if persisted.Status == task.OperationUnknown {
 			if persisted.LeaseVersion != current.Lease.Version || persisted.RuntimeLeaseVersion < 1 ||
 				persisted.RuntimeGeneration != fence.RuntimeGeneration || persisted.RuntimeInstanceID != fence.RuntimeInstanceID ||
 				persisted.ControlVersion != fence.ControlVersion {
-				return unknownAgentVerification("The unknown verification operation belongs to a different lease or Host fence.")
+				return unknownAgentVerification("The unknown verification operation belongs to a different lease or Host fence."), nil
 			}
 			if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt, current.WorkspaceID != ""); err != nil {
-				return unknownAgentVerification("The runtime task lease could not be synchronized for reconciliation.")
+				return unknownAgentVerification("The runtime task lease could not be synchronized for reconciliation."), nil
 			}
 			return e.reconcileFileVerificationOperation(ctx, session, current, fence, stepID, operationKey, persisted, group)
 		}
 		if persisted.Status != task.OperationPrepared {
-			return unknownAgentVerification("The file verification operation is in an unsupported state.")
+			return unknownAgentVerification("The file verification operation is in an unsupported state."), nil
 		}
 		if persisted.LeaseVersion != current.Lease.Version {
 			persisted, err = e.store.UpdateOperation(ctx, OperationUpdate{
@@ -1203,25 +1210,25 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 				RuntimeLeaseVersion: current.Lease.Version, AdoptPrepared: true, Status: task.OperationPrepared,
 			})
 			if err != nil {
-				return unknownAgentVerification("The prepared verification operation could not be adopted safely.")
+				return unknownAgentVerification("The prepared verification operation could not be adopted safely."), nil
 			}
 		} else if persisted.RuntimeGeneration != fence.RuntimeGeneration || persisted.RuntimeInstanceID != fence.RuntimeInstanceID ||
 			persisted.ControlVersion != fence.ControlVersion {
-			return unknownAgentVerification("The prepared verification operation belongs to a different Host fence.")
+			return unknownAgentVerification("The prepared verification operation belongs to a different Host fence."), nil
 		}
 	}
 	if current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
-		return unknownAgentVerification("The task lease is no longer active.")
+		return unknownAgentVerification("The task lease is no longer active."), nil
 	}
 	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt, current.WorkspaceID != ""); err != nil {
-		return unknownAgentVerification("The runtime task lease could not be synchronized.")
+		return unknownAgentVerification("The runtime task lease could not be synchronized."), nil
 	}
 	if _, err := e.store.UpdateOperation(ctx, OperationUpdate{
 		TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 		RuntimeGeneration: fence.RuntimeGeneration, RuntimeInstanceID: fence.RuntimeInstanceID,
 		ControlVersion: fence.ControlVersion, RuntimeLeaseVersion: current.Lease.Version, Status: task.OperationDispatched,
 	}); err != nil {
-		return unknownAgentVerification("The file verification operation could not pass its persisted fence.")
+		return unknownAgentVerification("The file verification operation could not pass its persisted fence."), nil
 	}
 	operationCtx, cancelOperation := context.WithCancel(ctx)
 	leaseKeeperDone := make(chan struct{})
@@ -1234,7 +1241,7 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 		<-leaseKeeperDone
 	}()
 	if group.viewID == "" || current.WorkspaceCheckpointRevision == nil {
-		return unknownAgentVerification("The Task Workspace checkpoint is unavailable.")
+		return unknownAgentVerification("The Task Workspace checkpoint is unavailable."), nil
 	}
 	operation, err := session.Execute(operationCtx, current.ID, persisted.ID, current.Lease.Version,
 		runtimeFileVerifyCapability, runtimeFileVerifyAction, arguments, group.workspaceID, group.bindingVersion,
@@ -1249,7 +1256,7 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 			TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner,
 			LeaseVersion: current.Lease.Version, Status: task.OperationUnknown,
 		})
-		return unknownAgentVerification("The runtime file verification result is unknown and will not be replayed.")
+		return unknownAgentVerification("The runtime file verification result is unknown and will not be replayed."), nil
 	}
 	switch operation.Status {
 	case runtimeclient.OperationSucceeded:
@@ -1258,14 +1265,14 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 				TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner,
 				LeaseVersion: current.Lease.Version, Status: task.OperationUnknown,
 			})
-			return unknownAgentVerification("The runtime returned an invalid file verification result.")
+			return unknownAgentVerification("The runtime returned an invalid file verification result."), nil
 		}
 		if _, err := e.store.UpdateOperation(ctx, OperationUpdate{
 			TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner,
 			LeaseVersion: current.Lease.Version, Status: task.OperationSucceeded,
 			ExternalID: operation.OperationID, Result: string(operation.Result),
 		}); err != nil {
-			return unknownAgentVerification("The file verification result could not be persisted.")
+			return unknownAgentVerification("The file verification result could not be persisted."), nil
 		}
 		persisted.Status = task.OperationSucceeded
 		persisted.ExternalID = operation.OperationID
@@ -1276,15 +1283,15 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 			TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner,
 			LeaseVersion: current.Lease.Version, Status: task.OperationFailed, ExternalID: operation.OperationID,
 		}); err != nil {
-			return unknownAgentVerification("The file verification failure could not be persisted.")
+			return unknownAgentVerification("The file verification failure could not be persisted."), nil
 		}
-		return AgentVerificationResult{Status: AgentNotVerified, Summary: "The runtime could not verify the requested files."}
+		return AgentVerificationResult{Status: AgentNotVerified, Summary: "The runtime could not verify the requested files."}, nil
 	default:
 		_, _ = e.store.UpdateOperation(ctx, OperationUpdate{
 			TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner,
 			LeaseVersion: current.Lease.Version, Status: task.OperationUnknown,
 		})
-		return unknownAgentVerification("The runtime file verification result is unknown.")
+		return unknownAgentVerification("The runtime file verification result is unknown."), nil
 	}
 }
 
@@ -1472,7 +1479,7 @@ func scheduledObservationResult(raw string) AgentVerificationResult {
 
 // reconcileFileVerificationOperation reads only the original runtime journal
 // row. It never dispatches or rearms an uncertain verification action.
-func (e *RuntimeToolExecutor) reconcileFileVerificationOperation(ctx context.Context, session *RuntimeSession, current task.Task, fence AgentHostFence, stepID, operationKey string, persisted task.Operation, group runtimeFileEvidenceGroup) AgentVerificationResult {
+func (e *RuntimeToolExecutor) reconcileFileVerificationOperation(ctx context.Context, session *RuntimeSession, current task.Task, fence AgentHostFence, stepID, operationKey string, persisted task.Operation, group runtimeFileEvidenceGroup) (AgentVerificationResult, error) {
 	operationCtx, cancelOperation := context.WithCancel(ctx)
 	leaseKeeperDone := make(chan struct{})
 	go func() {
@@ -1485,26 +1492,26 @@ func (e *RuntimeToolExecutor) reconcileFileVerificationOperation(ctx context.Con
 	}()
 	operation, err := e.operations.Get(operationCtx, session, current.ID, persisted.ID, persisted.RuntimeLeaseVersion)
 	if err != nil {
-		return unknownAgentVerification("The runtime could not confirm the original verification operation.")
+		return unknownAgentVerification("The runtime could not confirm the original verification operation."), nil
 	}
 	if !runtimeOperationMatchesTaskOperation(operation, current, persisted) {
-		return unknownAgentVerification("The runtime operation does not match its persisted Host and lease fence.")
+		return unknownAgentVerification("The runtime operation does not match its persisted Host and lease fence."), nil
 	}
 	operation, err = e.operations.Poll(operationCtx, session, current.ID, persisted.ID, persisted.RuntimeLeaseVersion, operation)
 	if err != nil || !runtimeOperationMatchesTaskOperation(operation, current, persisted) {
-		return unknownAgentVerification("The original runtime verification operation remains unknown.")
+		return unknownAgentVerification("The original runtime verification operation remains unknown."), nil
 	}
 	switch operation.Status {
 	case runtimeclient.OperationSucceeded:
 		if len(operation.Result) == 0 || len(operation.Result) > maxRuntimeToolResultBytes {
-			return unknownAgentVerification("The original runtime verification result is invalid.")
+			return unknownAgentVerification("The original runtime verification result is invalid."), nil
 		}
 		if _, err := e.store.UpdateOperation(ctx, OperationUpdate{
 			TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner,
 			LeaseVersion: current.Lease.Version, Status: task.OperationSucceeded,
 			ExternalID: operation.OperationID, Result: string(operation.Result),
 		}); err != nil {
-			return unknownAgentVerification("The reconciled file verification result could not be persisted.")
+			return unknownAgentVerification("The reconciled file verification result could not be persisted."), nil
 		}
 		persisted.Status = task.OperationSucceeded
 		persisted.ExternalID = operation.OperationID
@@ -1515,11 +1522,11 @@ func (e *RuntimeToolExecutor) reconcileFileVerificationOperation(ctx context.Con
 			TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner,
 			LeaseVersion: current.Lease.Version, Status: task.OperationFailed, ExternalID: operation.OperationID,
 		}); err != nil {
-			return unknownAgentVerification("The reconciled file verification failure could not be persisted.")
+			return unknownAgentVerification("The reconciled file verification failure could not be persisted."), nil
 		}
-		return AgentVerificationResult{Status: AgentNotVerified, Summary: "The runtime could not verify the requested files."}
+		return AgentVerificationResult{Status: AgentNotVerified, Summary: "The runtime could not verify the requested files."}, nil
 	default:
-		return unknownAgentVerification("The original runtime verification operation remains unknown.")
+		return unknownAgentVerification("The original runtime verification operation remains unknown."), nil
 	}
 }
 
@@ -1616,12 +1623,12 @@ func mapFileVerificationOperation(operation task.Operation, expected []AgentFile
 	}
 }
 
-func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, session *RuntimeSession, current task.Task, fence AgentHostFence, stepID string, group runtimeFileEvidenceGroup, result AgentVerificationResult) AgentVerificationResult {
+func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, session *RuntimeSession, current task.Task, fence AgentHostFence, stepID string, group runtimeFileEvidenceGroup, result AgentVerificationResult) (AgentVerificationResult, error) {
 	if result.Status != AgentVerified || len(result.Artifacts) == 0 {
-		return result
+		return result, nil
 	}
 	if current.InputRevision == nil || current.WorkspaceCheckpointRevision == nil || group.viewID == "" || group.workspaceID != current.WorkspaceID {
-		return unknownAgentVerification("The Task Workspace checkpoint is unavailable for publishing.")
+		return unknownAgentVerification("The Task Workspace checkpoint is unavailable for publishing."), nil
 	}
 	inputManifestSHA := hex.EncodeToString(current.ContextDigest)
 	operationKey := taskWorkspacePublishOperationKey(stepID, group.workspaceID)
@@ -1634,11 +1641,11 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 		InputRevision: *current.InputRevision, BaseRevision: *current.WorkspaceCheckpointRevision,
 	})
 	if err != nil || operationKey == "" {
-		return unknownAgentVerification("The Task Workspace publish request is invalid.")
+		return unknownAgentVerification("The Task Workspace publish request is invalid."), nil
 	}
 	requestHash, err := agentOperationHash("task.workspace.publish", requestArguments)
 	if err != nil {
-		return unknownAgentVerification("The Task Workspace publish request is invalid.")
+		return unknownAgentVerification("The Task Workspace publish request is invalid."), nil
 	}
 	command := TaskWorkspacePublishCommand{
 		OwnerID: current.OwnerID, TaskID: current.ID, WorkspaceID: group.workspaceID, HostID: current.HostID,
@@ -1650,41 +1657,44 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 	}
 	liveDirectory, err := e.workspaces.UsesLiveDirectorySource(ctx, taskWorkspaceOwner(current), group.workspaceID)
 	if err != nil {
-		return taskWorkspacePublishErrorVerification(err)
+		return taskWorkspacePublishErrorVerification(err), nil
 	}
 	command.DirectDirectorySource = liveDirectory
 	receipt, err := e.workspaces.ReserveTaskWorkspacePublish(ctx, command)
 	if err != nil {
-		return taskWorkspacePublishErrorVerification(err)
+		return taskWorkspacePublishErrorVerification(err), nil
 	}
 	if receipt.State == TaskWorkspacePublishSucceeded {
 		artifacts, artifactErr := e.committedWorkspaceOutputArtifacts(ctx, current, group, receipt, result.Artifacts)
 		if artifactErr != nil {
-			return unknownAgentVerification("The committed Task Workspace output could not be compared with its fixed base revision.")
+			return unknownAgentVerification("The committed Task Workspace output could not be compared with its fixed base revision."), nil
 		}
 		if artifacts.Status != AgentVerified || len(artifacts.Artifacts) == 0 {
-			return artifacts
+			return artifacts, nil
 		}
 		result.Artifacts = artifacts.Artifacts
-		return e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, &result)
+		return e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, &result), nil
+	}
+	if receipt.State == TaskWorkspacePublishSuperseded {
+		return AgentVerificationResult{}, taskWorkspacePublishReceiptPendingError(receipt)
 	}
 	if receipt.State == TaskWorkspacePublishConflict {
-		return workspaceInputChangedVerification()
+		return workspaceInputChangedVerification(), nil
 	}
 	if receipt.State == TaskWorkspacePublishQuotaRejected {
-		return workspacePublishQuotaVerification()
+		return workspacePublishQuotaVerification(), nil
 	}
 	if liveDirectory {
 		live, snapshotErr := readWorkspaceLiveSnapshot(ctx, e.workspaces.currentDirectory, taskWorkspaceOwner(current), group.workspaceID, e.workspaces.maxOwnerBytes)
 		if snapshotErr != nil {
-			return taskWorkspacePublishErrorVerification(snapshotErr)
+			return taskWorkspacePublishErrorVerification(snapshotErr), nil
 		}
 		artifacts, artifactErr := e.workspaceOutputDeltaArtifacts(ctx, current, *current.WorkspaceCheckpointRevision, live.files, result.Artifacts)
 		if artifactErr != nil {
-			return unknownAgentVerification("The live Workspace output does not match durable file evidence.")
+			return unknownAgentVerification("The live Workspace output does not match durable file evidence."), nil
 		}
 		if len(artifacts) == 0 {
-			return AgentVerificationResult{Status: AgentNotVerified, Summary: "The Host Task Workspace has no new or modified deliverable files."}
+			return AgentVerificationResult{Status: AgentNotVerified, Summary: "The Host Task Workspace has no new or modified deliverable files."}, nil
 		}
 		result.Artifacts = artifacts
 		receipt, err = e.workspaces.CommitTaskWorkspacePublishDirect(ctx, command, live.files, live.emptyDirectories, live.directories,
@@ -1692,23 +1702,27 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 				return live.readBlock(e.workspaces.currentDirectory, taskWorkspaceOwner(current), group.workspaceID, digest)
 			})
 		if err != nil {
-			return taskWorkspacePublishErrorVerification(err)
+			var pending *TaskInputPendingError
+			if errors.As(err, &pending) {
+				return AgentVerificationResult{}, err
+			}
+			return taskWorkspacePublishErrorVerification(err), nil
 		}
-		return e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, &result)
+		return e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, &result), nil
 	}
 	if group.output == nil {
 		files, emptyDirectories, directories, manifestSHA, outputErr := taskWorkspaceOutputManifest(ctx, session, current, group)
 		if outputErr != nil {
-			return taskWorkspacePublishErrorVerification(outputErr)
+			return taskWorkspacePublishErrorVerification(outputErr), nil
 		}
 		group.output = &runtimeTaskWorkspaceOutput{files: files, emptyDirectories: emptyDirectories, directories: directories, manifestSHA256: manifestSHA}
 	}
 	artifacts, artifactErr := e.workspaceOutputDeltaArtifacts(ctx, current, *current.WorkspaceCheckpointRevision, group.output.files, result.Artifacts)
 	if artifactErr != nil {
-		return unknownAgentVerification("The Task Workspace output diff is invalid or exceeds artifact limits.")
+		return unknownAgentVerification("The Task Workspace output diff is invalid or exceeds artifact limits."), nil
 	}
 	if len(artifacts) == 0 {
-		return AgentVerificationResult{Status: AgentNotVerified, Summary: "The Host Task Workspace has no new or modified deliverable files."}
+		return AgentVerificationResult{Status: AgentNotVerified, Summary: "The Host Task Workspace has no new or modified deliverable files."}, nil
 	}
 	result.Artifacts = artifacts
 	receipt, err = e.workspaces.CommitTaskWorkspacePublish(ctx, command, group.output.files, group.output.emptyDirectories, group.output.directories, group.output.manifestSHA256, func(ctx context.Context, digest string) ([]byte, error) {
@@ -1719,9 +1733,20 @@ func (e *RuntimeToolExecutor) publishWorkspaceArtifacts(ctx context.Context, ses
 		return block.Data, nil
 	})
 	if err != nil {
-		return taskWorkspacePublishErrorVerification(err)
+		var pending *TaskInputPendingError
+		if errors.As(err, &pending) {
+			return AgentVerificationResult{}, err
+		}
+		return taskWorkspacePublishErrorVerification(err), nil
 	}
-	return e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, &result)
+	return e.verifyPublishedTaskWorkspaceArtifacts(ctx, session, current, group, receipt, &result), nil
+}
+
+func taskWorkspacePublishReceiptPendingError(receipt TaskWorkspacePublishReceipt) error {
+	if receipt.State != TaskWorkspacePublishSuperseded || len(receipt.SupersedingMessages) == 0 {
+		return domain.NewError(domain.CodeInvalidState, "superseded Task Workspace publish receipt has no input snapshot")
+	}
+	return NewTaskInputPendingError(receipt.SupersedingMessages)
 }
 
 func taskWorkspacePublishOperationKey(stepID, workspaceID string) string {

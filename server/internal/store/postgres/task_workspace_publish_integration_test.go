@@ -277,7 +277,7 @@ func TestTaskWorkspacePublishCommitsCheckpointAndBlocksNewOperations(t *testing.
 		t.Fatal("published receipt replay read Runtime output blocks")
 		return nil, nil
 	})
-	if err != nil || replayed != receipt || reads != 1 {
+	if err != nil || !reflect.DeepEqual(replayed, receipt) || reads != 1 {
 		t.Fatalf("idempotent publish replay = %#v, reads=%d, err=%v", replayed, reads, err)
 	}
 }

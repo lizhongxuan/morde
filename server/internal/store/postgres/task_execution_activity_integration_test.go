@@ -28,6 +28,8 @@ func TestPostgresTaskToolStepPersistsFencedDetailAndCascades(t *testing.T) {
 		t.Helper()
 		child, replayed, err := children.Create(ctx, app.AgentChildSessionCommand{
 			Fence: lease.Fence, ParentSessionID: lease.Fence.AgentSessionID, SpawnKey: spawnKey,
+			RootCheckpointThroughSequence: rootAgentCheckpointBaselineForTest(t, f.store, lease.Fence.TaskID,
+				lease.Fence.OwnerID, lease.Fence.AgentSessionID),
 			Arguments: []byte(`{"title":"Inspect workspace","objective":"read a file"}`),
 			Title:     "Inspect workspace", Summary: "Inspect the authorized workspace.", AllowedTools: []string{"file_read"},
 		})

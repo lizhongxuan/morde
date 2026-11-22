@@ -97,6 +97,14 @@ func TestPostgresAgentLifecycleRequiresVerifiedStopBeforeReplacement(t *testing.
 	if err != nil || replayed || first.Fence.AgentGeneration != 1 {
 		t.Fatalf("start first agent: lease=%+v replayed=%t err=%v", first, replayed, err)
 	}
+	var initialRootThrough int64
+	var initialRootBaselineKnown bool
+	if err := f.store.pool.QueryRow(ctx, `SELECT root_checkpoint_through_seq,root_checkpoint_baseline_known
+FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3`, first.Fence.TaskID, first.Fence.OwnerID,
+		first.Fence.AgentSessionID).Scan(&initialRootThrough, &initialRootBaselineKnown); err != nil ||
+		initialRootThrough != -1 || !initialRootBaselineKnown {
+		t.Fatalf("initial root session checkpoint baseline=%d known=%t err=%v; want -1/known", initialRootThrough, initialRootBaselineKnown, err)
+	}
 	var taskExpiry, authExpiry time.Time
 	if err := f.store.pool.QueryRow(ctx, `SELECT lease_expires_at,auth_expires_at FROM tasks WHERE id=$1`, first.Fence.TaskID).
 		Scan(&taskExpiry, &authExpiry); err != nil {
@@ -182,6 +190,14 @@ WHERE task_id=$1 AND session_id=$2`, first.Fence.TaskID, first.Fence.AgentSessio
 	second, replayed, err := f.service.Start(ctx, next)
 	if err != nil || replayed || second.Fence.AgentGeneration != 2 || second.Fence.AgentSessionID != first.Fence.AgentSessionID {
 		t.Fatalf("start replacement after verified stop: lease=%+v replayed=%t err=%v", second, replayed, err)
+	}
+	var restoredRootThrough int64
+	var restoredRootBaselineKnown bool
+	if err := f.store.pool.QueryRow(ctx, `SELECT root_checkpoint_through_seq,root_checkpoint_baseline_known
+FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3`, second.Fence.TaskID, second.Fence.OwnerID,
+		second.Fence.AgentSessionID).Scan(&restoredRootThrough, &restoredRootBaselineKnown); err != nil ||
+		restoredRootThrough != 0 || !restoredRootBaselineKnown {
+		t.Fatalf("restored root session checkpoint baseline=%d known=%t err=%v; want 0/known", restoredRootThrough, restoredRootBaselineKnown, err)
 	}
 	loaded, err := f.store.GetTask(ctx, first.Fence.TaskID, first.Fence.OwnerID)
 	if err != nil || loaded.Task.CheckpointThroughSequence != 0 || loaded.Task.AgentInstanceID != "agent-2" ||

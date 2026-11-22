@@ -123,11 +123,12 @@ const (
 )
 
 type AgentToolResult struct {
-	Status        AgentToolResultStatus
-	WaitingReason string
-	ExternalID    string
-	Output        string
-	Images        []ModelImage
+	Status              AgentToolResultStatus
+	WaitingReason       string
+	ExternalID          string
+	Output              string
+	Images              []ModelImage
+	SupersedingMessages []AgentConversationMessage
 }
 
 type AgentVerificationRequest struct {

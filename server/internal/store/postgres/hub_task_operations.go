@@ -111,7 +111,9 @@ func (s *Store) MarkTaskHubOperationDispatched(ctx context.Context, value app.Ta
 	if !validTaskHubOperationState(value) || !validTaskHubLeaseOwner(leaseOwner) {
 		return domain.InvalidArgument("operation", "Hub Task operation fields are invalid")
 	}
-	return s.WithTx(ctx, func(tx pgx.Tx) error {
+	var inputPending bool
+	var supersedingMessages []app.AgentConversationMessage
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		row, err := lockTaskHubOperationLease(ctx, tx, value, leaseOwner)
 		if err != nil {
 			return err
@@ -129,6 +131,20 @@ func (s *Store) MarkTaskHubOperationDispatched(ctx context.Context, value app.Ta
 		if stored.Status != task.OperationPrepared {
 			return domain.NewError(domain.CodeConflict, "Hub Task operation is no longer prepared")
 		}
+		supersedingMessages, err = pendingTaskAgentToolMessagesForOperation(ctx, tx, value.TaskID, value.OwnerID, value.Key)
+		if err != nil {
+			return err
+		}
+		if len(supersedingMessages) != 0 {
+			if err := persistTaskAgentToolSupersession(ctx, tx, value.TaskID, value.OwnerID, value.Key, supersedingMessages); err != nil {
+				return err
+			}
+			if err := failPreparedAgentToolOperations(ctx, tx, value.TaskID, value.OwnerID, value.Key); err != nil {
+				return err
+			}
+			inputPending = true
+			return nil
+		}
 		command, err := tx.Exec(ctx, `UPDATE task_hub_operations SET status='dispatched', updated_at=clock_timestamp()
 WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 AND lease_version=$4 AND status='prepared'`,
 			value.OwnerID, value.TaskID, value.Key, value.LeaseVersion)
@@ -140,6 +156,10 @@ WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3 AND lease_version=$4 AND s
 		}
 		return nil
 	})
+	if err == nil && inputPending {
+		return app.NewTaskInputPendingError(supersedingMessages)
+	}
+	return err
 }
 
 func (s *Store) CompleteTaskHubOperation(ctx context.Context, value app.TaskHubOperation, leaseOwner string,

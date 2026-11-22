@@ -69,8 +69,9 @@ func TestPostgresBackgroundAgentJobsListAndCancelFence(t *testing.T) {
 		t.Helper()
 		child, replayed, err := service.Create(ctx, app.AgentChildSessionCommand{
 			Fence: lease.Fence, ParentSessionID: lease.Fence.AgentSessionID, SpawnKey: spawnKey,
-			Arguments: []byte(`{"title":"Collect notes","objective":"read the workspace"}`),
-			Title:     "Collect notes", Summary: "safe child task", AllowedTools: []string{"workspace_read"}, Background: background,
+			RootCheckpointThroughSequence: rootAgentCheckpointBaselineForTest(t, store, claimed.ID, owner.ID, lease.Fence.AgentSessionID),
+			Arguments:                     []byte(`{"title":"Collect notes","objective":"read the workspace"}`),
+			Title:                         "Collect notes", Summary: "safe child task", AllowedTools: []string{"workspace_read"}, Background: background,
 		})
 		if err != nil || replayed || child.Step.Status != task.StepRunning || child.Background != background {
 			t.Fatalf("create child background=%t: child=%#v replayed=%t err=%v", background, child, replayed, err)
@@ -81,16 +82,18 @@ func TestPostgresBackgroundAgentJobsListAndCancelFence(t *testing.T) {
 	ordinary := create("ordinary_spawn", false)
 	replayedJob, replayed, err := service.Create(ctx, app.AgentChildSessionCommand{
 		Fence: lease.Fence, ParentSessionID: lease.Fence.AgentSessionID, SpawnKey: "job_spawn",
-		Arguments: []byte(`{"title":"Collect notes","objective":"read the workspace"}`),
-		Title:     "Collect notes", Summary: "safe child task", AllowedTools: []string{"workspace_read"}, Background: true,
+		RootCheckpointThroughSequence: rootAgentCheckpointBaselineForTest(t, store, claimed.ID, owner.ID, lease.Fence.AgentSessionID),
+		Arguments:                     []byte(`{"title":"Collect notes","objective":"read the workspace"}`),
+		Title:                         "Collect notes", Summary: "safe child task", AllowedTools: []string{"workspace_read"}, Background: true,
 	})
 	if err != nil || !replayed || replayedJob.SessionID != job.SessionID || replayedJob.SpawnKey != job.SpawnKey {
 		t.Fatalf("replay background job: job=%#v replayed=%t err=%v", replayedJob, replayed, err)
 	}
 	if _, _, err := service.Create(ctx, app.AgentChildSessionCommand{
 		Fence: lease.Fence, ParentSessionID: lease.Fence.AgentSessionID, SpawnKey: "job_spawn",
-		Arguments: []byte(`{"title":"Collect notes","objective":"read the workspace"}`),
-		Title:     "Collect notes", Summary: "safe child task", AllowedTools: []string{"workspace_read"}, Background: false,
+		RootCheckpointThroughSequence: rootAgentCheckpointBaselineForTest(t, store, claimed.ID, owner.ID, lease.Fence.AgentSessionID),
+		Arguments:                     []byte(`{"title":"Collect notes","objective":"read the workspace"}`),
+		Title:                         "Collect notes", Summary: "safe child task", AllowedTools: []string{"workspace_read"}, Background: false,
 	}); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
 		t.Fatalf("background job replay changed mode: %v", err)
 	}

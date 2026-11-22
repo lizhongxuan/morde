@@ -278,6 +278,18 @@ type TaskToolCallProgress struct {
 	Truncated             bool
 }
 
+// TaskAgentCompletionFence binds a terminal DSH result to the exact root
+// checkpoint that produced it. The store rechecks it while holding the Task
+// row lock before publishing the result.
+type TaskAgentCompletionFence struct {
+	AgentSessionID            string
+	AgentInstanceID           string
+	AgentGeneration           int64
+	AuthorizationVersion      int64
+	CheckpointThroughSequence int64
+	CheckpointDigest          []byte
+}
+
 type AssistantMessageStatus string
 
 const (
@@ -356,6 +368,7 @@ type TaskProgress struct {
 	ObservationFingerprint   string
 	Steps                    []task.Step
 	ToolCall                 *TaskToolCallProgress
+	AgentCompletionFence     *TaskAgentCompletionFence
 	Artifacts                []task.Artifact
 	Event                    task.Event
 	PendingRequest           *task.PendingRequest
