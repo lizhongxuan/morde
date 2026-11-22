@@ -30,6 +30,152 @@ type conversationContextScopedRuntimeControl struct {
 	leaseOwner string
 }
 
+const conversationContextCompletionSteer = "Please include the word BLUE in the answer."
+const conversationContextCompletionWriteCallID = "completion_race_write_once"
+const conversationContextCompletionWriteOutput = `{"bytes_written":10,"path":"notes.txt"}`
+
+type conversationContextCompletionRaceModel struct {
+	mu    sync.Mutex
+	calls []app.ModelCall
+}
+
+func (m *conversationContextCompletionRaceModel) Complete(_ context.Context, call app.ModelCall) (app.ModelResponse, error) {
+	m.mu.Lock()
+	m.calls = append(m.calls, call)
+	callNumber := len(m.calls)
+	m.mu.Unlock()
+	usage := app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 4}
+	if callNumber == 1 {
+		return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: conversationContextCompletionWriteCallID,
+			Name: "file_write", Arguments: `{"workspace_id":"w1234567","path":"notes.txt","content":"saved once"}`}},
+			StopReason: "tool_calls", Usage: usage}, nil
+	}
+	if callNumber == 2 {
+		if !strings.Contains(string(call.RawRequest), `"bytes_written"`) || !strings.Contains(string(call.RawRequest), `"notes.txt"`) {
+			return app.ModelResponse{}, errors.New("first completion request omitted the completed write result")
+		}
+		return app.ModelResponse{Text: "STALE COMPLETION RESULT", StopReason: "stop", Usage: usage}, nil
+	}
+	if callNumber != 3 || !strings.Contains(string(call.RawRequest), conversationContextCompletionSteer) ||
+		!strings.Contains(string(call.RawRequest), `"bytes_written"`) || !strings.Contains(string(call.RawRequest), `"notes.txt"`) {
+		return app.ModelResponse{}, fmt.Errorf("recovered model call did not receive the pending steer: call=%d", callNumber)
+	}
+	return app.ModelResponse{Text: "The revised answer includes BLUE.", StopReason: "stop", Usage: usage}, nil
+}
+
+func (m *conversationContextCompletionRaceModel) snapshot() []app.ModelCall {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]app.ModelCall(nil), m.calls...)
+}
+
+type conversationContextCompletionRaceTools struct {
+	mu         sync.Mutex
+	results    map[string]app.AgentToolResult
+	executions int
+	reconciles int
+}
+
+func (t *conversationContextCompletionRaceTools) Definitions(context.Context, task.Task) ([]app.AgentToolDefinition, error) {
+	return []app.AgentToolDefinition{cloudDSHWriteTool()}, nil
+}
+
+func (t *conversationContextCompletionRaceTools) AdmitToolCall(context.Context, task.Task, app.ModelToolCall,
+	bool) (app.AgentToolCallAdmission, error) {
+	return app.AgentToolCallAdmission{Status: app.AgentToolCallAdmitted}, nil
+}
+
+func (t *conversationContextCompletionRaceTools) Execute(_ context.Context, _ task.Task,
+	call app.ModelToolCall) (app.AgentToolResult, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if call.CallID != conversationContextCompletionWriteCallID || call.Name != "file_write" {
+		return app.AgentToolResult{}, fmt.Errorf("unexpected side-effecting call %q/%q", call.Name, call.CallID)
+	}
+	if t.results == nil {
+		t.results = make(map[string]app.AgentToolResult)
+	}
+	if result, exists := t.results[call.CallID]; exists {
+		return result, nil
+	}
+	t.executions++
+	result := app.AgentToolResult{Status: app.AgentToolSucceeded, Output: conversationContextCompletionWriteOutput}
+	t.results[call.CallID] = result
+	return result, nil
+}
+
+func (t *conversationContextCompletionRaceTools) Reconcile(_ context.Context, _ task.Task,
+	call app.ModelToolCall, _ *string) (app.AgentToolResult, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	result, exists := t.results[call.CallID]
+	if !exists {
+		return app.AgentToolResult{}, errors.New("side-effecting call has no durable result")
+	}
+	t.reconciles++
+	return result, nil
+}
+
+func (t *conversationContextCompletionRaceTools) PauseRecovery(context.Context, task.Task) error {
+	return nil
+}
+
+func (t *conversationContextCompletionRaceTools) snapshot() (executions, reconciles int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.executions, t.reconciles
+}
+
+type conversationContextCompletionGate struct {
+	inner   CloudDSHCompleter
+	started chan app.CloudDSHTaskCompletion
+	release chan struct{}
+	mu      sync.Mutex
+	calls   []app.CloudDSHTaskCompletion
+}
+
+func (c *conversationContextCompletionGate) Complete(ctx context.Context, value task.Task,
+	completion app.CloudDSHTaskCompletion) error {
+	c.mu.Lock()
+	c.calls = append(c.calls, completion)
+	callNumber := len(c.calls)
+	c.mu.Unlock()
+	if callNumber == 1 {
+		select {
+		case c.started <- completion:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return c.inner.Complete(ctx, value, completion)
+}
+
+type conversationContextSteerRouteClassifier struct{}
+
+func (conversationContextSteerRouteClassifier) ResolveConversationRouteModel(_ context.Context,
+	claim app.ConversationRouteClaim) (string, error) {
+	if claim.Input.ModelID == "" {
+		return "", errors.New("route has no model id")
+	}
+	return claim.Input.ModelID, nil
+}
+
+func (conversationContextSteerRouteClassifier) ClassifyConversationRoute(_ context.Context, _ app.ConversationRouteClaim,
+	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
+	for _, candidate := range value.Candidates {
+		if candidate.TaskID == value.ReferenceTaskID && candidate.Status == task.StatusRunning {
+			return app.ConversationRouteDecision{Action: app.ConversationRouteSteer, TaskID: candidate.TaskID,
+				ExpectedRevision: candidate.Revision}, nil
+		}
+	}
+	return app.ConversationRouteDecision{}, errors.New("referenced running Task is missing from route context")
+}
+
 func (c conversationContextScopedRuntimeControl) ListAccountAgentRuntimeStopCandidates(ctx context.Context, limit int) ([]app.AccountAgentRuntimeStopIdentity, error) {
 	candidates, err := c.CloudDSHAccountRuntimeControl.ListAccountAgentRuntimeStopCandidates(ctx, limit)
 	if err != nil {
@@ -57,6 +203,234 @@ func (c conversationContextScopedRuntimeControl) ListPendingAccountAgentRuntimeS
 		}
 	}
 	return scoped, nil
+}
+
+func TestCloudDSHCompletionRaceRecoversPendingSteerOnSameSession(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	store, pool := newF01TemporaryStore(t)
+	owner := createF01User(t, ctx, store)
+	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	audit, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(store, store, store, audit, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
+	}, f01DefaultHosts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := credentials.VerifySession(ctx, createF01Session(t, ctx, store, owner.ID))
+	if err != nil || principal.Kind != identity.KindSession {
+		t.Fatalf("verify session: principal=%+v err=%v", principal, err)
+	}
+	tasks, err := app.NewTaskService(store, credentials, f01ConfiguredModels{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clientMessageID = "completion-gate-initial"
+	submitted, err := tasks.Submit(ctx, principal, app.SubmitTaskCommand{
+		ClientMessageID: clientMessageID, ModelID: "p1234567", Objective: "Answer briefly.",
+		Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 4, ModelTokens: 2000}, IdempotencyKey: clientMessageID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	serviceInstanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountRuntimeControl, err := app.NewAccountAgentRuntimeService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, accountScript := f01NodeRuntimePaths(t)
+	sealer, err := app.NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const supervisorID = "completion-gate-supervisor"
+	runtimeStopVerifier, err := app.NewAccountAgentRuntimeGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisorAuth, err := app.NewAgentStopAuthenticator(supervisorID, make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	agentGuardianAuth, err := app.NewAgentGuardianStopAuthenticator(supervisorID, publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskGuardianAuth, err := app.NewAccountAgentTaskGuardianStopAuthenticator(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := app.NewAgentInstanceServiceWithGuardianStops(store, supervisorAuth, agentGuardianAuth, taskGuardianAuth)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	supervisor := &f01RecoveringNodeAccountSupervisor{
+		f01NodeAccountSupervisor: &f01NodeAccountSupervisor{node: node, script: accountScript},
+		recovery:                 &signedRuntimeRecoverySupervisor{accountRuntimeSupervisorStub: &accountRuntimeSupervisorStub{}, key: privateKey},
+	}
+	defer func() {
+		if command := supervisor.cmd; command != nil && command.Process != nil && command.ProcessState == nil {
+			_ = command.Process.Kill()
+			_ = command.Wait()
+		}
+	}()
+	runtimeManager, err := NewCloudDSHAccountRuntimeManager(CloudDSHAccountRuntimeManagerOptions{
+		Control: accountRuntimeControl, Supervisor: supervisor, Guardian: &f01SignedNodeTaskGuardian{key: privateKey},
+		StopVerifier: runtimeStopVerifier, TaskStopper: instances, LeaseOwner: "completion-gate-runtime", MaxTasks: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolBroker, err := app.NewCloudDSHToolBroker(store, &app.RuntimeToolExecutor{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	completionGate := &conversationContextCompletionGate{inner: toolBroker,
+		started: make(chan app.CloudDSHTaskCompletion, 1), release: make(chan struct{})}
+	model := &conversationContextCompletionRaceModel{}
+	tools := &conversationContextCompletionRaceTools{}
+	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
+		SupervisorID: supervisorID, SummarySealer: sealer, AccountRuntimes: runtimeManager, Instances: instances,
+		Checkpoints: checkpoints, Models: model, ToolCapabilities: cloudDSHTestToolCapability{allowed: true},
+		Tools: tools, Completion: completionGate,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskWorker, err := NewTaskWorker(TaskWorkerOptions{Store: store, Executor: executor, WorkerID: "completion-gate-worker",
+		LeaseDuration: 2 * time.Second, PollInterval: 10 * time.Millisecond, MaxConcurrentTasks: 1, MaxConcurrentTasksPerOwner: 1,
+		Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	workerDone := make(chan error, 1)
+	go func() { workerDone <- taskWorker.Run(workerCtx) }()
+	defer func() {
+		stopWorker()
+		select {
+		case runErr := <-workerDone:
+			if !errors.Is(runErr, context.Canceled) {
+				t.Errorf("TaskWorker.Run() = %v, want context canceled during cleanup", runErr)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("TaskWorker did not stop")
+		}
+	}()
+
+	var firstCompletion app.CloudDSHTaskCompletion
+	select {
+	case firstCompletion = <-completionGate.started:
+	case <-ctx.Done():
+		t.Fatalf("old Task completion did not reach its final gate: %v", ctx.Err())
+	}
+	if firstCompletion.Result != "STALE COMPLETION RESULT" {
+		t.Fatalf("final gate received %q, want stale pre-steer answer", firstCompletion.Result)
+	}
+	firstTask, err := store.GetTask(ctx, submitted.Task.ID, owner.ID)
+	if err != nil || firstTask.Task.Status != task.StatusRunning || firstTask.Task.Result != "" || firstTask.Task.AgentSessionID == "" {
+		t.Fatalf("old completion escaped before pending-input gate: status=%q result=%q session=%q err=%v",
+			firstTask.Task.Status, firstTask.Task.Result, firstTask.Task.AgentSessionID, err)
+	}
+	var staleReceipts int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE task_id=$1 AND role='assistant' AND content=$2`,
+		submitted.Task.ID, "STALE COMPLETION RESULT").Scan(&staleReceipts); err != nil || staleReceipts != 0 {
+		t.Fatalf("stale assistant receipt escaped the completion gate: count=%d err=%v", staleReceipts, err)
+	}
+	firstSessionID := firstTask.Task.AgentSessionID
+	steer, replayed, err := tasks.AcceptConversationMessage(ctx, principal, submitted.Conversation.ID,
+		app.AcceptConversationMessageCommand{ServiceInstanceID: serviceInstanceID, ClientMessageID: "completion-gate-steer",
+			PreviousClientMessageID: clientMessageID, ReferenceTaskID: submitted.Task.ID,
+			Content: conversationContextCompletionSteer, ModelID: submitted.Task.ModelID,
+			Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 4, ModelTokens: 2000}, IdempotencyKey: "completion-gate-steer"})
+	if err != nil || replayed {
+		t.Fatalf("accept completion-race steer: replayed=%t err=%v", replayed, err)
+	}
+	routeWorker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{Queue: store, Actions: store,
+		Models: conversationContextSteerRouteClassifier{}, WorkerID: "completion-gate-route-worker",
+		LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found, err := routeWorker.RunOnce(ctx); err != nil || !found {
+		t.Fatalf("route completion-race steer: found=%t err=%v", found, err)
+	}
+	var deliveryStatus, deliveryMode string
+	if err := pool.QueryRow(ctx, `SELECT delivery_status,delivery_mode FROM conversation_messages WHERE id=$1`, steer.ID).
+		Scan(&deliveryStatus, &deliveryMode); err != nil || deliveryStatus != "pending" || deliveryMode != string(app.AgentMessageDeliverySteer) {
+		t.Fatalf("steer was not pending at completion gate: status=%q mode=%q err=%v", deliveryStatus, deliveryMode, err)
+	}
+	close(completionGate.release)
+
+	deadline := time.NewTimer(45 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		completed, err := store.GetTask(ctx, submitted.Task.ID, owner.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if completed.Task.Status == task.StatusCompleted {
+			if completed.Task.Result != "The revised answer includes BLUE." || completed.Task.AgentSessionID != firstSessionID {
+				t.Fatalf("recovered completion = status %q result %q session %q; want revised result on same Session %q",
+					completed.Task.Status, completed.Task.Result, completed.Task.AgentSessionID, firstSessionID)
+			}
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("Task did not recover and complete: %v", ctx.Err())
+		case <-deadline.C:
+			t.Fatalf("Task did not recover and complete: status=%q result=%q", completed.Task.Status, completed.Task.Result)
+		case <-ticker.C:
+		}
+	}
+	if got := model.snapshot(); len(got) != 3 || got[0].Task == nil || got[1].Task == nil || got[2].Task == nil ||
+		got[0].Task.AgentSessionID != firstSessionID || got[1].Task.AgentSessionID != firstSessionID || got[2].Task.AgentSessionID != firstSessionID ||
+		!strings.Contains(string(got[2].RawRequest), conversationContextCompletionSteer) ||
+		!strings.Contains(string(got[2].RawRequest), conversationContextCompletionWriteOutput) {
+		t.Fatalf("Task recovery did not reuse the DSH Session and apply steer: model calls=%d", len(got))
+	}
+	if executions, reconciles := tools.snapshot(); executions != 1 {
+		t.Fatalf("recovery repeated or skipped the side effect: executions=%d reconciliations=%d", executions, reconciles)
+	}
+	completionGate.mu.Lock()
+	completionCalls := append([]app.CloudDSHTaskCompletion(nil), completionGate.calls...)
+	completionGate.mu.Unlock()
+	if len(completionCalls) != 2 || completionCalls[0].Result != "STALE COMPLETION RESULT" ||
+		completionCalls[1].Result != "The revised answer includes BLUE." {
+		t.Fatalf("completion deliveries = %#v; want stale attempt rejected, then revised result committed", completionCalls)
+	}
+	if err := pool.QueryRow(ctx, `SELECT delivery_status FROM conversation_messages WHERE id=$1`, steer.ID).Scan(&deliveryStatus); err != nil || deliveryStatus != "applied" {
+		t.Fatalf("recovered Session did not claim the steer: status=%q err=%v", deliveryStatus, err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE task_id=$1 AND role='assistant' AND content=$2`,
+		submitted.Task.ID, "STALE COMPLETION RESULT").Scan(&staleReceipts); err != nil || staleReceipts != 0 {
+		t.Fatalf("stale assistant receipt was committed during recovery: count=%d err=%v", staleReceipts, err)
+	}
+	var revisedReceipts int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE task_id=$1 AND role='assistant' AND content=$2`,
+		submitted.Task.ID, "The revised answer includes BLUE.").Scan(&revisedReceipts); err != nil || revisedReceipts != 1 {
+		t.Fatalf("revised assistant receipt count=%d err=%v; want exactly one", revisedReceipts, err)
+	}
 }
 
 func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t *testing.T) {

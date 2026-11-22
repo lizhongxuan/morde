@@ -211,7 +211,7 @@ func (e *CloudDSHExecutor) cloudDSHJobOutput(ctx context.Context, fence app.Agen
 	return history.outputAfter(after, cloudDSHJobOutputMaxBytes)
 }
 
-func (e *CloudDSHExecutor) cancelCloudDSHJob(ctx context.Context, fence app.AgentInstanceFence, actorSessionID string,
+func (e *CloudDSHExecutor) cancelCloudDSHJob(ctx context.Context, fence app.AgentInstanceFence, actorSessionID, callID string,
 	raw json.RawMessage) (app.AgentToolResult, bool, string, error) {
 	var arguments struct {
 		JobID string `json:"job_id"`
@@ -227,7 +227,7 @@ func (e *CloudDSHExecutor) cancelCloudDSHJob(ctx context.Context, fence app.Agen
 		return app.AgentToolResult{Status: app.AgentToolSucceeded, Output: cloudDSHJobResult(child)}, false, child.SessionID, nil
 	}
 	updated, _, err := e.options.Children.RequestCancel(ctx, app.AgentChildSessionCancelCommand{Fence: fence,
-		ActorSessionID: actorSessionID, SessionID: child.SessionID})
+		ActorSessionID: actorSessionID, SessionID: child.SessionID, CallID: callID})
 	if err != nil || updated.Step.Status != task.StepRunning || !updated.Background || !updated.CancelRequested {
 		return app.AgentToolResult{}, false, "", errors.New("background job cancel request was not durably saved")
 	}

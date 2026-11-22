@@ -236,11 +236,13 @@ export class WorkerIPC {
       this.startFrame = frame
       if (frame.initial_message) {
         this.messageDeliveries.set(frame.initial_message.message_id,
-          JSON.stringify([frame.initial_message.content, frame.initial_message.attachment_ids ?? [], 'followup']))
+          { signature: JSON.stringify([frame.initial_message.content, frame.initial_message.attachment_ids ?? [], 'followup']),
+            supersedeActive: false })
       }
       if (Array.isArray(frame.revision_messages)) {
         for (const message of frame.revision_messages) {
-          this.messageDeliveries.set(message.message_id, JSON.stringify([message.content, message.attachment_ids ?? [], 'followup']))
+          this.messageDeliveries.set(message.message_id,
+            { signature: JSON.stringify([message.content, message.attachment_ids ?? [], 'followup']), supersedeActive: false })
         }
       }
       this.start.resolve(frame)
@@ -267,13 +269,22 @@ export class WorkerIPC {
       const attachmentIDs = frame.attachment_ids ?? []
       const mode = frame.mode ?? 'followup'
       const signature = JSON.stringify([frame.content, attachmentIDs, mode])
+      const supersedeActive = frame.version === 4 && frame.supersede_active === true
       const previous = this.messageDeliveries.get(frame.message_id)
       if (previous !== undefined) {
-        if (previous !== signature) throw new Error('message delivery id conflicts with prior content or mode')
+        if (previous.signature !== signature) throw new Error('message delivery id conflicts with prior content or mode')
+        if (supersedeActive && !previous.supersedeActive) {
+          previous.supersedeActive = true
+          const delivery = { message_id: frame.message_id, content: frame.content, attachment_ids: [...attachmentIDs], mode,
+            supersede_active: true }
+          if (this.messageDeliveryHandler) this.messageDeliveryHandler(delivery)
+          else this.pendingMessageDeliveries.push(delivery)
+        }
         return
       }
-      this.messageDeliveries.set(frame.message_id, signature)
-      const delivery = { message_id: frame.message_id, content: frame.content, attachment_ids: [...attachmentIDs], mode }
+      this.messageDeliveries.set(frame.message_id, { signature, supersedeActive })
+      const delivery = { message_id: frame.message_id, content: frame.content, attachment_ids: [...attachmentIDs], mode,
+        ...(supersedeActive ? { supersede_active: true } : {}) }
       if (this.messageDeliveryHandler) this.messageDeliveryHandler(delivery)
       else this.pendingMessageDeliveries.push(delivery)
       return

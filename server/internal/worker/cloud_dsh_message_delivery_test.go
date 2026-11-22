@@ -61,3 +61,46 @@ func TestCloudDSHMessageDeliveryUsesV3ModeAndDeduplicatesByMode(t *testing.T) {
 	}
 	var _ io.WriteCloser = writer
 }
+
+func TestCloudDSHSupersedingDeliveryUpgradesTheSameSnapshotWithoutRequery(t *testing.T) {
+	message := app.AgentConversationMessage{ID: "m1234567", Content: "apply the new heading", Mode: app.AgentMessageDeliverySteer}
+	checkpoints := &cloudDSHTestCheckpoints{pending: []app.AgentConversationMessage{message}}
+	executor := &CloudDSHExecutor{options: CloudDSHExecutorOptions{Checkpoints: checkpoints}}
+	fence := app.AgentInstanceFence{TaskID: "task_123", OwnerID: "user_123", InitiatorID: "user_123",
+		AgentInstanceID: "agent_123", AgentGeneration: 2, AgentSessionID: "session_123", AuthorizationVersion: 3,
+		LeaseOwner: "worker-123", LeaseVersion: 4, EngineVersion: "0.2.2-rc.1", ProfileVersion: "v1"}
+	writer := &cloudDSHFrameBuffer{}
+	seen := make(map[string]string)
+	if err := executor.deliverPendingMessagesOnce(context.Background(), fence, writer, seen); err != nil {
+		t.Fatal(err)
+	}
+	checkpointReads := len(checkpoints.pendingFences)
+	if err := executor.deliverSupersedingMessages(context.Background(), fence, writer,
+		[]app.AgentConversationMessage{message}, seen); err != nil {
+		t.Fatal(err)
+	}
+	if len(checkpoints.pendingFences) != checkpointReads {
+		t.Fatalf("superseding delivery re-read pending messages: reads=%d before=%d", len(checkpoints.pendingFences), checkpointReads)
+	}
+	lines := strings.Split(strings.TrimSpace(writer.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("delivery frame count = %d, want v3 then v4: %q", len(lines), writer.String())
+	}
+	var first, second struct {
+		Version         int    `json:"version"`
+		MessageID       string `json:"message_id"`
+		Content         string `json:"content"`
+		Mode            string `json:"mode"`
+		SupersedeActive bool   `json:"supersede_active"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &first); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &second); err != nil {
+		t.Fatal(err)
+	}
+	if first.Version != 3 || first.MessageID != message.ID || first.Content != message.Content || first.Mode != string(message.Mode) ||
+		second.Version != 4 || second.MessageID != first.MessageID || second.Content != first.Content || second.Mode != first.Mode || !second.SupersedeActive {
+		t.Fatalf("message identity changed during superseding upgrade: first=%+v second=%+v", first, second)
+	}
+}

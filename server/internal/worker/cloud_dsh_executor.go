@@ -586,6 +586,13 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 			completeCtx, cancelComplete := context.WithTimeout(ctx, 30*time.Second)
 			defer cancelComplete()
 			if err := e.options.Completion.Complete(completeCtx, value, completion); err != nil {
+				if errors.Is(err, app.ErrTaskInputPending) {
+					// The Task-lock completion gate proved that user input won the
+					// finalization race. Keep the Task running so lease recovery can
+					// resume this same Session and consume its pending inbox.
+					retErr = ErrCloudDSHCompletionPending
+					return
+				}
 				retErr = err
 				return
 			}
