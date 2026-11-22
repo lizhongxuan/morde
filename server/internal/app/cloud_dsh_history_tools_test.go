@@ -23,11 +23,15 @@ import (
 type cloudDSHHistoryTaskStore struct {
 	*cloudDSHBrokerTaskStore
 	conversations         ConversationPage
+	conversationPages     map[string]ConversationPage
 	messages              map[string]MessagePage
+	messagePages          map[string]MessagePage
 	suppressed            map[string]struct{}
 	listOwner             string
 	messageOwners         []string
 	messageIDs            []string
+	conversationCursors   []string
+	messageCursors        []string
 	pageCalls             int
 	afterPage             func()
 	suppressionBatchSizes []int
@@ -38,8 +42,15 @@ func (s *cloudDSHHistoryTaskStore) ListConversations(ctx context.Context, ownerI
 		return ConversationPage{}, err
 	}
 	s.listOwner = ownerID
-	if page.Limit != cloudDSHHistoryConversationLimit || page.Cursor != "" {
+	s.conversationCursors = append(s.conversationCursors, page.Cursor)
+	if page.Limit != cloudDSHHistoryConversationLimit {
 		return ConversationPage{}, fmt.Errorf("unexpected history conversation page: %+v", page)
+	}
+	if page.Cursor != "" {
+		if result, ok := s.conversationPages[page.Cursor]; ok {
+			return result, nil
+		}
+		return ConversationPage{}, fmt.Errorf("unexpected history conversation cursor")
 	}
 	return s.conversations, nil
 }
@@ -50,6 +61,7 @@ func (s *cloudDSHHistoryTaskStore) ListMessages(ctx context.Context, ownerID, co
 	}
 	s.messageOwners = append(s.messageOwners, ownerID)
 	s.messageIDs = append(s.messageIDs, conversationID)
+	s.messageCursors = append(s.messageCursors, page.Cursor)
 	if page.Limit == cloudDSHCurrentHistoryPageSize {
 		s.pageCalls++
 		before := int64(math.MaxInt64)
@@ -81,6 +93,12 @@ func (s *cloudDSHHistoryTaskStore) ListMessages(ctx context.Context, ownerID, co
 			s.afterPage()
 		}
 		return result, nil
+	}
+	if page.Limit == cloudDSHHistoryMessageLimit && page.Cursor != "" {
+		if result, ok := s.messagePages[conversationID+"\x00"+page.Cursor]; ok {
+			return result, nil
+		}
+		return MessagePage{}, fmt.Errorf("unexpected history message cursor")
 	}
 	if (page.Limit != cloudDSHHistoryMessageLimit && page.Limit != cloudDSHHistorySummaryMessageLimit) || page.Cursor != "" {
 		return MessagePage{}, fmt.Errorf("unexpected history message page: %+v", page)
@@ -231,6 +249,7 @@ func TestCloudDSHCurrentConversationHistorySearchUsesOnlyFixedCurrentConversatio
 		Name: cloudDSHCurrentHistorySearchToolName, Arguments: mustCloudDSHHistoryArguments(t, "cedar", 1, crossTaskToken)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("cross-Task current history cursor error=%v, want invalid argument", err)
 	}
+	baseStore.details.Task.Budget.ToolCalls = baseStore.details.Task.Usage.ToolCalls
 	legacy := `{"matches":[],"scanned_messages":1,"partial":true}`
 	legacyCall := ModelToolCall{CallID: call.CallID, Name: call.Name, Arguments: `{"query":"cedar","limit":1}`}
 	replayed, err := broker.execute(context.Background(), claimed, legacyCall, true, &legacy)
@@ -474,7 +493,8 @@ func TestCloudDSHDeletedPersonalMemoryIsFilteredFromHistorySearchAndSummary(t *t
 		t.Fatal("fixture did not produce a personal principal")
 	}
 
-	search, err := broker.searchPersonalConversationHistory(context.Background(), principal, claimed.ConversationID, "乌龙茶", 5)
+	search, _, err := broker.searchPersonalConversationHistory(context.Background(), principal, claimed.ConversationID, "乌龙茶", 5,
+		cloudDSHHistorySearchCursor{SeenMessageIDs: []string{}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -538,8 +558,9 @@ func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope
 	previous := conversation.Conversation{ID: previousID, OwnerID: claimed.OwnerID, Title: "上次聊茶叶"}
 	projectConversation := conversation.Conversation{ID: projectID, OwnerID: claimed.OwnerID, ProjectID: "j1234567", Title: "项目中的茶叶"}
 	baseStore.details.Task.Usage.ToolCalls = 0
-	baseStore.details.Task.Budget.ToolCalls = 12
+	baseStore.details.Task.Budget.ToolCalls = 2
 	baseStore.details.Task.Authorization.Version = claimed.Authorization.Version
+	historyMessageID := messageID()
 	store := &cloudDSHHistoryTaskStore{
 		cloudDSHBrokerTaskStore: baseStore,
 		conversations: ConversationPage{Items: []conversation.Conversation{
@@ -549,7 +570,7 @@ func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope
 		}},
 		messages: map[string]MessagePage{
 			previousID: {Items: []conversation.Message{
-				{ID: messageID(), ConversationID: previousID, OwnerID: claimed.OwnerID, Role: conversation.RoleUser,
+				{ID: historyMessageID, ConversationID: previousID, OwnerID: claimed.OwnerID, Role: conversation.RoleUser,
 					Content: "上次我们聊了茶叶的冲泡方法，先用 85 度水温。", DeliveryStatus: conversation.DeliveryApplied, CreatedAt: time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)},
 				{ID: messageID(), ConversationID: previousID, OwnerID: claimed.OwnerID, Role: conversation.RoleAssistant,
 					Content: "更早的记录提到茶叶的价格。", DeliveryStatus: conversation.DeliveryApplied, CreatedAt: time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC)},
@@ -581,8 +602,11 @@ func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope
 	if !containsAgentTool(definitions, cloudDSHRecentHistorySummaryToolName) {
 		t.Fatal("recent history summary was not exposed with the default personal memory setting")
 	}
+	if err := broker.SetHistorySearchCursorSigning("11111111-1111-1111-1111-111111111111", []byte(strings.Repeat("k", 32))); err != nil {
+		t.Fatal(err)
+	}
 	call = ModelToolCall{CallID: "call_history_enabled", Name: cloudDSHConversationHistorySearchToolName,
-		Arguments: `{"query":"茶叶","limit":1}`}
+		Arguments: `{"query":"茶叶","limit":1,"cursor":null}`}
 	result, err := broker.execute(context.Background(), claimed, call, false, nil)
 	if err != nil || result.Status != AgentToolSucceeded {
 		t.Fatalf("history search result=%+v err=%v", result, err)
@@ -592,7 +616,9 @@ func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope
 		t.Fatal(err)
 	}
 	if len(output.Matches) != 1 || output.Matches[0].Content != "上次我们聊了茶叶的冲泡方法，先用 85 度水温。" ||
-		output.Matches[0].ConversationTitle != "上次聊茶叶" || output.ScannedConversations != 1 || !output.Partial {
+		output.Matches[0].ConversationTitle != "上次聊茶叶" || output.Matches[0].ConversationID != previousID ||
+		output.Matches[0].MessageID != historyMessageID || output.ScannedConversations != 1 || !output.Partial ||
+		output.NextCursor == "" || output.TruncationReason != "match_limit" {
 		t.Fatalf("history search leaked excluded data or returned wrong match: %+v", output)
 	}
 	if store.listOwner != claimed.OwnerID || len(store.messageIDs) != 1 || store.messageIDs[0] != previousID ||
@@ -630,6 +656,159 @@ func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope
 	changedCheckpoint := "{}"
 	if _, err := broker.execute(context.Background(), claimed, call, true, &changedCheckpoint); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("changed history result was accepted during recovery: %v", err)
+	}
+}
+
+func TestCloudDSHConversationHistorySearchReturnsSourcesAndContinuesWithBoundCursor(t *testing.T) {
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	personalData, err := NewPersonalMutationService(&personalMutationStoreStub{objects: map[string]personal.Object{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.personalData = personalData
+	if err := broker.SetHistorySearchCursorSigning("11111111-1111-1111-1111-111111111111", []byte(strings.Repeat("k", 32))); err != nil {
+		t.Fatal(err)
+	}
+
+	firstConversationID, err := domain.NewConversationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondConversationID, err := domain.NewConversationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID := func() string {
+		t.Helper()
+		id, err := domain.NewMessageID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	firstMessageID, secondMessageID, pageMessageID, nextConversationMessageID := messageID(), messageID(), messageID(), messageID()
+	firstCreatedAt := time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
+	store := &cloudDSHHistoryTaskStore{
+		cloudDSHBrokerTaskStore: baseStore,
+		conversations: ConversationPage{
+			Items:      []conversation.Conversation{{ID: firstConversationID, OwnerID: claimed.OwnerID, Title: "茶叶讨论一"}},
+			NextCursor: "conversations-next",
+		},
+		conversationPages: map[string]ConversationPage{
+			"conversations-next": {Items: []conversation.Conversation{{ID: secondConversationID, OwnerID: claimed.OwnerID, Title: "茶叶讨论二"}}},
+		},
+		messages: map[string]MessagePage{
+			firstConversationID: {Items: []conversation.Message{
+				{ID: firstMessageID, ConversationID: firstConversationID, OwnerID: claimed.OwnerID, Role: conversation.RoleUser,
+					Content: "茶叶冲泡方法一", CreatedAt: firstCreatedAt, DeliveryStatus: conversation.DeliveryApplied},
+				{ID: secondMessageID, ConversationID: firstConversationID, OwnerID: claimed.OwnerID, Role: conversation.RoleAssistant,
+					Content: "茶叶冲泡方法二", CreatedAt: firstCreatedAt.Add(-time.Minute), DeliveryStatus: conversation.DeliveryApplied},
+			}, NextCursor: "messages-next"},
+			secondConversationID: {Items: []conversation.Message{{
+				ID: nextConversationMessageID, ConversationID: secondConversationID, OwnerID: claimed.OwnerID, Role: conversation.RoleUser,
+				Content: "茶叶冲泡方法三", DeliveryStatus: conversation.DeliveryApplied,
+			}}},
+		},
+		messagePages: map[string]MessagePage{
+			firstConversationID + "\x00messages-next": {Items: []conversation.Message{{
+				ID: pageMessageID, ConversationID: firstConversationID, OwnerID: claimed.OwnerID, Role: conversation.RoleUser,
+				Content: "茶叶冲泡方法补充", DeliveryStatus: conversation.DeliveryApplied,
+			}}},
+		},
+	}
+	broker.store = store
+	baseStore.details.Task.Budget.ToolCalls = 10
+	call := func(callID, query, cursor string) ModelToolCall {
+		t.Helper()
+		arguments, err := json.Marshal(map[string]any{"query": query, "limit": 1, "cursor": cursor})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ModelToolCall{CallID: callID, Name: cloudDSHConversationHistorySearchToolName, Arguments: string(arguments)}
+	}
+	decode := func(output string) cloudDSHHistorySearchResult {
+		t.Helper()
+		var result cloudDSHHistorySearchResult
+		if err := json.Unmarshal([]byte(output), &result); err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+
+	first, err := broker.execute(context.Background(), claimed, call("call_history_page_1", "茶叶", ""), false, nil)
+	if err != nil || first.Status != AgentToolSucceeded {
+		t.Fatalf("first history page=%+v err=%v", first, err)
+	}
+	firstPage := decode(first.Output)
+	if len(firstPage.Matches) != 1 || firstPage.Matches[0].ConversationID != firstConversationID ||
+		firstPage.Matches[0].MessageID != firstMessageID || firstPage.NextCursor == "" ||
+		!firstPage.Partial || firstPage.TruncationReason != "match_limit" {
+		t.Fatalf("first page omitted source identity or continuation: %+v", firstPage)
+	}
+
+	if _, err := broker.execute(context.Background(), claimed, call("call_history_wrong_query", "不同查询", firstPage.NextCursor), false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("cursor accepted a changed query: %v", err)
+	}
+	otherConversationID, err := domain.NewConversationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedIdentity := claimed
+	changedIdentity.ConversationID = otherConversationID
+	changedContext := *claimed.ConversationContext
+	changedContext.ConversationID = otherConversationID
+	changedIdentity.ConversationContext = &changedContext
+	currentTask := baseStore.details.Task
+	baseStore.details.Task = changedIdentity
+	if _, err := broker.execute(context.Background(), changedIdentity, call("call_history_wrong_identity", "茶叶", firstPage.NextCursor), false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("cursor accepted a changed conversation identity: %v", err)
+	}
+	changedAuthorization := claimed
+	changedAuthorization.Authorization = claimed.Authorization
+	changedAuthorization.Authorization.Version++
+	baseStore.details.Task = changedAuthorization
+	if _, err := broker.execute(context.Background(), changedAuthorization, call("call_history_wrong_authorization", "茶叶", firstPage.NextCursor), false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("cursor accepted a changed authorization scope: %v", err)
+	}
+	baseStore.details.Task = currentTask
+
+	second, err := broker.execute(context.Background(), claimed, call("call_history_page_2", "茶叶", firstPage.NextCursor), false, nil)
+	if err != nil || second.Status != AgentToolSucceeded {
+		t.Fatalf("second history page=%+v err=%v", second, err)
+	}
+	secondPage := decode(second.Output)
+	if len(secondPage.Matches) != 1 || secondPage.Matches[0].ConversationID != firstConversationID ||
+		secondPage.Matches[0].MessageID != secondMessageID || secondPage.NextCursor == "" ||
+		!secondPage.Partial || secondPage.TruncationReason != "scan_limit" {
+		t.Fatalf("second page repeated a source or omitted the next message page: %+v", secondPage)
+	}
+
+	third, err := broker.execute(context.Background(), claimed, call("call_history_page_3", "茶叶", secondPage.NextCursor), false, nil)
+	if err != nil || third.Status != AgentToolSucceeded {
+		t.Fatalf("third history page=%+v err=%v", third, err)
+	}
+	thirdPage := decode(third.Output)
+	if len(thirdPage.Matches) != 1 || thirdPage.Matches[0].ConversationID != firstConversationID ||
+		thirdPage.Matches[0].MessageID != pageMessageID || thirdPage.NextCursor == "" || !thirdPage.Partial {
+		t.Fatalf("third page did not continue the message cursor: %+v", thirdPage)
+	}
+
+	fourth, err := broker.execute(context.Background(), claimed, call("call_history_page_4", "茶叶", thirdPage.NextCursor), false, nil)
+	if err != nil || fourth.Status != AgentToolSucceeded {
+		t.Fatalf("fourth history page=%+v err=%v", fourth, err)
+	}
+	fourthPage := decode(fourth.Output)
+	if len(fourthPage.Matches) != 1 || fourthPage.Matches[0].ConversationID != secondConversationID ||
+		fourthPage.Matches[0].MessageID != nextConversationMessageID || fourthPage.NextCursor != "" || fourthPage.Partial {
+		t.Fatalf("fourth page did not finish at the next conversation: %+v", fourthPage)
+	}
+	if store.listOwner != claimed.OwnerID || len(store.messageOwners) != 4 {
+		t.Fatalf("history continuation broadened owner scope: list owner=%s message owners=%v", store.listOwner, store.messageOwners)
+	}
+	for _, ownerID := range store.messageOwners {
+		if ownerID != claimed.OwnerID {
+			t.Fatalf("history continuation read another owner: %v", store.messageOwners)
+		}
 	}
 }
 
@@ -676,7 +855,8 @@ func TestCloudDSHConversationHistoryRejectsForeignAndMalformedRows(t *testing.T)
 	if !ok {
 		t.Fatal("fixture did not produce a personal principal")
 	}
-	if _, err := broker.searchPersonalConversationHistory(context.Background(), principal, claimed.ConversationID, "茶叶", 5); domain.CodeOf(err) != domain.CodeInternal {
+	if _, _, err := broker.searchPersonalConversationHistory(context.Background(), principal, claimed.ConversationID, "茶叶", 5,
+		cloudDSHHistorySearchCursor{SeenMessageIDs: []string{}}); domain.CodeOf(err) != domain.CodeInternal {
 		t.Fatalf("foreign conversation row error = %v, want internal fail-closed", err)
 	}
 	store.conversations = ConversationPage{Items: []conversation.Conversation{{ID: previousID, OwnerID: claimed.OwnerID, Title: "malformed"}}}
@@ -684,7 +864,8 @@ func TestCloudDSHConversationHistoryRejectsForeignAndMalformedRows(t *testing.T)
 		ID: "invalid", ConversationID: previousID, OwnerID: claimed.OwnerID, Role: conversation.RoleUser,
 		Content: "茶叶", DeliveryStatus: conversation.DeliveryApplied,
 	}}}}
-	if _, err := broker.searchPersonalConversationHistory(context.Background(), principal, claimed.ConversationID, "茶叶", 5); domain.CodeOf(err) != domain.CodeInternal {
+	if _, _, err := broker.searchPersonalConversationHistory(context.Background(), principal, claimed.ConversationID, "茶叶", 5,
+		cloudDSHHistorySearchCursor{SeenMessageIDs: []string{}}); domain.CodeOf(err) != domain.CodeInternal {
 		t.Fatalf("malformed message row error = %v, want internal fail-closed", err)
 	}
 }
@@ -708,7 +889,8 @@ func TestCloudDSHHistorySearchSchemaUsesStrictNullableLimit(t *testing.T) {
 	}
 	var schema struct {
 		Properties map[string]struct {
-			Type any `json:"type"`
+			Type      any `json:"type"`
+			MaxLength int `json:"maxLength"`
 		} `json:"properties"`
 		Required             []string `json:"required"`
 		AdditionalProperties bool     `json:"additionalProperties"`
@@ -716,8 +898,9 @@ func TestCloudDSHHistorySearchSchemaUsesStrictNullableLimit(t *testing.T) {
 	if err := json.Unmarshal(definition.Parameters, &schema); err != nil {
 		t.Fatal(err)
 	}
-	if len(schema.Required) != 2 || schema.Required[0] != "query" || schema.Required[1] != "limit" ||
-		schema.AdditionalProperties || schema.Properties["limit"].Type == nil {
+	if len(schema.Required) != 3 || schema.Required[0] != "query" || schema.Required[1] != "limit" ||
+		schema.Required[2] != "cursor" || schema.AdditionalProperties || schema.Properties["limit"].Type == nil ||
+		schema.Properties["cursor"].MaxLength != cloudDSHHistorySearchCursorMaxBytes {
 		t.Fatalf("history search schema is not strict-compatible: %s", definition.Parameters)
 	}
 	var limitTypes []string
@@ -725,6 +908,12 @@ func TestCloudDSHHistorySearchSchemaUsesStrictNullableLimit(t *testing.T) {
 	if err != nil || json.Unmarshal(encoded, &limitTypes) != nil || len(limitTypes) != 2 ||
 		limitTypes[0] != "integer" || limitTypes[1] != "null" {
 		t.Fatalf("history search limit schema is not nullable: %s", definition.Parameters)
+	}
+	var cursorTypes []string
+	encoded, err = json.Marshal(schema.Properties["cursor"].Type)
+	if err != nil || json.Unmarshal(encoded, &cursorTypes) != nil || len(cursorTypes) != 2 ||
+		cursorTypes[0] != "string" || cursorTypes[1] != "null" {
+		t.Fatalf("history search cursor schema is not nullable: %s", definition.Parameters)
 	}
 }
 
@@ -812,7 +1001,8 @@ func TestCloudDSHHistorySearchSkipsCredentialLikeMessagesAndTitles(t *testing.T)
 	if !ok {
 		t.Fatal("fixture did not produce a personal principal")
 	}
-	result, err := broker.searchPersonalConversationHistory(context.Background(), principal, claimed.ConversationID, "茶叶", 5)
+	result, _, err := broker.searchPersonalConversationHistory(context.Background(), principal, claimed.ConversationID, "茶叶", 5,
+		cloudDSHHistorySearchCursor{SeenMessageIDs: []string{}})
 	if err != nil {
 		t.Fatal(err)
 	}
