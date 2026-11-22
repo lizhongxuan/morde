@@ -7,12 +7,20 @@ import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
 import { validStart } from '../src/engine.mjs'
-import { hermesCompactionBudget, originalToolResultsForRange, planHermesCompaction, selectHermesCompactionRange } from '../src/hermes-compaction-window.mjs'
+import { hermesCompactionBudget, hermesCompactionMadeProgress, originalToolResultsForRange, planHermesCompaction, selectHermesCompactionRange } from '../src/hermes-compaction-window.mjs'
 
 test('Hermes trigger and lean-tail budgets use output-reserved capacity at both context scales', () => {
   assert.deepEqual(hermesCompactionBudget(64_000, 8_000), { thresholdTokens: 47_600, tailTokens: 10_000 })
   assert.deepEqual(hermesCompactionBudget(1_000_000, 100_000), { thresholdTokens: 450_000, tailTokens: 25_000 })
   assert.throws(() => hermesCompactionBudget(4096, 4096), /output reservation/)
+})
+
+test('compaction progress is measured by token reduction or new covered source events', () => {
+  const covered = new Set([4, 5])
+  assert.equal(hermesCompactionMadeProgress(100, 90, [], covered), true)
+  assert.equal(hermesCompactionMadeProgress(100, 100, [6], covered), true)
+  assert.equal(hermesCompactionMadeProgress(100, 100, [4, 5], covered), false)
+  assert.equal(hermesCompactionMadeProgress(100, 110, [4, 5], covered), false)
 })
 
 test('Hermes windows keep the system/head, last user and assistant, and whole tool groups', () => {

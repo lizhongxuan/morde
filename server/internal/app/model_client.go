@@ -150,6 +150,7 @@ type ModelClientError struct {
 	Kind         ModelClientErrorKind
 	Stage        string
 	ProviderCode string
+	RetryAfter   time.Duration
 }
 
 func (e *ModelClientError) Error() string {

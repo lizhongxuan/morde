@@ -17,7 +17,6 @@ import { clearProcessingRetryKey, processingRetryKey } from '../app/message-proc
 import { maxMessageBytes, needsMessageUpload, uploadMessage } from '../app/message-upload';
 import { conversationTitleFromText, firstOutboxConversationMessage, messageOutbox, outboxReceiptRequest } from '../app/message-outbox';
 import type { PendingConversationMessage, PendingMessageAttachment } from '../app/message-outbox';
-import type { components } from '../api/schema';
 import { ApiError } from '../api/client';
 import { isTransientNetworkError } from '../api/errors';
 import { useAuth } from '../app/auth';
@@ -126,48 +125,6 @@ function UserMessageContent({ content }: { content: string }) {
   </>;
 }
 
-function AssistantConversationRow({ item, isMain, selected, recent, previewTitle, onSelect, onMakeMain, makeMainPending }: {
-  item: Conversation; isMain?: boolean; selected: boolean; recent: boolean; previewTitle?: string | null; onSelect: (id: string) => void;
-  onMakeMain?: (id: string) => void; makeMainPending?: boolean;
-}) {
-  const title = isMain ? '主会话' : isPlaceholderConversationTitle(item.title) ? previewTitle || item.title || '新对话' : item.title;
-  return <div className={`conversation-row${isMain ? ' conversation-row-main' : ''}`}>
-    <button type="button" className={`conversation-item ${selected ? 'is-selected' : ''}`} onClick={() => onSelect(item.id)}>
-      {isMain && <span className="assistant-logo conversation-main-logo" aria-hidden="true" />}
-      <strong>{title}</strong>
-      {recent && !isMain && <small>本机最近查看</small>}
-      <small>{isMain ? '最近更新 · ' : ''}{formatDate(item.updated_at)}</small>
-    </button>
-    {onMakeMain && <button type="button" className="button button-small button-secondary conversation-make-main"
-      aria-label={`将 ${title} 设为主会话`} disabled={makeMainPending} onClick={() => onMakeMain(item.id)}>
-      {makeMainPending ? '正在设为主会话…' : '设为主会话'}
-    </button>}
-  </div>;
-}
-
-function conversationMessageStatus(message: AssistantDisplayMessage, task?: Task): string | null {
-  if (message.duplicate_of_message_id) return null;
-  const taskTitle = conversationTitleFromText(task?.objective);
-  const messageSource = taskTitle ? `任务“${taskTitle}”`
-    : message.task_id ? `关联任务 ${message.task_id}` : '此消息';
-  if (message.routing_status === 'failed') return null;
-  if (message.routing_status === 'pending' || message.routing_status === 'processing') return null;
-  const routingStatus = userVisibleRoutingStatusText(message.routing_status);
-  if (routingStatus) return `${messageSource} · ${routingStatus}`;
-  if (message.routing_status === 'waiting_user') return null;
-  if (message.delivery_status === 'applied') return null;
-  const deliveryStatus = message.delivery_status === 'pending' && task && terminalTaskStatuses.has(task.status)
-    ? '消息未处理，处理已结束' : deliveryStatusText(message.delivery_status);
-  return `${messageSource} · ${deliveryStatus}`;
-}
-
-function hasCompleteVerifiedArtifactProof(artifact: TaskArtifact): boolean {
-  return artifact.verified && Boolean(artifact.workspace_id) && Number.isSafeInteger(artifact.workspace_revision)
-    && (artifact.workspace_revision ?? -1) >= 0 && Number.isSafeInteger(artifact.size_bytes)
-    && (artifact.size_bytes ?? -1) >= 0 && /^[a-f0-9]{64}$/iu.test(artifact.sha256 ?? '')
-    && Boolean(artifact.path.trim()) && Boolean(artifact.media_type.trim());
-}
-
 function AssistantOutboxRetryButton({ entry, sendMessage, label }: {
   entry: MessageOutboxEntry; sendMessage: (entry: MessageOutboxEntry, reconcile: boolean) => Promise<void>; label: string;
 }) {
@@ -197,6 +154,48 @@ function AssistantTaskSupplementForm({ task, value, disabled, saving, needsWorks
       {needsWorkspaceTarget ? '选择 Workspace 并继续' : '发送补充任务'}
     </button>
   </form>;
+}
+
+function AssistantConversationRow({ item, isMain, selected, recent, previewTitle, onSelect, onMakeMain, makeMainPending }: {
+  item: Conversation; isMain?: boolean; selected: boolean; recent: boolean; previewTitle?: string | null; onSelect: (id: string) => void;
+  onMakeMain?: (id: string) => void; makeMainPending?: boolean;
+}) {
+  const title = isMain ? '主会话' : isPlaceholderConversationTitle(item.title) ? previewTitle || item.title || '新对话' : item.title;
+  return <div className={`conversation-row${isMain ? ' conversation-row-main' : ''}`}>
+    <button type="button" className={`conversation-item ${selected ? 'is-selected' : ''}`} onClick={() => onSelect(item.id)}>
+      {isMain && <span className="assistant-logo conversation-main-logo" aria-hidden="true" />}
+      <strong>{title}</strong>
+      {recent && !isMain && <small>本机最近查看</small>}
+      <small>{isMain ? '最近更新 · ' : ''}{formatDate(item.updated_at)}</small>
+    </button>
+    {onMakeMain && <button type="button" className="button button-small button-secondary conversation-make-main"
+      aria-label={`将 ${title} 设为主会话`} disabled={makeMainPending} onClick={() => onMakeMain(item.id)}>
+      {makeMainPending ? '正在设为主会话…' : '设为主会话'}
+    </button>}
+  </div>;
+}
+
+function conversationMessageStatus(message: AssistantDisplayMessage, task?: Task): string | null {
+  if (message.duplicate_of_message_id) return null;
+  const taskTitle = conversationTitleFromText(task?.objective);
+  const messageSource = taskTitle ? `任务“${taskTitle}”`
+    : message.task_id ? `关联任务 ${message.task_id}` : '此消息';
+  if (message.routing_status === 'pending' || message.routing_status === 'processing') return null;
+  const routingStatus = userVisibleRoutingStatusText(message.routing_status);
+  if (routingStatus) return `${messageSource} · ${routingStatus}`;
+  if (task?.status === 'waiting_user') return `${messageSource} · ${safeTaskActivityText(taskStatusText(task, undefined), 300).value}`;
+  if (message.routing_status === 'waiting_user') return null;
+  if (message.delivery_status === 'applied') return null;
+  const deliveryStatus = message.delivery_status === 'pending' && task && terminalTaskStatuses.has(task.status)
+    ? '消息未处理，处理已结束' : deliveryStatusText(message.delivery_status);
+  return `${messageSource} · ${deliveryStatus}`;
+}
+
+function hasCompleteVerifiedArtifactProof(artifact: TaskArtifact): boolean {
+  return artifact.verified && Boolean(artifact.workspace_id) && Number.isSafeInteger(artifact.workspace_revision)
+    && (artifact.workspace_revision ?? -1) >= 0 && Number.isSafeInteger(artifact.size_bytes)
+    && (artifact.size_bytes ?? -1) >= 0 && /^[a-f0-9]{64}$/iu.test(artifact.sha256 ?? '')
+    && Boolean(artifact.path.trim()) && Boolean(artifact.media_type.trim());
 }
 
 function hostEmbedTargetPlan(host: ComputerHostOption): HostEmbedTicketRequest['targets'] {
@@ -449,78 +448,6 @@ function latestConversationClientMessageID(messages: ConversationMessage[] | und
   }, undefined)?.client_message_id;
 }
 
-function taskStatusText(task: Task, cloudTasksAvailable: boolean | undefined): string {
-  if (task.status === 'queued') {
-    return cloudTasksAvailable === false
-      ? '任务已保存并排队；当前服务未启用云端执行，启用后才会开始运行。'
-      : '任务已保存，正在等待开始。关闭页面不会取消任务。';
-  }
-  if (task.status === 'running') {
-    if (task.current_revision !== undefined && task.desired_revision !== undefined && task.current_revision !== task.desired_revision) {
-      return '正在调整任务，等待开始新要求。';
-    }
-    if (task.current_revision_started === true && task.current_revision !== undefined && task.current_revision === task.desired_revision) {
-      return '开始处理你的请求。';
-    }
-    if (task.current_revision_started !== undefined) return '任务已保存，正在等待开始。';
-    return 'AI 正在处理…';
-  }
-  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_missing') return '尚未配置默认云端电脑，本次操作未执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_changed') return '任务已绑定其他云端电脑，无法安全切换；请为新目标另发起任务。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_unavailable') return '目标云端电脑当前不可用或无法确认访问权限，本次操作未执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_unavailable') return '目标电脑的 Workspace 当前不可用、版本未就绪或无法确认访问权限，本次操作未执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_target_changed') return '任务已绑定其他云端电脑的文件，无法安全切换；请为新目标另发起任务。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'target_result_unknown') return '上次电脑操作的结果需要核对，暂不能重复执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_host_sync') return '任务等待目标云端电脑重新就绪并同步文件；确认版本已应用后才会完成。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'model_context_limit') return '消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'dsh_recovery_unresolved') return 'AI 运行中断，无法确认本次执行结果。请停止任务后重试。';
-  if (task.status === 'waiting_user') return '任务正在等待你的确认或补充信息。';
-  if (task.status === 'paused') return '任务已暂停。';
-  if (task.status === 'pausing') return '正在安全暂停任务。';
-  if (task.status === 'cancelling') {
-    const unsettled = task.stop_request?.unsettled_operation_ids.length ?? 0;
-    if (unsettled > 0) return `停止请求已受理，仍有 ${unsettled} 个操作结果待确认。`;
-    if (task.stop_request?.status === 'pending') return '正在等待服务端确认停止结果。';
-    if (task.stop_request?.status === 'completed') return '服务端已处理停止请求，正在等待最终任务状态。';
-    return '停止状态待确认，正在重新读取服务端任务。';
-  }
-  if (task.status === 'failed') return task.result || '任务执行失败。';
-  if (task.status === 'cancelled') return '服务端已确认任务停止。';
-  if (task.result_message_pending) return '任务已完成，正在整理回复。';
-  if (task.result_message_published) return '任务已完成，最终回复已发布。';
-  return task.result || '任务已完成。';
-}
-
-function recoveryHint(step: Task['steps'][number] | undefined): string | null {
-  if (step?.title !== 'Review cloud task recovery') return null;
-  const category = /^The model request could not be verified \(category: ([a-z_]+)\); retry after checking the model connection\.$/.exec(step.summary)?.[1];
-  switch (category) {
-    case 'provider_rate_limited':
-    case 'rate_limited':
-      return '模型服务正在限流，稍后再试。';
-    case 'provider_invalid_api_key':
-    case 'authentication_rejected':
-      return '模型密钥未通过服务商验证，请检查模型连接。';
-    case 'provider_quota_exhausted':
-    case 'quota_exhausted':
-    case 'task_budget_exhausted':
-      return '模型额度已用尽，请检查额度后重试。';
-    case 'provider_model_not_found':
-      return '服务商未找到此模型，请检查模型名称。';
-    case 'provider_permission_denied':
-    case 'access_rejected':
-      return '此 API Key 无权调用该模型，请检查模型权限。';
-    case 'timeout':
-    case 'transport':
-    case 'unavailable':
-    case 'upstream_error':
-    case 'provider_server_error':
-      return '模型服务暂时不可用，请稍后重试。';
-    default:
-      return null;
-  }
-}
-
 function isResourceNoLongerAccessible(error: unknown): boolean {
   return error instanceof ApiError && [401, 403, 404].includes(error.status);
 }
@@ -531,11 +458,15 @@ const taskEventTypes = [
 ] as const;
 
 function stepTitle(step: Task['steps'][number]): string {
+  return stepPresentationTitle(step.title);
+}
+
+function stepPresentationTitle(title: string): string {
   const mcpPrefix = 'Run cloud dsh MCP tool: ';
   const prefix = ['Run cloud dsh tool: ', mcpPrefix, 'Run Hostless Workspace tool: ']
-    .find((value) => step.title.startsWith(value));
-  if (!prefix) return step.title;
-  const name = step.title.slice(prefix.length);
+    .find((value) => title.startsWith(value));
+  if (!prefix) return title;
+  const name = title.slice(prefix.length);
   if (name === 'morde_web_search' || name.includes('searxng_web_search')) return '搜索网页';
   if (name === 'morde_web_read' || name.includes('web_url_read')) return '读取网页';
   if (name === 'morde_workspace_list') return '查看电脑文件';
@@ -561,8 +492,8 @@ function stepDetailObject(step: TaskStep, object: string | null): string | null 
   return 'MCP 连接器';
 }
 
-type TaskPanelGroup = { id: string; title: string; tasks: TaskSummary[] };
-type TaskPanelRow = { key: string; group: TaskPanelGroup; task: TaskSummary | null; first: boolean };
+type TaskAgent = NonNullable<Task['agents']>[number];
+type TaskAgentActivityGroup = { id: string; title: string; steps: TaskStep[] };
 
 function latestTaskSnapshot(previous: unknown, next: unknown): unknown {
   const oldTask = previous as Task | undefined;
@@ -627,112 +558,94 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
   const toolName = stepDetailToolName(step, data.tool_name);
   const object = stepDetailObject(step, data.object);
   if (data.detail_state === 'available' && data.event_sequence < task.event_sequence) return <p className="task-step-detail-message" role="status">正在读取详情…</p>;
+  const safeToolName = toolName ? safeTaskActivityText(toolName, 160) : null;
+  const safeObject = object !== null ? safeTaskActivityText(object) : null;
+  const safeInput = data.input !== null ? safeTaskActivityText(data.input) : null;
+  const safeResult = data.result !== null ? safeTaskActivityText(data.result) : null;
   return <div className="task-step-detail" aria-label="动作详情">
-    {toolName && <p><strong>工具</strong> {toolName}</p>}
+    {safeToolName && <p><strong>工具</strong> {safeToolName.value}</p>}
     <p><strong>时间</strong> {formatDate(step.created_at)}</p>
     {data.detail_state !== 'available' ? <p role="status">{unavailable[data.detail_state]}</p> : <>
-      {object !== null && <p><strong>对象</strong> {object || '（空）'}</p>}
-      {data.input !== null && <p><strong>输入</strong> {data.input || '（空）'}</p>}
-      {data.result !== null && <p><strong>结果</strong> {data.result || '（空结果）'}</p>}
+      {safeObject && <p><strong>对象</strong> {safeObject.value || '（空）'}</p>}
+      {safeInput && <p><strong>输入</strong> {safeInput.value || '（空）'}</p>}
+      {safeResult && <p><strong>结果</strong> {safeResult.value || '（空结果）'}</p>}
       {data.object === null && data.input === null && data.result === null && <p>没有可展示的输入或结果。</p>}
-      {data.truncated && <p>内容已截断。</p>}
+      {(data.truncated || [safeToolName, safeObject, safeInput, safeResult].some((field) => field?.truncated)) && <p>详情已截断。</p>}
     </>}
   </div>;
 }
 
-function TaskValidationStepEvidence({ task, step, actorID, serviceInstanceID }: {
-  task: Task; step: TaskStep; actorID: string; serviceInstanceID: string;
-}) {
-  const [expanded, setExpanded] = useState(false);
-  return <details onToggle={(event) => setExpanded(event.currentTarget.open)}>
-    <summary>查看步骤详情：{stepTitle(step)}</summary>
-    {expanded && <TaskStepDetails task={task} step={step} conversationID={task.conversation_id} actorID={actorID}
-      serviceInstanceID={serviceInstanceID} />}
-  </details>;
+function taskActivityIsExecuting(status: string): boolean {
+  return status === 'running' || status === 'cancelling';
 }
 
-function taskActivityStatusText(summary: TaskSummary, task?: Task): string {
-  const status = task?.status ?? summary.status;
-  if (status === 'completed' && ['pending', 'processing'].includes(summary.result_review?.state ?? '')) return '回复整理中';
-  if (status === 'waiting_user' && task?.pending_request) return '待审批';
-  if (status === 'waiting_user' && task?.clarification_request) return '待补充信息';
-  const labels: Record<string, string> = {
-    queued: '等待执行', running: '进行中', waiting_user: '待你处理', pausing: '正在暂停', paused: '已暂停',
-    cancelling: '正在停止', completed: '已完成', failed: '失败', cancelled: '已停止',
-  };
-  return labels[status] ?? '状态待确认';
+function taskStatusText(task: Task, cloudTasksAvailable: boolean | undefined): string {
+  if (task.status === 'queued') return cloudTasksAvailable === false
+    ? '任务已保存并排队；当前服务未启用云端执行，启用后才会开始运行。'
+    : '任务已保存，正在等待开始。关闭页面不会取消任务。';
+  if (task.status === 'running') {
+    if (task.current_revision !== undefined && task.desired_revision !== undefined && task.current_revision !== task.desired_revision) return '正在调整任务，等待开始新要求。';
+    if (task.current_revision_started === true && task.current_revision !== undefined && task.current_revision === task.desired_revision) return '开始处理你的请求。';
+    if (task.current_revision_started !== undefined) return '任务已保存，正在等待开始。';
+    return 'AI 正在处理…';
+  }
+  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_missing') return '尚未配置默认云端电脑，本次操作未执行。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_changed') return '任务已绑定其他云端电脑，无法安全切换；请为新目标另发起任务。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_unavailable') return '目标云端电脑当前不可用或无法确认访问权限，本次操作未执行。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_unavailable') return '目标电脑的 Workspace 当前不可用、版本未就绪或无法确认访问权限，本次操作未执行。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_target_changed') return '任务已绑定其他云端电脑的文件，无法安全切换；请为新目标另发起任务。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'target_result_unknown') return '上次电脑操作的结果需要核对，暂不能重复执行。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_host_sync') return '任务等待目标云端电脑重新就绪并同步文件；确认版本已应用后才会完成。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'model_context_limit') return '消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'dsh_recovery_unresolved') return 'AI 运行中断，无法确认本次执行结果。请停止任务后重试。';
+  if (task.status === 'waiting_user') return '任务正在等待你的确认或补充信息。';
+  if (task.status === 'paused') return '任务已暂停。';
+  if (task.status === 'pausing') return '正在安全暂停任务。';
+  if (task.status === 'cancelling') {
+    const unsettled = task.stop_request?.unsettled_operation_ids.length ?? 0;
+    if (unsettled > 0) return `停止请求已受理，仍有 ${unsettled} 个操作结果待确认。`;
+    if (task.stop_request?.status === 'pending') return '正在等待服务端确认停止结果。';
+    if (task.stop_request?.status === 'completed') return '服务端已处理停止请求，正在等待最终任务状态。';
+    return '停止状态待确认，正在重新读取服务端任务。';
+  }
+  if (task.status === 'failed') return task.result || '任务执行失败。';
+  if (task.status === 'cancelled') return '服务端已确认任务停止。';
+  if (task.result_message_pending) return '任务已完成，正在整理回复。';
+  if (task.result_message_published) return '任务已完成，最终回复已发布。';
+  return task.result || '任务已完成。';
 }
 
-type TaskValidationState = 'pending' | 'PASS' | 'PASS+NOTES' | 'FAIL' | 'unknown';
-type TaskValidationPresentation = {
-  state: TaskValidationState;
-  label: string;
-  explanation: string;
-  statusClass: string;
-};
-
-function taskValidationPresentation(task: TaskSummary | Task | undefined): TaskValidationPresentation {
-  const validation = (task as unknown as { validation?: unknown } | undefined)?.validation;
-  if (validation === undefined || validation === null) {
-    return { state: 'pending', label: '待校验', explanation: '尚未收到可确认的校验结论。', statusClass: 'status-queued' };
-  }
-  if (typeof validation !== 'object' || Array.isArray(validation)) {
-    return { state: 'unknown', label: '未知状态', explanation: '服务端返回了无法识别的校验状态。', statusClass: 'status-queued' };
-  }
-  const state = (validation as { state?: unknown }).state;
-  if (state === undefined) {
-    return { state: 'pending', label: '待校验', explanation: '尚未收到可确认的校验结论。', statusClass: 'status-queued' };
-  }
-  switch (state) {
-    case 'pending':
-      return { state: 'pending', label: '待校验', explanation: '尚未收到可确认的校验结论。', statusClass: 'status-queued' };
-    case 'PASS':
-      return { state: 'PASS', label: '通过', explanation: '服务端校验已通过。', statusClass: 'status-completed' };
-    case 'PASS+NOTES':
-      return { state: 'PASS+NOTES', label: '通过（有备注）', explanation: '校验已通过，包含非阻塞备注。', statusClass: 'status-queued' };
-    case 'FAIL':
-      return { state: 'FAIL', label: '未通过', explanation: '服务端校验未通过。', statusClass: 'status-failed' };
-    default:
-      return { state: 'unknown', label: '未知状态', explanation: '服务端返回了无法识别的校验状态。', statusClass: 'status-queued' };
-  }
+function taskQueuePriorityText(priority: TaskSummary['queue_priority']): string {
+  return priority === 'pinned' ? '置顶' : priority === 'background' ? '后台' : priority === 'normal' ? '普通' : '未知';
 }
 
-function taskValidationClaimExcerpt(result: string, claim: components['schemas']['TaskValidationEvidenceClaim']): string | null {
-  if (!Number.isSafeInteger(claim.start_byte) || !Number.isSafeInteger(claim.end_byte) ||
-    claim.start_byte < 0 || claim.end_byte <= claim.start_byte) return null;
-  const bytes = new TextEncoder().encode(result);
-  if (claim.end_byte > bytes.length) return null;
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.subarray(claim.start_byte, claim.end_byte));
-  } catch {
-    return null;
-  }
-}
-
-const taskValidationEvidenceLabels = {
-  source: '来源消息', baseline: '基线', action: '操作', result: '结果', side_effect: '副作用', before_after: '前后对比',
-} satisfies Record<components['schemas']['TaskValidationEvidenceRef']['kind'], string>;
-
-function taskActivityProgressText(summary: TaskSummary, task: Task | undefined, cloudTasksAvailable: boolean | undefined): string {
-  if (!task) return summary.status === 'running' ? '正在处理，打开详情查看进展。'
-    : summary.status === 'queued' ? '已排队等待开始。' : '打开详情查看任务状态。';
-  if (task.status === 'completed' && (task.result_message_pending || ['pending', 'processing'].includes(summary.result_review?.state ?? '')))
-    return '任务已完成，回复整理中。';
+function taskActivityProgressText(task: Task, cloudTasksAvailable: boolean | undefined): string {
+  if (task.status === 'queued' && cloudTasksAvailable !== false) return '等待执行';
   if (task.status === 'waiting_user') {
     if (task.pending_request) return `等待审批：${task.pending_request.title}`;
     if (task.clarification_request) return `等待补充：${task.clarification_request.question}`;
   }
   const currentStep = task.steps.find((step) => step.id === task.current_step);
-  const latestStep = currentStep?.kind !== 'model' ? currentStep : undefined;
-  const progressStep = latestStep ?? [...task.steps].reverse().find((step) => ['tool', 'subagent', 'verification', 'verify', 'progress'].includes(step.kind));
+  const progressStep = currentStep?.status === 'running' && currentStep.kind !== 'model' ? currentStep
+    : [...task.steps].reverse().find((step) => step.status === 'running' && ['tool', 'subagent', 'verification', 'verify', 'progress'].includes(step.kind));
   if (progressStep && task.status === 'running') return stepTitle(progressStep);
   if (task.status === 'failed') return '任务执行失败，请查看当前状态和处理提示。';
+  if (task.status === 'completed' && (task.result_message_pending || ['pending', 'processing'].includes(task.result_review?.state ?? '')))
+    return '任务已完成，回复整理中。';
   if (task.status === 'completed') return '任务已完成，打开详情查看结果。';
   return taskStatusText(task, cloudTasksAvailable);
 }
 
-function taskQueuePriorityText(priority: TaskSummary['queue_priority'] | undefined): string {
-  return priority === 'pinned' ? '置顶' : priority === 'background' ? '后台' : priority === 'normal' ? '普通' : '未知';
+function recoveryHint(step: TaskStep | undefined): string | null {
+  if (step?.title !== 'Review cloud task recovery') return null;
+  const category = /^The model request could not be verified \(category: ([a-z_]+)\); retry after checking the model connection\.$/.exec(step.summary)?.[1];
+  if (category === 'provider_rate_limited' || category === 'rate_limited') return '模型服务正在限流，稍后再试。';
+  if (category === 'provider_invalid_api_key' || category === 'authentication_rejected') return '模型密钥未通过服务商验证，请检查模型连接。';
+  if (category === 'provider_quota_exhausted' || category === 'quota_exhausted' || category === 'task_budget_exhausted') return '模型额度已用尽，请检查额度后重试。';
+  if (category === 'provider_model_not_found') return '服务商未找到此模型，请检查模型名称。';
+  if (category === 'provider_permission_denied' || category === 'access_rejected') return '此 API Key 无权调用该模型，请检查模型权限。';
+  if (['timeout', 'transport', 'unavailable', 'upstream_error', 'provider_server_error'].includes(category ?? '')) return '模型服务暂时不可用，请稍后重试。';
+  return null;
 }
 
 function resultReviewStatusText(review: K2ResultReview, replyVisible: boolean): string {
@@ -744,9 +657,116 @@ function resultReviewStatusText(review: K2ResultReview, replyVisible: boolean): 
   }
 }
 
+function childJobStatusText(status: string): string {
+  if (status === 'queued') return '等待执行';
+  if (status === 'running') return '进行中';
+  if (status === 'succeeded') return '已完成';
+  if (status === 'failed') return '失败';
+  if (status === 'cancelled') return '已停止';
+  return '状态待确认';
+}
+
+function taskActivitySnippet(value: string, maximumCharacters: number): string | null {
+  const safe = safeTaskActivityText(value, 1_000).value.replace(/\s+/gu, ' ').trim();
+  if (!safe || /^(?:the model request could not be verified|the cloud dsh session completed|the task (?:failed|was interrupted)|(?:internal|runtime) error\b|traceback\b)/iu.test(safe)) return null;
+  const first = safe.split(/(?<=[。！？!?；;，,：:\n])/u, 1)[0]?.trim();
+  return first ? safeTaskActivityText(first, maximumCharacters).value : null;
+}
+
+function taskActivityStepTitle(step: TaskStep): string {
+  const title = stepTitle(step);
+  if (title === 'Review cloud task recovery') return '核对任务恢复状态';
+  if (/^the model request could not be verified\b/iu.test(title)) return '模型请求未能确认';
+  if (/^the cloud dsh session completed\b/iu.test(title)) return '任务会话已结束';
+  if (/^the task (?:failed|was interrupted)\b/iu.test(title)) return '任务未完成';
+  if (/^(?:internal|runtime) error\b|^traceback\b/iu.test(title)) return '运行步骤失败';
+  return title;
+}
+
+function taskActivityStepSummary(step: TaskStep): string {
+  const summary = step.summary.trim();
+  const source = summary || taskActivityStepTitle(step);
+  if (/^the model request could not be verified\b/iu.test(source)) return '模型服务未返回可确认的结果。';
+  if (/^the cloud dsh session completed\b/iu.test(source)) return '任务会话已结束，结果未能确认。';
+  if (/^the task (?:failed|was interrupted)\b|^(?:internal|runtime) error\b|^traceback\b/iu.test(source)) return '此步骤执行失败，详细原因暂不可用。';
+  return safeTaskActivityText(source, 500).value;
+}
+
+function taskActivityTitle(objective: string): string {
+  const withoutSyntheticID = safeTaskActivityText(objective, 1_000).value.replace(/^合成并行任务\s+[A-Z0-9-]+[：:]\s*/iu, '');
+  const title = taskActivitySnippet(withoutSyntheticID, 42)?.replace(/^(?:请你|请|帮我|帮忙|麻烦|这是)\s*/u, '').replace(/[，,。.!！？?；;：:]+$/u, '').trim();
+  return title || '未命名任务';
+}
+
+function taskActivityLatestWorkText(summary: TaskSummary, task?: Task): string {
+  const latest = task?.steps.filter((step) => !['model', 'plan', 'budget'].includes(step.kind) &&
+    step.title !== '开始处理')
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  const text = latest?.status === 'failed' ? null : taskActivitySnippet(latest?.summary.trim() ?? '', 56);
+  if (text) return text;
+  if (latest) return taskActivityStepTitle(latest);
+  const currentStep = task?.current_step ?? summary.current_step;
+  if (currentStep && !/^s[a-z0-9]{7,}$/iu.test(currentStep)) {
+    const currentSummary = taskActivitySnippet(stepPresentationTitle(currentStep), 56);
+    if (currentSummary) return currentSummary;
+  }
+  return taskActivityIsExecuting(task?.status ?? summary.status) ? '正在处理任务' : '暂无工作项';
+}
+
+function safeTaskActivityText(value: string, maximumCharacters = 2_000): { value: string; truncated: boolean } {
+  const redacted = value
+    .replace(/(["']?(?:password|passwd|pwd|secret|token|api[\s_-]?key|authorization|auth[\s_-]?token|credential|credentials|client[\s_-]?secret|private[\s_-]?key|access[\s_-]?key|refresh[\s_-]?token)["']?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,}\]]+)/giu, '$1[已隐藏]')
+    .replace(/\bBearer\s+[^\s,}\]]+/giu, 'Bearer [已隐藏]');
+  const characters = Array.from(redacted);
+  if (characters.length <= maximumCharacters) return { value: redacted, truncated: false };
+  return { value: `${characters.slice(0, maximumCharacters - 1).join('')}…`, truncated: true };
+}
+
+function taskAgentActivityGroups(task: Task): TaskAgentActivityGroup[] {
+  const steps = task.steps.filter((step) => !['model', 'plan', 'budget'].includes(step.kind) &&
+    step.title !== '开始处理')
+    .sort((left, right) => left.sequence - right.sequence);
+  if (!steps.length) return [];
+  const unassigned = (items: TaskStep[]): TaskAgentActivityGroup[] => items.length
+    ? [{ id: 'unassigned', title: '归属未确认', steps: items }] : [];
+  const agents = task.agents ?? [];
+  if (!agents.length) return steps.some((step) => step.agent_id)
+    ? unassigned(steps) : [{ id: 'main', title: 'MAIN', steps }];
+
+  const byID = new Map(agents.map((agent) => [agent.id, agent]));
+  const roots = agents.filter((agent) => agent.parent_id === null && agent.role === 'main');
+  if (byID.size !== agents.length || roots.length !== 1 || agents.some((agent) =>
+    !agent.id || agent.task_revision < 0 || (agent.parent_id === null ? agent.role !== 'main' : agent.role !== 'subagent' || !byID.has(agent.parent_id))))
+    return unassigned(steps);
+
+  const byStepID = new Map(steps.map((step) => [step.id, step]));
+  const children = agents.filter((agent) => agent.parent_id !== null).sort((left, right) => {
+    const leftSequence = left.step_id ? byStepID.get(left.step_id)?.sequence ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
+    const rightSequence = right.step_id ? byStepID.get(right.step_id)?.sequence ?? Number.MAX_SAFE_INTEGER : Number.MAX_SAFE_INTEGER;
+    return leftSequence - rightSequence || left.id.localeCompare(right.id);
+  });
+  const visited = new Set<string>();
+  const groups: TaskAgentActivityGroup[] = [];
+  let invalidTree = false;
+  const append = (agent: TaskAgent, path: number[]) => {
+    if (visited.has(agent.id)) { invalidTree = true; return; }
+    visited.add(agent.id);
+    const ownSteps = steps.filter((step) => step.agent_id === agent.id);
+    if (ownSteps.length) groups.push({ id: agent.id,
+      title: path.length ? `SUBAGENT ${path.map((part) => String(part).padStart(2, '0')).join('.')}` : 'MAIN', steps: ownSteps });
+    children.filter((item) => item.parent_id === agent.id).forEach((child, index) => append(child, [...path, index + 1]));
+  };
+  append(roots[0]!, []);
+  if (invalidTree || visited.size !== agents.length) return unassigned(steps);
+  const assignedStepIDs = new Set(groups.flatMap((group) => group.steps.map((step) => step.id)));
+  return [...groups, ...unassigned(steps.filter((step) => !assignedStepIDs.has(step.id)))];
+}
+
 type TaskFeedState = 'connected' | 'disconnected' | 'resyncing';
 
-function TaskStream({ task, conversationID, onState }: { task: Task; conversationID: string; onState: (id: string, state: TaskFeedState) => void }) {
+function TaskStream({ task, conversationID, onState }: {
+  task: Task; conversationID: string; onState: (id: string, state: TaskFeedState) => void;
+}) {
   const client = useQueryClient();
   const cursor = useRef(task.event_sequence);
   const [generation, setGeneration] = useState(0);
@@ -856,8 +876,16 @@ export function Assistant() {
   const [taskWorkspaceSelections, setTaskWorkspaceSelections] = useState<Record<string, string>>({});
   const [supplementTaskID, setSupplementTaskID] = useState<string | null>(null);
   const [taskDetailTaskID, setTaskDetailTaskID] = useState<string | null>(null);
+  const [taskDetailStepID, setTaskDetailStepID] = useState<string | null>(null);
+  const [visibleTaskPanelCount, setVisibleTaskPanelCount] = useState(5);
+  const [openingTaskID, setOpeningTaskID] = useState('');
+  const [taskObservationRequest, setTaskObservationRequest] = useState(false);
+  const [pendingTaskActions, setPendingTaskActions] = useState<Map<string, { fingerprint: string; key: string }>>(() => new Map());
+  const [taskEventFeeds, setTaskEventFeeds] = useState<Record<string, TaskFeedState>>({});
+  const setTaskEventFeed = useCallback((id: string, state: TaskFeedState) => {
+    setTaskEventFeeds((current) => current[id] === state ? current : { ...current, [id]: state });
+  }, []);
   const handledNavigationTaskID = useRef<string | null>(null);
-  const [taskPanelRecentOpen, setTaskPanelRecentOpen] = useState(false);
   const [enableExecutionConfirmationOpen, setEnableExecutionConfirmationOpen] = useState(false);
   const enableExecutionAttempt = useRef<{ userID: string; epoch: number; key: string } | null>(null);
   const [standaloneTaskPanelTab, setStandaloneTaskPanelTab] = useState<AssistantPanelTab>('tasks');
@@ -952,8 +980,6 @@ export function Assistant() {
   const [showJumpToLatest, setShowJumpToLatest] = useState(false);
   const [selectedMessageVariantVersions, setSelectedMessageVariantVersions] = useState<Record<string, number>>({});
   const [historyPageLoadVersion, setHistoryPageLoadVersion] = useState(0);
-  const [openingTaskID, setOpeningTaskID] = useState('');
-  const [taskObservationRequest, setTaskObservationRequest] = useState(false);
   const pendingMessageSave = useRef<Promise<void>>(Promise.resolve());
   const savingMessageRef = useRef(false);
   const preparingAttachmentCountRef = useRef(0);
@@ -964,7 +990,6 @@ export function Assistant() {
   const preparingAttachmentIDs = useRef(new Set<string>());
   const sendingMessageIDs = useRef(new Set<string>());
   const newConversationKey = useRef<string | null>(null);
-  const [pendingTaskActions, setPendingTaskActions] = useState<Map<string, { fingerprint: string; key: string }>>(() => new Map());
   const ensureMainKey = useRef<{ userID: string; key: string } | null>(null);
   const ensureAttemptedUserID = useRef<string | null>(null);
   const ensureMainErrorToastID = useRef<number | null>(null);
@@ -989,11 +1014,7 @@ export function Assistant() {
     for (const controllers of pdfPreparationControllers.current.values()) for (const controller of controllers) controller.abort();
     pdfPreparationControllers.current.clear();
   }, []);
-  const [taskEventFeeds, setTaskEventFeeds] = useState<Record<string, TaskFeedState>>({});
   const [visibleSideConversationCount, setVisibleSideConversationCount] = useState(5);
-  const setTaskEventFeed = useCallback((taskID: string, state: TaskFeedState) => {
-    setTaskEventFeeds((current) => current[taskID] === state ? current : { ...current, [taskID]: state });
-  }, []);
   const capabilities = useQuery({ queryKey: ['service-capabilities'], queryFn: portalApi.capabilities });
   const outbox = useMessageOutbox(user?.id, capabilities.data?.service_instance_id);
   const variantOutbox = useMessageVariantOutbox(user?.id, capabilities.data?.service_instance_id);
@@ -1036,6 +1057,7 @@ export function Assistant() {
   });
   const models = useQuery({ queryKey: ['model-connections'], queryFn: portalApi.modelConnections, staleTime: 60_000, refetchOnMount: 'always' });
   const workspaces = useQuery({ queryKey: ['assistant-workspaces'], queryFn: portalApi.workspaces, staleTime: 30_000 });
+  const workspaceItems = (workspaces.data?.items ?? []).filter((workspace) => workspace.state === 'ready' && !workspace.is_read_only);
   const mcpConnectors = useQuery({ queryKey: ['mcp-connectors'], queryFn: portalApi.mcpConnectors, retry: false });
   const availableModels = useQuery({ queryKey: ['available-models'], queryFn: portalApi.availableModels });
   const preferences = useQuery({ queryKey: ['user-preferences'], queryFn: portalApi.preferences });
@@ -1140,6 +1162,7 @@ export function Assistant() {
     if (!navigationTaskID || !navigationConversationID || conversationID !== navigationConversationID ||
       handledNavigationTaskID.current === navigationTaskID) return;
     handledNavigationTaskID.current = navigationTaskID;
+    setTaskDetailStepID(null);
     setTaskDetailTaskID(navigationTaskID);
     setTaskPanelTab('tasks');
     setTaskPanelOpen(true);
@@ -1149,8 +1172,8 @@ export function Assistant() {
   const [panelConversationID, setPanelConversationID] = useState(conversationID);
   if (panelConversationID !== conversationID) {
     setPanelConversationID(conversationID);
+    setTaskDetailStepID(null);
     setTaskDetailTaskID(null);
-    setTaskPanelRecentOpen(false);
     setComputerConnecting(false);
     setComputerEmbed(null);
     setComputerControlExpanded(false);
@@ -1417,10 +1440,19 @@ export function Assistant() {
   });
   const conversationTaskItems = conversationContentAccessRevoked ? [] : conversationTasks.data?.items ?? [];
   const recentConversationTaskItems = conversationContentAccessRevoked ? [] : recentConversationTasks.data?.items ?? [];
+  const taskPanelItemsByID = new Map<string, TaskSummary>();
+  for (const item of accountTasks.data?.items ?? []) taskPanelItemsByID.set(item.id, item);
+  for (const item of waitingAccountTasks.data?.items ?? []) taskPanelItemsByID.set(item.id, item);
+  for (const item of [...conversationTaskItems, ...recentConversationTaskItems]) taskPanelItemsByID.set(item.id, item);
+  const taskPanelSummaryItems = [...taskPanelItemsByID.values()].sort((left, right) =>
+    Number(taskActivityIsExecuting(right.status)) - Number(taskActivityIsExecuting(left.status)) || Date.parse(right.updated_at) - Date.parse(left.updated_at));
+  const taskPanelPreviewTaskIDs = new Set(taskPanelSummaryItems.slice(0, visibleTaskPanelCount).map((item) => item.id));
   const taskIDs = [...new Set([
     ...conversationTaskItems.map((item) => item.id),
     ...recentConversationTaskItems.map((item) => item.id),
     ...conversationMessageItems.flatMap((message) => [message.task_id, message.related_task_id].filter((id): id is string => Boolean(id))),
+    ...(waitingAccountTasks.data?.items.map((item) => item.id) ?? []),
+    ...taskPanelPreviewTaskIDs,
     ...(taskDetailTaskID ? [taskDetailTaskID] : []),
   ])];
   const currentConversationTaskIDs = new Set([
@@ -1430,7 +1462,7 @@ export function Assistant() {
   ]);
   const taskQueries = useQueries({ queries: taskIDs.map((id) => ({
     queryKey: ['task', id], queryFn: () => portalApi.task(id),
-    enabled: currentConversationTaskIDs.has(id) || taskDetailTaskID === id,
+    enabled: currentConversationTaskIDs.has(id) || taskPanelPreviewTaskIDs.has(id) || taskDetailTaskID === id,
     structuralSharing: latestTaskSnapshot,
     refetchInterval: (query: { state: { data: Task | undefined } }) => query.state.data?.result_message_pending ? 1000
       : query.state.data && terminalTaskStatuses.has(query.state.data.status) ? false
@@ -1475,59 +1507,18 @@ export function Assistant() {
         return next.size === current.size ? current : next;
       });
     }
-    const progressedReviewTaskIDs = new Set<string>();
-    const failedAgainReviewTaskIDs = new Set<string>();
-    for (const task of allTasks) {
-      const k2Read = readK2TaskProjection(task);
-      if (k2Read.kind !== 'available') continue;
-      const review = k2Read.projection.result_review;
-      if (!review?.trigger_message_id) continue;
-      const retryIdentity = JSON.stringify([serviceInstanceID, actorID, task.conversation_id, task.id, review.trigger_message_id]);
-      const previousStatus = observedProcessingRetryStates.current.get(retryIdentity);
-      observedProcessingRetryStates.current.set(retryIdentity, review.state);
-      if (review.state === 'failed') {
-        if (previousStatus && previousStatus !== 'failed') failedAgainReviewTaskIDs.add(task.id);
-        continue;
-      }
-      progressedReviewTaskIDs.add(task.id);
-      if (previousStatus === review.state) continue;
-      try {
-        clearProcessingRetryKey(serviceInstanceID, actorID, `result-review:${task.id}`, task.conversation_id, review.trigger_message_id);
-      } catch {
-        // Keep the key if local storage is unavailable; repeating it is safe.
-      }
-    }
-    if (progressedReviewTaskIDs.size || failedAgainReviewTaskIDs.size) {
-      // Reconcile transient retry UI after the persisted task confirms review progress.
-      setRetryAcceptedResultReviewTaskIDs((current) => {
-        const next = new Set(current);
-        for (const taskID of progressedReviewTaskIDs) next.delete(taskID);
-        for (const taskID of failedAgainReviewTaskIDs) next.delete(taskID);
-        return next.size === current.size ? current : next;
-      });
-    }
-  }, [allTasks, capabilities.data?.service_instance_id, messages.data, user?.id]);
-  const taskPanelItemsByID = new Map<string, TaskSummary>();
-  for (const item of accountTasks.data?.items ?? []) taskPanelItemsByID.set(item.id, item);
-  for (const item of [...conversationTaskItems, ...recentConversationTaskItems, ...allTasks]) taskPanelItemsByID.set(item.id, item);
-  const taskPanelTasks = [...taskPanelItemsByID.values()].sort((left, right) =>
-    Date.parse(allTasksByID.get(right.id)?.updated_at ?? right.updated_at) -
-    Date.parse(allTasksByID.get(left.id)?.updated_at ?? left.updated_at) || right.id.localeCompare(left.id));
+  }, [capabilities.data?.service_instance_id, messages.data, user?.id]);
+  for (const item of allTasks) taskPanelItemsByID.set(item.id, item);
+  const taskPanelTasks = [...taskPanelItemsByID.values()].sort((left, right) => {
+    const leftTask = allTasksByID.get(left.id);
+    const rightTask = allTasksByID.get(right.id);
+    return Number(taskActivityIsExecuting(rightTask?.status ?? right.status)) - Number(taskActivityIsExecuting(leftTask?.status ?? left.status)) ||
+      Date.parse(rightTask?.updated_at ?? right.updated_at) - Date.parse(leftTask?.updated_at ?? left.updated_at) || right.id.localeCompare(left.id);
+  });
   const taskProgressReadError = taskQueries.some((query, index) => query.isError && currentConversationTaskIDs.has(taskIDs[index] ?? ''));
   const taskProgressNetworkReadError = taskQueries.some((query, index) => query.isError &&
     isTransientNetworkError(query.error) && currentConversationTaskIDs.has(taskIDs[index] ?? ''));
-  const visibleTaskPanelTasks = taskPanelTasks;
-  const taskPanelGroups: TaskPanelGroup[] = [
-    { id: 'attention', title: '待你处理', tasks: visibleTaskPanelTasks.filter((item) => (allTasksByID.get(item.id)?.status ?? item.status) === 'waiting_user') },
-    { id: 'running', title: '进行中', tasks: visibleTaskPanelTasks.filter((item) => ['queued', 'running', 'pausing', 'cancelling'].includes(allTasksByID.get(item.id)?.status ?? item.status)) },
-    { id: 'paused', title: '已暂停', tasks: visibleTaskPanelTasks.filter((item) => (allTasksByID.get(item.id)?.status ?? item.status) === 'paused') },
-    { id: 'recent', title: '最近结束', tasks: visibleTaskPanelTasks.filter((item) => terminalTaskStatuses.has(allTasksByID.get(item.id)?.status ?? item.status)) },
-  ];
-  const taskPanelRows = taskPanelGroups.flatMap<TaskPanelRow>((group) => {
-    if (!group.tasks.length) return [];
-    if (group.id === 'recent' && !taskPanelRecentOpen) return [{ key: 'group-recent', group, task: null, first: true }];
-    return group.tasks.map((item, index) => ({ key: `task-${item.id}`, group, task: item, first: index === 0 }));
-  });
+  const visibleTaskPanelTasks = taskPanelTasks.slice(0, visibleTaskPanelCount);
   const conversationFiles: ConversationFileItem[] = [
     ...conversationMessageItems.flatMap((item) => (item.attachment_ids ?? []).map((attachmentID, index) => ({
       kind: 'attachment' as const, key: `attachment:${item.id}:${attachmentID}`, attachmentID,
@@ -1536,7 +1527,6 @@ export function Assistant() {
     ...tasks.flatMap((item) => item.artifacts.filter(hasCompleteVerifiedArtifactProof).map((artifact) => ({ kind: 'artifact' as const,
       key: `artifact:${item.id}:${artifact.id}`, taskID: item.id, taskTitle: item.objective || '未命名任务', artifact }))),
   ];
-  const pendingTaskCount = waitingAccountTasks.isSuccess ? waitingAccountTasks.data.items.length : null;
   const resultsAwaitingMessages = tasks.some((task) => task.result_message_pending || (task.result_message_published &&
     !conversationMessageItems.some((message) => message.sources?.some((source) => source.task_id === task.id &&
       source.task_revision === task.assistant_message?.task_revision && source.event_sequence === task.assistant_message?.result_event_sequence))));
@@ -1568,7 +1558,7 @@ export function Assistant() {
     { failed: Boolean(conversationID) && messages.isError, error: messages.error },
     { failed: Boolean(conversationID) && conversationTasks.isError, error: conversationTasks.error },
     { failed: taskPanelOpen && taskPanelTab === 'tasks' && accountTasks.isError, error: accountTasks.error },
-    { failed: Boolean(user) && waitingAccountTasks.isError, error: waitingAccountTasks.error },
+    { failed: Boolean(user?.id) && waitingAccountTasks.isError, error: waitingAccountTasks.error },
     { failed: Boolean(conversationID) && taskPanelOpen && recentConversationTasks.isError, error: recentConversationTasks.error },
     ...conversationPreviewQueries.map((query) => ({ failed: query.isError, error: query.error })),
     ...taskQueries.map((query) => ({ failed: query.isError, error: query.error })),
@@ -1623,7 +1613,6 @@ export function Assistant() {
   };
   const hostItems = useMemo(() => hosts.data?.items ?? [], [hosts.data?.items]);
   const preferredHostID = preferences.data?.default_host_id || (hostItems.length === 1 ? hostItems[0]?.id : '') || '';
-  const workspaceItems = (workspaces.data?.items ?? []).filter((workspace) => workspace.state === 'ready' && !workspace.is_read_only);
   const computerHostOptions = useMemo<ComputerHostOption[]>(() => [
     ...hostItems.map((host) => ({ id: host.id, name: host.name || host.id, url: host.url, state: host.state, owned: true, permissions: [], control_state: host.control_state })),
     ...(sharedHosts.data?.items ?? []).map((host) => ({
@@ -1917,7 +1906,6 @@ export function Assistant() {
     }
     notify(details.message, 'error');
   };
-
   const sendVariantOperation = async (entry: MessageVariantOutboxEntry): Promise<boolean> => {
     const key = entry.operation.input.idempotencyKey;
     if (sendingVariantOperationKeys.current.has(key)) return false;
@@ -2273,9 +2261,7 @@ export function Assistant() {
     },
     onError: async (error, request) => {
       await handleTaskActionError(error, request.taskID);
-      if (errorDetails(error).code === 'conflict') {
-        await client.invalidateQueries({ queryKey: ['task', request.taskID] });
-      }
+      if (errorDetails(error).code === 'conflict') await client.invalidateQueries({ queryKey: ['task', request.taskID] });
     },
   });
   const cancelComposerAttachmentPreparation = () => {
@@ -2557,6 +2543,56 @@ export function Assistant() {
     pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
   };
 
+  const submitTaskSupplement = (event: FormEvent<HTMLFormElement>, task: Task) => {
+    event.preventDefault();
+    const supplementalText = (taskSupplementDrafts[task.id] ?? '').trim();
+    const needsWorkspaceTarget = task.waiting_reason === 'workspace_unavailable' && !task.workspace_id;
+    const selectedWorkspaceID = needsWorkspaceTarget ? taskWorkspaceSelections[task.id] ?? '' : '';
+    const text = supplementalText || (needsWorkspaceTarget && selectedWorkspaceID
+      ? '请继续当前任务，并将结果保存到我选择的 Workspace。' : '');
+    if (savingMessageRef.current || !text || (needsWorkspaceTarget && !selectedWorkspaceID)) return;
+    if (new TextEncoder().encode(text).length > maxMessageBytes) {
+      notify('单条消息不能超过 8 MiB；完整内容仍保留在输入框中。', 'error');
+      return;
+    }
+    const id = newIdempotencyKey();
+    savingMessageRef.current = true;
+    setSavingMessage(true);
+    const previous = pendingMessageSave.current.then(async () => {
+      const targetMessages = task.conversation_id === conversationID && messages.data
+        ? conversationMessageItems : (await portalApi.conversationMessages(task.conversation_id)).items;
+      const pending: PendingConversationMessage = {
+        actorID: user?.id ?? '',
+        request: { client_message_id: id, content: text, reference_task_id: task.id,
+          ...(selectedWorkspaceID ? { workspace_id: selectedWorkspaceID, change_task_target: true } : {}) },
+        conversationID: task.conversation_id,
+        ...(capabilities.data?.service_instance_id ? { serviceInstanceID: capabilities.data.service_instance_id } : {}),
+        attachments: [], status: 'pending', createdAt: Date.now(),
+      };
+      const entry = await outbox.enqueue(pending, latestConversationClientMessageID(targetMessages));
+      if (activeOutboxScope.current === entry.scope) {
+        setTaskSupplementDrafts((current) => ({ ...current, [task.id]: '' }));
+        setSupplementTaskID(null);
+      }
+      void sendMessage(entry, false);
+    }).finally(() => {
+      savingMessageRef.current = false;
+      setSavingMessage(false);
+    });
+    pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
+  };
+
+  const submitTaskControl = (action: 'pause' | 'resume' | 'cancel', task: TaskSummary) => {
+    const actionScope = `${action}:${task.id}`;
+    const expectedCurrentRevision = task.current_revision ?? null;
+    const expectedDesiredRevision = task.desired_revision ?? null;
+    const fingerprint = JSON.stringify({ action, expected_status: task.status,
+      current_revision: expectedCurrentRevision, desired_revision: expectedDesiredRevision });
+    taskControl.mutate({ taskID: task.id, action, expectedStatus: task.status,
+      expectedCurrentRevision, expectedDesiredRevision, actionScope,
+      key: taskActionKey(actionScope, fingerprint) });
+  };
+
   const ensureLocalConversationKey = () => {
     if (conversationID) return null;
     const key = selectedLocalDraftKey ?? newConversationKey.current ?? newIdempotencyKey();
@@ -2639,56 +2675,6 @@ export function Assistant() {
       writeRecentConversation(recentConversationKey, id);
       client.setQueryData(['assistant-recent-conversation', recentConversationKey], id);
     }
-  };
-
-  const submitTaskSupplement = (event: FormEvent<HTMLFormElement>, task: Task) => {
-    event.preventDefault();
-    const supplementalText = (taskSupplementDrafts[task.id] ?? '').trim();
-    const needsWorkspaceTarget = task.waiting_reason === 'workspace_unavailable' && !task.workspace_id;
-    const selectedWorkspaceID = needsWorkspaceTarget ? taskWorkspaceSelections[task.id] ?? '' : '';
-    const text = supplementalText || (needsWorkspaceTarget && selectedWorkspaceID
-      ? '请继续当前任务，并将结果保存到我选择的 Workspace。' : '');
-    if (savingMessageRef.current || !text || (needsWorkspaceTarget && !selectedWorkspaceID)) return;
-    if (new TextEncoder().encode(text).length > maxMessageBytes) {
-      notify('单条消息不能超过 8 MiB；完整内容仍保留在输入框中。', 'error');
-      return;
-    }
-    const id = newIdempotencyKey();
-    savingMessageRef.current = true;
-    setSavingMessage(true);
-    const previous = pendingMessageSave.current.then(async () => {
-      const targetMessages = task.conversation_id === conversationID && messages.data
-        ? conversationMessageItems : (await portalApi.conversationMessages(task.conversation_id)).items;
-      const pending: PendingConversationMessage = {
-        actorID: user?.id ?? '',
-        request: { client_message_id: id, content: text, reference_task_id: task.id,
-          ...(selectedWorkspaceID ? { workspace_id: selectedWorkspaceID, change_task_target: true } : {}) },
-        conversationID: task.conversation_id,
-        ...(capabilities.data?.service_instance_id ? { serviceInstanceID: capabilities.data.service_instance_id } : {}),
-        attachments: [], status: 'pending', createdAt: Date.now(),
-      };
-      const entry = await outbox.enqueue(pending, latestConversationClientMessageID(targetMessages));
-      if (activeOutboxScope.current === entry.scope) {
-        setTaskSupplementDrafts((current) => ({ ...current, [task.id]: '' }));
-        setSupplementTaskID(null);
-      }
-      void sendMessage(entry, false);
-    }).finally(() => {
-      savingMessageRef.current = false;
-      setSavingMessage(false);
-    });
-    pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
-  };
-
-  const submitTaskControl = (action: 'pause' | 'resume' | 'cancel', task: TaskSummary) => {
-    const actionScope = `${action}:${task.id}`;
-    const expectedCurrentRevision = task.current_revision ?? null;
-    const expectedDesiredRevision = task.desired_revision ?? null;
-    const fingerprint = JSON.stringify({ action, expected_status: task.status,
-      current_revision: expectedCurrentRevision, desired_revision: expectedDesiredRevision });
-    taskControl.mutate({ taskID: task.id, action, expectedStatus: task.status,
-      expectedCurrentRevision, expectedDesiredRevision, actionScope,
-      key: taskActionKey(actionScope, fingerprint) });
   };
 
   const showMoreSideConversations = async () => {
@@ -2897,6 +2883,7 @@ export function Assistant() {
       setComputerEmbed(null);
       setComputerControlExpanded(false);
       setTaskPanelOpen(false);
+      setTaskDetailStepID(null);
       setTaskDetailTaskID(null);
       window.requestAnimationFrame(() => {
         if (outletContext?.focusPanelToggle) outletContext.focusPanelToggle();
@@ -3031,15 +3018,34 @@ export function Assistant() {
     const task = allTasksByID.get(summary.id);
     const taskQuery = taskQueries[taskIDs.indexOf(summary.id)];
     if (!task) return taskQuery?.isError && !isTransientNetworkError(taskQuery.error)
-      ? <FloatingError className="error-inline task-detail-load-error" role="alert">任务详情暂不可用，当前状态未确认。
+      ? <FloatingError className="error-inline task-detail-load-error" role="alert">任务工作过程暂不可用。
         <button type="button" className="button button-small button-secondary" onClick={() => void taskQuery.refetch()}>重试</button></FloatingError>
-      : <p className="muted" role="status">正在读取任务详情…</p>;
+      : <p className="muted" role="status">正在读取任务工作过程…</p>;
+
+    if (taskDetailStepID) {
+      const step = task.steps.find((item) => item.id === taskDetailStepID);
+      if (!step) return <p className="muted" role="status">此工作项已不在当前任务记录中。</p>;
+      const text = taskActivitySnippet(taskActivityStepSummary(step), 280) ?? '暂无可展示的步骤结果。';
+      return <div className="task-work-step-detail" aria-label="工作项详情">
+        {step.kind === 'tool' || step.tool_name
+          ? <TaskStepDetails task={task} step={step} conversationID={task.conversation_id} actorID={user?.id ?? ''}
+            serviceInstanceID={capabilities.data?.service_instance_id ?? ''} />
+          : <div className="task-step-detail" aria-label="步骤结果"><p>{text}</p></div>}
+      </div>;
+    }
+
+    const groups = taskAgentActivityGroups(task);
+    const isRunning = taskActivityIsExecuting(task.status);
+    const title = taskActivityTitle(task.objective);
     const busy = !terminalTaskStatuses.has(task.status);
-    const k2Read = readK2TaskProjection(task);
-    const k2 = k2Read.kind === 'available' ? k2Read.projection : null;
-    const review = k2?.result_review ?? null;
     const currentStep = task.steps.find((step) => step.id === task.current_step);
     const recoveryMessage = task.waiting_reason === 'dsh_recovery_unresolved' ? recoveryHint(currentStep) : null;
+    const progressText = taskActivityProgressText(task, cloudTasksAvailable);
+    const showProgress = !terminalTaskStatuses.has(task.status) ||
+      (task.status === 'completed' && (task.result_message_pending || ['pending', 'processing'].includes(task.result_review?.state ?? '')));
+    const projectionRead = readK2TaskProjection(task);
+    const projection = projectionRead.kind === 'available' ? projectionRead.projection : null;
+    const review = projection?.result_review ?? null;
     const publishedReplyVisible = Boolean(review?.state === 'published' && review.source_task_id === task.id && review.reply_message_id &&
       (task.conversation_id !== conversationID || displayMessages.some((message) => message.id === review.reply_message_id && message.role === 'assistant' &&
         message.sources?.some((source) => source.task_id === review.source_task_id &&
@@ -3051,61 +3057,13 @@ export function Assistant() {
     const answer = clarificationAnswers[task.id] ?? '';
     const supplementEntries = outbox.entries.filter(({ message }) => message.conversationID === task.conversation_id &&
       message.request.reference_task_id === task.id);
-    const progressText = taskActivityProgressText(summary, task, cloudTasksAvailable);
-    const validation = taskValidationPresentation(task);
-    const validationEvidence = task.validation_detail && Number.isSafeInteger(task.current_revision) &&
-      task.current_revision === task.desired_revision && task.validation_detail.task_revision === task.current_revision &&
-      Number.isSafeInteger(task.validation_detail.event_sequence) && task.validation_detail.event_sequence <= task.event_sequence
-      ? task.validation_detail : null;
-    return <section className="task-activity" data-task-id={task.id} aria-label={`任务详情：${task.objective || '未命名任务'}`}>
+    return <section className="task-activity" data-task-id={task.id} aria-label={`任务详情：${title}`}>
       <header className="task-activity-heading">
-        <div><strong>{task.objective || '未命名任务'}</strong>
-        </div>
-        <span className={`task-activity-status status-${task.status}`}>{taskActivityStatusText(summary, task)}</span>
+        <div><strong>{title}</strong><small>更新于 {formatDate(task.updated_at)}</small></div>
+        <span className={`task-activity-status task-dynamics-status ${isRunning ? 'is-running' : 'is-stopped'}`}>
+          {isRunning ? '执行中' : task.status === 'failed' ? '失败' : '停止'}
+        </span>
       </header>
-      <section className="task-activity-k2 task-activity-validation" aria-label="任务校验">
-        <h3>校验状态</h3>
-        <p><span className={`task-activity-status ${validation.statusClass}`} aria-label={`总体状态：${validation.label}`}>{validation.label}</span></p>
-        <p>{validation.explanation}</p>
-      </section>
-      {validationEvidence && validationEvidence.claims.length > 0 && <section className="task-activity-k2 task-activity-evidence" aria-label="结果与证据对应关系">
-        <h3>结果与证据对应关系</h3>
-        <p>只读证据索引，不代表独立校验通过。</p>
-        <ol>{validationEvidence.claims.map((claim, index) => {
-          const excerpt = task.result === null ? null : taskValidationClaimExcerpt(task.result, claim);
-          return <li key={`${claim.claim_id}:${index}`}>
-            <strong>声明 {index + 1}</strong>
-            {excerpt ? <blockquote>{excerpt}</blockquote> : <small>结果文本范围无效或暂不可用。</small>}
-            {claim.performance_comparison && <p className="task-activity-evidence-performance">
-              <strong>性能对比：</strong>{claim.performance_comparison.metric}，
-              {claim.performance_comparison.before} {claim.performance_comparison.unit} → {claim.performance_comparison.after} {claim.performance_comparison.unit}，
-              变化 {claim.performance_comparison.delta} {claim.performance_comparison.unit}；环境：{claim.performance_comparison.environment}
-            </p>}
-            <ul>{claim.evidence_refs.map((ref) => {
-              const revisionMatches = ref.task_revision === validationEvidence.task_revision;
-              const artifact = revisionMatches && ref.kind === 'side_effect' ? task.artifacts.find((item) => item.id === ref.id) : undefined;
-              const stepID = ref.kind === 'side_effect' ? artifact?.step_id : ref.id;
-              const step = revisionMatches && ref.kind !== 'source' && stepID
-                ? task.steps.find((item) => item.id === stepID && item.sequence === ref.sequence &&
-                  (item.task_revision === undefined || item.task_revision === ref.task_revision)) : undefined;
-              const source = revisionMatches && ref.kind === 'source' ? displayMessages.find((item) => item.id === ref.id &&
-                item.conversation_id === task.conversation_id && item.sequence === ref.sequence && item.role === 'user') : undefined;
-              const artifactVisible = artifact && step && hasCompleteVerifiedArtifactProof(artifact);
-              return <li key={`${ref.kind}:${ref.id}:${ref.call_id ?? ''}`}>
-                <span><strong>{taskValidationEvidenceLabels[ref.kind]}</strong><small>第 {ref.sequence} 条记录</small></span>
-                {!revisionMatches ? <small>引用修订不匹配，已隐藏。</small>
-                  : source ? <a className="task-activity-link" href={`#conversation-message-${encodeURIComponent(source.id)}`}>查看来源消息</a>
-                    : artifactVisible ? <small>{artifact.label} · {artifact.path}</small>
-                      : step ? <TaskValidationStepEvidence key={`${user?.id ?? ''}:${capabilities.data?.service_instance_id ?? ''}:${task.id}:${step.id}`}
-                        task={task} step={step} actorID={user?.id ?? ''} serviceInstanceID={capabilities.data?.service_instance_id ?? ''} />
-                        : ref.kind === 'source' ? <small>来源消息当前不在已加载记录中。</small>
-                          : ref.kind === 'side_effect' ? <small>产物当前不可用或未核验。</small>
-                            : <small>引用步骤当前不可用。</small>}
-              </li>;
-            })}</ul>
-          </li>;
-        })}</ol>
-      </section>}
       {task.status === 'queued' && task.queue_priority && <section className="task-activity-k2 task-queue-priority" aria-label="任务优先级">
         <h3>排队优先级</h3>
         <p>当前：{taskQueuePriorityText(task.queue_priority)}</p>
@@ -3118,21 +3076,26 @@ export function Assistant() {
               if (priority === task.queue_priority) return;
               const actionScope = `priority:${task.id}`;
               const fingerprint = JSON.stringify({ priority, event_sequence: task.event_sequence });
-              const key = taskActionKey(actionScope, fingerprint);
               setTaskPriority.mutate({ taskID: task.id, priority, expectedEventSequence: task.event_sequence,
-                actionScope, key });
+                actionScope, key: taskActionKey(actionScope, fingerprint) });
             }}>{taskQueuePriorityText(priority)}</button>)}
         </div>
         <small>等待 15 分钟仍未执行的任务会按等待时间进入公平排序。</small>
+      </section>}
+      {projection && (projection.dependencies.length > 0 || projection.child_jobs.length > 0) && <section className="task-activity-k2" aria-label="任务依赖与子任务">
+        <h3>任务依赖与子任务</h3>
+        {projection.dependencies.map((dependency) => <p key={`${dependency.task_id}:${dependency.required_revision}`}>
+          {dependency.satisfied ? '依赖已满足' : '依赖任务未就绪'} · {dependency.task_id} · 修订 {dependency.required_revision}
+        </p>)}
+        {projection.child_jobs.map((job) => <p key={job.job_id}>{job.title} · {childJobStatusText(job.status)}</p>)}
       </section>}
       {task.pending_request && <TaskApprovalCard approval={task.pending_request} compact submitting={respondToApproval.isPending}
         onDecision={(decision) => {
           const request = task.pending_request!;
           const actionScope = `approval:${task.id}:${request.id}`;
           const fingerprint = JSON.stringify({ version: request.version, decision });
-          const key = taskActionKey(actionScope, fingerprint);
           respondToApproval.mutate({ taskID: task.id, approvalID: request.id, version: request.version,
-            decision, actionScope, key });
+            decision, actionScope, key: taskActionKey(actionScope, fingerprint) });
         }} />}
       {task.clarification_request && <form className="notice notice-warning task-detail-attention" aria-label="补充任务信息"
         onSubmit={(event) => {
@@ -3142,9 +3105,8 @@ export function Assistant() {
           if (!request || !clarificationAnswer || answerClarification.isPending) return;
           const actionScope = `clarification:${task.id}:${request.id}`;
           const fingerprint = JSON.stringify({ version: request.version, answer: clarificationAnswer });
-          const key = taskActionKey(actionScope, fingerprint);
           answerClarification.mutate({ taskID: task.id, clarificationID: request.id, version: request.version,
-            answer: clarificationAnswer, actionScope, key });
+            answer: clarificationAnswer, actionScope, key: taskActionKey(actionScope, fingerprint) });
         }}>
         <h3>任务需要补充信息</h3><p>{task.clarification_request.question}</p>
         <label htmlFor={`task-clarification-${task.id}`}>你的回答</label>
@@ -3154,12 +3116,13 @@ export function Assistant() {
           {answerClarification.isPending ? '正在提交…' : '提交并继续'}
         </button>
       </form>}
-      <section className="task-current-progress" aria-label="当前进展">
+      {showProgress && <section className="task-current-progress" aria-label="当前进展">
         <h3>当前进展</h3>
-        <p role={task.status === 'failed' ? 'alert' : 'status'}>{progressText}</p>
+        <p role="status">{progressText}</p>
         {recoveryMessage && <p role="status">{recoveryMessage}</p>}
         {['disconnected', 'resyncing'].includes(taskEventFeeds[task.id] ?? '') && !showConsolidatedNetworkError && <p role="status">连接中断，正在重连…</p>}
-      </section>
+      </section>}
+      {task.status === 'failed' && <p className="task-current-progress-message" role="alert">{progressText}</p>}
       {busy && <div className="inline-actions task-activity-actions">
         {task.status === 'paused' && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
           onClick={() => submitTaskControl('resume', task)}>继续任务</button>}
@@ -3167,8 +3130,7 @@ export function Assistant() {
           onClick={() => submitTaskControl('pause', task)}>暂停任务</button>}
         {['queued', 'running', 'waiting_user', 'paused'].includes(task.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
           onClick={() => submitTaskControl('cancel', task)}>{taskControl.isPending ? '正在停止…' : '停止任务'}</button>}
-        <button type="button" className="button button-secondary"
-          onClick={() => setSupplementTaskID((current) => current === task.id ? null : task.id)}>
+        <button type="button" className="button button-secondary" onClick={() => setSupplementTaskID((current) => current === task.id ? null : task.id)}>
           {supplementTaskID === task.id ? '收起补充任务' : '补充任务'}
         </button>
       </div>}
@@ -3179,15 +3141,16 @@ export function Assistant() {
         onWorkspaceChange={(workspaceID) => setTaskWorkspaceSelections((current) => ({ ...current, [task.id]: workspaceID }))}
         onSubmit={submitTaskSupplement}
         onChange={(event) => setTaskSupplementDrafts((current) => ({ ...current, [task.id]: event.target.value }))} />}
-      {busy && supplementTaskID === task.id && task.waiting_reason === 'workspace_unavailable' && !task.workspace_id && workspaces.isError && !isTransientNetworkError(workspaces.error) && <FloatingError className="error-inline assistant-connector-error" role="alert">Workspace 列表暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void workspaces.refetch()}>重试</button></FloatingError>}
+      {busy && supplementTaskID === task.id && task.waiting_reason === 'workspace_unavailable' && !task.workspace_id && workspaces.isError && !isTransientNetworkError(workspaces.error) &&
+        <FloatingError className="error-inline assistant-connector-error" role="alert">Workspace 列表暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void workspaces.refetch()}>重试</button></FloatingError>}
       {supplementEntries.map(({ message, scope }) => {
         const error = messageOutboxErrorForDisplay(message.error);
         return <div className="task-supplement-status" key={message.request.client_message_id}>
-        <small role="status">补充消息：{message.status === 'accepted' ? '已发送' : message.status === 'sending' ? '正在发送'
-          : message.status === 'unknown' ? '发送结果待确认' : message.status === 'failed' ? '发送失败' : '等待发送'}{error ? `：${error}` : ''}</small>
-        {message.status !== 'sending' && <AssistantOutboxRetryButton entry={{ scope, message }} sendMessage={sendMessage}
-          label={message.status === 'accepted' ? '核对消息' : '核对并重试'} />}
-      </div>;
+          <small role="status">补充消息：{message.status === 'accepted' ? '已发送' : message.status === 'sending' ? '正在发送'
+            : message.status === 'unknown' ? '发送结果待确认' : message.status === 'failed' ? '发送失败' : '等待发送'}{error ? `：${error}` : ''}</small>
+          {message.status !== 'sending' && <AssistantOutboxRetryButton entry={{ scope, message }} sendMessage={sendMessage}
+            label={message.status === 'accepted' ? '核对消息' : '核对并重试'} />}
+        </div>;
       })}
       {browserHandoffRequested && task.host_id && <div className="inline-actions assistant-browser-handoff">
         <Link className="button button-secondary" to={`/hosts#host-${encodeURIComponent(task.host_id)}`}>打开目标电脑进行登录</Link>
@@ -3206,8 +3169,7 @@ export function Assistant() {
       </section>}
       {task.artifacts.some(hasCompleteVerifiedArtifactProof) && <section className="task-activity-k2 task-activity-artifacts" aria-label="任务成果">
         <h3>任务成果</h3><ul>{task.artifacts.filter(hasCompleteVerifiedArtifactProof).map((artifact) => <li key={artifact.id}>
-          <strong>{artifact.label}</strong>
-          <small>{artifact.path} · {artifact.media_type} · {formatBytes(artifact.size_bytes!)}</small>
+          <strong>{artifact.label}</strong><small>{artifact.path} · {artifact.media_type} · {formatBytes(artifact.size_bytes!)}</small>
           <a className="task-activity-link" href={portalApi.taskArtifactContentURL(task.id, artifact.id)} download
             aria-label={`下载任务成果 ${artifact.label}`}>下载成果 ↓</a>
         </li>)}</ul>
@@ -3215,37 +3177,61 @@ export function Assistant() {
       {task.execution_location === 'server' && task.host_id && <div className="inline-actions">
         {taskHost?.state === 'running'
           ? <button type="button" className="button button-secondary" disabled={openingTaskID === task.id}
-            onClick={openTaskObservation.bind(undefined, task, taskHost)}>{openingTaskID === task.id ? '正在准备只读观察…'
+            onClick={() => void openTaskObservation(task, taskHost)}>{openingTaskID === task.id ? '正在准备只读观察…'
               : task.artifacts.some(hasCompleteVerifiedArtifactProof) ? '在 Workbench 查看已核验产物' : '在 Workbench 只读观察'}</button>
           : <p className="muted" role="status">目标电脑当前不可用或未运行，暂不能打开 Workbench 观察页。</p>}
       </div>}
-
+      <section className="task-detail-work" aria-label="Agent 工作过程">
+        <div className="task-detail-work-heading"><h3>Agent 工作过程</h3></div>
+        {groups.length ? groups.map((group) => <section className="task-agent-group" key={group.id}>
+          <h4><strong>{group.title}</strong><span aria-hidden="true" /></h4>
+          {group.steps.map((step) => {
+            const stepTitleText = safeTaskActivityText(conversationTitleFromText(taskActivityStepTitle(step)) ?? 'Agent 工作项', 120).value;
+            const stepSummaryText = taskActivitySnippet(taskActivityStepSummary(step), 120) ?? '';
+            return <button key={step.id} type="button" className="task-activity-step-button task-work-item"
+              aria-label={`查看工作项：${stepTitleText}`} onClick={() => setTaskDetailStepID(step.id)}>
+              <span className={`task-step-icon status-${step.status}`} aria-hidden="true" />
+              <span className="task-work-copy"><strong>{stepTitleText}</strong>
+                {stepSummaryText && <small>{stepSummaryText}</small>}
+              </span>
+              <span className="task-work-arrow" aria-hidden="true">›</span>
+            </button>;
+          })}
+        </section>) : <p className="muted task-work-empty">暂无已记录的工作项。</p>}
+      </section>
     </section>;
   };
 
   const renderTaskSummary = (summary: TaskSummary) => {
     const task = allTasksByID.get(summary.id);
-    const title = task?.objective || summary.objective || '未命名任务';
+    const title = taskActivityTitle(task?.objective ?? summary.objective);
     const status = task?.status ?? summary.status;
     const updatedAt = task?.updated_at ?? summary.updated_at;
-    const waiting = status === 'waiting_user';
-    const validation = taskValidationPresentation(task ?? summary);
+    const isRunning = taskActivityIsExecuting(status);
+    const subtitle = taskActivityLatestWorkText(summary, task);
     return <article className="task-activity-card" data-task-id={summary.id} key={summary.id}>
       <button ref={(button) => { if (button) taskCardButtons.current.set(summary.id, button); else taskCardButtons.current.delete(summary.id); }}
         type="button" className="task-activity-card-button"
-        aria-label={`${waiting ? '查看并处理' : '查看详情'}：${title}，${taskActivityStatusText(summary, task)}`}
+        aria-label={`查看任务：${title}，${isRunning ? '执行中' : '停止'}`}
         onClick={() => {
           if (summary.conversation_id !== conversationID) {
+            setTaskDetailStepID(null);
             setConversationSelection(null);
             navigate('/assistant', { state: { conversationID: summary.conversation_id, taskID: summary.id } });
-          } else setTaskDetailTaskID(summary.id);
+          } else {
+            setTaskDetailStepID(null);
+            setTaskDetailTaskID(summary.id);
+          }
         }}>
-        <span className="task-activity-card-title"><strong>{title}</strong>
-          <span className={`task-activity-status status-${status}`}>{taskActivityStatusText(summary, task)}</span></span>
-        <span className="task-activity-card-subtitle" aria-label="任务校验状态">校验：<span className={`task-activity-status ${validation.statusClass}`}>{validation.label}</span></span>
-        <span className="task-activity-card-subtitle">{status === 'queued' && summary.queue_priority ? `优先级：${taskQueuePriorityText(summary.queue_priority)} · ` : ''}{taskActivityProgressText(summary, task, cloudTasksAvailable)}</span>
-        <span className="task-activity-card-footer"><small>更新于 {formatDate(updatedAt)}</small>
-          <span>{waiting ? '查看并处理' : '查看详情'} <span aria-hidden="true">›</span></span></span>
+        <span className={`task-activity-state-icon ${isRunning ? 'is-running' : 'is-stopped'}`} aria-hidden="true">
+          {isRunning ? <><span className="task-activity-state-orbit" />
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="2.2">
+              <path d="M7 15v-4m5 4V7m5 8v-5" /></svg></>
+            : <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7.5" y="7.5" width="9" height="9" rx="2.2" fill="currentColor" /></svg>}
+        </span>
+        <span className="task-activity-card-copy"><strong>{title}</strong>
+          <small>{subtitle}</small><time dateTime={updatedAt}>{formatDate(updatedAt)}</time></span>
+        <span className="task-work-arrow" aria-hidden="true">›</span>
       </button>
     </article>;
   };
@@ -3444,12 +3430,11 @@ export function Assistant() {
         onKeyDown={(event) => handleDividerKeyDown(event, 'workspace')} />}
       <div className="assistant-main">
         {!taskPanelOpen && !outletContext?.focusPanelToggle && <button ref={taskPanelToggle} type="button" className="button button-secondary task-panel-toggle"
-          aria-label="打开侧边栏" aria-describedby={pendingTaskCount === null ? undefined : 'assistant-task-pending-count'}
+          aria-label="打开侧边栏"
           aria-expanded="false" aria-controls="assistant-task-panel"
-          title={pendingTaskCount === null ? '打开侧边栏' : `打开侧边栏，${pendingTaskCount} 项待处理`}
+          title="打开侧边栏"
           onClick={() => setTaskPanelOpen(true)}>
-          <MordeIcon name="panel" />{pendingTaskCount !== null && <span id="assistant-task-pending-count" className="sr-only">{pendingTaskCount} 项等待用户</span>}
-          {pendingTaskCount !== null && pendingTaskCount > 0 && <span className="task-pending-count" aria-hidden="true">{pendingTaskCount}</span>}
+          <MordeIcon name="panel" />
         </button>}
         <header className="conversation-view-heading assistant-chat-heading-accessible sr-only">
           <h2>{conversationID && conversationID === mainConversationID ? '主会话' : selectedConversationTitle}</h2>
@@ -3488,7 +3473,8 @@ export function Assistant() {
                     (entry.operation.input.messageID === variantGroup.id || variantGroup.messageIDs.has(entry.operation.input.messageID))) : [];
                   const acceptedRetryStatus = retryAcceptedMessageIDs.has(message.id) &&
                     ['failed', 'pending', 'processing'].includes(message.routing_status ?? '') ? '正在重新处理消息' : null;
-                  const routingStatus = message.role === 'user' ? acceptedRetryStatus ?? conversationMessageStatus(message, messageTask) : null;
+                  const routingStatus = message.role === 'user'
+                    ? acceptedRetryStatus ?? (message.routing_status === 'failed' ? null : conversationMessageStatus(message, messageTask)) : null;
                   const previous = displayMessages[index - 1];
                   const messageDate = formatDate(message.created_at).split(' ')[0];
                   const showDate = !previous || formatDate(previous.created_at).split(' ')[0] !== messageDate;
@@ -3699,6 +3685,7 @@ export function Assistant() {
               setComputerEmbed(null);
               setComputerControlExpanded(false);
               setTaskPanelOpen(false);
+              setTaskDetailStepID(null);
               setTaskDetailTaskID(null);
               setTaskPanelTab('tasks');
               window.requestAnimationFrame(() => {
@@ -3714,9 +3701,12 @@ export function Assistant() {
         {taskPanelTab === 'tasks' && taskDetailTaskID && <div className="task-panel-detail task-panel-list">
           <div className="task-panel-detail-nav"><button type="button" className="button button-small button-secondary"
             onClick={() => {
-              setTaskDetailTaskID(null);
-              window.requestAnimationFrame(() => taskCardButtons.current.get(taskDetailTaskID)?.focus());
-            }}>‹ 返回任务列表</button></div>
+              if (taskDetailStepID) setTaskDetailStepID(null);
+              else {
+                setTaskDetailTaskID(null);
+                window.requestAnimationFrame(() => taskCardButtons.current.get(taskDetailTaskID)?.focus());
+              }
+            }}>‹ {taskDetailStepID ? '返回任务详情' : '返回任务列表'}</button></div>
           {selectedTaskSummary ? renderTaskDetail(selectedTaskSummary)
             : selectedTaskQuery?.isError && !isTransientNetworkError(selectedTaskQuery.error) ? <FloatingError className="error-inline task-detail-load-error" role="alert">任务详情暂不可用，当前状态未确认。
               <button type="button" className="button button-small button-secondary" onClick={() => void selectedTaskQuery.refetch()}>重试</button></FloatingError>
@@ -3732,15 +3722,11 @@ export function Assistant() {
             部分任务进展暂不可用，显示最近一次已确认状态。<button type="button" className="button button-small button-secondary"
               onClick={() => void client.invalidateQueries({ queryKey: ['task'] })}>重试</button></FloatingError>}
           {accountTasks.isSuccess && !visibleTaskPanelTasks.length && <p className="muted">当前账号还没有任务。</p>}
-          {taskPanelRows.length > 0 && <ScreenPagination items={taskPanelRows} getKey={(item) => item.key}
-            estimatedItemHeight={116} height="100%" ariaLabel="用户任务分页" className="task-panel-pagination"
-            renderItem={(row) => <div className="task-panel-group">
-              {row.first && (row.group.id === 'recent'
-                ? <button type="button" className="task-panel-group-toggle" aria-expanded={taskPanelRecentOpen}
-                  onClick={() => setTaskPanelRecentOpen((open) => !open)}>最近结束 <span aria-hidden="true">{taskPanelRecentOpen ? '▾' : '▸'}</span></button>
-                : <h3>{row.group.title}</h3>)}
-              {row.task && renderTaskSummary(row.task)}
-            </div>} />}
+          {visibleTaskPanelTasks.length > 0 && <div className="task-panel-cards">{visibleTaskPanelTasks.map(renderTaskSummary)}</div>}
+          {visibleTaskPanelTasks.length < taskPanelTasks.length && <button type="button" className="task-panel-load-more"
+            onClick={() => setVisibleTaskPanelCount((count) => Math.min(taskPanelTasks.length, count + 5))}>
+            更多任务 <span aria-hidden="true">↓</span>
+          </button>}
         </div>}
         {!conversationContentAccessRevoked && taskPanelTab === 'files' && <div className="task-panel-list task-panel-files">
           <Link className="button button-secondary button-small" to="/hosts?sync=1">管理本机项目</Link>
@@ -3762,6 +3748,7 @@ export function Assistant() {
                   aria-label={`下载任务成果 ${item.artifact.label}`}>下载成果 ↓</a>
                 <button type="button" className="button button-small button-secondary" onClick={() => {
                   setTaskPanelTab('tasks');
+                  setTaskDetailStepID(null);
                   setTaskDetailTaskID(item.taskID);
                 }}>查看任务成果</button>
               </article>} />}

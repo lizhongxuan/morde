@@ -44,6 +44,11 @@ export function hermesCompactionBudget(contextWindow, outputTokens = 0) {
   return { thresholdTokens, tailTokens }
 }
 
+export function hermesCompactionMadeProgress(beforeTokens, afterTokens, shadowedSeqs, previouslyCoveredSeqs) {
+  return afterTokens < beforeTokens ||
+    (Array.isArray(shadowedSeqs) && shadowedSeqs.some(seq => !previouslyCoveredSeqs.has(seq)))
+}
+
 // Input rows are current DSH surface order, priced by TokenMeter. isUserInput identifies
 // real user messages (including non-text input), isSummary identifies prior checkpoints,
 // and balancedBefore is DSH's tool-pair balance at that cut. A pinned child retains its

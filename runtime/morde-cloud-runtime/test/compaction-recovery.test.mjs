@@ -67,7 +67,8 @@ async function run(t, { outcome = 'success', pages = [], resume = false } = {}) 
         send({ type: 'model_end', ...fence(frame), id: frame.id, ok: false,
           ...(outcome === 'overflow' ? { failure_code: 'CONTEXT_WINDOW_EXCEEDED' } : {}) })
       } else {
-        const text = outcome === 'empty' ? '   ' : 'Original preference and early requirement were preserved.'
+        const text = outcome === 'empty' ? '   ' : outcome === 'no-progress' ? 'unhelpful summary '.repeat(2500)
+          : 'Original preference and early requirement were preserved.'
         const chunks = [
           { type: 'block-start', index: 0, blockType: 'text' },
           { type: 'text-delta', index: 0, text },
@@ -86,6 +87,17 @@ async function run(t, { outcome = 'success', pages = [], resume = false } = {}) 
 function events(result) {
   return result.pages.flatMap(page => JSON.parse(page.payload).events)
 }
+
+test('a summary that does not reduce its source window fails before replacing durable history',
+  { timeout: 15_000 }, async t => {
+    const result = await run(t, { outcome: 'no-progress' })
+    assert.equal(result.code, 1, JSON.stringify(result.frames.map(frame => frame.type)))
+    const history = events(result)
+    assert.ok(history.some(event => event.type === 'user/message' && JSON.stringify(event).includes('Preserve this original preference')))
+    assert.equal(history.some(event => event.type === 'compaction/summary'), false)
+    assert.equal(history.some(event => event.type === 'user/message' && event.surfaceOp?.op === 'replace'), false)
+    assert.ok(history.some(event => event.type === 'compaction/end' && event.data.error?.includes('did not reduce its source window')))
+  })
 
 for (const outcome of ['empty', 'truncated', 'failure', 'overflow']) {
   test(`production compaction preserves source events after ${outcome} model output`, { timeout: 15_000 }, async t => {

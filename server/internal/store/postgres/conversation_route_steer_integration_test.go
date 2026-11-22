@@ -39,6 +39,9 @@ func TestConversationRouteSteersOnlySafeRunningTaskSupplement(t *testing.T) {
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteSteer, TaskID: taskID,
 		ExpectedRevision: snapshot.Context.Candidates[0].Revision,
 		ModelOutput:      `{"action":"steer","task_id":"` + taskID + `","acknowledge":false}`}
+	if !validStoredRouteDecision(decision, snapshot.Context) {
+		t.Fatal("safe running-task supplement was rejected as a stored route decision")
+	}
 	if err := f.store.ApplyConversationRoute(ctx, supplement, snapshot, decision); err != nil {
 		t.Fatal(err)
 	}

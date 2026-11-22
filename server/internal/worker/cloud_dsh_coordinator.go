@@ -18,7 +18,7 @@ import (
 
 type CloudDSHCoordinatorModelGateway interface {
 	ResolveConversationRouteModel(context.Context, app.ConversationRouteClaim) (string, error)
-	RecoverConversationCoordinatorModelOutput(context.Context, app.ConversationRouteClaim, app.ConversationRouteContext) (string, error)
+	RecoverConversationCoordinatorModelOutput(context.Context, app.ConversationRouteClaim, app.ConversationRouteContext) (app.ModelResponse, error)
 	CompleteConversationCoordinatorModel(context.Context, app.ConversationRouteClaim, app.ConversationRouteContext,
 		string, int64, json.RawMessage) (app.ModelResponse, error)
 }
@@ -299,16 +299,19 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 				return app.ConversationRouteDecision{}, errors.New("DSH coordinator did not settle a verified model result")
 			}
 			if lastModel == nil {
-				output, err := c.options.Models.RecoverConversationCoordinatorModelOutput(ctx, claim, value)
+				response, err := c.options.Models.RecoverConversationCoordinatorModelOutput(ctx, claim, value)
 				if err != nil {
 					return app.ConversationRouteDecision{}, err
 				}
-				lastModel = &app.ModelResponse{Text: output, StopReason: "stop", Usage: app.ModelUsage{Known: true}}
+				lastModel = &response
 			}
 			if frame.Result != lastModel.Text {
 				return app.ConversationRouteDecision{}, errors.New("DSH coordinator result does not match its metered model output")
 			}
 			decision := app.ParseConversationRouteDecisionForContext(frame.Result, value)
+			if lastModel.StopReason != "stop" || len(lastModel.ToolCalls) != 0 {
+				decision = app.ParseConversationRouteDecisionForContext("", value)
+			}
 			decision.ModelOutput = frame.Result
 			return decision, nil
 		case "coordinator_failed", "coordinator_terminated", "failed":
@@ -344,7 +347,8 @@ func cloudDSHCoordinatorIdentity(claim app.ConversationRouteClaim, value app.Con
 }
 
 func validCoordinatorModelResponse(response app.ModelResponse, maxOutputBytes int) bool {
-	return response.StopReason == "stop" && len(response.ToolCalls) == 0 && response.Usage.Known &&
+	return (response.StopReason == "stop" || response.StopReason == "length" || response.StopReason == "invalid_response") &&
+		len(response.ToolCalls) == 0 && response.Usage.Known &&
 		response.Usage.InputTokens >= 0 && response.Usage.OutputTokens >= 0 &&
 		utf8.ValidString(response.Text) && len(response.Text) > 0 && len(response.Text) <= maxOutputBytes
 }

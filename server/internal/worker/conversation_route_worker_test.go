@@ -25,26 +25,32 @@ import (
 )
 
 type routeWorkerStub struct {
-	claim               app.ConversationRouteClaim
-	snapshot            app.ConversationRouteSnapshot
-	decision            app.ConversationRouteDecision
-	contextWindow       int
-	capacityKnown       bool
-	capacityErr         error
-	modelErr            error
-	classifyErr         error
-	applyErr            error
-	checkModelCtx       bool
-	applied             []app.ConversationRouteDecision
-	failures            []string
-	deferred            int
-	resolves            int
-	classifies          int
-	requeued            bool
-	requeueCalls        int
-	contextRequeued     bool
-	contextRequeueCalls int
-	classified          app.ConversationRouteContext
+	claim                app.ConversationRouteClaim
+	snapshot             app.ConversationRouteSnapshot
+	decision             app.ConversationRouteDecision
+	contextWindow        int
+	capacityKnown        bool
+	capacityErr          error
+	modelErr             error
+	classifyErr          error
+	applyErr             error
+	checkModelCtx        bool
+	applied              []app.ConversationRouteDecision
+	failures             []string
+	deferred             int
+	resolves             int
+	classifies           int
+	requeued             bool
+	requeueCalls         int
+	contextRequeued      bool
+	contextRequeueCalls  int
+	rateLimitHandled     bool
+	rateLimitRetryDelay  time.Duration
+	rateLimitHandleCalls int
+	repairRequeues       int
+	repairStatusErr      error
+	repairRequeueErr     error
+	classified           app.ConversationRouteContext
 }
 
 type routeAggregationWorkerStub struct {
@@ -95,6 +101,28 @@ func (s *routeWorkerStub) RequeueConversationRouteAfterPredecessor(context.Conte
 func (s *routeWorkerStub) RequeueConversationRouteAfterContextChange(context.Context, app.ConversationRouteClaim) (bool, error) {
 	s.contextRequeueCalls++
 	return s.contextRequeued, nil
+}
+func (s *routeWorkerStub) HandleConversationRouteRateLimit(_ context.Context, _ app.ConversationRouteClaim, delay time.Duration) (bool, error) {
+	s.rateLimitHandleCalls++
+	s.rateLimitRetryDelay = delay
+	return s.rateLimitHandled, nil
+}
+func (s *routeWorkerStub) RequeueConversationRouteAfterInvalidOutput(_ context.Context, _ app.ConversationRouteClaim) (bool, error) {
+	if s.repairRequeueErr != nil {
+		return false, s.repairRequeueErr
+	}
+	if s.decision.InvalidOutput && s.repairRequeues == 0 {
+		s.repairRequeues++
+		s.claim.RouteAttempt++
+		return true, nil
+	}
+	return false, nil
+}
+func (s *routeWorkerStub) IsConversationRouteRepairAttempt(context.Context, app.ConversationRouteClaim) (bool, error) {
+	if s.repairStatusErr != nil {
+		return false, s.repairStatusErr
+	}
+	return s.repairRequeues > 0, nil
 }
 func (s *routeWorkerStub) ResolveConversationRouteModel(ctx context.Context, _ app.ConversationRouteClaim) (string, error) {
 	s.resolves++
@@ -475,6 +503,28 @@ func TestConversationRouteWorkerClassifiesEveryFreeTextMessage(t *testing.T) {
 	})
 }
 
+func TestConversationRouteWorkerRetriesInvalidOutputOnceWithRepairContext(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "请求暂时无法安全分类，请稍后重试。", InvalidOutput: true}
+	if found, err := worker.RunOnce(context.Background()); err != nil || !found || stub.repairRequeues != 1 ||
+		len(stub.failures) != 0 || len(stub.applied) != 0 {
+		t.Fatalf("invalid output was not requeued for one repair: found=%t err=%v requeues=%d failures=%v applied=%+v",
+			found, err, stub.repairRequeues, stub.failures, stub.applied)
+	}
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "你好。"}
+	if found, err := worker.RunOnce(context.Background()); err != nil || !found || !stub.classified.Repair ||
+		len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteReply {
+		t.Fatalf("repair attempt did not use the bounded repair context: found=%t err=%v repair=%t applied=%+v",
+			found, err, stub.classified.Repair, stub.applied)
+	}
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "请求暂时无法安全分类，请稍后重试。", InvalidOutput: true}
+	if found, err := worker.RunOnce(context.Background()); err != nil || !found || stub.repairRequeues != 1 ||
+		len(stub.failures) != 1 || stub.failures[0] != "routing_action_unavailable" {
+		t.Fatalf("second invalid output did not fail closed: found=%t err=%v requeues=%d failures=%v",
+			found, err, stub.repairRequeues, stub.failures)
+	}
+}
+
 func TestConversationRouteWorkerNeverStopsAnUnrelatedOrStaleTask(t *testing.T) {
 	for _, test := range []struct {
 		name     string
@@ -666,6 +716,43 @@ func TestConversationRouteWorkerRecordsModelFailureWithoutTaskAction(t *testing.
 			stub.classifyErr = scenario.err
 			if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 || stub.failures[0] != scenario.wantFailure || len(stub.applied) != 0 {
 				t.Fatalf("model failure affected task routing: failures=%v applied=%v err=%v", stub.failures, stub.applied, err)
+			}
+		})
+	}
+}
+
+func TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits(t *testing.T) {
+	providerRateLimit := func(delay time.Duration) *domain.Error {
+		err := domain.NewError(domain.CodeRateLimited, "provider rate limited")
+		err.Details["reason"] = string(app.ModelErrorRateLimited)
+		err.Details["stage"] = "provider_status"
+		err.RetryAfter = delay
+		return err
+	}
+	for _, test := range []struct {
+		name        string
+		err         error
+		wantDelay   time.Duration
+		wantHandler bool
+	}{
+		{name: "provider retry after", err: providerRateLimit(1500 * time.Millisecond), wantDelay: 2 * time.Second, wantHandler: true},
+		{name: "bounded fallback", err: providerRateLimit(0), wantDelay: time.Second, wantHandler: true},
+		{name: "provider delay exceeds automatic bound", err: providerRateLimit(3 * time.Minute), wantHandler: true},
+		{name: "unclassified rate limit", err: domain.NewError(domain.CodeRateLimited, "rate limited")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			worker, stub := newRouteWorkerTest(t)
+			stub.classifyErr = test.err
+			stub.rateLimitHandled = true
+			if found, err := worker.RunOnce(context.Background()); err != nil || !found {
+				t.Fatalf("rate-limited route processing: found=%t err=%v", found, err)
+			}
+			if test.wantHandler {
+				if stub.rateLimitHandleCalls != 1 || stub.rateLimitRetryDelay != test.wantDelay || len(stub.failures) != 0 {
+					t.Fatalf("rate-limit handling calls=%d delay=%s failures=%v, want one handling with delay %s", stub.rateLimitHandleCalls, stub.rateLimitRetryDelay, stub.failures, test.wantDelay)
+				}
+			} else if stub.rateLimitHandleCalls != 0 || len(stub.failures) != 1 || stub.failures[0] != "model_unavailable" {
+				t.Fatalf("unconfirmed rate limit entered recovery: calls=%d failures=%v", stub.rateLimitHandleCalls, stub.failures)
 			}
 		})
 	}

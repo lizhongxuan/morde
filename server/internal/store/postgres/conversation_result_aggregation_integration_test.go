@@ -48,6 +48,10 @@ func (*resultReviewRouteModel) ResolveConversationRouteModel(context.Context, ap
 	return "p1234567", nil
 }
 
+func (*resultReviewRouteModel) ResolveConversationRouteContextWindow(context.Context, app.ConversationRouteClaim, string) (int, bool, error) {
+	return 65_536, true, nil
+}
+
 func (model *resultReviewRouteModel) ClassifyConversationRoute(_ context.Context, _ app.ConversationRouteClaim,
 	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
 	if value.ResultReview == nil {

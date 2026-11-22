@@ -191,6 +191,14 @@ func checkConversationRouteModelFence(ctx context.Context, tx pgx.Tx, fence app.
 	}
 	expected := snapshot.Context
 	expected.ModelID = modelID
+	if claim.Input.ResultReviewID == "" && claim.RouteAttempt > 0 {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls
+WHERE message_id=$1 AND actor_id=$2 AND state='settled' AND attempt=$3
+ AND phase IN ('normal','missing_predecessor') AND decision->>'invalid_output'='true')`,
+			claim.Message.ID, claim.Message.ActorID, claim.RouteAttempt-1).Scan(&expected.Repair); err != nil {
+			return fmt.Errorf("read authorized route repair state: %w", err)
+		}
+	}
 	if value.SummaryVersion > 0 {
 		if snapshot.Summary == nil || snapshot.Summary.Version != value.SummaryVersion ||
 			!bytes.Equal(snapshot.Summary.SummarySHA256, value.SummarySHA256) ||
@@ -283,7 +291,8 @@ WHERE r.service_instance_id=$1::uuid AND r.actor_id=$2 AND r.conversation_id=$3 
     AND predecessor.conversation_id=$2 AND predecessor.client_message_id=$11))) AND (
   (m.actor_id=$8 AND (m.task_id IS NULL OR t.initiator_id=$8)
    AND (m.role='user' OR (m.role='assistant' AND (
-    (m.output_status IS NULL AND (t.status='completed' OR EXISTS (
+    ($13::text='' AND m.task_id IS NULL AND m.source_kind='conversation' AND m.delivery_status='applied')
+    OR (m.output_status IS NULL AND (t.status='completed' OR EXISTS (
      SELECT 1 FROM conversation_result_batches batch WHERE batch.message_id=m.id AND batch.published_message_id=m.id
       AND batch.state='published' AND batch.service_instance_id=$9::uuid
       AND batch.owner_id=m.owner_id AND batch.conversation_id=m.conversation_id AND batch.actor_id=m.actor_id
@@ -303,7 +312,7 @@ WHERE r.service_instance_id=$1::uuid AND r.actor_id=$2 AND r.conversation_id=$3 
 FROM conversation_messages m LEFT JOIN tasks t ON t.id=m.task_id AND t.owner_id=m.owner_id AND t.conversation_id=m.conversation_id
 WHERE m.id=$1 FOR SHARE OF m`, item.MessageID, claim.Message.ConversationID, claim.Message.OwnerID,
 			item.Sequence, claim.Message.Sequence, string(item.Role), item.Content, claim.Message.ActorID, claim.ServiceInstanceID,
-			claim.Input.ProjectID, claim.Input.PreviousClientMessageID, item.Truncated).Scan(&valid)
+			claim.Input.ProjectID, claim.Input.PreviousClientMessageID, item.Truncated, claim.Input.ResultReviewID).Scan(&valid)
 		if err != nil || !valid {
 			return domain.NewError(domain.CodeUnauthenticated, "route history is unavailable")
 		}
@@ -933,6 +942,17 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 		return !value.Acknowledge && value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 &&
 			len(value.AggregateMessageIDs) == 0 && value.Question != "" &&
 			utf8.ValidString(value.Question) && utf8.RuneCountInString(value.Question) <= 200
+	case app.ConversationRouteSteer:
+		if value.Acknowledge || value.TaskID == "" || value.TargetMessageID != "" || value.ExplicitNew || value.Question != "" ||
+			value.Reply != "" || value.ExpectedRevision < 0 || len(value.DependencyTaskIDs) != 0 || len(value.AggregateMessageIDs) != 0 ||
+			!app.ValidConversationRouteSteerTarget(value.TaskID, context) {
+			return false
+		}
+		for _, candidate := range context.Candidates {
+			if candidate.TaskID == value.TaskID && candidate.Revision == value.ExpectedRevision {
+				return true
+			}
+		}
 	case app.ConversationRouteUpdate, app.ConversationRouteStatus, app.ConversationRouteStop:
 		if value.Action != app.ConversationRouteUpdate && value.Acknowledge || value.ExplicitNew || value.Question != "" ||
 			value.Reply != "" || len(value.DependencyTaskIDs) != 0 || len(value.AggregateMessageIDs) != 0 {
@@ -966,14 +986,15 @@ func staleAttemptZeroRouteDecision(value app.ConversationRouteDecision, context 
 	return false
 }
 
-func (s *Store) RecoverConversationCoordinatorModelOutput(ctx context.Context, fence app.ConversationRouteModelFence) (string, error) {
+func (s *Store) RecoverConversationCoordinatorModelOutput(ctx context.Context, fence app.ConversationRouteModelFence) (app.ModelResponse, error) {
 	claim := fence.Claim
 	value := fence.Context
 	if ctx == nil || !domain.ValidModelConnectionID(value.ModelID) || value.ActorID != claim.Message.ActorID ||
 		value.ReferenceTaskID != claim.Input.ReferenceTaskID {
-		return "", domain.InvalidArgument("route_context", "coordinator model recovery fence is invalid")
+		return app.ModelResponse{}, domain.InvalidArgument("route_context", "coordinator model recovery fence is invalid")
 	}
 	var output string
+	var invalidOutput bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := checkConversationRouteModelFence(ctx, tx, fence, value.ModelID); err != nil {
 			return err
@@ -998,26 +1019,38 @@ WHERE message_id=$1 AND actor_id=$2 AND phase=$3 AND attempt=$4`, claim.Message.
 			!validStoredRouteDecision(decision, value) {
 			return domain.NewError(domain.CodeInvalidState, "coordinator model result is not safely recoverable")
 		}
+		invalidOutput = decision.InvalidOutput
 		if attempt == 0 && staleAttemptZeroRouteDecision(decision, value) {
 			return domain.NewError(domain.CodeConflict, "legacy coordinator result predates current request candidates")
 		}
 		output = decision.ModelOutput
 		if output == "" {
-			fallback, err := json.Marshal(struct {
-				Action   app.ConversationRouteAction `json:"action"`
-				TaskID   string                      `json:"task_id"`
-				Question string                      `json:"question"`
-				Reply    string                      `json:"reply,omitempty"`
-			}{decision.Action, decision.TaskID, decision.Question, decision.Reply})
-			if err != nil {
-				return fmt.Errorf("encode settled coordinator model result: %w", err)
+			if decision.InvalidOutput {
+				output = "INVALID_MODEL_OUTPUT"
+			} else {
+				fallback, err := json.Marshal(struct {
+					Action   app.ConversationRouteAction `json:"action"`
+					TaskID   string                      `json:"task_id"`
+					Question string                      `json:"question"`
+					Reply    string                      `json:"reply,omitempty"`
+				}{decision.Action, decision.TaskID, decision.Question, decision.Reply})
+				if err != nil {
+					return fmt.Errorf("encode settled coordinator model result: %w", err)
+				}
+				output = string(fallback)
 			}
-			output = string(fallback)
 		}
 		if !app.ValidConversationRouteModelOutput(output) || output == "" {
 			return domain.NewError(domain.CodeInvalidState, "coordinator model result is invalid")
 		}
 		return nil
 	})
-	return output, err
+	if err != nil {
+		return app.ModelResponse{}, err
+	}
+	stopReason := "stop"
+	if invalidOutput {
+		stopReason = "invalid_response"
+	}
+	return app.ModelResponse{Text: output, StopReason: stopReason, Usage: app.ModelUsage{Known: true}}, nil
 }

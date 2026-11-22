@@ -36,10 +36,14 @@ func (store *liveModelCallStore) SettleModelCall(_ context.Context, value app.Mo
 	return nil
 }
 
-type liveModelResolver struct{ endpoint app.ModelEndpoint }
+type liveModelResolver struct {
+	endpoint            app.ModelEndpoint
+	contextWindowTokens *int
+}
 
 func (resolver *liveModelResolver) ResolveGatewayEndpoint(_ context.Context, _, _ string, _, _ bool) (app.ModelGatewayEndpoint, error) {
-	return app.ModelGatewayEndpoint{Endpoint: resolver.endpoint, Version: time.Unix(1, 0), Personal: true}, nil
+	return app.ModelGatewayEndpoint{Endpoint: resolver.endpoint, Version: time.Unix(1, 0), Personal: true,
+		ContextWindowTokens: resolver.contextWindowTokens}, nil
 }
 
 func (resolver *liveModelResolver) ResolveProbeEndpoint(ctx context.Context, principal identity.Principal, modelID string) (app.ModelGatewayEndpoint, error) {

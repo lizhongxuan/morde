@@ -1281,10 +1281,10 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 			if err != nil {
 				return app.ModelResponse{}, err
 			}
-			return app.ModelResponse{Text: string(reply),
+			return app.ModelResponse{Text: string(reply), StopReason: "stop",
 				Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
 		}
-		return app.ModelResponse{Text: `{"action":"reply","reply":"本地验收：任务结果已汇总。"}`,
+		return app.ModelResponse{Text: `{"action":"reply","reply":"本地验收：任务结果已汇总。"}`, StopReason: "stop",
 			Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
 	}
 	if strings.HasPrefix(request.Instructions, "Classify the user's new message") {
@@ -1297,16 +1297,16 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 			if json.Unmarshal([]byte(request.Input[0].Text), &input) == nil {
 				for name, objective := range browserActivityObjectives {
 					if name != "search" && input.Message == objective {
-						return app.ModelResponse{Text: `{"action":"new","task_id":"","question":"","acknowledge":true}`,
+						return app.ModelResponse{Text: `{"action":"new","task_id":"","question":"","acknowledge":true}`, StopReason: "stop",
 							Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
 					}
 				}
 				if input.Message == browserAcceptanceQuickReplyContent {
-					return app.ModelResponse{Text: `{"action":"reply","task_id":"","target_message_id":"","aggregate_message_ids":[],"explicit_new":false,"question":"","reply":"本地验收：快速请求直接回复。","dependency_task_ids":[],"acknowledge":false}`,
+					return app.ModelResponse{Text: `{"action":"reply","task_id":"","target_message_id":"","aggregate_message_ids":[],"explicit_new":false,"question":"","reply":"本地验收：快速请求直接回复。","dependency_task_ids":[],"acknowledge":false}`, StopReason: "stop",
 						Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 8}}, nil
 				}
 				if input.Message == browserAcceptanceAcknowledgedContent {
-					return app.ModelResponse{Text: `{"action":"new","task_id":"","target_message_id":"","aggregate_message_ids":[],"explicit_new":false,"question":"","reply":"","dependency_task_ids":[],"acknowledge":true}`,
+					return app.ModelResponse{Text: `{"action":"new","task_id":"","target_message_id":"","aggregate_message_ids":[],"explicit_new":false,"question":"","reply":"","dependency_task_ids":[],"acknowledge":true}`, StopReason: "stop",
 						Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 8}}, nil
 				}
 				if input.Message == browserAcceptanceStatusContent {
@@ -1316,7 +1316,7 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 							if err != nil {
 								return app.ModelResponse{}, err
 							}
-							return app.ModelResponse{Text: string(body), Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+							return app.ModelResponse{Text: string(body), StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
 						}
 					}
 				}
@@ -1325,7 +1325,7 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 						if err := model.routeBarrier.wait(ctx); err != nil {
 							return app.ModelResponse{}, err
 						}
-						return app.ModelResponse{Text: `{"action":"new","task_id":"","question":""}`,
+						return app.ModelResponse{Text: `{"action":"new","task_id":"","question":""}`, StopReason: "stop",
 							Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
 					}
 					for _, prior := range input.PriorRequests {
@@ -1334,13 +1334,13 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 							if err != nil {
 								return app.ModelResponse{}, err
 							}
-							return app.ModelResponse{Text: string(body), Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+							return app.ModelResponse{Text: string(body), StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
 						}
 					}
 				}
 			}
 		}
-		return app.ModelResponse{Text: `{"action":"new","task_id":"","question":""}`,
+		return app.ModelResponse{Text: `{"action":"new","task_id":"","question":""}`, StopReason: "stop",
 			Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
 	}
 	return (nativeAcceptanceModel{}).Complete(ctx, request)

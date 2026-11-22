@@ -52,6 +52,18 @@ func routeGatewayFixture() (ConversationRouteClaim, ConversationRouteContext) {
 	return claim, ConversationRouteContext{ActorID: claim.Message.ActorID, RouteAttempt: 1, ModelID: "p1234567", Content: claim.Message.Content}
 }
 
+func TestConversationRouteProviderErrorCarriesOnlyConfirmedRateLimitDelay(t *testing.T) {
+	providerErr := &ModelClientError{Kind: ModelErrorRateLimited, Stage: "provider_status", RetryAfter: 3 * time.Second}
+	var routeErr *domain.Error
+	if err := conversationRouteProviderError(providerErr); !errors.As(err, &routeErr) || routeErr.Code != domain.CodeRateLimited || routeErr.RetryAfter != 3*time.Second {
+		t.Fatalf("provider rate limit mapping = %#v, err=%v", routeErr, err)
+	}
+	providerErr.Stage = "transport"
+	if err := conversationRouteProviderError(providerErr); !errors.As(err, &routeErr) || routeErr.RetryAfter != 0 {
+		t.Fatalf("non-provider failure preserved retry delay: %#v, err=%v", routeErr, err)
+	}
+}
+
 func TestConversationRouteInitialAttemptIncludesJoinCandidates(t *testing.T) {
 	claim, value := routeGatewayFixture()
 	scopeDigest := make([]byte, sha256.Size)
@@ -186,6 +198,35 @@ func TestConversationRouteGatewayAccountsForTextOnlyDecisionAndRecoversIt(t *tes
 	}
 }
 
+func TestConversationRouteGatewayRejectsTruncatedAndToolResponses(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		response ModelResponse
+	}{
+		{name: "truncated JSON", response: ModelResponse{Text: `{"action":"reply","task_id":"","question":"","reply":"OK"}`,
+			StopReason: "length", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3}}},
+		{name: "unexpected tool call", response: ModelResponse{Text: `{"action":"reply","task_id":"","question":"","reply":"OK"}`,
+			ToolCalls:  []ModelToolCall{{CallID: "call-1", Name: "unexpected", Arguments: `{}`}},
+			StopReason: "tool_calls", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			claim, value := routeGatewayFixture()
+			store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+			client := &modelGatewayClientTest{response: test.response}
+			service, err := NewModelGatewayService(store, &modelGatewayResolverTest{personal: true}, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decision, err := service.ClassifyConversationRoute(context.Background(), claim, value)
+			if err != nil || !decision.InvalidOutput || store.decision == nil || !store.decision.InvalidOutput ||
+				store.unknown || !store.usage.Known || client.calls != 1 {
+				t.Fatalf("incomplete or tool response was accepted: decision=%+v settled=%+v unknown=%t usage=%+v calls=%d err=%v",
+					decision, store.decision, store.unknown, store.usage, client.calls, err)
+			}
+		})
+	}
+}
+
 func TestConversationRouteGatewayUsesConfiguredGPT6LunaMaxReasoning(t *testing.T) {
 	claim, value := routeGatewayFixture()
 	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
@@ -293,6 +334,21 @@ func TestConversationRouteGatewayHoldsUnknownProviderOutcome(t *testing.T) {
 	}
 	if _, err := service.ClassifyConversationRoute(context.Background(), claim, value); err == nil || !store.unknown || store.decision != nil {
 		t.Fatalf("unknown provider result was not held: %v", err)
+	}
+}
+
+func TestConversationRouteGatewayLeavesConfirmedRateLimitForAtomicRecovery(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	client := &modelGatewayClientTest{err: &ModelClientError{Kind: ModelErrorRateLimited, Stage: "provider_status"}}
+	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{personal: true}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ClassifyConversationRoute(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeRateLimited ||
+		store.begins != 1 || store.unknown || store.decision != nil || store.usage.Known {
+		t.Fatalf("confirmed 429 was recorded as unknown usage instead of deferred to route recovery: begins=%d unknown=%t settlement=%+v usage=%+v err=%v",
+			store.begins, store.unknown, store.decision, store.usage, err)
 	}
 }
 

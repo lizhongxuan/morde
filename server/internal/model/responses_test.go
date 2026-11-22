@@ -587,6 +587,20 @@ func TestModelProxyConnectsToValidatedIPWithoutForwardingCredentials(t *testing.
 	if openAIRequest.Method != http.MethodConnect || openAIRequest.Host != "api.openai.com:443" {
 		t.Fatalf("proxy did not receive the exact OpenAI host: method=%s host=%s", openAIRequest.Method, openAIRequest.Host)
 	}
+	deepSeekClient, err := NewResponsesClient([]string{"api.deepseek.com"}, server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deepSeekTransport := deepSeekClient.httpClient.Transport.(*http.Transport)
+	conn, err = deepSeekTransport.DialContext(context.Background(), "tcp", "api.deepseek.com:443")
+	if err != nil {
+		t.Fatalf("allowlisted DeepSeek host could not use the configured proxy: %v", err)
+	}
+	_ = conn.Close()
+	deepSeekRequest := <-requests
+	if deepSeekRequest.Method != http.MethodConnect || deepSeekRequest.Host != "api.deepseek.com:443" {
+		t.Fatalf("proxy did not receive the exact DeepSeek host: method=%s host=%s", deepSeekRequest.Method, deepSeekRequest.Host)
+	}
 	privateClient, err := NewResponsesClient([]string{"localhost"}, server.URL)
 	if err != nil {
 		t.Fatal(err)
@@ -690,6 +704,43 @@ func TestProviderErrorsAreClassifiedAndDoNotExposeCredentialsOrBody(t *testing.T
 				t.Fatalf("error leaked sensitive data: %v", err)
 			}
 		})
+	}
+}
+
+func TestProviderRateLimitCarriesBoundedRetryAfter(t *testing.T) {
+	client := newTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		response := jsonResponse(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_exceeded"}}`)
+		response.Header.Set("Retry-After", "3")
+		return response, nil
+	}))
+	_, err := client.Complete(context.Background(), app.ModelRequest{
+		Endpoint: testEndpoint(), Input: []app.ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 10,
+	})
+	var providerErr *app.ModelClientError
+	if !errors.As(err, &providerErr) || providerErr.Kind != app.ModelErrorRateLimited || providerErr.RetryAfter != 3*time.Second {
+		t.Fatalf("provider rate-limit retry hint = %#v, err=%v", providerErr, err)
+	}
+}
+
+func TestParseProviderRetryAfter(t *testing.T) {
+	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		value string
+		want  time.Duration
+		ok    bool
+	}{
+		{value: "2", want: 2 * time.Second, ok: true},
+		{value: "0", want: 0, ok: true},
+		{value: now.Add(4 * time.Second).Format(http.TimeFormat), want: 4 * time.Second, ok: true},
+		{value: now.Add(-time.Second).Format(http.TimeFormat), want: 0, ok: true},
+		{value: "99999999", want: 24 * time.Hour, ok: true},
+		{value: "invalid", want: 0, ok: false},
+		{value: "-2", want: 0, ok: false},
+	} {
+		got, ok := parseProviderRetryAfter(test.value, now)
+		if got != test.want || ok != test.ok {
+			t.Errorf("parseProviderRetryAfter(%q) = %s, %t; want %s, %t", test.value, got, ok, test.want, test.ok)
+		}
 	}
 }
 

@@ -140,6 +140,7 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 		}
 		return app.ModelResponse{}, modelClientError(app.ModelErrorTransport)
 	}
+	responseReceivedAt := time.Now()
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -150,7 +151,8 @@ func (c *ResponsesClient) complete(ctx context.Context, request app.ModelRequest
 			}
 			return app.ModelResponse{}, modelClientError(app.ModelErrorTransport)
 		}
-		return app.ModelResponse{}, providerStatusError(resp.StatusCode, responseBody, request.Endpoint.APIKey, zai)
+		return app.ModelResponse{}, providerStatusError(resp.StatusCode, responseBody, request.Endpoint.APIKey, zai,
+			resp.Header.Get("Retry-After"), responseReceivedAt)
 	}
 	if request.OnTextDelta != nil {
 		if !strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
@@ -589,7 +591,7 @@ func readStreamingResponse(body io.Reader, onTextDelta func(string) error) (app.
 	return result, nil
 }
 
-func providerStatusError(status int, body []byte, apiKey string, zai bool) error {
+func providerStatusError(status int, body []byte, apiKey string, zai bool, retryAfterHeader string, receivedAt time.Time) error {
 	var parsed struct {
 		Error struct {
 			Code string `json:"code"`
@@ -624,7 +626,37 @@ func providerStatusError(status int, body []byte, apiKey string, zai bool) error
 	default:
 		kind = app.ModelErrorInvalidResponse
 	}
-	return modelClientErrorAt(kind, "provider_status", code)
+	err := &app.ModelClientError{Kind: kind, Stage: "provider_status", ProviderCode: code}
+	if kind == app.ModelErrorRateLimited {
+		err.RetryAfter, _ = parseProviderRetryAfter(retryAfterHeader, receivedAt)
+	}
+	return err
+}
+
+func parseProviderRetryAfter(value string, now time.Time) (time.Duration, bool) {
+	value = strings.TrimSpace(value)
+	if seconds, err := strconv.ParseUint(value, 10, 64); err == nil {
+		const maxDelay = 24 * time.Hour
+		if seconds > uint64(maxDelay/time.Second) {
+			return maxDelay, true
+		}
+		return time.Duration(seconds) * time.Second, true
+	}
+	if value == "" {
+		return 0, false
+	}
+	when, err := http.ParseTime(value)
+	if err != nil {
+		return 0, false
+	}
+	delay := when.Sub(now)
+	if delay < 0 {
+		return 0, true
+	}
+	if delay > 24*time.Hour {
+		delay = 24 * time.Hour
+	}
+	return delay, true
 }
 
 func readResponseBody(body io.Reader, limit int64) ([]byte, error) {
@@ -782,11 +814,10 @@ func newPublicHTTPTransport(allowedHosts []string, proxyAddress string) http.Rou
 			if _, ok := allowed[host]; !ok || net.ParseIP(host) != nil {
 				return nil, errors.New("model provider host is not allowlisted")
 			}
-			if proxyAddress != "" && host == "api.openai.com" {
-				// Some managed desktop resolvers deliberately return synthetic
-				// non-public records for public APIs. For this fixed, allowlisted
-				// provider only, delegate DNS to the explicitly configured proxy;
-				// TLS still verifies api.openai.com against a public certificate.
+			if proxyAddress != "" && (host == "api.openai.com" || host == "api.deepseek.com") {
+				// Some managed desktop resolvers return synthetic non-public records
+				// for public APIs. Delegate these fixed allowlisted hosts to the
+				// explicitly configured proxy; TLS still verifies the host identity.
 				return dialModelProxy(ctx, dialer, proxyAddress, net.JoinHostPort(host, port))
 			}
 			ips, err := resolvePublicAddresses(ctx, net.DefaultResolver, host)

@@ -1210,7 +1210,7 @@ func TestConversationRouteRetryFromDuplicateTargetsOriginalRoute(t *testing.T) {
 	}
 }
 
-func TestConversationRouteContextChangesReclassifyAndFailAfterThreeConflicts(t *testing.T) {
+func TestConversationRouteContextChangesReclassifyUpToWorkerConcurrencyLimit(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
 	prior := f.receive(t, "route-reclass-prior-001", "先前的任务", app.ConversationRoutingInput{})
@@ -1227,7 +1227,7 @@ func TestConversationRouteContextChangesReclassifyAndFailAfterThreeConflicts(t *
 		t.Fatal(err)
 	}
 	claim := f.receive(t, "route-reclass-root-001", "分析这个项目", app.ConversationRoutingInput{})
-	for conflict := 1; conflict <= 3; conflict++ {
+	for conflict := 1; conflict <= maxAutomaticRouteConflicts; conflict++ {
 		snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
 		if err != nil {
 			t.Fatal(err)
@@ -1248,11 +1248,12 @@ FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.messag
 			Scan(&state, &failure, &attempt, &retries, &taskID); err != nil {
 			t.Fatal(err)
 		}
-		if taskID != "" || retries != int16(conflict) || (conflict < 3 && (state != "pending" || attempt != claim.RouteAttempt+1)) ||
-			(conflict == 3 && (state != "failed" || failure != "routing_context_unavailable" || attempt != claim.RouteAttempt)) {
+		if taskID != "" || retries != int16(conflict) ||
+			(conflict < maxAutomaticRouteConflicts && (state != "pending" || attempt != claim.RouteAttempt+1)) ||
+			(conflict == maxAutomaticRouteConflicts && (state != "failed" || failure != "routing_context_unavailable" || attempt != claim.RouteAttempt)) {
 			t.Fatalf("conflict %d produced state=%s failure=%s attempt=%d retries=%d task=%s", conflict, state, failure, attempt, retries, taskID)
 		}
-		if conflict < 3 {
+		if conflict < maxAutomaticRouteConflicts {
 			next, found, err := f.store.ClaimConversationRoute(ctx, "route-reclass-test-worker", time.Minute)
 			if err != nil || !found || next.Message.ID != claim.Message.ID {
 				t.Fatalf("claim reclassified route: claim=%+v found=%t err=%v", next, found, err)

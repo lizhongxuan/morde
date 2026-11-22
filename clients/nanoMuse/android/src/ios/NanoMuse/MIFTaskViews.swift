@@ -38,7 +38,7 @@ enum MIFTaskPageRules {
 enum MIFTaskDynamicsPresentation {
     static let pageSize = 5
 
-    static func isExecuting(_ status: String) -> Bool { status == "running" }
+    static func isExecuting(_ status: String) -> Bool { status == "running" || status == "cancelling" }
 
     static func statusLabel(_ status: String) -> String {
         AppLocalized(isExecuting(status) ? "Task executing" : "Task stopped")
@@ -54,16 +54,42 @@ enum MIFTaskDynamicsPresentation {
     }
 
     static func title(_ objective: String) -> String {
-        let compact = objective.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
-        return MIFTaskDynamicsSafeText.make(compact, maximumCharacters: 60).value
+        var compact = objective.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+        compact = compact.replacingOccurrences(of: #"^合成并行任务\s+[A-Z0-9-]+[：:]\s*"#, with: "", options: .regularExpression)
+        let phrase = compact.split(whereSeparator: { "。！？!?；;，,：:\n".contains($0) }).first.map(String.init) ?? compact
+        let title = phrase.replacingOccurrences(of: #"^(请你|请|帮我|帮忙|麻烦|这是)\s*"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespacesAndNewlines)
+        return MIFTaskDynamicsSafeText.make(title.isEmpty ? AppLocalized("Task") : title, maximumCharacters: 42).value
     }
 
     static func latestWorkSummary(_ task: MordeTask) -> String {
         let step = MIFTaskPresentation.visibleSteps(task.steps,
-            waitingForRevisionStart: task.isWaitingForRevisionStart).last
+            waitingForRevisionStart: task.isWaitingForRevisionStart)
+            .filter { !["model", "plan", "budget"].contains($0.kind) && $0.title != "开始处理" }.last
         let summary = step.flatMap { MordeTaskStepPresentation.summary($0.summary, title: $0.title) }
-        let value = summary ?? step.map { MordeTaskStepPresentation.title($0.title) } ?? AppLocalized("No recorded steps")
-        return MIFTaskDynamicsSafeText.make(value, maximumCharacters: 120).value
+        let isDiagnostic = summary.map { $0.range(of: #"^(the model request could not be verified|the cloud dsh session completed|the task (failed|was interrupted)|(?:internal|runtime) error\b|traceback\b)"#, options: [.regularExpression, .caseInsensitive]) != nil } ?? false
+        let summaryPhrase = summary?.split(whereSeparator: { "。！？!?；;，,：:\n".contains($0) }).first.map(String.init)
+        let readableSummary = isDiagnostic ? nil : summaryPhrase.flatMap { $0.isEmpty ? nil : $0 }
+        let stepTitle = step.map { MordeTaskStepPresentation.title($0.title) }
+        let readableTitle = stepTitle.flatMap { title in
+            title.range(of: #"^(the model request|the cloud dsh session|review cloud task recovery)"#,
+                        options: [.regularExpression, .caseInsensitive]) == nil ? title : nil
+        }
+        let value = readableSummary ?? readableTitle
+            ?? (task.status == "running" ? AppLocalized("Processing your request.") : AppLocalized("No recorded steps"))
+        return MIFTaskDynamicsSafeText.make(value, maximumCharacters: 56).value
+    }
+
+    static func workItemTitle(_ title: String) -> String {
+        let value = MordeTaskStepPresentation.title(title)
+        let internalFailure = #"^(the model request could not be verified|the cloud dsh session completed|the task (failed|was interrupted)|(?:internal|runtime) error\b|traceback\b)"#
+        return value.range(of: internalFailure, options: [.regularExpression, .caseInsensitive]) == nil
+            ? value : AppLocalized("Task failed")
+    }
+
+    static func workItemSummary(_ summary: String, title: String) -> String? {
+        guard let value = MordeTaskStepPresentation.summary(summary, title: title) else { return nil }
+        let internalFailure = #"^(the model request could not be verified|the cloud dsh session completed|the task (failed|was interrupted)|(?:internal|runtime) error\b|traceback\b)"#
+        return value.range(of: internalFailure, options: [.regularExpression, .caseInsensitive]) == nil ? value : nil
     }
 }
 
@@ -1272,12 +1298,12 @@ private struct MIFTaskDynamicsWorkItemRow: View {
                 MIFTaskTimelineMarkerView(marker: marker)
                     .accessibilityHidden(true)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(MIFTaskDynamicsSafeText.make(MordeTaskStepPresentation.title(step.title),
+                    Text(MIFTaskDynamicsSafeText.make(MIFTaskDynamicsPresentation.workItemTitle(step.title),
                         maximumCharacters: 120).value)
                         .font(.system(size: 15.5, weight: .semibold))
                         .lineSpacing(2.5)
                         .fixedSize(horizontal: false, vertical: true)
-                    if let summary = MordeTaskStepPresentation.summary(step.summary, title: step.title) {
+                    if let summary = MIFTaskDynamicsPresentation.workItemSummary(step.summary, title: step.title) {
                         Text(MIFTaskDynamicsSafeText.make(summary, maximumCharacters: 240).value)
                             .font(.system(size: 14))
                             .lineSpacing(3)
@@ -1358,7 +1384,7 @@ private struct MIFTaskDynamicsStepDetailView: View {
                     dismiss()
                 }
                 .accessibilityIdentifier("morde.taskDynamics.workItem.back")
-                Text(MIFTaskDynamicsSafeText.make(MordeTaskStepPresentation.title(step.title),
+                Text(MIFTaskDynamicsSafeText.make(MIFTaskDynamicsPresentation.workItemTitle(step.title),
                     maximumCharacters: 120).value)
                     .font(.headline.weight(.semibold))
                     .lineLimit(1)
@@ -1371,7 +1397,9 @@ private struct MIFTaskDynamicsStepDetailView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    Text(MIFTaskDynamicsSafeText.make(MIFTaskPresentation.stepSummary(step),
+                    let status = MIFTaskPresentation.stepStatusLabel(step.status, kind: step.kind, title: step.title)
+                    let summary = MIFTaskDynamicsPresentation.workItemSummary(step.summary, title: step.title)
+                    Text(MIFTaskDynamicsSafeText.make(([status] + (summary.map { [$0] } ?? [])).joined(separator: " · "),
                         maximumCharacters: 500).value)
                         .font(.subheadline)
                         .foregroundStyle(NanoMuseTones.secondaryText)
@@ -1383,11 +1411,6 @@ private struct MIFTaskDynamicsStepDetailView: View {
                         Text(AppLocalized("No tool was called"))
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(NanoMuseTones.secondaryText)
-                        if let summary = MordeTaskStepPresentation.summary(step.summary, title: step.title) {
-                            Text(MIFTaskDynamicsSafeText.make(summary, maximumCharacters: 500).value)
-                                .font(.body)
-                                .fixedSize(horizontal: false, vertical: true)
-                        }
                     }
                 }
                 .padding(22)

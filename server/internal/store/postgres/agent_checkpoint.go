@@ -543,17 +543,19 @@ FROM task_agent_message_deliveries WHERE message_id=$1 FOR UPDATE`, message.ID).
 		return false, true, nil
 	}
 	if agentID != fence.AgentInstanceID || generation != fence.AgentGeneration {
-		if !enqueuedThrough.Valid || generation >= fence.AgentGeneration {
+		if generation >= fence.AgentGeneration || !enqueuedThrough.Valid && !message.Initial {
 			return false, true, nil
 		}
-		var checkpointed bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_checkpoints
+		if enqueuedThrough.Valid {
+			var checkpointed bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_checkpoints
 WHERE task_id=$1 AND owner_id=$2 AND agent_session_id=$3 AND from_seq<=$4 AND through_seq>=$4)`,
-			fence.TaskID, fence.OwnerID, fence.AgentSessionID, enqueuedThrough.Int64).Scan(&checkpointed); err != nil {
-			return false, false, fmt.Errorf("verify recovered task message enqueue checkpoint: %w", err)
-		}
-		if !checkpointed {
-			return false, true, nil
+				fence.TaskID, fence.OwnerID, fence.AgentSessionID, enqueuedThrough.Int64).Scan(&checkpointed); err != nil {
+				return false, false, fmt.Errorf("verify recovered task message enqueue checkpoint: %w", err)
+			}
+			if !checkpointed {
+				return false, true, nil
+			}
 		}
 		if _, err := tx.Exec(ctx, `UPDATE task_agent_message_deliveries SET agent_instance_id=$2,agent_generation=$3,updated_at=clock_timestamp()
 WHERE message_id=$1`, message.ID, fence.AgentInstanceID, fence.AgentGeneration); err != nil {

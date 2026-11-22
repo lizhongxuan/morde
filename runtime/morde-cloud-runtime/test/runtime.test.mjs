@@ -3734,8 +3734,12 @@ test('restages a partially persisted revision batch before one model turn', asyn
   const messages = result.modelRequests[0].messages.filter(message => revisionMessages.some(item => item.message_id === message.id))
   assert.deepEqual(messages.map(message => message.id), revisionMessages.map(item => item.message_id))
   const events = result.emitted.flatMap(frame => JSON.parse(frame.payload).events)
-  for (const message of revisionMessages) {
+  for (const [index, message] of revisionMessages.entries()) {
     assert.equal(events.filter(event => event.type === 'user/message' && event.data.id === message.message_id).length, 1)
+    const delivery = events.findLast(event => event.type === 'agent/inbox/spliced' &&
+      event.data.inserted.some(inserted => inserted.id === message.message_id))
+    assert.equal(delivery?.data.target, index + 1 === revisionMessages.length ? 'next-turn' : 'next-step',
+      'revision batch checkpoint target differs from its durable delivery mode')
   }
 })
 

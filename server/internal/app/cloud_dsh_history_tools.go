@@ -296,7 +296,7 @@ func (b *CloudDSHToolBroker) searchCurrentConversationHistory(ctx context.Contex
 			if !domain.ValidMessageID(message.ID) || message.OwnerID != current.OwnerID || message.ConversationID != current.ConversationID ||
 				message.Sequence < 1 || message.Sequence >= previousSequence || message.Sequence > current.ConversationContext.ThroughSequence ||
 				(message.Role != conversation.RoleUser && message.Role != conversation.RoleAssistant) ||
-				!utf8.ValidString(message.Content) || len(message.Content) > MaxAssistantMessageBytes || !message.DeliveryStatus.Valid() {
+				!utf8.ValidString(message.Content) || len(message.Content) > MaxConversationAgentInputBytes || !message.DeliveryStatus.Valid() {
 				return cloudDSHCurrentHistorySearchResult{}, domain.NewError(domain.CodeInternal, "current conversation history store returned an invalid message")
 			}
 			previousSequence = message.Sequence
@@ -404,7 +404,7 @@ func (b *CloudDSHToolBroker) searchCurrentConversationHistory(ctx context.Contex
 				continue
 			}
 		}
-		content := truncateHistoryText(message.Content, cloudDSHHistoryContentRunes)
+		content := truncateHistoryMatchText(message.Content, cloudDSHHistoryContentRunes, query)
 		result.Matches = append(result.Matches, cloudDSHCurrentHistoryMatch{MessageID: message.ID, Role: message.Role,
 			Content: content, CreatedAt: message.CreatedAt.UTC(), Truncated: content != message.Content,
 			Score: score, Sequence: message.Sequence})
@@ -848,7 +848,7 @@ func (b *CloudDSHToolBroker) summarizablePersonalHistory(ctx context.Context, pr
 		for _, message := range messages.Items {
 			if !domain.ValidMessageID(message.ID) || message.ConversationID != item.ID || message.OwnerID != principal.UserID ||
 				(message.Role != conversation.RoleUser && message.Role != conversation.RoleAssistant) ||
-				!utf8.ValidString(message.Content) || len(message.Content) > MaxAssistantMessageBytes || !message.DeliveryStatus.Valid() {
+				!utf8.ValidString(message.Content) || len(message.Content) > MaxConversationAgentInputBytes || !message.DeliveryStatus.Valid() {
 				return cloudDSHHistorySummaryResult{}, domain.NewError(domain.CodeInternal, "conversation history store returned an invalid message")
 			}
 			if message.DeliveryStatus != conversation.DeliveryApplied || len(message.AttachmentIDs) > 0 || cloudDSHHistoryCredentialPattern.MatchString(message.Content) {
@@ -996,7 +996,7 @@ func (b *CloudDSHToolBroker) searchPersonalConversationHistory(ctx context.Conte
 		for _, message := range messages.Items {
 			if !domain.ValidMessageID(message.ID) || message.ConversationID != item.ID || message.OwnerID != principal.UserID ||
 				(message.Role != conversation.RoleUser && message.Role != conversation.RoleAssistant) ||
-				!utf8.ValidString(message.Content) || len(message.Content) > MaxAssistantMessageBytes ||
+				!utf8.ValidString(message.Content) || len(message.Content) > MaxConversationAgentInputBytes ||
 				!message.DeliveryStatus.Valid() {
 				return cloudDSHHistorySearchResult{}, domain.NewError(domain.CodeInternal, "conversation history store returned an invalid message")
 			}
@@ -1019,7 +1019,7 @@ func (b *CloudDSHToolBroker) searchPersonalConversationHistory(ctx context.Conte
 			}
 			result.Matches = append(result.Matches, cloudDSHHistorySearchMatch{
 				ConversationTitle: title, Role: message.Role,
-				Content: truncateHistoryText(message.Content, cloudDSHHistoryContentRunes), CreatedAt: message.CreatedAt.UTC(),
+				Content: truncateHistoryMatchText(message.Content, cloudDSHHistoryContentRunes, query), CreatedAt: message.CreatedAt.UTC(),
 				Score: score, ConversationID: item.ID,
 			})
 		}
@@ -1156,4 +1156,56 @@ func truncateHistoryText(value string, maxRunes int) string {
 		return value
 	}
 	return string(runes[:maxRunes]) + "…"
+}
+
+func truncateHistoryMatchText(value string, maxRunes int, query string) string {
+	if !utf8.ValidString(value) || maxRunes < 1 {
+		return ""
+	}
+	runes := []rune(value)
+	if len(runes) <= maxRunes || maxRunes <= 2 {
+		return truncateHistoryText(value, maxRunes)
+	}
+
+	lowered := strings.ToLower(value)
+	find := func(term string) (int, int) {
+		term = strings.ToLower(strings.TrimSpace(term))
+		if term == "" {
+			return -1, 0
+		}
+		first := strings.Index(lowered, term)
+		if first < 0 {
+			return -1, 0
+		}
+		return utf8.RuneCountInString(lowered[:first]), strings.Count(lowered, term)
+	}
+	matchIndex, matches := find(query)
+	if matches == 0 {
+		bestMatches, bestLength := int(^uint(0)>>1), 0
+		for _, term := range cloudDSHHistoryQueryTerms(query) {
+			index, count := find(term)
+			length := utf8.RuneCountInString(term)
+			if count > 0 && (count < bestMatches || count == bestMatches && length > bestLength) {
+				matchIndex, bestMatches, bestLength = index, count, length
+			}
+		}
+	}
+	if matchIndex < 0 {
+		return truncateHistoryText(value, maxRunes)
+	}
+
+	window := maxRunes - 2
+	start := max(matchIndex-window/3, 0)
+	if start+window > len(runes) {
+		start = len(runes) - window
+	}
+	end := start + window
+	excerpt := string(runes[start:end])
+	if start > 0 {
+		excerpt = "…" + excerpt
+	}
+	if end < len(runes) {
+		excerpt += "…"
+	}
+	return excerpt
 }

@@ -1409,6 +1409,32 @@ func TestConversationMessageIsAcceptedBeforeRouting(t *testing.T) {
 	}
 }
 
+func TestOversizedConversationMessageIsRejectedBeforeAcceptance(t *testing.T) {
+	service := &taskServiceStub{}
+	gin.SetMode(gin.TestMode)
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set(principalKey, identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"})
+		c.Next()
+	})
+	handler := &api{options: Options{APIMaxBodyBytes: 128}}
+	group := engine.Group("/api", handler.limitBody)
+	handler.registerConversations(group, nil, service)
+
+	body := `{"client_message_id":"message-0001","content":"` + strings.Repeat("x", 200) + `"}`
+	request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "message-0001")
+	request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
+	request.Header.Set("X-Morde-Actor-ID", "u1234567")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusRequestEntityTooLarge || service.acceptCalls != 0 || service.submitCalls != 0 {
+		t.Fatalf("oversized conversation message = %d, accept calls=%d submit calls=%d: %s",
+			response.Code, service.acceptCalls, service.submitCalls, response.Body.String())
+	}
+}
+
 func TestConversationMessageExpiredSessionDoesNotAcceptAndReloginReplaysStableID(t *testing.T) {
 	const (
 		conversationID  = "c1234567"

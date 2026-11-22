@@ -122,7 +122,7 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 		var used int64
 		var running int32
 		var unknown bool
-		err = tx.QueryRow(ctx, `SELECT COALESCE(SUM(CASE WHEN state='settled' THEN input_tokens+output_tokens ELSE reserved_tokens END),0),
+		err = tx.QueryRow(ctx, `SELECT COALESCE(SUM(CASE WHEN state='settled' THEN input_tokens+output_tokens WHEN state='rejected' THEN 0 ELSE reserved_tokens END),0),
   count(*) FILTER (WHERE state='dispatched'), COALESCE(bool_or(state='unknown'),false)
 	  FROM model_call_ledger WHERE owner_id=$1 AND NOT personal_model`, request.OwnerID).Scan(&used, &running, &unknown)
 		if err != nil {

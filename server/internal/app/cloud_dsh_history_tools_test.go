@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
@@ -242,6 +243,53 @@ func TestCloudDSHCurrentConversationHistorySearchUsesOnlyFixedCurrentConversatio
 	if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "call_forged_history",
 		Name: cloudDSHCurrentHistorySearchToolName, Arguments: `{"query":"cedar","limit":1,"conversation_id":"c9876543"}`}, false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("caller-supplied conversation ID was not rejected: %v", err)
+	}
+}
+
+func TestCloudDSHCurrentConversationHistorySearchReturnsMiddleOfLongMessage(t *testing.T) {
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	claimed.ConversationContext.ThroughSequence = 1
+	configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+
+	var content strings.Builder
+	for record := 1; record <= 800; record++ {
+		if record == 400 {
+			fmt.Fprintf(&content, "记录%04d：分类=蓝；数值=842；校验=167600。", record)
+			continue
+		}
+		fmt.Fprintf(&content, "记录%04d：分类=青；数值=%d；校验=%06d。", record, record, record)
+	}
+	if content.Len() <= MaxAssistantMessageBytes || content.Len() > MaxConversationAgentInputBytes {
+		t.Fatalf("fixture must exceed the assistant reply limit and fit the conversation input budget: bytes=%d", content.Len())
+	}
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &cloudDSHHistoryTaskStore{
+		cloudDSHBrokerTaskStore: baseStore,
+		messages: map[string]MessagePage{claimed.ConversationID: {Items: []conversation.Message{{
+			ID: messageID, ConversationID: claimed.ConversationID, OwnerID: claimed.OwnerID, Role: conversation.RoleUser,
+			Sequence: 1, Content: content.String(), DeliveryStatus: conversation.DeliveryApplied,
+		}}}},
+		suppressed: map[string]struct{}{},
+	}
+	broker.store = store
+
+	result, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "call_long_message_middle",
+		Name: cloudDSHCurrentHistorySearchToolName, Arguments: `{"query":"0400 数值","limit":1,"cursor":null}`}, false, nil)
+	if err != nil || result.Status != AgentToolSucceeded {
+		t.Fatalf("long current history search=%+v err=%v", result, err)
+	}
+	var output cloudDSHCurrentHistorySearchResult
+	if err := json.Unmarshal([]byte(result.Output), &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.Matches) != 1 || output.Matches[0].MessageID != messageID || !output.Matches[0].Truncated ||
+		!strings.Contains(output.Matches[0].Content, "记录0400：分类=蓝；数值=842；校验=167600") ||
+		utf8.RuneCountInString(output.Matches[0].Content) > cloudDSHHistoryContentRunes ||
+		strings.Contains(output.Matches[0].Content, "记录0001：") {
+		t.Fatalf("long-message search did not return a bounded excerpt around the match: %+v", output.Matches)
 	}
 }
 

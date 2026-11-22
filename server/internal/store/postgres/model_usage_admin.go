@@ -137,7 +137,7 @@ func loadModelAccountBudget(ctx context.Context, tx pgx.Tx, ownerID string) (app
 	var concurrent int64
 	var inFlight int64
 	err := tx.QueryRow(ctx, `SELECT u.id,COALESCE(b.token_limit,0),COALESCE(b.max_concurrent,0),b.owner_id IS NOT NULL,
- COALESCE((SELECT SUM(CASE WHEN l.state='settled' THEN l.input_tokens::numeric+l.output_tokens::numeric ELSE l.reserved_tokens::numeric END)
+ COALESCE((SELECT SUM(CASE WHEN l.state='settled' THEN l.input_tokens::numeric+l.output_tokens::numeric WHEN l.state='rejected' THEN 0 ELSE l.reserved_tokens::numeric END)
    FROM model_call_ledger l WHERE l.owner_id=u.id AND NOT l.personal_model),0),
   COALESCE((SELECT count(*) FROM model_call_ledger l WHERE l.owner_id=u.id AND NOT l.personal_model AND l.state='dispatched'),0),
  COALESCE((SELECT bool_or(l.state='unknown') FROM model_call_ledger l WHERE l.owner_id=u.id AND NOT l.personal_model),false)
@@ -412,7 +412,7 @@ WHERE project_id=$1 AND source=$2 AND call_id=$3 AND status='unknown'`, taskProj
 		// that would make the account's settled and reserved total unrepresentable.
 		var accountTotalFits bool
 		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(CASE WHEN state='settled'
- THEN input_tokens::numeric+output_tokens::numeric ELSE reserved_tokens::numeric END),0) <= 9223372036854775807
+ THEN input_tokens::numeric+output_tokens::numeric WHEN state='rejected' THEN 0 ELSE reserved_tokens::numeric END),0) <= 9223372036854775807
  FROM model_call_ledger WHERE owner_id=$1 AND NOT personal_model`, command.OwnerID).Scan(&accountTotalFits); err != nil {
 			return fmt.Errorf("check reconciled model usage total: %w", err)
 		}

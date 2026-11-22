@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/model"
@@ -75,7 +77,7 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 	defer cancel()
 	nextCall := 0
-	complete := func(request app.ModelRequest) app.ModelResponse {
+	complete := func(t *testing.T, request app.ModelRequest) app.ModelResponse {
 		t.Helper()
 		nextCall++
 		response, err := gateway.Complete(ctx, app.ModelCall{
@@ -84,6 +86,10 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 			Request: request,
 		})
 		if err != nil {
+			var gatewayErr *domain.Error
+			if errors.As(err, &gatewayErr) {
+				t.Fatalf("Morde model-gateway call %d failed: code=%s details=%v", nextCall, gatewayErr.Code, gatewayErr.Details)
+			}
 			t.Fatalf("Morde model-gateway call %d failed: %v", nextCall, err)
 		}
 		if !response.Usage.Known || response.Usage.InputTokens < 1 || response.Usage.OutputTokens < 1 {
@@ -93,7 +99,7 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 	}
 
 	t.Run("Chinese factual question", func(t *testing.T) {
-		response := complete(app.ModelRequest{
+		response := complete(t, app.ModelRequest{
 			Input:           []app.ModelInput{{Type: "message", Role: "user", Text: "请只回答数字：1+1等于几？"}},
 			MaxOutputTokens: 32, DisableThinking: true,
 		})
@@ -103,7 +109,7 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 	})
 
 	t.Run("format instruction", func(t *testing.T) {
-		response := complete(app.ModelRequest{
+		response := complete(t, app.ModelRequest{
 			Input:           []app.ModelInput{{Type: "message", Role: "user", Text: "用中文给出恰好三条降低会议时长的建议，每条单独一行并以数字开头。"}},
 			MaxOutputTokens: 96, DisableThinking: true,
 		})
@@ -157,11 +163,11 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 	})
 
 	t.Run("multi-turn context", func(t *testing.T) {
-		first := complete(app.ModelRequest{
+		first := complete(t, app.ModelRequest{
 			Input:           []app.ModelInput{{Type: "message", Role: "user", Text: "请记住暗号是星河-2048，只回复收到。"}},
 			MaxOutputTokens: 32, DisableThinking: true,
 		})
-		second := complete(app.ModelRequest{
+		second := complete(t, app.ModelRequest{
 			Input: []app.ModelInput{
 				{Type: "message", Role: "user", Text: "请记住暗号是星河-2048，只回复收到。"},
 				{Type: "message", Role: "assistant", Text: first.Text},
@@ -174,9 +180,111 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 		}
 	})
 
+	t.Run("long input usage and history follow-up routing", func(t *testing.T) {
+		var archive strings.Builder
+		for index := 0; index < 800; index++ {
+			marker := ""
+			value := (index*37 + 11) % 997
+			checksum := (value * (index + 1000)) % 1000003
+			switch index {
+			case 0:
+				marker, value, checksum = "ALPHA-7KQ2", 11, 11000
+			case 400:
+				marker, value, checksum = "MID-4P8N", 842, 167600
+			case 799:
+				marker, value, checksum = "OMEGA-Q9W3", 913, 799913
+			}
+			fmt.Fprintf(&archive, "Record %04d: value=%d; checksum=%d; source=archive_batch_%02d", index, value, checksum, index%97)
+			if marker != "" {
+				fmt.Fprintf(&archive, "; marker=%s", marker)
+			}
+			archive.WriteByte('\n')
+		}
+		archiveText := archive.String()
+		type recordAnswer struct {
+			Marker   string `json:"marker"`
+			Value    int    `json:"value"`
+			Checksum int    `json:"checksum"`
+		}
+		type archiveAnswer struct {
+			Count   int                     `json:"count"`
+			Records map[string]recordAnswer `json:"records"`
+		}
+		parseAnswer := func(t *testing.T, response app.ModelResponse) archiveAnswer {
+			t.Helper()
+			var answer archiveAnswer
+			if err := json.Unmarshal([]byte(response.Text), &answer); err != nil {
+				t.Fatalf("long-input response was not the requested JSON: %q: %v", response.Text, err)
+			}
+			return answer
+		}
+		first := complete(t, app.ModelRequest{
+			Instructions:    "只依据下面完整的合成档案回答：总记录数，以及记录 0000、0400、0799 各自的 marker、value 和 checksum。只输出 JSON 对象，字段为 count 和 records。不要猜测。",
+			Input:           []app.ModelInput{{Type: "message", Role: "user", Text: archiveText}},
+			MaxOutputTokens: 256, DisableThinking: true, JSONMode: true,
+		})
+		if first.Usage.InputTokens <= 8192 {
+			t.Fatalf("provider reported only %d input tokens for %d synthetic bytes; want more than 8192",
+				first.Usage.InputTokens, len(archiveText))
+		}
+		t.Logf("DeepSeek Flash via Morde gateway: input_tokens=%d synthetic_bytes=%d", first.Usage.InputTokens, len(archiveText))
+		answer := parseAnswer(t, first)
+		if answer.Count != 800 || answer.Records["0000"] != (recordAnswer{Marker: "ALPHA-7KQ2", Value: 11, Checksum: 11000}) ||
+			answer.Records["0400"] != (recordAnswer{Marker: "MID-4P8N", Value: 842, Checksum: 167600}) ||
+			answer.Records["0799"] != (recordAnswer{Marker: "OMEGA-Q9W3", Value: 913, Checksum: 799913}) {
+			t.Fatalf("long-input answer did not preserve the exact count and anchors: %+v", answer)
+		}
+
+		window := 65536
+		longHistoryResolver := &liveModelResolver{endpoint: resolver.endpoint, contextWindowTokens: &window}
+		routeStore := &liveConversationRouteStore{}
+		routeGateway, err := app.NewModelGatewayService(routeStore, longHistoryResolver, client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		followup := "刚才档案里记录 0400 的 marker、value 和 checksum 是什么？"
+		claim := app.ConversationRouteClaim{Message: conversation.Message{ID: "m5678901", ConversationID: "c1234567",
+			OwnerID: principal.UserID, ActorID: principal.UserID, Role: conversation.RoleUser, Sequence: 2,
+			Content: followup}, ServiceInstanceID: "00000000-0000-4000-8000-000000000001", RouteAttempt: 1,
+			LeaseOwner: "deepseek-long-history-test", LeaseVersion: 1}
+		decision, err := routeGateway.ClassifyConversationRoute(ctx, claim, app.ConversationRouteContext{
+			ActorID: principal.UserID, ModelID: "p1234567", RouteAttempt: 1, Content: followup,
+			HistoryIncomplete: true,
+			History:           []app.ConversationRouteHistory{{MessageID: "m4567890", Sequence: 1, Role: conversation.RoleUser, Content: archiveText}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision.Action != app.ConversationRouteNew || decision.ExplicitNew || decision.Reply != "" {
+			t.Fatalf("truncated-history follow-up did not route to authorized Task search: action=%q explicit_new=%t invalid=%t reply=%q output=%q",
+				decision.Action, decision.ExplicitNew, decision.InvalidOutput, decision.Reply, decision.ModelOutput)
+		}
+		if routeStore.calls != 1 || len(routeStore.settlements) != 1 || routeStore.settlements[0].unknown ||
+			!routeStore.settlements[0].usage.Known || routeStore.settlements[0].decision.InvalidOutput {
+			t.Fatalf("long-history route usage was not durably settled: calls=%d settlements=%+v", routeStore.calls, routeStore.settlements)
+		}
+
+		second := complete(t, app.ModelRequest{
+			Instructions: "只依据对话中完整的合成档案回答记录 0400 的 marker、value 和 checksum。用一行中文，包含 marker、value、checksum，不输出 JSON，不要猜测。",
+			Input: []app.ModelInput{
+				{Type: "message", Role: "user", Text: archiveText},
+				{Type: "message", Role: "assistant", Text: first.Text},
+				{Type: "message", Role: "user", Text: followup},
+			},
+			MaxOutputTokens: 128, DisableThinking: true,
+		})
+		if second.Usage.InputTokens <= 8192 {
+			t.Fatalf("provider reported only %d input tokens for the full-history follow-up; want more than 8192", second.Usage.InputTokens)
+		}
+		if !strings.Contains(second.Text, "MID-4P8N") || !strings.Contains(second.Text, "842") || !strings.Contains(second.Text, "167600") {
+			t.Fatalf("full-history follow-up did not recover record 0400: %q", second.Text)
+		}
+		t.Logf("DeepSeek Flash full-history follow-up via Morde gateway: input_tokens=%d", second.Usage.InputTokens)
+	})
+
 	t.Run("streamed reply", func(t *testing.T) {
 		var streamed strings.Builder
-		response := complete(app.ModelRequest{
+		response := complete(t, app.ModelRequest{
 			Input:           []app.ModelInput{{Type: "message", Role: "user", Text: "请只输出 STREAM_OK。"}},
 			MaxOutputTokens: 32, DisableThinking: true,
 			OnTextDelta: func(delta string) error { streamed.WriteString(delta); return nil },
@@ -195,7 +303,7 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 			Tools:        []app.ModelTool{tool}, RequiredTool: tool.Name,
 			MaxOutputTokens: 64, DisableThinking: true,
 		}
-		first := complete(request)
+		first := complete(t, request)
 		if len(first.ToolCalls) != 1 || first.ToolCalls[0].Name != tool.Name {
 			t.Fatalf("model did not return the requested tool call: %#v", first.ToolCalls)
 		}
@@ -205,7 +313,7 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 			app.ModelInput{Type: "function_call", CallID: call.CallID, Name: call.Name, Arguments: call.Arguments},
 			app.ModelInput{Type: "function_call_output", CallID: call.CallID, Output: "Synthetic lookup result: DELTA-73."},
 		)
-		second := complete(request)
+		second := complete(t, request)
 		if !strings.Contains(second.Text, "DELTA-73") {
 			t.Fatalf("model did not incorporate the tool result: %q", second.Text)
 		}

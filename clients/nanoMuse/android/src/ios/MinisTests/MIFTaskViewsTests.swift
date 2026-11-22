@@ -52,7 +52,7 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertEqual(MIFTaskValidationPresentation.state(for: publishedResultReview.validation), .pending,
                        "Result review state is not the independent validation verdict.")
 
-        let knownStates: [(String, MIFTaskValidationState, String)] = [
+        let knownStates: [(String, MIFTaskValidationState, String.LocalizationValue)] = [
             ("PASS", .pass, "PASS"),
             ("PASS+NOTES", .passWithNotes, "PASS+NOTES"),
             ("FAIL", .fail, "FAIL"),
@@ -212,6 +212,40 @@ final class MIFTaskViewsTests: XCTestCase {
 
         XCTAssertEqual(merged.map(\.id), ["q1234567", "q2345678"])
         XCTAssertEqual(merged.first?.status, "completed")
+    }
+
+    func testTaskDynamicsPinsRunningAndUsesOnlyTwoTaskStates() {
+        let tasks = [makeTask(id: "q1111111", status: "waiting_user"),
+                     makeTask(id: "q2222222", status: "running"),
+                     makeTask(id: "q3333333", status: "paused"),
+                     makeTask(id: "q4444444", status: "cancelling")]
+
+        XCTAssertEqual(MIFTaskDynamicsPresentation.orderedTasks(tasks).map(\.id),
+                       ["q2222222", "q4444444", "q1111111", "q3333333"])
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("running"), AppLocalized("Task executing"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("cancelling"), AppLocalized("Task executing"))
+        for status in ["queued", "waiting_user", "paused", "completed", "failed", "future_status"] {
+            XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel(status), AppLocalized("Task stopped"), status)
+        }
+        XCTAssertEqual(MIFTaskDynamicsPresentation.latestWorkSummary(
+            makeTask(id: "q5555555", status: "running", currentStep: "Run cloud dsh tool: morde_web_search")),
+            AppLocalized("Search the web"))
+    }
+
+    func testTaskDynamicsSummariesCompactLongObjectivesAndHideModelErrors() {
+        XCTAssertEqual(MIFTaskDynamicsPresentation.title(
+            "合成并行任务 H05-CHAT-ASSOC-2711：请协调两个子 Agent 分析三个模拟案例，完整上下文不应进入列表。"),
+            "协调两个子 Agent 分析三个模拟案例")
+        let modelError = makeStep(id: "s1234567", sequence: 1, kind: "model", status: "failed",
+            title: "The model request could not be verified", summary: "The model request could not be verified (category: provider_error).",
+            createdAt: "2026-11-04T00:00:01Z")
+        let task = makeTask(id: "q5555555", status: "failed", currentStep: "The model request could not be verified",
+                            steps: [modelError])
+        XCTAssertEqual(MIFTaskDynamicsPresentation.latestWorkSummary(task), AppLocalized("No recorded steps"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.workItemTitle("The model request could not be verified (category: upstream_error)"),
+                       AppLocalized("Task failed"))
+        XCTAssertNil(MIFTaskDynamicsPresentation.workItemSummary(
+            "The model request could not be verified (category: upstream_error).", title: "Review cloud task recovery"))
     }
 
     func testPaginationRequiresAnAdvancingNonemptyCursorAndSingleRequest() {
@@ -488,7 +522,7 @@ final class MIFTaskViewsTests: XCTestCase {
                        failure_reason: nil, retry_of_step_id: nil)
     }
 
-    private func makeTask(id: String, status: String, batchItems: [MordeBatchItem]? = nil,
+    private func makeTask(id: String, status: String, objective: String = "Synthetic task", batchItems: [MordeBatchItem]? = nil,
                           currentStep: String? = nil, result: String? = nil,
                           stepCount: Int64 = 0, completedStepCount: Int64 = 0,
                           steps: [MordeTask.Step]? = nil) -> MordeTask {
@@ -496,7 +530,7 @@ final class MIFTaskViewsTests: XCTestCase {
         MordeTask(owner_id: nil, initiator_id: nil, id: id, conversation_id: "c1234567", host_id: nil,
                   execution_location: "server", model_id: nil, queue_priority: nil,
                   workspace_id: nil, input_revision: nil,
-                  objective: "Synthetic task", status: status, event_sequence: 1,
+                  objective: objective, status: status, event_sequence: 1,
                   current_revision: nil, desired_revision: nil, current_revision_started: nil,
                   result: result, result_message_pending: nil,
                   result_message_published: nil,

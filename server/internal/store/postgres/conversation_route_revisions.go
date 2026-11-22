@@ -320,10 +320,14 @@ FROM conversation_messages m WHERE m.task_id=$1 AND m.owner_id=$2 AND m.role='us
 				fileIntent = directive
 			}
 		}
-		for _, revision := range revisions {
-			result, err := tx.Exec(ctx, `UPDATE conversation_messages SET task_id=$2,delivery_status='pending'
+		for index, revision := range revisions {
+			deliveryMode := app.AgentMessageDeliverySteer
+			if index+1 == len(revisions) {
+				deliveryMode = app.AgentMessageDeliveryFollowup
+			}
+			result, err := tx.Exec(ctx, `UPDATE conversation_messages SET task_id=$2,delivery_status='pending',delivery_mode=$6
 WHERE id=$1 AND task_id IS NULL AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5`,
-				revision.claim.Message.ID, taskID, ownerID, initiatorID, conversationID)
+				revision.claim.Message.ID, taskID, ownerID, initiatorID, conversationID, string(deliveryMode))
 			if err != nil || result.RowsAffected() != 1 {
 				return domain.NewError(domain.CodeConflict, "revision message changed before delivery")
 			}

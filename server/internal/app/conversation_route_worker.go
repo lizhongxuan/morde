@@ -72,3 +72,21 @@ type ConversationRoutePredecessorRecovery interface {
 type ConversationRouteContextRecovery interface {
 	RequeueConversationRouteAfterContextChange(context.Context, ConversationRouteClaim) (bool, error)
 }
+
+// ConversationRouteRateLimitRecovery records the confirmed provider rejection
+// and atomically retries or fails the route.
+type ConversationRouteRateLimitRecovery interface {
+	HandleConversationRouteRateLimit(context.Context, ConversationRouteClaim, time.Duration) (bool, error)
+}
+
+// ConversationRouteInvalidOutputRecovery requeues one settled invalid route
+// result for a separately metered, text-only repair attempt.
+type ConversationRouteInvalidOutputRecovery interface {
+	RequeueConversationRouteAfterInvalidOutput(context.Context, ConversationRouteClaim) (bool, error)
+}
+
+// ConversationRouteRepairStatus marks only the attempt immediately following
+// a settled invalid output for the repair prompt.
+type ConversationRouteRepairStatus interface {
+	IsConversationRouteRepairAttempt(context.Context, ConversationRouteClaim) (bool, error)
+}

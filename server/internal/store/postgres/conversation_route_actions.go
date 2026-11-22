@@ -412,7 +412,8 @@ WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.source_kind
  AND (
    (m.actor_id=$4 AND (m.task_id IS NULL OR t.initiator_id=$4)
     AND (m.role='user' OR (m.role='assistant' AND (
-      (m.output_status IS NULL AND (t.status='completed' OR EXISTS (
+      ($9::text='' AND m.task_id IS NULL AND m.source_kind='conversation' AND m.delivery_status='applied')
+      OR (m.output_status IS NULL AND (t.status='completed' OR EXISTS (
         SELECT 1 FROM conversation_result_batches batch
         WHERE batch.message_id=m.id AND batch.published_message_id=m.id AND batch.state='published'
           AND batch.service_instance_id=$5::uuid
@@ -432,7 +433,7 @@ WHERE m.owner_id=$1 AND m.conversation_id=$2 AND m.sequence<$3 AND m.source_kind
     AND (`+projectSharedHistoryEvidenceSQL+`))
  )
 ORDER BY m.sequence DESC LIMIT 8`, claim.Message.OwnerID, claim.Message.ConversationID, claim.Message.Sequence, claim.Message.ActorID,
-		claim.ServiceInstanceID, claim.Input.ProjectID, descendants, claim.Input.VariantGroupID)
+		claim.ServiceInstanceID, claim.Input.ProjectID, descendants, claim.Input.VariantGroupID, claim.Input.ResultReviewID)
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read route history: %w", err)
 	}
@@ -1154,8 +1155,9 @@ RETURNING m.id,m.owner_id,r.client_message_id`, claim.Message.ID, claim.Message.
 	return nil
 }
 
+const maxAutomaticRouteConflicts = 16 // Matches the maximum route-worker concurrency so one independent batch can settle.
+
 func requeueConversationRouteForReclassification(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) error {
-	const maxAutomaticConflicts = 16 // Matches the maximum route-worker concurrency so one independent batch can settle.
 	result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET
 state=CASE WHEN auto_retry_count+1 >= $9 THEN 'failed' ELSE 'pending' END,
 failure_reason=CASE WHEN auto_retry_count+1 >= $9 THEN 'routing_context_unavailable' ELSE '' END,
@@ -1165,7 +1167,7 @@ acknowledgement_requested=false,available_after=clock_timestamp(),updated_at=clo
 WHERE service_instance_id=$1::uuid AND message_id=$2 AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5
  AND state='processing' AND lease_owner=$6 AND lease_version=$7 AND route_attempt=$8 AND lease_expires_at>clock_timestamp()`,
 		claim.ServiceInstanceID, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID,
-		claim.LeaseOwner, claim.LeaseVersion, claim.RouteAttempt, maxAutomaticConflicts)
+		claim.LeaseOwner, claim.LeaseVersion, claim.RouteAttempt, maxAutomaticRouteConflicts)
 	if err != nil {
 		return fmt.Errorf("requeue conversation route after context change: %w", err)
 	}

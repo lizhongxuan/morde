@@ -7,6 +7,61 @@ import test from 'node:test'
 const identityKeys = ['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
 const fence = frame => Object.fromEntries(identityKeys.map(key => [key, frame[key]]))
 
+test('passes an 18 KB current message intact to the model within its context budget',
+  { timeout: 15_000 }, async t => {
+    const prefix = 'head-anchor\n'
+    const middle = '\nmiddle-anchor\n'
+    const suffix = '\ntail-anchor'
+    const filler = 18 * 1024 - prefix.length - middle.length - suffix.length
+    const left = Math.floor(filler / 2)
+    const content = `${prefix}${'a'.repeat(left)}${middle}${'b'.repeat(filler - left)}${suffix}`
+    assert.equal(Buffer.byteLength(content), 18 * 1024)
+    const start = {
+      type: 'start', version: 1, task_id: 'task_long_input', owner_id: 'owner_long_input',
+      agent_id: 'agent_long_input', generation: 1, authorization_version: 1, session_id: 'session_long_input',
+      model: 'test-model', tools: [], context_window_tokens: 32_768, max_tokens: 512,
+      initial_message: { message_id: 'm1234567', content, attachment_ids: [] },
+    }
+    const child = spawn(process.execPath, ['bin.mjs'], {
+      cwd: new URL('..', import.meta.url), env: { PATH: process.env.PATH, LANG: 'C.UTF-8' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    t.after(() => child.kill())
+    const frames = []
+    const modelRequests = []
+    const send = frame => child.stdin.write(`${JSON.stringify(frame)}\n`)
+    const lines = createInterface({ input: child.stdout })
+    lines.on('line', line => {
+      const frame = JSON.parse(line)
+      frames.push(frame)
+      if (frame.type === 'ready') send(start)
+      else if (frame.type === 'checkpoint') send({ type: 'checkpoint_ack', ...fence(frame), id: frame.id,
+        ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
+      else if (frame.type === 'model') {
+        modelRequests.push(frame.request)
+        const text = 'Received the complete current message.'
+        const chunks = [
+          { type: 'block-start', index: 0, blockType: 'text' },
+          { type: 'text-delta', index: 0, text },
+          { type: 'block-end', index: 0, block: { type: 'text', text } },
+          { type: 'finish', reason: { kind: 'stop' } },
+        ]
+        chunks.forEach((chunk, index) => send({ type: 'model_chunk', ...fence(frame), id: frame.id, index, chunk }))
+        send({ type: 'model_end', ...fence(frame), id: frame.id, ok: true })
+      } else if (['settled', 'failed', 'protocol_error'].includes(frame.type)) child.stdin.end()
+    })
+    const [code] = await once(child, 'close')
+    assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+    assert.equal(modelRequests.length, 1)
+    const request = JSON.stringify(modelRequests[0].messages)
+    assert.ok(request.includes(JSON.stringify(content).slice(1, -1)),
+      'model request omitted or truncated the current message')
+    for (const anchor of ['head-anchor', 'middle-anchor', 'tail-anchor']) {
+      assert.ok(request.includes(anchor), `model request omitted ${anchor}`)
+    }
+    assert.ok(frames.some(frame => frame.type === 'settled'))
+  })
+
 test('long task conversation survives repeated pressure compaction and keeps its early requirement',
   { timeout: 15_000 }, async t => {
     const start = {
@@ -71,7 +126,10 @@ test('long task conversation survives repeated pressure compaction and keeps its
     assert.ok(!summaryInput.includes('head-anchor'))
     assert.ok(!summaryInput.includes('followup-3'))
     const events = pages.flatMap(page => JSON.parse(page.payload).events)
-    assert.ok(events.some(event => event.type === 'compaction/summary'))
+    const summaries = events.filter(event => event.type === 'compaction/summary')
+    assert.ok(summaries.length >= 2)
+    assert.ok(summaries.every(event => Array.isArray(event.data.shadowedSeqs) && event.data.shadowedSeqs.length > 0),
+      'every summary must prove which source events it covered')
     assert.ok(events.some(event => event.type === 'compaction/end' && !event.data.error))
     assert.ok(events.some(event => event.type === 'user/message' && JSON.stringify(event).includes('head-anchor')))
     assert.ok(events.some(event => event.type === 'user/message' && JSON.stringify(event).includes('followup-7')))

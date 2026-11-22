@@ -621,7 +621,12 @@ struct NanoMuseLoopingClipView: UIViewRepresentable {
 
 /// Android's MuseTones: a quiet grey palette for the shell.
 enum NanoMuseTones {
+    static let brand = Color(red: 96.0 / 255, green: 165.0 / 255, blue: 250.0 / 255)
+    static let brandDeep = Color(red: 29.0 / 255, green: 78.0 / 255, blue: 216.0 / 255)
+    static let brandSoft = Color(red: 219.0 / 255, green: 234.0 / 255, blue: 254.0 / 255)
+    static let brandTint = Color(red: 191.0 / 255, green: 219.0 / 255, blue: 254.0 / 255)
     static let surface = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.11, green: 0.11, blue: 0.118, alpha: 1) : .white })
+    static let side = Color(red: 239.0 / 255, green: 246.0 / 255, blue: 1)
     static let fill = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.165, green: 0.165, blue: 0.18, alpha: 1) : UIColor(red: 0.945, green: 0.945, blue: 0.957, alpha: 1) })
     static let bubble = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.149, green: 0.149, blue: 0.165, alpha: 1) : UIColor(red: 0.914, green: 0.918, blue: 0.925, alpha: 1) })
     static let userMessage = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.17, green: 0.31, blue: 0.47, alpha: 1) : UIColor(red: 0.75, green: 0.87, blue: 0.99, alpha: 1) })
@@ -631,6 +636,15 @@ enum NanoMuseTones {
     static let action = Color(red: 0.039, green: 0.4, blue: 0.894)
     static let actionText = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.49, green: 0.68, blue: 1, alpha: 1) : UIColor(red: 0.039, green: 0.4, blue: 0.894, alpha: 1) })
     static let secondaryText = Color(uiColor: UIColor { $0.userInterfaceStyle == .dark ? UIColor(red: 0.73, green: 0.73, blue: 0.77, alpha: 1) : UIColor(red: 0.37, green: 0.37, blue: 0.4, alpha: 1) })
+    static let muted = Color(red: 148.0 / 255, green: 163.0 / 255, blue: 184.0 / 255)
+    static let success = Color(red: 52.0 / 255, green: 178.0 / 255, blue: 122.0 / 255)
+    static let successFill = Color(red: 209.0 / 255, green: 250.0 / 255, blue: 229.0 / 255)
+    static let successInk = Color(red: 4.0 / 255, green: 120.0 / 255, blue: 87.0 / 255)
+    static let warning = Color(red: 180.0 / 255, green: 83.0 / 255, blue: 9.0 / 255)
+    static let warningFill = Color(red: 254.0 / 255, green: 243.0 / 255, blue: 199.0 / 255)
+    static let danger = Color(red: 240.0 / 255, green: 101.0 / 255, blue: 90.0 / 255)
+    static let dangerFill = Color(red: 254.0 / 255, green: 226.0 / 255, blue: 226.0 / 255)
+    static let dangerInk = Color(red: 185.0 / 255, green: 28.0 / 255, blue: 28.0 / 255)
     /// The chat's ink (Android's `ChatColors.userBubble` and `sendButton` since #331): your
     /// message pill, the send disc and the scroll-to-latest disc. Black on the white canvas in
     /// light, white on the black canvas in dark; `onInk` is what sits on it, the canvas colour.
@@ -643,6 +657,20 @@ enum NanoMuseTones {
     /// a white glyph in light and white with a black glyph in dark, as Android's MuseBottomBar.
     static let tabIndicator = ink
     static let tabIndicatorGlyph = onInk
+}
+
+struct NanoMuseIceCreamTextFieldStyle: TextFieldStyle {
+    func _body(configuration: TextField<Self._Label>) -> some View {
+        configuration
+            .font(.body)
+            .foregroundStyle(NanoMuseTones.ink)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .frame(minHeight: 44)
+            .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .strokeBorder(NanoMuseTones.brandTint, lineWidth: 1.5))
+    }
 }
 
 /// Whether the UI runs in Chinese right now (the in-app override wins).

@@ -39,6 +39,24 @@ func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 	}
 }
 
+func TestConversationRouteModelRequestAddsBoundedRepairInstructions(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "你好"}
+	initial, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value.Repair = true
+	repair, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initial.Input[0].Text != repair.Input[0].Text || strings.Contains(initial.Instructions, "previous response") ||
+		!strings.Contains(repair.Instructions, "previous response to this exact request failed strict JSON or schema validation") ||
+		!strings.Contains(repair.Instructions, "Do not call tools or take actions") {
+		t.Fatalf("repair prompt changed source content or missed its bounded guard: initial=%+v repair=%+v", initial, repair)
+	}
+}
+
 func TestConversationRouteAcknowledgementIsExplicitAndLimitedToBackgroundWork(t *testing.T) {
 	context := ConversationRouteContext{ActorID: "u1234567", Content: "Please handle this request", Candidates: []ConversationRouteCandidate{{
 		TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 2,
@@ -61,6 +79,11 @@ func TestConversationRouteAcknowledgementIsExplicitAndLimitedToBackgroundWork(t 
 				t.Fatalf("decision = %+v, want action=%s acknowledge=%t invalid=%t", decision, test.action, test.acknowledge, test.invalid)
 			}
 		})
+	}
+	completeNew := ConversationRouteContext{ActorID: "u1234567", Content: "Morde browser acceptance: long background task"}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","target_message_id":"","aggregate_message_ids":[],"explicit_new":false,"question":"","reply":"","dependency_task_ids":[],"acknowledge":true}`, completeNew)
+	if decision.Action != ConversationRouteNew || !decision.Acknowledge || decision.InvalidOutput {
+		t.Fatalf("complete acknowledged new-task decision was rejected without active candidates: %+v", decision)
 	}
 }
 

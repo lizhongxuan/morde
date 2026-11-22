@@ -36,7 +36,7 @@ type ConversationRouteModelStore interface {
 }
 
 type ConversationRouteCoordinatorOutputStore interface {
-	RecoverConversationCoordinatorModelOutput(context.Context, ConversationRouteModelFence) (string, error)
+	RecoverConversationCoordinatorModelOutput(context.Context, ConversationRouteModelFence) (ModelResponse, error)
 }
 
 var ErrRouteProjectReservationRequired = errors.New("route project reservation is required")
@@ -88,7 +88,19 @@ func conversationRouteProviderError(err error) error {
 	if errors.As(err, &clientErr) && clientErr.Stage == "provider_status" && clientErr.ProviderCode == "context_length_exceeded" {
 		return domain.NewError(domain.CodeResultTooLarge, "conversation route exceeds the provider context window")
 	}
-	return modelConnectionCheckError(err)
+	result := modelConnectionCheckError(err)
+	if errors.As(err, &clientErr) && clientErr.Kind == ModelErrorRateLimited && clientErr.Stage == "provider_status" && clientErr.RetryAfter > 0 {
+		var routeErr *domain.Error
+		if errors.As(result, &routeErr) && routeErr.Code == domain.CodeRateLimited {
+			routeErr.RetryAfter = clientErr.RetryAfter
+		}
+	}
+	return result
+}
+
+func confirmedConversationRouteRejection(err error) bool {
+	var clientErr *ModelClientError
+	return errors.As(err, &clientErr) && clientErr.Kind == ModelErrorRateLimited && clientErr.Stage == "provider_status"
 }
 
 // DSHConversationCoordinatorModelCallID derives a stable route-call identity
@@ -257,14 +269,14 @@ func (s *ModelGatewayService) ResolveConversationRouteModel(ctx context.Context,
 }
 
 func (s *ModelGatewayService) RecoverConversationCoordinatorModelOutput(ctx context.Context, claim ConversationRouteClaim,
-	value ConversationRouteContext) (string, error) {
+	value ConversationRouteContext) (ModelResponse, error) {
 	store, ok := s.store.(ConversationRouteCoordinatorOutputStore)
 	if !ok {
-		return "", domain.NewError(domain.CodeUnsupported, "conversation coordinator result recovery is unavailable")
+		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "conversation coordinator result recovery is unavailable")
 	}
 	if ctx == nil || value.ActorID != claim.Message.ActorID || !conversationRouteContextMatchesClaim(value, claim) ||
 		value.ReferenceTaskID != claim.Input.ReferenceTaskID || !domain.ValidModelConnectionID(value.ModelID) {
-		return "", domain.InvalidArgument("route_context", "coordinator recovery context is invalid")
+		return ModelResponse{}, domain.InvalidArgument("route_context", "coordinator recovery context is invalid")
 	}
 	return store.RecoverConversationCoordinatorModelOutput(ctx, ConversationRouteModelFence{Claim: claim, Context: value})
 }
@@ -486,12 +498,17 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 	var decision *ConversationRouteDecision
 	if !unknown {
 		parsed := ParseConversationRouteDecisionForContext(response.Text, value)
+		if response.StopReason != "stop" || len(response.ToolCalls) != 0 {
+			parsed = invalidConversationRouteDecision(response.Text)
+		}
 		decision = &parsed
 	}
 	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 	defer cancelSettle()
-	if err := store.SettleConversationRouteModelCall(settleCtx, call, decision, response.Usage, unknown); err != nil {
-		return ConversationRouteDecision{}, fmt.Errorf("settle conversation route model call: %w", err)
+	if !confirmedConversationRouteRejection(callErr) {
+		if err := store.SettleConversationRouteModelCall(settleCtx, call, decision, response.Usage, unknown); err != nil {
+			return ConversationRouteDecision{}, fmt.Errorf("settle conversation route model call: %w", err)
+		}
 	}
 	if callErr != nil {
 		return ConversationRouteDecision{}, conversationRouteProviderError(callErr)
@@ -606,21 +623,29 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 	if prior != nil {
 		output := prior.ModelOutput
 		if output == "" {
-			// Older settled route rows did not retain their source text. Rebuild
-			// only the already committed decision; never redispatch it.
-			var encoded []byte
-			encoded, err = json.Marshal(struct {
-				Action   ConversationRouteAction `json:"action"`
-				TaskID   string                  `json:"task_id"`
-				Question string                  `json:"question"`
-				Reply    string                  `json:"reply,omitempty"`
-			}{prior.Action, prior.TaskID, prior.Question, prior.Reply})
-			if err != nil {
-				return ModelResponse{}, fmt.Errorf("encode saved coordinator decision: %w", err)
+			if prior.InvalidOutput {
+				output = "INVALID_MODEL_OUTPUT"
+			} else {
+				// Older settled route rows did not retain their source text. Rebuild
+				// only the already committed decision; never redispatch it.
+				var encoded []byte
+				encoded, err = json.Marshal(struct {
+					Action   ConversationRouteAction `json:"action"`
+					TaskID   string                  `json:"task_id"`
+					Question string                  `json:"question"`
+					Reply    string                  `json:"reply,omitempty"`
+				}{prior.Action, prior.TaskID, prior.Question, prior.Reply})
+				if err != nil {
+					return ModelResponse{}, fmt.Errorf("encode saved coordinator decision: %w", err)
+				}
+				output = string(encoded)
 			}
-			output = string(encoded)
 		}
-		return ModelResponse{Text: output, StopReason: "stop", Usage: ModelUsage{Known: true}}, nil
+		stopReason := "stop"
+		if prior.InvalidOutput {
+			stopReason = "invalid_response"
+		}
+		return ModelResponse{Text: output, StopReason: stopReason, Usage: ModelUsage{Known: true}}, nil
 	}
 	if err := store.BeginConversationRouteModelCall(ctx, call); err != nil {
 		return ModelResponse{}, err
@@ -629,14 +654,16 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 	dispatchCtx, cancel := context.WithTimeout(ctx, ModelCallTimeout)
 	defer cancel()
 	response, callErr := s.client.Complete(dispatchCtx, request)
-	unknown := callErr != nil || len(response.ToolCalls) != 0 || response.StopReason != "stop" ||
-		!response.Usage.Known || response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 ||
+	unknown := callErr != nil || !response.Usage.Known || response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 ||
 		response.Usage.InputTokens > math.MaxInt64-response.Usage.OutputTokens ||
-		!utf8.ValidString(response.Text) || !ValidConversationRouteModelOutput(response.Text) ||
 		(!endpoint.Personal && response.Usage.InputTokens+response.Usage.OutputTokens > reserve)
 	var decision *ConversationRouteDecision
 	if !unknown {
 		parsed := ParseConversationRouteDecisionForContext(response.Text, value)
+		if response.StopReason != "stop" || len(response.ToolCalls) != 0 ||
+			!utf8.ValidString(response.Text) || !ValidConversationRouteModelOutput(response.Text) {
+			parsed = invalidConversationRouteDecision(response.Text)
+		}
 		decision = &parsed
 	}
 	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -649,6 +676,12 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 	}
 	if unknown {
 		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "coordinator model result or usage is unknown and requires reconciliation")
+	}
+	if decision.InvalidOutput {
+		response.StopReason = "invalid_response"
+		if !utf8.ValidString(response.Text) || !ValidConversationRouteModelOutput(response.Text) || strings.TrimSpace(response.Text) == "" {
+			response.Text = "INVALID_MODEL_OUTPUT"
+		}
 	}
 	response.ToolCalls = nil
 	return response, nil

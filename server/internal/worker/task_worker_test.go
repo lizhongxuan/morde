@@ -317,15 +317,20 @@ func TestTaskWorkerRenewsLeaseWhileExecuting(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := startTaskWorker(ctx, worker)
 	waitTaskWorkerSignal(t, store.renewCalls)
+	waitTaskWorkerSignal(t, store.renewCalls)
 	select {
 	case <-executorCanceled:
-		t.Fatal("successful lease renewal canceled the executor")
+		t.Fatal("successful repeated lease renewals canceled the executor")
 	default:
 	}
 	cancel()
 	waitTaskWorkerSignal(t, executorCanceled)
 	if err := waitTaskWorkerResult(t, done); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Run() error = %v, want context.Canceled", err)
+	}
+	_, renewals := store.counts()
+	if renewals < 2 {
+		t.Fatalf("lease renewals = %d, want at least two while execution remained active", renewals)
 	}
 }
 

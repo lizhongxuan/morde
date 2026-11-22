@@ -12,12 +12,15 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/worker"
 )
 
 type routeModelClientTest struct {
@@ -30,6 +33,60 @@ type routeModelClientTest struct {
 	allowRepeated bool
 }
 
+func TestConversationRouteRepairsOneInvalidOutputWithSeparateMeteredCall(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		secondReply   string
+		wantFinal     string
+		wantRouteDone bool
+	}{
+		{name: "valid repair", secondReply: `{"action":"reply","task_id":"","question":"","reply":"你好。"}`, wantFinal: "routed", wantRouteDone: true},
+		{name: "second invalid output fails closed", secondReply: "still not json", wantFinal: "failed"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &routeModelClientTest{reply: "not json", secondReply: test.secondReply}
+			store, gateway, _, claim, _ := routeModelFixture(t, false, client)
+			if err := store.ReleaseConversationRoute(context.Background(), claim); err != nil {
+				t.Fatal(err)
+			}
+			routeWorker, err := worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
+				Queue: store, Actions: store, Models: gateway, WorkerID: "invalid-output-repair-test",
+				LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop(),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			for attempt := 0; attempt < 4 && client.calls.Load() < 2; attempt++ {
+				if found, err := routeWorker.RunOnce(context.Background()); err != nil || !found {
+					t.Fatalf("route attempt %d: found=%t err=%v", attempt+1, found, err)
+				}
+			}
+			if calls := client.calls.Load(); calls != 2 {
+				t.Fatalf("provider calls = %d, want initial plus one repair", calls)
+			}
+			var state string
+			var attempts, settled, invalid, firstCallAttempt, lastCallAttempt int64
+			if err := store.pool.QueryRow(context.Background(), `SELECT r.state,r.route_attempt,
+ (SELECT count(*) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.state='settled'),
+ (SELECT count(*) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.state='settled' AND c.decision->>'invalid_output'='true'),
+ (SELECT min(c.attempt) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.state='settled'),
+ (SELECT max(c.attempt) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.state='settled')
+				FROM conversation_message_routes r WHERE r.message_id=$1`, claim.Message.ID).
+				Scan(&state, &attempts, &settled, &invalid, &firstCallAttempt, &lastCallAttempt); err != nil {
+				t.Fatal(err)
+			}
+			wantInvalid := 1
+			if !test.wantRouteDone {
+				wantInvalid = 2
+			}
+			if state != test.wantFinal || attempts < lastCallAttempt || settled != 2 || invalid != int64(wantInvalid) || lastCallAttempt-firstCallAttempt != 1 {
+				t.Fatalf("route repair state=%q route_attempt=%d settled=%d invalid=%d call_attempts=%d,%d, want %q/two distinct calls/%d invalid",
+					state, attempts, settled, invalid, firstCallAttempt, lastCallAttempt, test.wantFinal, wantInvalid)
+			}
+		})
+	}
+}
+
 func TestConversationRouteModelPhaseUsesResultReviewRetryAttempt(t *testing.T) {
 	value := app.ConversationRouteContext{ResultReview: &app.ConversationTaskResultReview{}}
 	if phase := conversationRouteModelPhase(value); phase != "normal" {
@@ -39,6 +96,116 @@ func TestConversationRouteModelPhaseUsesResultReviewRetryAttempt(t *testing.T) {
 	if phase := conversationRouteModelPhase(value); phase != "result_review_2" {
 		t.Fatalf("retried result review phase = %q, want result_review_2", phase)
 	}
+}
+
+func TestConversationRouteRetriesConfirmedRateLimitWithNewMeteredIdentity(t *testing.T) {
+	newWorker := func(t *testing.T, store *Store, gateway *app.ModelGatewayService) *worker.ConversationRouteWorker {
+		t.Helper()
+		result, err := worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
+			Queue: store, Actions: store, Models: gateway, WorkerID: "route-rate-limit-test",
+			LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return result
+	}
+	t.Run("retries after provider delay then routes", func(t *testing.T) {
+		client := &routeModelClientTest{err: &app.ModelClientError{Kind: app.ModelErrorRateLimited, Stage: "provider_status", RetryAfter: 2 * time.Second},
+			reply: `{"action":"reply","task_id":"","question":"","reply":"你好。"}`}
+		store, gateway, _, claim, _ := routeModelFixture(t, true, client)
+		if err := store.ReleaseConversationRoute(context.Background(), claim); err != nil {
+			t.Fatal(err)
+		}
+		routeWorker := newWorker(t, store, gateway)
+		if found, err := routeWorker.RunOnce(context.Background()); err != nil || !found {
+			t.Fatalf("rate-limited route attempt: found=%t err=%v", found, err)
+		}
+		var state string
+		var routeAttempt int64
+		var retryDelay float64
+		if err := store.pool.QueryRow(context.Background(), `SELECT state,route_attempt,
+EXTRACT(EPOCH FROM (available_after-clock_timestamp())) FROM conversation_message_routes WHERE message_id=$1`, claim.Message.ID).
+			Scan(&state, &routeAttempt, &retryDelay); err != nil || state != "pending" || routeAttempt != claim.RouteAttempt+1 || retryDelay < 1 || retryDelay > 2.5 {
+			t.Fatalf("rate-limited route retry state=%q attempt=%d delay=%f err=%v", state, routeAttempt, retryDelay, err)
+		}
+		var oldCallID, oldCallState, oldLedgerState string
+		if err := store.pool.QueryRow(context.Background(), `SELECT c.call_id,c.state,l.state FROM conversation_route_model_calls c
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+WHERE c.message_id=$1 AND c.attempt=$2 AND c.phase='normal'`, claim.Message.ID, claim.RouteAttempt).
+			Scan(&oldCallID, &oldCallState, &oldLedgerState); err != nil || oldCallState != "rejected" || oldLedgerState != "rejected" {
+			t.Fatalf("confirmed provider rejection was not recorded: call=%q route=%q ledger=%q err=%v", oldCallID, oldCallState, oldLedgerState, err)
+		}
+		var projectState string
+		if err := store.pool.QueryRow(context.Background(), `SELECT status FROM project_budget_ledger WHERE source='route' AND call_id=$1`, oldCallID).Scan(&projectState); err != nil || projectState != "rejected" {
+			t.Fatalf("confirmed provider rejection did not release project reservation: status=%q err=%v", projectState, err)
+		}
+		var accountUsed int64
+		var accountUnknown bool
+		if err := store.pool.QueryRow(context.Background(), `SELECT COALESCE(SUM(CASE WHEN state='settled' THEN input_tokens+output_tokens WHEN state='rejected' THEN 0 ELSE reserved_tokens END),0),
+COALESCE(bool_or(state='unknown'),false) FROM model_call_ledger WHERE owner_id=$1 AND source='route' AND call_id=$2 AND NOT personal_model`, claim.Message.ActorID, oldCallID).
+			Scan(&accountUsed, &accountUnknown); err != nil || accountUsed != 0 || accountUnknown {
+			t.Fatalf("rejected call still occupies account budget: used=%d unknown=%t err=%v", accountUsed, accountUnknown, err)
+		}
+		var projectReserved, projectSpent int64
+		var projectUnknown bool
+		if err := store.pool.QueryRow(context.Background(), `SELECT COALESCE(SUM(actual_micros) FILTER (WHERE status='settled'),0),
+COALESCE(SUM(reserved_micros) FILTER (WHERE status IN ('reserved','unknown')),0),COALESCE(bool_or(status='unknown'),false)
+FROM project_budget_ledger WHERE source='route' AND call_id=$1`, oldCallID).
+			Scan(&projectSpent, &projectReserved, &projectUnknown); err != nil || projectSpent != 0 || projectReserved != 0 || projectUnknown {
+			t.Fatalf("rejected call still occupies project budget: spent=%d reserved=%d unknown=%t err=%v", projectSpent, projectReserved, projectUnknown, err)
+		}
+		client.err = nil
+		if _, err := store.pool.Exec(context.Background(), `UPDATE conversation_message_routes SET available_after=clock_timestamp() WHERE message_id=$1`, claim.Message.ID); err != nil {
+			t.Fatal(err)
+		}
+		if found, err := routeWorker.RunOnce(context.Background()); err != nil || !found {
+			t.Fatalf("recovered route attempt: found=%t err=%v", found, err)
+		}
+		var routeState, failureReason, recoveredState, recoveredCallID string
+		var persistedAttempt int64
+		if err := store.pool.QueryRow(context.Background(), `SELECT r.state,r.route_attempt,r.failure_reason,
+COALESCE((SELECT state FROM conversation_route_model_calls WHERE message_id=r.message_id AND attempt=$2 AND phase='normal'),'missing'),
+COALESCE((SELECT call_id FROM conversation_route_model_calls WHERE message_id=r.message_id AND attempt=$2 AND phase='normal'),'')
+FROM conversation_message_routes r WHERE r.message_id=$1`, claim.Message.ID, claim.RouteAttempt+1).
+			Scan(&routeState, &persistedAttempt, &failureReason, &recoveredState, &recoveredCallID); err != nil || routeState != "routed" || recoveredState != "settled" || recoveredCallID == oldCallID {
+			t.Fatalf("recovered route state=%q attempt=%d reason=%q model=%q call=%q old=%q providerCalls=%d err=%v",
+				routeState, persistedAttempt, failureReason, recoveredState, recoveredCallID, oldCallID, client.calls.Load(), err)
+		}
+	})
+	t.Run("stops after three provider rejections", func(t *testing.T) {
+		client := &routeModelClientTest{err: &app.ModelClientError{Kind: app.ModelErrorRateLimited, Stage: "provider_status", RetryAfter: time.Second}}
+		store, gateway, _, claim, _ := routeModelFixture(t, false, client)
+		if err := store.ReleaseConversationRoute(context.Background(), claim); err != nil {
+			t.Fatal(err)
+		}
+		routeWorker := newWorker(t, store, gateway)
+		for attempt := 0; attempt < 3; attempt++ {
+			if attempt > 0 {
+				if _, err := store.pool.Exec(context.Background(), `UPDATE conversation_message_routes SET available_after=clock_timestamp() WHERE message_id=$1`, claim.Message.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if found, err := routeWorker.RunOnce(context.Background()); err != nil || !found {
+				var state, reason string
+				var currentAttempt int64
+				_ = store.pool.QueryRow(context.Background(), `SELECT state,route_attempt,failure_reason FROM conversation_message_routes WHERE message_id=$1`, claim.Message.ID).
+					Scan(&state, &currentAttempt, &reason)
+				t.Fatalf("rate-limit attempt %d: found=%t state=%q attempt=%d reason=%q err=%v", attempt+1, found, state, currentAttempt, reason, err)
+			}
+		}
+		var routeState string
+		var calls, rejected, ledgerRejected int64
+		if err := store.pool.QueryRow(context.Background(), `SELECT r.state,
+(SELECT count(*) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.phase='normal'),
+(SELECT count(*) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.phase='normal' AND c.state='rejected'),
+(SELECT count(*) FROM model_call_ledger l JOIN conversation_route_model_calls c ON c.actor_id=l.owner_id AND c.source=l.source AND c.call_id=l.call_id
+ WHERE c.message_id=r.message_id AND c.phase='normal' AND c.state='rejected' AND l.state='rejected')
+FROM conversation_message_routes r WHERE r.message_id=$1`, claim.Message.ID).Scan(&routeState, &calls, &rejected, &ledgerRejected); err != nil ||
+			routeState != "failed" || calls != 3 || rejected != 3 || ledgerRejected != 3 || client.calls.Load() != 3 {
+			t.Fatalf("rate-limit cap state=%q calls=%d rejected=%d ledger=%d provider=%d err=%v", routeState, calls, rejected, ledgerRejected, client.calls.Load(), err)
+		}
+	})
 }
 
 func (c *routeModelClientTest) Complete(ctx context.Context, request app.ModelRequest) (app.ModelResponse, error) {

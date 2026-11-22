@@ -307,6 +307,7 @@
   background: var(--brand);
   border-radius: var(--radius-bubble) var(--radius-bubble) 8px var(--radius-bubble);
 }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-expand { color: #fff; }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-assistant {
   width: fit-content;
   max-width: 100%;

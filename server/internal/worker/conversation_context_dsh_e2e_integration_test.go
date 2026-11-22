@@ -180,11 +180,13 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 			}
 		}
 	}()
+	lastClientMessageIDs := make(map[string]string, len(conversationIDs))
 	acceptAndRoute := func(conversationID, content, clientID string) string {
 		t.Helper()
 		message, replayed, err := tasks.AcceptConversationMessage(ctx, principal, conversationID, app.AcceptConversationMessageCommand{
 			ServiceInstanceID: serviceInstanceID, ClientMessageID: clientID, IdempotencyKey: clientID,
-			Content: content, ModelID: model.ID, Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
+			Content: content, PreviousClientMessageID: lastClientMessageIDs[conversationID], ModelID: model.ID,
+			Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
 		})
 		if err != nil || replayed {
 			t.Fatalf("accept conversation message %q: replayed=%t err=%v", clientID, replayed, err)
@@ -198,6 +200,7 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 			Scan(&state, &failureReason); err != nil || state != "routed" {
 			t.Fatalf("message %q route state=%q failure_reason=%q err=%v", clientID, state, failureReason, err)
 		}
+		lastClientMessageIDs[conversationID] = clientID
 		return message.ID
 	}
 	for chatIndex, conversationID := range conversationIDs {
@@ -262,11 +265,13 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, oldMainFe
 		clientID := fmt.Sprintf("context-history-%04d", index)
 		message, replayed, err := tasks.AcceptConversationMessage(ctx, principal, mainConversation.ConversationID,
 			app.AcceptConversationMessageCommand{ServiceInstanceID: serviceInstanceID, ClientMessageID: clientID, IdempotencyKey: clientID,
-				Content: content, ModelID: model.ID, Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000}})
+				Content: content, PreviousClientMessageID: lastClientMessageIDs[mainConversation.ConversationID], ModelID: model.ID,
+				Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000}})
 		if err != nil || replayed {
 			t.Fatalf("seed authorized long-history message %d: replayed=%t err=%v", index, replayed, err)
 		}
 		bulkMessageIDs = append(bulkMessageIDs, message.ID)
+		lastClientMessageIDs[mainConversation.ConversationID] = clientID
 	}
 	if _, err := pool.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied',
 created_at=clock_timestamp()-interval '1 hour' WHERE id=ANY($1::text[])`, bulkMessageIDs); err != nil {
@@ -274,6 +279,20 @@ created_at=clock_timestamp()-interval '1 hour' WHERE id=ANY($1::text[])`, bulkMe
 	}
 	if _, err := pool.Exec(ctx, `UPDATE conversation_message_routes SET state='routed' WHERE message_id=ANY($1::text[])`, bulkMessageIDs); err != nil {
 		t.Fatal(err)
+	}
+	var linkedHistoryRows int
+	if err := pool.QueryRow(ctx, `WITH RECURSIVE chain(client_message_id,previous_id,depth) AS (
+ SELECT client_message_id,previous_client_message_id,1 FROM conversation_message_routes
+ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$2 AND conversation_id=$3
+  AND client_message_id='context-history-0839'
+ UNION ALL
+ SELECT r.client_message_id,r.previous_client_message_id,c.depth+1 FROM chain c
+ JOIN conversation_message_routes r ON r.service_instance_id=$1::uuid AND r.owner_id=$2 AND r.actor_id=$2
+  AND r.conversation_id=$3 AND r.client_message_id=c.previous_id WHERE c.depth<900
+)
+SELECT count(*) FILTER (WHERE client_message_id LIKE 'context-history-%') FROM chain`,
+		serviceInstanceID, owner.ID, mainConversation.ConversationID).Scan(&linkedHistoryRows); err != nil || linkedHistoryRows != 840 {
+		t.Fatalf("linked predecessor history rows=%d, want 840; err=%v", linkedHistoryRows, err)
 	}
 	var historyBytes int64
 	if err := pool.QueryRow(ctx, `SELECT sum(octet_length(content)) FROM conversation_messages WHERE conversation_id=$1`, mainConversation.ConversationID).Scan(&historyBytes); err != nil {
@@ -285,7 +304,8 @@ created_at=clock_timestamp()-interval '1 hour' WHERE id=ANY($1::text[])`, bulkMe
 	newMainCoordinator := makeCoordinator(mainConversation.ConversationID, "context-e2e-runtime-main-restarted")
 	routeModels.coordinators[mainConversation.ConversationID] = newMainCoordinator
 	mainManager = newMainCoordinator.runtimes.(cloudDSHCoordinatorAccountRuntimeManager).manager
-	acceptAndRoute(mainConversation.ConversationID, "E2E_ROUTE_TO_TASK: find the earlier archive marker and report its value", "context-final-task-main")
+	historyTaskMessageID := acceptAndRoute(mainConversation.ConversationID,
+		conversationContextE2EHistoryTaskContent, "context-final-task-main")
 	for index, conversationID := range conversationIDs[1:] {
 		acceptAndRoute(conversationID, fmt.Sprintf("E2E_SIDE_CHAT_CONTINUES side=%d", index+1), fmt.Sprintf("context-side-after-restart-%d", index+1))
 	}
@@ -329,6 +349,10 @@ WHERE owner_id=$1 AND state='committed' AND octet_length(response_ciphertext)>0`
 	if err != nil || !found || claimed.ConversationID != mainConversation.ConversationID || claimed.ConversationContext == nil ||
 		claimed.ConversationContext.Summary == nil || claimed.ConversationContext.Summary.Version != 4 {
 		t.Fatalf("new Task did not receive the latest fixed summary: found=%t task=%+v err=%v", found, claimed, err)
+	}
+	var routedTaskID string
+	if err := pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, historyTaskMessageID).Scan(&routedTaskID); err != nil || routedTaskID != claimed.ID {
+		t.Fatalf("authorized-history follow-up message was not linked to the claimed Task: linked=%q task=%q err=%v", routedTaskID, claimed.ID, err)
 	}
 	blocks, err := workspacefs.Open(filepath.Join(t.TempDir(), "workspace-blocks"))
 	if err != nil {
@@ -380,10 +404,19 @@ WHERE owner_id=$1 AND state='committed' AND octet_length(response_ciphertext)>0`
 	if err != nil {
 		t.Fatal(err)
 	}
+	checkpointObserver := &conversationContextE2ECheckpointObserver{
+		CloudDSHCheckpoints: checkpointsForTask, targetSeen: make(chan struct{}),
+	}
 	const historyCallID = "context-e2e-history-agent-search"
 	const historyAnswer = "此前消息中的归档标记是 ORCHID-ARCHIVE-SENTINEL-8472。"
+	const historySteeredAnswer = historyAnswer + " 已按补充要求加入简短引言。"
 	modelCalls := 0
-	taskModels := &cloudDSHTestModels{complete: func(_ context.Context, call app.ModelCall) (app.ModelResponse, error) {
+	blockedModelCallStarted := make(chan struct{})
+	resumeBlockedModelCall := make(chan struct{})
+	var resumeBlockedModelCallOnce sync.Once
+	resumeBlockedModel := func() { resumeBlockedModelCallOnce.Do(func() { close(resumeBlockedModelCall) }) }
+	defer resumeBlockedModel()
+	taskModels := &cloudDSHTestModels{complete: func(callCtx context.Context, call app.ModelCall) (app.ModelResponse, error) {
 		modelCalls++
 		var request struct {
 			Tools []struct {
@@ -409,11 +442,14 @@ WHERE owner_id=$1 AND state='committed' AND octet_length(response_ciphertext)>0`
 			if !searchOffered || strings.Contains(string(call.RawRequest), "ORCHID-ARCHIVE-SENTINEL-8472") {
 				return app.ModelResponse{}, errors.New("long-history request lacked the authorized search tool or contained the old fact already")
 			}
+			close(blockedModelCallStarted)
+			select {
+			case <-resumeBlockedModelCall:
+			case <-callCtx.Done():
+				return app.ModelResponse{}, callCtx.Err()
+			}
 			return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: historyCallID, Name: "morde_current_conversation_history_search",
 				Arguments: `{"query":"ORCHID-ARCHIVE-SENTINEL-8472","limit":1}`}}, StopReason: "tool_calls", Usage: usage}, nil
-		}
-		if modelCalls != 2 {
-			return app.ModelResponse{}, fmt.Errorf("unexpected long-history DSH model call %d", modelCalls)
 		}
 		resultSeen := false
 		for _, message := range request.Messages {
@@ -424,27 +460,123 @@ WHERE owner_id=$1 AND state='committed' AND octet_length(response_ciphertext)>0`
 				resultSeen = resultSeen || strings.Contains(part.Text, "ORCHID-ARCHIVE-SENTINEL-8472")
 			}
 		}
-		if !resultSeen {
-			return app.ModelResponse{}, errors.New("original history search result was not returned to the DSH model")
+		if modelCalls == 2 {
+			supersededResponseSeen := false
+			for _, message := range request.Messages {
+				if message.Role != "assistant" {
+					continue
+				}
+				for _, part := range message.Content {
+					supersededResponseSeen = supersededResponseSeen || strings.Contains(part.Text, "A new task input arrived during this model call.")
+				}
+			}
+			if !supersededResponseSeen || resultSeen || !strings.Contains(string(call.RawRequest), conversationContextE2EHistorySteerContent) {
+				return app.ModelResponse{}, errors.New("DSH did not discard the superseded model response before resuming with the supplement")
+			}
+			return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: historyCallID, Name: "morde_current_conversation_history_search",
+				Arguments: `{"query":"ORCHID-ARCHIVE-SENTINEL-8472","limit":1}`}}, StopReason: "tool_calls", Usage: usage}, nil
 		}
-		return app.ModelResponse{Text: historyAnswer, StopReason: "stop", Usage: usage}, nil
+		if modelCalls != 3 {
+			return app.ModelResponse{}, fmt.Errorf("unexpected long-history DSH model call %d", modelCalls)
+		}
+		if !resultSeen || !strings.Contains(string(call.RawRequest), conversationContextE2EHistorySteerContent) {
+			return app.ModelResponse{}, errors.New("DSH model request omitted the authorized history result or running-task supplement")
+		}
+		return app.ModelResponse{Text: historySteeredAnswer, StopReason: "stop", Usage: usage}, nil
 	}}
 	taskExecutor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
 		SupervisorID: "context-e2e-runtime-main-restarted", SummarySealer: sealer, AccountRuntimes: mainManager,
-		Instances: instances, Checkpoints: checkpointsForTask, Models: taskModels,
+		Instances: instances, Checkpoints: checkpointObserver, Models: taskModels,
 		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, Tools: toolBroker, Completion: toolBroker,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := taskExecutor.ExecuteTask(ctx, claimed); err != nil {
-		t.Fatalf("execute long-history Task through DSH: %v", err)
+	taskCtx, cancelTask := context.WithCancel(ctx)
+	taskDone := make(chan error, 1)
+	taskDonePending := true
+	defer func() {
+		resumeBlockedModel()
+		cancelTask()
+		if taskDonePending {
+			select {
+			case <-taskDone:
+			case <-time.After(15 * time.Second):
+				t.Error("long-history Task did not stop after the test ended")
+			}
+		}
+	}()
+	go func() { taskDone <- taskExecutor.ExecuteTask(taskCtx, claimed) }()
+	select {
+	case <-blockedModelCallStarted:
+	case err := <-taskDone:
+		taskDonePending = false
+		t.Fatalf("long-history Task exited before its first model call: %v", err)
+	case <-ctx.Done():
+		t.Fatalf("long-history Task did not start its first model call: %v", ctx.Err())
 	}
-	if modelCalls != 2 {
-		t.Fatalf("long-history model calls=%d; want two model turns", modelCalls)
+	var taskStateBeforeSteer string
+	if err := pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id=$1`, claimed.ID).Scan(&taskStateBeforeSteer); err != nil ||
+		taskStateBeforeSteer != string(task.StatusRunning) {
+		t.Fatalf("long-history Task was not running during the blocked model call: status=%q err=%v", taskStateBeforeSteer, err)
+	}
+	steerClientMessageID := "context-history-task-steer"
+	steerMessage, replayed, err := tasks.AcceptConversationMessage(ctx, principal, mainConversation.ConversationID,
+		app.AcceptConversationMessageCommand{ServiceInstanceID: serviceInstanceID, ClientMessageID: steerClientMessageID,
+			IdempotencyKey: steerClientMessageID, Content: conversationContextE2EHistorySteerContent,
+			PreviousClientMessageID: lastClientMessageIDs[mainConversation.ConversationID], ReferenceTaskID: claimed.ID,
+			ModelID: model.ID, Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000}})
+	if err != nil || replayed {
+		t.Fatalf("accept running-task supplement: replayed=%t err=%v", replayed, err)
+	}
+	checkpointObserver.mu.Lock()
+	checkpointObserver.targetID = steerMessage.ID
+	checkpointObserver.mu.Unlock()
+	modelClient.mu.Lock()
+	modelClient.steerTaskID = claimed.ID
+	modelClient.mu.Unlock()
+	lastClientMessageIDs[mainConversation.ConversationID] = steerClientMessageID
+	if found, err := routeWorker.RunOnce(ctx); err != nil || !found {
+		t.Fatalf("route running-task supplement: found=%t err=%v", found, err)
+	}
+	modelClient.mu.Lock()
+	steerCalls := modelClient.steerCalls
+	modelClient.mu.Unlock()
+	var linkedTaskID, deliveryStatus, deliveryMode, routeState, taskState, routeFailure string
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(message.task_id,''),message.delivery_status,message.delivery_mode,route.state,COALESCE(task.status,''),route.failure_reason
+FROM conversation_messages message JOIN conversation_message_routes route ON route.message_id=message.id
+LEFT JOIN tasks task ON task.id=message.task_id WHERE message.id=$1`, steerMessage.ID).
+		Scan(&linkedTaskID, &deliveryStatus, &deliveryMode, &routeState, &taskState, &routeFailure); err != nil ||
+		linkedTaskID != claimed.ID || deliveryStatus != "pending" || deliveryMode != string(app.AgentMessageDeliverySteer) ||
+		routeState != "routed" || taskState != string(task.StatusRunning) || steerCalls == 0 {
+		t.Fatalf("running-task supplement route: classifier_calls=%d task=%q delivery=%q mode=%q route=%q task_state=%q failure=%q err=%v",
+			steerCalls, linkedTaskID, deliveryStatus, deliveryMode, routeState, taskState, routeFailure, err)
+	}
+	select {
+	case <-checkpointObserver.targetSeen:
+	case <-time.After(5 * time.Second):
+		t.Fatal("running-task supplement was not discovered by the DSH delivery poller")
+	}
+	time.Sleep(100 * time.Millisecond)
+	resumeBlockedModel()
+	var taskErr error
+	select {
+	case taskErr = <-taskDone:
+	case <-time.After(30 * time.Second):
+		t.Fatal("long-history Task did not finish after the model call resumed")
+	}
+	taskDonePending = false
+	if taskErr != nil {
+		t.Fatalf("execute long-history Task through DSH: %v", taskErr)
+	}
+	if err := pool.QueryRow(ctx, `SELECT delivery_status FROM conversation_messages WHERE id=$1`, steerMessage.ID).Scan(&deliveryStatus); err != nil || deliveryStatus != "applied" {
+		t.Fatalf("DSH did not checkpoint the running-task supplement; delivery status=%q err=%v", deliveryStatus, err)
+	}
+	if modelCalls != 3 {
+		t.Fatalf("long-history model calls=%d; want three model turns including stale-call recovery", modelCalls)
 	}
 	details, err := tasks.Get(ctx, principal, claimed.ID)
-	if err != nil || details.Task.Status != task.StatusCompleted || details.Task.Result != historyAnswer {
+	if err != nil || details.Task.Status != task.StatusCompleted || details.Task.Result != historySteeredAnswer {
 		t.Fatalf("long-history DSH result was not completed: status=%q result=%q err=%v",
 			details.Task.Status, details.Task.Result, err)
 	}
@@ -529,14 +661,11 @@ WHERE owner_id=$1 AND state='committed' AND octet_length(response_ciphertext)>0`
 			modelClient.mu.Lock()
 			routeCalls := modelClient.routeCalls
 			modelClient.mu.Unlock()
-			routeModels.mu.Lock()
-			classifyErrors := append([]string(nil), routeModels.classifyErrors...)
-			routeModels.mu.Unlock()
 			concurrentRouteBarrier.mu.Lock()
 			barrierArrived := concurrentRouteBarrier.arrived
 			concurrentRouteBarrier.mu.Unlock()
-			t.Fatalf("concurrent DSH messages routed before timeout: %d/%d, model calls=%d, barrier=%d, states=%v, classify errors=%v",
-				routed, len(concurrentMessageIDs), routeCalls, barrierArrived, routeStates, classifyErrors)
+			t.Fatalf("concurrent DSH messages routed before timeout: %d/%d, model calls=%d, barrier=%d, states=%v",
+				routed, len(concurrentMessageIDs), routeCalls, barrierArrived, routeStates)
 		case <-routeTicker.C:
 		}
 	}
@@ -552,11 +681,16 @@ WHERE owner_id=$1 AND state='committed' AND octet_length(response_ciphertext)>0`
 	}
 }
 
+const conversationContextE2EHistoryTaskContent = "E2E_ROUTE_TO_TASK: find the earlier archive marker and report its value"
+const conversationContextE2EHistorySteerContent = "E2E_STEER_SUPPLEMENT: include a brief introduction"
+
 type conversationContextE2EModelClient struct {
 	mu           sync.Mutex
 	summaryCalls int
 	routeCalls   int
 	routeBarrier *conversationContextE2ERouteBarrier
+	steerTaskID  string
+	steerCalls   int
 }
 
 type conversationContextE2ERouteBarrier struct {
@@ -586,6 +720,25 @@ func (c *conversationContextE2EModelClient) Complete(ctx context.Context, reques
 	if err := ctx.Err(); err != nil {
 		return app.ModelResponse{}, err
 	}
+	var currentMessage string
+	for _, input := range request.Input {
+		candidates := append([]string{input.Text}, make([]string, 0, len(input.Parts))...)
+		for _, part := range input.Parts {
+			candidates = append(candidates, part.Text)
+		}
+		for _, candidate := range candidates {
+			var routeInput struct {
+				Message string `json:"message"`
+			}
+			if json.Unmarshal([]byte(candidate), &routeInput) == nil && routeInput.Message != "" {
+				currentMessage = routeInput.Message
+				break
+			}
+		}
+		if currentMessage != "" {
+			break
+		}
+	}
 	text := request.Instructions
 	for _, input := range request.Input {
 		text += "\n" + input.Text
@@ -601,11 +754,15 @@ func (c *conversationContextE2EModelClient) Complete(ctx context.Context, reques
 		response = "持续会话摘要：保留已确认资料、决策与约束，后续继续从当前消息推进。"
 	} else {
 		c.routeCalls++
-		if strings.Contains(text, "DSH_CONCURRENT_ROUTE_") {
+		if strings.Contains(currentMessage, "DSH_CONCURRENT_ROUTE_") {
 			routeBarrier = c.routeBarrier
 		}
-		if strings.Contains(text, "E2E_ROUTE_TO_TASK") {
+		if currentMessage == conversationContextE2EHistoryTaskContent {
 			response = `{"action":"new","task_id":"","question":"","reply":"","dependency_task_ids":[]}`
+		}
+		if currentMessage == conversationContextE2EHistorySteerContent && c.steerTaskID != "" {
+			c.steerCalls++
+			response = fmt.Sprintf(`{"action":"steer","task_id":%q}`, c.steerTaskID)
 		}
 	}
 	c.mu.Unlock()
@@ -622,13 +779,37 @@ func (*conversationContextE2EModelClient) Check(context.Context, app.ModelEndpoi
 }
 
 type conversationContextE2ERouteModels struct {
-	mu             sync.Mutex
-	gateway        *app.ModelGatewayService
-	coordinators   map[string]*CloudDSHConversationCoordinator
-	classifyErrors []string
+	gateway      *app.ModelGatewayService
+	coordinators map[string]*CloudDSHConversationCoordinator
 }
 
 type conversationContextE2ETaskStore struct{ *storepostgres.Store }
+
+type conversationContextE2ECheckpointObserver struct {
+	CloudDSHCheckpoints
+	mu         sync.Mutex
+	targetID   string
+	targetSeen chan struct{}
+	once       sync.Once
+}
+
+func (o *conversationContextE2ECheckpointObserver) PendingMessages(ctx context.Context,
+	fence app.AgentCheckpointFence) ([]app.AgentConversationMessage, error) {
+	messages, err := o.CloudDSHCheckpoints.PendingMessages(ctx, fence)
+	if err != nil {
+		return messages, err
+	}
+	o.mu.Lock()
+	targetID := o.targetID
+	o.mu.Unlock()
+	for _, message := range messages {
+		if message.ID == targetID && targetID != "" {
+			o.once.Do(func() { close(o.targetSeen) })
+			break
+		}
+	}
+	return messages, nil
+}
 
 func (conversationContextE2ETaskStore) LoadDeferredTaskTarget(context.Context, task.Task) (app.DeferredTaskTarget, bool, error) {
 	return app.DeferredTaskTarget{}, false, nil
@@ -645,13 +826,7 @@ func (m *conversationContextE2ERouteModels) ResolveConversationRouteContextWindo
 
 func (m *conversationContextE2ERouteModels) ClassifyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim,
 	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
-	decision, err := m.coordinators[claim.Message.ConversationID].ClassifyConversationRoute(ctx, claim, value)
-	if err != nil {
-		m.mu.Lock()
-		m.classifyErrors = append(m.classifyErrors, claim.Message.ClientMessageID+": "+err.Error())
-		m.mu.Unlock()
-	}
-	return decision, err
+	return m.coordinators[claim.Message.ConversationID].ClassifyConversationRoute(ctx, claim, value)
 }
 
 func (m *conversationContextE2ERouteModels) ResolveConversationSummaryModel(ctx context.Context,

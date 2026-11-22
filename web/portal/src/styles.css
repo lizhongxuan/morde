@@ -983,7 +983,6 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-jump-latest { flex: 0 0 auto; min-height: 36px; padding: 0 28px 6px; display: flex; justify-content: flex-end; }
 .assistant-jump-latest .button { border-radius: 18px; box-shadow: 0 3px 14px rgb(20 40 65 / 18%); }
 .task-panel-toggle { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 7px; }
-.task-pending-count { min-width: 19px; height: 19px; padding: 0 5px; display: inline-grid; place-items: center; border-radius: 10px; color: #fff; background: #d94841; font-size: 10px; line-height: 1; }
 .assistant-task-panel { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; border-left: 1px solid var(--line); background: #fff; }
 .task-panel-heading { min-height: 48px; padding: 8px 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border-bottom: 1px solid #edf0f4; }
 .task-panel-heading h2 { margin: 0 0 2px; font-size: 13px; }
@@ -1065,7 +1064,6 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .assistant-mark { background-color: #fff; }
 .assistant-page .task-panel-toggle { gap: 6px; min-height: 30px; padding: 5px 9px; border-color: #e9ecf3; border-radius: 8px; color: #68778d; font-size: 11px; }
 .task-panel-toggle .morde-icon { width: 15px; height: 15px; }
-.task-pending-count { min-width: 18px; height: 18px; border-radius: 6px; background: #fff3df; color: #a87520; font-size: 10px; }
 .assistant-page .conversation-view { min-height: 0; padding: 21px 28px 42px; scroll-padding-bottom: 42px; }
 .assistant-page .message-list { width: min(100%, 770px); max-width: none; gap: 12px; }
 .conversation-time-divider { justify-self: center; margin-bottom: 6px; color: #9ba6b5; font-size: 11px; }
@@ -1337,6 +1335,60 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .task-panel-detail .task-activity-artifacts li { gap: 3px; }
 .assistant-page .task-panel-detail .task-activity-artifacts li strong { font-size: 13px; }
 .assistant-page .task-panel-detail .task-activity-artifacts li small { color: #7f8da2; font-size: 12px; overflow-wrap: anywhere; }
+.assistant-page .task-panel-cards { min-width: 0; display: grid; gap: 10px; }
+.assistant-page .task-panel-load-more { width: 100%; min-height: 46px; border: 1px solid #c8dcff; border-radius: 12px; color: #0969e6; background: #fff; font: inherit; font-weight: 650; cursor: pointer; }
+.assistant-page .task-panel-load-more:hover { background: #f4f8ff; }
+.assistant-page .task-activity-card { border-color: #d9e6f9; border-radius: 14px; }
+.assistant-page .task-activity-card-button { min-height: 90px; padding: 13px 14px; grid-template-columns: 44px minmax(0, 1fr) auto; align-items: center; gap: 12px; }
+.assistant-page .task-activity-state-icon { position: relative; width: 42px; height: 42px; display: grid; place-items: center; border: 1px solid #d8e3f1; border-radius: 50%; color: #8294ad; background: #edf3fb; }
+.assistant-page .task-activity-state-icon svg { width: 23px; height: 23px; }
+.assistant-page .task-activity-state-icon.is-running { border: 2px solid #d6e7ff; color: #1269e8; background: #f1f7ff; }
+.assistant-page .task-activity-state-orbit { position: absolute; inset: 2px; border: 2px solid transparent; border-top-color: #2478ee; border-left-color: #2478ee; border-radius: 50%; animation: task-activity-orbit 1.15s linear infinite; }
+.assistant-page .task-activity-card-copy { min-width: 0; display: grid; gap: 3px; }
+.assistant-page .task-activity-card-copy strong { display: -webkit-box; overflow: hidden; color: #29384f; font-size: 14px; font-weight: 650; line-height: 1.4; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.assistant-page .task-activity-card-copy small { display: -webkit-box; overflow: hidden; color: #63758f; font-size: 12px; line-height: 1.4; overflow-wrap: anywhere; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.assistant-page .task-activity-card-copy time { color: #95a3b7; font-size: 11px; }
+.assistant-page .task-dynamics-status { max-width: none !important; padding: 5px 9px; border-radius: 999px; text-align: center !important; font-size: 12px !important; }
+.assistant-page .task-dynamics-status.is-running { color: #0969e6; background: #e9f2ff; }
+.assistant-page .task-dynamics-status.is-stopped { color: #657892; background: #eef2f7; }
+.assistant-page .task-panel-detail { gap: 14px; }
+.assistant-page .task-panel-detail { overflow-y: auto; overscroll-behavior: contain; }
+.assistant-page .task-panel-list:not(.task-panel-detail) { overflow-y: auto; overscroll-behavior: contain; }
+.assistant-page .task-panel-detail .task-activity-heading { align-items: center; }
+.assistant-page .task-detail-work { min-width: 0; display: grid; gap: 8px; }
+.assistant-page .task-detail-work-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding-bottom: 10px; border-bottom: 1px solid #dce7f5; }
+.assistant-page .task-detail-work-heading h3 { margin: 0; color: #344762; font-size: 14px; }
+.assistant-page .task-detail-work-heading span { color: #8798af; font-size: 11px; }
+.assistant-page .task-agent-group { min-width: 0; padding: 6px 0 0; border-top: 0; }
+.assistant-page .task-agent-group > h4 { min-height: 26px; margin: 0 0 3px; display: flex; align-items: center; gap: 9px; color: #526783; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+.assistant-page .task-agent-group > h4 span { height: 1px; flex: 1; background: #dce7f5; }
+.assistant-page .task-work-item { min-height: 46px; padding: 7px 0; grid-template-columns: 13px minmax(0, 1fr) auto auto; align-items: center; gap: 9px; border-radius: 7px; }
+.assistant-page .task-work-item:hover { background: #f3f7fd; }
+.assistant-page .task-work-copy { min-width: 0; display: grid; gap: 3px; }
+.assistant-page .task-work-copy strong { color: #334763; font-size: 13px; font-weight: 650; line-height: 1.4; overflow-wrap: anywhere; }
+.assistant-page .task-work-copy small { color: #7b8ba2; font-size: 11px; line-height: 1.4; overflow-wrap: anywhere; }
+.assistant-page .task-work-status { color: #8b9ab0; font-size: 10px; white-space: nowrap; }
+.assistant-page .task-work-arrow { color: #91a2ba; font-size: 20px; font-weight: 400; line-height: 1; }
+.assistant-page .task-step-icon { width: 12px; height: 12px; border: 2px solid #b9c7d9; border-radius: 50%; background: #fff; }
+.assistant-page .task-step-icon.status-succeeded { border-color: #31ad79; background: #31ad79; box-shadow: 0 0 0 3px #e5f6ee; }
+.assistant-page .task-step-icon.status-running { border-color: #438df3; box-shadow: 0 0 0 3px #e8f1ff; animation: task-step-pulse 1.25s ease-in-out infinite; }
+.assistant-page .task-step-icon.status-failed { border-color: #cf635b; background: #cf635b; }
+.assistant-page .task-step-icon.status-queued,
+.assistant-page .task-step-icon.status-waiting_user,
+.assistant-page .task-step-icon.status-unknown { border-color: #9baec5; }
+.assistant-page .task-work-empty { margin: 6px 0; }
+.assistant-page .task-work-step-detail { min-width: 0; }
+.assistant-page .task-work-step-detail .task-step-detail { margin-top: 0; padding: 12px; border: 1px solid #dbe7f7; border-radius: 12px; background: #f5f8fd; }
+.assistant-page .task-work-step-detail .task-step-detail p { margin: 4px 0; color: #526783; }
+.assistant-page .task-work-step-detail .task-step-detail p strong { margin-right: 8px; color: #8293aa; font-weight: 550; }
+.assistant-page .task-work-step-detail .task-step-detail p:has(strong) { padding-bottom: 5px; border-bottom: 1px solid #e5edf7; }
+.assistant-page .task-work-step-detail .task-step-detail p:last-child { border: 0; }
+@keyframes task-activity-orbit { to { transform: rotate(360deg); } }
+@keyframes task-step-pulse { 50% { box-shadow: 0 0 0 5px #e8f1ff; } }
+@media (prefers-reduced-motion: reduce) {
+  .assistant-page .task-activity-state-orbit,
+  .assistant-page .task-step-icon.status-running { animation: none; }
+}
 .assistant-page .task-detail-work > summary,
 .assistant-page .task-detail-diagnostics > summary { color: #536780; font-size: 13px; font-weight: 650; cursor: pointer; }
 .assistant-page .task-detail-work h3 { margin: 0 0 10px; color: #60728b; font-size: 13px; }

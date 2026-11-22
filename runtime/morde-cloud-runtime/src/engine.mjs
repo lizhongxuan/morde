@@ -15,7 +15,7 @@ import { estimateMessage } from '@deepseek-ai/dsh-token-meter/estimate'
 import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { apply as nativeToolExecutorApply, inject as nativeToolExecutorInject, name as nativeToolExecutorName } from '@deepseek-ai/dsh-tool-executor-native'
-import { hermesCompactionBudget, originalToolResultsForRange, selectHermesCompactionRange } from './hermes-compaction-window.mjs'
+import { hermesCompactionBudget, hermesCompactionMadeProgress, originalToolResultsForRange, selectHermesCompactionRange } from './hermes-compaction-window.mjs'
 
 const MAX_CHECKPOINT_PAYLOAD_BYTES = 1024 * 1024
 const MAX_RESTORE_BYTES = 8 * 1024 * 1024
@@ -805,6 +805,7 @@ class DurableSession {
     this.stepRetrySource = undefined
     this.stepRetryDispatched = false
     this.recoveryHasInbox = false
+    this.messageDeliveryVersion = 0
     this.messageDeliveryCheckpoints = new Set()
     this.firstCheckpoint = deferred()
     void this.firstCheckpoint.promise.catch(() => {})
@@ -1217,6 +1218,7 @@ export async function runAgent(ipc, frame) {
       measurement = ctx.tokenMeter.measure(agent.session, header)
       const attempts = this.config.compactionRetries + 1
       let result = null
+      const coveredSeqs = new Set()
       for (let attempt = 0; attempt < attempts; attempt++) {
         const range = selectHermesCompactionRange(agent.session, measurement, {
           contextWindow, outputTokens, pinTask: childOwners.has(agent.session.id),
@@ -1232,8 +1234,12 @@ export async function runAgent(ipc, frame) {
         } finally {
           this.summarySources.delete(agent.session)
         }
+        const nextMeasurement = ctx.tokenMeter.measure(agent.session, header)
+        if (!hermesCompactionMadeProgress(measurement.totalTokens, nextMeasurement.totalTokens,
+          result?.shadowedSeqs, coveredSeqs)) throw new Error('context compaction made no progress')
+        for (const seq of result.shadowedSeqs ?? []) coveredSeqs.add(seq)
+        measurement = nextMeasurement
         if (force) return result
-        measurement = ctx.tokenMeter.measure(agent.session, header)
         if (measurement.totalTokens < thresholdTokens) return result
       }
       throw new Error(`context remains above the Hermes compaction threshold (${measurement.totalTokens} >= ${thresholdTokens})`)
@@ -1247,6 +1253,13 @@ export async function runAgent(ipc, frame) {
       const originals = this.summarySources.get(agent.session)
       const restored = input.messages.map(message => message.role === 'tool' && originals?.has(message.toolCallId)
         ? originals.get(message.toolCallId) : message)
+      const sourceTokens = restored.reduce((total, message) => total + conservativeMessageTokens(message), 0)
+      const assertSummaryProgress = text => {
+        if (!hermesCompactionMadeProgress(sourceTokens,
+          conservativeMessageTokens(compactionMessage(text)), [], new Set())) {
+          throw new LlmError('conversation summary did not reduce its source window', 'COMPACTION_NO_PROGRESS')
+        }
+      }
       const generate = async (sourceMessages, prompt) => {
         const assembler = new BlockAssembler()
         for await (const chunk of ctx.llm.stream({ provider: 'morde', model: frame.model,
@@ -1270,7 +1283,9 @@ export async function runAgent(ipc, frame) {
           ...(assembler.usage === undefined ? {} : { usage: assembler.usage }) }
       }
       try {
-        return await generate(restored, COMPACTION_SUMMARY_PROMPT)
+        const summary = await generate(restored, COMPACTION_SUMMARY_PROMPT)
+        assertSummaryProgress(summary.summary.map(block => block.text).join(''))
+        return summary
       } catch (error) {
         if (error?.code !== CONTEXT_WINDOW_EXCEEDED_CODE || !originals?.size) throw error
         const degraded = await generate(input.messages,
@@ -1279,6 +1294,7 @@ export async function runAgent(ipc, frame) {
         if (Buffer.byteLength(text, 'utf8') > MAX_COMPACTION_SUMMARY_BYTES) {
           throw new LlmError('degraded conversation summary exceeds its output limit', 'RESULT_TOO_LARGE')
         }
+        assertSummaryProgress(text)
         return { ...degraded, summary: [{ type: 'text', text }] }
       }
     }
@@ -1601,7 +1617,9 @@ export async function runAgent(ipc, frame) {
       await sessionDurable.waitForMessageDeliveryCheckpoints(options.signal)
       if (sessionDurable.agentState?.toolFailure) throw new Error('tool result is unavailable')
       if (sessionDurable.through <= sessionDurable.lastModelThrough) throw new Error('model request has no new durable prefix')
-      sessionDurable.lastModelThrough = sessionDurable.through
+      const requestThrough = sessionDurable.through
+      const deliveryVersion = sessionDurable.messageDeliveryVersion
+      sessionDurable.lastModelThrough = requestThrough
       const request = {
         provider: options.provider,
         model: options.model,
@@ -1613,15 +1631,27 @@ export async function runAgent(ipc, frame) {
         ? taskValidationReviewModelCallID(sessionDurable.identity.owner_id, sessionDurable.identity.task_id,
           sessionDurable.identity.task_revision, sessionDurable.identity.result_event_sequence,
           sessionDurable.identity.result_sha256, sessionDurable.identity.claim_generation,
-          sessionDurable.identity.session_id, sessionDurable.through)
+          sessionDurable.identity.session_id, requestThrough)
         : sessionDurable.identity.context_role === 'coordinator'
         ? sessionDurable.identity.purpose === 'compaction'
           ? coordinatorCompactionModelCallID(sessionDurable.identity.conversation_id, sessionDurable.identity.operation_id,
-            sessionDurable.identity.session_id, sessionDurable.through)
+            sessionDurable.identity.session_id, requestThrough)
           : coordinatorModelCallID(sessionDurable.identity.conversation_id, sessionDurable.identity.message_id,
-            sessionDurable.identity.session_id, sessionDurable.through)
-        : modelCallID(sessionDurable.identity.task_id, sessionDurable.identity.session_id, sessionDurable.through)
-      yield* ipc.streamModel(sessionDurable.identity, id, sessionDurable.through, request, options.signal)
+            sessionDurable.identity.session_id, requestThrough)
+        : modelCallID(sessionDurable.identity.task_id, sessionDurable.identity.session_id, requestThrough)
+      const chunks = []
+      for await (const chunk of ipc.streamModel(sessionDurable.identity, id, requestThrough, request, options.signal)) chunks.push(chunk)
+      if (deliveryVersion !== sessionDurable.messageDeliveryVersion) {
+        const text = 'A new task input arrived during this model call. Re-evaluate the current task before taking action.'
+        yield { type: 'block-start', index: 0, blockType: 'text' }
+        yield { type: 'text-delta', index: 0, text }
+        yield { type: 'block-end', index: 0, block: { type: 'text', text } }
+        const usage = chunks.find(chunk => chunk.type === 'usage')
+        if (usage) yield usage
+        yield { type: 'finish', reason: { kind: 'stop' } }
+        return
+      }
+      yield* chunks
     }
   }
   ctx.llm.registerAdapter(['morde'], new WorkerModel())
@@ -1708,6 +1738,7 @@ export async function runAgent(ipc, frame) {
       }
       for (const message of [...agent.inbox.nextTurn, ...agent.inbox.nextStep]) check(message)
       if (!found) {
+        durable.messageDeliveryVersion++
         const message = freezeMessage({
           id: MessageId(message_id), role: 'user', content: deliveredMessageBlocks(content, attachmentIDs),
           source: { kind: 'user', morde_delivery_mode: mode },

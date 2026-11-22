@@ -1241,11 +1241,14 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					}
 					return cloudDSHModelResultErrorFor(result.err)
 				}
-				if pending.stream.hasVisibleText() {
-					pending.state.lastStream = pending.stream
-				}
 				if !validCloudDSHModelResponse(result.response, pending.state.definitions) {
 					return cloudDSHModelResultErrorFor(nil)
+				}
+				if pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through {
+					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
+						StopReason: "stop", Usage: result.response.Usage, ProviderReportedModel: result.response.ProviderReportedModel}
+				} else if pending.stream.hasVisibleText() {
+					pending.state.lastStream = pending.stream
 				}
 				if protectsMemory && memoryValidator.ValidatePersonalMemoryProof(ctx, value, memoryProof, pending.memoryVersions) != nil {
 					return errCloudDSHPersonalMemoryChanged

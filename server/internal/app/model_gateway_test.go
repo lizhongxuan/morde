@@ -588,6 +588,56 @@ func TestCoordinatorGatewayPreservesTextOnlyClassificationAndSettledOutput(t *te
 	}
 }
 
+func TestCoordinatorGatewaySettlesKnownIncompleteOutputForBoundedRepair(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		response ModelResponse
+		wantText string
+	}{
+		{name: "truncated but parseable JSON", response: ModelResponse{
+			Text:       `{"action":"reply","task_id":"","question":"","reply":"OK"}`,
+			StopReason: "length", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3},
+		}, wantText: `{"action":"reply","task_id":"","question":"","reply":"OK"}`},
+		{name: "empty response", response: ModelResponse{
+			StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3},
+		}, wantText: "INVALID_MODEL_OUTPUT"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			claim, value := routeGatewayFixture()
+			route, err := ConversationRouteModelRequest(value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			frame := dshModelRequest{Provider: "morde", Model: value.ModelID, MaxTokens: &route.MaxOutputTokens,
+				Messages: []dshModelMessage{
+					{Role: "system", Content: []dshModelBlock{{Type: "text", Text: strings.TrimSpace(mordeSoulFile) + "\n\n" + route.Instructions}}},
+					{Role: "user", Content: []dshModelBlock{{Type: "text", Text: route.Input[0].Text}}},
+				}, Tools: []dshModelTool{}}
+			raw, err := json.Marshal(frame)
+			if err != nil {
+				t.Fatal(err)
+			}
+			store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+			client := &modelGatewayClientTest{response: test.response}
+			service, err := NewModelGatewayService(store, &modelGatewayResolverTest{personal: true}, client)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response, err := service.CompleteConversationCoordinatorModel(context.Background(), claim, value, "coord_session_12345678", 0, raw)
+			if err != nil || response.Text != test.wantText || response.StopReason != "invalid_response" ||
+				store.unknown || store.decision == nil || !store.decision.InvalidOutput || !store.usage.Known || client.calls != 1 {
+				t.Fatalf("known incomplete output was not durably classified for repair: response=%+v decision=%+v unknown=%t usage=%+v calls=%d err=%v",
+					response, store.decision, store.unknown, store.usage, client.calls, err)
+			}
+			replayed, err := service.CompleteConversationCoordinatorModel(context.Background(), claim, value, "coord_session_12345678", 0, raw)
+			if err != nil || replayed.Text != response.Text || replayed.StopReason != "invalid_response" || client.calls != 1 {
+				t.Fatalf("settled incomplete output was not replayed without dispatch: response=%+v replay=%+v calls=%d err=%v",
+					response, replayed, client.calls, err)
+			}
+		})
+	}
+}
+
 func TestTaskModelRequestReportsOversizeBeforeReservation(t *testing.T) {
 	store := &modelGatewayStoreTest{}
 	client := &modelGatewayClientTest{}

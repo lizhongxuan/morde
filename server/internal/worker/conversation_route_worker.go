@@ -199,6 +199,15 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		classifyContext.HistoryIncomplete = true
 	}
 	classifyContext.ModelID = modelID
+	if claim.Input.ResultReviewID == "" {
+		if repairStatus, ok := w.options.Actions.(app.ConversationRouteRepairStatus); ok {
+			repair, statusErr := repairStatus.IsConversationRouteRepairAttempt(routeCtx, claim)
+			if statusErr != nil {
+				return true, w.failRoute(ctx, claim, "routing_context_unavailable", statusErr)
+			}
+			classifyContext.Repair = repair
+		}
+	}
 	copyConversationRouteCandidates(&classifyContext)
 	if err := fitConversationRouteContext(&classifyContext, contextWindow); err != nil {
 		return true, w.failRoute(ctx, claim, "message_too_long", err)
@@ -237,10 +246,41 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 				}
 				return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
 			}
+			if claim.Input.ResultReviewID == "" {
+				if delay, confirmed := conversationRouteRateLimitDelay(claim, err); confirmed {
+					if recovery, ok := w.options.Actions.(app.ConversationRouteRateLimitRecovery); ok {
+						recoveryCtx := ctx
+						var cancelRecovery context.CancelFunc
+						if ctx.Err() != nil {
+							delay = 0
+							recoveryCtx, cancelRecovery = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+							defer cancelRecovery()
+						}
+						handled, recoveryErr := recovery.HandleConversationRouteRateLimit(recoveryCtx, claim, delay)
+						if recoveryErr != nil {
+							return true, errors.Join(err, recoveryErr)
+						}
+						if handled {
+							return true, nil
+						}
+					}
+				}
+			}
 			return true, w.failRoute(ctx, claim, "model_unavailable", err)
 		}
 	}
 	if decision.InvalidOutput {
+		if claim.Input.ResultReviewID == "" {
+			if recovery, ok := w.options.Actions.(app.ConversationRouteInvalidOutputRecovery); ok {
+				requeued, recoveryErr := recovery.RequeueConversationRouteAfterInvalidOutput(ctx, claim)
+				if recoveryErr != nil {
+					return true, recoveryErr
+				}
+				if requeued {
+					return true, nil
+				}
+			}
+		}
 		return true, w.failRoute(ctx, claim, "routing_action_unavailable", errors.New("route model output is invalid"))
 	}
 	decision = safeConversationRouteDecision(classifyContext, decision)
@@ -279,6 +319,22 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	}
 	w.observeRouteDecision(claim, decision, "applied")
 	return true, nil
+}
+
+func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error) (time.Duration, bool) {
+	var routeErr *domain.Error
+	if !errors.As(err, &routeErr) || routeErr.Code != domain.CodeRateLimited ||
+		routeErr.Details["reason"] != string(app.ModelErrorRateLimited) || routeErr.Details["stage"] != "provider_status" {
+		return 0, false
+	}
+	if routeErr.RetryAfter > 0 {
+		if routeErr.RetryAfter > 2*time.Minute {
+			return 0, true
+		}
+		return ((routeErr.RetryAfter + time.Second - 1) / time.Second) * time.Second, true
+	}
+	shift := min(max(claim.RouteAttempt-1, int64(0)), int64(2))
+	return time.Second << shift, true
 }
 
 func fitConversationRouteContext(value *app.ConversationRouteContext, contextWindow int) error {
