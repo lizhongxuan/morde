@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 
@@ -279,6 +280,63 @@ WHERE batch.message_id=$7 FOR SHARE OF batch,message`, claim.ServiceInstanceID, 
 	return err
 }
 
+func conversationTaskResultValidationStateInTx(ctx context.Context, tx pgx.Tx, ownerID string, source app.ConversationTaskResultSource) (app.TaskValidationState, error) {
+	pending := app.TaskValidationPending
+	digest := sha256.Sum256([]byte(source.Content))
+	var state app.TaskValidationState
+	err := tx.QueryRow(ctx, `SELECT review.validation_state
+FROM task_validation_reviews review
+JOIN tasks task ON task.id=review.task_id AND task.owner_id=review.owner_id
+JOIN task_events event ON event.task_id=review.task_id AND event.sequence=review.result_event_sequence
+WHERE review.task_id=$1 AND review.owner_id=$2 AND review.task_revision=$3
+	  AND review.result_event_sequence=$4 AND review.result_sha256=$5
+  AND review.state='reviewed' AND task.status='completed'
+  AND task.current_revision=review.task_revision AND task.desired_revision=review.task_revision
+  AND task.result=$6 AND sha256(convert_to(task.result,'UTF8'))=review.result_sha256
+  AND event.task_revision=review.task_revision AND event.event_type='task.result'
+  AND event.result_content_sha256=review.result_sha256
+	FOR SHARE OF review`, source.TaskID, ownerID, source.TaskRevision, source.EventSequence, digest[:], source.Content).Scan(&state)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pending, nil
+	}
+	if err != nil {
+		return pending, fmt.Errorf("read current Task validation verdict for result receipt: %w", err)
+	}
+	if !app.ValidTaskValidationState(state) {
+		return pending, nil
+	}
+	return state, nil
+}
+
+func conversationTaskResultReceipt(reply string, sources []app.ConversationTaskResultSource, states []app.TaskValidationState) string {
+	const header = "结果摘要（主助手整理，不代表独立验收）：\n"
+	var footer strings.Builder
+	footer.WriteString("\n\nTask 执行状态：completed\n服务端验收状态（当前修订）：")
+	for index, source := range sources {
+		state := app.TaskValidationPending
+		if index < len(states) && app.ValidTaskValidationState(states[index]) {
+			state = states[index]
+		}
+		fmt.Fprintf(&footer, "\n- %s r%d：%s", source.TaskID, source.TaskRevision, state)
+	}
+	suffix := footer.String()
+	available := app.MaxConversationRouteReplyRunes - utf8.RuneCountInString(header+suffix)
+	if available < 1 {
+		return strings.TrimSpace(suffix)
+	}
+	summary := strings.TrimSpace(reply)
+	runes := []rune(summary)
+	if len(runes) > available {
+		if available > 1 {
+			runes = append(runes[:available-1], '…')
+		} else {
+			runes = runes[:available]
+		}
+		summary = string(runes)
+	}
+	return header + summary + suffix
+}
+
 func publishConversationResultReviewInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, reply string) error {
 	if claim.Input.ResultReviewID == "" || !app.ValidConversationRouteReply(reply) {
 		return domain.InvalidArgument("result_review", "task result review reply is invalid")
@@ -333,6 +391,18 @@ WHERE message_id=$1 AND state='processing'`, replyMessageID); err != nil {
 		}
 		return finishConversationRoute(ctx, tx, claim, "routed", "", "", true)
 	}
+	validationStates := make([]app.TaskValidationState, 0, len(review.Sources))
+	for _, source := range review.Sources {
+		state, err := conversationTaskResultValidationStateInTx(ctx, tx, claim.Message.OwnerID, source)
+		if err != nil {
+			return err
+		}
+		validationStates = append(validationStates, state)
+	}
+	receipt := conversationTaskResultReceipt(reply, review.Sources, validationStates)
+	if !app.ValidConversationRouteReply(receipt) {
+		return domain.InvalidArgument("result_review", "task result review receipt is invalid")
+	}
 	for _, source := range review.Sources {
 		var interruptedMessageID string
 		err := tx.QueryRow(ctx, `UPDATE conversation_messages message SET output_status='interrupted'
@@ -357,7 +427,7 @@ WHERE task_id=$1 AND status='streaming' AND content<>''`, source.TaskID); err !=
 		}
 	}
 	message := conversation.Message{ID: replyMessageID, OwnerID: claim.Message.OwnerID, ActorID: claim.Message.ActorID,
-		ConversationID: claim.Message.ConversationID, Role: conversation.RoleAssistant, Content: strings.TrimSpace(reply),
+		ConversationID: claim.Message.ConversationID, Role: conversation.RoleAssistant, Content: receipt,
 		SourceKind: "conversation", DeliveryStatus: conversation.DeliveryApplied}
 	if err := insertMessage(ctx, tx, message); err != nil {
 		return err
