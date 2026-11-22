@@ -73,6 +73,14 @@ WHERE task_id=$1 AND session_id=$2`, value.ID, lease.Fence.AgentSessionID); err 
 		Scan(&messageID, &stepID, &state); err != nil || state != "active" {
 		t.Fatalf("persisted stall notice = (%q,%q), err=%v", state, stepID, err)
 	}
+	var noticeRevisionMatches, stepRevisionIsNull bool
+	if err := f.store.pool.QueryRow(ctx, `SELECT n.task_revision=$2,s.task_revision IS NULL
+FROM task_agent_stall_notices n JOIN task_steps s ON s.task_id=n.task_id AND s.id=n.step_id
+WHERE n.task_id=$1 AND n.message_id=$3`, value.ID, revision, messageID).
+		Scan(&noticeRevisionMatches, &stepRevisionIsNull); err != nil || !noticeRevisionMatches || !stepRevisionIsNull {
+		t.Fatalf("stall notice revision ownership = notice_matches:%t step_revision_null:%t err:%v",
+			noticeRevisionMatches, stepRevisionIsNull, err)
+	}
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1 AND payload->>'step_id'=$2`, value.ID, stepID).Scan(&notices); err != nil || notices != 1 {
 		t.Fatalf("repeat stale check duplicated the active event: count=%d err=%v", notices, err)
 	}

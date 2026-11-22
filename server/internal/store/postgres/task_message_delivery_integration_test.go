@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -165,8 +166,10 @@ func TestPostgresPendingConversationMessagesBlockTaskCompletion(t *testing.T) {
 		Status: task.StatusCompleted, Result: "done",
 		Event: task.Event{Type: "task.result", Payload: []byte(`{"result":"done"}`)},
 	})
-	if domain.CodeOf(err) != domain.CodeConflict {
-		t.Fatalf("completed Task accepted pending user input: %v", err)
+	var pending *app.TaskInputPendingError
+	if !errors.Is(err, app.ErrTaskInputPending) || !errors.As(err, &pending) || len(pending.PendingMessages) != 1 ||
+		pending.PendingMessages[0].ID != appended.ID || pending.PendingMessages[0].Content != appended.Content {
+		t.Fatalf("completed Task did not return the locked pending input snapshot: err=%v pending=%+v", err, pending)
 	}
 	var status, deliveryStatus string
 	if err := pool.QueryRow(ctx, `SELECT t.status,m.delivery_status FROM tasks t JOIN conversation_messages m ON m.task_id=t.id

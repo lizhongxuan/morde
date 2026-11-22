@@ -183,7 +183,7 @@ WHERE id=$1 AND owner_id=$2 AND initiator_id=$3`, request.Task.TaskID, request.T
 (owner_id,source,call_id,task_id,task_owner_id,initiator_id,project_id,personal_model,agent_instance_id,agent_generation,
  agent_session_id,agent_root_session_id,lease_owner,lease_version,authorization_version,through_sequence,engine_version,
  profile_version,model_id,provider_endpoint,provider_model,provider_reported_model,connection_version,request_digest,response_ciphertext,response_digest)
-VALUES ($1,'task',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25)`,
+VALUES ($1,'task',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,NULLIF($21,''),$22,$23,$24,$25)`,
 		request.OwnerID, request.CallID, request.Task.TaskID, request.Task.OwnerID, request.OwnerID, request.ProjectID, request.PersonalModel,
 		request.Task.AgentInstanceID, request.Task.AgentGeneration, request.Task.AgentSessionID, request.Task.AgentRootSessionID,
 		request.Task.LeaseOwner, request.Task.LeaseVersion, request.Task.AuthorizationVersion, request.Task.ThroughSequence,
