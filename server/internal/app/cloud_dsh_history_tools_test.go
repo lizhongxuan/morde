@@ -37,6 +37,24 @@ type cloudDSHHistoryTaskStore struct {
 	suppressionBatchSizes []int
 }
 
+type cloudDSHProjectHistoryReplayStore struct {
+	*cloudDSHHistoryTaskStore
+	allowed map[string]struct{}
+	calls   [][]string
+}
+
+func (s *cloudDSHProjectHistoryReplayStore) FilterTaskProjectConversationHistory(_ context.Context, _ task.Task,
+	messageIDs []string) (map[string]struct{}, error) {
+	s.calls = append(s.calls, append([]string(nil), messageIDs...))
+	allowed := make(map[string]struct{}, len(messageIDs))
+	for _, messageID := range messageIDs {
+		if _, ok := s.allowed[messageID]; ok {
+			allowed[messageID] = struct{}{}
+		}
+	}
+	return allowed, nil
+}
+
 func (s *cloudDSHHistoryTaskStore) ListConversations(ctx context.Context, ownerID string, _ []string, page PageRequest) (ConversationPage, error) {
 	if err := ctx.Err(); err != nil {
 		return ConversationPage{}, err
@@ -250,6 +268,16 @@ func TestCloudDSHCurrentConversationHistorySearchUsesOnlyFixedCurrentConversatio
 		t.Fatalf("cross-Task current history cursor error=%v, want invalid argument", err)
 	}
 	baseStore.details.Task.Budget.ToolCalls = baseStore.details.Task.Usage.ToolCalls
+	usageBeforeReplay := baseStore.details.Task.Usage.ToolCalls
+	eventsBeforeReplay := len(baseStore.events)
+	store.suppressed[output.Matches[0].MessageID] = struct{}{}
+	if _, err := broker.execute(context.Background(), claimed, call, true, &result.Output); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("checkpointed current history replay returned a deleted message: %v", err)
+	}
+	if baseStore.details.Task.Usage.ToolCalls != usageBeforeReplay || len(baseStore.events) != eventsBeforeReplay {
+		t.Fatalf("rejected current history replay changed usage/events: usage=%+v events=%d", baseStore.details.Task.Usage, len(baseStore.events))
+	}
+	delete(store.suppressed, output.Matches[0].MessageID)
 	legacy := `{"matches":[],"scanned_messages":1,"partial":true}`
 	legacyCall := ModelToolCall{CallID: call.CallID, Name: call.Name, Arguments: `{"query":"cedar","limit":1}`}
 	replayed, err := broker.execute(context.Background(), claimed, legacyCall, true, &legacy)
@@ -263,6 +291,55 @@ func TestCloudDSHCurrentConversationHistorySearchUsesOnlyFixedCurrentConversatio
 		Name: cloudDSHCurrentHistorySearchToolName, Arguments: `{"query":"cedar","limit":1,"conversation_id":"c9876543"}`}, false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("caller-supplied conversation ID was not rejected: %v", err)
 	}
+}
+
+func TestCloudDSHCurrentProjectHistoryReplayRechecksMatchedSources(t *testing.T) {
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	claimed.ProjectID = "j1234567"
+	contextValue := *claimed.ConversationContext
+	contextValue.ProjectID = claimed.ProjectID
+	contextValue.Scope = "project"
+	claimed.ConversationContext = &contextValue
+	baseStore.details.Task = claimed
+	configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &cloudDSHProjectHistoryReplayStore{
+		cloudDSHHistoryTaskStore: &cloudDSHHistoryTaskStore{cloudDSHBrokerTaskStore: baseStore},
+		allowed:                  map[string]struct{}{messageID: {}},
+	}
+	broker.store = store
+	baseStore.details.Task.Budget.ToolCalls = baseStore.details.Task.Usage.ToolCalls
+	checkpoint, err := json.Marshal(cloudDSHCurrentHistorySearchResult{
+		Matches: []cloudDSHCurrentHistoryMatch{{MessageID: messageID, Role: conversation.RoleUser,
+			Content: "authorized project excerpt", CreatedAt: time.Now().UTC()}},
+		ScannedMessages: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "call_project_history_replay", Name: cloudDSHCurrentHistorySearchToolName,
+		Arguments: `{"query":"excerpt","message_id":null,"limit":1,"cursor":null}`}
+	result, err := broker.execute(context.Background(), claimed, call, true, cloudDSHTestStringPointer(string(checkpoint)))
+	if err != nil || result.Status != AgentToolSucceeded || result.Output != string(checkpoint) {
+		t.Fatalf("authorized project history replay=%+v err=%v", result, err)
+	}
+	if len(store.calls) != 2 || len(store.calls[0]) != 0 || len(store.calls[1]) != 1 || store.calls[1][0] != messageID {
+		t.Fatalf("project replay did not recheck exact match IDs: calls=%v", store.calls)
+	}
+	delete(store.allowed, messageID)
+	if _, err := broker.execute(context.Background(), claimed, call, true, cloudDSHTestStringPointer(string(checkpoint))); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("project replay returned a source that is no longer authorized: %v", err)
+	}
+	if baseStore.details.Task.Usage.ToolCalls != 0 || len(baseStore.events) != 0 {
+		t.Fatalf("project replay changed usage/events: usage=%+v events=%d", baseStore.details.Task.Usage, len(baseStore.events))
+	}
+}
+
+func cloudDSHTestStringPointer(value string) *string {
+	return &value
 }
 
 func TestCloudDSHCurrentConversationHistorySearchReturnsMiddleOfLongMessage(t *testing.T) {
@@ -652,6 +729,16 @@ func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope
 	recovered, err := broker.execute(context.Background(), claimed, call, true, &result.Output)
 	if err != nil || recovered.Output != result.Output || baseStore.details.Task.Usage.ToolCalls != 2 || len(baseStore.events) != 2 {
 		t.Fatalf("checkpointed history search recovery=%+v err=%v usage=%+v events=%d", recovered, err, baseStore.details.Task.Usage, len(baseStore.events))
+	}
+	store.suppressed = map[string]struct{}{historyMessageID: {}}
+	if _, err := broker.execute(context.Background(), claimed, summaryCall, true, &summary.Output); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("checkpointed summary replay returned a deleted source: %v", err)
+	}
+	if _, err := broker.execute(context.Background(), claimed, call, true, &result.Output); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("checkpointed history search replay returned a deleted source: %v", err)
+	}
+	if baseStore.details.Task.Usage.ToolCalls != 2 || len(baseStore.events) != 2 {
+		t.Fatalf("rejected checkpoint replays changed usage/events: usage=%+v events=%d", baseStore.details.Task.Usage, len(baseStore.events))
 	}
 	changedCheckpoint := "{}"
 	if _, err := broker.execute(context.Background(), claimed, call, true, &changedCheckpoint); domain.CodeOf(err) != domain.CodeInvalidState {
