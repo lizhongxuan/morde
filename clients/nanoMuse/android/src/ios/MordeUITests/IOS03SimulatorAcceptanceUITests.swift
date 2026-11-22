@@ -1791,10 +1791,10 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let taskList = app.scrollViews["morde.tasks.list"]
         XCTAssertTrue(taskList.exists)
         let permissionError = app.descendants(matching: .any)["morde.tasks.loadError"]
-        for _ in 0..<15 where !permissionError.exists {
-            taskList.swipeUp()
-            _ = permissionError.waitForExistence(timeout: 2)
-        }
+        let moreTasks = app.buttons["morde.tasks.more"]
+        XCTAssertTrue(waitForHittable(moreTasks, timeout: 10),
+                      "The first page should expose its server pagination control.")
+        moreTasks.tap()
         XCTAssertTrue(permissionError.waitForExistence(timeout: 15),
                       "Loading the next page after the initial rows should surface the revoked permission.")
         XCTAssertFalse(task.exists,
@@ -2778,9 +2778,15 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         signInLocalFixtureAccount(app, name: "account-a")
         app.buttons["morde.nav.tab.approvals"].tap()
 
-        let accountAEventChain = app.buttons["mif.approval.timeline.q0000001"]
+        let accountAEventChain = app.buttons.matching(NSPredicate(
+            format: "identifier == %@ AND label BEGINSWITH %@",
+            "mif.approval.card.q0000001:r0000001:1", "详情:"
+        )).firstMatch
         XCTAssertTrue(accountAEventChain.waitForExistence(timeout: 15))
         accountAEventChain.tap()
+        let eventChain = app.buttons["mif.approval.timeline.q0000001"]
+        XCTAssertTrue(eventChain.waitForExistence(timeout: 10))
+        eventChain.tap()
         let taskTitle = app.staticTexts["morde.eventChain.taskTitle"]
         XCTAssertTrue(taskTitle.waitForExistence(timeout: 15))
         XCTAssertEqual(taskTitle.label, "account-a-private-task-detail")
@@ -2792,9 +2798,14 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         signInLocalFixtureAccount(app, name: "account-b")
         app.buttons["morde.nav.tab.approvals"].tap()
 
-        let accountBEventChain = app.buttons["mif.approval.timeline.q0000001"]
+        let accountBEventChain = app.buttons.matching(NSPredicate(
+            format: "identifier == %@ AND label BEGINSWITH %@",
+            "mif.approval.card.q0000001:r0000001:1", "详情:"
+        )).firstMatch
         XCTAssertTrue(accountBEventChain.waitForExistence(timeout: 15))
         accountBEventChain.tap()
+        XCTAssertTrue(eventChain.waitForExistence(timeout: 10))
+        eventChain.tap()
         XCTAssertTrue(taskTitle.waitForExistence(timeout: 15))
         XCTAssertEqual(taskTitle.label, "account-b-private-task-detail")
         let accountBEvent = app.staticTexts["account-b-private-event"]
@@ -3296,7 +3307,12 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         app.buttons["morde.nav.tab.tasks"].tap()
 
         XCTAssertTrue(app.buttons["morde.tasks.row.q0000001"].waitForExistence(timeout: 15))
-        XCTAssertTrue(app.descendants(matching: .any)["morde.tasks.loadingMore"].waitForExistence(timeout: 10),
+        let moreTasks = app.buttons["morde.tasks.more"]
+        XCTAssertTrue(moreTasks.waitForExistence(timeout: 10))
+        moreTasks.tap()
+        let loadingPage = XCTNSPredicateExpectation(predicate: NSPredicate(format: "isEnabled == false"),
+                                                    object: moreTasks)
+        XCTAssertEqual(XCTWaiter.wait(for: [loadingPage], timeout: 5), .completed,
                       "Account A's second page should be in flight before switching accounts.")
 
         app.buttons["morde.nav.menu"].tap()
@@ -3330,14 +3346,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                       "The native sign-out confirmation should be visible.")
         confirmSignOut.tap()
 
-        let username = app.textFields["morde.auth.username"]
-        XCTAssertTrue(username.waitForExistence(timeout: 10))
-        username.tap()
-        username.typeText("account-b")
-        let password = app.secureTextFields["morde.auth.password"]
-        password.tap()
-        password.typeText("local-password")
-        app.buttons["morde.auth.submit"].tap()
+        signInLocalFixtureAccount(app, name: "account-b")
         XCTAssertTrue(app.buttons["morde.nav.menu"].waitForExistence(timeout: 20))
         app.buttons["morde.nav.tab.tasks"].tap()
         XCTAssertTrue(app.buttons["morde.tasks.row.q0000002"].waitForExistence(timeout: 15))
@@ -5549,6 +5558,13 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
             format: "identifier == %@ OR identifier == %@", "morde.nav.menu", "morde.nav.tab.chat")).firstMatch
         XCTAssertTrue(authenticatedRoute.waitForExistence(timeout: 20),
                       "Sign-in should return to an authenticated Morde route.")
+        let menu = app.buttons["morde.nav.menu"]
+        for _ in 0..<3 where !menu.waitForExistence(timeout: 1) {
+            let back = app.buttons["chevron.left"]
+            guard back.waitForExistence(timeout: 3) else { break }
+            back.tap()
+        }
+        XCTAssertTrue(menu.waitForExistence(timeout: 10), "Sign-in should return to the main Morde route.")
     }
 
     private func waitForHittable(_ element: XCUIElement, timeout: TimeInterval = 5) -> Bool {
