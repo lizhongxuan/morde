@@ -451,6 +451,41 @@ func TestAgentChildCreateAndCancelFinalGatesRespectSteerOrder(t *testing.T) {
 		}
 	})
 
+	t.Run("existing child replay keeps stored baseline after root advances", func(t *testing.T) {
+		fixture := createS03RunningAgentTask(t, newRouteActionsTestFixture(t), "s03-child-replay-advanced-root", false)
+		saveS03RootCheckpoint(t, fixture, 0, 2, nil)
+		service, command := newChildService(t, fixture)
+		created, replayed, err := service.Create(context.Background(), command)
+		if err != nil || replayed || created.RootCheckpointThroughSequence != 2 {
+			t.Fatalf("initial child create = %+v replayed=%t err=%v; want stored baseline 2", created, replayed, err)
+		}
+
+		message := acceptS03TaskSteer(t, fixture.route.store, fixture.task.OwnerID, fixture.task.ConversationID,
+			fixture.task.ID, "s03-child-replay-advanced-root-message", "Continue with updated instructions.")
+		saveS03RootCheckpoint(t, fixture, 3, 4, &message)
+		if currentRootBaseline := rootAgentCheckpointBaselineForTest(t, fixture.route.store, fixture.task.ID,
+			fixture.task.OwnerID, fixture.fence.AgentSessionID); currentRootBaseline != 4 {
+			t.Fatalf("current root baseline = %d; want 4", currentRootBaseline)
+		}
+
+		recovered, replayed, err := service.Create(context.Background(), command)
+		if err != nil || !replayed || recovered.SessionID != created.SessionID || recovered.RootCheckpointThroughSequence != 2 {
+			t.Fatalf("replay at stored baseline 2 after root advanced to 4 = %+v replayed=%t err=%v",
+				recovered, replayed, err)
+		}
+
+		changedBaseline := command
+		changedBaseline.RootCheckpointThroughSequence = 4
+		if _, _, err := service.Create(context.Background(), changedBaseline); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+			t.Fatalf("child replay accepted changed baseline: %v", err)
+		}
+		changedArguments := command
+		changedArguments.Arguments = []byte(`{"objective":"different objective"}`)
+		if _, _, err := service.Create(context.Background(), changedArguments); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+			t.Fatalf("child replay accepted changed arguments: %v", err)
+		}
+	})
+
 	t.Run("steer blocks new child cancellation", func(t *testing.T) {
 		fixture := createS03RunningAgentTask(t, newRouteActionsTestFixture(t), "s03-cancel-steer-first", false)
 		service, create := newChildService(t, fixture)

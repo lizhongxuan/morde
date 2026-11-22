@@ -52,9 +52,6 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR UPDATE`, fence.TaskID, fe
 		} else if err != nil {
 			return fmt.Errorf("lock parent Agent Session: %w", err)
 		}
-		if request.RootCheckpointThroughSequence != parentRootThroughSequence {
-			return domain.NewError(domain.CodeConflict, "child root checkpoint baseline changed before spawn")
-		}
 		if request.ParentSessionID == fence.AgentSessionID {
 			if parentOfParent != "" {
 				return domain.NewError(domain.CodeUnauthenticated, "root Agent Session is unavailable")
@@ -112,6 +109,9 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 AND s.spawn_key=
 			return nil
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read existing child Agent Session: %w", err)
+		}
+		if request.RootCheckpointThroughSequence != parentRootThroughSequence {
+			return domain.NewError(domain.CodeConflict, "child root checkpoint baseline changed before spawn")
 		}
 		operationKey := app.AgentOperationKey(request.SpawnKey)
 		storedMessages, hasStoredSupersession, err := readTaskAgentToolSupersession(ctx, tx,
