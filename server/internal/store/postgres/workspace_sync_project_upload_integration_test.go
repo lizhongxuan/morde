@@ -173,6 +173,72 @@ func TestWorkspaceProjectUploadUsesInstallationCredentialWithoutSyncthingBinding
 	}
 }
 
+func TestWorkspaceProjectUploadPreservesRemotelyModifiedFileWhenLocalSnapshotDeletes(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "project-upload-delete-conflict")
+	hostValue := workspaceSyncHostForFolderTest(t, ctx, store, owner.ID, workspaceValue.ID)
+	portal := workspaceSyncPortalPrincipal(t, store, owner.ID)
+	folderService, err := app.NewWorkspaceSyncDeviceService(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := folderService.CreateFolder(ctx, portal, hostValue.ID, "demo", "project-upload-delete-conflict-folder")
+	if err != nil {
+		t.Fatal(err)
+	}
+	installationID := createTestClientInstallation(t, store.pool, owner.ID, nil)
+	syncToken := clientTestToken(t, owner.ID, installationID, identity.KindDevice, nil)
+	if _, err := store.CreateToken(ctx, syncToken); err != nil {
+		t.Fatal(err)
+	}
+	device := identity.Principal{
+		UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindDevice, TokenID: syncToken.ID,
+		ClientInstallationID: installationID, Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+	}
+	syncService, err := app.NewWorkspaceSyncServiceWithOptions(store, workspaceTransferTestBlocks{}, workspace.MaxSyncManifestBytes, 1<<30,
+		app.WorkspaceSyncOptions{ProjectUploadEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceBindingID := "12345678-1234-4234-8234-123456789abc"
+	baseFile := workspace.File{Path: "owned.txt", Kind: workspace.FileKindRegular, SizeBytes: 0,
+		SHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", Mode: 0o644, Chunks: []workspace.Chunk{}}
+	first, err := syncService.CreateSyncSession(ctx, device, workspaceValue.ID, workspace.CreateSyncSession{
+		FolderID: folder.FolderID, SourceBindingID: sourceBindingID, Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
+		Files: []workspace.File{baseFile},
+	}, "project-upload-delete-conflict-baseline")
+	if err != nil || len(first.TransferBlocks) != 0 {
+		t.Fatalf("create project source baseline = %#v, err=%v", first, err)
+	}
+	committed, err := syncService.CommitSyncSession(ctx, device, workspaceValue.ID, first.ID, "project-upload-delete-conflict-baseline-commit")
+	if err != nil || committed.State != workspace.SyncCompleted {
+		t.Fatalf("commit project source baseline = %#v, err=%v", committed, err)
+	}
+	confirmWorkspaceProjectApplicationForTest(t, store, committed, committed.TargetRevision, "applied")
+
+	remoteFile := baseFile
+	remoteFile.Path = "project/demo/owned.txt"
+	remoteFile.Mode = 0o600
+	remoteRevision := applySyntheticProjectMutationForTest(t, store, workspaceValue.ID, remoteFile.Path, &remoteFile, nil)
+	if remoteRevision <= committed.TargetRevision {
+		t.Fatalf("remote file revision = %d; want after source baseline %d", remoteRevision, committed.TargetRevision)
+	}
+	second, err := syncService.CreateSyncSession(ctx, device, workspaceValue.ID, workspace.CreateSyncSession{
+		FolderID: folder.FolderID, SourceBindingID: sourceBindingID, Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
+		Files: []workspace.File{},
+	}, "project-upload-delete-conflict-second")
+	if err != nil || second.SourceBaselineSessionID != first.ID || len(second.Conflicts) != 1 ||
+		second.Conflicts[0].Path != remoteFile.Path || second.Conflicts[0].Reason != "delete_changed" || len(second.UploadDeletedPaths) != 0 {
+		t.Fatalf("local-delete/remote-modify plan = %#v, err=%v; want preserved conflict and no deletion", second, err)
+	}
+	manifest, err := store.GetWorkspaceManifestPage(ctx, workspaceValue.ID, remoteRevision, "project/demo", "", 100)
+	if err != nil || len(manifest.Files) != 1 || manifest.Files[0].Path != remoteFile.Path || manifest.Files[0].Mode != remoteFile.Mode {
+		t.Fatalf("remote modified file after conflicting delete plan = %#v, err=%v", manifest.Files, err)
+	}
+}
+
 func TestWorkspaceProjectSourceRebindsWithStableAgentWorkspace(t *testing.T) {
 	store, pool := newTemporaryStore(t)
 	ctx := context.Background()

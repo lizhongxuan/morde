@@ -1943,6 +1943,51 @@ test('runs an authorized dsh tool through the parent and persists its result bef
   assert.equal(mismatch.emitted.length, 0)
 })
 
+test('emits heartbeats while an IPC tool call is pending', { timeout: 30_000 }, async t => {
+  const tool = {
+    name: 'long_tool', description: 'Complete a pending test operation.',
+    parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
+  }
+  let modelCalls = 0
+  let pendingToolCall
+  let heartbeatDuringTool = false
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [tool] })
+    if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
+    if (frame.type === 'model') {
+      modelCalls++
+      if (modelCalls === 1) {
+        const chunks = [
+          { type: 'tool-call-delta', index: 0, id: 'call_long_1', name: tool.name, argumentsDelta: '{"value":"pending"}' },
+          { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+          { type: 'finish', reason: { kind: 'tool-calls' } },
+        ]
+        chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+        send(proc, { type: 'model_end', id: frame.id, ok: true })
+      } else {
+        const result = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_long_1')
+        assert.equal(result?.content[0]?.text, 'finished')
+        replyWithText(proc, frame, 'done')
+      }
+    }
+    if (frame.type === 'tool_call') pendingToolCall = frame
+    if (frame.type === 'agent_heartbeat' && pendingToolCall && frame.session_id === start.session_id &&
+        frame.phase === 'tool' && frame.activity_id === pendingToolCall.call_id) {
+      heartbeatDuringTool = true
+      send(proc, { type: 'tool_result', id: pendingToolCall.id, ...taskFence(pendingToolCall),
+        call_id: pendingToolCall.call_id, status: 'succeeded', output: 'finished' })
+      pendingToolCall = undefined
+    }
+  })
+  t.after(() => child.kill())
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(modelCalls, 2)
+  assert.equal(heartbeatDuringTool, true, 'periodic heartbeat arrives before the tool result')
+  assertMonotonicAgentObservations(frames)
+  assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
 test('replays an enqueued steer after its checkpoint acknowledgement is lost', { timeout: 15_000 }, async t => {
   const tool = {
     name: 'file_write', description: 'Write a file in the task workspace.',

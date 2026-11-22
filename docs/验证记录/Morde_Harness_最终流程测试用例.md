@@ -229,6 +229,37 @@
 
 下表状态表示整条端到端用例是否执行；下方“本地自动化证据”只证明列出的代码路径，不替代真实模型、PC/iOS 或 60 分钟耐久验收。
 
+### S00 H00 Hermes 固定提交关键文件哈希核对 2026-11-22
+
+- **来源：** 固定上游 [`NousResearch/hermes-agent@0d49d6d9d20e461155d49ba9d188687079c811af`](https://github.com/NousResearch/hermes-agent/tree/0d49d6d9d20e461155d49ba9d188687079c811af)；本地 `project/hermes-agent/` 无独立 Git 元数据。
+- **方法：** 对下列本地文件运行 `shasum -a 256`，并分别对固定 SHA 的对应 raw 文件运行 `curl -fsSL <raw-url> | shasum -a 256`。上下游哈希逐项一致；网络仅读取公开上游字节流，没有上传或保存外部文件。
+- **结果（本地 SHA-256 = 固定提交 SHA-256）：**
+
+| 文件 | SHA-256 |
+|---|---|
+| `agent/retry_utils.py` | `4c643880c012dd536dca08041f1bae93b6a58477186b5cf0b4e27ec3c640014c` |
+| `scripts/build/agent.py` | `d3e1b6a4ed10c03945457ab81b5163715ac89fec5a8f5ec7d67c3652c848665d` |
+| `agent/turn_response_check.py` | `ab7e47f2f39890955effd01330f7da8dc3ef5b9a5de13afdadf717731956c94c` |
+| `agent/turn_empty_response.py` | `c547e532fd6a82269bd88aa4a2bef8547b59995c3db14de2b2e44adfe66067d4` |
+| `gateway/run_turn_hygiene.py` | `b5e59f36c1cefa1aacf19ff272e0603aadac200417e4cf84365559145a1204c4` |
+| `tools/session_search_tool.py` | `5c16c13bdda96c45641f1c40b4459630f6802f914c12022c3b79cdc3c726aeb1` |
+| `agent/turn_context.py` | `42674dad11fbe0c202e518c11dd9ad765aa1404b42ec39fa13d9cfaaeb9ced25` |
+| `agent/context_compressor_window.py` | `8497d0b5b802a5e9a2ff5d74a0d4e52b3ba40e0ed5aa335b6263315a182af0fa` |
+| `agent/context_compressor.py` | `498871a5b8c0f3a8b53c2547fb25867f32357c62d8dbf81fdd3c0f17275f065f` |
+| `agent/turn_iteration_prep.py` | `16a8ee94f8ec974e165e91580fa737b150f5102e538c12b41afa1cb56cfccfdc` |
+| `gateway/session_busy_controls.py` | `1557b6a052a76805dae5889474277a2f9a6e099fc1e0f02a6f2d9cd9b3232b28` |
+| `gateway/turn_lease.py` | `5600965be037e2d440d547c2967e2d3ae74d0e30fc77d50e7f37250c8acae661` |
+| `agent/turn_tool_round.py` | `9cd3be661ea93acb51985c2907dafced48b6df6238060903bd9608a560c83b17` |
+| `agent/turn_liveness.py` | `1577203f3c2b8f19c42103e2f310b1e147d9eaadab14759d12cb7e4ea30b2f84` |
+| `gateway/session_stall.py` | `d21aa30df0cbf8e66dc4e08dfb5457641a1c08e65cfef623f66fd2890125007e` |
+| `agent/turn_stop_gates.py` | `ec0e46a1bb51c9529ab44447f4506a25a7724a4f9f036cda6bbd1bc907da619b` |
+| `agent/turn_final_response.py` | `7a669214584974cf0745be653b2a784dc66d0f319dcc2549da12ca0096fbfbc8` |
+| `LICENSE` | `821556e6336796450ab852d375117b48a4887e71d255794fd6318d99982a5ab6` |
+
+- **关键文件边界：** 17 个核心源文件及 LICENSE 共 18 个重点文件逐字节匹配固定提交；该抽查结果单独不能证明整个快照与上游提交完全一致，实际全树比较见下项。
+- **全树比较：** 对固定提交 GitHub recursive tree（`truncated=false`）的 blob SHA-1 与本地 Git blob SHA-1 逐路径比较：上游 27,298 个 blob，本地 27,297 个文件；27,187 个共有文件内容匹配，28 个上游文件本地缺失，83 个共有文件内容不同。27 个本地额外路径全部是 `__pycache__/*.pyc`。差异示例包括 `gateway/run_shutdown.py`、`gateway/run_startup.py`、`apps/desktop/src/app/chat/transcript-backfill.ts`、`hermes_cli/urllib_security.py`；具体为哪些文件不同不改变关键清单中 17 个源文件与 LICENSE 均匹配的结果。本次只读取上游 tree 元数据，没有下载或上传整份快照。
+- **边界：** 不能把 `project/hermes-agent/` 快照称为固定提交的完整副本。H00 仍缺真实 Provider/PC/iOS、目标云电脑、故障复现闭环及耐久验收，继续保持进行中。
+
 ### 长会话测试方案 LC 用例映射到当前 MH 范围
 
 此表仅用于把必执行的 LC-01–LC-06 对应到 MH 记录项，不是选测菜单。最终验收须逐项执行测试方案中的场景；尚未运行、环境不满足或只有局部自动化证据时，状态保持待验证/阻塞并注明原因。
@@ -403,6 +434,11 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **Git 验证：** 19 个分支 tip 对集成分支执行 `git merge-base --is-ancestor` 均成功；无冲突分支使用正常 merge，冲突按文件比较后解决，未使用 `git merge -s ours`。合并树相对起点只有 S01 交接文档一处内容差异（42 行新增、2 行删除）；随后增加管理文档，产品源码 diff 仍为空。正常 fast-forward 后执行 `git push origin main` 成功，合并提交为 `e631d4cdd9ec68e1143f93a46f5572a54702862f`；随后 `main` 与 `origin/main` 前进到 `a23d7e7572f349211992bdea69c541a31a29de5c`（`fix: 优化harness`）。当前本地和远端 `main` 均为 `a23d7e7572f349211992bdea69c541a31a29de5c`，19/19 指定分支 tip 仍是其祖先。
 - **分支与 worktree 清理：** 截图中的 19 个分支 tip 均为 `main` 祖先，目标 worktree 均已清理，19 个本地分支引用已删除。`codex/harness-s05` 有三处未提交 Portal 改动，经逐文件比较与 `main` 完全相同后随其 worktree 一并清理。临时 `codex/harness-merge-all` 与 `codex/merge-to-main` 分支/worktree 也已移除；后者只剩未完成的冲突工作区，已确认其已提交 tip 在 main 中。`git worktree prune` 清掉已不存在路径的登记。未删除无关的 `workspace-1` 和 `codex/client-login-ordering-20261105`。
 - **测试范围：** 本次分支整合没有改变产品源码，因此未机械重跑代码测试。复用上方同一产品源码快照已有的 App、路由预算、14 项 PostgreSQL、5 项 Worker/Node 及生命周期 E2E 定向结果；当时已知会话修订重启 E2E 尚未解决，后续修复与通过结果见“修订重启 E2E 根因与修复”。H06/H00 不因此标完成。对合并后的文档与 Git diff 执行 `git diff --check main` 通过，冲突标记扫描无匹配；新提交对象中的 API key/私钥常见格式扫描无匹配。
+
+### S00 合并后剩余本地分支与 worktree 清理 2026-11-23
+
+- **核验：** 当前 `main`/`origin/main` 为 `51cbe1375e02abfd780c9b9ee349d1fa85e79b99`。本地剩余 `codex/client-login-ordering-20261105`（`e5877690`）与 `workspace-1`（`fd8574dd`）均通过 `git merge-base --is-ancestor <branch> main`；`git log --oneline main..<branch>` 无输出。目标 `workspace-1` worktree `git status --short --branch` 仅显示干净分支状态。远端 `git ls-remote --heads origin` 只列 `refs/heads/main`。
+- **清理：** 执行 `git worktree remove /Users/zhongxuan_li/.thinkrail/worktrees/morde/workspace-1`、`git branch -d workspace-1` 和 `git branch -d codex/client-login-ordering-20261105`。三项成功；清理后 `git worktree list` 只列 `/Users/zhongxuan_li/Desktop/morde`，`git branch -vv` 只列 `main`，远端仍只列 `main`。主工作区内 8 个本地未提交文件未触碰、未推送。
 - **远端核对：** `git fetch origin main` 后本地 `main` 与远端提交均为 `a23d7e7572f349211992bdea69c541a31a29de5c`；`git ls-remote --heads origin` 只返回 `main`，因此截图分支没有待推送的远端引用，当前不需要再次 push。合并历史本身不代表真实 Provider、PC/iOS、云端电脑或耐久验收通过。
 
 ### S00 会话修订重启 E2E 退出诊断（2026-11-22；本机隔离 PostgreSQL）
@@ -468,11 +504,25 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **客户端静态链路核对：** `clients/desktop/harness/desktop/src/morde-main.ts` 加载本地 Portal bundle；`web/portal/src/routes/Assistant.tsx` 订阅 Task SSE，并在 Agent 工作过程中显示 Task snapshot steps。iOS `MordeApp.swift` 将 `task.step` 投影为可见 timeline row，`MIFTaskViews.swift` 渲染该时间线。独立 `clients/desktop/harness/dsh-nanomuse/src/client/TaskDetail.tsx` 使用本机 Rooms ActivityRecord，不消费云端 Task。未运行客户端测试或操作实际客户端；真实 PC/iOS 用户入口呈现该通知仍待验收。
 - **限制：** 未调用真实 Provider；45 秒是当前服务端单次请求总期限。工具/子 Agent/checkpoint 的请求级期限、真实慢工具进程、PC/iOS 提示呈现、断线恢复和 60 分钟耐久仍未验收，故 H04 继续进行中。
 
-### S00 H04 工具执行期间活动帧静态审计 2026-11-22
+### S00 H04 工具执行期间活动帧静态审计（修复前） 2026-11-22
 
 - **发现：** `cloud_dsh_session_tree.go` 的帧消费循环在 `tool_call` 分支同步调用 `Tools.Execute`，恢复调用同步执行 `Reconcile`；`readCloudDSHFrames` 虽独立读取 stdout，但写入容量为 1 的帧通道。工具调用未返回前，主循环不能消费并持久化后续 activity/heartbeat，子 Agent 的普通帧也可能占住待处理槽位。当前请求级停滞提示只覆盖 `model/started` 的 45 秒期限；工具、子 Agent 与 checkpoint 仍只有整个 Task 的 ActiveSeconds 及 Task 生命周期取消。
 - **处理：** 本轮只读审计，没有改代码或跑测试。现有副作用规则不允许把超时当作“操作未执行”，也不应在没有最新租约/活动证据时自动取消或重派。因此保留未知操作的对账路径，不加固定工具超时；后续若实现监测，应在工具等待期间继续处理经身份/代次/序号验证的 activity 帧，并让失效/超时代次进入 Reconcile，而非重复 Execute。
-- **边界：** 这是 H04 的明确本地实现与覆盖缺口。健康长时间工具可能没有及时刷新持久 heartbeat，pending 输入提示可能滞后或误判；本轮没有验证真实慢工具、子 Agent 或 PC/iOS 通知。H04 继续进行中。
+- **边界：** 以上记录的是补强前缺口；后续通过工具等待期间继续消费活动帧修复了 heartbeat 持久化阻塞。工具/子 Agent 请求级停滞语义、真实慢工具、子 Agent 与 PC/iOS 通知仍未验证，H04 继续进行中。
+
+### S00 H04 工具等待期间活动帧持久化补强 2026-11-22
+
+- **改动：** `runCloudDSH` 在 `Tools.Execute` 和恢复路径 `CloudDSHRecoveryTools.Reconcile` 等待期间，继续从 Runtime frame channel 接收帧，并复用同一 status/activity/heartbeat 校验及持久化逻辑。身份、Task revision、活动转移、当前活动与单调序号验证保持不变。其他业务帧按 FIFO 暂存；暂存达到 16 MiB 阈值后停止读取并等待工具结果，使用既有 channel/pipe 背压，结果返回后再按序消费；读取/解码/活动持久化错误也会保留给主循环处理。没有增加工具超时、自动取消或重试。
+- **验证：** `cd server && go test -race ./internal/worker -run '^TestCloudDSHExecutorPersistsHeartbeatsWhileToolExecutionIsPending$' -count=1 -v -timeout=3m` 通过（0.40 秒）；恢复路径 `go test -race ./internal/worker -run '^TestCloudDSHExecutorReconcilesEveryPinnedToolCallBeforeSettling$' -count=1 -v -timeout=3m` 通过（0.36 秒）；`go test ./internal/worker -count=1 -timeout=5m` 全量通过（57.295 秒）。两条合成 worker 回归分别阻塞普通 `Tools.Execute` 与 pinned checkpoint 的 `Reconcile`，断言至少两次 heartbeat 在释放前落库；普通路径还排入 Runtime failure 帧并验证工具结果后再按序处理。Runtime `npm test`（包含 compaction build 与全部 `test/*.test.mjs`）通过，182/182，74.823 秒；其中 `emits heartbeats while an IPC tool call is pending` 通过（15.205 秒）。`node --check runtime/morde-cloud-runtime/test/runtime.test.mjs`、`gofmt` 与 `git diff --check` 通过。
+- **范围与限制：** 服务端 worker 侧缓解了“工具调用同步等待导致 heartbeat 无法落库”的缺口；普通工具与 checkpoint 恢复对账都由合成 Runtime/假 Broker 覆盖，没有使用真实 Host 工具或故障中的远端副作用。未操作实际 `morde-pc`/iOS，未使用真实 Provider；工具/子 Agent/checkpoint 请求级期限、未知副作用安全停止、断线恢复和 60 分钟耐久仍待验收。H04 保持进行中。
+
+### S00 H04 操作对账与跨包 race 复验 2026-11-23
+
+- **恢复语义审计：** 追踪 `CloudDSHRecoveryTools`、`CloudDSHToolBroker.Reconcile`、`RuntimeToolExecutor.ReconcileOperation`、`observeScheduledField` 与 `RuntimeOperationRunner.Execute`。当前实现只在原 Runtime lease fence 的精确查询得到 `AgentToolNotFound` 时，才以相同 operation ID 重 arm；其它错误或 fence 不匹配均保留 unknown。Runtime Manager 在启动 handler 前持久记录 accepted/running；相同实例中的活跃操作查询得到既有记录，同 ID 重复提交返回原记录而不重复执行。Runtime 存储损坏/故障或服务未就绪会失败关闭，不作为 NotFound。未发现需改 app 生产逻辑的缺陷。
+- **新增回归：** `TestRuntimeToolExecutorReconcilesActiveDispatchAfterTaskLeaseReclaim` 使用进程内 Runtime Manager 和阻塞 handler：旧 dispatch 处于 running 时回收 Task lease，恢复仍按原 Runtime lease 查询并取得旧结果；handler 调用次数为 1，恢复没有 POST 第二次 dispatch。现有相邻用例继续覆盖精确原 lease 查询和仅在显式 NotFound 后同 ID retry。
+- **Account Runtime 握手复核：** 当前 Go 校验的 ready frame 需要与 Node `account-runtime.mjs` 的 producer 对照的字段一致；两端的 `runtime_start` / `runtime_ready` 字段和 `0.2.0-rc.2` engine version 匹配。旧快照 `fee63a35` 的 race 握手失败未在当前主线重现，但旧日志没有原始 stdout/stderr，不能据此证明旧失败的具体根因。
+- **验证：** `cd server && go test ./internal/app -run '^(TestRuntimeToolExecutorReconcilesActiveDispatchAfterTaskLeaseReclaim|TestRuntimeToolExecutorReturnsNotFoundOnlyAfterExactOriginalLeaseQuery|TestRuntimeToolExecutorRetriesSameIDOnlyAfterExplicitNotFound)$' -count=1` 通过（1.972 秒）；`cd server && go test -race -count=1 ./...` 全部 Go 包通过，`internal/app` 42.532 秒、`internal/worker` 65.795 秒；本轮前述工具执行/恢复 heartbeat 定向 race 用例、worker 全量与 Runtime 182/182 也通过。源码格式检查和 `git diff --check` 通过。
+- **仍待验范围：** 未操作远端测试站、真实 Host 工具进程或真实 Provider；真实 Provider 验证暂缓，因为项目会话约定要求聊天明文出现的凭据先按已暴露处理、撤销并轮换，新凭据只从本机环境变量/密钥存储读取。工具/子 Agent/checkpoint 的请求级停滞策略、PC/iOS 实际入口、60 分钟耐久及旧握手失败的原始现场仍未验证。H04、H00 保持进行中，当前工作区改动未提交/推送。
 
 ### S00 H05 来源身份 SQL 静态审计 2026-11-22
 
@@ -515,7 +565,8 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 
 - **删除来源：** `runtime/morde-sync` 的 LiveSync 只对共同基线中存在、服务端生成删除动作且当前内容仍匹配基线的路径执行删除；删除前保留恢复副本，内容变动会转为冲突。目录读取/元数据错误会使扫描失败，客户端在建立同步 session 前退出，不能用部分清单代表完整目录。
 - **项目上传：** 服务端从目标 `SourceBindingID` 对应且 Host 已确认 `applied` 的 session manifest 生成删除候选，不把合并后的 Workspace manifest 当成本机来源快照。项目上传客户端不能直接提交 `DeletedPaths`。远端独立新增不属于 PC 来源，因此不进入删除集；远端改动已同步路径时计划逻辑报冲突并过滤删除，Host 应用前还检查 pinned 当前状态、哈希及目录非空条件。现有 PostgreSQL `TestWorkspaceProjectUploadUsesInstallationCredentialWithoutSyncthingBinding` 覆盖“初次 PC 空项目、云端新增文件、再次手动空快照后云端文件保留”；`TestProjectUploadBaselineComesFromHostConfirmedSourceNotWorkspaceRevision` 验证基线来源；`TestProjectUploadConflictDoesNotApplyNonconflictingMutations` 验证冲突原子性。
-- **覆盖缺口与范围：** helper 侧已有单边删除、删除并发替换、双方修改保留、远端删除与本地编辑冲突回归；没有直接注入嵌套 `ReadDir` 失败，也没有项目上传“远端独立修改已同步文件、同时本机删除”的三方冲突集成用例。审计为静态读取，没有修改文件、运行测试、操作客户端/Host 或发送文件。生产删除链路未发现需修复缺陷，但以上两个边界及实际 PC/Host 手动同步仍待 H06。
+- **补充三方冲突回归：** 新增 `TestWorkspaceProjectUploadPreservesRemotelyModifiedFileWhenLocalSnapshotDeletes`，建立 Host 已确认的 PC 来源基线，再模拟云端独立修改已同步文件并提交本机不含该文件的下一次完整快照；断言计划保留 `delete_changed` 冲突、过滤上传删除，远端 revision 中仍保留修改后的文件。使用一次性 `postgres:16.15-bookworm`，端口仅绑定 `127.0.0.1:55433`、无持久卷，测试后移除；`CH_TEST_DATABASE_URL=<本机一次性 PostgreSQL DSN> go test ./internal/store/postgres -run '^TestWorkspaceProjectUploadPreservesRemotelyModifiedFileWhenLocalSnapshotDeletes$' -count=1 -v -timeout=3m` 通过（测试 1.14 秒，包 3.069 秒）。
+- **仍待验范围：** helper 侧已有单边删除、删除并发替换、双方修改保留、远端删除与本地编辑冲突回归；嵌套 `ReadDir` 失败尚未直接注入，且本轮未操作客户端/Host 或发送文件。实际 PC/Host 手动同步仍待 H06。
 
 ### S07 H11 真实站点子 Agent 委派探针（2026-11-22；未通过）
 

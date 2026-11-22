@@ -454,6 +454,7 @@ type cloudDSHTestTools struct {
 	admissionCalls    []app.ModelToolCall
 	admissionRecovery []bool
 	afterAdmit        func()
+	afterReconcile    func()
 	calls             []app.ModelToolCall
 	claimed           []task.Task
 	recoveryCalls     []app.ModelToolCall
@@ -644,6 +645,9 @@ func (t *cloudDSHTestTools) AdmitToolCall(_ context.Context, _ task.Task, call a
 
 func (t *cloudDSHTestTools) Reconcile(_ context.Context, _ task.Task, call app.ModelToolCall, expected *string) (app.AgentToolResult, error) {
 	t.recoveryCalls = append(t.recoveryCalls, call)
+	if t.afterReconcile != nil {
+		t.afterReconcile()
+	}
 	if expected == nil {
 		t.recoveryExpected = append(t.recoveryExpected, nil)
 	} else {
@@ -957,12 +961,19 @@ func TestCloudDSHExecutorTreatsPendingTaskInputAtCompletionAsRecoverable(t *test
 
 type cloudDSHTestActivityRecorder struct {
 	observations []app.TaskAgentActivityObservation
+	observed     chan app.TaskAgentActivityObservation
 	applied      bool
 	err          error
 }
 
 func (r *cloudDSHTestActivityRecorder) RecordTaskAgentActivity(_ context.Context, observation app.TaskAgentActivityObservation) (bool, error) {
 	r.observations = append(r.observations, observation)
+	if r.observed != nil {
+		select {
+		case r.observed <- observation:
+		default:
+		}
+	}
 	return r.applied, r.err
 }
 
@@ -1858,6 +1869,103 @@ func TestCloudDSHExecutorRunsAuthorizedToolAndReturnsDurableResultToNextModelCal
 	}
 	if !found {
 		t.Fatalf("next model request did not include the persisted tool result: %s", models.calls[1].RawRequest)
+	}
+}
+
+func TestCloudDSHExecutorPersistsHeartbeatsWhileToolExecutionIsPending(t *testing.T) {
+	executor, supervisor, _, _, _, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}, result: app.AgentToolResult{
+		Status: app.AgentToolSucceeded, Output: `{"path":"README.md","text":"from Host"}`,
+	}}
+	executeStarted, releaseExecute := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseExecute) })
+	tools.afterExecute = func() {
+		close(executeStarted)
+		<-releaseExecute
+	}
+	executor.options.Tools = tools
+	observed := make(chan app.TaskAgentActivityObservation, 32)
+	recorder := &cloudDSHTestActivityRecorder{applied: true, observed: observed}
+	executor.options.AgentActivity = recorder
+
+	script := filepath.Join(t.TempDir(), "pending-tool-heartbeat.mjs")
+	source := fmt.Sprintf(`import { createHash } from 'node:crypto'
+import { createInterface } from 'node:readline'
+const emit = frame => process.stdout.write(JSON.stringify(frame) + '\n')
+const digest = value => createHash('sha256').update(value).digest('hex')
+const identity = frame => ({ task_id: frame.task_id, owner_id: frame.owner_id, agent_id: frame.agent_id,
+  generation: frame.generation, authorization_version: frame.authorization_version, session_id: frame.session_id })
+const toolName = %q, callID = 'call_pending_1', argumentsText = %q, args = JSON.parse(argumentsText)
+emit({ type: 'ready', version: 1, engine: 'dsh', engine_version: '0.2.0-rc.2' })
+let start, timer, sequence = 0
+createInterface({ input: process.stdin }).on('line', raw => {
+  const frame = JSON.parse(raw)
+  if (frame.type === 'start') {
+    start = frame
+    const payload = JSON.stringify({ header: { id: frame.session_id }, from_seq: 0, events: [
+      { seq: 0, type: 'turn/start', data: { turn: 1 } },
+      { seq: 1, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
+        message: { role: 'assistant', content: [{ type: 'tool-call', id: callID, name: toolName, arguments: argumentsText }] } } },
+      { seq: 2, type: 'tool/call', data: { turn: 1, step: 1, callId: callID, name: toolName, arguments: argumentsText } },
+    ] })
+    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_pending', from_seq: 0, through_seq: 2,
+      payload, sha256: digest(payload) })
+  } else if (frame.type === 'checkpoint_ack') {
+    emit({ type: 'agent_activity', ...identity(start), task_revision: start.task_revision,
+      observation_sequence: ++sequence, phase: 'tool', state: 'started', activity_id: callID })
+    emit({ type: 'tool_call', id: 'tool_pending', ...identity(start), through_seq: 2, call_id: callID,
+      name: toolName, arguments: args })
+    emit({ type: 'failed', ...identity(start), code: 'queued_until_tool_result' })
+    timer = setInterval(() => emit({ type: 'agent_heartbeat', ...identity(start), task_revision: start.task_revision,
+      observation_sequence: ++sequence, phase: 'tool', activity_id: callID }), 20)
+  } else if (frame.type === 'tool_result') {
+    clearInterval(timer)
+    setImmediate(() => process.exit(0))
+  }
+})
+setInterval(() => {}, 1000)`, tool.Name, `{"workspace_id":"w1234567","path":"README.md"}`)
+	if err := os.WriteFile(script, []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cloudDSHUseTestTaskScript(t, supervisor, script)
+
+	executeDone := make(chan error, 1)
+	go func() { executeDone <- executor.ExecuteTask(context.Background(), value) }()
+	select {
+	case <-executeStarted:
+	case err := <-executeDone:
+		t.Fatalf("task ended before the tool was held open: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("tool execution did not start")
+	}
+
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	heartbeats := 0
+	for heartbeats < 2 {
+		select {
+		case observation := <-observed:
+			if observation.Kind == app.TaskAgentActivityKindHeartbeat {
+				if observation.Fence != supervisor.launch.Fence || observation.AgentSessionID != supervisor.launch.Fence.AgentSessionID ||
+					observation.TaskRevision != cloudDSHTaskRevision(value) || observation.Phase != "tool" || observation.ActivityID != "call_pending_1" {
+					t.Fatalf("tool heartbeat identity/activity = %#v", observation)
+				}
+				heartbeats++
+			}
+		case err := <-executeDone:
+			t.Fatalf("task ended before two pending-tool heartbeats were recorded: %v", err)
+		case <-deadline.C:
+			t.Fatalf("recorded %d heartbeats while tool execution remained pending", heartbeats)
+		}
+	}
+	releaseOnce.Do(func() { close(releaseExecute) })
+	if err := <-executeDone; err == nil || !strings.Contains(err.Error(), "unavailable runtime") {
+		t.Fatalf("task result after releasing tool = %v; want scripted runtime shutdown", err)
+	}
+	if len(tools.calls) != 1 || len(recorder.observations) < 3 {
+		t.Fatalf("tool calls=%d activity observations=%d; want one tool and start plus heartbeats", len(tools.calls), len(recorder.observations))
 	}
 }
 
@@ -3531,7 +3639,17 @@ func TestCloudDSHExecutorReconcilesEveryPinnedToolCallBeforeSettling(t *testing.
 	tool := cloudDSHWriteTool()
 	result := app.AgentToolResult{Status: app.AgentToolSucceeded, Output: checkpointToolOutput}
 	tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}, result: result}
+	reconcileStarted, releaseReconcile := make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(releaseReconcile) })
+	tools.afterReconcile = func() {
+		close(reconcileStarted)
+		<-releaseReconcile
+	}
 	executor.options.Tools = tools
+	observed := make(chan app.TaskAgentActivityObservation, 32)
+	recorder := &cloudDSHTestActivityRecorder{applied: true, observed: observed}
+	executor.options.AgentActivity = recorder
 
 	value.AgentInstanceID, value.AgentGeneration, value.AgentSessionID = "agent_previous", 1, "session_previous"
 	value.AgentEngineVersion, value.AgentProfileVersion = cloudDSHEngineVersion, cloudDSHProfileVersion
@@ -3563,21 +3681,31 @@ func TestCloudDSHExecutorReconcilesEveryPinnedToolCallBeforeSettling(t *testing.
 	source := `import { createInterface } from 'node:readline'
 const send = value => process.stdout.write(JSON.stringify(value) + '\n')
 send({type:'ready',version:1,engine:'dsh',engine_version:'0.2.0-rc.2'})
-let identity
+let identity, taskRevision, timer, sequence = 0
 createInterface({input:process.stdin}).on('line', line => {
   const frame = JSON.parse(line)
   if (frame.type === 'start') {
+    taskRevision = frame.task_revision
     identity = {task_id:frame.task_id,owner_id:frame.owner_id,agent_id:frame.agent_id,generation:frame.generation,
       authorization_version:frame.authorization_version,session_id:frame.session_id}
     send({type:'checkpoint_read',id:'page_1',...identity,from_seq:0})
   } else if (frame.type === 'checkpoint_page') {
+    send({type:'agent_activity',...identity,task_revision:taskRevision,observation_sequence:++sequence,
+      phase:'tool',state:'started',activity_id:'call_write_1'})
     send({type:'tool_call',id:'tool_1',...identity,through_seq:7,call_id:'call_write_1',name:'file_write',
       arguments:{workspace_id:'w1234567',path:'notes.txt',content:'saved'}})
+    timer = setInterval(() => send({type:'agent_heartbeat',...identity,task_revision:taskRevision,
+      observation_sequence:++sequence,phase:'tool',activity_id:'call_write_1'}),20)
   } else if (frame.type === 'tool_result') {
+    clearInterval(timer)
     if (frame.status !== 'succeeded' || frame.output !== '{"path":"notes.txt","bytes_written":5}') process.exit(9)
+    send({type:'agent_activity',...identity,task_revision:taskRevision,observation_sequence:++sequence,
+      phase:'tool',state:'completed',activity_id:'call_write_1'})
+    send({type:'agent_status',...identity,task_revision:taskRevision,observation_sequence:++sequence,status:'idle'})
     process.stdout.write(JSON.stringify({type:'settled',...identity,state:'completed_candidate',through_seq:7}) + '\n', () => process.exit(0))
   }
-})`
+})
+setInterval(() => {}, 1000)`
 	if err := os.WriteFile(script, []byte(source), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -3585,7 +3713,36 @@ createInterface({input:process.stdin}).on('line', line => {
 	value.Lease.Version++
 	expires := time.Now().Add(time.Minute)
 	value.Lease.ExpiresAt = &expires
-	err := executor.ExecuteTask(context.Background(), value)
+	executeDone := make(chan error, 1)
+	go func() { executeDone <- executor.ExecuteTask(context.Background(), value) }()
+	select {
+	case <-reconcileStarted:
+	case err := <-executeDone:
+		t.Fatalf("task ended before Reconcile was held open: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("tool reconciliation did not start")
+	}
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+	heartbeats := 0
+	for heartbeats < 2 {
+		select {
+		case observation := <-observed:
+			if observation.Kind == app.TaskAgentActivityKindHeartbeat {
+				if observation.Fence != supervisor.launch.Fence || observation.AgentSessionID != supervisor.launch.Fence.AgentSessionID ||
+					observation.TaskRevision != cloudDSHTaskRevision(value) || observation.Phase != "tool" || observation.ActivityID != "call_write_1" {
+					t.Fatalf("recovery tool heartbeat identity/activity = %#v", observation)
+				}
+				heartbeats++
+			}
+		case err := <-executeDone:
+			t.Fatalf("task ended before two reconciliation heartbeats were recorded: %v", err)
+		case <-deadline.C:
+			t.Fatalf("recorded %d heartbeats while Reconcile remained pending", heartbeats)
+		}
+	}
+	releaseOnce.Do(func() { close(releaseReconcile) })
+	err := <-executeDone
 	if !errors.Is(err, ErrCloudDSHCompletionPending) {
 		t.Fatalf("recovery result = %v", err)
 	}

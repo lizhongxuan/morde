@@ -1411,6 +1411,100 @@ func TestRuntimeToolExecutorReturnsNotFoundOnlyAfterExactOriginalLeaseQuery(t *t
 	}
 }
 
+func TestRuntimeToolExecutorReconcilesActiveDispatchAfterTaskLeaseReclaim(t *testing.T) {
+	handler := &blockingRuntimeToolTestHandler{started: make(chan struct{}), release: make(chan struct{})}
+	defer handler.finish()
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{runtimeAction: handler}})
+	fixture.store.details.Task.WorkspaceID = ""
+	fixture.store.details.Task.InputRevision = nil
+	fixture.store.details.Task.WorkspaceCheckpointRevision = nil
+	fixture.executor.operations.pollEvery = time.Millisecond
+	request, _ := fixture.prepared(runtimeToolBrowserOpenTab, `{"url":"https://example.test/"}`, identity.ScopeComputerOperate)
+	fixture.persistOperation(request)
+
+	session, err := fixture.executor.runtime.Connect(context.Background(), request.Task.HostID, &request.Fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.Close()
+	if err := session.SetTaskLease(context.Background(), request.Task.ID, request.Task.Lease.Version,
+		*request.Task.Lease.ExpiresAt, false); err != nil {
+		t.Fatal(err)
+	}
+	mapping, _ := runtimeToolMappingByName(request.Call.Name)
+	operation, err := fixture.executor.operations.Execute(context.Background(), session, request.Task.ID, request.OperationID,
+		request.Task.Lease.Version, mapping.capability, mapping.action, request.Arguments, "", 0, "", 0, nil)
+	if err != nil || operation.Status != runtimeclient.OperationRunning {
+		t.Fatalf("initial dispatch = %#v, %v; want running", operation, err)
+	}
+	select {
+	case <-handler.started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runtime handler did not start")
+	}
+	observed, err := fixture.executor.operations.Get(context.Background(), session, request.Task.ID, request.OperationID, request.Task.Lease.Version)
+	if err != nil || observed.Status != runtimeclient.OperationRunning || handler.calls.Load() != 1 {
+		t.Fatalf("active runtime query = %#v, %v; handler calls=%d; want running with one active dispatcher",
+			observed, err, handler.calls.Load())
+	}
+
+	newExpiry := time.Now().Add(time.Minute).UTC()
+	fixture.store.mu.Lock()
+	fixture.store.details.Task.Lease = task.Lease{Owner: "worker-2", Version: 2, ExpiresAt: &newExpiry}
+	claimed := fixture.store.details.Task
+	fixture.store.operation.Status = task.OperationUnknown
+	fixture.store.operation.LeaseVersion = claimed.Lease.Version
+	fixture.store.operations[fixture.store.operation.Key] = fixture.store.operation
+	persisted := fixture.store.operation
+	fixture.store.mu.Unlock()
+	request.Task = claimed
+
+	var dispatches atomic.Int32
+	queryObserved := make(chan struct{}, 1)
+	fixture.wrap = func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodGet && request.URL.Path == "/runtime/v1/operations/"+persisted.ID {
+				select {
+				case queryObserved <- struct{}{}:
+				default:
+				}
+			}
+			if request.Method == http.MethodPost && request.URL.Path == "/runtime/v1/operations" {
+				dispatches.Add(1)
+			}
+			next.ServeHTTP(writer, request)
+		})
+	}
+	type reconciliation struct {
+		result AgentToolResult
+		err    error
+	}
+	reconciled := make(chan reconciliation, 1)
+	go func() {
+		result, err := fixture.executor.ReconcileOperation(context.Background(), request, persisted)
+		reconciled <- reconciliation{result: result, err: err}
+	}()
+	select {
+	case <-queryObserved:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recovery did not query the original runtime operation")
+	}
+	if handler.calls.Load() != 1 || dispatches.Load() != 0 {
+		t.Fatalf("reconciliation while dispatcher is active: handler calls=%d new dispatches=%d; want 1 / 0",
+			handler.calls.Load(), dispatches.Load())
+	}
+	handler.finish()
+	select {
+	case got := <-reconciled:
+		if got.err != nil || got.result.Status != AgentToolSucceeded || handler.calls.Load() != 1 || dispatches.Load() != 0 {
+			t.Fatalf("reconciliation = %#v, %v; handler calls=%d new dispatches=%d; want stored result without redispatch",
+				got.result, got.err, handler.calls.Load(), dispatches.Load())
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reconciliation did not settle after the original dispatcher completed")
+	}
+}
+
 func TestRuntimeToolExecutorRetriesSameIDOnlyAfterExplicitNotFound(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{capability: "shell.exec", action: "run", result: `{"exit_code":0,"stdout":"ok","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`}})
 	var posts atomic.Int32
@@ -2164,6 +2258,32 @@ func (h *runtimeToolTestHandler) Execute(ctx context.Context, _ contract.Execute
 func (*runtimeToolTestHandler) Stop(context.Context, contract.Operation) (runtimecore.StopResult, error) {
 	return runtimecore.StopResult{VerifiedStopped: true}, nil
 }
+
+type blockingRuntimeToolTestHandler struct {
+	started     chan struct{}
+	release     chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+	calls       atomic.Int32
+}
+
+func (*blockingRuntimeToolTestHandler) Capability() string { return "browser.actions" }
+func (*blockingRuntimeToolTestHandler) Action() string     { return "open_tab" }
+func (h *blockingRuntimeToolTestHandler) Execute(ctx context.Context, _ contract.ExecuteRequest) (json.RawMessage, error) {
+	h.calls.Add(1)
+	h.startOnce.Do(func() { close(h.started) })
+	select {
+	case <-h.release:
+		return json.RawMessage(`{"target_id":"target_1","url":"https://example.test/","title":"Example"}`), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+func (*blockingRuntimeToolTestHandler) Stop(context.Context, contract.Operation) (runtimecore.StopResult, error) {
+	return runtimecore.StopResult{VerifiedStopped: false}, nil
+}
+
+func (h *blockingRuntimeToolTestHandler) finish() { h.releaseOnce.Do(func() { close(h.release) }) }
 
 type runtimeToolTaskStore struct {
 	TaskStore

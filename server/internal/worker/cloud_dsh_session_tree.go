@@ -1065,6 +1065,81 @@ func markCloudDSHRetrySourceReconciled(history *cloudDSHCheckpointHistory, inten
 	return nil
 }
 
+func (e *CloudDSHExecutor) recordCloudDSHAgentObservation(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
+	rootIdentity cloudDSHIdentity, states map[string]*cloudDSHSessionState, frame cloudDSHFrame) (bool, error) {
+	if frame.Type != "agent_status" && frame.Type != "agent_activity" && frame.Type != "agent_heartbeat" {
+		return false, nil
+	}
+	state := states[frame.SessionID]
+	if state == nil || frame.cloudDSHIdentity != state.identity || state.settled {
+		return true, errors.New("dsh frame identity is invalid")
+	}
+	switch frame.Type {
+	case "agent_status":
+		if frame.cloudDSHIdentity != rootIdentity || frame.TaskRevision == nil || *frame.TaskRevision != cloudDSHTaskRevision(value) ||
+			frame.ObservationSequence == nil || *frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 ||
+			(frame.Status != "idle" && frame.Status != "running") || *frame.ObservationSequence <= state.lastObservationSequence {
+			return true, errors.New("dsh agent status observation is invalid")
+		}
+		state.lastObservationSequence = *frame.ObservationSequence
+		if e.options.AgentActivity != nil {
+			_, err := e.options.AgentActivity.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
+				Fence: fence, AgentSessionID: state.identity.SessionID, TaskRevision: cloudDSHTaskRevision(value),
+				Kind: app.TaskAgentActivityKindStatus, Status: frame.Status, ObservationSequence: *frame.ObservationSequence,
+			})
+			if err != nil {
+				return true, fmt.Errorf("record dsh agent status observation: %w", err)
+			}
+		}
+	case "agent_activity":
+		if frame.TaskRevision == nil || *frame.TaskRevision != cloudDSHTaskRevision(value) || frame.ObservationSequence == nil ||
+			*frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 ||
+			(frame.Phase != "model" && frame.Phase != "tool" && frame.Phase != "subagent" && frame.Phase != "checkpoint") ||
+			(frame.State != "started" && frame.State != "waiting" && frame.State != "completed" && frame.State != "failed" && frame.State != "cancelled") ||
+			!cloudDSHID.MatchString(frame.ActivityID) || *frame.ObservationSequence <= state.lastObservationSequence {
+			return true, errors.New("dsh agent activity observation is invalid")
+		}
+		activePhase, active := state.activeActivities[frame.ActivityID]
+		if frame.State == "started" && active || frame.State == "waiting" && (!active || activePhase != frame.Phase) ||
+			(frame.State == "completed" || frame.State == "failed" || frame.State == "cancelled") && (!active || activePhase != frame.Phase) {
+			return true, errors.New("dsh agent activity transition is invalid")
+		}
+		state.lastObservationSequence = *frame.ObservationSequence
+		state.noteActivity(frame.Phase, frame.ActivityID, frame.State)
+		if e.options.AgentActivity != nil {
+			_, err := e.options.AgentActivity.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
+				Fence: fence, AgentSessionID: state.identity.SessionID, TaskRevision: *frame.TaskRevision,
+				Kind: app.TaskAgentActivityKindActivity, Phase: frame.Phase, State: frame.State,
+				ActivityID: frame.ActivityID, ObservationSequence: *frame.ObservationSequence,
+			})
+			if err != nil {
+				return true, fmt.Errorf("record dsh agent activity observation: %w", err)
+			}
+		}
+	case "agent_heartbeat":
+		currentPhase, currentActivityID := state.currentActivity()
+		validHeartbeatActivity := frame.Phase == currentPhase && frame.ActivityID == currentActivityID &&
+			(frame.ActivityID == "" || cloudDSHID.MatchString(frame.ActivityID))
+		if frame.TaskRevision == nil || *frame.TaskRevision != cloudDSHTaskRevision(value) || frame.ObservationSequence == nil ||
+			*frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 || !validHeartbeatActivity ||
+			*frame.ObservationSequence <= state.lastObservationSequence {
+			return true, errors.New("dsh agent heartbeat observation is invalid")
+		}
+		state.lastObservationSequence = *frame.ObservationSequence
+		if e.options.AgentActivity != nil {
+			_, err := e.options.AgentActivity.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
+				Fence: fence, AgentSessionID: state.identity.SessionID, TaskRevision: *frame.TaskRevision,
+				Kind: app.TaskAgentActivityKindHeartbeat, Phase: frame.Phase, ActivityID: frame.ActivityID,
+				ObservationSequence: *frame.ObservationSequence,
+			})
+			if err != nil {
+				return true, fmt.Errorf("record dsh agent heartbeat observation: %w", err)
+			}
+		}
+	}
+	return true, nil
+}
+
 func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
 	input io.WriteCloser, output io.ReadCloser, resume, toolsAllowed, streamAllowed bool, completion *app.CloudDSHTaskCompletion, onStart func()) error {
 	ctx, cancel := context.WithCancelCause(ctx)
@@ -1369,9 +1444,69 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		}
 		return nil
 	}
+	deferredFrames := make([]cloudDSHRead, 0)
+	deferredFrameBytes := 0
+	type cloudDSHToolExecutionResult struct {
+		result app.AgentToolResult
+		err    error
+	}
+	const deferredFrameBytesLimit = 16 << 20
+	deferFrame := func(item cloudDSHRead) {
+		deferredFrames = append(deferredFrames, item)
+		deferredFrameBytes += len(item.frame)
+	}
+	executeToolAndRecordActivity := func(execute func() (app.AgentToolResult, error)) (app.AgentToolResult, error) {
+		results := make(chan cloudDSHToolExecutionResult, 1)
+		go func() {
+			result, err := execute()
+			results <- cloudDSHToolExecutionResult{result: result, err: err}
+		}()
+		for {
+			select {
+			case result := <-results:
+				return result.result, result.err
+			default:
+			}
+			if deferredFrameBytes >= deferredFrameBytesLimit {
+				result := <-results
+				return result.result, result.err
+			}
+			select {
+			case result := <-results:
+				return result.result, result.err
+			case item := <-frames:
+				if item.err != nil {
+					deferFrame(item)
+					result := <-results
+					return result.result, result.err
+				}
+				frame, err := decodeCloudDSHFrame(item.frame)
+				if err != nil {
+					deferFrame(item)
+					result := <-results
+					return result.result, result.err
+				}
+				handled, err := e.recordCloudDSHAgentObservation(ctx, value, fence, rootIdentity, states, frame)
+				if !handled {
+					deferFrame(item)
+					continue
+				}
+				if err != nil {
+					deferFrame(item)
+					result := <-results
+					return result.result, result.err
+				}
+			}
+		}
+	}
 	for {
 		var item cloudDSHRead
-		if activeModelID == "" && len(queuedModelIDs) > 0 {
+		if len(deferredFrames) > 0 {
+			item = deferredFrames[0]
+			deferredFrames[0] = cloudDSHRead{}
+			deferredFrames = deferredFrames[1:]
+			deferredFrameBytes -= len(item.frame)
+		} else if activeModelID == "" && len(queuedModelIDs) > 0 {
 			select {
 			case <-ctx.Done():
 				return context.Cause(ctx)
@@ -1721,73 +1856,18 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 			continue
 		}
+		handledObservation, err := e.recordCloudDSHAgentObservation(ctx, value, fence, rootIdentity, states, frame)
+		if err != nil {
+			return err
+		}
+		if handledObservation {
+			continue
+		}
 		state := states[frame.SessionID]
 		if state == nil || frame.cloudDSHIdentity != state.identity || state.settled {
 			return errors.New("dsh frame identity is invalid")
 		}
 		switch frame.Type {
-		case "agent_status":
-			if frame.cloudDSHIdentity != rootIdentity || frame.TaskRevision == nil || *frame.TaskRevision != cloudDSHTaskRevision(value) ||
-				frame.ObservationSequence == nil ||
-				*frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 ||
-				(frame.Status != "idle" && frame.Status != "running") || *frame.ObservationSequence <= state.lastObservationSequence {
-				return errors.New("dsh agent status observation is invalid")
-			}
-			state.lastObservationSequence = *frame.ObservationSequence
-			if e.options.AgentActivity != nil {
-				_, err := e.options.AgentActivity.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
-					Fence: fence, AgentSessionID: state.identity.SessionID, TaskRevision: cloudDSHTaskRevision(value),
-					Kind: app.TaskAgentActivityKindStatus, Status: frame.Status, ObservationSequence: *frame.ObservationSequence,
-				})
-				if err != nil {
-					return fmt.Errorf("record dsh agent status observation: %w", err)
-				}
-			}
-		case "agent_activity":
-			if frame.TaskRevision == nil || *frame.TaskRevision != cloudDSHTaskRevision(value) || frame.ObservationSequence == nil ||
-				*frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 ||
-				(frame.Phase != "model" && frame.Phase != "tool" && frame.Phase != "subagent" && frame.Phase != "checkpoint") ||
-				(frame.State != "started" && frame.State != "waiting" && frame.State != "completed" && frame.State != "failed" && frame.State != "cancelled") ||
-				!cloudDSHID.MatchString(frame.ActivityID) || *frame.ObservationSequence <= state.lastObservationSequence {
-				return errors.New("dsh agent activity observation is invalid")
-			}
-			activePhase, active := state.activeActivities[frame.ActivityID]
-			if frame.State == "started" && active || frame.State == "waiting" && (!active || activePhase != frame.Phase) ||
-				(frame.State == "completed" || frame.State == "failed" || frame.State == "cancelled") && (!active || activePhase != frame.Phase) {
-				return errors.New("dsh agent activity transition is invalid")
-			}
-			state.lastObservationSequence = *frame.ObservationSequence
-			state.noteActivity(frame.Phase, frame.ActivityID, frame.State)
-			if e.options.AgentActivity != nil {
-				_, err := e.options.AgentActivity.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
-					Fence: fence, AgentSessionID: state.identity.SessionID, TaskRevision: *frame.TaskRevision,
-					Kind: app.TaskAgentActivityKindActivity, Phase: frame.Phase, State: frame.State,
-					ActivityID: frame.ActivityID, ObservationSequence: *frame.ObservationSequence,
-				})
-				if err != nil {
-					return fmt.Errorf("record dsh agent activity observation: %w", err)
-				}
-			}
-		case "agent_heartbeat":
-			currentPhase, currentActivityID := state.currentActivity()
-			validHeartbeatActivity := frame.Phase == currentPhase && frame.ActivityID == currentActivityID &&
-				(frame.ActivityID == "" || cloudDSHID.MatchString(frame.ActivityID))
-			if frame.TaskRevision == nil || *frame.TaskRevision != cloudDSHTaskRevision(value) || frame.ObservationSequence == nil ||
-				*frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 || !validHeartbeatActivity ||
-				*frame.ObservationSequence <= state.lastObservationSequence {
-				return errors.New("dsh agent heartbeat observation is invalid")
-			}
-			state.lastObservationSequence = *frame.ObservationSequence
-			if e.options.AgentActivity != nil {
-				_, err := e.options.AgentActivity.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
-					Fence: fence, AgentSessionID: state.identity.SessionID, TaskRevision: *frame.TaskRevision,
-					Kind: app.TaskAgentActivityKindHeartbeat, Phase: frame.Phase, ActivityID: frame.ActivityID,
-					ObservationSequence: *frame.ObservationSequence,
-				})
-				if err != nil {
-					return fmt.Errorf("record dsh agent heartbeat observation: %w", err)
-				}
-			}
 		case "checkpoint_read":
 			if !state.resume || !cloudDSHID.MatchString(frame.ID) || frame.From == nil || *frame.From != state.readThrough+1 ||
 				*frame.From > state.restoreThrough || len(state.pageReadIDs) >= 100_000 {
@@ -2200,10 +2280,14 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 						if !ok {
 							return errors.New("dsh recovery broker is unavailable")
 						}
-						result, err = recoveryTools.Reconcile(ctx, value, call, state.history.recoveryOutput(frame.CallID))
+						result, err = executeToolAndRecordActivity(func() (app.AgentToolResult, error) {
+							return recoveryTools.Reconcile(ctx, value, call, state.history.recoveryOutput(frame.CallID))
+						})
 					}
 				} else {
-					result, err = e.options.Tools.Execute(ctx, value, call)
+					result, err = executeToolAndRecordActivity(func() (app.AgentToolResult, error) {
+						return e.options.Tools.Execute(ctx, value, call)
+					})
 				}
 			}
 			if err != nil {
