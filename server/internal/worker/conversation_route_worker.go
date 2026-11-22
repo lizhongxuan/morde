@@ -126,6 +126,9 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if len(snapshot.Context.Content) > app.MaxConversationAgentInputBytes {
 		err := domain.NewError(domain.CodeResultTooLarge, "message exceeds the model input budget")
 		err.Details["stage"] = "route_protocol_input_limit"
+		contentBytes, historyBytes := conversationRouteContextSizeDetails(snapshot.Context)
+		err.Details["content_bytes"] = contentBytes
+		err.Details["history_bytes"] = historyBytes
 		return true, w.failRoute(ctx, claim, "message_too_long", err)
 	}
 	if snapshot.PreviousCycle {
@@ -215,7 +218,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	copyConversationRouteCandidates(&classifyContext)
 	if err := fitConversationRouteContext(&classifyContext, contextWindow); err != nil {
 		return true, w.failRoute(ctx, claim, "message_too_long",
-			conversationRouteBudgetDiagnostic(err, "worker_context_fit", contextWindow, capacityKnown))
+			conversationRouteBudgetDiagnostic(err, "worker_context_fit", contextWindow, capacityKnown, classifyContext))
 	}
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	if classifyContext.Content != "" || len(classifyContext.Candidates) != 0 || classifyContext.ReferenceTaskID != "" ||
@@ -227,7 +230,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 			}
 			if domain.CodeOf(err) == domain.CodeResultTooLarge {
 				return true, w.failRoute(ctx, claim, "message_too_long",
-					conversationRouteBudgetDiagnostic(err, "model_request", contextWindow, capacityKnown))
+					conversationRouteBudgetDiagnostic(err, "model_request", contextWindow, capacityKnown, classifyContext))
 			}
 			if snapshot.PreviousMissing && domain.CodeOf(err) == domain.CodeConflict && ctx.Err() == nil {
 				if recovery, ok := w.options.Actions.(app.ConversationRoutePredecessorRecovery); ok {
@@ -342,6 +345,11 @@ func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error
 	return time.Second << shift, true
 }
 
+// conversationRouteHistoryPreviewBytes bounds one history entry when the
+// route context is shrunk to fit the model window. A preview keeps the
+// entry's identity plus its head and tail instead of blanking it outright.
+const conversationRouteHistoryPreviewBytes = 2048
+
 func fitConversationRouteContext(value *app.ConversationRouteContext, contextWindow int) error {
 	for {
 		request, err := app.ConversationRouteModelRequest(*value)
@@ -354,23 +362,19 @@ func fitConversationRouteContext(value *app.ConversationRouteContext, contextWin
 		if trimConversationRouteCandidates(value) {
 			continue
 		}
+		// Shrink history to previews before dropping the summary: the
+		// summary is the compressed form of older history, so it is the
+		// last thing to go, not the first.
+		if previewConversationRouteHistory(value) {
+			continue
+		}
+		if blankConversationRouteHistory(value) {
+			continue
+		}
 		if value.SummaryVersion > 0 {
 			value.SummaryVersion = 0
 			value.SummarySHA256, value.SummarySourcesSHA256, value.SummaryText = nil, nil, ""
 			value.HistoryIncomplete = true
-			continue
-		}
-		trimmedHistory := false
-		for index := range value.History {
-			if value.History[index].Content != "" {
-				value.History[index].Content = ""
-				value.History[index].Truncated = true
-				value.HistoryIncomplete = true
-				trimmedHistory = true
-				break
-			}
-		}
-		if trimmedHistory {
 			continue
 		}
 		if err != nil {
@@ -378,6 +382,42 @@ func fitConversationRouteContext(value *app.ConversationRouteContext, contextWin
 		}
 		return domain.NewError(domain.CodeResultTooLarge, "conversation message exceeds the selected model context budget")
 	}
+}
+
+// previewConversationRouteHistory replaces the oldest oversized history
+// entry with a head-and-tail preview. Entries already marked truncated are
+// left alone; blanking them is the next step.
+func previewConversationRouteHistory(value *app.ConversationRouteContext) bool {
+	for index := range value.History {
+		item := &value.History[index]
+		if item.Truncated || len(item.Content) <= conversationRouteHistoryPreviewBytes {
+			continue
+		}
+		preview, truncated := app.ConversationRouteTextPreview(item.Content, conversationRouteHistoryPreviewBytes)
+		if !truncated {
+			continue
+		}
+		item.Content = preview
+		item.Truncated = true
+		value.HistoryIncomplete = true
+		return true
+	}
+	return false
+}
+
+// blankConversationRouteHistory removes the oldest remaining history text,
+// keeping its identity (message id, sequence, task) so the model still sees
+// the reference.
+func blankConversationRouteHistory(value *app.ConversationRouteContext) bool {
+	for index := range value.History {
+		if value.History[index].Content != "" {
+			value.History[index].Content = ""
+			value.History[index].Truncated = true
+			value.HistoryIncomplete = true
+			return true
+		}
+	}
+	return false
 }
 
 func (w *ConversationRouteWorker) observeRouteDecision(claim app.ConversationRouteClaim, decision app.ConversationRouteDecision, result string) {
@@ -512,6 +552,12 @@ func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.Conve
 		if known, ok := routeErr.Details["context_window_known"].(bool); ok {
 			fields = append(fields, zap.Bool("context_window_known", known))
 		}
+		if contentBytes, ok := routeErr.Details["content_bytes"].(int); ok {
+			fields = append(fields, zap.Int("content_bytes", contentBytes))
+		}
+		if historyBytes, ok := routeErr.Details["history_bytes"].(int); ok {
+			fields = append(fields, zap.Int("history_bytes", historyBytes))
+		}
 	}
 	w.options.Logger.Warn("conversation route failed", fields...)
 	if err := w.options.Actions.FailConversationRoute(ctx, claim, reason); err != nil {
@@ -520,7 +566,7 @@ func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.Conve
 	return nil
 }
 
-func conversationRouteBudgetDiagnostic(err error, stage string, contextWindow int, capacityKnown bool) error {
+func conversationRouteBudgetDiagnostic(err error, stage string, contextWindow int, capacityKnown bool, value app.ConversationRouteContext) error {
 	var routeErr *domain.Error
 	if !errors.As(err, &routeErr) {
 		return err
@@ -533,7 +579,21 @@ func conversationRouteBudgetDiagnostic(err error, stage string, contextWindow in
 	}
 	routeErr.Details["context_window_tokens"] = contextWindow
 	routeErr.Details["context_window_known"] = capacityKnown
+	contentBytes, historyBytes := conversationRouteContextSizeDetails(value)
+	routeErr.Details["content_bytes"] = contentBytes
+	routeErr.Details["history_bytes"] = historyBytes
 	return err
+}
+
+// conversationRouteContextSizeDetails records the byte sizes that decide
+// whether a route context fits, so a size failure can be diagnosed from the
+// log alone instead of re-reading the database.
+func conversationRouteContextSizeDetails(value app.ConversationRouteContext) (int, int) {
+	historyBytes := 0
+	for _, item := range value.History {
+		historyBytes += len(item.Content)
+	}
+	return len(value.Content), historyBytes
 }
 
 func safeConversationRouteDecision(value app.ConversationRouteContext, decision app.ConversationRouteDecision) app.ConversationRouteDecision {

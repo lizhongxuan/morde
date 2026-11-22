@@ -81,6 +81,41 @@ func TestFitConversationRouteContextDropsOversizedSummary(t *testing.T) {
 	}
 }
 
+func TestFitConversationRouteContextKeepsSummaryWhilePreviewingHistory(t *testing.T) {
+	value := app.ConversationRouteContext{ActorID: "u1234567", ModelID: "p1234567", Content: "short current message",
+		SummaryVersion: 1, SummaryText: strings.Repeat("s", 2048)}
+	summaryDigest, sourcesDigest := sha256.Sum256([]byte(value.SummaryText)), sha256.Sum256([]byte("sources"))
+	value.SummarySHA256, value.SummarySourcesSHA256 = summaryDigest[:], sourcesDigest[:]
+	for sequence := int64(1); sequence <= 8; sequence++ {
+		value.History = append(value.History, app.ConversationRouteHistory{
+			MessageID: fmt.Sprintf("m%07d", sequence), Sequence: sequence,
+			Role: conversation.RoleAssistant, Content: strings.Repeat("x", 4000),
+		})
+	}
+	if err := fitConversationRouteContext(&value, 8192); err != nil {
+		t.Fatalf("fit history context with summary: %v", err)
+	}
+	if value.Content != "short current message" || value.SummaryVersion != 1 || value.SummaryText == "" || !value.HistoryIncomplete {
+		t.Fatalf("fitting dropped the summary before shrinking history: %+v", value)
+	}
+	previewed := false
+	for i, history := range value.History {
+		if history.MessageID == "" || history.Sequence != int64(i+1) {
+			t.Fatalf("history identity/order was lost: %+v", value.History)
+		}
+		if history.Content != "" && len(history.Content) < 4000 && history.Truncated {
+			previewed = true
+		}
+	}
+	if !previewed {
+		t.Fatal("over-budget history was not shrunk to a preview before the summary was kept")
+	}
+	request, err := app.ConversationRouteModelRequest(value)
+	if err != nil || !app.ConversationRouteInputFitsContextWindow(request, 8192) {
+		t.Fatalf("fitted request exceeds the window: err=%v", err)
+	}
+}
+
 func TestFitConversationRouteContextFitsMinimumWindowWithIncompleteHistoryAndCandidates(t *testing.T) {
 	value := app.ConversationRouteContext{ActorID: "u1234567", Content: "A30 path traversal: A30_TRAVERSAL_FETCH ../outside.pdf",
 		HistoryIncomplete: true, ServerReceivedAt: time.Now(), RequestCandidates: []app.ConversationRouteRequestCandidate{{
