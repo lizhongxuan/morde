@@ -153,13 +153,19 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversat
 		return app.ConversationSummaryHead{}, fmt.Errorf("lock conversation summary head: %w", err)
 	}
 	if storedAuthorization != identity.AuthorizationVersion || storedScopeVersion != identity.ScopeVersion {
-		if head.LeaseOperationID != "" {
-			if _, err := tx.Exec(ctx, `UPDATE conversation_compaction_operations SET state='invalidated',lease_owner='',lease_expires_at=NULL,updated_at=clock_timestamp()
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND scope_kind=$5 AND scope_id=$6 AND operation_id=$7
- AND state IN ('claimed','checkpointed','unknown')`, identity.ServiceInstanceID, identity.OwnerID,
-				identity.ActorID, identity.ConversationID, identity.ScopeKind, identity.ScopeID, head.LeaseOperationID); err != nil {
-				return app.ConversationSummaryHead{}, fmt.Errorf("invalidate stale conversation compaction operation: %w", err)
-			}
+		if _, err := tx.Exec(ctx, `UPDATE conversation_compaction_operations SET state='invalidated',lease_owner='',lease_expires_at=NULL,updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND scope_kind=$5 AND scope_id=$6
+ AND (authorization_version<>$7 OR scope_version<>$8) AND state IN ('claimed','checkpointed','unknown')`, identity.ServiceInstanceID,
+			identity.OwnerID, identity.ActorID, identity.ConversationID, identity.ScopeKind, identity.ScopeID,
+			identity.AuthorizationVersion, identity.ScopeVersion); err != nil {
+			return app.ConversationSummaryHead{}, fmt.Errorf("invalidate stale conversation compaction operations: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE conversation_summary_versions SET state='invalid',invalid_reason='scope_revoked',invalidated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND scope_kind=$5 AND scope_id=$6
+ AND (authorization_version<>$7 OR scope_version<>$8) AND state='valid'`, identity.ServiceInstanceID,
+			identity.OwnerID, identity.ActorID, identity.ConversationID, identity.ScopeKind, identity.ScopeID,
+			identity.AuthorizationVersion, identity.ScopeVersion); err != nil {
+			return app.ConversationSummaryHead{}, fmt.Errorf("invalidate stale conversation summaries: %w", err)
 		}
 		_, err := tx.Exec(ctx, `UPDATE conversation_summary_heads SET authorization_version=$7,scope_version=$8,
 lease_operation_id='',lease_owner='',lease_expires_at=NULL,updated_at=clock_timestamp()
