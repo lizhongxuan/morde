@@ -53,7 +53,7 @@ test('Hermes windows keep the system/head, last user and assistant, and whole to
 test('DSH frame validation rejects an output cap that consumes the known context window', () => {
   const start = {
     type: 'start', version: 1, task_id: 'task_window', owner_id: 'owner_window', agent_id: 'agent_window',
-    generation: 1, authorization_version: 1, session_id: 'session_window', model: 'test-model', tools: [],
+    generation: 1, authorization_version: 1, session_id: 'session_window', task_revision: 1, model: 'test-model', tools: [],
     prompt: 'continue', context_window_tokens: 4096,
   }
   assert.equal(validStart({ ...start, max_tokens: 1024 }), true)

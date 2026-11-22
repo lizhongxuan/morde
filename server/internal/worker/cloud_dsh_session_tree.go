@@ -24,26 +24,29 @@ import (
 )
 
 type cloudDSHSessionState struct {
-	identity         cloudDSHIdentity
-	parentSessionID  string
-	spawnKey         string
-	definitions      []app.AgentToolDefinition
-	canDelegate      bool
-	background       bool
-	resume           bool
-	through          int64
-	restoreThrough   int64
-	lastModel        int64
-	readThrough      int64
-	checkpointDigest []byte
-	restoreDigest    []byte
-	checkpointIDs    map[string]struct{}
-	pageReadIDs      map[string]struct{}
-	history          *cloudDSHCheckpointHistory
-	images           *cloudDSHImageRegistry
-	lastStream       *cloudDSHTextStream
-	stepRetryResult  *app.AgentToolResult
-	settled          bool
+	identity                cloudDSHIdentity
+	parentSessionID         string
+	spawnKey                string
+	definitions             []app.AgentToolDefinition
+	canDelegate             bool
+	background              bool
+	resume                  bool
+	through                 int64
+	restoreThrough          int64
+	lastModel               int64
+	readThrough             int64
+	checkpointDigest        []byte
+	restoreDigest           []byte
+	checkpointIDs           map[string]struct{}
+	pageReadIDs             map[string]struct{}
+	history                 *cloudDSHCheckpointHistory
+	images                  *cloudDSHImageRegistry
+	lastStream              *cloudDSHTextStream
+	stepRetryResult         *app.AgentToolResult
+	lastObservationSequence int64
+	activeActivities        map[string]string
+	activeActivityOrder     []string
+	settled                 bool
 }
 
 const cloudDSHMaxPendingModelCalls = 17
@@ -77,7 +80,31 @@ func newCloudDSHSessionState(fence app.AgentInstanceFence, identity cloudDSHIden
 		definitions: definitions, canDelegate: canDelegate, resume: resume, through: through, restoreThrough: through, lastModel: -1, readThrough: -1,
 		checkpointDigest: append([]byte(nil), digest...), restoreDigest: append([]byte(nil), digest...),
 		checkpointIDs: make(map[string]struct{}), pageReadIDs: make(map[string]struct{}),
-		history: history, images: newCloudDSHImageRegistry(cloudDSHModelFence(fence, identity.SessionID, through))}
+		history: history, images: newCloudDSHImageRegistry(cloudDSHModelFence(fence, identity.SessionID, through)),
+		activeActivities: make(map[string]string)}
+}
+
+func (state *cloudDSHSessionState) noteActivity(phase, activityID, activityState string) {
+	for index, id := range state.activeActivityOrder {
+		if id == activityID {
+			state.activeActivityOrder = append(state.activeActivityOrder[:index], state.activeActivityOrder[index+1:]...)
+			break
+		}
+	}
+	if activityState == "started" || activityState == "waiting" {
+		state.activeActivities[activityID] = phase
+		state.activeActivityOrder = append(state.activeActivityOrder, activityID)
+		return
+	}
+	delete(state.activeActivities, activityID)
+}
+
+func (state *cloudDSHSessionState) currentActivity() (string, string) {
+	if len(state.activeActivityOrder) == 0 {
+		return "", ""
+	}
+	activityID := state.activeActivityOrder[len(state.activeActivityOrder)-1]
+	return state.activeActivities[activityID], activityID
 }
 
 func cloudDSHModelFence(fence app.AgentInstanceFence, sessionID string, through int64) app.ModelTaskFence {
@@ -90,6 +117,13 @@ func cloudDSHModelFence(fence app.AgentInstanceFence, sessionID string, through 
 func cloudDSHModelFencePointer(fence app.AgentInstanceFence, sessionID string, through int64) *app.ModelTaskFence {
 	modelFence := cloudDSHModelFence(fence, sessionID, through)
 	return &modelFence
+}
+
+func cloudDSHTaskRevision(value task.Task) int64 {
+	if value.CurrentRevision == nil {
+		return 0
+	}
+	return *value.CurrentRevision
 }
 
 func cloudDSHInitialPrompt(value task.Task) (string, error) {
@@ -715,7 +749,7 @@ func (w *cloudDSHSerializedWriter) Close() error {
 	return w.WriteCloser.Close()
 }
 
-func (e *CloudDSHExecutor) deliverPendingMessages(ctx context.Context, fence app.AgentInstanceFence, input io.WriteCloser, seen map[string]string) error {
+func (e *CloudDSHExecutor) deliverPendingMessages(ctx context.Context, deliver func(context.Context) error) error {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -723,7 +757,7 @@ func (e *CloudDSHExecutor) deliverPendingMessages(ctx context.Context, fence app
 		case <-ctx.Done():
 			return context.Cause(ctx)
 		case <-ticker.C:
-			if err := e.deliverPendingMessagesOnce(ctx, fence, input, seen); err != nil {
+			if err := deliver(ctx); err != nil {
 				return err
 			}
 		}
@@ -1198,7 +1232,13 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	}()
 	pendingCancels := make(map[string]cloudDSHJobCancelPending)
 	ready := false
-	var lastAgentObservation int64
+	seenDeliveries := make(map[string]string)
+	var seenDeliveriesMu sync.Mutex
+	deliverPendingMessagesOnce := func(deliveryCtx context.Context) error {
+		seenDeliveriesMu.Lock()
+		defer seenDeliveriesMu.Unlock()
+		return e.deliverPendingMessagesOnce(deliveryCtx, fence, input, seenDeliveries)
+	}
 	for {
 		var item cloudDSHRead
 		if activeModelID == "" && len(queuedModelIDs) > 0 {
@@ -1232,6 +1272,27 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if errors.Is(result.err, errCloudDSHPersonalMemoryChanged) {
 					return result.err
 				}
+				steerPending := false
+				if pending.identity.SessionID == rootIdentity.SessionID {
+					messages, pendingErr := e.options.Checkpoints.PendingMessages(ctx, checkpointFence(fence))
+					if pendingErr != nil {
+						return errors.New("pending conversation messages are unavailable")
+					}
+					for _, message := range messages {
+						if !message.Initial && !message.RevisionUpdate && message.Mode == app.AgentMessageDeliverySteer {
+							steerPending = true
+							break
+						}
+					}
+				}
+				if steerPending {
+					if err := deliverPendingMessagesOnce(ctx); err != nil {
+						return errors.New("pending conversation messages are unavailable")
+					}
+					result.err = nil
+					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
+						StopReason: "stop", Usage: result.response.Usage, ProviderReportedModel: result.response.ProviderReportedModel}
+				}
 				if result.err != nil {
 					if cloudDSHModelErrorCategory(result.err) == "provider_context_length_exceeded" {
 						if err := writeCloudDSHModelFailure(ctx, input, result.id, pending.identity); err != nil {
@@ -1244,10 +1305,10 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if !validCloudDSHModelResponse(result.response, pending.state.definitions) {
 					return cloudDSHModelResultErrorFor(nil)
 				}
-				if pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through {
+				if !steerPending && pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through {
 					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
 						StopReason: "stop", Usage: result.response.Usage, ProviderReportedModel: result.response.ProviderReportedModel}
-				} else if pending.stream.hasVisibleText() {
+				} else if !steerPending && pending.stream.hasVisibleText() {
 					pending.state.lastStream = pending.stream
 				}
 				if protectsMemory && memoryValidator.ValidatePersonalMemoryProof(ctx, value, memoryProof, pending.memoryVersions) != nil {
@@ -1277,7 +1338,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 			start := map[string]any{"type": "start", "version": 1, "task_id": rootIdentity.TaskID, "owner_id": rootIdentity.OwnerID,
 				"agent_id": rootIdentity.AgentID, "session_id": rootIdentity.SessionID, "generation": rootIdentity.Generation,
-				"authorization_version": rootIdentity.AuthorizationVersion, "model": value.ModelID,
+				"authorization_version": rootIdentity.AuthorizationVersion, "task_revision": cloudDSHTaskRevision(value), "model": value.ModelID,
 				"max_tokens": maxTokens, "tools": cloudDSHToolPayload(rootDefinitions)}
 			if models, ok := e.options.Models.(CloudDSHTaskContextWindowResolver); ok {
 				contextWindow, resolveErr := models.ResolveTaskContextWindow(ctx, value)
@@ -1288,7 +1349,6 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					start["context_window_tokens"] = *contextWindow
 				}
 			}
-			seenDeliveries := make(map[string]string)
 			pending, err := e.options.Checkpoints.PendingMessages(ctx, checkpointFence(fence))
 			if err != nil {
 				return errors.New("pending conversation messages are unavailable")
@@ -1483,14 +1543,14 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err := writeCloudDSHFrame(ctx, input, start); err != nil {
 				return err
 			}
-			if err := e.deliverPendingMessagesOnce(ctx, fence, input, seenDeliveries); err != nil {
+			if err := deliverPendingMessagesOnce(ctx); err != nil {
 				return errors.New("pending conversation messages are unavailable")
 			}
 			deliveryCtx, cancelDelivery := context.WithCancel(ctx)
 			deliveryCancel = cancelDelivery
 			go func() {
 				defer close(deliveryDone)
-				if err := e.deliverPendingMessages(deliveryCtx, fence, input, seenDeliveries); err != nil && deliveryCtx.Err() == nil {
+				if err := e.deliverPendingMessages(deliveryCtx, deliverPendingMessagesOnce); err != nil && deliveryCtx.Err() == nil {
 					cancel(e.pendingDeliveryFailureCause(ctx, value, err))
 				}
 			}()
@@ -1524,21 +1584,65 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		}
 		switch frame.Type {
 		case "agent_status":
-			if frame.cloudDSHIdentity != rootIdentity || frame.ObservationSequence == nil ||
+			if frame.cloudDSHIdentity != rootIdentity || frame.TaskRevision == nil || *frame.TaskRevision != cloudDSHTaskRevision(value) ||
+				frame.ObservationSequence == nil ||
 				*frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 ||
-				(frame.Status != "idle" && frame.Status != "running") {
+				(frame.Status != "idle" && frame.Status != "running") || *frame.ObservationSequence <= state.lastObservationSequence {
 				return errors.New("dsh agent status observation is invalid")
 			}
-			if *frame.ObservationSequence <= lastAgentObservation {
-				continue
-			}
-			lastAgentObservation = *frame.ObservationSequence
+			state.lastObservationSequence = *frame.ObservationSequence
 			if e.options.AgentActivity != nil {
 				_, err := e.options.AgentActivity.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
-					Fence: fence, Status: frame.Status, ObservationSequence: *frame.ObservationSequence,
+					Fence: fence, AgentSessionID: state.identity.SessionID, TaskRevision: cloudDSHTaskRevision(value),
+					Kind: app.TaskAgentActivityKindStatus, Status: frame.Status, ObservationSequence: *frame.ObservationSequence,
 				})
 				if err != nil {
 					return fmt.Errorf("record dsh agent status observation: %w", err)
+				}
+			}
+		case "agent_activity":
+			if frame.TaskRevision == nil || *frame.TaskRevision != cloudDSHTaskRevision(value) || frame.ObservationSequence == nil ||
+				*frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 ||
+				(frame.Phase != "model" && frame.Phase != "tool" && frame.Phase != "subagent" && frame.Phase != "checkpoint") ||
+				(frame.State != "started" && frame.State != "waiting" && frame.State != "completed" && frame.State != "failed" && frame.State != "cancelled") ||
+				!cloudDSHID.MatchString(frame.ActivityID) || *frame.ObservationSequence <= state.lastObservationSequence {
+				return errors.New("dsh agent activity observation is invalid")
+			}
+			activePhase, active := state.activeActivities[frame.ActivityID]
+			if frame.State == "started" && active || frame.State == "waiting" && (!active || activePhase != frame.Phase) ||
+				(frame.State == "completed" || frame.State == "failed" || frame.State == "cancelled") && (!active || activePhase != frame.Phase) {
+				return errors.New("dsh agent activity transition is invalid")
+			}
+			state.lastObservationSequence = *frame.ObservationSequence
+			state.noteActivity(frame.Phase, frame.ActivityID, frame.State)
+			if e.options.AgentActivity != nil {
+				_, err := e.options.AgentActivity.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
+					Fence: fence, AgentSessionID: state.identity.SessionID, TaskRevision: *frame.TaskRevision,
+					Kind: app.TaskAgentActivityKindActivity, Phase: frame.Phase, State: frame.State,
+					ActivityID: frame.ActivityID, ObservationSequence: *frame.ObservationSequence,
+				})
+				if err != nil {
+					return fmt.Errorf("record dsh agent activity observation: %w", err)
+				}
+			}
+		case "agent_heartbeat":
+			currentPhase, currentActivityID := state.currentActivity()
+			validHeartbeatActivity := frame.Phase == currentPhase && frame.ActivityID == currentActivityID &&
+				(frame.ActivityID == "" || cloudDSHID.MatchString(frame.ActivityID))
+			if frame.TaskRevision == nil || *frame.TaskRevision != cloudDSHTaskRevision(value) || frame.ObservationSequence == nil ||
+				*frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 || !validHeartbeatActivity ||
+				*frame.ObservationSequence <= state.lastObservationSequence {
+				return errors.New("dsh agent heartbeat observation is invalid")
+			}
+			state.lastObservationSequence = *frame.ObservationSequence
+			if e.options.AgentActivity != nil {
+				_, err := e.options.AgentActivity.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
+					Fence: fence, AgentSessionID: state.identity.SessionID, TaskRevision: *frame.TaskRevision,
+					Kind: app.TaskAgentActivityKindHeartbeat, Phase: frame.Phase, ActivityID: frame.ActivityID,
+					ObservationSequence: *frame.ObservationSequence,
+				})
+				if err != nil {
+					return fmt.Errorf("record dsh agent heartbeat observation: %w", err)
 				}
 			}
 		case "checkpoint_read":

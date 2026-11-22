@@ -134,6 +134,21 @@ FROM tasks t CROSS JOIN service_identity i WHERE t.id=$1 AND t.owner_id=$2 AND t
 		if currentRevision < 0 || currentRevision != desiredRevision || currentRevision != dispatchRevision || taskModelID != dispatchModelID {
 			return domain.NewError(domain.CodeInvalidState, "stream task revision changed")
 		}
+		// Route acceptance and delta appends both hold the Task row, so this orders
+		// the stream fence against a steer persisted before its inbox checkpoint.
+		var pendingSteer bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_messages
+WHERE task_id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='user'
+ AND source_kind<>'task_result_review' AND delivery_status='pending' AND delivery_mode=$5)`,
+			fence.TaskID, fence.OwnerID, fence.InitiatorID, conversationID, string(app.AgentMessageDeliverySteer)).Scan(&pendingSteer); err != nil {
+			return fmt.Errorf("check pending Task steer before streaming: %w", err)
+		}
+		if pendingSteer {
+			if err := interruptAssistantMessageSnapshot(ctx, tx, fence.TaskID, "", true); err != nil {
+				return err
+			}
+			return nil
+		}
 		var continuingVariant bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_message_variants
 WHERE task_id=$1 AND action='continue_generation' AND state IN ('accepted','running','unknown'))`, fence.TaskID).Scan(&continuingVariant); err != nil {

@@ -909,14 +909,33 @@ func TestCloudDSHExecutorRecordsRootAgentStatusObservations(t *testing.T) {
 	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
 		t.Fatalf("candidate result = %v", err)
 	}
-	if len(recorder.observations) != 3 {
-		t.Fatalf("observations = %#v, want initial, running and idle", recorder.observations)
+	var statuses []app.TaskAgentActivityObservation
+	var lastSequence int64
+	seenModel, seenCheckpoint, seenHeartbeat := false, false, false
+	for _, observation := range recorder.observations {
+		if observation.Fence != supervisor.launch.Fence || observation.AgentSessionID != supervisor.launch.Fence.AgentSessionID ||
+			observation.TaskRevision != cloudDSHTaskRevision(value) || observation.ObservationSequence <= lastSequence {
+			t.Fatalf("observation fence/revision/sequence = %#v", observation)
+		}
+		lastSequence = observation.ObservationSequence
+		switch observation.Kind {
+		case app.TaskAgentActivityKindStatus:
+			statuses = append(statuses, observation)
+		case app.TaskAgentActivityKindActivity:
+			seenModel = seenModel || observation.Phase == "model"
+			seenCheckpoint = seenCheckpoint || observation.Phase == "checkpoint"
+		case app.TaskAgentActivityKindHeartbeat:
+			seenHeartbeat = true
+		default:
+			t.Fatalf("unexpected observation kind: %#v", observation)
+		}
+	}
+	if len(statuses) != 3 || !seenModel || !seenCheckpoint || !seenHeartbeat {
+		t.Fatalf("statuses=%#v model=%v checkpoint=%v heartbeat=%v observations=%#v", statuses, seenModel, seenCheckpoint, seenHeartbeat, recorder.observations)
 	}
 	for index, expected := range []string{"idle", "running", "idle"} {
-		observation := recorder.observations[index]
-		if observation.Fence != supervisor.launch.Fence || observation.Status != expected ||
-			observation.ObservationSequence != int64(index+1) {
-			t.Fatalf("observation %d = %#v", index, observation)
+		if statuses[index].Status != expected || statuses[index].Kind != app.TaskAgentActivityKindStatus {
+			t.Fatalf("status observation %d = %#v", index, statuses[index])
 		}
 	}
 }
@@ -2758,6 +2777,70 @@ setInterval(() => {}, 1000)`
 	err := <-done
 	if !cancelledByRuntime || err == nil || errors.Is(err, context.DeadlineExceeded) || store.stopped != 1 {
 		t.Fatalf("runtime model cancellation = %v (request_cancel=%v), stopped=%d", err, cancelledByRuntime, store.stopped)
+	}
+}
+
+func TestCloudDSHExecutorDeliversPendingSteerBeforeSuppressingOldModelResult(t *testing.T) {
+	executor, supervisor, store, checkpoints, models, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}}
+	executor.options.Tools = tools
+	checkpoints.pending = nil
+	models.complete = func(_ context.Context, _ app.ModelCall) (app.ModelResponse, error) {
+		checkpoints.mu.Lock()
+		checkpoints.pending = []app.AgentConversationMessage{{ID: "m7654321", Content: "Use the new introduction", Mode: app.AgentMessageDeliverySteer}}
+		checkpoints.mu.Unlock()
+		return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: "call_read_1", Name: tool.Name,
+			Arguments: `{"workspace_id":"w1234567","path":"README.md"}`}}, StopReason: "tool_calls",
+			Usage: app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}, nil
+	}
+	script := filepath.Join(t.TempDir(), "pending-steer.mjs")
+	source := `import { createHash } from 'node:crypto'
+import { createInterface } from 'node:readline'
+const emit = frame => process.stdout.write(JSON.stringify(frame) + '\n')
+const digest = value => createHash('sha256').update(value).digest('hex')
+const identity = frame => ({ task_id: frame.task_id, owner_id: frame.owner_id, agent_id: frame.agent_id,
+  generation: frame.generation, authorization_version: frame.authorization_version, session_id: frame.session_id })
+emit({ type: 'ready', version: 1, engine: 'dsh', engine_version: '0.2.0-rc.2' })
+let start
+let sawSteer = false
+const fail = code => { process.exit(code) }
+createInterface({ input: process.stdin }).on('line', raw => {
+  const frame = JSON.parse(raw)
+  if (frame.type === 'start') {
+    start = frame
+    const payload = JSON.stringify({ header: { id: frame.session_id }, from_seq: 0,
+      events: [{ seq: 0, type: 'turn/start', data: { turn: 1 } }] })
+    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_steer', from_seq: 0, through_seq: 0,
+      payload, sha256: digest(payload) })
+  } else if (frame.type === 'checkpoint_ack') {
+    const request = { provider: 'morde', model: start.model, tools: start.tools,
+      messages: [{ id: 'm1234567', role: 'user', content: [{ type: 'text', text: start.prompt }] }], max_tokens: start.max_tokens }
+    const id = 'mdl_' + digest('morde-dsh-model-v1\n' + start.task_id + '\n' + start.session_id + '\n0')
+    emit({ type: 'model', ...identity(start), id, through_seq: 0, request, sha256: digest(JSON.stringify(request)) })
+  } else if (frame.type === 'message_delivery') {
+    if (frame.mode !== 'steer' || frame.content !== 'Use the new introduction') fail(91)
+    sawSteer = true
+  } else if (frame.type === 'model_chunk') {
+    if (!sawSteer || frame.chunk?.type === 'tool-call-delta' ||
+        frame.chunk?.type === 'text-delta' && !frame.chunk.text.includes('A new task input arrived')) fail(92)
+  } else if (frame.type === 'model_end') {
+    if (!sawSteer || frame.ok !== true) fail(93)
+    emit({ type: 'failed', ...identity(start), code: 'test_finished' })
+    setImmediate(() => process.exit(0))
+  }
+})
+setInterval(() => {}, 1000)`
+	if err := os.WriteFile(script, []byte(source), 0600); err != nil {
+		t.Fatal(err)
+	}
+	cloudDSHUseTestTaskScript(t, supervisor, script)
+	err := executor.ExecuteTask(context.Background(), value)
+	if err == nil || !strings.Contains(err.Error(), "unavailable runtime") {
+		t.Fatalf("test runtime termination = %v", err)
+	}
+	if len(models.calls) != 1 || len(tools.calls) != 0 || store.stopped != 1 {
+		t.Fatalf("model calls=%d old tool executions=%d stopped=%d", len(models.calls), len(tools.calls), store.stopped)
 	}
 }
 
