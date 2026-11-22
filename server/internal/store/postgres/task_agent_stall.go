@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 )
@@ -138,12 +139,14 @@ ORDER BY sequence,id`, taskID, ownerID, conversationID)
 
 func taskAgentActivityStalled(ctx context.Context, tx pgx.Tx, value task.Task, staleAfter time.Duration) (known, stalled bool, err error) {
 	rows, err := tx.Query(ctx, `SELECT session_id,COALESCE(parent_session_id,''),activity_status,
-activity_generation,activity_revision,activity_heartbeat_at,
-COALESCE(activity_heartbeat_at<=clock_timestamp()-($4::bigint*interval '1 millisecond'),false)
+activity_generation,activity_revision,activity_phase,activity_state,activity_progressed_at,activity_heartbeat_at,
+COALESCE(activity_heartbeat_at<=clock_timestamp()-($4::bigint*interval '1 millisecond'),false),
+COALESCE(activity_phase='model' AND activity_state='started' AND
+  activity_progressed_at<=clock_timestamp()-($5::bigint*interval '1 millisecond'),false)
 FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2
   AND (parent_session_id IS NULL OR task_revision=$3)
 ORDER BY (parent_session_id IS NULL) DESC,created_at,session_id`, value.ID, value.OwnerID, *value.CurrentRevision,
-		staleAfter.Milliseconds())
+		staleAfter.Milliseconds(), app.ModelCallTimeout.Milliseconds())
 	if err != nil {
 		return false, false, fmt.Errorf("read current Task agent activity: %w", err)
 	}
@@ -154,9 +157,11 @@ ORDER BY (parent_session_id IS NULL) DESC,created_at,session_id`, value.ID, valu
 		var sessionID, parentSessionID string
 		var status pgtype.Text
 		var generation, revision pgtype.Int8
-		var heartbeat pgtype.Timestamptz
-		var heartbeatStale bool
-		if err := rows.Scan(&sessionID, &parentSessionID, &status, &generation, &revision, &heartbeat, &heartbeatStale); err != nil {
+		var phase, state pgtype.Text
+		var progressedAt, heartbeat pgtype.Timestamptz
+		var heartbeatStale, modelCallStale bool
+		if err := rows.Scan(&sessionID, &parentSessionID, &status, &generation, &revision, &phase, &state,
+			&progressedAt, &heartbeat, &heartbeatStale, &modelCallStale); err != nil {
 			return false, false, fmt.Errorf("scan current Task agent activity: %w", err)
 		}
 		if parentSessionID == "" {
@@ -170,7 +175,18 @@ ORDER BY (parent_session_id IS NULL) DESC,created_at,session_id`, value.ID, valu
 				unknown = true
 				continue
 			}
+			if state.Valid && state.String == "started" && status.String != "running" {
+				unknown = true
+				continue
+			}
 			stalled = stalled || heartbeatStale
+			if phase.Valid && phase.String == "model" {
+				if !state.Valid || state.String == "started" && !progressedAt.Valid {
+					unknown = true
+					continue
+				}
+				stalled = stalled || modelCallStale
+			}
 			continue
 		}
 		if !generation.Valid || generation.Int64 != value.AgentGeneration {
@@ -179,6 +195,17 @@ ORDER BY (parent_session_id IS NULL) DESC,created_at,session_id`, value.ID, valu
 		if !revision.Valid || revision.Int64 != *value.CurrentRevision || !status.Valid {
 			unknown = true
 			continue
+		}
+		if state.Valid && state.String == "started" && status.String != "running" {
+			unknown = true
+			continue
+		}
+		if phase.Valid && phase.String == "model" {
+			if !state.Valid || state.String == "started" && !progressedAt.Valid {
+				unknown = true
+				continue
+			}
+			stalled = stalled || modelCallStale
 		}
 		if status.String == "idle" {
 			continue

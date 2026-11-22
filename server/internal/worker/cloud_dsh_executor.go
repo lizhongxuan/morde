@@ -132,6 +132,12 @@ func cloudDSHModelErrorCategory(err error) string {
 		case domain.CodeUpstreamTimeout:
 			return "timeout"
 		case domain.CodeUpstreamError:
+			if reason, ok := domainErr.Details["reason"].(string); ok {
+				switch reason {
+				case "empty_response", "truncated_response":
+					return reason
+				}
+			}
 			return "upstream_error"
 		case domain.CodeInvalidState:
 			return "usage_unknown"

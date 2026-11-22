@@ -100,10 +100,13 @@ type TaskValidationReviewStepDetail struct {
 }
 
 type TaskValidationReviewArtifact struct {
-	Label     string `json:"label"`
-	Path      string `json:"path"`
-	MediaType string `json:"media_type"`
-	SizeBytes int64  `json:"size_bytes"`
+	SourceCallID string `json:"source_call_id"`
+	Label        string `json:"label"`
+	Path         string `json:"path"`
+	MediaType    string `json:"media_type"`
+	SizeBytes    int64  `json:"size_bytes"`
+	Revision     int64  `json:"revision"`
+	SHA256       string `json:"sha256"`
 }
 
 const (

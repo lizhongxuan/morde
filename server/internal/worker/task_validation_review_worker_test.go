@@ -17,6 +17,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 type taskValidationReviewQueueStub struct {
@@ -245,11 +246,13 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(
 		digest := sha256.Sum256([]byte(result))
 		revision, desiredRevision := int64(4), int64(4)
 		stepRef := app.TaskValidationEvidenceRefRecord{Kind: app.TaskValidationEvidenceAction, ID: "s1234567", TaskRevision: revision, Sequence: 2}
-		artifactRef := app.TaskValidationEvidenceRefRecord{Kind: app.TaskValidationEvidenceSideEffect, ID: "a1234567", TaskRevision: revision, Sequence: 2}
+		artifactRef := app.TaskValidationEvidenceRefRecord{Kind: app.TaskValidationEvidenceSideEffect, ID: "a1234567", TaskRevision: revision, Sequence: 2, CallID: "write_report_1"}
 		evidence := &app.TaskValidationEvidenceRecord{TaskRevision: revision, EventSequence: 9, ResultSHA256: hex.EncodeToString(digest[:]),
 			Claims: []app.TaskValidationEvidenceClaimRecord{{ID: "c1", StartByte: 0, EndByte: int32(len(result)),
 				EvidenceRefs: []app.TaskValidationEvidenceRefRecord{stepRef, artifactRef}}}}
 		object, inputText, resultText := "search", "validated query summary", "three sources found"
+		artifactContent := "private report bytes are not included in the review packet"
+		artifactDigest := sha256.Sum256([]byte(artifactContent))
 		sourceText := "Example authorized source passage supporting the cited result."
 		sourceDigest := sha256.Sum256([]byte(sourceText))
 		contentEvidence := &app.TaskStepContentEvidence{SHA256: hex.EncodeToString(sourceDigest[:]), Preview: sourceText}
@@ -257,10 +260,12 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(
 			TaskID: "q1234567", TaskRevision: revision, ResultEventSequence: 9, ResultSHA256: digest[:], ClaimGeneration: 1, LeaseOwner: "worker"}
 		snapshots := taskValidationReviewSnapshotStub{details: app.TaskDetails{
 			Task: task.Task{ID: claim.TaskID, OwnerID: claim.OwnerID, InitiatorID: claim.InitiatorID, ConversationID: claim.ConversationID,
-				Status: task.StatusCompleted, CurrentRevision: &revision, DesiredRevision: &desiredRevision, Objective: "Verify search", Result: result},
+				Status: task.StatusCompleted, CurrentRevision: &revision, DesiredRevision: &desiredRevision, WorkspaceID: "w1234567",
+				Objective: "Verify search", Result: result},
 			Steps: []task.Step{{ID: stepRef.ID, TaskID: claim.TaskID, Sequence: stepRef.Sequence, Kind: "tool", Status: task.StepSucceeded,
 				Title: "Read source", Summary: "Read completed successfully.", TaskRevision: &revision, ToolName: toolName, DetailState: "available"}},
-			Artifacts:          []task.Artifact{{ID: artifactRef.ID, TaskID: claim.TaskID, StepID: stepRef.ID, Label: "Report", Path: "reports/result.txt", MediaType: "text/plain", SizeBytes: 128}},
+			Artifacts: []task.Artifact{{ID: artifactRef.ID, TaskID: claim.TaskID, StepID: stepRef.ID, WorkspaceID: "w1234567", Revision: 11,
+				Label: "Report", Path: "reports/result.txt", MediaType: "text/plain", SizeBytes: int64(len(artifactContent)), SHA256: hex.EncodeToString(artifactDigest[:])}},
 			ValidationEvidence: evidence,
 		}, stepDetails: map[string]app.TaskStepDetail{stepRef.ID: {TaskID: claim.TaskID, StepID: stepRef.ID, DetailState: "available",
 			Object: &object, Input: &inputText, Result: &resultText, ContentEvidence: contentEvidence}}}
@@ -279,9 +284,64 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(
 			!bytes.Contains(encoded, []byte(`"content_evidence":{"sha256":"`+hex.EncodeToString(sourceDigest[:])+`","preview":"`)) ||
 			!bytes.Contains(encoded, []byte(sourceText)) ||
 			!bytes.Contains(encoded, []byte(`"state":"artifact_metadata_only"`)) ||
-			!bytes.Contains(encoded, []byte(`"path":"reports/result.txt"`)) || bytes.Contains(encoded, []byte("artifact_bytes")) {
+			!bytes.Contains(encoded, []byte(`"path":"reports/result.txt"`)) ||
+			!bytes.Contains(encoded, []byte(`"source_call_id":"write_report_1"`)) ||
+			!bytes.Contains(encoded, []byte(`"revision":11`)) ||
+			!bytes.Contains(encoded, []byte(`"sha256":"`+hex.EncodeToString(artifactDigest[:])+`"`)) ||
+			bytes.Contains(encoded, []byte(artifactContent)) || bytes.Contains(encoded, []byte("artifact_bytes")) {
 			t.Fatalf("review evidence snapshot = %s, err=%v", encoded, err)
 		}
+		if !strings.Contains(taskValidationReviewSystemPrompt, "不含产物字节") ||
+			!strings.Contains(taskValidationReviewSystemPrompt, "不能证明该操作的运行环境或产物内容正确") {
+			t.Fatal("artifact hash/revision was not described as metadata-only evidence")
+		}
+		missingHash := snapshots.details.Artifacts[0]
+		missingHash.SHA256 = ""
+		staleWorkspace := snapshots.details.Artifacts[0]
+		staleWorkspace.WorkspaceID = "w7654321"
+		invalidRevision := snapshots.details.Artifacts[0]
+		invalidRevision.Revision = -1
+		oversizedArtifact := snapshots.details.Artifacts[0]
+		oversizedArtifact.SizeBytes = workspace.MaxSyncFileBytes + 1
+		invalidArtifacts := []struct {
+			name     string
+			artifact task.Artifact
+		}{{name: "missing hash", artifact: missingHash}, {name: "stale workspace", artifact: staleWorkspace},
+			{name: "invalid revision", artifact: invalidRevision}, {name: "oversized metadata", artifact: oversizedArtifact}}
+		for _, test := range invalidArtifacts {
+			t.Run(test.name, func(t *testing.T) {
+				invalidSnapshot := snapshots
+				invalidSnapshot.details.Artifacts = []task.Artifact{test.artifact}
+				worker.options.Snapshots = invalidSnapshot
+				invalid, err := worker.reviewInput(context.Background(), claim)
+				if err != nil || len(invalid.EvidenceDetails) != 2 || invalid.EvidenceDetails[1].State != "unavailable" ||
+					invalid.EvidenceDetails[1].Artifact != nil {
+					t.Fatalf("invalid artifact evidence state=%+v err=%v; want unavailable", invalid.EvidenceDetails, err)
+				}
+			})
+		}
+		missingSnapshot := snapshots
+		missingSnapshot.details.Artifacts = nil
+		worker.options.Snapshots = missingSnapshot
+		missing, err := worker.reviewInput(context.Background(), claim)
+		if err != nil || len(missing.EvidenceDetails) != 2 || missing.EvidenceDetails[1].State != "unavailable" ||
+			missing.EvidenceDetails[1].Artifact != nil {
+			t.Fatalf("missing artifact evidence state=%+v err=%v; want unavailable", missing.EvidenceDetails, err)
+		}
+		missingCallID := snapshots
+		missingCallEvidence := *snapshots.details.ValidationEvidence
+		missingCallEvidence.Claims = append([]app.TaskValidationEvidenceClaimRecord(nil), snapshots.details.ValidationEvidence.Claims...)
+		missingCallEvidence.Claims[0].EvidenceRefs = append([]app.TaskValidationEvidenceRefRecord(nil),
+			snapshots.details.ValidationEvidence.Claims[0].EvidenceRefs...)
+		missingCallEvidence.Claims[0].EvidenceRefs[1].CallID = ""
+		missingCallID.details.ValidationEvidence = &missingCallEvidence
+		worker.options.Snapshots = missingCallID
+		missingCall, err := worker.reviewInput(context.Background(), claim)
+		if err != nil || len(missingCall.EvidenceDetails) != 2 || missingCall.EvidenceDetails[1].State != "unavailable" ||
+			missingCall.EvidenceDetails[1].Artifact != nil {
+			t.Fatalf("artifact without operation CallID state=%+v err=%v; want unavailable", missingCall.EvidenceDetails, err)
+		}
+		worker.options.Snapshots = snapshots
 		snapshots.details.Steps[0].ToolName = "morde_workspace_read"
 		worker.options.Snapshots = snapshots
 		if _, err := worker.reviewInput(context.Background(), claim); err == nil {

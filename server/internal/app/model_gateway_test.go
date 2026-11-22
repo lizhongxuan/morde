@@ -24,6 +24,7 @@ type modelGatewayStoreTest struct {
 	settlement      ModelCallSettlement
 	recovered       TaskModelResponseRecord
 	recoveredCallID string
+	invalidTaskCall string
 	recoverErr      error
 	taskProject     string
 	scopeErr        error
@@ -54,6 +55,9 @@ func setTestModelResponseSealer(t *testing.T, service *ModelGatewayService) {
 
 func (s *modelGatewayStoreTest) RecoverTaskModelResponse(_ context.Context, request ModelCallReservation) (TaskModelResponseRecord, bool, error) {
 	s.recoverN++
+	if s.invalidTaskCall == request.CallID {
+		return TaskModelResponseRecord{}, false, domain.NewError(domain.CodeInvalidState, "settled Task model response is unavailable and requires reconciliation")
+	}
 	return s.recovered, s.recovered.AgentGeneration != 0 && s.recoveredCallID == request.CallID, s.recoverErr
 }
 
@@ -88,11 +92,35 @@ func (s *modelGatewayStoreTest) SettleModelCall(ctx context.Context, value Model
 			Digest: append([]byte(nil), value.ResponseDigest...)}
 		s.recoveredCallID = value.CallID
 	}
+	if value.Source == ModelCallTask && value.ResponseInvalid {
+		s.invalidTaskCall = value.CallID
+	}
 	return s.settleErr
 }
 
 func (s *modelGatewayStoreTest) ValidateTaskModelDelivery(context.Context, ModelCallReservation) error {
 	return s.deliveryErr
+}
+
+func taskGatewayFixture(t *testing.T, rawRequest []byte, response ModelResponse) (*ModelGatewayService, *modelGatewayStoreTest,
+	*modelGatewayClientTest, ModelCall) {
+	t.Helper()
+	fence := &ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
+		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 0,
+		EngineVersion: "dsh-1", ProfileVersion: "v1"}
+	callID, err := DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &modelGatewayStoreTest{}
+	client := &modelGatewayClientTest{response: response}
+	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTestModelResponseSealer(t, service)
+	call := ModelCall{Source: ModelCallTask, Task: fence, ModelID: "p1234567", CallID: callID, RawRequest: rawRequest}
+	return service, store, client, call
 }
 
 type modelGatewayResolverTest struct {
@@ -267,18 +295,13 @@ func TestModelGatewayRejectsToolCallsNotAllowedByRequest(t *testing.T) {
 }
 
 func TestModelGatewayRejectsTaskToolCallsOutsideWorkerContract(t *testing.T) {
-	fence := &ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
-		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 0,
-		EngineVersion: "dsh-1", ProfileVersion: "v1"}
-	callID, err := DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
-	if err != nil {
-		t.Fatal(err)
-	}
 	for _, test := range []struct {
 		name       string
 		text       string
 		stopReason string
 		calls      []ModelToolCall
+		reported   string
+		reason     ModelClientErrorKind
 	}{
 		{name: "call ID exceeds worker pattern", stopReason: "tool_calls", calls: []ModelToolCall{{CallID: strings.Repeat("x", 129), Name: "lookup", Arguments: `{}`}}},
 		{name: "call ID contains unsupported character", stopReason: "tool_calls", calls: []ModelToolCall{{CallID: "call.id", Name: "lookup", Arguments: `{}`}}},
@@ -295,24 +318,94 @@ func TestModelGatewayRejectsTaskToolCallsOutsideWorkerContract(t *testing.T) {
 		}()},
 		{name: "text exceeds worker limit", stopReason: "stop", text: strings.Repeat("x", MaxDSHModelResponseTextBytes+1)},
 		{name: "empty final text", stopReason: "stop"},
-		{name: "incomplete final response", stopReason: "length", text: "partial"},
+		{name: "incomplete final response", stopReason: "length", text: "partial", reported: "provider-snapshot-3", reason: ModelErrorTruncatedResponse},
 		{name: "tool calls with text stop reason", stopReason: "stop", calls: []ModelToolCall{{CallID: "call-1", Name: "lookup", Arguments: `{}`}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			store := &modelGatewayStoreTest{}
-			client := &modelGatewayClientTest{response: ModelResponse{Text: test.text, ToolCalls: test.calls,
-				StopReason: test.stopReason, Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2}}}
-			service, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, client)
-			if err != nil {
-				t.Fatal(err)
-			}
-			setTestModelResponseSealer(t, service)
-			call := ModelCall{Source: ModelCallTask, Task: fence, ModelID: "p1234567", CallID: callID,
-				RawRequest: []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[{"name":"lookup","parameters":{"type":"object"}}]}`)}
+			rawRequest := []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[{"name":"lookup","parameters":{"type":"object"}}]}`)
+			service, store, client, call := taskGatewayFixture(t, rawRequest, ModelResponse{Text: test.text, ToolCalls: test.calls,
+				StopReason: test.stopReason, Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2}, ProviderReportedModel: test.reported})
 			response, err := service.Complete(context.Background(), call)
-			if domain.CodeOf(err) != domain.CodeUpstreamError || len(response.ToolCalls) != 0 || store.settleN != 1 ||
+			var upstream *domain.Error
+			wantReason := test.reason
+			if wantReason == "" {
+				wantReason = ModelErrorInvalidResponse
+			}
+			if !errors.As(err, &upstream) || upstream.Code != domain.CodeUpstreamError ||
+				upstream.Details["reason"] != string(wantReason) || len(response.ToolCalls) != 0 || client.calls != 1 || store.settleN != 1 ||
 				store.settlement.Unknown || store.settlement.Usage.InputTokens != 3 || store.settlement.Usage.OutputTokens != 2 {
-				t.Fatalf("invalid Task tool response was returned or usage was lost: response=%#v settlement=%#v error=%v", response, store.settlement, err)
+				t.Fatalf("invalid Task response was returned or usage/reason was lost: response=%#v settlement=%#v error=%v", response, store.settlement, err)
+			}
+		})
+	}
+}
+
+func TestTaskModelGatewayClassifiesOnlyUnambiguousEmptyAndTruncatedResponses(t *testing.T) {
+	rawRequest := []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[]}`)
+	for _, test := range []struct {
+		name       string
+		response   ModelResponse
+		reason     ModelClientErrorKind
+		wantCode   domain.ErrorCode
+		wantReplay bool
+	}{
+		{name: "confirmed zero output", response: ModelResponse{StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 3},
+			ProviderReportedModel: "provider-snapshot-3"}, reason: ModelErrorEmptyResponse, wantCode: domain.CodeUpstreamError, wantReplay: true},
+		{name: "empty text but output tokens reported", response: ModelResponse{StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}},
+			reason: ModelErrorInvalidResponse, wantCode: domain.CodeUpstreamError},
+		{name: "empty text but no input usage", response: ModelResponse{StopReason: "stop", Usage: ModelUsage{Known: true}},
+			reason: ModelErrorInvalidResponse, wantCode: domain.CodeUpstreamError},
+		{name: "reasoning present without text", response: ModelResponse{Reasoning: "private reasoning", StopReason: "stop",
+			Usage: ModelUsage{Known: true, InputTokens: 3}}, reason: ModelErrorInvalidResponse, wantCode: domain.CodeUpstreamError},
+		{name: "reported model is too long", response: ModelResponse{StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 3},
+			ProviderReportedModel: strings.Repeat("m", MaxProviderReportedModelBytes+1)}, reason: ModelErrorInvalidResponse, wantCode: domain.CodeUpstreamError},
+		{name: "empty response without reported model", response: ModelResponse{StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 3}},
+			reason: ModelErrorInvalidResponse, wantCode: domain.CodeUpstreamError},
+		{name: "truncated response without reported model", response: ModelResponse{StopReason: "length", Text: "partial",
+			Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2}}, reason: ModelErrorInvalidResponse, wantCode: domain.CodeUpstreamError},
+		{name: "reported model has control character", response: ModelResponse{StopReason: "length", Text: "partial",
+			Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2}, ProviderReportedModel: "provider\nspoof"},
+			reason: ModelErrorInvalidResponse, wantCode: domain.CodeUpstreamError},
+		{name: "length without generated tokens", response: ModelResponse{StopReason: "length", Text: "partial",
+			Usage: ModelUsage{Known: true, InputTokens: 3}}, reason: ModelErrorInvalidResponse, wantCode: domain.CodeUpstreamError},
+		{name: "truncated output", response: ModelResponse{StopReason: "length", Text: "partial", ProviderReportedModel: "provider-snapshot-3",
+			Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2}}, reason: ModelErrorTruncatedResponse, wantCode: domain.CodeUpstreamError},
+		{name: "unknown usage remains unknown", response: ModelResponse{StopReason: "stop", ProviderReportedModel: "provider-snapshot-3"},
+			wantCode: domain.CodeInvalidState},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, store, client, call := taskGatewayFixture(t, rawRequest, test.response)
+			_, err := service.Complete(context.Background(), call)
+			if domain.CodeOf(err) != test.wantCode || client.calls != 1 || store.settleN != 1 ||
+				store.settlement.Unknown != (test.wantCode == domain.CodeInvalidState) ||
+				store.settlement.ResponseInvalid != (test.wantCode == domain.CodeUpstreamError) {
+				t.Fatalf("Task response classification: err=%v calls=%d settles=%d settlement=%#v", err, client.calls, store.settleN, store.settlement)
+			}
+			if test.wantCode == domain.CodeUpstreamError {
+				var upstream *domain.Error
+				if !errors.As(err, &upstream) || upstream.Details["reason"] != string(test.reason) {
+					t.Fatalf("upstream reason=%v, want %q; err=%v", upstream, test.reason, err)
+				}
+			} else {
+				var unknown *domain.Error
+				if !errors.As(err, &unknown) || unknown.Details["reason"] != nil {
+					t.Fatalf("unknown usage was reclassified: err=%v", err)
+				}
+			}
+			if test.wantCode == domain.CodeUpstreamError && (store.settlement.ProviderReportedModel != test.response.ProviderReportedModel ||
+				store.settlement.Usage != test.response.Usage) {
+				t.Fatalf("known usage/provider identity not settled: settlement=%#v response=%#v", store.settlement, test.response)
+			}
+			if test.wantReplay {
+				if store.reservation.ProviderEndpoint != "https://provider.example/v1" || store.reservation.ProviderModel != "test-model" {
+					t.Fatalf("reservation provider identity = %#v", store.reservation)
+				}
+				_, replayErr := service.Complete(context.Background(), call)
+				if domain.CodeOf(replayErr) != domain.CodeInvalidState || client.calls != 1 || store.reserveN != 1 ||
+					store.dispatchN != 1 || store.settleN != 1 || store.recoverN != 2 {
+					t.Fatalf("settled invalid response redispatched: err=%v calls=%d reserve=%d dispatch=%d settle=%d recover=%d",
+						replayErr, client.calls, store.reserveN, store.dispatchN, store.settleN, store.recoverN)
+				}
 			}
 		})
 	}

@@ -269,7 +269,8 @@ func TestConversationRevisionStopsRealAgentAndRestartsWithLatestMessages(t *test
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_revision_starts WHERE task_id=$1`, taskID).Scan(&startsBeforeExecution); err != nil || startsBeforeExecution != 0 {
 		t.Fatalf("queued task falsely recorded execution: count=%d err=%v", startsBeforeExecution, err)
 	}
-	first, found, err := f.store.ClaimNextTask(ctx, "revision-first-worker", time.Minute)
+	// This test calls the executor directly without a TaskWorker renewal loop.
+	first, found, err := f.store.ClaimNextTask(ctx, "revision-first-worker", 5*time.Minute)
 	if err != nil || !found || first.ID != taskID {
 		t.Fatalf("claim initial task: found=%t err=%v", found, err)
 	}
@@ -387,12 +388,15 @@ ON i.task_id=t.id AND i.agent_generation=t.agent_generation WHERE t.id=$1`, task
 		t.Fatalf("apply stopped revisions: applied=%t err=%v", applied, err)
 	}
 	assertStarted(false)
-	second, found, err := f.store.ClaimNextTask(ctx, "revision-second-worker", time.Minute)
+	second, found, err := f.store.ClaimNextTask(ctx, "revision-second-worker", 5*time.Minute)
 	if err != nil || !found || second.ID != taskID {
 		t.Fatalf("claim revised task: found=%t err=%v", found, err)
 	}
 	if err := executor.ExecuteTask(ctx, second); !errors.Is(err, worker.ErrCloudDSHCompletionPending) {
-		t.Fatalf("execute revised task: %v", err)
+		model.mu.Lock()
+		modelCalls := len(model.calls)
+		model.mu.Unlock()
+		t.Fatalf("execute revised task: %v (model calls=%d)", err, modelCalls)
 	}
 	assertStarted(true)
 	var initialStarts, skippedStarts, latestStarts int

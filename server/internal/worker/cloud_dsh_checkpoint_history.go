@@ -18,6 +18,9 @@ const (
 	cloudDSHToolResultPruneHeadChars      = 4096
 	cloudDSHToolResultPruneTailChars      = 1024
 	cloudDSHToolResultPruneMarker         = "\n\n[... tool result middle pruned ...]\n\n"
+	cloudDSHUnknownToolResultText         = "The tool outcome is unknown. The operation may already have happened. Do not repeat it; verify external state or ask the user before trying again."
+	cloudDSHUnknownToolResultErrorName    = "ToolOutcomeUnknownError"
+	cloudDSHUnknownToolResultErrorCode    = "TOOL_OUTCOME_UNKNOWN"
 )
 
 type cloudDSHCheckpointHistory struct {
@@ -105,6 +108,7 @@ type cloudDSHToolCall struct {
 	surfaceResultSeq  int64
 	surfaceResultData json.RawMessage
 	resultSeen        bool
+	resultUnknown     bool
 	reconciled        bool
 	outputRecorded    bool
 }
@@ -842,9 +846,14 @@ func (h *cloudDSHCheckpointHistory) beginToolResultPrune(sequence int64, data js
 func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.RawMessage, surfaceOp string, sourceSeqs []int64) error {
 	var event cloudDSHToolResultCheckpoint
 	if json.Unmarshal(data, &event) != nil || event.Turn < 1 || event.Step < 1 || event.Message.ToolCallID == "" ||
-		event.Message.ToolCallID != event.Message.Source.CallID || event.Message.IsError || len(event.Error) != 0 && string(event.Error) != "null" ||
+		event.Message.ToolCallID != event.Message.Source.CallID ||
 		surfaceOp != "append" || len(sourceSeqs) != 1 || sourceSeqs[0] >= sequence {
 		return errors.New("dsh tool result checkpoint is invalid")
+	}
+	unknownOutcome := event.Message.IsError && cloudDSHToolResultErrorMatches(event.Error,
+		cloudDSHUnknownToolResultErrorName, cloudDSHUnknownToolResultErrorCode)
+	if event.Message.IsError != unknownOutcome || !unknownOutcome && len(event.Error) != 0 && string(event.Error) != "null" {
+		return errors.New("dsh tool result checkpoint has an unsupported error")
 	}
 	call := h.calls[event.Message.ToolCallID]
 	if call == nil || !call.callSeen || call.resultSeen || sourceSeqs[0] != call.callSeq || call.turn != event.Turn || call.step != event.Step ||
@@ -855,6 +864,9 @@ func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.R
 	if err != nil || !utf8.ValidString(output) || len(output) > 64<<10 {
 		return errors.New("dsh tool result checkpoint exceeds its limit")
 	}
+	if unknownOutcome && (call.status != "" || len(imageRefs) != 0 || output != cloudDSHUnknownToolResultText) {
+		return errors.New("dsh unknown tool result is invalid")
+	}
 	if call.status != "" && !sameCloudDSHImageRefs(call.runtimeImages, imageRefs) {
 		return errors.New("dsh tool result image differs from the reconciled Host result")
 	}
@@ -862,6 +874,7 @@ func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.R
 		return errors.New("dsh tool result differs from the reconciled runtime result")
 	}
 	call.resultText, call.resultImages, call.resultSeen, call.resultSeq = output, imageRefs, true, sequence
+	call.resultUnknown = unknownOutcome
 	call.surfaceResultSeq = sequence
 	call.surfaceResultData = append(json.RawMessage(nil), data...)
 	if call.status != "" {
@@ -869,6 +882,14 @@ func (h *cloudDSHCheckpointHistory) appendToolResult(sequence int64, data json.R
 		h.recordFileWriteOutput(event.Message.ToolCallID, output)
 	}
 	return nil
+}
+
+func cloudDSHToolResultErrorMatches(raw json.RawMessage, name, code string) bool {
+	var fields map[string]string
+	if len(raw) == 0 || string(raw) == "null" || json.Unmarshal(raw, &fields) != nil || len(fields) != 2 {
+		return false
+	}
+	return fields["name"] == name && fields["code"] == code
 }
 
 func (h *cloudDSHCheckpointHistory) replacePrunedToolResult(sequence int64, data, rawSurfaceOp json.RawMessage, sourceSeqs []int64) error {

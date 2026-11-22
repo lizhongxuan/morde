@@ -67,6 +67,19 @@ function timeout(promise, ms) {
   ]).finally(() => clearTimeout(timer))
 }
 
+function taskTerminationReason(task) {
+  if (task.terminateReason !== undefined && task.terminateReason !== null) return task.terminateReason
+
+  const reason = 'child_exited_without_result'
+  const exit = task.exit
+  const detail = Number.isInteger(exit?.code) && exit.code >= 0 && exit.code <= 255
+    ? `exit_code=${exit.code}`
+    : typeof exit?.signal === 'string' && /^SIG[A-Z0-9]{1,16}$/.test(exit.signal)
+      ? `signal=${exit.signal}`
+      : ''
+  return detail ? `${reason}; ${detail}` : reason
+}
+
 function taskEnvironment() {
   const allowed = new Set(['PATH', 'LANG', 'LC_ALL', 'TZ', 'NODE_ENV', '__CF_USER_TEXT_ENCODING', 'UV_USE_IO_URING'])
   return Object.fromEntries(Object.entries(process.env).filter(([key]) => allowed.has(key)))
@@ -1395,7 +1408,7 @@ export class AccountRuntime {
       // shortcut: direct child exit is not cgroup proof; Guardian must verify all descendants before production stop claims.
       await this.send({
         type: 'task_terminated', ...runtimeFields(this.runtime), runtime_sequence: task.runtimeSequence, ...task.fence, state: 'unknown',
-        reason: task.terminateReason ?? 'child_exited_without_result', process_exited: true,
+        reason: taskTerminationReason(task), process_exited: true,
       }).catch(() => {})
       this.finishShutdownIfIdle()
     } else {

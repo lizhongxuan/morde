@@ -30,26 +30,44 @@ import (
 )
 
 func TestCloudDSHModelFailureCategoryUsesOnlySafeAllowlistedReason(t *testing.T) {
-	providerFailure := domain.NewError(domain.CodeUpstreamError, "provider request failed")
-	providerFailure.Details["reason"] = string(app.ModelErrorTimeout)
-	if got := cloudDSHModelErrorCategory(providerFailure); got != "timeout" {
-		t.Fatalf("cloudDSHModelErrorCategory() = %q, want timeout", got)
+	for _, test := range []struct {
+		name         string
+		code         domain.ErrorCode
+		reason       any
+		stage        any
+		providerCode any
+		want         string
+	}{
+		{name: "empty response", code: domain.CodeUpstreamError, reason: "empty_response", want: "empty_response"},
+		{name: "truncated response", code: domain.CodeUpstreamError, reason: "truncated_response", want: "truncated_response"},
+		{name: "unknown reason", code: domain.CodeUpstreamError, reason: "private provider response containing secrets", want: "upstream_error"},
+		{name: "non-exact reason", code: domain.CodeUpstreamError, reason: " empty_response", want: "upstream_error"},
+		{name: "non-string reason", code: domain.CodeUpstreamError, reason: []string{"empty_response"}, want: "upstream_error"},
+		{name: "other upstream error reason", code: domain.CodeUpstreamError, reason: string(app.ModelErrorTimeout), want: "timeout"},
+		{name: "provider status keeps its classification", code: domain.CodeUpstreamError, reason: "empty_response", stage: "provider_status",
+			providerCode: "context_length_exceeded", want: "provider_context_length_exceeded"},
+		{name: "empty reason requires upstream error code", code: domain.CodeInvalidState, reason: "empty_response", want: "usage_unknown"},
+		{name: "client validation", code: domain.CodeUpstreamError, stage: "client_validation", want: "client_request_invalid"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			modelFailure := domain.NewError(test.code, "provider request failed")
+			if test.reason != nil {
+				modelFailure.Details["reason"] = test.reason
+			}
+			if test.stage != nil {
+				modelFailure.Details["stage"] = test.stage
+			}
+			if test.providerCode != nil {
+				modelFailure.Details["provider_code"] = test.providerCode
+			}
+			if got := cloudDSHModelErrorCategory(modelFailure); got != test.want {
+				t.Fatalf("cloudDSHModelErrorCategory() = %q, want %q", got, test.want)
+			}
+		})
 	}
 
+	providerFailure := domain.NewError(domain.CodeUpstreamError, "provider request failed")
 	providerFailure.Details["reason"] = "private provider response containing secrets"
-	if got := cloudDSHModelErrorCategory(providerFailure); got != "upstream_error" {
-		t.Fatalf("cloudDSHModelErrorCategory() accepted an untrusted reason: %q", got)
-	}
-	providerFailure.Details["stage"] = "provider_status"
-	providerFailure.Details["provider_code"] = "context_length_exceeded"
-	if got := cloudDSHModelErrorCategory(providerFailure); got != "provider_context_length_exceeded" {
-		t.Fatalf("cloudDSHModelErrorCategory() = %q, want provider_context_length_exceeded", got)
-	}
-	providerFailure.Details["stage"] = "client_validation"
-	delete(providerFailure.Details, "provider_code")
-	if got := cloudDSHModelErrorCategory(providerFailure); got != "client_request_invalid" {
-		t.Fatalf("cloudDSHModelErrorCategory() = %q, want client_request_invalid", got)
-	}
 	taskBudgetFailure := domain.NewError(domain.CodeQuotaExceeded, "task model token budget exceeded")
 	taskBudgetFailure.Details["reason"] = "task_model_budget_exhausted"
 	if got := cloudDSHModelErrorCategory(taskBudgetFailure); got != "task_budget_exhausted" {

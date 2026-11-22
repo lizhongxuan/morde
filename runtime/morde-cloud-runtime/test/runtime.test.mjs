@@ -344,6 +344,22 @@ test('Task validation review start is a strict zero-tool root session', () => {
   assert.equal(validStart({ ...valid, unexpected: true }), false)
 })
 
+test('Task start validates persisted message modes while defaulting old frames to followup', () => {
+  const initialStart = { ...start, initial_message: { message_id: 'm1234567', content: 'initial request', attachment_ids: [] } }
+  delete initialStart.prompt
+  assert.equal(validStart(initialStart), true)
+  assert.equal(validStart({ ...initialStart, initial_message: { ...initialStart.initial_message, mode: 'followup' } }), true)
+  assert.equal(validStart({ ...initialStart, initial_message: { ...initialStart.initial_message, mode: 'steer' } }), true)
+  assert.equal(validStart({ ...initialStart, initial_message: { ...initialStart.initial_message, mode: 'unknown' } }), false)
+  assert.equal(validStart({ ...initialStart, initial_message: { ...initialStart.initial_message, unexpected: true } }), false)
+
+  const revisionStart = { ...start, revision_messages: [{ message_id: 'm1234567', content: 'revision', attachment_ids: [] }] }
+  assert.equal(validStart(revisionStart), true)
+  assert.equal(validStart({ ...revisionStart, revision_messages: [{ ...revisionStart.revision_messages[0], mode: 'steer' }] }), true)
+  assert.equal(validStart({ ...revisionStart, revision_messages: [{ ...revisionStart.revision_messages[0], mode: 'invalid' }] }), false)
+  assert.equal(validStart({ ...revisionStart, revision_messages: [{ ...revisionStart.revision_messages[0], extra: true }] }), false)
+})
+
 test('accepts a fresh root Task validation review with only final text', async t => {
   const startFrame = taskValidationReviewAccountStart()
   const fence = taskValidationReviewFence(startFrame)
@@ -932,6 +948,50 @@ test('seeded message delivery identities initialize supersede target tracking', 
   output.destroy()
 })
 
+test('start-seeded persisted message modes allow only matching deliveries and superseding upgrades', () => {
+  for (const source of ['initial_message', 'revision_messages']) {
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const ipc = new WorkerIPC(input, output)
+    const deliveries = []
+    ipc.setMessageDeliveryHandler(delivery => deliveries.push(delivery))
+    const message = { message_id: 'm1234567', content: 'persisted steer', attachment_ids: [], mode: 'steer' }
+    const seeded = source === 'initial_message'
+      ? { ...start, initial_message: message }
+      : { ...start, revision_messages: [message] }
+    const upgraded = messageDeliveryV4(seeded, message.message_id, message.content)
+    input.write(`${JSON.stringify(seeded)}\n${JSON.stringify(upgraded)}\n`)
+    assert.equal(ipc.failed, false, `${source} rejected a matching superseding delivery`)
+    assert.equal(deliveries.length, 1)
+    assert.equal(deliveries[0].mode, 'steer')
+    assert.equal(deliveries[0].supersede_active, true)
+    input.destroy()
+    output.destroy()
+
+    const mismatchInput = new PassThrough()
+    const mismatchOutput = new PassThrough()
+    const mismatchIPC = new WorkerIPC(mismatchInput, mismatchOutput)
+    mismatchIPC.setMessageDeliveryHandler(() => {})
+    const mismatchedMode = messageDeliveryV3(seeded, message.message_id, message.content, [], 'followup')
+    mismatchInput.write(`${JSON.stringify(seeded)}\n${JSON.stringify(mismatchedMode)}\n`)
+    assert.equal(mismatchIPC.failed, true, `${source} accepted a delivery with a different persisted mode`)
+    mismatchInput.destroy()
+    mismatchOutput.destroy()
+  }
+
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  const deliveries = []
+  ipc.setMessageDeliveryHandler(delivery => deliveries.push(delivery))
+  const legacy = { ...start, initial_message: { message_id: 'm1234567', content: 'legacy followup', attachment_ids: [] } }
+  input.write(`${JSON.stringify(legacy)}\n${JSON.stringify(messageDeliveryV3(legacy, 'm1234567', 'legacy followup', [], 'followup'))}\n`)
+  assert.equal(ipc.failed, false, 'old start frames without mode must remain followup-compatible')
+  assert.equal(deliveries.length, 0, 'matching duplicate delivery should be deduplicated')
+  input.destroy()
+  output.destroy()
+})
+
 test('child_abort is restricted to the active task fence and one child identity', () => {
   const input = new PassThrough()
   const output = new PassThrough()
@@ -1285,7 +1345,8 @@ test('resumes a completed coordinator checkpoint and returns its saved text with
 
 test('starts a first attachment message once with its authorized context', async t => {
   const attachmentIDs = ['pa_0123456789abcdef0123456789abcdef']
-  const initial = { message_id: 'm1234567', content: 'Please inspect this file: ' + 'a'.repeat(40 * 1024), attachment_ids: attachmentIDs }
+  const initial = { message_id: 'm1234567', content: 'Please inspect this file: ' + 'a'.repeat(40 * 1024),
+    attachment_ids: attachmentIDs, mode: 'steer' }
   const initialStart = { ...start, initial_message: initial, initial_context: 'Earlier authorized context: a draft report.' }
   delete initialStart.prompt
   assert.equal(validStart(initialStart), true)
@@ -1293,7 +1354,7 @@ test('starts a first attachment message once with its authorized context', async
   const { child, frames } = launch((frame, proc) => {
     if (frame.type === 'ready') {
       send(proc, initialStart)
-      send(proc, messageDelivery(initialStart, initial.message_id, initial.content, initial.attachment_ids))
+      send(proc, messageDeliveryV3(initialStart, initial.message_id, initial.content, initial.attachment_ids, 'steer'))
     }
     if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
     if (frame.type === 'model') {
@@ -1311,6 +1372,8 @@ test('starts a first attachment message once with its authorized context', async
   assert.equal(calls, 1)
   const events = frames.filter(frame => frame.type === 'checkpoint').flatMap(frame => JSON.parse(frame.payload).events)
   assert.equal(events.filter(event => event.type === 'user/message' && event.data.id === initial.message_id).length, 1)
+  assert.ok(events.some(event => event.type === 'user/message' && event.data.id === initial.message_id &&
+    event.data.source?.morde_delivery_mode === 'steer'))
   assert.ok(events.some(event => event.type === 'user/message' && event.data.source?.kind === 'plugin' &&
     event.data.source?.plugin === 'morde-context' && event.data.content?.some(block => block.text === initialStart.initial_context)))
 })
@@ -3637,6 +3700,47 @@ async function captureInterruptedDelegateChildSession() {
   return pagesBySession
 }
 
+async function captureToolResultInterrupted(tool, argumentsJSON, callID, result) {
+  const pages = []
+  let modelCalls = 0
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [tool] })
+    if (frame.type === 'checkpoint') {
+      pages.push({ from_seq: frame.from_seq, through_seq: frame.through_seq, payload: frame.payload, sha256: frame.sha256 })
+      acknowledgeCheckpoint(proc, frame)
+    }
+    if (frame.type === 'model') {
+      modelCalls++
+      if (modelCalls > 1) {
+        proc.kill('SIGKILL')
+        return
+      }
+      const chunks = [
+        { type: 'tool-call-delta', index: 0, id: callID, name: tool.name, argumentsDelta: argumentsJSON },
+        { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ]
+      chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+      send(proc, { type: 'model_end', id: frame.id, ok: true })
+    }
+    if (frame.type === 'tool_call') {
+      assert.equal(frame.call_id, callID)
+      send(proc, {
+        type: 'tool_result', id: frame.id, ...taskFence(frame), call_id: frame.call_id,
+        status: result.status, output: result.output,
+      })
+    }
+  })
+  const [code, signal] = await once(child, 'close')
+  assert.equal(signal, 'SIGKILL')
+  assert.equal(code, null)
+  assert.equal(modelCalls, 2)
+  assert.ok(frames.some(frame => frame.type === 'tool_call'))
+  const events = pages.flatMap(page => JSON.parse(page.payload).events)
+  assert.equal(events.filter(event => event.type === 'tool/result' && event.data.message?.toolCallId === callID).length, 1)
+  return pages
+}
+
 async function captureScreenshotResultInterrupted(image, tool = screenshotTool, output = 'Screenshot captured') {
   const images = Array.isArray(image) ? image : [image]
   const pages = []
@@ -3703,6 +3807,184 @@ test('reconciles an interrupted tool call before resuming the dsh model', async 
   assert.equal(recoveryResults[0].data.message.content[0].text, '{"bytes_written":5}')
   const callSeq = pages.flatMap(page => JSON.parse(page.payload).events).find(event => event.type === 'tool/call').seq
   assert.deepEqual(recoveryResults[0].sourceEventSeqs, [callSeq])
+})
+
+test('supersedes an interrupted tool recovery without replaying an uncertain side effect', async () => {
+  const revision = { message_id: 'm7654321', content: 'Use the revised answer.', attachment_ids: [], mode: 'steer' }
+  const tool = {
+    name: 'file_write', description: 'Write a file in the task workspace.',
+    parameters: {
+      type: 'object', properties: { workspace_id: { type: 'string' }, path: { type: 'string' }, content: { type: 'string' } },
+      required: ['workspace_id', 'path', 'content'], additionalProperties: false,
+    },
+  }
+  // Model one broker dispatch before the Runtime process is interrupted.
+  let modeledDispatches = 0
+  const pages = await captureInterruptedToolSession(tool, undefined, frame => {
+    assert.equal(frame.call_id, 'call_interrupted_1')
+    modeledDispatches++
+  })
+  const persistedEvents = pages.flatMap(page => JSON.parse(page.payload).events)
+  const lastTurnStart = persistedEvents.findLastIndex(event => event.type === 'turn/start')
+  const lastTurnEnd = persistedEvents.findLastIndex(event => event.type === 'turn/end')
+  assert.ok(lastTurnStart >= 0 && lastTurnEnd < lastTurnStart, 'fixture must contain an interrupted open turn')
+  assert.ok(persistedEvents.some(event => event.type === 'tool/call') &&
+    !persistedEvents.some(event => event.type === 'tool/result'), 'fixture must stop with an unresolved durable tool call')
+  let timeout
+  const resumed = await resumeSession(pages, {
+    tools: [tool],
+    alterStart: value => ({ ...value, revision_messages: [revision] }),
+    onToolCall(frame, proc) {
+      assert.equal(frame.call_id, 'call_interrupted_1')
+      assert.equal(frame.name, 'file_write')
+      assert.deepEqual(frame.arguments, { workspace_id: 'w1234567', path: 'notes.txt', content: 'saved' })
+      send(proc, messageDeliveryV4(frame, revision.message_id, revision.content, [], frame.session_id, frame.call_id))
+      timeout = setTimeout(() => proc.kill('SIGKILL'), 1000)
+      return null
+    },
+    onModel(frame, proc) {
+      clearTimeout(timeout)
+      replyWithText(proc, frame, 'revised answer')
+    },
+  })
+
+  assert.equal(resumed.code, 0, `frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(resumed.frames.filter(frame => frame.type === 'tool_call').length, 1,
+    'recovery must emit one call and must not retry it after v4')
+  assert.equal(resumed.modelCalls, 1)
+  assert.ok(resumed.modelRequests[0].messages.some(message => message.id === revision.message_id),
+    'the first model turn after resume must include the staged steer')
+  const recoveredTool = resumed.modelRequests[0].messages.find(message => message.role === 'tool' && message.toolCallId === 'call_interrupted_1')
+  assert.ok(recoveredTool, 'the open turn must be closed before the model resumes')
+  assert.match(recoveredTool.content[0].text, /outcome is unknown/i)
+  assert.match(recoveredTool.content[0].text, /may already have happened/i)
+  assert.match(recoveredTool.content[0].text, /do not repeat/i)
+  assert.equal(modeledDispatches, 1, 'recovery must not model another broker dispatch')
+  assert.deepEqual(resumed.sentToolResults, [], 'the v4 admission response must not be paired with a tool_result')
+  const events = resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)
+  assert.equal(events.filter(event => event.type === 'user/message' && event.data.id === revision.message_id).length, 1)
+  assert.equal(events.find(event => event.type === 'user/message' && event.data.id === revision.message_id)
+    ?.data.source?.morde_delivery_mode, 'steer')
+  const recoveryResults = events.filter(event => event.type === 'tool/result' && event.data.message?.toolCallId === 'call_interrupted_1')
+  assert.equal(recoveryResults.length, 1)
+  assert.equal(recoveryResults[0].data.message.isError, true)
+  assert.equal(recoveryResults[0].data.error?.code, 'TOOL_OUTCOME_UNKNOWN')
+  assert.match(recoveryResults[0].data.message.content[0].text, /do not repeat/i)
+})
+
+test('a v4 supersede for another recovering call waits for the actual tool result and fails closed', async () => {
+  const tool = {
+    name: 'file_write', description: 'Write a file in the task workspace.',
+    parameters: {
+      type: 'object', properties: { workspace_id: { type: 'string' }, path: { type: 'string' }, content: { type: 'string' } },
+      required: ['workspace_id', 'path', 'content'], additionalProperties: false,
+    },
+  }
+  for (const mismatch of [
+    { sessionID: start.session_id, callID: 'call_other_1' },
+    { sessionID: 'child_other_1', callID: 'call_interrupted_1' },
+  ]) {
+    let modeledDispatches = 0
+    const pages = await captureInterruptedToolSession(tool, undefined, () => { modeledDispatches++ })
+    const resumed = await resumeSession(pages, {
+      tools: [tool],
+      onToolCall(frame, proc) {
+        send(proc, messageDeliveryV4(frame, 'm7654321', 'Use the revised answer.', [], mismatch.sessionID, mismatch.callID))
+        return { status: 'succeeded', output: 'durably reconciled result' }
+      },
+    })
+    assert.notEqual(resumed.code, 0, `mismatched supersede should fail closed: ${JSON.stringify(mismatch)}`)
+    assert.equal(resumed.modelCalls, 0)
+    assert.equal(resumed.frames.filter(frame => frame.type === 'tool_call').length, 1)
+    assert.equal(resumed.sentToolResults.length, 1, 'the mismatched v4 must leave the pending recovery call waiting for its real result')
+    assert.equal(modeledDispatches, 1)
+    const events = resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)
+    const result = events.find(event => event.type === 'tool/result' && event.data.message?.toolCallId === 'call_interrupted_1')
+    assert.equal(result?.data.message.content[0].text, 'durably reconciled result')
+  }
+})
+
+test('a v4 supersede preserves a checkpointed tool result during recovery', async () => {
+  const revision = { message_id: 'm7654321', content: 'Use the revised answer.', attachment_ids: [], mode: 'steer' }
+  const callID = 'call_checkpointed_1'
+  const pages = await captureToolResultInterrupted(fileReadTool,
+    '{"workspace_id":"w1234567","path":"notes.txt"}', callID,
+    { status: 'succeeded', output: 'Persisted read result' })
+  const persisted = pages.flatMap(page => JSON.parse(page.payload).events)
+  assert.equal(persisted.filter(event => event.type === 'tool/result' && event.data.message?.toolCallId === callID).length, 1)
+  const resumed = await resumeSession(pages, {
+    tools: [fileReadTool],
+    alterStart: value => ({ ...value, revision_messages: [revision] }),
+    onToolCall(frame, proc) {
+      assert.equal(frame.call_id, callID)
+      send(proc, messageDeliveryV4(frame, revision.message_id, revision.content, [], frame.session_id, frame.call_id))
+      return null
+    },
+    onModel(frame, proc) {
+      const result = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === callID)
+      assert.equal(result?.content[0].text, 'Persisted read result')
+      assert.ok(frame.request.messages.some(message => message.id === revision.message_id))
+      replyWithText(proc, frame, 'revised answer after preserving the result')
+    },
+  })
+  assert.equal(resumed.code, 0, `frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(resumed.modelCalls, 1)
+  assert.deepEqual(resumed.sentToolResults, [])
+  const recovered = [...persisted, ...resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)]
+  assert.equal(recovered.filter(event => event.type === 'tool/result' && event.data.message?.toolCallId === callID).length, 1)
+  assert.equal(recovered.filter(event => event.type === 'user/message' && event.data.id === revision.message_id).length, 1)
+})
+
+test('a v4 supersede releases a pending delegated child recovery without creating a child', async () => {
+  const revision = { message_id: 'm7654321', content: 'Use the revised answer.', attachment_ids: [], mode: 'steer' }
+  const pages = await captureInterruptedDelegateSession()
+  let timeout
+  const resumed = await resumeSession(pages, {
+    tools: [delegateTool, fileReadTool],
+    alterStart: value => ({ ...value, revision_messages: [revision] }),
+    onChildCreate(frame, proc) {
+      assert.equal(frame.call_id, 'call_delegate_1')
+      send(proc, messageDeliveryV4(frame, revision.message_id, revision.content, [], frame.session_id, frame.call_id))
+      timeout = setTimeout(() => proc.kill('SIGKILL'), 1000)
+    },
+    onModel(frame, proc) {
+      clearTimeout(timeout)
+      replyWithText(proc, frame, 'revised answer after blocked delegation')
+    },
+  })
+  assert.equal(resumed.code, 0, `frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(resumed.frames.filter(frame => frame.type === 'child_create').length, 1)
+  assert.equal(resumed.modelCalls, 1)
+  assert.ok(resumed.modelRequests[0].messages.some(message => message.id === revision.message_id))
+  const delegatedResult = resumed.modelRequests[0].messages.find(message => message.role === 'tool' && message.toolCallId === 'call_delegate_1')
+  assert.match(delegatedResult?.content[0].text ?? '', /outcome is unknown/i)
+  const events = resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)
+  assert.equal(events.filter(event => event.type === 'user/message' && event.data.id === revision.message_id).length, 1)
+  assert.equal(events.filter(event => event.type === 'tool/result' && event.data.message?.toolCallId === 'call_delegate_1').length, 1)
+})
+
+test('a mismatched v4 target does not release a pending delegated child recovery', async () => {
+  const pages = await captureInterruptedDelegateSession()
+  const resumed = await resumeSession(pages, {
+    tools: [delegateTool, fileReadTool],
+    onChildCreate(frame, proc) {
+      send(proc, messageDeliveryV4(frame, 'm7654321', 'Use the revised answer.', [], frame.session_id, 'call_other_1'))
+      return {
+        type: 'child_session', call_id: frame.call_id,
+        task_id: frame.task_id, owner_id: frame.owner_id, agent_id: frame.agent_id,
+        generation: frame.generation, authorization_version: frame.authorization_version, session_id: 'child_789',
+        parent_session_id: frame.session_id, objective: frame.arguments.objective,
+        tools: [fileReadTool], checkpoint_through_seq: -1, checkpoint_sha256: '',
+        step_status: 'failed', summary: 'The child reports its durably reconciled failure.',
+      }
+    },
+  })
+  assert.notEqual(resumed.code, 0)
+  assert.equal(resumed.modelCalls, 0)
+  assert.equal(resumed.sentChildSessions.length, 1, 'mismatched v4 must leave child creation waiting for its actual response')
+  const events = resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)
+  assert.match(events.find(event => event.type === 'tool/result' && event.data.message?.toolCallId === 'call_delegate_1')
+    ?.data.message.content[0].text ?? '', /durably reconciled failure/i)
 })
 
 test('reconciles an interrupted MCP IPC call from the task ledger before the model resumes', async () => {
@@ -3923,6 +4205,8 @@ async function resumeSession(pages, { alterStart = value => value, alterPage = v
   const emitted = []
   const offsets = []
   const modelRequests = []
+  const sentToolResults = []
+  const sentChildSessions = []
   let modelCalls = 0
   const { child, frames } = launch((frame, proc) => {
     if (frame.type === 'ready') {
@@ -3953,20 +4237,29 @@ async function resumeSession(pages, { alterStart = value => value, alterPage = v
         proc.stdin.end()
         return
       }
-      const result = onToolCall?.(frame) ?? { status: 'succeeded', output: 'reconciled output' }
+      const result = onToolCall?.(frame, proc)
+      if (result === null) return
+      const resolved = result ?? { status: 'succeeded', output: 'reconciled output' }
+      sentToolResults.push({ call_id: frame.call_id, status: resolved.status, output: resolved.output })
       send(proc, {
         type: 'tool_result', id: frame.id, task_id: frame.task_id, owner_id: frame.owner_id,
         agent_id: frame.agent_id, generation: frame.generation, authorization_version: frame.authorization_version,
-        session_id: frame.session_id, call_id: frame.call_id, status: result.status, output: result.output,
-        ...(result.images === undefined ? {} : { images: result.images }),
+        session_id: frame.session_id, call_id: frame.call_id, status: resolved.status, output: resolved.output,
+        ...(resolved.images === undefined ? {} : { images: resolved.images }),
       })
     }
     if (frame.type === 'child_create') {
-      const result = onChildCreate?.(frame)
-      if (result) send(proc, result)
+      const result = onChildCreate?.(frame, proc)
+      if (result) {
+        sentChildSessions.push(result)
+        send(proc, result)
+      }
     }
     if (frame.type === 'child_settle') {
       send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+    }
+    if (frame.type === 'model_cancel') {
+      send(proc, { type: 'model_end', id: frame.id, ok: false })
     }
     if (frame.type === 'model') {
       modelCalls += 1
@@ -3987,7 +4280,7 @@ async function resumeSession(pages, { alterStart = value => value, alterPage = v
     }
   })
   const [code] = await once(child, 'close')
-  return { code, frames, emitted, offsets, modelCalls, modelRequests }
+  return { code, frames, emitted, offsets, modelCalls, modelRequests, sentToolResults, sentChildSessions }
 }
 
 test('restores a completed dsh session from verified pages without replaying the prompt', async () => {
@@ -4344,10 +4637,11 @@ test('restages a partially persisted revision batch before one model turn', asyn
   const persisted = body.events[pending].data.inserted[0]
   persisted.id = 'm1234567'
   persisted.content = [{ type: 'text', text: 'Use revenue only.' }]
+  persisted.source = { ...persisted.source, morde_delivery_mode: 'steer' }
   const payload = JSON.stringify(body)
   const page = { from_seq: 0, through_seq: body.events.at(-1).seq, payload, sha256: createHash('sha256').update(payload).digest('hex') }
   const revisionMessages = [
-    { message_id: 'm1234567', content: 'Use revenue only.', attachment_ids: [] },
+    { message_id: 'm1234567', content: 'Use revenue only.', attachment_ids: [], mode: 'steer' },
     { message_id: 'm2345678', content: 'Use Chinese headings.', attachment_ids: [] },
   ]
   const result = await resumeSession([page], { alterStart: value => ({ ...value, revision_messages: revisionMessages }) })
@@ -4358,6 +4652,8 @@ test('restages a partially persisted revision batch before one model turn', asyn
   const events = result.emitted.flatMap(frame => JSON.parse(frame.payload).events)
   for (const [index, message] of revisionMessages.entries()) {
     assert.equal(events.filter(event => event.type === 'user/message' && event.data.id === message.message_id).length, 1)
+    const userMessage = events.find(event => event.type === 'user/message' && event.data.id === message.message_id)
+    assert.equal(userMessage.data.source?.morde_delivery_mode, message.mode ?? 'followup')
     const delivery = events.findLast(event => event.type === 'agent/inbox/spliced' &&
       event.data.inserted.some(inserted => inserted.id === message.message_id))
     assert.equal(delivery?.data.target, index + 1 === revisionMessages.length ? 'next-turn' : 'next-step',
@@ -5408,6 +5704,89 @@ test('account runtime can stop one Task process while a sibling process continue
   input.end()
   await run
   assert.equal(frames.some(frame => frame.type === 'task_terminated' && frame.task_id === frameB.task_id), false)
+})
+
+test('account runtime reports unexpected child signals but preserves explicit Task termination reasons', async t => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const runtime = new AccountRuntime(input, output)
+  const frames = []
+  const waiters = new Set()
+  const lines = createInterface({ input: output })
+  lines.on('line', line => {
+    const frame = JSON.parse(line)
+    frames.push(frame)
+    if (frame.type === 'checkpoint') {
+      send({ stdin: input }, {
+        type: 'checkpoint_ack', ...taskFence(frame), id: frame.id, ok: true,
+        through_seq: frame.through_seq, sha256: frame.sha256,
+      })
+    }
+    if (frame.type === 'task_process_ready') send({ stdin: input }, taskProcessAdmission(frame))
+    for (const waiter of waiters) {
+      if (!waiter.predicate(frame)) continue
+      waiters.delete(waiter)
+      clearTimeout(waiter.timer)
+      waiter.resolve(frame)
+    }
+  })
+  const waitFor = predicate => {
+    const found = frames.find(predicate)
+    if (found) return Promise.resolve(found)
+    return new Promise((resolve, reject) => {
+      const waiter = { predicate, resolve, reject, timer: undefined }
+      waiter.timer = setTimeout(() => {
+        waiters.delete(waiter)
+        reject(new Error('account runtime frame timed out'))
+      }, 5_000)
+      waiters.add(waiter)
+    })
+  }
+  const run = runtime.run()
+  t.after(async () => {
+    for (const task of [...runtime.tasks.values()]) await runtime.terminateTask(task, 'test_cleanup').catch(() => {})
+    runtime.shutdown('test_cleanup')
+    input.end()
+    let timer
+    await Promise.race([run, new Promise(resolve => { timer = setTimeout(resolve, 3_000) })])
+    clearTimeout(timer)
+    lines.close()
+    output.destroy()
+  })
+
+  send({ stdin: input }, account)
+  await waitFor(frame => frame.type === 'runtime_ready')
+  const taskStart = accountTask('task_process_signal_exit')
+  send({ stdin: input }, taskStart)
+  await waitFor(frame => frame.type === 'task_started' && frame.task_id === taskStart.task_id)
+  await waitFor(frame => frame.type === 'model' && frame.task_id === taskStart.task_id)
+  const task = [...runtime.tasks.values()].find(value => value.fence.task_id === taskStart.task_id)
+  assert.ok(task?.child?.pid)
+  assert.equal(task.child.kill('SIGKILL'), true)
+
+  const terminated = await waitFor(frame => frame.type === 'task_terminated' && frame.task_id === taskStart.task_id)
+  assert.equal(terminated.state, 'unknown')
+  assert.equal(terminated.process_exited, true)
+  assert.equal(task.exit.signal, 'SIGKILL')
+  assert.equal(terminated.reason, 'child_exited_without_result; signal=SIGKILL')
+  assert.ok(Buffer.byteLength(terminated.reason) <= 128)
+
+  const explicitTaskStart = accountTask('task_process_explicit_exit', 'explicit termination reason', 2)
+  send({ stdin: input }, explicitTaskStart)
+  await waitFor(frame => frame.type === 'task_started' && frame.task_id === explicitTaskStart.task_id)
+  await waitFor(frame => frame.type === 'model' && frame.task_id === explicitTaskStart.task_id)
+  const explicitTask = [...runtime.tasks.values()].find(value => value.fence.task_id === explicitTaskStart.task_id)
+  assert.ok(explicitTask?.child?.pid)
+  explicitTask.terminateReason = 'explicit_test_stop'
+  assert.equal(explicitTask.child.kill('SIGKILL'), true)
+  const explicitlyTerminated = await waitFor(frame => frame.type === 'task_terminated' && frame.task_id === explicitTaskStart.task_id)
+  assert.equal(explicitlyTerminated.state, 'unknown')
+  assert.equal(explicitlyTerminated.reason, 'explicit_test_stop')
+
+  send({ stdin: input }, { ...account, type: 'runtime_shutdown' })
+  await waitFor(frame => frame.type === 'runtime_stopped')
+  input.end()
+  await run
 })
 
 test('account runtime rejects an invalid first runtime identity before accepting Tasks', async t => {

@@ -135,15 +135,17 @@ type ModelClient interface {
 type ModelClientErrorKind string
 
 const (
-	ModelErrorAuthentication  ModelClientErrorKind = "authentication_rejected"
-	ModelErrorAccess          ModelClientErrorKind = "access_rejected"
-	ModelErrorRateLimited     ModelClientErrorKind = "rate_limited"
-	ModelErrorQuota           ModelClientErrorKind = "quota_exhausted"
-	ModelErrorInvalidRequest  ModelClientErrorKind = "invalid_request"
-	ModelErrorUnavailable     ModelClientErrorKind = "unavailable"
-	ModelErrorTimeout         ModelClientErrorKind = "timeout"
-	ModelErrorTransport       ModelClientErrorKind = "transport"
-	ModelErrorInvalidResponse ModelClientErrorKind = "invalid_response"
+	ModelErrorAuthentication    ModelClientErrorKind = "authentication_rejected"
+	ModelErrorAccess            ModelClientErrorKind = "access_rejected"
+	ModelErrorRateLimited       ModelClientErrorKind = "rate_limited"
+	ModelErrorQuota             ModelClientErrorKind = "quota_exhausted"
+	ModelErrorInvalidRequest    ModelClientErrorKind = "invalid_request"
+	ModelErrorUnavailable       ModelClientErrorKind = "unavailable"
+	ModelErrorTimeout           ModelClientErrorKind = "timeout"
+	ModelErrorTransport         ModelClientErrorKind = "transport"
+	ModelErrorInvalidResponse   ModelClientErrorKind = "invalid_response"
+	ModelErrorEmptyResponse     ModelClientErrorKind = "empty_response"
+	ModelErrorTruncatedResponse ModelClientErrorKind = "truncated_response"
 )
 
 type ModelClientError struct {

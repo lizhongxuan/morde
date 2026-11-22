@@ -17,6 +17,7 @@ const MAX_TOOL_IMAGE_CACHE_BYTES = 8 * 1024 * 1024
 const CHECKPOINT_TIMEOUT_MS = 30_000
 const TOOL_RESULT_TIMEOUT_MS = 6 * 60_000
 const CHILD_RESULT_TIMEOUT_MS = 6 * 60_000
+const RECOVERY_TOOL_SUPERSEDED = Symbol.for('morde-cloud-runtime.recovery-tool-superseded.v1')
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 const COORDINATOR_IDENTITY_FIELDS = ['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id', 'purpose', 'operation_id']
 
@@ -236,13 +237,13 @@ export class WorkerIPC {
       this.startFrame = frame
       if (frame.initial_message) {
         this.messageDeliveries.set(frame.initial_message.message_id,
-          { signature: JSON.stringify([frame.initial_message.content, frame.initial_message.attachment_ids ?? [], 'followup']),
+          { signature: JSON.stringify([frame.initial_message.content, frame.initial_message.attachment_ids ?? [], frame.initial_message.mode ?? 'followup']),
             supersedeActive: false, supersedeTargets: new Map() })
       }
       if (Array.isArray(frame.revision_messages)) {
         for (const message of frame.revision_messages) {
           this.messageDeliveries.set(message.message_id,
-            { signature: JSON.stringify([message.content, message.attachment_ids ?? [], 'followup']),
+            { signature: JSON.stringify([message.content, message.attachment_ids ?? [], message.mode ?? 'followup']),
               supersedeActive: false, supersedeTargets: new Map() })
         }
       }
@@ -283,6 +284,7 @@ export class WorkerIPC {
           const supersedeRoot = !previous.supersedeActive
           previous.supersedeActive = true
           previous.supersedeTargets.set(frame.supersede_session_id, frame.supersede_call_id)
+          this.resolveRecoveringToolCall(frame)
           const delivery = { message_id: frame.message_id, content: frame.content, attachment_ids: [...attachmentIDs], mode,
             supersede_active: true, supersede_session_id: frame.supersede_session_id,
             supersede_call_id: frame.supersede_call_id, supersede_root: supersedeRoot }
@@ -293,6 +295,7 @@ export class WorkerIPC {
       }
       this.messageDeliveries.set(frame.message_id, { signature, supersedeActive,
         supersedeTargets: supersedeActive ? new Map([[frame.supersede_session_id, frame.supersede_call_id]]) : new Map() })
+      if (supersedeActive) this.resolveRecoveringToolCall(frame)
       const delivery = { message_id: frame.message_id, content: frame.content, attachment_ids: [...attachmentIDs], mode,
         ...(supersedeActive ? { supersede_active: true, supersede_session_id: frame.supersede_session_id,
           supersede_call_id: frame.supersede_call_id, supersede_root: true } : {}) }
@@ -459,6 +462,35 @@ export class WorkerIPC {
     throw new Error('unknown worker message')
   }
 
+  resolveRecoveringToolCall(frame) {
+    if (frame.version !== 4 || frame.supersede_active !== true) return
+    const root = this.startFrame
+    const matchesRoot = identity => identity.task_id === root.task_id && identity.task_id === frame.task_id &&
+      identity.owner_id === root.owner_id && identity.owner_id === frame.owner_id &&
+      identity.agent_id === root.agent_id && identity.agent_id === frame.agent_id &&
+      identity.generation === root.generation && identity.generation === frame.generation &&
+      identity.authorization_version === root.authorization_version && identity.authorization_version === frame.authorization_version
+    for (const [id, pending] of this.pending) {
+      if (pending.kind !== 'tool_result' || pending.recovering !== true || !matchesRoot(pending.identity) ||
+          pending.identity.session_id !== frame.supersede_session_id || pending.callID !== frame.supersede_call_id) continue
+      queueMicrotask(() => {
+        // An already delivered tool result is authoritative if both frames
+        // were queued together; supersede only releases a still-pending
+        // recovery waiter.
+        if (this.pending.get(id) === pending) pending.resolve(RECOVERY_TOOL_SUPERSEDED)
+      })
+      return
+    }
+    for (const [callID, pending] of this.childPending) {
+      if (pending.kind !== 'child_session' || pending.recovering !== true || !matchesRoot(pending.identity) ||
+          pending.identity.session_id !== frame.supersede_session_id || callID !== frame.supersede_call_id) continue
+      queueMicrotask(() => {
+        if (this.childPending.get(callID) === pending) pending.resolve(RECOVERY_TOOL_SUPERSEDED)
+      })
+      return
+    }
+  }
+
   setMessageDeliveryHandler(handler) {
     if (this.messageDeliveryClosed || this.messageDeliveryHandler || typeof handler !== 'function') {
       throw new Error('message delivery handler is unavailable')
@@ -526,7 +558,7 @@ export class WorkerIPC {
     }
   }
 
-  async toolCall(identity, through, callID, name, args, signal) {
+  async toolCall(identity, through, callID, name, args, signal, { recovering = false } = {}) {
     if (this.cancelled) throw abortError()
     if (!Number.isSafeInteger(through) || through < 0 || typeof callID !== 'string' || !callID ||
         Buffer.byteLength(callID) > 256 || typeof name !== 'string' || !name || !isObject(args)) {
@@ -545,7 +577,7 @@ export class WorkerIPC {
       clearTimeout(timer)
       result.reject(abortError())
     }
-    this.pending.set(id, { ...result, timer, kind: 'tool_result', identity, callID, name })
+    this.pending.set(id, { ...result, timer, kind: 'tool_result', identity, callID, name, recovering })
     signal?.addEventListener('abort', abort, { once: true })
     try {
       await this.send({ type: 'tool_call', id, ...identity, through_seq: through, call_id: callID, name, arguments: args })
@@ -559,7 +591,7 @@ export class WorkerIPC {
     }
   }
 
-  async createChild(identity, through, callID, args, signal) {
+  async createChild(identity, through, callID, args, signal, { recovering = false } = {}) {
     if (this.cancelled) throw abortError()
     if (!Number.isSafeInteger(through) || through < 0 || typeof callID !== 'string' || !callID ||
         Buffer.byteLength(callID) > 256 || !isObject(args) || this.childPending.has(callID)) {
@@ -577,7 +609,7 @@ export class WorkerIPC {
       clearTimeout(timer)
       result.reject(abortError())
     }
-    this.childPending.set(callID, { ...result, timer, kind: 'child_session' })
+    this.childPending.set(callID, { ...result, timer, kind: 'child_session', identity, callID, recovering })
     signal?.addEventListener('abort', abort, { once: true })
     try {
       await this.send({ type: 'child_create', ...identity, through_seq: through, call_id: callID, arguments: args })

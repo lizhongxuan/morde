@@ -264,6 +264,54 @@ func TestCloudDSHCheckpointHistoryKeepsToolResultAppendRequirement(t *testing.T)
 	}
 }
 
+func TestCloudDSHCheckpointHistoryPersistsUnknownSupersededToolResultWithoutReconciling(t *testing.T) {
+	const callID = "call_unknown_1"
+	event := cloudDSHCheckpointEvent{Sequence: 4, Type: "tool/result", SurfaceOp: "append", SourceEventSeqs: []int64{3}, Data: map[string]any{
+		"turn": 1, "step": 1, "message": map[string]any{"toolCallId": callID, "isError": true,
+			"source": map[string]any{"kind": "tool", "callId": callID}, "content": []any{
+				map[string]any{"type": "text", "text": cloudDSHUnknownToolResultText}}},
+		"error": map[string]any{"name": cloudDSHUnknownToolResultErrorName, "code": cloudDSHUnknownToolResultErrorCode},
+	}}
+	history := newCloudDSHCheckpointHistory("session_1")
+	if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+		checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+		checkpointTurnStart(1, "step/start", map[string]any{"turn": 1, "step": 1}),
+		checkpointAssistantCall(2, callID), checkpointToolCall(3, callID), event), 0, 4); err != nil {
+		t.Fatalf("explicit unknown tool outcome was not persisted: %v", err)
+	}
+	call := history.calls[callID]
+	if !call.resultSeen || !call.resultUnknown || call.reconciled || history.allCallsReconciled() {
+		t.Fatalf("unknown tool outcome was treated as reconciled: %+v", call)
+	}
+
+	for name, mutate := range map[string]func(cloudDSHCheckpointEvent) cloudDSHCheckpointEvent{
+		"wrong marker": func(value cloudDSHCheckpointEvent) cloudDSHCheckpointEvent {
+			value.Data.(map[string]any)["error"] = map[string]any{"name": "ToolOutcomeUnknownError", "code": "OTHER"}
+			return value
+		},
+		"wrong message": func(value cloudDSHCheckpointEvent) cloudDSHCheckpointEvent {
+			value.Data.(map[string]any)["message"].(map[string]any)["content"].([]any)[0].(map[string]any)["text"] = "Operation completed."
+			return value
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := event
+			encoded, _ := json.Marshal(event.Data)
+			if err := json.Unmarshal(encoded, &value.Data); err != nil {
+				t.Fatal(err)
+			}
+			value = mutate(value)
+			history := newCloudDSHCheckpointHistory("session_1")
+			if err := history.append(cloudDSHCheckpointPayload("session_1", 0,
+				checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
+				checkpointTurnStart(1, "step/start", map[string]any{"turn": 1, "step": 1}),
+				checkpointAssistantCall(2, callID), checkpointToolCall(3, callID), value), 0, 4); err == nil {
+				t.Fatal("invalid unknown tool outcome was accepted")
+			}
+		})
+	}
+}
+
 func TestCloudDSHCheckpointHistoryReconcilesPinnedToolResult(t *testing.T) {
 	history := newCloudDSHCheckpointHistory("session_1")
 	history.beginRestore()

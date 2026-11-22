@@ -1454,24 +1454,29 @@ func TestCloudDSHToolBrokerPausesUnresolvedRecoveryDurably(t *testing.T) {
 }
 
 func TestCloudDSHToolBrokerModelRecoveryStoresSafeFailureCategory(t *testing.T) {
+	for _, category := range []string{"timeout", "empty_response", "truncated_response"} {
+		t.Run(category, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, nil)
+			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+			fixture.executor.store = store
+			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := broker.PauseModelRecovery(context.Background(), store.details.Task, category); err != nil {
+				t.Fatalf("PauseModelRecovery() error = %v", err)
+			}
+			if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "dsh_recovery_unresolved" ||
+				len(store.details.Steps) != 1 || !strings.Contains(store.details.Steps[0].Summary, "category: "+category) {
+				t.Fatalf("model recovery did not persist safe category %q: task=%#v steps=%#v", category, store.details.Task, store.details.Steps)
+			}
+		})
+	}
+
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
 	fixture.executor.store = store
 	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := broker.PauseModelRecovery(context.Background(), store.details.Task, "timeout"); err != nil {
-		t.Fatalf("PauseModelRecovery() error = %v", err)
-	}
-	if len(store.details.Steps) != 1 || !strings.Contains(store.details.Steps[0].Summary, "category: timeout") {
-		t.Fatalf("model recovery summary did not include safe category: %#v", store.details.Steps)
-	}
-
-	fixture = newRuntimeToolExecutorFixture(t, nil)
-	store = &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
-	fixture.executor.store = store
-	broker, err = NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

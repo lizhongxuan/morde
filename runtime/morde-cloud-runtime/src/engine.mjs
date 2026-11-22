@@ -49,6 +49,9 @@ const MAX_USER_MESSAGE_BYTES = 128 * 1024
 const MAX_COMPACTION_INPUT_BYTES = 128 * 1024
 const MAX_COMPACTION_SUMMARY_BYTES = 256 * 1024
 const STALE_MODEL_TOOL_MESSAGE = 'A new task input arrived before this tool call was dispatched. Re-evaluate the updated request first.'
+const UNKNOWN_SUPERSEDED_TOOL_RESULT = 'The tool outcome is unknown. The operation may already have happened. Do not repeat it; verify external state or ask the user before trying again.'
+const UNKNOWN_SUPERSEDED_TOOL_ERROR = Object.freeze({ name: 'ToolOutcomeUnknownError', code: 'TOOL_OUTCOME_UNKNOWN' })
+const RECOVERY_TOOL_SUPERSEDED = Symbol.for('morde-cloud-runtime.recovery-tool-superseded.v1')
 const CHILD_ABORT_REASON_MAX_BYTES = 1024
 const AGENT_HEARTBEAT_INTERVAL_MS = 15_000
 const ACTIVITY_PHASES = new Set(['model', 'tool', 'subagent', 'checkpoint'])
@@ -115,7 +118,7 @@ function isMordeMCPTool(tool) {
   return typeof tool?.name === 'string' && tool.name.startsWith(MORDE_MCP_TOOL_PREFIX)
 }
 
-function mordeMCPToolDefinition(sessionDurable, tool, onError) {
+function mordeMCPToolDefinition(sessionDurable, tool, onError, { recovering = false } = {}) {
   return {
     name: tool.name,
     description: tool.description,
@@ -142,7 +145,9 @@ function mordeMCPToolDefinition(sessionDurable, tool, onError) {
           }
           const response = await sessionDurable.ipc.toolCall(
             sessionDurable.identity, sessionDurable.through, execution.callId, tool.name, args, execution.signal,
+            { recovering },
           )
+          if (response === RECOVERY_TOOL_SUPERSEDED) return response
           if (!validMordeMCPToolResult(response)) throw new Error('Morde MCP broker returned an invalid result')
           return response
         })
@@ -277,7 +282,8 @@ function recoveryToolCalls(events, tools) {
         }
         const args = JSON.parse(block.arguments)
         if (!isObject(args) || calls.has(block.id)) throw new Error('checkpointed dsh tool call identity is invalid')
-        calls.set(block.id, { id: block.id, name: block.name, definition: tool, arguments: block.arguments, args, turn: event.data.turn, step: event.data.step, callSeq: undefined, resultText: undefined, resultImages: undefined })
+        calls.set(block.id, { id: block.id, name: block.name, definition: tool, arguments: block.arguments, args,
+          turn: event.data.turn, step: event.data.step, callSeq: undefined, resultText: undefined, resultImages: undefined, resultUnknown: false })
       }
     } else if (event.type === 'tool/call') {
       const call = calls.get(event.data.callId)
@@ -288,11 +294,17 @@ function recoveryToolCalls(events, tools) {
       const message = event.data.message
       const call = calls.get(message?.source?.callId)
       const imageContent = Array.isArray(message?.content) ? message.content.slice(1) : []
+      const unknownOutcome = message?.isError === true && exactKeys(event.data.error ?? {}, ['name', 'code']) &&
+        event.data.error.name === UNKNOWN_SUPERSEDED_TOOL_ERROR.name && event.data.error.code === UNKNOWN_SUPERSEDED_TOOL_ERROR.code &&
+        Array.isArray(message.content) && message.content.length === 1 && message.content[0]?.type === 'text' &&
+        message.content[0].text === UNKNOWN_SUPERSEDED_TOOL_RESULT
+      const ordinaryOutcome = message?.isError === false && event.data.error === undefined
       if (!call || call.resultText !== undefined || call.callSeq === undefined || message.toolCallId !== call.id ||
-          message.isError !== false || event.data.error !== undefined || event.surfaceOp !== 'append' ||
+          (!ordinaryOutcome && !unknownOutcome) || event.surfaceOp !== 'append' ||
           !Array.isArray(event.sourceEventSeqs) || event.sourceEventSeqs.length !== 1 || event.sourceEventSeqs[0] !== call.callSeq ||
           event.data.turn !== call.turn || event.data.step !== call.step || openTurn !== call.turn || openStep !== call.step || !Array.isArray(message.content) ||
           message.content.length < 1 || message.content.length > 1 + toolImageLimit(call.name) ||
+          unknownOutcome && imageContent.length !== 0 ||
           message.content[0].type !== 'text' || typeof message.content[0].text !== 'string' ||
           imageContent.some(block => !isObject(block) || Object.keys(block).sort().join(',') !== 'attachment,type' ||
             block.type !== 'image' || !validImageRef(block.attachment))) {
@@ -300,6 +312,7 @@ function recoveryToolCalls(events, tools) {
       }
       call.resultText = message.content[0].text
       call.resultImages = imageContent.map(block => block.attachment)
+      call.resultUnknown = unknownOutcome
     }
   }
   for (const call of calls.values()) {
@@ -547,6 +560,19 @@ export function taskValidationReviewModelCallID(ownerID, taskID, taskRevision, r
   return `review_${createHash('sha256').update(input, 'utf8').digest('hex')}`
 }
 
+function validTaskStartMessage(message, identity) {
+  const keys = ['message_id', 'content', 'attachment_ids']
+  if (!isObject(message) || (!exactKeys(message, keys) && !exactKeys(message, [...keys, 'mode']))) return false
+  const mode = Object.hasOwn(message, 'mode') ? message.mode : 'followup'
+  if (!['steer', 'followup'].includes(mode)) return false
+  return validMessageDelivery({
+    type: 'message_delivery', version: 3,
+    ...Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+      .map(key => [key, identity[key]])),
+    ...message, mode,
+  }, identity)
+}
+
 export function validStart(frame) {
   if (frame.version !== 1 || frame.type !== 'start') return false
   const coordinator = frame.context_role === 'coordinator'
@@ -619,11 +645,10 @@ export function validStart(frame) {
   if (frame.checkpoint !== undefined || (frame.resume !== undefined && typeof frame.resume !== 'boolean')) return false
   if (frame.initial_message !== undefined) {
     const initial = frame.initial_message
-    if (!isObject(initial) || !exactKeys(initial, ['message_id', 'content', 'attachment_ids']) || frame.prompt !== undefined ||
-        (coordinator && (initial.message_id !== frame.message_id || !validCoordinatorMessage(initial))) ||
-        (!coordinator && (!validMessageDelivery({ type: 'message_delivery', version: 2,
-          ...Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id'].map(key => [key, frame[key]])),
-          ...initial }, frame) || frame.resume === true))) return false
+    if (frame.prompt !== undefined || (coordinator
+      ? !isObject(initial) || !exactKeys(initial, ['message_id', 'content', 'attachment_ids']) ||
+        initial.message_id !== frame.message_id || !validCoordinatorMessage(initial)
+      : !validTaskStartMessage(initial, frame) || frame.resume === true)) return false
   }
   if (frame.initial_context !== undefined && (typeof frame.initial_context !== 'string' || !frame.initial_context.isWellFormed() ||
       frame.initial_context.includes('\0') || Buffer.byteLength(frame.initial_context) > MAX_CHECKPOINT_PAYLOAD_BYTES / 2 || (!coordinator && frame.resume === true))) return false
@@ -631,10 +656,7 @@ export function validStart(frame) {
     if (!Array.isArray(frame.revision_messages) || frame.revision_messages.length < 1 || frame.revision_messages.length > 128) return false
     const seen = new Set(frame.initial_message ? [frame.initial_message.message_id] : [])
     for (const message of frame.revision_messages) {
-      if (!isObject(message) || !exactKeys(message, ['message_id', 'content', 'attachment_ids']) || seen.has(message.message_id) ||
-          !validMessageDelivery({ type: 'message_delivery', version: 2,
-            ...Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id'].map(key => [key, frame[key]])),
-            ...message }, frame)) return false
+      if (!validTaskStartMessage(message, frame) || seen.has(message.message_id)) return false
       seen.add(message.message_id)
     }
   }
@@ -1073,30 +1095,52 @@ class DurableSession {
         continue
       }
       if (retry && call.id === retry.retry_call_id) throw new Error('step retry identity already appears in checkpoint history')
+      if (call.resultUnknown) continue
       let resultText
       let resultImages
+      let supersededDuringRecovery = false
       if (call.name === DELEGATE_TOOL) {
-        const result = await this.executeDelegate?.(this, call.id, call.args, signal, call.resultText)
+        const result = await this.executeDelegate?.(this, call.id, call.args, signal, call.resultText, true)
         if (!result) throw new Error('delegated child recovery is unavailable')
-        resultText = result.status === 'failed' ? `Tool failed: ${result.output}` : result.output
-        resultImages = result.images
-      } else if (isMordeMCPTool(call.definition)) {
-        const definition = mordeMCPToolDefinition(this, call.definition)
-        const value = await definition.execute(call.args, { callId: call.id, signal })
-        const content = definition.output.render(call.args, value)
-        if (!Array.isArray(content) || content.length !== 1 + value.images.length || content[0]?.type !== 'text' ||
-            typeof content[0].text !== 'string' || content.slice(1).some((block, index) =>
-              block?.type !== 'image' || !validImageRef(block.attachment) ||
-              !sameImageRefs([block.attachment], [value.images[index]]))) {
-          throw new Error('Morde MCP recovery result could not be rendered')
+        if (result === RECOVERY_TOOL_SUPERSEDED) {
+          supersededDuringRecovery = true
+        } else {
+          resultText = result.status === 'failed' ? `Tool failed: ${result.output}` : result.output
+          resultImages = result.images
         }
-        resultText = content[0].text
-        resultImages = value.images
+      } else if (isMordeMCPTool(call.definition)) {
+        const definition = mordeMCPToolDefinition(this, call.definition, undefined, { recovering: true })
+        const value = await definition.execute(call.args, { callId: call.id, signal })
+        if (value === RECOVERY_TOOL_SUPERSEDED) {
+          supersededDuringRecovery = true
+        } else {
+          const content = definition.output.render(call.args, value)
+          if (!Array.isArray(content) || content.length !== 1 + value.images.length || content[0]?.type !== 'text' ||
+              typeof content[0].text !== 'string' || content.slice(1).some((block, index) =>
+                block?.type !== 'image' || !validImageRef(block.attachment) ||
+                !sameImageRefs([block.attachment], [value.images[index]]))) {
+            throw new Error('Morde MCP recovery result could not be rendered')
+          }
+          resultText = content[0].text
+          resultImages = value.images
+        }
       } else {
-        const result = await this.ipc.toolCall(this.identity, this.through, call.id, call.name, call.args, signal)
-        if (!result) throw new Error('tool recovery result is unavailable')
-        resultText = result.status === 'failed' ? `Tool failed: ${result.output}` : result.output
-        resultImages = result.images
+        const result = await this.ipc.toolCall(this.identity, this.through, call.id, call.name, call.args, signal, { recovering: true })
+        if (result === RECOVERY_TOOL_SUPERSEDED) {
+          supersededDuringRecovery = true
+        } else {
+          if (!result) throw new Error('tool recovery result is unavailable')
+          resultText = result.status === 'failed' ? `Tool failed: ${result.output}` : result.output
+          resultImages = result.images
+        }
+      }
+      if (supersededDuringRecovery) {
+        // A v4 steer can race the result gate after dispatch. Preserve a
+        // checkpointed result when one exists; otherwise close this open call
+        // with an explicit unknown outcome so DSH never repeats it blindly.
+        if (call.resultText !== undefined) continue
+        resultText = UNKNOWN_SUPERSEDED_TOOL_RESULT
+        resultImages = []
       }
       if (call.resultText !== undefined) {
         if (call.resultText !== resultText || !sameImageRefs(call.resultImages, resultImages)) throw new Error('checkpointed dsh result differs from the reconciled operation ledger')
@@ -1106,10 +1150,14 @@ class DurableSession {
       await this.appendRecovery([{
         type: 'tool/result', seq: this.through + 1, time: last.time,
         data: { turn: call.turn, step: call.step, message: createToolResultMessage({
-          callId: call.id, content: [{ type: 'text', text: resultText }, ...resultImages.map(attachment => ({ type: 'image', attachment }))], isError: false,
-        }) },
+          callId: call.id, content: [{ type: 'text', text: resultText }, ...resultImages.map(attachment => ({ type: 'image', attachment }))],
+          isError: supersededDuringRecovery,
+        }), ...(supersededDuringRecovery ? { error: UNKNOWN_SUPERSEDED_TOOL_ERROR } : {}) },
         surfaceOp: 'append', sourceEventSeqs: [call.callSeq],
       }], context, signal)
+      call.resultText = resultText
+      call.resultImages = resultImages
+      call.resultUnknown = supersededDuringRecovery
     }
     if (this.start.step_retry && !retrySource) throw new Error('step retry source is missing from the pinned checkpoint')
     this.stepRetrySource = retrySource
@@ -1556,9 +1604,12 @@ export async function runAgent(ipc, frame) {
 
   function requireSupersedingActivity(sessionDurable, callID) {
     const activity = sessionDurable.activeActivities.get(callID)
-    if (!activity || !['tool', 'subagent'].includes(activity.phase)) {
-      throw new Error('superseding call does not match an active DSH tool')
-    }
+    if (activity && ['tool', 'subagent'].includes(activity.phase)) return
+    const history = sessionDurable.recoveryHistory
+    const recoveredCall = history?.calls.find(call => call.id === callID && call.callSeq !== undefined)
+    const recoveredResult = recoveredCall && sessionDurable.restored?.events.some(event => event.type === 'tool/result' &&
+      event.data?.message?.source?.callId === callID)
+    if (!recoveredResult) throw new Error('superseding call does not match an active DSH tool')
   }
 
   function supersedeChildSession(sessionID, callID) {
@@ -1718,7 +1769,7 @@ export async function runAgent(ipc, frame) {
     return job.status === 'cancelled' ? 'cancelled' : job.status
   }
 
-  async function runDelegation(parentDurable, parentAgent, callID, argumentsValue, signal, recordedOutput) {
+  async function runDelegation(parentDurable, parentAgent, callID, argumentsValue, signal, recordedOutput, recovering = false) {
     if (!validDelegateArguments(argumentsValue, appTools)) throw new Error('delegated task arguments are invalid')
     const ownerKey = `${parentDurable.identity.session_id}\0${callID}`
     const existing = delegatedCalls.get(ownerKey)
@@ -1729,7 +1780,9 @@ export async function runAgent(ipc, frame) {
       if (parentAgent && parentDurable.modelDeliveryVersion !== parentDurable.messageDeliveryVersion) {
         return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
       }
-      const response = await ipc.createChild(parentDurable.identity, parentDurable.through, callID, argumentsValue, signal)
+      const response = await ipc.createChild(parentDurable.identity, parentDurable.through, callID, argumentsValue, signal,
+        { recovering })
+      if (response === RECOVERY_TOOL_SUPERSEDED) return response
       const child = validateChildSession(response, parentDurable.identity, callID, argumentsValue, appTools)
       if (argumentsValue.run_in_background === true) {
         if (recordedOutput !== undefined) {
@@ -1773,8 +1826,8 @@ export async function runAgent(ipc, frame) {
     }
   }
 
-  durable.executeDelegate = (parentDurable, callID, args, signal, recordedOutput) =>
-    runDelegation(parentDurable, undefined, callID, args, signal, recordedOutput)
+  durable.executeDelegate = (parentDurable, callID, args, signal, recordedOutput, recovering = false) =>
+    runDelegation(parentDurable, undefined, callID, args, signal, recordedOutput, recovering)
   class WorkerModel extends LlmAdapter {
     async resolveModel(provider, model) {
       if (provider !== 'morde' || model !== frame.model) throw new Error('model route is not authorized')
@@ -1996,15 +2049,17 @@ export async function runAgent(ipc, frame) {
       for (const existing of [...agent.inbox.nextStep, ...agent.inbox.nextTurn]) {
         const message = byID.get(existing.id)
         if (!message && existing.source?.kind === 'plugin' && existing.source?.plugin === 'morde-context' && ++contextCount === 1) continue
-        if (!message || !sameDeliveredMessage(existing, message.message_id, message.content, message.attachment_ids)) {
+        const mode = message && (Object.hasOwn(message, 'mode') ? message.mode : 'followup')
+        if (!message || !sameDeliveredMessage(existing, message.message_id, message.content, message.attachment_ids, mode)) {
           throw new Error('checkpoint contains an unrelated pending message')
         }
         if (!agent.inbox.remove(existing.id)) throw new Error('pending revision could not be restaged')
       }
       for (let index = 0; index < deliveries.length; index++) {
         const message = deliveries[index]
+        const mode = Object.hasOwn(message, 'mode') ? message.mode : 'followup'
         const value = freezeMessage({ id: MessageId(message.message_id), role: 'user',
-          content: deliveredMessageBlocks(message.content, message.attachment_ids), source: { kind: 'user' } })
+          content: deliveredMessageBlocks(message.content, message.attachment_ids), source: { kind: 'user', morde_delivery_mode: mode } })
         if (index + 1 === deliveries.length) agent.followup(value)
         else agent.inject(value)
       }
@@ -2034,9 +2089,16 @@ export async function runAgent(ipc, frame) {
       if (frame.prompt !== undefined && (!recovery.completed || recovery.openTurn !== null)) {
         throw new Error('server continuation requires a completed checkpoint')
       }
+      const hasRevisionMessages = revisionMessages.length !== 0
+      if (frame.step_retry === undefined && hasRevisionMessages) {
+        stageRevisionMessages(revisionMessages)
+        installMessageDeliveryHandler()
+      }
       await agent.whenIdle()
       if (!await ctx.sessions.flush(agent.session)) throw new Error('checkpoint listener unavailable')
-      if (state.failed || state.toolFailure || ipc.cancelled) throw new Error('session recovery did not remain idle')
+      if (state.failed || state.toolFailure || ipc.cancelled) {
+        throw new Error(hasRevisionMessages ? 'revised task did not remain idle' : 'session recovery did not remain idle')
+      }
       if (frame.step_retry !== undefined) {
         if (!recovery.completed || recovery.openTurn !== null || revisionMessages.length !== 0) {
           throw new Error('step retry requires a completed pinned checkpoint')
@@ -2056,13 +2118,6 @@ export async function runAgent(ipc, frame) {
         await agent.whenIdle()
         if (!await ctx.sessions.flush(agent.session)) throw new Error('step retry checkpoint listener unavailable')
         if (state.failed || state.toolFailure || ipc.cancelled) throw new Error('step retry continuation did not remain idle')
-      }
-      if (revisionMessages.length !== 0) {
-        stageRevisionMessages(revisionMessages)
-        installMessageDeliveryHandler()
-        await agent.whenIdle()
-        if (!await ctx.sessions.flush(agent.session)) throw new Error('checkpoint listener unavailable')
-        if (state.failed || state.toolFailure || ipc.cancelled) throw new Error('revised task did not remain idle')
       }
       if (frame.prompt !== undefined && !continuationAlreadyQueued) {
         // A completed checkpoint cannot naturally enter another turn. The
@@ -2102,8 +2157,12 @@ export async function runAgent(ipc, frame) {
         content: [{ type: 'text', text: frame.initial_context }], source: { kind: 'plugin', plugin: 'morde-context' },
       }))
       if (revisionMessages.length !== 0) stageRevisionMessages([frame.initial_message, ...revisionMessages])
-      else agent.followup(freezeMessage({ id: MessageId(frame.initial_message.message_id), role: 'user',
-        content: deliveredMessageBlocks(frame.initial_message.content, frame.initial_message.attachment_ids), source: { kind: 'user' } }))
+      else {
+        const mode = Object.hasOwn(frame.initial_message, 'mode') ? frame.initial_message.mode : 'followup'
+        agent.followup(freezeMessage({ id: MessageId(frame.initial_message.message_id), role: 'user',
+          content: deliveredMessageBlocks(frame.initial_message.content, frame.initial_message.attachment_ids),
+          source: { kind: 'user', morde_delivery_mode: mode } }))
+      }
     } else if (revisionMessages.length !== 0) {
       agent.inject(createUserMessage({ content: [{ type: 'text', text: frame.prompt }], source: { kind: 'plugin', plugin: 'morde-context' } }))
       stageRevisionMessages(revisionMessages)

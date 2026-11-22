@@ -191,19 +191,36 @@ func OpenTaskModelResponse(sealer *Sealer, record TaskModelResponseRecord, reser
 
 func validateTaskModelResponse(request ModelRequest, response ModelResponse) error {
 	if !ValidDSHModelResponse(response) {
-		return domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid task response")
+		return invalidTaskModelResponseError(response, "model provider returned an invalid task response")
 	}
 	for _, call := range response.ToolCalls {
 		if !validAgentJSONObject([]byte(call.Arguments), maxAgentToolArgsBytes) {
-			return domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid tool call")
+			return invalidTaskModelResponseError(response, "model provider returned an invalid tool call")
 		}
 		declared := false
 		for _, tool := range request.Tools {
 			declared = declared || tool.Name == call.Name
 		}
 		if !declared || request.RequiredTool != "" && call.Name != request.RequiredTool {
-			return domain.NewError(domain.CodeUpstreamError, "model provider returned a tool call not allowed by the request")
+			return invalidTaskModelResponseError(response, "model provider returned a tool call not allowed by the request")
 		}
 	}
 	return nil
+}
+
+func invalidTaskModelResponseError(response ModelResponse, message string) *domain.Error {
+	reason := ModelErrorInvalidResponse
+	switch {
+	case response.ProviderReportedModel != "" && ValidProviderReportedModel(response.ProviderReportedModel) && response.Usage.Known &&
+		response.Usage.InputTokens > 0 && response.Usage.InputTokens <= maxDSHModelResponseTokenCount &&
+		response.Usage.OutputTokens > 0 && response.Usage.OutputTokens <= maxDSHModelResponseTokenCount && response.StopReason == "length":
+		reason = ModelErrorTruncatedResponse
+	case response.ProviderReportedModel != "" && ValidProviderReportedModel(response.ProviderReportedModel) && response.StopReason == "stop" &&
+		len(response.ToolCalls) == 0 && response.Text == "" && response.Reasoning == "" && response.Usage.Known &&
+		response.Usage.InputTokens > 0 && response.Usage.InputTokens <= maxDSHModelResponseTokenCount && response.Usage.OutputTokens == 0:
+		reason = ModelErrorEmptyResponse
+	}
+	err := domain.NewError(domain.CodeUpstreamError, message)
+	err.Details["reason"] = string(reason)
+	return err
 }

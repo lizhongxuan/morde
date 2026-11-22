@@ -919,6 +919,13 @@ func cloudDSHTaskInputPendingMessages(err error) ([]app.AgentConversationMessage
 	return append([]app.AgentConversationMessage(nil), pending.PendingMessages...), true
 }
 
+func cloudDSHStartDeliveryMode(mode app.AgentMessageDeliveryMode) (app.AgentMessageDeliveryMode, bool) {
+	if mode == "" {
+		mode = app.AgentMessageDeliveryFollowup
+	}
+	return mode, mode == app.AgentMessageDeliverySteer || mode == app.AgentMessageDeliveryFollowup
+}
+
 func cloudDSHMessageDeliveryFingerprint(message app.AgentConversationMessage) string {
 	mode := message.Mode
 	if mode == "" {
@@ -1481,15 +1488,16 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if !message.RevisionUpdate {
 					continue
 				}
+				mode, validMode := cloudDSHStartDeliveryMode(message.Mode)
 				if !domain.ValidMessageID(message.ID) || (strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) ||
-					!utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) {
+					!utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) || !validMode {
 					return errors.New("pending task revision is invalid")
 				}
 				if len(message.Content) > app.MaxConversationAgentInputBytes {
 					return cloudDSHModelResultError{category: "context_length_exceeded"}
 				}
 				revisionBatch = append(revisionBatch, map[string]any{"message_id": message.ID, "content": message.Content,
-					"attachment_ids": append([]string{}, message.AttachmentIDs...)})
+					"attachment_ids": append([]string{}, message.AttachmentIDs...), "mode": string(mode)})
 				seenDeliveries[message.ID] = cloudDSHMessageDeliveryFingerprint(message)
 			}
 			if resume && len(revisionBatch) != 0 {
@@ -1499,13 +1507,14 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					if !message.Initial || message.RevisionUpdate {
 						continue
 					}
+					mode, validMode := cloudDSHStartDeliveryMode(message.Mode)
 					if !domain.ValidMessageID(message.ID) || !utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') ||
 						(strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) || len(message.Content) > app.MaxConversationAgentInputBytes ||
-						!validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) {
+						!validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) || !validMode {
 						return errors.New("pending initial conversation message is invalid")
 					}
 					revisionBatch = append([]map[string]any{{"message_id": message.ID, "content": message.Content,
-						"attachment_ids": append([]string{}, message.AttachmentIDs...)}}, revisionBatch...)
+						"attachment_ids": append([]string{}, message.AttachmentIDs...), "mode": string(mode)}}, revisionBatch...)
 					seenDeliveries[message.ID] = cloudDSHMessageDeliveryFingerprint(message)
 				}
 			}
@@ -1655,8 +1664,12 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					if len(contextText) > cloudDSHMaxText {
 						return cloudDSHModelResultError{category: "context_length_exceeded"}
 					}
+					mode, validMode := cloudDSHStartDeliveryMode(initial.Mode)
+					if !validMode {
+						return errors.New("initial conversation message delivery mode is invalid")
+					}
 					start["initial_message"] = map[string]any{"message_id": initial.ID, "content": initial.Content,
-						"attachment_ids": append([]string{}, initial.AttachmentIDs...)}
+						"attachment_ids": append([]string{}, initial.AttachmentIDs...), "mode": string(mode)}
 					if contextText != "" {
 						start["initial_context"] = contextText
 					}
@@ -2065,27 +2078,47 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 			call := app.ModelToolCall{CallID: toolCallID, Name: frame.Name, Arguments: string(arguments),
 				TaskFence: cloudDSHModelFencePointer(fence, state.identity.SessionID, state.through)}
-			admission, err := e.admitToolCall(ctx, value, call, fence, recoveryCall)
-			if err != nil {
-				return errors.New("dsh tool call admission could not be confirmed")
+			var result app.AgentToolResult
+			recoveredPersonalResult := false
+			if recoveryCall {
+				// A committed personal receipt must be reconciled before later steer admission.
+				if _, recorded, ok := cloudDSHRecoveredPersonalReceipt(recoveredPersonalWrites, state.history, frame.CallID,
+					state.history.calls[frame.CallID]); ok {
+					reader, ok := e.options.Tools.(cloudDSHPersonalWriteReceiptReader)
+					if !ok {
+						return errCloudDSHPersonalMemoryChanged
+					}
+					_, output, err := reader.ConfirmPersonalContextWrite(ctx, value, fence, rootThrough, rootDigest, call)
+					if err != nil || output != recorded {
+						return errCloudDSHPersonalMemoryChanged
+					}
+					result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: output}
+					recoveredPersonalResult = true
+				}
 			}
-			switch admission.Status {
-			case app.AgentToolCallAdmitted:
-			case app.AgentToolCallSuperseded:
-				if err := supersedeToolCall(ctx, admission.PendingMessages, state.identity.SessionID, frame.CallID); err != nil {
-					return err
+			if !recoveredPersonalResult {
+				admission, err := e.admitToolCall(ctx, value, call, fence, recoveryCall)
+				if err != nil {
+					return errors.New("dsh tool call admission could not be confirmed")
 				}
-				continue
-			case app.AgentToolCallBaselineUnverifiable:
-				if state.identity.SessionID == rootIdentity.SessionID || admission.Reason == "" {
-					return errors.New("dsh baseline-unverifiable admission is not a child call")
+				switch admission.Status {
+				case app.AgentToolCallAdmitted:
+				case app.AgentToolCallSuperseded:
+					if err := supersedeToolCall(ctx, admission.PendingMessages, state.identity.SessionID, frame.CallID); err != nil {
+						return err
+					}
+					continue
+				case app.AgentToolCallBaselineUnverifiable:
+					if state.identity.SessionID == rootIdentity.SessionID || admission.Reason == "" {
+						return errors.New("dsh baseline-unverifiable admission is not a child call")
+					}
+					if err := e.writeCloudDSHChildAbort(ctx, fence, input, state.identity.SessionID, frame.CallID, admission.Reason); err != nil {
+						return err
+					}
+					continue
+				default:
+					return errors.New("dsh tool call admission returned an unsupported result")
 				}
-				if err := e.writeCloudDSHChildAbort(ctx, fence, input, state.identity.SessionID, frame.CallID, admission.Reason); err != nil {
-					return err
-				}
-				continue
-			default:
-				return errors.New("dsh tool call admission returned an unsupported result")
 			}
 			cancelRequested, err := e.cloudDSHJobCancelRequested(ctx, fence, state)
 			if err != nil {
@@ -2112,65 +2145,66 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return errCloudDSHPersonalMemoryChanged
 				}
 			}
-			var result app.AgentToolResult
-			if frame.Name == cloudDSHResultEvidenceToolName {
-				result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: "Evidence map received as an untrusted claim. It is retained only if references resolve and the final answer exactly matches the text in the assistant message that submitted it."}
-			} else if cloudDSHJobTool(frame.Name) {
-				if state.identity.SessionID != rootIdentity.SessionID || e.options.Children == nil {
-					return errors.New("dsh job tool is unavailable to this session")
-				}
-				if recoveryCall {
-					if output := state.history.recoveryOutput(frame.CallID); output != nil {
-						result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: *output}
+			if !recoveredPersonalResult {
+				if frame.Name == cloudDSHResultEvidenceToolName {
+					result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: "Evidence map received as an untrusted claim. It is retained only if references resolve and the final answer exactly matches the text in the assistant message that submitted it."}
+				} else if cloudDSHJobTool(frame.Name) {
+					if state.identity.SessionID != rootIdentity.SessionID || e.options.Children == nil {
+						return errors.New("dsh job tool is unavailable to this session")
 					}
-				}
-				if result.Status == "" {
-					if frame.Name == cloudDSHJobCancelToolName {
-						immediate, pending, jobID, cancelErr := e.cancelCloudDSHJob(ctx, fence, rootIdentity.SessionID, frame.CallID, frame.Arguments)
-						if cancelErr != nil {
-							if messages, superseded := cloudDSHTaskInputPendingMessages(cancelErr); superseded {
-								if err := supersedeToolCall(ctx, messages, state.identity.SessionID, frame.CallID); err != nil {
+					if recoveryCall {
+						if output := state.history.recoveryOutput(frame.CallID); output != nil {
+							result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: *output}
+						}
+					}
+					if result.Status == "" {
+						if frame.Name == cloudDSHJobCancelToolName {
+							immediate, pending, jobID, cancelErr := e.cancelCloudDSHJob(ctx, fence, rootIdentity.SessionID, frame.CallID, frame.Arguments)
+							if cancelErr != nil {
+								if messages, superseded := cloudDSHTaskInputPendingMessages(cancelErr); superseded {
+									if err := supersedeToolCall(ctx, messages, state.identity.SessionID, frame.CallID); err != nil {
+										return err
+									}
+									continue
+								}
+								return errors.New("dsh background job cancellation could not be authorized")
+							}
+							if pending {
+								pendingCancels[frame.ID] = cloudDSHJobCancelPending{session: state, fence: fence, frame: frame,
+									arguments: arguments, identity: rootIdentity, jobID: jobID}
+								if err := e.writeCloudDSHJobCancel(ctx, rootIdentity, frame.ID, jobID, input); err != nil {
+									delete(pendingCancels, frame.ID)
 									return err
 								}
 								continue
 							}
-							return errors.New("dsh background job cancellation could not be authorized")
+							result = immediate
+						} else {
+							result, err = e.executeCloudDSHJobRead(ctx, value, fence, frame, states)
 						}
-						if pending {
-							pendingCancels[frame.ID] = cloudDSHJobCancelPending{session: state, fence: fence, frame: frame,
-								arguments: arguments, identity: rootIdentity, jobID: jobID}
-							if err := e.writeCloudDSHJobCancel(ctx, rootIdentity, frame.ID, jobID, input); err != nil {
-								delete(pendingCancels, frame.ID)
-								return err
-							}
-							continue
+					}
+				} else if recoveryCall {
+					if _, recorded, ok := cloudDSHRecoveredPersonalReceipt(recoveredPersonalWrites, state.history, frame.CallID,
+						state.history.calls[frame.CallID]); ok {
+						reader, ok := e.options.Tools.(cloudDSHPersonalWriteReceiptReader)
+						if !ok {
+							return errCloudDSHPersonalMemoryChanged
 						}
-						result = immediate
+						_, output, err := reader.ConfirmPersonalContextWrite(ctx, value, fence, rootThrough, rootDigest, call)
+						if err != nil || output != recorded {
+							return errCloudDSHPersonalMemoryChanged
+						}
+						result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: output}
 					} else {
-						result, err = e.executeCloudDSHJobRead(ctx, value, fence, frame, states)
+						recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools)
+						if !ok {
+							return errors.New("dsh recovery broker is unavailable")
+						}
+						result, err = recoveryTools.Reconcile(ctx, value, call, state.history.recoveryOutput(frame.CallID))
 					}
-				}
-			} else if recoveryCall {
-				if _, recorded, ok := cloudDSHRecoveredPersonalReceipt(recoveredPersonalWrites, state.history, frame.CallID,
-					state.history.calls[frame.CallID]); ok {
-					reader, ok := e.options.Tools.(cloudDSHPersonalWriteReceiptReader)
-					if !ok {
-						return errCloudDSHPersonalMemoryChanged
-					}
-					_, output, err := reader.ConfirmPersonalContextWrite(ctx, value, fence, rootThrough, rootDigest, call)
-					if err != nil || output != recorded {
-						return errCloudDSHPersonalMemoryChanged
-					}
-					result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: output}
 				} else {
-					recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools)
-					if !ok {
-						return errors.New("dsh recovery broker is unavailable")
-					}
-					result, err = recoveryTools.Reconcile(ctx, value, call, state.history.recoveryOutput(frame.CallID))
+					result, err = e.options.Tools.Execute(ctx, value, call)
 				}
-			} else {
-				result, err = e.options.Tools.Execute(ctx, value, call)
 			}
 			if err != nil {
 				return errors.New("dsh tool execution could not be confirmed")
@@ -2187,22 +2221,24 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				}
 				return errors.New("dsh tool execution requires user attention")
 			}
-			resultAdmission, err := e.admitToolCall(ctx, value, call, fence, true)
-			if err != nil {
-				return errors.New("dsh tool result admission could not be confirmed")
-			}
-			if resultAdmission.Status == app.AgentToolCallSuperseded {
-				if err := supersedeToolCall(ctx, resultAdmission.PendingMessages, state.identity.SessionID, frame.CallID); err != nil {
-					return err
-				}
-				continue
-			}
 			terminalChildFailure := ""
-			if resultAdmission.Status == app.AgentToolCallBaselineUnverifiable && state.identity.SessionID != rootIdentity.SessionID {
-				terminalChildFailure = resultAdmission.Reason
-			}
-			if resultAdmission.Status != app.AgentToolCallAdmitted && terminalChildFailure == "" {
-				return errors.New("dsh tool result admission returned an unsupported result")
+			if !recoveredPersonalResult {
+				resultAdmission, err := e.admitToolCall(ctx, value, call, fence, true)
+				if err != nil {
+					return errors.New("dsh tool result admission could not be confirmed")
+				}
+				if resultAdmission.Status == app.AgentToolCallSuperseded {
+					if err := supersedeToolCall(ctx, resultAdmission.PendingMessages, state.identity.SessionID, frame.CallID); err != nil {
+						return err
+					}
+					continue
+				}
+				if resultAdmission.Status == app.AgentToolCallBaselineUnverifiable && state.identity.SessionID != rootIdentity.SessionID {
+					terminalChildFailure = resultAdmission.Reason
+				}
+				if resultAdmission.Status != app.AgentToolCallAdmitted && terminalChildFailure == "" {
+					return errors.New("dsh tool result admission returned an unsupported result")
+				}
 			}
 			if result.Status != app.AgentToolSucceeded && result.Status != app.AgentToolFailed {
 				return errors.New("dsh tool returned an unsupported result")

@@ -1777,7 +1777,7 @@ func (b *CloudDSHToolBroker) PauseRecovery(ctx context.Context, claimed task.Tas
 func (b *CloudDSHToolBroker) PauseModelRecovery(ctx context.Context, claimed task.Task, category string) error {
 	switch category {
 	case "authentication_rejected", "access_rejected", "rate_limited", "quota_exhausted", "invalid_request",
-		"unavailable", "timeout", "transport", "invalid_response", "upstream_error", "usage_unknown", "unsupported",
+		"unavailable", "timeout", "transport", "invalid_response", "empty_response", "truncated_response", "upstream_error", "usage_unknown", "unsupported",
 		"client_request_invalid", "context_length_exceeded", "provider_invalid_request", "provider_unsupported_parameter", "provider_context_length_exceeded",
 		"provider_model_not_found", "provider_permission_denied", "provider_invalid_api_key", "provider_rate_limited",
 		"provider_quota_exhausted", "provider_server_error", "provider_request_rejected", "attachment_reader_unavailable", "stream_result_mismatch":
