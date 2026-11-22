@@ -8,6 +8,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
@@ -102,7 +103,7 @@ WHERE task_id=$1 AND task_revision=$2`, fence.Claim.TaskID, fence.Claim.TaskRevi
 }
 
 func TestPostgresProjectReviewModelUsageAttributesAndReconcilesToReviewedTask(t *testing.T) {
-	f, fence := completedReviewModelFence(t)
+	f := newAgentLifecycleFixture(t)
 	ctx := context.Background()
 	projectID, err := project.NewID()
 	if err != nil {
@@ -119,7 +120,49 @@ func TestPostgresProjectReviewModelUsageAttributesAndReconcilesToReviewedTask(t 
 		project.Budget{Currency: "USD", LimitMicros: 1000, Version: 1}, 0, "review-budget-create-01"); err != nil {
 		t.Fatalf("create project budget: %v", err)
 	}
-	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET project_id=$2,usage_model_tokens=37,budget_model_tokens=1 WHERE id=$1`, fence.Claim.TaskID, projectID); err != nil {
+	conversationID := mustID(t, domain.NewConversationID)
+	projectConversation, _, err := f.store.CreateProjectConversation(ctx, f.principal.UserID,
+		conversation.Conversation{ID: conversationID, OwnerID: f.principal.UserID, ProjectID: projectID},
+		testIdempotency(f.principal.UserID, "project_conversation.create", "review-project-conversation-01"))
+	if err != nil {
+		t.Fatalf("create project conversation: %v", err)
+	}
+	baseline, err := f.store.GetTask(ctx, f.request.Fence.TaskID, f.principal.UserID)
+	if err != nil {
+		t.Fatalf("load valid Task authorization: %v", err)
+	}
+	projectSubmission := newTestTaskSubmission(t, f.principal.UserID, "", "review-project-task-01", "review project usage task")
+	projectSubmission.Task.ProjectID, projectSubmission.Task.InitiatorID = projectID, f.principal.UserID
+	projectSubmission.Task.ConversationID, projectSubmission.Task.ModelID = projectConversation.ID, "p1234567"
+	projectSubmission.Task.Authorization = baseline.Task.Authorization
+	projectSubmission.Message.ConversationID, projectSubmission.Message.ActorID = projectConversation.ID, f.principal.UserID
+	projectSubmission.Idempotency = testIdempotency(f.principal.UserID, "task.submit", "review-project-task-01")
+	submission, err := f.store.SubmitTask(ctx, projectSubmission)
+	if err != nil {
+		t.Fatalf("create project scoped Task: %v", err)
+	}
+	claimed, found, err := f.store.ClaimNextTask(ctx, "review-project-task-worker", time.Minute)
+	if err != nil || !found || claimed.ID != submission.Task.ID {
+		t.Fatalf("claim project scoped Task: found=%t task=%q err=%v", found, claimed.ID, err)
+	}
+	stepID := mustID(t, domain.NewStepID)
+	event, err := f.store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: claimed.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusCompleted, CurrentStep: stepID, Result: "Reviewed project Task result.", Usage: claimed.Usage,
+		Steps: []task.Step{{ID: stepID, TaskID: claimed.ID, Sequence: 1, Kind: "model", Status: task.StepSucceeded}},
+		Event: task.Event{TaskID: claimed.ID, Type: "task.result", Payload: []byte(`{"status":"completed"}`)},
+	})
+	if err != nil {
+		t.Fatalf("complete project scoped Task for review: %v", err)
+	}
+	claims, err := f.store.ClaimTaskValidationReviews(ctx, "review-project-model-worker", 30*time.Second, 1)
+	if err != nil || len(claims) != 1 || claims[0].TaskID != claimed.ID || claims[0].ResultEventSequence != event.Sequence {
+		t.Fatalf("claim project scoped Task review: claims=%+v err=%v", claims, err)
+	}
+	claim := claims[0]
+	fence := app.TaskValidationReviewModelFence{Claim: claim, InitiatorID: claim.InitiatorID,
+		SessionID: "review-project-session-1", ThroughSequence: 1}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET usage_model_tokens=37,budget_model_tokens=1 WHERE id=$1`, fence.Claim.TaskID); err != nil {
 		t.Fatal(err)
 	}
 	call := reviewModelReservation(t, f.store, fence, projectID)
