@@ -592,7 +592,7 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 
 - **基线：** 工作区位于 `main`，`HEAD` 与 `origin/main` 均为 `e9414668fa6c9e822af6e7f1cb9d4a9de00c3705`；`git ls-remote --heads origin` 仅返回 `main`。本轮代码和文档改动留在本地，未提交或推送。DSH 包及锁文件版本为 `0.2.2-rc.1`，Node `v26.13.0`，Go `1.27.1 darwin/arm64`。
 - **H04 改动：** WorkerIPC 与 AccountRuntime 对 Task IPC 的超时/取消、Task 退役边界增加有界迟到回复 tombstone。`tool_result`、checkpoint ack/page、child session/settlement ack 只在 runtime sequence、完整 Task/session fence、请求关联值一致时被消费一次；重复、未知或不匹配回复仍失败关闭。child tombstone 只保留 objective/tool allowlist 摘要，不保留完整正文；可选 settlement `output` 与既有合同一致；迟到图片复用 IPC 的既有解码/大小/媒体验证。本轮进一步把 Coordinator runtime sequence 贯穿 Go/Node 双向协议；checkpoint ack/page 在进程退出窗口与退役后按完整身份、请求 ID、通过序号或页面 payload digest 精确消费一次，Coordinator 重试/重放的 `coordinator_started` 也带 sequence。Coordinator 是零工具执行环境，不存在 Coordinator child tool replies。
-- **H01/H09 改动：** 对混合 Unicode 的长消息，来源 fence 依据固定 2,048/1,024 字节预览预算重新验证，避免 rune-safe 边界导致实际预览短于预算后被误拒。Worker 对未知模型容量使用 4,096-token 最小窗口并保留当前消息 ID/字节数/SHA-256；摘要网关在模型计费预留和派发前复核实际容量。当前消息 reader 按授权 Task 会话、message ID、SHA-256 与连续 rune offset 提供最多 8 KiB 的分页片段；200 KiB 原文 PostgreSQL 重建回归纳入下方临时库用例。对已关联的多条补充消息，route context 新增有序 source manifest（消息 ID、sequence、原文字节数、SHA-256）；PostgreSQL 派发 fence 从原始行重新组合并核对每项授权/执行范围、总内容摘要及 2,048/1,024 预览。模型请求不把 root ID 冒充聚合内容 ID，Task 目标保留完整 root 与选中补充；聚合上限为 32 KiB，超限返回 `result_too_large` 且不建 Task。聚合内容仍只向分类器提供有界预览，不新增独立多源分页 API。
+- **H01/H09 改动：** 对混合 Unicode 的长消息，来源 fence 依据固定 2,048/1,024 字节预览预算重新验证，避免 rune-safe 边界导致实际预览短于预算后被误拒。Worker 对未知模型容量使用 4,096-token 最小窗口并保留当前消息 ID/字节数/SHA-256；摘要网关在模型计费预留和派发前复核实际容量。当前消息 reader 按授权 Task 会话、message ID、SHA-256 与连续 rune offset 提供最多 8 KiB 的分页片段；200 KiB 原文 PostgreSQL 重建回归纳入下方临时库用例。对已关联的多条补充消息，route context 新增有序 source manifest（消息 ID、sequence、原文字节数、SHA-256）；PostgreSQL 派发 fence 从原始行重新组合并核对每项授权/执行范围、总内容摘要及 2,048/1,024 预览。模型请求不把 root ID 冒充聚合内容 ID，Task 目标保留完整 root 与选中补充；单次聚合输入上限为 32 KiB，超限补充解除关联后单独排队，来源清单只包含实际合并项。聚合内容仍只向分类器提供有界预览，不新增独立多源分页 API。
 - **自动化验证：**
 
   ```text
@@ -618,8 +618,23 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **本轮追加验证（2026-11-23）：** `cd runtime/morde-cloud-runtime && npm test`（含 DSH compaction 构建）通过，192/192，79.408 秒；随后扩展迟到 Coordinator 定向回归，覆盖退出窗口 ack、退役后的 page、错误 page 与重复 page，`node --test --test-concurrency=1 --test-name-pattern='exact late coordinator replies' test/runtime.test.mjs` 通过 1/1。`cd server && go test ./internal/app -count=1` 通过（最终版本 20.864 秒），`cd server && go test ./internal/worker -count=1` 通过（58.612 秒）。临时 PostgreSQL 16 上 `CH_TEST_DATABASE_URL=<仅绑定 127.0.0.1:55434 的临时 DSN> go test ./internal/store/postgres -run '^(TestConversationRouteJoinedMessageSources(FenceAndPreviews|FailClosedAboveLimit)|TestConversationRouteApplyKeepsLongRootAndSelectedSupplementInTaskObjective|TestConversationRouteJoinWaitsOnOriginalRequestWithoutCreatingTask|TestPostgresConversationRouteAggregationUsesWindowAndExplicitMessageSelection|TestH01Long.*)$' -count=1 -timeout=5m` 通过，包用时 12.143 秒。覆盖来源顺序/摘要、预览与派发 fence、授权/范围变化拒绝、32 KiB 超限不建 Task，以及长 root 和所选补充完整进入 Task objective；容器测试后已删除。
 - **首次失败及修正：** Runtime 全量首次发现 account Coordinator 测试 helper 未把 `runtime_sequence` 回显到 model/checkpoint 响应；更新夹具携带该 fence 后全量通过。PostgreSQL 新用例修正为“正在处理的 root 被补充后重新分类”路径，并补齐所选模型 ID；超限检查在 Apply 的事务边界断言，确认不建 Task。新增 aggregate preview 的分类澄清说明已保存完整源，不要求用户重复发送。
 - **首次尝试及修正：** 新 Runtime 定向测试最初错误地假设 Task 取消会取消尚未超时的 checkpoint ack；后改为让该请求走既有超时语义。另一个 AccountRuntime 合成 Task 未带 runtime sequence；response tracking 现只在有效正 sequence 下启用，旧测试形态不误登记退役响应。最终 Runtime 全量 167 项通过。Worker 预览测试首次因一个不再使用的 import 编译失败；删除 import 后，测试暴露了它对预览中段锚点位置的额外断言。现改为核对本功能合同：内容受限、原文长度/ID/SHA 保留、首尾锚点在预览、模型窗口预算可容纳；独立 app 请求用例继续验证直接预览的首尾布局。Worker 全量 57.375 秒通过。
-- **本轮合并冲突回归（2026-11-23）：** 长消息路由与上下文裁剪定向单测通过，覆盖 8 KiB、16 KiB、200 KiB 用户消息及 8 MiB 存储边界；`go test ./internal/store/postgres -run 'Test(PostgresJoinedConversationRouteContentDetachesOversizedSupplements|ConversationRouteJoinedMessageSources|ConversationRouteApplyKeepsLongRootAndSelectedSupplementInTaskObjective)' -count=1` 编译和包级执行通过，但 `CH_TEST_DATABASE_URL` 未配置，数据库集成用例跳过。合并后的 32 KiB 机制按序保留可容纳补充，将超预算或来源数超限的补充解除关联、重置待路由并单独处理；需在隔离 PostgreSQL 上再执行这些集成用例，确认落库状态和客户端提示。
-- **已知缺口与未验范围：** 旧验证记录中“多消息聚合超限安全失败”描述的是合并前行为；现代码改为有限合并并拆分超限补充，本轮未运行数据库集成测试，也未验证超限提示的客户端展示。工具、子 Agent 与 Task checkpoint 的请求级停滞期限仍未补齐。用户选择等轮换凭据配置到本机后继续真实模型验收；本轮未调用真实模型、测试站或客户端，旧聊天 key 未使用。真实 tokenizer/Provider 窗口、跨账号长历史、双端 Task 状态、真实 Host 工具和 60 分钟耐久验收均未执行，H01/H04/H09 保持未完成。
+- **本轮 main 冲突整合与 H01 回归（2026-11-23）：** 本地 `main` 的合并提交 `83e96a8f` 已由 `git ls-remote --heads origin` 核对存在于 GitHub `origin/main`；冲突集中在最终流程图、PostgreSQL 路由聚合及 Worker 上下文预算。整合保留 H01 有序来源摘要/授权与执行范围 fence、8 MiB 已接收消息上限和当前消息原文预览；纳入 32 KiB/来源数预算、超限补充解除关联并标记待路由、历史预览先于摘要丢弃，以及分类失败时的安全启发式澄清/路由。来源清单只包含实际进入聚合文本的消息，过长补充不会混入 root Task objective。远端 `dev` tip `900bd6bc` 是 `main` 祖先，两个分支引用均保留。
+
+  ```text
+  cd server && go test ./internal/worker -count=1
+  # 通过，59.671 秒
+  CH_TEST_DATABASE_URL=<仅绑定 127.0.0.1:55435 的临时 PostgreSQL 16 DSN> \
+    go test ./internal/store/postgres -run '^(TestConversationRouteJoinedMessageSourcesFenceAndPreviews|TestConversationRouteJoinedMessageSourcesDetachOversizedSupplement|TestPostgresJoinedConversationRouteContentDetachesOversizedSupplements|TestConversationRouteApplyKeepsLongRootAndSelectedSupplementInTaskObjective|TestConversationRouteJoinWaitsOnOriginalRequestWithoutCreatingTask|TestPostgresConversationRouteAggregationUsesWindowAndExplicitMessageSelection|TestH01Long.*)$' -count=1 -timeout=5m
+  # 10 项通过，12.501 秒；临时容器无数据卷，测试后移除
+  cd runtime/morde-cloud-runtime && node --test --test-concurrency=1 --test-name-pattern='bin.mjs accepts MORDE_WORKSPACE_DIR' test/runtime.test.mjs
+  # 1/1 通过
+  gofmt -w server/internal/store/postgres/conversation_route_actions.go server/internal/store/postgres/conversation_route_actions_integration_test.go server/internal/worker/conversation_route_worker.go
+  git diff --check
+  # gofmt 与 diff 检查通过
+  ```
+
+  首次 PostgreSQL 运行发现新用例直接切换 `state='routed'` 时未清除模拟租约，触发既有数据库状态约束；夹具改为与完成路由一致地结清聚合状态和租约，重跑通过。另一次未配置 `CH_TEST_DATABASE_URL` 的调用只跳过集成用例，不计入通过。当前本轮仅本地代码合并和自动化回归；未调用真实 Provider、测试站或客户端。
+- **已知缺口与未验范围：** 单次聚合仍受 32 KiB 限制；超限补充按已验证路径单独排队，但客户端如何呈现这些独立消息未实测，也没有聚合原文分页读取接口。工具、子 Agent 与 Task checkpoint 的请求级停滞期限仍未补齐。用户选择等轮换凭据配置到本机后继续真实模型验收；本轮未调用真实模型、测试站或客户端，旧聊天 key 未使用。真实 tokenizer/Provider 窗口、跨账号长历史、双端 Task 状态、真实 Host 工具和 60 分钟耐久验收均未执行，H01/H04/H09 保持未完成。
 
 ### 单次执行信息模板
 

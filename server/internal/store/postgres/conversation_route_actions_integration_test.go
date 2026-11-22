@@ -1370,9 +1370,11 @@ WHERE message_id=$2 AND service_instance_id=$3::uuid`, root.Message.ID, suppleme
 		t.Fatal(err)
 	}
 	var duplicateOf *string
-	var state string
-	if err := f.store.pool.QueryRow(ctx, `SELECT duplicate_of_message_id,state FROM conversation_message_routes
-WHERE message_id=$1`, second.Message.ID).Scan(&duplicateOf, &state); err != nil || duplicateOf != nil || state != "pending" {
-		t.Fatalf("oversized supplement was not released for its own route: duplicate_of=%v state=%s err=%v", duplicateOf, state, err)
+	var state, deliveryStatus string
+	if err := f.store.pool.QueryRow(ctx, `SELECT r.duplicate_of_message_id,r.state,m.delivery_status
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id WHERE r.message_id=$1`, second.Message.ID).
+		Scan(&duplicateOf, &state, &deliveryStatus); err != nil || duplicateOf != nil || state != "pending" || deliveryStatus != "pending" {
+		t.Fatalf("oversized supplement was not released for its own route: duplicate_of=%v state=%s delivery=%s err=%v",
+			duplicateOf, state, deliveryStatus, err)
 	}
 }
