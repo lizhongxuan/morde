@@ -301,6 +301,9 @@ func TestConversationResultReceiptSeparatesCompletionFromCurrentValidation(t *te
 VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f.ownerID, f.conversation.ID, message.Sequence); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_message_routes SET state='routed' WHERE message_id=$1`, oldRevisionMessageID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET current_revision=1,desired_revision=1 WHERE id=$1`, oldRevision.ID); err != nil {
 		t.Fatal(err)
 	}
