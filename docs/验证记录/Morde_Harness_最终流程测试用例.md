@@ -634,7 +634,7 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
   ```
 
   首次 PostgreSQL 运行发现新用例直接切换 `state='routed'` 时未清除模拟租约，触发既有数据库状态约束；夹具改为与完成路由一致地结清聚合状态和租约，重跑通过。另一次未配置 `CH_TEST_DATABASE_URL` 的调用只跳过集成用例，不计入通过。当前本轮仅本地代码合并和自动化回归；未调用真实 Provider、测试站或客户端。
-- **本轮 H02 流错误分类与已显示增量保留（2026-11-23）：** `ResponsesClient.complete` 过去将流读超时和底层 I/O 中断统一归为 `invalid_response`。现在区分 caller deadline（`timeout`）、流读取 `net.Error` 超时（`timeout`）、scanner I/O 中断（`transport`）、畸形协议/缺少终止事件（`invalid_response`）；caller cancellation 仍原样返回，不把用户取消记成 Provider timeout。OpenAI Responses 与 Z.ai 两条流分别通过合成 SSE delta 后 `io.ErrUnexpectedEOF` 的测试，确认已回调文本保留、模型调用不被误报成功；10ms deadline 测试确认已回调文本之后超时仍分类为 `timeout`。App 侧显式取消回归确认取消前已回调的增量仍可见、之后 Provider 停止、Task 响应为空、账本为 `unknown` 且调用次数为一。首次 App 全量回归中的新用例因测试 store 未声明流式派发能力而未触发 delta；补齐 fixture 的流能力后通过，生产流式授权门禁未改。
+- **本轮 H02 流错误分类与已显示增量保留（2026-11-23）：** `ResponsesClient.complete` 过去将流读超时和底层 I/O 中断统一归为 `invalid_response`。现在区分 caller deadline（`timeout`）、流读取 `net.Error` 超时（`timeout`）、scanner I/O 中断（`transport`）、畸形协议/缺少终止事件（`invalid_response`）；caller cancellation 仍原样返回，不把用户取消记成 Provider timeout。OpenAI Responses 与 Z.ai 两条流分别通过合成 SSE delta 后 `io.ErrUnexpectedEOF` 的测试，确认已回调文本保留、模型调用不被误报成功；10ms deadline 测试确认已回调文本之后超时仍分类为 `timeout`。App 侧显式取消回归确认取消前已回调的增量仍可见、之后 Provider 停止、Task 响应为空、账本为 `unknown` 且调用次数为一。首次 App 全量回归中的新用例因测试 store 未声明流式派发能力而未触发 delta；补齐 fixture 的流能力后通过，生产流式授权门禁未改。代码修复提交 `7dbdb274` 已推送至 `origin/main`。
 
   ```text
   cd server && go test ./internal/app -run '^TestTaskModelCancellationPreservesAlreadyDeliveredStreamText$' -count=1
