@@ -381,6 +381,12 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **修订重启 E2E 根因边界：** S02 在同一 HEAD 的隔离 PostgreSQL 上连续两次复现 `TestConversationRevisionStopsRealAgentAndRestartsWithLatestMessages` 失败。可证实新 Account Runtime 的 DSH 子进程关闭前没有发送 `settled` 或 `failed`；`account-runtime.mjs` 将无终态退出记录为 `child_exited_without_result`，而 `recordCloudDSHE2ESupervisor` 丢弃 stderr、终止帧也没有 child exit code/signal。Runtime 恢复路径先调用 checkpoint Agent 的 `whenIdle()`，之后才注入 revision 消息；这可能让旧轮次先恢复，但目前只是待验证假设。最小下一步是保留关闭前帧序列和子进程退出码/信号，再决定是否修改 `engine.mjs`。不把此失败与先前已通过的生命周期用例混为一谈。
 - **未覆盖与结论：** 本轮没有重跑 962 秒整包；定向复验后仍有会话修订重启 E2E 一项失败，且其退出根因未证实。没有使用聊天中暴露的 Provider key，也没有访问测试站、登录管理员或改远程数据库。真实模型、PC→iOS 同会话、账号隔离、指定远程环境和 60 分钟耐久验收仍未执行；H06 与 P0 不标完成。原始整包失败数不能替代这些定向 PASS 的范围声明。
 
+### S00 本地分支代码整合核对（2026-11-22）
+
+- **范围：** 检查 `git branch -avv`、Harness 各 S01–S06 worktree 状态、patch 等价关系及当前 HEAD 的源码差异。所有现存 Harness worktree 均干净。
+- **结果：** 当前 `main` 已包含各 Harness 分支的代码，或包含比分支 head 更新的同域实现；S01/S02/S03/S04/S06 分支差异没有待移入的有效源码改动。比如当前 S02 child baseline/admission、S03 task activity/steer fence、S04 validation receipt 和 S06 task timeline 都在 `main`，而旧分支在这些文件中缺少后来整合的 fence 或回归修正。`workspace-1` 与 `codex/client-login-ordering-20261105` 均为 `main` 的祖先（当前 main 分别领先 75 和 71 个提交）；不需要再合并。
+- **处置：** 没有创建无内容的 merge commit，也没有把陈旧分支树合回去覆盖 main 上较新的安全 fence。分支引用保留；本轮没有发现尚未合入 main 的 Harness 代码。这个结果表示代码已在 main，不表示所有分支 ref 都已删除。
+
 ### H10 工具接纳与最终完成栅栏（2026-11-22；本机隔离 PostgreSQL）
 
 - **实现：** S03 提交 `8d66e8326601ed36682412d0f6ce57406c095ccb`，已 cherry-pick 到主工作树为 `9d3ffac7`。迁移 `00227_task_tool_supersession_fences.sql` 持久化 tool-call admission 与 superseding message IDs；root checkpoint 在 steer 标记 `applied` 的同一事务写入 delivery；工具及 child/Workspace/Task 完成的最终副作用门按 Task 行锁核对 pending 与 applied steer。新 child 保存创建时 root checkpoint baseline；无法证明历史 child baseline 且已有后续 applied steer 时，admission 终态失败关闭，避免错误比较 child-local/root 序号或无界重试。Task 完成候选携带 root Session、Agent instance/代次、授权版本、checkpoint through 和 digest；命中较新 applied steer 时保留 Task running，不创建旧结果事件或 assistant 回执。
