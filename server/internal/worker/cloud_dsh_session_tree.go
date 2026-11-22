@@ -2282,9 +2282,22 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 	for _, definition := range definitions {
 		allowedTools = append(allowedTools, definition.Name)
 	}
+	rootCheckpointThrough := rootCheckpointThroughSequence(parent, fence.AgentSessionID)
+	if recoveryCall && frame.SessionID == fence.AgentSessionID {
+		children, err := e.options.Children.List(ctx, fence, frame.SessionID)
+		if err != nil {
+			return false, errors.New("dsh root child sessions could not be reconciled")
+		}
+		for _, existing := range children {
+			if existing.ParentSessionID == frame.SessionID && existing.SpawnKey == frame.CallID {
+				rootCheckpointThrough = existing.RootCheckpointThroughSequence
+				break
+			}
+		}
+	}
 	child, _, err := e.options.Children.Create(ctx, app.AgentChildSessionCommand{Fence: fence, ParentSessionID: fence.AgentSessionID,
 		SpawnKey: frame.CallID, Arguments: canonical, Title: strings.TrimSpace(arguments.Title), AllowedTools: allowedTools,
-		Background: arguments.RunInBackground, RootCheckpointThroughSequence: rootCheckpointThroughSequence(parent, fence.AgentSessionID)})
+		Background: arguments.RunInBackground, RootCheckpointThroughSequence: rootCheckpointThrough})
 	if messages, superseded := cloudDSHTaskInputPendingMessages(err); superseded {
 		if supersede == nil {
 			return false, errors.New("dsh child Agent superseding delivery is unavailable")

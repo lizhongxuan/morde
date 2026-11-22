@@ -1215,7 +1215,8 @@ WHERE id=$1 AND lease_owner=$2 AND lease_version=$3`, taskID, claimed.Lease.Owne
 	settledChildren, err := f07ReadPersistedChildren(ctx, pool, taskID, owner.ID, rootSessionID)
 	if err != nil || len(settledChildren) != 1 || settledChildren[0].Step.Status != task.StepSucceeded ||
 		settledChildren[0].Step.Summary != f07BackgroundOutputSummary || settledChildren[0].CheckpointThrough < 0 ||
-		len(settledChildren[0].CheckpointDigest) != 32 || settledChildren[0].CancelRequested {
+		len(settledChildren[0].CheckpointDigest) != 32 || settledChildren[0].CancelRequested ||
+		settledChildren[0].RootCheckpointThroughSequence != childBeforeRestart[0].RootCheckpointThroughSequence {
 		t.Fatalf("background result was not durably settled after restart: children=%#v err=%v", settledChildren, err)
 	}
 	if settledDetails.Task.CheckpointThroughSequence <= rootThroughBeforeRestart || len(settledDetails.Task.CheckpointDigest) != 32 ||
@@ -1331,7 +1332,7 @@ func (checkpoints *f07ObservedCheckpoints) rootHistory(sessionID string, through
 }
 
 func f07ReadPersistedChildren(ctx context.Context, pool *pgxpool.Pool, taskID, ownerID, rootSessionID string) ([]app.AgentChildSession, error) {
-	rows, err := pool.Query(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
+	rows, err := pool.Query(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.root_checkpoint_through_seq,s.spawn_key,s.checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
 s.is_background,s.cancel_requested_at IS NOT NULL,st.id,st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
 WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 ORDER BY st.sequence`, taskID, ownerID, rootSessionID)
@@ -1344,7 +1345,8 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 ORDER BY st.sequ
 		var child app.AgentChildSession
 		var allowedTools []byte
 		var status string
-		if err := rows.Scan(&child.TaskID, &child.SessionID, &child.ParentSessionID, &child.SpawnKey, &child.CheckpointThrough,
+		if err := rows.Scan(&child.TaskID, &child.SessionID, &child.ParentSessionID, &child.RootCheckpointThroughSequence,
+			&child.SpawnKey, &child.CheckpointThrough,
 			&child.CheckpointDigest, &allowedTools, &child.Background, &child.CancelRequested, &child.Step.ID, &child.Step.Sequence,
 			&child.Step.Kind, &status, &child.Step.Title, &child.Step.Summary, &child.Step.CreatedAt); err != nil {
 			return nil, err
