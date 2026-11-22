@@ -197,15 +197,21 @@ const conversationRouteIncompleteHistoryInstructions = `When history_incomplete 
 const conversationRouteHistorySearchTaskInstructions = `Incomplete/truncated history is partial; never infer omitted details or present excerpts as complete. If a request depends on a prior detail or requirement missing from it, do not report it unavailable from a preview. Apply Task association; if no supplied Task or prior_request clearly matches, use action "new" with explicit_new=false so the Task Agent searches authorized conversation originals via morde_current_conversation_history_search. Report unavailable only after no match or an authorization block; never claim a match before search.`
 
 func conversationRouteTextPreview(value string) (string, bool) {
-	if len(value) <= conversationRoutePreviewBytes {
+	return ConversationRouteTextPreview(value, conversationRoutePreviewBytes)
+}
+
+// ConversationRouteTextPreview returns a rune-safe preview bounded by maxBytes.
+func ConversationRouteTextPreview(value string, maxBytes int) (string, bool) {
+	maxBytes = max(8, maxBytes)
+	if len(value) <= maxBytes {
 		return value, false
 	}
 	const gap = "\n…\n"
-	head := (conversationRoutePreviewBytes - len(gap)) / 2
+	head := (maxBytes - len(gap)) / 2
 	for !utf8.RuneStart(value[head]) {
 		head--
 	}
-	tail := len(value) - (conversationRoutePreviewBytes - len(gap) - head)
+	tail := len(value) - (maxBytes - len(gap) - head)
 	for !utf8.RuneStart(value[tail]) {
 		tail++
 	}
@@ -372,7 +378,9 @@ func ConversationRouteModelRequest(value ConversationRouteContext) (ModelRequest
 		tasks = append([]ConversationRouteCandidate{}, value.Candidates...)
 	}
 	for index := range tasks {
-		tasks[index].Objective, tasks[index].ObjectiveTruncated = conversationRouteTextPreview(tasks[index].Objective)
+		var objectiveTruncated bool
+		tasks[index].Objective, objectiveTruncated = conversationRouteTextPreview(tasks[index].Objective)
+		tasks[index].ObjectiveTruncated = tasks[index].ObjectiveTruncated || objectiveTruncated
 		truncated = truncated || tasks[index].ObjectiveTruncated
 	}
 	var aggregation []ConversationRouteAggregationCandidate

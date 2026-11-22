@@ -2954,7 +2954,7 @@ test('child_abort settles only its matching legacy child and leaves the root ste
   assert.equal(frames.findLast(frame => frame.type === 'settled')?.state, 'completed_candidate')
 })
 
-test('runs two background children concurrently and the parent consumes both settled results', async () => {
+test('cancelling one of two concurrent background children leaves its sibling active and summarized', { timeout: 15_000 }, async t => {
   const childIDs = ['child_parallel_1', 'child_parallel_2']
   const childByCall = new Map([['call_background_1', childIDs[0]], ['call_background_2', childIDs[1]]])
   const tools = [delegateTool, fileReadTool, ...jobTools].sort((left, right) => left.name.localeCompare(right.name))
@@ -2962,7 +2962,10 @@ test('runs two background children concurrently and the parent consumes both set
   const childModels = new Map()
   const settled = new Set()
   let parentModels = 0
-  let waitingParentModel
+  let waitingCancelModel
+  let waitingSiblingOutputModel
+  let cancelCall
+  let cancelSent = false
   const sendModel = (proc, frame, text, call) => {
     const chunks = call ? [
       { type: 'tool-call-delta', index: 0, id: call.id, name: call.name, argumentsDelta: JSON.stringify(call.arguments) },
@@ -2978,12 +2981,20 @@ test('runs two background children concurrently and the parent consumes both set
     chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
     send(proc, { type: 'model_end', id: frame.id, ok: true })
   }
-  const sendFirstResultRead = () => {
-    if (!waitingParentModel || settled.size !== 2) return
-    const frame = waitingParentModel
-    waitingParentModel = undefined
-    sendModel(frame.proc, frame.model, '', { id: 'call_output_1', name: jobOutputTool.name,
-      arguments: { job_id: childIDs[0], after_seq: -1 } })
+  const sendCancelWhenChildrenStarted = () => {
+    if (!waitingCancelModel || childModels.size !== 2 || cancelSent) return
+    const frame = waitingCancelModel
+    waitingCancelModel = undefined
+    cancelSent = true
+    sendModel(frame.proc, frame.model, '', { id: 'call_cancel_job', name: jobCancelTool.name,
+      arguments: { job_id: childIDs[0] } })
+  }
+  const sendSiblingOutputRead = () => {
+    if (!waitingSiblingOutputModel || !settled.has(childIDs[1])) return
+    const frame = waitingSiblingOutputModel
+    waitingSiblingOutputModel = undefined
+    sendModel(frame.proc, frame.model, '', { id: 'call_output_2', name: jobOutputTool.name,
+      arguments: { job_id: childIDs[1], after_seq: -1 } })
   }
   const { child, frames } = launch((frame, proc) => {
     if (frame.type === 'ready') send(proc, { ...start, tools })
@@ -3000,21 +3011,28 @@ test('runs two background children concurrently and the parent consumes both set
         sendModel(proc, frame, '', { id: `call_background_${index}`, name: delegateTool.name,
           arguments: { title: `Background task ${index}`, objective: `Finish child ${index}.`, tool_names: ['file_read'], run_in_background: true } })
       } else if (parentModels === 3) {
-        waitingParentModel = { proc, model: frame }
-        sendFirstResultRead()
+        waitingCancelModel = { proc, model: frame }
+        sendCancelWhenChildrenStarted()
       } else if (parentModels === 4) {
-        const firstResult = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_output_1')
-        assert.match(firstResult?.content[0]?.text ?? '', /child result one/)
-        sendModel(proc, frame, '', { id: 'call_output_2', name: jobOutputTool.name,
-          arguments: { job_id: childIDs[1], after_seq: -1 } })
+        const cancelResult = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_cancel_job')
+        assert.equal(JSON.parse(cancelResult?.content[0]?.text ?? '{}').status, 'cancelled')
+        sendModel(proc, frame, '', { id: 'call_output_1', name: jobOutputTool.name,
+          arguments: { job_id: childIDs[0], after_seq: -1 } })
+      } else if (parentModels === 5) {
+        const cancelledResult = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'call_output_1')
+        assert.equal(JSON.parse(cancelledResult?.content[0]?.text ?? '{}').status, 'cancelled')
+        waitingSiblingOutputModel = { proc, model: frame }
+        sendSiblingOutputRead()
       } else {
+        assert.equal(parentModels, 6)
         const results = frame.request.messages.filter(message => message.role === 'tool' &&
           ['call_output_1', 'call_output_2'].includes(message.toolCallId))
         assert.equal(results.length, 2)
-        assert.match(results[0].content[0].text, /child result one/)
+        assert.equal(JSON.parse(results[0].content[0].text).status, 'cancelled')
+        assert.equal(JSON.parse(results[1].content[0].text).status, 'succeeded')
         assert.match(results[1].content[0].text, /child result two/)
         assert.equal(settled.size, 2)
-        sendModel(proc, frame, 'Both delegated results were reviewed and summarized.', undefined)
+        sendModel(proc, frame, 'Child one was cancelled; child two completed and was summarized.', undefined)
       }
     }
     if (frame.type === 'model' && childIDs.includes(frame.session_id)) {
@@ -3022,9 +3040,7 @@ test('runs two background children concurrently and the parent consumes both set
       childModels.set(frame.session_id, frame)
       if (childModels.size === 2) {
         assert.equal(settled.size, 0, 'both children must be in flight before either settles')
-        for (const [sessionID, model] of childModels) {
-          replyWithText(proc, model, sessionID === childIDs[0] ? 'child result one' : 'child result two')
-        }
+        sendCancelWhenChildrenStarted()
       }
     }
     if (frame.type === 'child_create') {
@@ -3037,30 +3053,63 @@ test('runs two background children concurrently and the parent consumes both set
         step_status: 'running', summary: '',
       })
     }
+    if (frame.type === 'tool_call' && frame.name === jobCancelTool.name) {
+      assert.equal(frame.arguments.job_id, childIDs[0])
+      assert.equal(childModels.size, 2, 'cancel only after both child model calls are in flight')
+      cancelCall = frame
+      send(proc, { type: 'job_cancel', id: 'job_cancel_control_1', task_id: start.task_id,
+        owner_id: start.owner_id, agent_id: start.agent_id, generation: start.generation,
+        authorization_version: start.authorization_version, session_id: start.session_id, job_id: childIDs[0] })
+    }
+    if (frame.type === 'job_cancel_result') {
+      assert.equal(frame.job_id, childIDs[0])
+      assert.equal(frame.status, 'cancelled')
+      assert.ok(settled.has(childIDs[0]), 'cancellation waits for the selected child to settle')
+      assert.equal(frames.some(item => item.type === 'model_cancel' && item.session_id === childIDs[1]), false,
+        'cancelling one child must not cancel its in-flight sibling')
+      send(proc, { type: 'tool_result', id: cancelCall.id, task_id: start.task_id, owner_id: start.owner_id,
+        agent_id: start.agent_id, generation: start.generation, authorization_version: start.authorization_version,
+        session_id: start.session_id, call_id: cancelCall.call_id, status: 'succeeded',
+        output: JSON.stringify({ job_id: childIDs[0], status: 'cancelled', title: 'Background task 1',
+          summary: 'Background job cancelled.', output_cursor: 3 }) })
+      replyWithText(proc, childModels.get(childIDs[1]), 'child result two')
+    }
     if (frame.type === 'tool_call' && frame.name === jobOutputTool.name) {
-      const index = frame.arguments.job_id === childIDs[0] ? 1 : 2
-      const result = index === 1 ? 'child result one' : 'child result two'
-      assert.ok(settled.has(frame.arguments.job_id), 'parent may only read a durably settled result')
+      const jobID = frame.arguments.job_id
+      const result = jobID === childIDs[0] ? 'Background job cancelled.' : 'child result two'
+      assert.ok(settled.has(jobID), 'parent may only read a durably settled result')
       send(proc, { type: 'tool_result', id: frame.id, ...taskFence(frame), session_id: frame.session_id,
-        call_id: frame.call_id, status: 'succeeded',
-        output: JSON.stringify({ job_id: frame.arguments.job_id, status: 'succeeded', next_cursor: 4, output: result }) })
+        call_id: frame.call_id, status: 'succeeded', output: JSON.stringify({ job_id: jobID,
+          status: jobID === childIDs[0] ? 'cancelled' : 'succeeded', next_cursor: 4, output: result }) })
+    }
+    if (frame.type === 'model_cancel') {
+      assert.equal(frame.session_id, childIDs[0], 'only the selected child receives model cancellation')
+      send(proc, { type: 'model_end', id: frame.id, ...taskFence(frame), ok: false })
     }
     if (frame.type === 'child_settle') {
-      assert.equal(frame.status, 'succeeded')
-      assert.equal(frame.summary, frame.session_id === childIDs[0] ? 'child result one' : 'child result two')
+      if (frame.session_id === childIDs[0]) {
+        assert.equal(frame.status, 'failed')
+        assert.equal(frame.summary, 'Background job cancelled.')
+      } else {
+        assert.equal(frame.session_id, childIDs[1])
+        assert.equal(frame.status, 'succeeded')
+        assert.equal(frame.summary, 'child result two')
+      }
       send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
       settled.add(frame.session_id)
-      sendFirstResultRead()
+      sendSiblingOutputRead()
     }
   })
   const [code] = await once(child, 'close')
   assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
-  assert.equal(parentModels, 5)
+  assert.equal(parentModels, 6)
   assert.equal(childModels.size, 2)
   assert.equal(settled.size, 2)
   assert.equal(frames.filter(frame => frame.type === 'child_create').length, 2)
   assert.equal(frames.filter(frame => frame.type === 'child_settle').length, 2)
   assert.equal(frames.filter(frame => frame.type === 'tool_call' && frame.name === jobOutputTool.name).length, 2)
+  assert.equal(frames.filter(frame => frame.type === 'model_cancel' && frame.session_id === childIDs[0]).length, 1)
+  assert.equal(frames.some(frame => frame.type === 'model_cancel' && frame.session_id === childIDs[1]), false)
   assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
 })
 

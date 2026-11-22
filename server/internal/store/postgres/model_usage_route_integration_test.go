@@ -38,6 +38,18 @@ type coordinatorRouteGatewayTest struct {
 	gateway *app.ModelGatewayService
 }
 
+type cancelRouteContextAfterClassification struct {
+	app.ConversationRouteClassifier
+	cancel context.CancelFunc
+}
+
+func (c cancelRouteContextAfterClassification) ClassifyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim,
+	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
+	decision, err := c.ConversationRouteClassifier.ClassifyConversationRoute(ctx, claim, value)
+	c.cancel()
+	return decision, err
+}
+
 func (m coordinatorRouteGatewayTest) ResolveConversationRouteModel(ctx context.Context, claim app.ConversationRouteClaim) (string, error) {
 	return m.gateway.ResolveConversationRouteModel(ctx, claim)
 }
@@ -125,10 +137,10 @@ func TestConversationRouteModelPhaseUsesResultReviewRetryAttempt(t *testing.T) {
 }
 
 func TestConversationRouteRetriesConfirmedRateLimitWithNewMeteredIdentity(t *testing.T) {
-	newWorker := func(t *testing.T, store *Store, gateway *app.ModelGatewayService) *worker.ConversationRouteWorker {
+	newWorker := func(t *testing.T, store *Store, classifier app.ConversationRouteClassifier) *worker.ConversationRouteWorker {
 		t.Helper()
 		result, err := worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
-			Queue: store, Actions: store, Models: gateway, WorkerID: "route-rate-limit-test",
+			Queue: store, Actions: store, Models: classifier, WorkerID: "route-rate-limit-test",
 			LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop(),
 		})
 		if err != nil {
@@ -197,6 +209,37 @@ FROM conversation_message_routes r WHERE r.message_id=$1`, claim.Message.ID, cla
 			Scan(&routeState, &persistedAttempt, &failureReason, &recoveredState, &recoveredCallID); err != nil || routeState != "routed" || recoveredState != "settled" || recoveredCallID == oldCallID {
 			t.Fatalf("recovered route state=%q attempt=%d reason=%q model=%q call=%q old=%q providerCalls=%d err=%v",
 				routeState, persistedAttempt, failureReason, recoveredState, recoveredCallID, oldCallID, client.calls.Load(), err)
+		}
+	})
+	t.Run("context cancellation preserves confirmed retry delay", func(t *testing.T) {
+		client := &routeModelClientTest{err: &app.ModelClientError{Kind: app.ModelErrorRateLimited,
+			Stage: "provider_status", RetryAfter: 2 * time.Second}}
+		store, gateway, _, claim, _ := routeModelFixture(t, true, client)
+		if err := store.ReleaseConversationRoute(context.Background(), claim); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		classifier := cancelRouteContextAfterClassification{ConversationRouteClassifier: gateway, cancel: cancel}
+		routeWorker := newWorker(t, store, classifier)
+		if found, err := routeWorker.RunOnce(ctx); err != nil || !found {
+			t.Fatalf("cancelled rate-limited route attempt: found=%t err=%v", found, err)
+		}
+		var state string
+		var routeAttempt int64
+		var retryDelay float64
+		if err := store.pool.QueryRow(context.Background(), `SELECT state,route_attempt,
+EXTRACT(EPOCH FROM (available_after-clock_timestamp())) FROM conversation_message_routes WHERE message_id=$1`, claim.Message.ID).
+			Scan(&state, &routeAttempt, &retryDelay); err != nil || state != "pending" || routeAttempt != claim.RouteAttempt+1 || retryDelay < 1 || retryDelay > 2.5 {
+			t.Fatalf("cancelled rate-limit retry state=%q attempt=%d delay=%f err=%v", state, routeAttempt, retryDelay, err)
+		}
+		var routeState, ledgerState string
+		if err := store.pool.QueryRow(context.Background(), `SELECT c.state,l.state FROM conversation_route_model_calls c
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+WHERE c.message_id=$1 AND c.attempt=$2 AND c.phase='normal'`, claim.Message.ID, claim.RouteAttempt).
+			Scan(&routeState, &ledgerState); err != nil || routeState != "rejected" || ledgerState != "rejected" || client.calls.Load() != 1 {
+			t.Fatalf("cancelled provider rejection route=%q ledger=%q providerCalls=%d err=%v",
+				routeState, ledgerState, client.calls.Load(), err)
 		}
 	})
 	t.Run("stops after three provider rejections", func(t *testing.T) {

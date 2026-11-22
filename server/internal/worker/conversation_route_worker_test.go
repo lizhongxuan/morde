@@ -46,7 +46,9 @@ type routeWorkerStub struct {
 	contextRequeueCalls  int
 	rateLimitHandled     bool
 	rateLimitRetryDelay  time.Duration
+	rateLimitContextErr  error
 	rateLimitHandleCalls int
+	cancelAfterClassify  context.CancelFunc
 	repairRequeues       int
 	repairStatusErr      error
 	repairRequeueErr     error
@@ -102,9 +104,10 @@ func (s *routeWorkerStub) RequeueConversationRouteAfterContextChange(context.Con
 	s.contextRequeueCalls++
 	return s.contextRequeued, nil
 }
-func (s *routeWorkerStub) HandleConversationRouteRateLimit(_ context.Context, _ app.ConversationRouteClaim, delay time.Duration) (bool, error) {
+func (s *routeWorkerStub) HandleConversationRouteRateLimit(ctx context.Context, _ app.ConversationRouteClaim, delay time.Duration) (bool, error) {
 	s.rateLimitHandleCalls++
 	s.rateLimitRetryDelay = delay
+	s.rateLimitContextErr = ctx.Err()
 	return s.rateLimitHandled, nil
 }
 func (s *routeWorkerStub) RequeueConversationRouteAfterInvalidOutput(_ context.Context, _ app.ConversationRouteClaim) (bool, error) {
@@ -140,6 +143,9 @@ func (s *routeWorkerStub) ResolveConversationRouteContextWindow(context.Context,
 func (s *routeWorkerStub) ClassifyConversationRoute(_ context.Context, _ app.ConversationRouteClaim, value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
 	s.classifies++
 	s.classified = value
+	if s.cancelAfterClassify != nil {
+		s.cancelAfterClassify()
+	}
 	return s.decision, s.classifyErr
 }
 
@@ -174,6 +180,31 @@ func TestConversationRouteFailureLogIncludesSafeErrorCode(t *testing.T) {
 	}
 	if _, ok := entries[0].ContextMap()["error"]; ok {
 		t.Fatalf("failure log exposed raw error: %+v", entries[0].ContextMap())
+	}
+}
+
+func TestConversationRouteBudgetFailureLogIncludesStageAndCapacity(t *testing.T) {
+	stub := &routeWorkerStub{}
+	core, logs := observer.New(zap.WarnLevel)
+	worker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{Queue: stub, Actions: stub, Models: stub,
+		WorkerID: "route-budget-log-test", LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.New(core)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	budgetErr := domain.NewError(domain.CodeResultTooLarge, "sensitive request detail")
+	budgetErr.Details["stage"] = "worker_context_fit"
+	budgetErr.Details["context_window_tokens"] = 4096
+	budgetErr.Details["context_window_known"] = false
+	if err := worker.failRoute(context.Background(), app.ConversationRouteClaim{}, "message_too_long", budgetErr); err != nil {
+		t.Fatal(err)
+	}
+	fields := logs.All()[0].ContextMap()
+	if fields["failure_stage"] != "worker_context_fit" || fmt.Sprint(fields["context_window_tokens"]) != "4096" ||
+		fields["context_window_known"] != false {
+		t.Fatalf("budget failure log omitted safe diagnostics: %+v", fields)
+	}
+	if _, ok := fields["error"]; ok {
+		t.Fatalf("budget failure log exposed raw error: %+v", fields)
 	}
 }
 
@@ -730,12 +761,14 @@ func TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits(t *testing
 		return err
 	}
 	for _, test := range []struct {
-		name        string
-		err         error
-		wantDelay   time.Duration
-		wantHandler bool
+		name                string
+		err                 error
+		wantDelay           time.Duration
+		wantHandler         bool
+		cancelAfterClassify bool
 	}{
 		{name: "provider retry after", err: providerRateLimit(1500 * time.Millisecond), wantDelay: 2 * time.Second, wantHandler: true},
+		{name: "worker context cancelled after confirmed rejection", err: providerRateLimit(1500 * time.Millisecond), wantDelay: 2 * time.Second, wantHandler: true, cancelAfterClassify: true},
 		{name: "bounded fallback", err: providerRateLimit(0), wantDelay: time.Second, wantHandler: true},
 		{name: "provider delay exceeds automatic bound", err: providerRateLimit(3 * time.Minute), wantHandler: true},
 		{name: "unclassified rate limit", err: domain.NewError(domain.CodeRateLimited, "rate limited")},
@@ -744,12 +777,20 @@ func TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits(t *testing
 			worker, stub := newRouteWorkerTest(t)
 			stub.classifyErr = test.err
 			stub.rateLimitHandled = true
-			if found, err := worker.RunOnce(context.Background()); err != nil || !found {
+			ctx := context.Background()
+			if test.cancelAfterClassify {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				defer cancel()
+				stub.cancelAfterClassify = cancel
+			}
+			if found, err := worker.RunOnce(ctx); err != nil || !found {
 				t.Fatalf("rate-limited route processing: found=%t err=%v", found, err)
 			}
 			if test.wantHandler {
-				if stub.rateLimitHandleCalls != 1 || stub.rateLimitRetryDelay != test.wantDelay || len(stub.failures) != 0 {
-					t.Fatalf("rate-limit handling calls=%d delay=%s failures=%v, want one handling with delay %s", stub.rateLimitHandleCalls, stub.rateLimitRetryDelay, stub.failures, test.wantDelay)
+				if stub.rateLimitHandleCalls != 1 || stub.rateLimitRetryDelay != test.wantDelay || len(stub.failures) != 0 || stub.rateLimitContextErr != nil {
+					t.Fatalf("rate-limit handling calls=%d delay=%s recovery_ctx_err=%v failures=%v, want one handling with delay %s and a live recovery context",
+						stub.rateLimitHandleCalls, stub.rateLimitRetryDelay, stub.rateLimitContextErr, stub.failures, test.wantDelay)
 				}
 			} else if stub.rateLimitHandleCalls != 0 || len(stub.failures) != 1 || stub.failures[0] != "model_unavailable" {
 				t.Fatalf("unconfirmed rate limit entered recovery: calls=%d failures=%v", stub.rateLimitHandleCalls, stub.failures)

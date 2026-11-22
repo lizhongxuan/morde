@@ -440,6 +440,8 @@ func TestConversationResultReceiptLocksValidationInputsUntilCommit(t *testing.T)
 	assertBlockedUntilCommit("task result event update",
 		`UPDATE task_events SET result_content_sha256=$3 WHERE task_id=$1 AND sequence=$2`, value.ID,
 		value.EventSequence, replacementDigest[:])
+	assertBlockedUntilCommit("validation verdict update",
+		`UPDATE task_validation_reviews SET validation_state='FAIL' WHERE task_id=$1 AND task_revision=$2`, value.ID, value.TaskRevision)
 	if err := receiptTx.Commit(ctx); err != nil {
 		t.Fatalf("commit result receipt: %v", err)
 	}
@@ -449,6 +451,10 @@ func TestConversationResultReceiptLocksValidationInputsUntilCommit(t *testing.T)
 	if _, err := f.store.pool.Exec(ctx, `UPDATE task_events SET result_content_sha256=$3 WHERE task_id=$1 AND sequence=$2`,
 		value.ID, value.EventSequence, replacementDigest[:]); err != nil {
 		t.Fatalf("task result event update after receipt commit: %v", err)
+	}
+	if result, err := f.store.pool.Exec(ctx, `UPDATE task_validation_reviews SET validation_state='PASS+NOTES'
+WHERE task_id=$1 AND task_revision=$2`, value.ID, value.TaskRevision); err != nil || result.RowsAffected() != 1 {
+		t.Fatalf("validation verdict update after receipt commit: rows=%d err=%v", result.RowsAffected(), err)
 	}
 }
 

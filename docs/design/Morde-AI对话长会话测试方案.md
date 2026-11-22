@@ -14,7 +14,7 @@
 
 | ID | 场景与步骤 | 通过条件 | 自动化位置 |
 |---|---|---|---|
-| LC-01 | 在同一会话发送约 18 KB 的长要求，随后发送“请用英语回答”；前序消息 ID 指向长要求。 | 短追问仍可分类和回答；模型路由只读取有界预览并带原文 ID/摘要，不因旧正文大小报错；数据库中的完整原文及摘要校验保持不变。 | `server/internal/store/postgres/conversation_route_h01_integration_test.go`；PostgreSQL 路由 E2E。 |
+| LC-01 | 在同一会话发送约 18 KB 的长要求，随后发送“请用英语回答”；前序消息 ID 指向长要求。另以 4K 合成窗口，构造短追问引用一个目标很长的运行中 Task、以及引用同作用域前序长请求的路径，并覆盖模型容量未知、按 4K 预检。 | 短追问仍可分类和回答；模型路由只读取有界预览并带原文 ID/摘要，不因旧正文或被引用 Task 的长目标误报超限；目标 Task/消息 ID、前序消息 ID 和完整原文 SHA-256 校验保持不变，裁剪标记明确。 | `server/internal/store/postgres/conversation_route_h01_integration_test.go`；`server/internal/worker/conversation_route_context_budget_test.go`（`TestConversationRouteWorkerFitsReferencedLongTaskAtUnknownCapacity`、`TestFitConversationRouteContextShrinksPreviousRequestWithoutLosingItsDigest`）；隔离 PostgreSQL 路由 E2E。 |
 | LC-02 | 以 4K token 合成窗口连续发送 40 条较长追问，使 DSH 至少压缩两次；最早要求设置唯一锚点，末条追问设置另一锚点。 | 所有 40 条用户消息各持久化一次；压缩后模型仍看到早期要求和最新追问；任务完成，无 Runtime 错误，检查点中仍可查原始消息。 | `runtime/morde-cloud-runtime/test/hermes-compaction-runtime.test.mjs`。 |
 | LC-03 | 发起多步骤工具任务；工具执行期间补充同任务要求，同时创建独立任务；在检查点确认后重启 Runtime。 | 追问进入正确会话/任务；已确认的工具调用不重放；两个任务各自恢复并完成，进度和结果不串线；停止一个任务不停止另一个。 | Runtime 投递/恢复用例；`server/internal/worker/conversation_context_dsh_e2e_integration_test.go`。 |
 | LC-04 | 分别注入空摘要、截断摘要、摘要模型失败、Provider 上下文溢出及用户取消。对失败案例恢复 Runtime 并重试一次。 | 无效摘要不替换活动历史；原始事件和失败记录保留；溢出仅按 DSH 有界恢复策略重试；取消不提交摘要；重启不会重复已确认调用或重复结算。 | `runtime/morde-cloud-runtime/test/compaction-recovery.test.mjs`。 |

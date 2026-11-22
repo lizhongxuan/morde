@@ -229,18 +229,29 @@
 
 下表状态表示整条端到端用例是否执行；下方“本地自动化证据”只证明列出的代码路径，不替代真实模型、PC/iOS 或 60 分钟耐久验收。
 
-### 旧 LC 用例映射到当前 MH 范围
+### 长会话测试方案 LC 用例映射到当前 MH 范围
 
-| 旧用例 | 当前承接用例 | 保留的验收意图与边界 |
+此表仅用于把必执行的 LC-01–LC-06 对应到 MH 记录项，不是选测菜单。最终验收须逐项执行测试方案中的场景；尚未运行、环境不满足或只有局部自动化证据时，状态保持待验证/阻塞并注明原因。
+
+| 测试方案用例 | 当前承接用例 | 保留的验收意图与边界 |
 |---|---|---|
-| LC-01｜长消息后短追问 | MH-CTX-001、MH-MSG-001 | 短追问不能因前一条长消息而失败；输入是否超过 8,192 tokens 必须另有 tokenizer/Provider 证据，不能用旧用例的字节数替代。 |
+| LC-01｜长消息后短追问 | MH-CTX-001、MH-MSG-001 | 短追问不能因前一条长消息或被引用 Task 的长目标而失败；4K 未知容量窗口下的回归属于必验项。输入是否超过 8,192 tokens 必须另有 tokenizer/Provider 证据，不能用字节数替代。 |
 | LC-02｜40 轮及多次压缩 | MH-CTX-002 | 4K 合成窗口、多轮压缩、早期与最新锚点、消息/工具组完整性。 |
 | LC-03｜运行中追问、独立任务与重启 | MH-MSG-001、MH-REC-001 | 检查任务关联、独立任务隔离、检查点恢复和不重放；真实 DSH/PC 入口仍须单独验收。 |
 | LC-04｜摘要/Provider 失败恢复 | MH-FAIL-001 | 保留无效摘要、上下文溢出、取消、版本冲突和有界恢复语义。 |
 | LC-05｜会话与账号隔离 | MH-ISO-001、MH-CTX-004 | 交叉追问不得泄漏其他账号/会话历史；历史检索文本仍是不可信数据。 |
 | LC-06｜PC/iOS 接续与重连 | MH-CLIENT-001、MH-DUR-001 | 两个真实客户端接续同一会话并检查消息、进度、结果和恢复；模拟器或合成接口测试不替代实测。 |
 
-该表只迁移旧方案的测试意图；当前规格的 token、授权、运行时与客户端边界优先，旧 LC 输入数字和“通过”结论不自动沿用。
+测试方案的全部验收意图均须保留；当前规格的 token、授权、运行时与客户端边界用于约束执行方式，既有 LC 输入数字和“通过”结论不自动沿用。
+
+### LC-01 短追问误报根因调查与修复 2026-11-22
+
+- **现象与证据边界：** 截图中的单字短消息显示 `message_too_long`。UI/持久状态把工作线程上下文预算失败、Model Gateway 预检失败和 Provider 明确溢出映射到同一用户文案；截图本身没有消息 ID、失败阶段、模型容量或 Provider 用量，不能单独证明这次线上失败属于哪一层。
+- **可复现根因：** 路由预算会删除普通候选，但保留明确引用的前序消息和活动 Task。原先只把它们预览到 4 KiB；若容量未知而按 4K 窗口预检，长 Task 目标或前序请求预览仍可能挤满预算，于是短当前消息被错误标成超限。新增的短追问 + 长被引用 Task 目标回归在修复前失败，确认了这类机制缺口；前序请求路径也已补充原文哈希不变的回归。
+- **修复：** 预算拟合现在会逐步缩短被保留的旧消息/Task 文本，保持 Task/message ID；前序消息继续保留完整 SHA-256 用于精确关联，Task 目标和候选集明确标记截断。当前消息不参与此裁剪。失败日志新增安全的 `failure_stage`、`context_window_tokens`、`context_window_known` 字段，不记录原始输入；Provider 明确溢出保留其独立阶段/错误码。
+- **Hermes 机制对照：** 对照固定上游 `0d49d6d9` 的 `gateway/run_turn_hygiene.py::_hmwa_hygiene_plan`、`agent/context_compressor_window.py::_plan_compaction_window` 和 `tools/session_search_tool.py::_discover/_scroll`。Hermes 的回合前压缩以 Provider 实际用量/持久锚点/保守估算加硬消息数兜底，采用失败冷却；窗口算法先做安全工具结果修剪，再保持近期尾部与工具配对选择压缩范围。Morde 已在 DSH Runtime 适配 Hermes 窗口预算、范围规划和进展检查；服务端则用 DSH TokenMeter 维护跨 Task 摘要与带授权证明的原文检索。本次复现属于独立路由器固定引用旧请求/Task 文本挤占 4K 预算，不属于 DSH Session 压缩窗口；已在路由预算拟合处做专属修复。没有复制 Hermes 的 Gateway/SQLite/后台线程实现，也没有新增第二个 Agent/压缩循环。`project/hermes-agent/` 本地源码快照没有独立 Git 元数据，核对上游函数时以规格固定提交 `0d49d6d9` 为准；本轮只做源码对照，未运行 Hermes 测试套件。
+- **本地验证：** 新回归在修复前稳定失败，修复后通过。本轮修改后 `cd server && go test ./internal/app -count=1` 通过（20.095 秒）；`cd server && go test ./internal/worker -run '^(TestFitConversationRouteContext|TestConversationRouteWorker)' -count=1` 通过（0.730 秒），覆盖长 Task 与前序长请求裁剪及安全预算诊断；两个新增回归单独复跑均通过（长 Task 0.725 秒，前序长请求 1.883 秒）。最终代码下 `go test ./internal/app ./internal/worker -count=1` 通过（App 20.192 秒，Worker 58.902 秒），包含未知容量 Worker 路由、窗口预算、长历史拟合、Task/message 保留、Provider 溢出诊断和 4K/8K/100K/200K 合成摘要用例。Runtime 全套 `npm test` 通过（181/181，63.6 秒），包含 40 轮多次压缩锚点及压缩失败恢复。PostgreSQL LC-01 命令已执行，但因 `CH_TEST_DATABASE_URL` 未配置而跳过；实际 PC/iOS 和真实 Provider 未重跑。以上自动化结果不替代[测试方案](../design/Morde-AI对话长会话测试方案.md)剩余 LC 用例的端到端验收。
+- **剩余确认：** 该修复覆盖了已复现的 4K 预算机制缺口，但目前不能确认截图中的部署实例就是此根因；需在测试站重现后按新失败阶段日志核对服务端版本、模型窗口来源和 Provider 用量，再完成 LC-01–LC-06 端到端验收。
 
 | 用例 | 主要规格 / TODO | 当前状态 | 实际结果与证据位置 |
 |---|---|---|---|
@@ -253,10 +264,10 @@
 | MH-MSG-001 | 规格 2.2；H10 | 部分通过（本机实际 PC 客户端 + 本地合成模型/执行器；DSH、真实 Provider、Task 定向追问与停止未验） | `TestConversationBrowserAcceptance` 中先创建后台 Task，确认 DB 状态为 `running`，随后从 `morde-pc` 发送普通快速消息并收到夹具回复；不覆盖 Task steer/followup、独立任务并行或目标停止。详见“本机 PC 运行中普通追问夹具”。 |
 | MH-TOOL-001 | 规格 07–08；H03、H04 | 未执行 | |
 | MH-REC-001、MH-FAIL-001 | 规格 2.1–2.3；H04、H09、H10 | 未执行 | |
-| MH-AGENT-001 | 规格 06、2.2；H11 | 未执行 | |
+| MH-AGENT-001 | 规格 06、2.2；H11 | 未通过（指定测试站实际入口任务中断；无子 Agent 记录） | 本轮 PC 旁聊请求实际进入 Task `q86mee2m`，状态 `waiting_user`、原因 `dsh_recovery_unresolved`；快照只有 main Agent，`child_jobs=[]`，无结果回执。没有重试。详见下方“S07 H11 真实站点子 Agent 委派探针”。 |
 | MH-GATE-001 | 规格 09–10；H05 | 部分通过（本地服务端门禁回归；工程/非工程场景和客户端入口未验） | App verdict、PostgreSQL revision/result/event fencing 与一次发布、Worker review 定向测试通过；原会话 assistant 回执分别标注主 Agent 摘要、Task completed 和各来源当前修订的 validation 状态；缺可信执行环境或可核查 Artifact 内容时保持 `pending`。Artifact review metadata 现绑定 Workspace revision 与内容 SHA-256，但输入包不含 Artifact 字节。Task 投影仍分别提供 Task 状态、ResultReview 和 validation。测试命令及完整边界见[S04 审计记录](../Morde_Harness_并发实施/04-结果验证与交付.md)。 |
 | MH-ISO-001 | 规格 2.1；H09 | 未执行 | |
-| MH-CLIENT-001 | 规格 2.4；H06 | 部分通过（PC 单次回复；iOS 本地发送 UI 用例通过）；同会话追问及 PC/iOS 接续未验收 | PC 短文本及 42,603 字节合成长文本首轮收到真实回复，但长消息后的历史追问未回复。iOS 本地模拟器用例仅覆盖未知云端模型状态下的消息受理，未连接真实 Provider，也未与 PC 接续同一会话。端到端客户端验收仍未完成。详见下方实际 PC 探测记录和“本地自动化证据”中的 iOS 行。 |
+| MH-CLIENT-001 | 规格 2.4；H06 | 部分通过（指定测试站的 PC/iOS 同一旁聊短文本往返及自动恢复对账通过；Task/耐久与其它 P0 场景未完成） | PC 短文本及 42,603 字节合成长消息首轮收到真实回复，但长消息后的历史追问未回复。后续 iOS 从同一旁聊读取 PC 提示与回复，并发送追问；客户端曾显示“发送结果待确认”，未手动重试，自动核对后显示“已发送”并收到 IOS-REAL-OK。模拟器另有本地消息受理用例。以上不证明 Task 进度、跨账号隔离、文件夹同步或耐久；详见“PC 短文本真实回复补充”和“S07 iOS 同会话真实服务补测”。 |
 | S05-PC-001 | 规格 2.2–2.4；H06 | 部分通过（本机实际 `morde-pc` + 合成模型/执行器；失败提示的实际路由注入及超限大文本未验） | PC 发出普通消息并显示合成回复；Task 失败与等待用户授权由本地夹具核验。运行中状态追问和重启后状态恢复已操作，但可访问性读取未确认状态回复全文。`routingFailureText` 展示、原文保留及 `message_too_long` 不允许同内容重试由 Assistant 组件测试覆盖。见“本机 PC S05 客户端验收”。 |
 
 ### 本地自动化及真实 Provider 探针（2026-11-22；不计作完整端到端验收）
@@ -372,6 +383,8 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 |---|---|---|
 | App 全量 | `cd server && go test ./internal/app -count=1` | PASS，20.739 秒。 |
 | 路由最小窗口 | `cd server && go test ./internal/worker -run '^(TestFitConversationRouteContextFitsMinimumWindowWithIncompleteHistoryAndCandidates|TestFitConversationRouteContextDropsHistoryTextButKeepsReferences|TestFitConversationRouteContextDropsOversizedSummary)$' -count=1` | PASS，3 项。大候选/不完整历史在 4096 token 窗口 fixture 中被安全收缩，候选集合标记不完整，模型输入预算仍在界内。 |
+| 长运行 Task 短追问最小窗口 | `cd server && go test ./internal/worker -run '^TestFitConversationRouteContextShrinksReferencedTaskForShortFollowup$' -count=1` | PASS，1 项（0.725 秒）。保留被引用的长运行 Task、截断其长目标并标记候选集合不完整，最终路由输入仍在 4096-token fixture 窗口内。 |
+| 前序长请求摘要保留 | `cd server && go test ./internal/worker -run '^TestFitConversationRouteContextShrinksPreviousRequestWithoutLosingItsDigest$' -count=1` | PASS，1 项（1.883 秒）；保留原消息 ID 与完整正文 SHA-256，同时对路由预览做安全截断并保持模型请求在 4096-token fixture 窗口内。 |
 | PostgreSQL 初始失败复验 | 隔离 PostgreSQL 下重跑初始失败中除修订重启 E2E 外的 14 项：回执、项目模型派发/预留、共享项目历史、streaming、task activity/stall 及 pending-input completion | PASS，14 项，15.263 秒。 |
 | Worker / Node 恢复与长历史 | 隔离 PostgreSQL 下 `TestCloudTaskWithCancelledPersonalChildFailsClosedAfterNodeRestart`、`TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim`、`TestCloudTaskHostGenerationFencePreservesAgentChildCheckpoint`、`TestA30TaskFileFetchRunsFromChatThroughPostgresHubAndPCBridge`、`TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart` | PASS，5 项，41.020 秒。 |
 | 会话修订重启（修复前） | `TestConversationRevisionStopsRealAgentAndRestartsWithLatestMessages` | 修复前失败：新版 Task Runtime 退出但没有结果，报告 `child_exited_without_result`。后续诊断和修复结果见下方 S00 记录。 |
@@ -387,10 +400,10 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 
 - **起点与范围：** 从本地 `main` / `origin/main` 相同提交 `ada69312946a235b9aa58577dcb754f7f7ae36ba` 建立隔离集成 worktree `codex/harness-merge-all`。按截图逐一合并以下 19 个分支：`codex/harness-h06-integration`、`codex/harness-s01`、`codex/harness-s01-coordinator-rate-limit`、`codex/harness-s01-history`、`codex/harness-s01-main`、`codex/harness-s02-go`、`codex/harness-s02-integration`、`codex/harness-s02-node`、`codex/harness-s02-receipt-fix`、`codex/harness-s02-review`、`codex/harness-s03-integration`、`codex/harness-s03-review`、`codex/harness-s04-integration`、`codex/harness-s04-main`、`codex/harness-s05`、`codex/harness-s05-review`、`codex/harness-s05-review-2`、`codex/harness-s06`、`codex/harness-s06-regression`。
 - **冲突处理：** H06/S01/S02/S03/S04/S06 合并中出现的冲突，均通过对照两侧实现和提交历史解决，保留当前集成树中的较新安全约束与回归覆盖。冲突文件为 `docs/Morde_Harness_并发实施/04-结果验证与交付.md`、`docs/Morde_Harness_并发实施/06-iOS客户端.md`、`server/internal/app/conversation_route_h01_test.go`、`runtime/morde-cloud-runtime/src/engine.mjs`、`server/internal/store/postgres/conversation_result_aggregation_integration_test.go`、`server/internal/store/postgres/conversation_result_review.go`、`server/internal/store/postgres/task_agent_stall_integration_test.go`、`server/internal/worker/cloud_dsh_executor_test.go`、`server/internal/worker/cloud_dsh_session_tree.go`、`server/internal/worker/conversation_context_dsh_e2e_integration_test.go`。例如保留了收据发布事务对 review/task/event 的共享锁、已应用 steer 的 admission fence、最新的 child checkpoint/restart 覆盖和完整 validation/UI 回归记录；没有将旧分支中缺少这些更新的文件版本覆盖进来。
-- **Git 验证：** 19 个分支 tip 对集成分支执行 `git merge-base --is-ancestor` 均成功；无冲突分支使用正常 merge，冲突按文件比较后解决，未使用 `git merge -s ours`。合并树相对起点只有 S01 交接文档一处内容差异（42 行新增、2 行删除）；随后增加管理文档，产品源码 diff 仍为空。正常 fast-forward 后执行 `git push origin main` 成功；本地 `main` 与 `origin/main` 当前均为 `e631d4cdd9ec68e1143f93a46f5572a54702862f`，重新核验 19/19 分支 tip 均是其祖先。
-- **分支工作树：** 所有截图内有独立 worktree 的分支均干净，只有 `codex/harness-s05` 带有三处未提交的 Portal 改动；与当前 `main` 对应文件逐字节一致。该工作树未修改或清理，也没有漏合入的独有内容。
+- **Git 验证：** 19 个分支 tip 对集成分支执行 `git merge-base --is-ancestor` 均成功；无冲突分支使用正常 merge，冲突按文件比较后解决，未使用 `git merge -s ours`。合并树相对起点只有 S01 交接文档一处内容差异（42 行新增、2 行删除）；随后增加管理文档，产品源码 diff 仍为空。正常 fast-forward 后执行 `git push origin main` 成功，合并提交为 `e631d4cdd9ec68e1143f93a46f5572a54702862f`；随后 `main` 与 `origin/main` 前进到 `a23d7e7572f349211992bdea69c541a31a29de5c`（`fix: 优化harness`）。当前本地和远端 `main` 均为 `a23d7e7572f349211992bdea69c541a31a29de5c`，19/19 指定分支 tip 仍是其祖先。
+- **分支与 worktree 清理：** 截图中的 19 个分支 tip 均为 `main` 祖先，目标 worktree 均已清理，19 个本地分支引用已删除。`codex/harness-s05` 有三处未提交 Portal 改动，经逐文件比较与 `main` 完全相同后随其 worktree 一并清理。临时 `codex/harness-merge-all` 与 `codex/merge-to-main` 分支/worktree 也已移除；后者只剩未完成的冲突工作区，已确认其已提交 tip 在 main 中。`git worktree prune` 清掉已不存在路径的登记。未删除无关的 `workspace-1` 和 `codex/client-login-ordering-20261105`。
 - **测试范围：** 本次分支整合没有改变产品源码，因此未机械重跑代码测试。复用上方同一产品源码快照已有的 App、路由预算、14 项 PostgreSQL、5 项 Worker/Node 及生命周期 E2E 定向结果；当时已知会话修订重启 E2E 尚未解决，后续修复与通过结果见“修订重启 E2E 根因与修复”。H06/H00 不因此标完成。对合并后的文档与 Git diff 执行 `git diff --check main` 通过，冲突标记扫描无匹配；新提交对象中的 API key/私钥常见格式扫描无匹配。
-- **分支 ref：** 本轮将分支提交纳入 `main` 的历史，不删除源分支引用；合并历史本身不代表真实 Provider、PC/iOS、云端电脑或耐久验收通过。
+- **远端核对：** `git fetch origin main` 后本地 `main` 与远端提交均为 `a23d7e7572f349211992bdea69c541a31a29de5c`；`git ls-remote --heads origin` 只返回 `main`，因此截图分支没有待推送的远端引用，当前不需要再次 push。合并历史本身不代表真实 Provider、PC/iOS、云端电脑或耐久验收通过。
 
 ### S00 会话修订重启 E2E 退出诊断（2026-11-22；本机隔离 PostgreSQL）
 
@@ -410,6 +423,13 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **审计结论：** S04 的 `TaskValidationReviewSnapshotReader` 只提供 Task/revision/result 与 Artifact metadata，没有 claim-bound 内容读取方法。仓库已有 `TaskService.OpenTaskArtifactContent`，会复用 Task/Host 授权并从 `WorkspaceSyncService.OpenCommittedArtifact` 读取固定 revision、校验 manifest/block/整文件 SHA-256；但通用方法本身不绑定当前 review claim、Task evidence ref 与 step。metadata 和 hash 证明来源及字节完整性，不证明语义正确。
 - **边界与决策：** 把 Artifact bytes 填入远程模型请求会把文件内容发送出本机，违反仓库 `AGENTS.md` 的本地文件约束；本轮未增加 claim-bound 读取、未将内容放进 reviewer 请求，也未调用外部环境。未来若需语义核验，应提供符合本地文件约束的本地复核路径。当前 metadata-only 输入继续要求 reviewer 对无法读取的 Artifact 内容标 `insufficient`，服务端 verdict 保持 `pending`。
 - **仍待验收：** 持久 Host/操作记录提供的可信环境身份、工程与非工程真实场景、H06 客户端入口与环境验收。只读审计无代码改动、无测试执行；本地 H09 Token 规模测试另见同轮 TODO/验证记录。
+
+### S00 H02 确认 429 后的 Worker 取消恢复 2026-11-22（本机隔离 PostgreSQL）
+
+- **根因与改动：** `ConversationRouteWorker.RunOnce` 收到分类阶段已确认的 Provider 429 后，如果 worker context 同时取消，会切换到限时 `WithoutCancel` context 完成数据库恢复；原代码却把已计算的重试延迟清零，导致存储层将 429 按不可重试结果失败。现保留确认的有界 Retry-After，只将恢复事务从已取消的请求 context 解耦。
+- **Worker 回归：** `cd server && go test ./internal/worker -run '^TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits$' -count=1` 通过（2.167 秒）；覆盖分类返回已确认 429 后取消 worker context，仍将原延迟传给恢复处理器。
+- **持久层回归：** 使用临时 `postgres:16.15-bookworm`（仅绑定 `127.0.0.1:55432`，无持久卷，运行后删除）执行 `cd server && CH_TEST_DATABASE_URL=<本机一次性 PostgreSQL 16 DSN> go test ./internal/store/postgres -run '^TestConversationRouteRetriesConfirmedRateLimitWithNewMeteredIdentity$' -count=1 -v -timeout=3m`，3 个子用例通过，4.451 秒。新增取消竞态用例检查路由仍为 `pending`、attempt 只递增一次、Retry-After 仍生效、拒绝的模型调用和用量账本均为 `rejected`，且 Provider 只调用一次。
+- **边界：** Provider 为合成客户端；未验证真实 429/Retry-After 头、真实 worker 进程退出、真实模型首响与流中断。H02 仍进行中。
 
 ### S00 H02 模型客户端恢复边界定向验证（2026-11-22；合成 transport）
 
@@ -444,8 +464,28 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 ### S00 H04 模型请求停滞提示 2026-11-22
 
 - **改动：** 复用 `task_agent_sessions.activity_progressed_at` 与现有严格 Task/Agent/lease/generation/revision 栅栏。当前 root 或 child Session 的 `model/started` 若超过 `app.ModelCallTimeout` 45 秒仍未进入终态，即使 Runtime heartbeat 新鲜也会触发既有的去重提示；模型终态会清除提示。所有阶段若 `started` 与 Session `running` 状态不一致，快照保持 unknown，既有提示不清除；工具、子 Agent 与 checkpoint 不按旧进展时间单独判停滞。本次没有新增 migration、自动取消或重试。
-- **验证：** 使用一次性 `postgres:16.15-bookworm` 容器（只绑定本机回环端口，测试后删除），执行 `CH_TEST_DATABASE_URL=<本机一次性 PostgreSQL 16 DSN> go test ./internal/store/postgres -run '^(TestPostgresTaskAgentModelCallStallUsesProgressDespiteFreshHeartbeat|TestPostgresTaskAgentStallNoticeWaitsForKnownStaleActivityAndClearsOnce)$' -count=1 -v`，通过（10.944 秒）。新测试八个子用例覆盖：模型期限内不提示、heartbeat 新鲜但 root/child model activity 超期时提示且仅一条、模型已终态不再判超期、child `idle+started` 保持 unknown、新鲜工具 heartbeat 不因旧进展时间误报，以及 root/child `idle+started` 工具快照不会清除既有提示；原有 pending 输入去重、活动恢复清除和 Task 状态不变回归也通过。目标 Go 文件 `gofmt`、`git diff --check` 通过。
+- **验证：** 使用一次性 `postgres:16.15-bookworm` 容器（只绑定本机回环端口，测试后删除），执行 `cd server && CH_TEST_DATABASE_URL=<本机一次性 PostgreSQL 16 DSN> go test ./internal/store/postgres -run '^(TestPostgresTaskAgentModelCallStallUsesProgressDespiteFreshHeartbeat|TestPostgresTaskAgentStallNoticeWaitsForKnownStaleActivityAndClearsOnce)$' -count=1 -v`，通过（10.944 秒）。新测试八个子用例覆盖：模型期限内不提示、heartbeat 新鲜但 root/child model activity 超期时提示且仅一条、模型已终态不再判超期、child `idle+started` 保持 unknown、新鲜工具 heartbeat 不因旧进展时间误报，以及 root/child `idle+started` 工具快照不会清除既有提示；原有 pending 输入去重、活动恢复清除和 Task 状态不变回归也通过。目标 Go 文件 `gofmt`、`git diff --check` 通过。
+- **客户端静态链路核对：** `clients/desktop/harness/desktop/src/morde-main.ts` 加载本地 Portal bundle；`web/portal/src/routes/Assistant.tsx` 订阅 Task SSE，并在 Agent 工作过程中显示 Task snapshot steps。iOS `MordeApp.swift` 将 `task.step` 投影为可见 timeline row，`MIFTaskViews.swift` 渲染该时间线。独立 `clients/desktop/harness/dsh-nanomuse/src/client/TaskDetail.tsx` 使用本机 Rooms ActivityRecord，不消费云端 Task。未运行客户端测试或操作实际客户端；真实 PC/iOS 用户入口呈现该通知仍待验收。
 - **限制：** 未调用真实 Provider；45 秒是当前服务端单次请求总期限。工具/子 Agent/checkpoint 的请求级期限、真实慢工具进程、PC/iOS 提示呈现、断线恢复和 60 分钟耐久仍未验收，故 H04 继续进行中。
+
+### S00 H04 工具执行期间活动帧静态审计 2026-11-22
+
+- **发现：** `cloud_dsh_session_tree.go` 的帧消费循环在 `tool_call` 分支同步调用 `Tools.Execute`，恢复调用同步执行 `Reconcile`；`readCloudDSHFrames` 虽独立读取 stdout，但写入容量为 1 的帧通道。工具调用未返回前，主循环不能消费并持久化后续 activity/heartbeat，子 Agent 的普通帧也可能占住待处理槽位。当前请求级停滞提示只覆盖 `model/started` 的 45 秒期限；工具、子 Agent 与 checkpoint 仍只有整个 Task 的 ActiveSeconds 及 Task 生命周期取消。
+- **处理：** 本轮只读审计，没有改代码或跑测试。现有副作用规则不允许把超时当作“操作未执行”，也不应在没有最新租约/活动证据时自动取消或重派。因此保留未知操作的对账路径，不加固定工具超时；后续若实现监测，应在工具等待期间继续处理经身份/代次/序号验证的 activity 帧，并让失效/超时代次进入 Reconcile，而非重复 Execute。
+- **边界：** 这是 H04 的明确本地实现与覆盖缺口。健康长时间工具可能没有及时刷新持久 heartbeat，pending 输入提示可能滞后或误判；本轮没有验证真实慢工具、子 Agent 或 PC/iOS 通知。H04 继续进行中。
+
+### S00 H05 来源身份 SQL 静态审计 2026-11-22
+
+- **核对：** `server/migrations/00150_conversation_result_aggregation.sql` 给 `conversation_result_sources` 建立复合外键：来源行的 `(batch_message_id, owner_id, conversation_id, actor_id)` 必须对应其批次；`(task_id, owner_id, conversation_id)` 必须对应 Task；`(task_id, owner_id, actor_id)` 必须对应 Task 的 initiator。路由加载先验证 batch owner/actor/conversation 与 route claim 相同，再对比 batch authorization version、source authorization version 和当前 claim version。因此只靠错绑来源行跨入另一批次/Task 的静态候选已由现有数据库约束和版本检查阻止，本轮未改 SQL。
+- **锁覆盖：** `conversationTaskResultValidationStateInTx` 使用 `FOR SHARE OF review, task, event`。现有 `TestConversationResultReceiptLocksValidationInputsUntilCommit` 直接验证 Task 与 event 更新被阻塞；尚未直接验证 `task_validation_reviews.validation_state` 更新被阻塞。这是测试覆盖缺口，不是已确认的生产锁缺陷。
+- **补充回归与验证：** 扩展 `TestConversationResultReceiptLocksValidationInputsUntilCommit`，证明 `task_validation_reviews.validation_state` 的并发更新在回执事务持有共享锁期间被阻塞，并在回执提交后成功。使用一次性 `postgres:16.15-bookworm`，端口仅绑定 `127.0.0.1:55433`，无持久卷，测试结束后移除容器；`CH_TEST_DATABASE_URL=<本机一次性 PostgreSQL DSN> go test ./internal/store/postgres -run '^TestConversationResultReceiptLocksValidationInputsUntilCommit$' -count=1 -v -timeout=3m` 通过（测试 1.98 秒，包 3.947 秒）。
+- **范围：** 静态检查上述迁移、入队/加载/发布 SQL 与既有集成测试，没有产品 SQL/schema 改动。错绑候选由现有复合外键/版本比对阻止。H05 仍因可信执行环境身份、可核查 Artifact 内容和 H06 入口验收未完成。
+
+### S00 H01 长前文截断与授权检索提示断言对齐 2026-11-22（本机隔离 PostgreSQL）
+
+- **复核：** `ConversationRouteModelRequest` 对长历史预览设置 `content_truncated=true`，并使用包含 `morde_current_conversation_history_search` 的授权历史检索指引及不推测省略内容规则。第一次集成运行发现测试仍要求已废弃的 `history_incomplete is true` 提示字样；只更新测试断言匹配当前提示契约，未改生产路由。
+- **验证：** 使用临时 `postgres:16.15-bookworm`（仅绑定 `127.0.0.1:55432`，无持久卷，运行后删除）执行 `cd server && CH_TEST_DATABASE_URL=<本机一次性 PostgreSQL 16 DSN> go test ./internal/store/postgres -run '^TestH01Long' -count=1 -v -timeout=3m`，4 项通过，8.645 秒。首跑因旧提示文案断言失败；更新后同组复跑全部通过。
+- **边界：** 该组验证 PostgreSQL 路由快照和分类请求，不调用真实 Provider，也不替代 PC/iOS 长历史入口或跨账号授权验收；H01 仍进行中。
 
 ### S00 H09 累计 Token 规模合成回归 2026-11-22
 
@@ -461,8 +501,41 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **DSH Runtime / Portal / PC 自动化：** 本机 Node `v24.22.2`。首次 Node 26 Runtime 全量 `157/158`，唯一失败是 `resumes a completed coordinator checkpoint and returns its saved text without a model call` 在 5 秒内未收到 resume frame；改在 Node 24 全量复验后 `158/158` 通过（39.375 秒），该失败未复现。命令 `PATH=/opt/homebrew/opt/node@24/bin:$PATH npm test`，日志 `/tmp/s07-runtime-node24-fee63a35.log`。Runtime 离线安装缺少缓存 `undici@8.11.2`；为不访问包仓库，临时链接到主工作树 Runtime 的本机 `node_modules`，确认两工作树 `package.json`/`package-lock.json` 哈希相同且 `undici` 为锁定的 `8.11.2` 后运行，结束时移除链接；fee63 测试工作树保持干净。Portal Node 26 和声明支持的 Node 24 全量均为 `792/838`，Node 24 重跑耗时 27.59 秒：46 项断言失败分布在 19 个有失败用例的文件，另有 1 个 suite setup 失败（20/66 个测试文件标失败）。缺少忽略目录 `.local/muse-a00-contract-v1.json` 导致 setup 失败。Node 24 下 `npm run typecheck` 再次通过（exit 0）。测试日志 `/tmp/s07-portal-node24-fee63a35.log`。Desktop `npm test` `288/288`、`typecheck` 通过，日志 `/tmp/s07-desktop-tests-fee63a35.log`。
 - **Portal 失败归因（只读）：** 46 个断言失败可归为：18 项找不到“重试”按钮；3 项 `.notice-center` class 期望与实际 error overlay 不符；10 项 PersonalData 测试期待的 `动态/偏好/灵感` 导航项不在 `PortalLayout.personalSections`，尽管 `PersonalData` 有对应 section；3 项需要的恢复链接/按钮被 `FloatingError` 消去或 Toast 模式隐藏；2 项 Connections alert 未找到；其余 10 项为文案、状态或 selector 期望不匹配。共享 `toast.tsx` 的 error 分支不保留 action，但 `use-network-read-notice.ts` 传入 retry action，相关 Toast 单测也固定了当前行为；`FloatingError.tsx` 同样会过滤子控件。以上暴露 route 与共享 UI 契约不一致，但不能仅据此判定产品缺陷；Connections 与其余文案/selector 项仍需各 route owner 单独核对。没有 `Assistant.test.tsx` 失败，因此本轮 Portal 结果未指向 S05 Assistant 改动。后台 Admin route 是否归 S05 不明确，修复前需按实际产品端文件 owner 交接。当前没有修改代码。
 - **iOS 本地入口：** `Morde` scheme、iPhone 18 Pro / iOS 27.2、Xcode 27.2；显式选择的七个 loopback fixture UI 用例覆盖顺序发送、失败原位重试、断网重启、受理状态对账、运行中追问/独立消息及 204 后时间线重连，`7/7` 通过、0 跳过。结果包 `/tmp/morde-s07-ios-20261122-morde-fixtures.xcresult`；有既存 UIKit hierarchy runtime warning。`MinisTests/MIFApprovalViewsTests` 的 19 项在 `fee63a35` 未进入 XCTest：build 缺少生成的 `Configs/ProviderCustomization.xcconfig`、`Rclone.xcframework` 和七个 FFmpeg XCFramework；结果包 `/tmp/morde-s07-ios-20261122-approval-tests.xcresult`。只读本地检查发现这些依赖仅在另一份 dirty 主工作树中有现成产物；干净基线的 Provider config 可用空值 `.example` 模板生成，Rclone 源码/模块可关闭代理离线解析，但 FFmpeg `6.1.2` 源码与构建脚本要求的本地 tarball 不存在，脚本会从 ffmpeg.org 下载。为保持 S07 指定远程主机边界及基线纯度，未复制主工作树的产物、未生成/下载依赖。另一次未计划的宽范围命令部分执行 12 项，其中 9 项审批 UI 断言失败、3 项跳过，随后中止；结果包 `/tmp/morde-s07-ios-20261122-morde-ui.xcresult`，不代替七项 fixture 验收或 19 项审批测试。
-- **远端及真实客户端：** 只对用户指定测试站执行匿名 `curl --head --max-time 15`，HTTP/2 200；未做登录或写入。未找到本机 S07 environment variables，也未找到以文档变量名作为 Keychain service 的条目；按仓库 [S07 秘密管理要求](../Morde_Harness_并发实施/10-各会话开发提示词.md#s07-测试环境变量)，聊天中提供的 DeepSeek key 按已暴露处理且未使用。用户指示先保持 H06 待验证，因此未继续配置密钥或凭据，也未连接 Provider、登录管理员或重置数据库密码；当前已运行 `morde-pc` 的实际服务目标也未确认是指定站点，未向现有会话发送消息。真实 PC↔iOS 同会话、Task 期间追问/停止、双账号隔离、超过模型窗口的累计历史及 60 分钟耐久均未执行。
-- **S07 结论：** 自动化证据有通过也有失败；真实站点/Provider/跨端/耐久项因安全凭据不可用而阻塞。H06 保持待验证，不将模拟器、自动化或匿名 HTTP 响应记为真实端到端通过。
+- **远端及真实客户端（早期检查）：** 首次 S07 检查只对用户指定测试站执行匿名 `curl --head --max-time 15`，HTTP/2 200；未做登录或写入。未找到本机 S07 environment variables，也未找到以文档变量名作为 Keychain service 的条目；按仓库 [S07 秘密管理要求](../Morde_Harness_并发实施/10-各会话开发提示词.md#s07-测试环境变量)，聊天中提供的 DeepSeek key 按已暴露处理且未使用。当时用户指示先保持 H06 待验证，因此未继续配置密钥或凭据，也未连接 Provider、登录管理员或重置数据库密码；当时已运行的 `morde-pc` 服务目标未确认是指定站点，未向现有会话发送消息。真实 PC↔iOS 同会话、Task 期间追问/停止、双账号隔离、超过模型窗口的累计历史及 60 分钟耐久均未执行。
+- **PC 短文本真实回复补充：** 使用本机当前工作区构建（本地 Portal bundle + Electron）的 `morde-pc`，临时隔离 profile `/tmp/morde-h04-morde-pc-profile`，启动参数 `--force-renderer-accessibility`，登录用户指定测试站 `https://portal.120.25.178.93.sslip.io`。在新建空旁聊中发送合成文本“这是本机 morde-pc 验收探针。请只回复 PC-REAL-OK。”；页面显示模型 `DeepSeek Flash · deepseek-flash`，并收到实际回复 `PC-REAL-OK`。没有上传或发送项目文件，也没有修改远端数据库。此项只证明当前本地 PC build 对测试服务的一次普通短文本真实回复；不证明 Task/停滞提示、iOS 接续、跨账号隔离、远端服务版本与当前工作树一致或耐久。
+- **S07 iOS 同会话真实服务补测（2026-11-22）：** 为仅本轮真实服务探测临时加入 `MordeUITests` opt-in XCTest，并以仅允许指定 HTTPS 主机的断言保护目标；`xcodebuild build-for-testing -project clients/nanoMuse/android/src/ios/Morde.xcodeproj -scheme Morde -destination 'id=E1C86EF7-3EB6-4348-9233-7C197A7E3490' -parallel-testing-enabled NO -derivedDataPath /tmp/morde-h06-ios-derived` 通过。Shell 环境不会自动传入 XCTest：首次试跑跳过；第二次尝试因抽屉搜索字段未获得键盘焦点失败，之后改为通过旁聊行 label 精确选择。最终试跑在 iPhone 18 Pro / iOS 27.2 专用模拟器使用已有账号会话，成功读取 PC 新建的旁聊行 `c66sqvzg` 和回复 `PC-REAL-OK`；该次临时测试的用户提示断言误用了大写 `PC`。只读消息 API 返回该会话 11 条消息，确认其中包含 PC 用户提示、PC 回复、iOS 追问和 iOS 回复；随后运行精确匹配小写 `morde-pc 验收探针` 的只读 UI 回归，`build-for-testing` 通过且单项 `test-without-building` 1/1 通过。探针随后仅发送一次合成 iOS 消息“请只回复 IOS-REAL-OK。”；XCUITest 退出后重新启动实际 App，消息一度显示“发送结果待确认”并带有“重试”；未点击重试。等待约 15 秒后，客户端的恢复核对将同一消息更新为“已发送”，并显示真实回复 `IOS-REAL-OK`。因此指定旁聊的 PC→iOS 历史、双向短文本和一次不重复重试后的自动状态核对通过；不代表 Task/停滞提示、双账号隔离、文件夹同步或耐久验收通过。结果包 `/tmp/morde-h06-ios-remote-20261122-attempt3.xcresult` 和 `/tmp/morde-h06-ios-history-readonly-20261122.xcresult`，消息自动恢复截图 `/tmp/morde-h06-ios-after-reconnect-wait.png`，UI hierarchy `/tmp/morde-h06-attempt3-all/B7EF4FF5-A82D-4DEB-AE3D-DC3FFC56E2F7.txt`。临时 XCTest 与临时 scheme 环境变量已恢复；未更改远端数据库或重试不确定消息。
+- **S07 结论：** 自动化证据有通过也有失败。早期真实站点/Provider/跨端/耐久探针因安全凭据不可用而阻塞；后续本机 PC 临时 profile 对用户指定站点登录成功，并收到一次 DeepSeek Flash 合成短文本回复（见“PC 短文本真实回复补充”）；iOS 已读取相同旁聊的 PC 用户提示与回复，发出的合成追问经自动对账后收到回复（见“S07 iOS 同会话真实服务补测”）。Task 与停滞提示、双账号隔离、文件夹同步和耐久仍未验收，H06 保持待验证。
+
+### S00 H06 PC 文件夹同步 UI 安全检查 2026-11-22（未执行同步）
+
+- **检查：** `arc-cua` 列出了一个标题为 `morde-pc` 的 Electron 窗口，但该进程没有暴露可核验的隔离 `user-data-dir`。为避免操作可能属于用户的默认 profile，本轮未向窗口输入、点击或切换账号。
+- **边界：** 未打开目录选择器、未触发同步、未上传/外发任何文件。用户明确要求文件仅在本地修改；远端真实同步验收保持待验证。此前本地合成同步测试与页面说明检查见 H06 现有记录。
+
+### S00 H06 PC 项目上传删除来源审计 2026-11-22
+
+- **删除来源：** `runtime/morde-sync` 的 LiveSync 只对共同基线中存在、服务端生成删除动作且当前内容仍匹配基线的路径执行删除；删除前保留恢复副本，内容变动会转为冲突。目录读取/元数据错误会使扫描失败，客户端在建立同步 session 前退出，不能用部分清单代表完整目录。
+- **项目上传：** 服务端从目标 `SourceBindingID` 对应且 Host 已确认 `applied` 的 session manifest 生成删除候选，不把合并后的 Workspace manifest 当成本机来源快照。项目上传客户端不能直接提交 `DeletedPaths`。远端独立新增不属于 PC 来源，因此不进入删除集；远端改动已同步路径时计划逻辑报冲突并过滤删除，Host 应用前还检查 pinned 当前状态、哈希及目录非空条件。现有 PostgreSQL `TestWorkspaceProjectUploadUsesInstallationCredentialWithoutSyncthingBinding` 覆盖“初次 PC 空项目、云端新增文件、再次手动空快照后云端文件保留”；`TestProjectUploadBaselineComesFromHostConfirmedSourceNotWorkspaceRevision` 验证基线来源；`TestProjectUploadConflictDoesNotApplyNonconflictingMutations` 验证冲突原子性。
+- **覆盖缺口与范围：** helper 侧已有单边删除、删除并发替换、双方修改保留、远端删除与本地编辑冲突回归；没有直接注入嵌套 `ReadDir` 失败，也没有项目上传“远端独立修改已同步文件、同时本机删除”的三方冲突集成用例。审计为静态读取，没有修改文件、运行测试、操作客户端/Host 或发送文件。生产删除链路未发现需修复缺陷，但以上两个边界及实际 PC/Host 手动同步仍待 H06。
+
+### S07 H11 真实站点子 Agent 委派探针（2026-11-22；未通过）
+
+- **操作：** 在本机当前工作区启动的 `morde-pc`、隔离 profile `/tmp/morde-h04-morde-pc-profile` 和用户指定测试站的新旁聊 `cxqiwn07` 中，提交纯文本 A/B 分工任务，要求主 Agent 通过两个 `dsh_delegate` 并行执行，只做合成文本处理，不调用文件、终端、网络或云端电脑。
+- **结果与证据：** PC 页面显示“AI 运行中断，无法确认本次执行结果。请停止任务后重试。”只读 `GET /api/conversations/cxqiwn07/messages?limit=100` 返回一条用户消息并关联 Task `q86mee2m`；只读 `GET /api/tasks/q86mee2m` 返回 `status=waiting_user`、`waiting_reason=dsh_recovery_unresolved`、`current_revision_started=false`，Agent 快照只有 `role=main,status=unknown`，`child_jobs=[]`，没有结果或 assistant 回执。因此未观察到真实子 Agent、并行重叠或主 Agent 汇总，`MH-AGENT-001` 未通过，H11 不勾选。
+- **边界：** 未点击“重试”，避免在上次执行结果未知时重复派发；未改远端数据库，也未上传或发送项目文件。该次不能证明当前测试站服务与本地 `main` 的代码版本一致。
+
+### S00 H11 并行子 Agent 取消隔离回归 2026-11-22
+
+- **改动：** 将既有“两子 Agent 并行、父 Agent 消费两份结果”Runtime 用例改为更强的组合：两个 child model 请求确认同时在途后，由主会话取消子 Agent A；断言只有 A 收到 `model_cancel`，A 等待持久结算为 cancelled，B 保持运行并返回成功结果，父 Agent 读取两份状态与结果后汇总。
+- **验证：** `cd runtime/morde-cloud-runtime && npm run build:dsh-compaction && node --test --test-concurrency=1 --test-name-pattern='cancelling one of two concurrent background children' test/runtime.test.mjs` 通过，1/1。随后 `node --test --test-concurrency=1 test/runtime.test.mjs` 全量通过，157/157，55.119 秒。
+- **边界：** 这是本地 DSH Runtime 合成 IPC/模型回归；指定测试站的实际 PC 探针此前停在 `dsh_recovery_unresolved`，没有观察到子 Agent，且未重试未知任务。H11 仍未通过真实服务入口验收。
+
+### S00 当前 main 工作区回归 2026-11-22
+
+- **代码基线：** `main` / 刚 fetch 的 `origin/main` 均指向 `a23d7e7572f349211992bdea69c541a31a29de5c`；以下是该基线上的本地未提交改动回归。
+- **Go 回归：** `cd server && go test ./internal/app -count=1` 通过（21.728 秒）；`cd server && go test ./internal/worker -count=1` 通过（58.961 秒）。H01 长历史 PostgreSQL 4 项及 H02 确认 429 重试 PostgreSQL 3 个子用例另见本记录对应小节。
+- **Runtime 回归：** `cd runtime/morde-cloud-runtime && npm run build:dsh-compaction && node --test --test-concurrency=1 test/runtime.test.mjs` 通过，157/157，55.119 秒；新增/加强的 H11 并行取消隔离场景包含在内。
+- **静态检查：** `git diff --check`、所有修改 Go 文件的 `gofmt -d`、`node --check runtime/morde-cloud-runtime/test/runtime.test.mjs` 均通过。
+- **未覆盖：** 本轮未重跑整个 PostgreSQL 包（完整包此前达到 10 分钟仓库超时上限并停在迁移初始化）；未调用真实 Provider，也未重试远端 `dsh_recovery_unresolved` Task。未提交/推送这些本地开发改动。
 
 ### 单次执行信息模板
 

@@ -3,6 +3,7 @@ package worker
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"strings"
 	"sync"
@@ -123,7 +124,9 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		return true, w.failRoute(ctx, claim, "routing_context_unavailable", errors.New("conversation aggregation contains unresolved messages"))
 	}
 	if len(snapshot.Context.Content) > app.MaxConversationAgentInputBytes {
-		return true, w.failRoute(ctx, claim, "message_too_long", errors.New("message exceeds the model input budget"))
+		err := domain.NewError(domain.CodeResultTooLarge, "message exceeds the model input budget")
+		err.Details["stage"] = "route_protocol_input_limit"
+		return true, w.failRoute(ctx, claim, "message_too_long", err)
 	}
 	if snapshot.PreviousCycle {
 		return true, w.options.Actions.ApplyConversationRoute(routeCtx, claim, snapshot, app.ConversationRouteDecision{
@@ -211,7 +214,8 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	classifyContext.History = append([]app.ConversationRouteHistory(nil), classifyContext.History...)
 	copyConversationRouteCandidates(&classifyContext)
 	if err := fitConversationRouteContext(&classifyContext, contextWindow); err != nil {
-		return true, w.failRoute(ctx, claim, "message_too_long", err)
+		return true, w.failRoute(ctx, claim, "message_too_long",
+			conversationRouteBudgetDiagnostic(err, "worker_context_fit", contextWindow, capacityKnown))
 	}
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	if classifyContext.Content != "" || len(classifyContext.Candidates) != 0 || classifyContext.ReferenceTaskID != "" ||
@@ -222,7 +226,8 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 5*time.Second)
 			}
 			if domain.CodeOf(err) == domain.CodeResultTooLarge {
-				return true, w.failRoute(ctx, claim, "message_too_long", err)
+				return true, w.failRoute(ctx, claim, "message_too_long",
+					conversationRouteBudgetDiagnostic(err, "model_request", contextWindow, capacityKnown))
 			}
 			if snapshot.PreviousMissing && domain.CodeOf(err) == domain.CodeConflict && ctx.Err() == nil {
 				if recovery, ok := w.options.Actions.(app.ConversationRoutePredecessorRecovery); ok {
@@ -253,7 +258,6 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 						recoveryCtx := ctx
 						var cancelRecovery context.CancelFunc
 						if ctx.Err() != nil {
-							delay = 0
 							recoveryCtx, cancelRecovery = context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 							defer cancelRecovery()
 						}
@@ -446,21 +450,90 @@ func trimConversationRouteCandidates(value *app.ConversationRouteContext) bool {
 		value.CandidateSetIncomplete = true
 		return true
 	}
+	for index := len(value.RequestCandidates) - 1; index >= 0; index-- {
+		candidate := &value.RequestCandidates[index]
+		if candidate.MessageID != value.PreviousMessageID {
+			continue
+		}
+		content, shortened := shortenConversationRoutePreview(candidate.Content)
+		if !shortened {
+			continue
+		}
+		if !candidate.ContentTruncated {
+			digest := sha256.Sum256([]byte(candidate.Content))
+			candidate.ContentSHA256 = digest[:]
+		}
+		candidate.Content = content
+		candidate.ContentTruncated = true
+		value.CandidateSetIncomplete = true
+		return true
+	}
+	for index := len(value.Candidates) - 1; index >= 0; index-- {
+		candidate := &value.Candidates[index]
+		if candidate.TaskID != value.ReferenceTaskID && candidate.TaskID != value.PreviousTaskID {
+			continue
+		}
+		objective, shortened := shortenConversationRoutePreview(candidate.Objective)
+		if !shortened {
+			continue
+		}
+		candidate.Objective = objective
+		candidate.ObjectiveTruncated = true
+		value.CandidateSetIncomplete = true
+		return true
+	}
 	return false
+}
+
+func shortenConversationRoutePreview(value string) (string, bool) {
+	if len(value) <= 128 {
+		return value, false
+	}
+	return app.ConversationRouteTextPreview(value, max(128, len(value)/2))
 }
 
 func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.ConversationRouteClaim, reason string, cause error) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	w.options.Logger.Warn("conversation route failed",
+	fields := []zap.Field{
 		zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
 		zap.String("failure_reason", reason), zap.String("failure_code", string(domain.CodeOf(cause))),
-		zap.String("failure_category", cloudDSHModelErrorCategory(cause)))
+		zap.String("failure_category", cloudDSHModelErrorCategory(cause)),
+	}
+	var routeErr *domain.Error
+	if errors.As(cause, &routeErr) {
+		if stage, ok := routeErr.Details["stage"].(string); ok {
+			fields = append(fields, zap.String("failure_stage", stage))
+		}
+		if tokens, ok := routeErr.Details["context_window_tokens"].(int); ok {
+			fields = append(fields, zap.Int("context_window_tokens", tokens))
+		}
+		if known, ok := routeErr.Details["context_window_known"].(bool); ok {
+			fields = append(fields, zap.Bool("context_window_known", known))
+		}
+	}
+	w.options.Logger.Warn("conversation route failed", fields...)
 	if err := w.options.Actions.FailConversationRoute(ctx, claim, reason); err != nil {
 		return errors.Join(cause, err)
 	}
 	return nil
+}
+
+func conversationRouteBudgetDiagnostic(err error, stage string, contextWindow int, capacityKnown bool) error {
+	var routeErr *domain.Error
+	if !errors.As(err, &routeErr) {
+		return err
+	}
+	if routeErr.Details == nil {
+		routeErr.Details = make(map[string]any)
+	}
+	if _, exists := routeErr.Details["stage"]; !exists {
+		routeErr.Details["stage"] = stage
+	}
+	routeErr.Details["context_window_tokens"] = contextWindow
+	routeErr.Details["context_window_known"] = capacityKnown
+	return err
 }
 
 func safeConversationRouteDecision(value app.ConversationRouteContext, decision app.ConversationRouteDecision) app.ConversationRouteDecision {

@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -66,10 +67,16 @@ func TestConversationRouteGatewayRejectsOverBudgetBeforeReservation(t *testing.T
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.ClassifyConversationRoute(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeResultTooLarge ||
+	_, err = service.ClassifyConversationRoute(context.Background(), claim, value)
+	if domain.CodeOf(err) != domain.CodeResultTooLarge ||
 		store.reservation.ModelID != "" || store.begins != 0 || client.calls != 0 {
 		t.Fatalf("over-budget route was reserved or dispatched: code=%s reservation=%+v begins=%d calls=%d",
 			domain.CodeOf(err), store.reservation, store.begins, client.calls)
+	}
+	var routeErr *domain.Error
+	if !errors.As(err, &routeErr) || routeErr.Details["stage"] != "gateway_preflight" ||
+		routeErr.Details["context_window_tokens"] != 4096 || routeErr.Details["context_window_known"] != false {
+		t.Fatalf("preflight failure omitted safe window diagnostics: %+v", routeErr)
 	}
 }
 
@@ -110,9 +117,15 @@ func TestConversationRouteProviderContextLimitHasBoundedFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := service.ClassifyConversationRoute(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeResultTooLarge ||
+	_, err = service.ClassifyConversationRoute(context.Background(), claim, value)
+	if domain.CodeOf(err) != domain.CodeResultTooLarge ||
 		!store.unknown || store.decision != nil || client.calls != 1 {
 		t.Fatalf("provider context overflow did not produce a bounded, non-replayed failure: code=%s unknown=%t decision=%+v calls=%d",
 			domain.CodeOf(err), store.unknown, store.decision, client.calls)
+	}
+	var routeErr *domain.Error
+	if !errors.As(err, &routeErr) || routeErr.Details["stage"] != "provider_status" ||
+		routeErr.Details["provider_code"] != "context_length_exceeded" {
+		t.Fatalf("provider context overflow lost its safe failure category: %+v", routeErr)
 	}
 }

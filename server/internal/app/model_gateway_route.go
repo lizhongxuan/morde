@@ -86,7 +86,10 @@ func conversationRouteTextTokenEstimate(value string) int64 {
 func conversationRouteProviderError(err error) error {
 	var clientErr *ModelClientError
 	if errors.As(err, &clientErr) && clientErr.Stage == "provider_status" && clientErr.ProviderCode == "context_length_exceeded" {
-		return domain.NewError(domain.CodeResultTooLarge, "conversation route exceeds the provider context window")
+		routeErr := domain.NewError(domain.CodeResultTooLarge, "conversation route exceeds the provider context window")
+		routeErr.Details["stage"] = "provider_status"
+		routeErr.Details["provider_code"] = "context_length_exceeded"
+		return routeErr
 	}
 	result := modelConnectionCheckError(err)
 	if errors.As(err, &clientErr) && clientErr.Kind == ModelErrorRateLimited && clientErr.Stage == "provider_status" && clientErr.RetryAfter > 0 {
@@ -469,7 +472,11 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 		contextWindow = *endpoint.ContextWindowTokens
 	}
 	if !ConversationRouteInputFitsContextWindow(request, contextWindow) {
-		return ConversationRouteDecision{}, domain.NewError(domain.CodeResultTooLarge, "conversation routing context exceeds the selected model window")
+		routeErr := domain.NewError(domain.CodeResultTooLarge, "conversation routing context exceeds the selected model window")
+		routeErr.Details["stage"] = "gateway_preflight"
+		routeErr.Details["context_window_tokens"] = contextWindow
+		routeErr.Details["context_window_known"] = endpoint.ContextWindowTokens != nil
+		return ConversationRouteDecision{}, routeErr
 	}
 	digest, callID, err := conversationRouteCallDigest(claim, value, request)
 	if err != nil {
@@ -520,7 +527,15 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 		}
 	}
 	if callErr != nil {
-		return ConversationRouteDecision{}, conversationRouteProviderError(callErr)
+		result := conversationRouteProviderError(callErr)
+		if routeErr, ok := result.(*domain.Error); ok && routeErr.Code == domain.CodeResultTooLarge {
+			if routeErr.Details == nil {
+				routeErr.Details = make(map[string]any)
+			}
+			routeErr.Details["context_window_tokens"] = contextWindow
+			routeErr.Details["context_window_known"] = endpoint.ContextWindowTokens != nil
+		}
+		return ConversationRouteDecision{}, result
 	}
 	if unknown {
 		return ConversationRouteDecision{}, domain.NewError(domain.CodeInvalidState, "route model result or usage is unknown and requires reconciliation")

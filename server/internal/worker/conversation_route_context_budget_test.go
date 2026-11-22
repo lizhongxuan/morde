@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -103,6 +104,63 @@ func TestFitConversationRouteContextFitsMinimumWindowWithIncompleteHistoryAndCan
 	request, err := app.ConversationRouteModelRequest(value)
 	if err != nil || !app.ConversationRouteInputFitsContextWindow(request, 4096) {
 		t.Fatalf("fitted incomplete-history request exceeds minimum window: err=%v", err)
+	}
+}
+
+func TestFitConversationRouteContextShrinksReferencedTaskForShortFollowup(t *testing.T) {
+	value := app.ConversationRouteContext{ActorID: "u1234567", Content: "这", ReferenceTaskID: "q1234567",
+		Candidates: []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567",
+			Objective: strings.Repeat("请保留这个任务的原始约束并继续执行。", 300), Status: task.StatusRunning, Revision: 1}}}
+	if err := fitConversationRouteContext(&value, 4096); err != nil {
+		t.Fatalf("short follow-up with a referenced long-running task did not fit minimum window: %v", err)
+	}
+	if len(value.Candidates) != 1 || value.Candidates[0].TaskID != value.ReferenceTaskID || value.Candidates[0].Objective == "" ||
+		!value.Candidates[0].ObjectiveTruncated || !value.CandidateSetIncomplete {
+		t.Fatalf("fitting removed or silently truncated the referenced task: %+v", value)
+	}
+	request, err := app.ConversationRouteModelRequest(value)
+	if err != nil || !app.ConversationRouteInputFitsContextWindow(request, 4096) ||
+		!strings.Contains(request.Input[0].Text, `"objective_truncated":true`) {
+		t.Fatalf("short follow-up route request still exceeds the minimum window: err=%v", err)
+	}
+}
+
+func TestFitConversationRouteContextShrinksPreviousRequestWithoutLosingItsDigest(t *testing.T) {
+	const previousID = "m7654321"
+	previousContent := strings.Repeat("这是之前的完整要求及其约束。", 300)
+	digest := sha256.Sum256([]byte(previousContent))
+	scope := make([]byte, sha256.Size)
+	value := app.ConversationRouteContext{ActorID: "u1234567", Content: "这", PreviousMessageID: previousID,
+		ExecutionScopeDigest: scope, RequestCandidates: []app.ConversationRouteRequestCandidate{{MessageID: previousID,
+			Sequence: 1, Content: previousContent, RoutingStatus: conversation.RoutingProcessing,
+			SameExecutionScope: true, SameAuthorization: true, ExecutionScopeDigest: scope}}}
+	if err := fitConversationRouteContext(&value, 4096); err != nil {
+		t.Fatalf("short follow-up with a referenced long prior request did not fit minimum window: %v", err)
+	}
+	candidate := value.RequestCandidates[0]
+	if candidate.MessageID != previousID || !candidate.ContentTruncated || len(candidate.Content) >= len(previousContent) ||
+		!bytes.Equal(candidate.ContentSHA256, digest[:]) || !app.ValidConversationRouteExactDuplicateTarget(previousID, previousContent, value.RequestCandidates) {
+		t.Fatalf("fitting lost the prior request identity or original-content proof: %+v", candidate)
+	}
+	request, err := app.ConversationRouteModelRequest(value)
+	if err != nil || !app.ConversationRouteInputFitsContextWindow(request, 4096) {
+		t.Fatalf("short follow-up route request still exceeds the minimum window: err=%v", err)
+	}
+}
+
+func TestConversationRouteWorkerFitsReferencedLongTaskAtUnknownCapacity(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	stub.contextWindow, stub.capacityKnown = 4096, false
+	stub.claim.Message = conversation.Message{ID: "m1234567", Role: conversation.RoleUser, Sequence: 2,
+		CreatedAt: time.Now(), Content: "这"}
+	stub.snapshot.Context = app.ConversationRouteContext{ActorID: "u1234567", Content: "这", ReferenceTaskID: "q1234567",
+		Candidates: []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567",
+			Objective: strings.Repeat("请保留这个任务的原始约束并继续执行。", 300), Status: task.StatusRunning, Revision: 1}}}
+	if found, err := worker.RunOnce(context.Background()); err != nil || !found || stub.classifies != 1 || len(stub.failures) != 0 ||
+		len(stub.classified.Candidates) != 1 || stub.classified.Candidates[0].TaskID != "q1234567" ||
+		!stub.classified.Candidates[0].ObjectiveTruncated {
+		t.Fatalf("short follow-up did not route with its pinned task at unknown 4K capacity: found=%t classified=%+v failures=%v err=%v",
+			found, stub.classified, stub.failures, err)
 	}
 }
 
