@@ -85,6 +85,8 @@ VALUES ('p1234567',NULL,'synthetic','http://127.0.0.1','test',decode(repeat('01'
 		t.Fatal("owner's Task result was not queued for review")
 	}
 	aggregation.runNextReview(t)
+	receiptContent := fmt.Sprintf("结果摘要（主助手整理，不代表独立验收）：\n%s\n\nTask 执行状态：completed\n服务端验收状态（当前修订）：\n- %s r%d：pending",
+		resultReviewTestReply, ownerTask.Task.ID, completed.TaskRevision)
 	memberTask := append(member.ID, "project-conversation-member-message", "from member")
 	for _, actorID := range []string{owner.ID, member.ID} {
 		page, err := service.ListTasks(ctx, principal(actorID), projectValue.ID, created.ID, app.PageRequest{Limit: 20})
@@ -97,10 +99,13 @@ VALUES ('p1234567',NULL,'synthetic','http://127.0.0.1','test',decode(repeat('01'
 	}
 	for _, actorID := range []string{owner.ID, member.ID} {
 		page, err := service.ListMessages(ctx, principal(actorID), projectValue.ID, created.ID, app.PageRequest{Limit: 20})
-		if err != nil || len(page.Items) != 3 || page.Items[0].ActorID != owner.ID || page.Items[1].ActorID != owner.ID ||
+		if err != nil || len(page.Items) != 3 || page.Items[0].Role != conversation.RoleUser || page.Items[0].ActorID != owner.ID ||
+			page.Items[1].Role != conversation.RoleAssistant || page.Items[1].ActorID != owner.ID ||
 			page.Items[2].ActorID != member.ID || page.Items[0].Content != "from owner" ||
-			page.Items[1].Content != resultReviewTestReply || len(page.Items[1].Sources) != 1 ||
-			page.Items[1].Sources[0].TaskID != ownerTask.Task.ID || page.Items[1].Sources[0].Content != "owner's confirmed answer" ||
+			page.Items[1].Content != receiptContent || len(page.Items[1].Sources) != 1 ||
+			page.Items[1].Sources[0].UserMessageID != ownerTask.Message.ID || page.Items[1].Sources[0].TaskID != ownerTask.Task.ID ||
+			page.Items[1].Sources[0].TaskRevision != completed.TaskRevision || page.Items[1].Sources[0].EventSequence != completed.EventSequence ||
+			page.Items[1].Sources[0].Content != "owner's confirmed answer" || page.Items[2].Role != conversation.RoleUser ||
 			page.Items[2].Content != "from member" {
 			t.Fatalf("shared history for %s = %#v err=%v", actorID, page, err)
 		}
@@ -189,7 +194,7 @@ VALUES ('p1234567',NULL,'synthetic','http://127.0.0.1','test',decode(repeat('01'
 	contextValue := claimed.ConversationContext
 	if contextValue == nil || contextValue.Scope != "project" || contextValue.ProjectID != projectValue.ID ||
 		contextValue.OwnerID != owner.ID || contextValue.InitiatorID != member.ID || contextValue.ThroughSequence != 3 || len(contextValue.Messages) != 2 ||
-		contextValue.Messages[0].Content != "from owner" || contextValue.Messages[1].Content != resultReviewTestReply {
+		contextValue.Messages[0].Content != "from owner" || contextValue.Messages[1].Content != receiptContent {
 		t.Fatalf("member project Task context = %#v", contextValue)
 	}
 	paused, err := tasks.RequestAction(ctx, principal(member.ID), memberTask.Task.ID, task.ActionPause, task.StatusRunning, "project-task-pause")
