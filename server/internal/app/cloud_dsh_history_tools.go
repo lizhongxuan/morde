@@ -246,10 +246,50 @@ func (b *CloudDSHToolBroker) executeCurrentConversationHistorySearch(ctx context
 		if err := b.authorizeCurrentHistorySearch(ctx, current); err != nil {
 			return AgentToolResult{}, err
 		}
-		if validCloudDSHCurrentHistoryCheckpointOutput(*checkpointOutput) {
-			return AgentToolResult{Status: AgentToolSucceeded, Output: *checkpointOutput}, nil
+		if !validCloudDSHCurrentHistoryCheckpointOutput(*checkpointOutput) {
+			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed current conversation history result is invalid")
 		}
-		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed current conversation history result is invalid")
+		var checkpoint cloudDSHCurrentHistorySearchResult
+		if decodeStrictRuntimeResult([]byte(*checkpointOutput), &checkpoint) != nil {
+			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed current conversation history result is invalid")
+		}
+		messageIDs := make([]string, 0, len(checkpoint.Matches))
+		seenMessageIDs := make(map[string]struct{}, len(checkpoint.Matches))
+		for _, match := range checkpoint.Matches {
+			if _, exists := seenMessageIDs[match.MessageID]; exists {
+				return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed current conversation history result is invalid")
+			}
+			seenMessageIDs[match.MessageID] = struct{}{}
+			messageIDs = append(messageIDs, match.MessageID)
+		}
+		if len(messageIDs) > 0 && current.ProjectID != "" {
+			filter, ok := b.store.(cloudDSHProjectHistoryFilter)
+			if !ok {
+				return AgentToolResult{}, domain.NewError(domain.CodeUnsupported, "project conversation history authorization is unavailable")
+			}
+			allowed, err := filter.FilterTaskProjectConversationHistory(ctx, current, messageIDs)
+			if err != nil {
+				return AgentToolResult{}, err
+			}
+			for _, messageID := range messageIDs {
+				if _, ok := allowed[messageID]; !ok {
+					return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed current conversation history result is no longer authorized")
+				}
+			}
+		} else if len(messageIDs) > 0 {
+			messages := make([]conversation.Message, 0, len(messageIDs))
+			for _, messageID := range messageIDs {
+				messages = append(messages, conversation.Message{ID: messageID})
+			}
+			unsuppressed, err := b.filterDeletedPersonalHistory(ctx, current.OwnerID, messages)
+			if err != nil {
+				return AgentToolResult{}, err
+			}
+			if len(unsuppressed) != len(messageIDs) {
+				return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed current conversation history result contains deleted messages")
+			}
+		}
+		return AgentToolResult{Status: AgentToolSucceeded, Output: *checkpointOutput}, nil
 	}
 	if current.Usage.ToolCalls == int64(^uint64(0)>>1) || current.Usage.ToolCalls >= current.Budget.ToolCalls {
 		return AgentToolResult{}, domain.NewError(domain.CodeQuotaExceeded, "task tool call budget is exhausted")
@@ -1002,6 +1042,17 @@ func (b *CloudDSHToolBroker) executeRecentHistorySummary(ctx context.Context, cl
 		if !validCloudDSHHistorySummaryCheckpointOutput(*checkpointOutput) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history summary is invalid")
 		}
+		result, err := b.summarizablePersonalHistory(ctx, principal, current.ConversationID)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
+		outputBytes, err := json.Marshal(result)
+		if err != nil || len(outputBytes) > maxAgentToolOutputBytes || !utf8.Valid(outputBytes) {
+			return AgentToolResult{}, domain.NewError(domain.CodeResultTooLarge, "recent conversation summary exceeds its limit")
+		}
+		if string(outputBytes) != *checkpointOutput {
+			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history summary changed")
+		}
 		return AgentToolResult{Status: AgentToolSucceeded, Output: *checkpointOutput}, nil
 	}
 	if current.Usage.ToolCalls == int64(^uint64(0)>>1) || current.Usage.ToolCalls >= current.Budget.ToolCalls {
@@ -1159,6 +1210,29 @@ func (b *CloudDSHToolBroker) executeConversationHistorySearch(ctx context.Contex
 	if recovering && checkpointOutput != nil {
 		if !validCloudDSHHistorySearchCheckpointOutput(*checkpointOutput, cursor, b.historyCursorKey) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history result is invalid")
+		}
+		var checkpoint cloudDSHHistorySearchResult
+		if decodeStrictRuntimeResult([]byte(*checkpointOutput), &checkpoint) != nil {
+			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history result is invalid")
+		}
+		messages := make([]conversation.Message, 0, len(checkpoint.Matches))
+		seenMessageIDs := make(map[string]struct{}, len(checkpoint.Matches))
+		for _, match := range checkpoint.Matches {
+			if match.ConversationID == "" || match.MessageID == "" {
+				return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history result has no source IDs")
+			}
+			if _, exists := seenMessageIDs[match.MessageID]; exists {
+				return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history result has duplicate source IDs")
+			}
+			seenMessageIDs[match.MessageID] = struct{}{}
+			messages = append(messages, conversation.Message{ID: match.MessageID, ConversationID: match.ConversationID, OwnerID: principal.UserID})
+		}
+		unsuppressed, err := b.filterDeletedPersonalHistory(ctx, principal.UserID, messages)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
+		if len(unsuppressed) != len(messages) {
+			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history result contains deleted messages")
 		}
 		return AgentToolResult{Status: AgentToolSucceeded, Output: *checkpointOutput}, nil
 	}
