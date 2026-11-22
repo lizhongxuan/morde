@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
@@ -365,6 +367,88 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f
 	var receiptCount int
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE id=$1 AND role='assistant'`, messageID).Scan(&receiptCount); err != nil || receiptCount != 1 {
 		t.Fatalf("receipt count=%d err=%v; want one persisted receipt", receiptCount, err)
+	}
+}
+
+func TestConversationResultReceiptLocksValidationInputsUntilCommit(t *testing.T) {
+	f := newResultAggregationFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	value := f.createTask(t, f.ownerID, "lock validation inputs through receipt publication")
+	if !f.complete(t, &value, "verified result") {
+		t.Fatal("task result was not queued")
+	}
+	digest := sha256.Sum256([]byte(value.Content))
+	seedConversationResultValidationReview(t, f, value, value.TaskRevision, value.EventSequence, digest[:], app.TaskValidationPass)
+
+	receiptTx, err := f.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = receiptTx.Rollback(context.Background()) }()
+	source := app.ConversationTaskResultSource{TaskID: value.ID, TaskRevision: value.TaskRevision,
+		EventSequence: value.EventSequence, Content: value.Content}
+	state, err := conversationTaskResultValidationStateInTx(ctx, receiptTx, f.ownerID, source)
+	if err != nil || state != app.TaskValidationPass {
+		t.Fatalf("validation state = %q err=%v; want PASS", state, err)
+	}
+	receipt := conversationTaskResultReceipt("verified summary", []app.ConversationTaskResultSource{source},
+		[]app.TaskValidationState{state})
+	receiptID := mustID(t, domain.NewMessageID)
+	if err := insertMessage(ctx, receiptTx, conversation.Message{ID: receiptID, OwnerID: f.ownerID, ActorID: value.ActorID,
+		ConversationID: f.conversation.ID, Role: conversation.RoleAssistant, Content: receipt,
+		SourceKind: "conversation", DeliveryStatus: conversation.DeliveryApplied}); err != nil {
+		t.Fatalf("insert result receipt: %v", err)
+	}
+
+	assertBlockedUntilCommit := func(name, statement string, args ...any) {
+		done := make(chan error, 1)
+		go func() {
+			tx, err := f.store.pool.Begin(ctx)
+			if err != nil {
+				done <- err
+				return
+			}
+			defer func() { _ = tx.Rollback(context.Background()) }()
+			if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout='300ms'`); err != nil {
+				done <- err
+				return
+			}
+			_, err = tx.Exec(ctx, statement, args...)
+			var pgErr *pgconn.PgError
+			if !errors.As(err, &pgErr) || pgErr.Code != "55P03" {
+				if err == nil {
+					err = fmt.Errorf("mutation completed while result receipt transaction was open")
+				}
+				done <- err
+				return
+			}
+			done <- nil
+		}()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("%s was not fenced by the receipt transaction: %v", name, err)
+			}
+		case <-ctx.Done():
+			t.Fatalf("wait for %s lock timeout: %v", name, ctx.Err())
+		}
+	}
+	assertBlockedUntilCommit("task revision/result update",
+		`UPDATE tasks SET current_revision=current_revision+1,desired_revision=desired_revision+1,result=result||' revised' WHERE id=$1`, value.ID)
+	replacementDigest := sha256.Sum256([]byte("revised result event"))
+	assertBlockedUntilCommit("task result event update",
+		`UPDATE task_events SET result_content_sha256=$3 WHERE task_id=$1 AND sequence=$2`, value.ID,
+		value.EventSequence, replacementDigest[:])
+	if err := receiptTx.Commit(ctx); err != nil {
+		t.Fatalf("commit result receipt: %v", err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET current_revision=current_revision+1,desired_revision=desired_revision+1,result=result||' revised' WHERE id=$1`, value.ID); err != nil {
+		t.Fatalf("task revision/result update after receipt commit: %v", err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE task_events SET result_content_sha256=$3 WHERE task_id=$1 AND sequence=$2`,
+		value.ID, value.EventSequence, replacementDigest[:]); err != nil {
+		t.Fatalf("task result event update after receipt commit: %v", err)
 	}
 }
 
