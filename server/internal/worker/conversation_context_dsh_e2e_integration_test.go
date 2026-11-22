@@ -32,7 +32,9 @@ type conversationContextScopedRuntimeControl struct {
 
 const conversationContextCompletionSteer = "Please include the word BLUE in the answer."
 const conversationContextCompletionWriteCallID = "completion_race_write_once"
-const conversationContextCompletionWriteOutput = `{"bytes_written":10,"path":"notes.txt"}`
+const conversationContextCompletionWriteToolName = "mcp_k1234567_abcdef123456"
+const conversationContextCompletionWriteOutput = `{"record_id":"completion-race-record"}`
+const conversationContextCompletionMemoryProof = "completion-race-test-proof"
 
 type conversationContextCompletionRaceModel struct {
 	mu    sync.Mutex
@@ -47,17 +49,19 @@ func (m *conversationContextCompletionRaceModel) Complete(_ context.Context, cal
 	usage := app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 4}
 	if callNumber == 1 {
 		return app.ModelResponse{ToolCalls: []app.ModelToolCall{{CallID: conversationContextCompletionWriteCallID,
-			Name: "file_write", Arguments: `{"workspace_id":"w1234567","path":"notes.txt","content":"saved once"}`}},
+			Name: conversationContextCompletionWriteToolName, Arguments: `{"record_name":"completion-race"}`}},
 			StopReason: "tool_calls", Usage: usage}, nil
 	}
 	if callNumber == 2 {
-		if !strings.Contains(string(call.RawRequest), `"bytes_written"`) || !strings.Contains(string(call.RawRequest), `"notes.txt"`) {
+		writeResult, found := f01ToolResult(call.RawRequest, conversationContextCompletionWriteCallID)
+		if !found || !strings.Contains(writeResult, `"record_id":"completion-race-record"`) {
 			return app.ModelResponse{}, errors.New("first completion request omitted the completed write result")
 		}
 		return app.ModelResponse{Text: "STALE COMPLETION RESULT", StopReason: "stop", Usage: usage}, nil
 	}
-	if callNumber != 3 || !strings.Contains(string(call.RawRequest), conversationContextCompletionSteer) ||
-		!strings.Contains(string(call.RawRequest), `"bytes_written"`) || !strings.Contains(string(call.RawRequest), `"notes.txt"`) {
+	writeResult, found := f01ToolResult(call.RawRequest, conversationContextCompletionWriteCallID)
+	if callNumber != 3 || !strings.Contains(string(call.RawRequest), conversationContextCompletionSteer) || !found ||
+		!strings.Contains(writeResult, `"record_id":"completion-race-record"`) {
 		return app.ModelResponse{}, fmt.Errorf("recovered model call did not receive the pending steer: call=%d", callNumber)
 	}
 	return app.ModelResponse{Text: "The revised answer includes BLUE.", StopReason: "stop", Usage: usage}, nil
@@ -77,7 +81,9 @@ type conversationContextCompletionRaceTools struct {
 }
 
 func (t *conversationContextCompletionRaceTools) Definitions(context.Context, task.Task) ([]app.AgentToolDefinition, error) {
-	return []app.AgentToolDefinition{cloudDSHWriteTool()}, nil
+	return []app.AgentToolDefinition{{ModelTool: app.ModelTool{Name: conversationContextCompletionWriteToolName,
+		Description: "Create one synthetic external record for the completion race test.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"record_name":{"type":"string"}},"required":["record_name"],"additionalProperties":false}`)}}}, nil
 }
 
 func (t *conversationContextCompletionRaceTools) AdmitToolCall(context.Context, task.Task, app.ModelToolCall,
@@ -89,7 +95,7 @@ func (t *conversationContextCompletionRaceTools) Execute(_ context.Context, _ ta
 	call app.ModelToolCall) (app.AgentToolResult, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if call.CallID != conversationContextCompletionWriteCallID || call.Name != "file_write" {
+	if call.CallID != conversationContextCompletionWriteCallID || call.Name != conversationContextCompletionWriteToolName {
 		return app.AgentToolResult{}, fmt.Errorf("unexpected side-effecting call %q/%q", call.Name, call.CallID)
 	}
 	if t.results == nil {
@@ -115,6 +121,20 @@ func (t *conversationContextCompletionRaceTools) Reconcile(_ context.Context, _ 
 	t.reconciles++
 	return result, nil
 }
+
+func (*conversationContextCompletionRaceTools) InitialContext(context.Context, task.Task) (string, error) {
+	return "Synthetic completion race context.\n" + app.CloudDSHMemoryProofPrefix + conversationContextCompletionMemoryProof, nil
+}
+
+func (*conversationContextCompletionRaceTools) ValidatePersonalMemoryProof(_ context.Context, _ task.Task, proof string,
+	versions []app.CloudDSHMemoryVersion) error {
+	if proof != conversationContextCompletionMemoryProof || len(versions) != 0 {
+		return errors.New("completion-race test unexpectedly accessed personal memory")
+	}
+	return nil
+}
+
+func (*conversationContextCompletionRaceTools) CloudDSHPersonalMemoryProofEnabled() bool { return true }
 
 func (t *conversationContextCompletionRaceTools) PauseRecovery(context.Context, task.Task) error {
 	return nil
@@ -159,14 +179,23 @@ type conversationContextSteerRouteClassifier struct{}
 
 func (conversationContextSteerRouteClassifier) ResolveConversationRouteModel(_ context.Context,
 	claim app.ConversationRouteClaim) (string, error) {
+	if claim.Input.ResultReviewID != "" {
+		return "p1234567", nil
+	}
 	if claim.Input.ModelID == "" {
 		return "", errors.New("route has no model id")
 	}
 	return claim.Input.ModelID, nil
 }
 
-func (conversationContextSteerRouteClassifier) ClassifyConversationRoute(_ context.Context, _ app.ConversationRouteClaim,
+func (conversationContextSteerRouteClassifier) ClassifyConversationRoute(_ context.Context, claim app.ConversationRouteClaim,
 	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
+	if value.ResultReview != nil {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "The revised answer includes BLUE."}, nil
+	}
+	if claim.Input.ReferenceTaskID == "" && value.ReferenceTaskID == "" {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}, nil
+	}
 	for _, candidate := range value.Candidates {
 		if candidate.TaskID == value.ReferenceTaskID && candidate.Status == task.StatusRunning {
 			return app.ConversationRouteDecision{Action: app.ConversationRouteSteer, TaskID: candidate.TaskID,
@@ -231,23 +260,70 @@ func TestCloudDSHCompletionRaceRecoversPendingSteerOnSameSession(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const clientMessageID = "completion-gate-initial"
-	submitted, err := tasks.Submit(ctx, principal, app.SubmitTaskCommand{
-		ClientMessageID: clientMessageID, ModelID: "p1234567", Objective: "Answer briefly.",
-		Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 4, ModelTokens: 2000}, IdempotencyKey: clientMessageID,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	serviceInstanceID, err := store.ServiceInstanceID(ctx)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := pool.Exec(ctx, `INSERT INTO model_connections
+(id,owner_id,name,base_url,model_name,api_key_cipher,capability_text,checked_at)
+VALUES ('p1234567',$1,'completion race test','http://127.0.0.1','test',decode(repeat('01',29),'hex'),true,clock_timestamp())`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	conversations, err := app.NewConversationService(store, credentials)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialConversation, _, err := conversations.Create(ctx, principal, app.CreateConversationCommand{
+		Title: "Completion race", IdempotencyKey: "completion-gate-conversation", ServiceInstanceID: serviceInstanceID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const clientMessageID = "completion-gate-initial"
+	initialMessage, replayed, err := tasks.AcceptConversationMessage(ctx, principal, initialConversation.ID,
+		app.AcceptConversationMessageCommand{ServiceInstanceID: serviceInstanceID, ClientMessageID: clientMessageID,
+			Content: "Start a new task to answer briefly.", ModelID: "p1234567",
+			Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 4, ModelTokens: 2000}, IdempotencyKey: clientMessageID})
+	if err != nil || replayed {
+		t.Fatalf("accept initial completion-race message: replayed=%t err=%v", replayed, err)
+	}
+	routeWorker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{Queue: store, Actions: store,
+		Models: conversationContextSteerRouteClassifier{}, WorkerID: "completion-gate-route-worker",
+		LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop()})
+	if err != nil {
+		t.Fatalf("create completion-race route worker: %v", err)
+	}
+	if found, err := routeWorker.RunOnce(ctx); err != nil || !found {
+		t.Fatalf("route initial completion-race message: found=%t err=%v", found, err)
+	}
+	var initialTaskID string
+	if err := pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, initialMessage.ID).Scan(&initialTaskID); err != nil || initialTaskID == "" {
+		t.Fatalf("initial route did not create a Task: id=%q err=%v", initialTaskID, err)
+	}
+	initialTask, err := store.GetTask(ctx, initialTaskID, owner.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	submitted := app.TaskSubmissionResult{Conversation: initialConversation, Message: initialMessage, Task: initialTask.Task}
 	accountRuntimeControl, err := app.NewAccountAgentRuntimeService(store)
 	if err != nil {
 		t.Fatal(err)
 	}
-	node, accountScript := f01NodeRuntimePaths(t)
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("local Node is unavailable; the real account Runtime subprocess cannot run")
+	}
+	node, err = filepath.Abs(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountScript, err := filepath.Abs(filepath.Join("..", "..", "..", "runtime", "morde-cloud-runtime", "bin-account.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(accountScript); err != nil {
+		t.Fatalf("locate real morde-cloud account Runtime entrypoint: %v", err)
+	}
 	sealer, err := app.NewSealer(make([]byte, 32))
 	if err != nil {
 		t.Fatal(err)
@@ -365,12 +441,6 @@ func TestCloudDSHCompletionRaceRecoversPendingSteerOnSameSession(t *testing.T) {
 	if err != nil || replayed {
 		t.Fatalf("accept completion-race steer: replayed=%t err=%v", replayed, err)
 	}
-	routeWorker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{Queue: store, Actions: store,
-		Models: conversationContextSteerRouteClassifier{}, WorkerID: "completion-gate-route-worker",
-		LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop()})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if found, err := routeWorker.RunOnce(ctx); err != nil || !found {
 		t.Fatalf("route completion-race steer: found=%t err=%v", found, err)
 	}
@@ -405,11 +475,24 @@ func TestCloudDSHCompletionRaceRecoversPendingSteerOnSameSession(t *testing.T) {
 		case <-ticker.C:
 		}
 	}
-	if got := model.snapshot(); len(got) != 3 || got[0].Task == nil || got[1].Task == nil || got[2].Task == nil ||
-		got[0].Task.AgentSessionID != firstSessionID || got[1].Task.AgentSessionID != firstSessionID || got[2].Task.AgentSessionID != firstSessionID ||
-		!strings.Contains(string(got[2].RawRequest), conversationContextCompletionSteer) ||
-		!strings.Contains(string(got[2].RawRequest), conversationContextCompletionWriteOutput) {
-		t.Fatalf("Task recovery did not reuse the DSH Session and apply steer: model calls=%d", len(got))
+	if _, err := store.QueueReadyConversationResultReviews(ctx, 100); err != nil {
+		t.Fatalf("queue completed Task result for conversation delivery: %v", err)
+	}
+	if found, err := routeWorker.RunOnce(ctx); err != nil || !found {
+		t.Fatalf("publish revised conversation result: found=%t err=%v", found, err)
+	}
+	modelCalls := model.snapshot()
+	var thirdWriteResult string
+	thirdToolResultFound := false
+	if len(modelCalls) >= 3 {
+		thirdWriteResult, thirdToolResultFound = f01ToolResult(modelCalls[2].RawRequest, conversationContextCompletionWriteCallID)
+	}
+	if len(modelCalls) != 3 || modelCalls[0].Task == nil || modelCalls[1].Task == nil || modelCalls[2].Task == nil ||
+		modelCalls[0].Task.AgentSessionID != firstSessionID || modelCalls[1].Task.AgentSessionID != firstSessionID || modelCalls[2].Task.AgentSessionID != firstSessionID ||
+		!strings.Contains(string(modelCalls[2].RawRequest), conversationContextCompletionSteer) || !thirdToolResultFound ||
+		!strings.Contains(thirdWriteResult, conversationContextCompletionWriteOutput) {
+		t.Fatalf("Task recovery did not reuse the DSH Session and apply steer: model calls=%d third_result_found=%t third_result=%s",
+			len(modelCalls), thirdToolResultFound, thirdWriteResult)
 	}
 	if executions, reconciles := tools.snapshot(); executions != 1 {
 		t.Fatalf("recovery repeated or skipped the side effect: executions=%d reconciliations=%d", executions, reconciles)
@@ -424,14 +507,19 @@ func TestCloudDSHCompletionRaceRecoversPendingSteerOnSameSession(t *testing.T) {
 	if err := pool.QueryRow(ctx, `SELECT delivery_status FROM conversation_messages WHERE id=$1`, steer.ID).Scan(&deliveryStatus); err != nil || deliveryStatus != "applied" {
 		t.Fatalf("recovered Session did not claim the steer: status=%q err=%v", deliveryStatus, err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE task_id=$1 AND role='assistant' AND content=$2`,
-		submitted.Task.ID, "STALE COMPLETION RESULT").Scan(&staleReceipts); err != nil || staleReceipts != 0 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant' AND content=$2`,
+		submitted.Conversation.ID, "STALE COMPLETION RESULT").Scan(&staleReceipts); err != nil || staleReceipts != 0 {
 		t.Fatalf("stale assistant receipt was committed during recovery: count=%d err=%v", staleReceipts, err)
 	}
 	var revisedReceipts int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE task_id=$1 AND role='assistant' AND content=$2`,
-		submitted.Task.ID, "The revised answer includes BLUE.").Scan(&revisedReceipts); err != nil || revisedReceipts != 1 {
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant' AND content=$2`,
+		submitted.Conversation.ID, "The revised answer includes BLUE.").Scan(&revisedReceipts); err != nil || revisedReceipts != 1 {
 		t.Fatalf("revised assistant receipt count=%d err=%v; want exactly one", revisedReceipts, err)
+	}
+	var publishedSources int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_result_sources WHERE task_id=$1 AND state='published'`,
+		submitted.Task.ID).Scan(&publishedSources); err != nil || publishedSources != 1 {
+		t.Fatalf("published revised result sources=%d err=%v; want one source for the Task", publishedSources, err)
 	}
 }
 
