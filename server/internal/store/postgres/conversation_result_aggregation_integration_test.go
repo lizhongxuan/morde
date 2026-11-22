@@ -277,6 +277,30 @@ func TestConversationResultReceiptSeparatesCompletionFromCurrentValidation(t *te
 	oldRevision := f.createTask(t, f.ownerID, "old validation revision")
 	passed := f.createTask(t, f.ownerID, "current passing review")
 	failed := f.createTask(t, f.ownerID, "current failing review")
+	instanceID, err := f.store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := f.store.GetTokenByID(ctx, testSessionTokenID(f.ownerID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldRevisionMessageID := mustID(t, domain.NewMessageID)
+	messageDigest := sha256.Sum256([]byte("revision one source"))
+	message, _, err := f.store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{
+		Message: conversation.Message{ID: oldRevisionMessageID, OwnerID: f.ownerID, ActorID: oldRevision.ActorID,
+			ConversationID: f.conversation.ID, Role: conversation.RoleUser, Content: "revision one source"},
+		ServiceInstanceID: instanceID, ClientID: "result-review-revision-one", RequestHash: messageDigest[:],
+		Authorization: task.Authorization{Kind: string(identity.KindSession), TokenID: token.ID, Version: 1, ExpiresAt: &token.ExpiresAt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_revision_intents
+(message_id,task_id,owner_id,initiator_id,conversation_id,message_sequence,expected_revision,state)
+VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f.ownerID, f.conversation.ID, message.Sequence); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET current_revision=1,desired_revision=1 WHERE id=$1`, oldRevision.ID); err != nil {
 		t.Fatal(err)
 	}
