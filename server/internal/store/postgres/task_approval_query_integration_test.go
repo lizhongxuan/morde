@@ -96,7 +96,7 @@ VALUES ($1,$2,$3,'approval','Confirm access','Workspace','Read a selected file',
 	insertApproval(created[1].Task.ID, 1, "approved", "approve", approvalBase.Add(2*time.Minute), nil, &respondedAt)
 	insertApproval(created[2].Task.ID, 1, "pending", "", approvalBase.Add(time.Minute), &expiredAt, nil)
 	insertApproval(created[0].Task.ID, 2, "cancelled", "", approvalBase.Add(4*time.Minute), nil, &respondedAt)
-	insertApproval(separateConversationTask.Task.ID, 1, "pending", "", approvalBase.Add(90*time.Second), nil, nil)
+	outsiderTargetApprovalID := insertApproval(separateConversationTask.Task.ID, 1, "pending", "", approvalBase.Add(90*time.Second), nil, nil)
 	insertApproval(projectTask.Task.ID, 1, "pending", "", approvalBase.Add(30*time.Second), nil, nil)
 
 	page, err := store.ListTaskApprovals(ctx, owner.ID, nil, first.Conversation.ID, app.PageRequest{Limit: 2})
@@ -122,6 +122,24 @@ VALUES ($1,$2,$3,'approval','Confirm access','Workspace','Read a selected file',
 	outsiderPage, err := store.ListTaskApprovals(ctx, outsider.ID, nil, "", app.PageRequest{Limit: 10})
 	if err != nil || len(outsiderPage.Items) != 0 || len(outsiderPage.PendingCountsByHostID) != 0 {
 		t.Fatalf("another account read Task approvals: %+v err=%v", outsiderPage, err)
+	}
+	outsiderResponse := testIdempotency(outsider.ID, "task.pending.respond", "approval-query-cross-account-response")
+	outsiderResponse.ResourceID, outsiderResponse.RelatedID = separateConversationTask.Task.ID, outsiderTargetApprovalID
+	if err := store.RespondToPendingRequest(ctx, outsiderResponse, separateConversationTask.Task.ID, outsiderTargetApprovalID, 1,
+		task.PendingDecisionApprove); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("another account responded to a Task approval: err=%v, want not found", err)
+	}
+	var approvalStatus, approvalDecision, targetStatus string
+	var targetLeaseVersion int64
+	if err := pool.QueryRow(ctx, `SELECT p.status,p.decision,t.status,t.lease_version
+FROM task_pending_requests p JOIN tasks t ON t.id=p.task_id
+WHERE p.id=$1 AND p.task_id=$2`, outsiderTargetApprovalID, separateConversationTask.Task.ID).
+		Scan(&approvalStatus, &approvalDecision, &targetStatus, &targetLeaseVersion); err != nil {
+		t.Fatalf("read cross-account approval after rejected response: %v", err)
+	}
+	if approvalStatus != string(task.PendingRequestPending) || approvalDecision != "" || targetStatus != string(task.StatusWaitingUser) || targetLeaseVersion != 0 {
+		t.Fatalf("cross-account approval attempt changed state: approval=(%s,%s) Task=(%s,%d)",
+			approvalStatus, approvalDecision, targetStatus, targetLeaseVersion)
 	}
 
 	panel, err := store.ListConversationTasks(ctx, owner.ID, "", first.Conversation.ID, nil, app.ConversationTaskViewPanel, app.PageRequest{Limit: 2})
