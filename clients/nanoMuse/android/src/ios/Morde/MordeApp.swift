@@ -3851,16 +3851,19 @@ private final class MordeAuthURLProtocol: URLProtocol {
                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesPermissionRecoveryFixtureLaunchArgument) {
             let cursor = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
                 .queryItems?.first(where: { $0.name == "cursor" })?.value
-            if cursor == "permission-page-2", Self.consumeTaskPagesPermissionFailure() {
+            let status = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?
+                .queryItems?.first(where: { $0.name == "status" })?.value
+            if status != nil {
+                statusCode = 200
+                body = Data(#"{"items":[],"next_cursor":null}"#.utf8)
+            } else if cursor == "permission-page-2" {
+                _ = Self.consumeTaskPagesPermissionFailure()
                 statusCode = 403
                 body = Data(#"{"error":{"code":"forbidden","message":"Local task list access was revoked"}}"#.utf8)
             } else {
                 statusCode = 200
-                let items = (1...24).map { index in
-                    Self.taskPagesSummary(id: String(format: "q%07d", index),
-                                          status: index == 1 ? "running" : "completed",
-                                          objective: index == 1 ? "Permission scoped local task" : "Local task \(index)")
-                }
+                let items = [Self.taskPagesSummary(id: "q0000001", status: "running",
+                                                    objective: "Permission scoped local task")]
                 let nextCursor: Any = cursor == nil && !Self.didFailTaskPagesPermissionRecovery
                     ? "permission-page-2" : NSNull()
                 body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": nextCursor])) ?? Data()
