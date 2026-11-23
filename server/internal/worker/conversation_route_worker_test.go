@@ -613,6 +613,33 @@ func TestConversationRouteWorkerAsksUserWhenClassifyFallbackCannotDecide(t *test
 	}
 }
 
+func TestConversationRouteWorkerFallbackDistinguishesMissingFromUnresolvedPredecessor(t *testing.T) {
+	// A predecessor that merely ended unresolved (waiting_user after a
+	// clarification) is known state: the user is likely answering it, so
+	// the fallback asks continue-or-new instead of demanding context.
+	worker, stub := newRouteWorkerTest(t)
+	stub.snapshot.Context.PreviousUnresolved = true
+	stub.snapshot.Context.Content = "你看看上面那条信息说了什么"
+	stub.classifyErr = errors.New("provider unavailable")
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteClarify ||
+		stub.applied[0].Question != "分类暂时不可用，请说明是继续上一个任务，还是开始一个新任务。" {
+		t.Fatalf("unresolved predecessor was treated as missing context: applied=%+v err=%v", stub.applied, err)
+	}
+	// A predecessor row that does not exist at all still asks for context.
+	worker, stub = newRouteWorkerTest(t)
+	stub.snapshot.PreviousMissing = true
+	stub.snapshot.Context.PreviousMissing = true
+	stub.snapshot.Context.PreviousUnresolved = true
+	stub.snapshot.Context.Content = "你看看上面那条信息说了什么"
+	stub.classifyErr = errors.New("provider unavailable")
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteClarify ||
+		stub.applied[0].Question != "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。" {
+		t.Fatalf("missing predecessor was not treated as missing context: applied=%+v err=%v", stub.applied, err)
+	}
+}
+
 func TestConversationRouteWorkerNeverStopsATaskOnClassifyFailure(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	routeWorkerFallbackSteerContext(stub)

@@ -39,6 +39,52 @@ func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 	}
 }
 
+func TestConversationRouteModelRequestKeepsMinimumWindowOutputBudget(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "你好"}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if request.MaxOutputTokens != 512 || MaxConversationRouteModelOutputTokens <= request.MaxOutputTokens {
+		t.Fatalf("route output budget left the minimum-window-safe default: MaxOutputTokens=%d ceiling=%d",
+			request.MaxOutputTokens, MaxConversationRouteModelOutputTokens)
+	}
+	review, err := ConversationRouteModelRequest(ConversationRouteContext{ActorID: "u1234567", Content: "你好",
+		ResultReview: &ConversationTaskResultReview{Sources: []ConversationTaskResultSource{{
+			TaskID: "q1234567", EventSequence: 1, AuthorizationVersion: 1, Objective: "do work", Content: "result"}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if review.MaxOutputTokens != 512 {
+		t.Fatalf("result review route output budget differs from the minimum-window default: MaxOutputTokens=%d", review.MaxOutputTokens)
+	}
+}
+
+func TestConversationRouteInvalidOutputKeepsBoundedPreview(t *testing.T) {
+	context := ConversationRouteContext{ActorID: "u1234567", Content: "你看看上面那条信息说了什么"}
+	oversized := strings.Repeat("你", 6000)
+	decision := ParseConversationRouteDecisionForContext(oversized, context)
+	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputPreview != strings.Repeat("你", 1024) {
+		t.Fatalf("oversized model output lost its diagnostic preview: %+v", decision)
+	}
+	truncated := `{"action":"reply","reply":"你好`
+	decision = ParseConversationRouteDecisionForContext(truncated, context)
+	if !decision.InvalidOutput || decision.ModelOutput != truncated || decision.InvalidOutputPreview != "" {
+		t.Fatalf("short invalid model output was not retained verbatim: %+v", decision)
+	}
+	decision = ParseConversationRouteDecisionForContext("", context)
+	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputPreview != "" {
+		t.Fatalf("empty model output gained a stored value: %+v", decision)
+	}
+	decision = ParseConversationRouteDecisionForContext(string([]byte{0xff, 0xfe})+"abc", context)
+	if !decision.InvalidOutput || decision.InvalidOutputPreview == "" {
+		t.Fatalf("invalid UTF-8 model output lost its diagnostic preview: %+v", decision)
+	}
+	if decision.InvalidOutputPreview != "�abc" {
+		t.Fatalf("invalid UTF-8 preview was not sanitized: %q", decision.InvalidOutputPreview)
+	}
+}
+
 func TestConversationRouteModelRequestAddsBoundedRepairInstructions(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "你好"}
 	initial, err := ConversationRouteModelRequest(value)
