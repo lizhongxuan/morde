@@ -997,10 +997,6 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .task-activity-heading > span { flex: 0 0 auto; max-width: 46%; font-size: 10px; overflow-wrap: anywhere; }
 .task-activity-actions { margin-top: 9px; }
 .task-activity-actions .button { white-space: normal; }
-.task-supplement-form { margin-top: 10px; display: grid; gap: 7px; }
-.task-supplement-target { display: grid; gap: 5px; }
-.task-supplement-target small { color: var(--muted); }
-.task-supplement-form textarea { min-height: 76px; resize: vertical; }
 .task-supplement-status { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
 .task-supplement-status small { color: var(--muted); }
 .assistant-composer { position: relative; z-index: 31; }
@@ -1093,7 +1089,6 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .chat-message-author { min-height: 26px; margin: 0; color: #607089; font-size: 11px; }
 .assistant-page .chat-message-user .chat-message-author { display: none; }
 .assistant-page .chat-message-status { margin: 4px 10px 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; color: #68778d; font-size: 11px; line-height: 1.4; }
-.assistant-page .chat-message-status-error { color: var(--danger); flex-wrap: wrap; }
 .assistant-page .message-variant-controls:empty { display: none; }
 .assistant-page .chat-message-user .message-variant-controls { margin-top: 6px; padding-top: 0; border-top: 0; }
 .project-message-received { width: 28px; height: 25px; margin-top: 6px; display: inline-grid; place-items: center; border: 2px solid #fff; border-radius: 14px; color: inherit; background: #eff6ff; font-size: 14px; line-height: 1; }
@@ -1357,9 +1352,6 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .task-panel-list:not(.task-panel-detail) { overflow-y: auto; overscroll-behavior: contain; }
 .assistant-page .task-panel-detail .task-activity-heading { align-items: center; }
 .assistant-page .task-detail-work { min-width: 0; display: grid; gap: 8px; }
-.assistant-page .task-detail-work-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; padding-bottom: 10px; border-bottom: 1px solid #dce7f5; }
-.assistant-page .task-detail-work-heading h3 { margin: 0; color: #344762; font-size: 14px; }
-.assistant-page .task-detail-work-heading span { color: #8798af; font-size: 11px; }
 .assistant-page .task-agent-group { min-width: 0; padding: 6px 0 0; border-top: 0; }
 .assistant-page .task-agent-group > h4 { min-height: 26px; margin: 0 0 3px; display: flex; align-items: center; gap: 9px; color: #526783; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
 .assistant-page .task-agent-group > h4 span { height: 1px; flex: 1; background: #dce7f5; }
@@ -1392,8 +1384,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 }
 .assistant-page .task-detail-work > summary,
 .assistant-page .task-detail-diagnostics > summary { color: #536780; font-size: 13px; font-weight: 650; cursor: pointer; }
-.assistant-page .task-detail-work h3 { margin: 0 0 10px; color: #60728b; font-size: 13px; }
-.assistant-page .task-agent-group { min-width: 0; padding: 8px 0; border-top: 1px solid #edf0f4; }
+.assistant-page .task-agent-group { min-width: 0; padding: 8px 0; border-top: 0; }
 .assistant-page .task-agent-group h4 { margin: 0; display: flex; justify-content: space-between; gap: 8px; color: #536780; font-size: 13px; }
 .assistant-page .task-agent-group h4 small { color: #7f8da2; font-size: 12px; font-weight: 400; }
 .assistant-page .task-activity-steps li > div { min-width: 0; }
@@ -1962,6 +1953,9 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .morde-shell:not(.morde-admin-shell) .morde-workspace-add-menu button { padding: 8px 10px; border: 0; border-radius: 6px; color: #4b5563; background: transparent; font: inherit; font-size: 12px; text-align: left; cursor: pointer; }
 .morde-shell:not(.morde-admin-shell) .morde-workspace-add-menu button:hover { background: #f2f4f7; }
 .morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace { --pc-workspace-panel-width: clamp(350px, 36vw, 660px); }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace { --pc-network-sidebar-width: var(--pc-context-sidebar-width); --pc-network-panel-width: var(--pc-workspace-panel-width); }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace-collapsed { --pc-network-panel-width: 0px; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace.morde-shell-context-collapsed { --pc-network-sidebar-width: 0px; }
 @media (min-width: 621px) {
   .morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace {
     --pc-workspace-panel-width: max(350px, min(var(--pc-workspace-panel-user-width, clamp(350px, 36vw, 660px)), 900px, calc(100vw - var(--pc-app-rail-width) - var(--pc-context-sidebar-width) - 320px)));
@@ -1976,6 +1970,16 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 }
 .morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-top-navigation { grid-column: 1; }
 .morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-top-navigation-status { width: 124px; min-width: 124px; min-height: 32px; margin-left: auto; display: flex; align-items: center; justify-content: flex-end; gap: 9px; }
+.morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-network-connecting-slot {
+  position: absolute; z-index: 1; inset-block: 0;
+  left: calc(var(--pc-app-rail-width) + var(--pc-network-sidebar-width));
+  width: calc(100% - var(--pc-app-rail-width) - var(--pc-network-sidebar-width) - var(--pc-network-panel-width));
+  display: flex; align-items: center; justify-content: center; pointer-events: none;
+}
+.morde-network-connecting { min-width: max-content; min-height: 30px; padding: 0 13px; display: inline-flex; align-items: center; gap: 8px; border: 1px solid #bfdbfe; border-radius: 999px; color: #2563eb; background: #eff6ff; font-size: 12px; font-weight: 650; }
+.morde-network-connecting > span { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #3b82f6; animation: morde-network-breathe 1.6s ease-in-out infinite; }
+@keyframes morde-network-breathe { 0%, 100% { opacity: .55; transform: scale(.82); } 50% { opacity: 1; transform: scale(1.18); } }
+@media (prefers-reduced-motion: reduce) { .morde-network-connecting > span { animation: none; } }
 .morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-top-actions-assistant {
   grid-column: 2;
   width: 100%;

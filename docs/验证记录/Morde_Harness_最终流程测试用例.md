@@ -882,7 +882,7 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 ### S00 H05 IPC reconciliation 执行事实漏项修正 2026-11-23
 
 - **问题与修复：** 上轮验证说明称 `loadTaskValidationVerdictFacts` 已覆盖 IPC reconciliation，但源码查询实际缺少 `task_agent_request_reconciliations`。pending tool/child 请求可能已产生未知副作用；把它们判为无执行会低估结果事实。现将该表加入执行存在性查询，仍将 `IrreversibleAction` 与 `RepeatedError` 留为 `unknown`，不推导审批完整或 PASS。
-- **回归：** 新增 PostgreSQL 用例启动真实 Agent session、持久化精确 pending tool-call reconciliation，再直接读取 validation facts，断言 `TaskExecution=present` 且 `IrreversibleAction=unknown`。已有 Hub operation 回归也在同一目标命令中复跑。
+- **回归：** 新增 PostgreSQL 用例启动真实 Agent session，先确认尚无执行账本时 `TaskExecution=absent`，再持久化精确 pending tool-call reconciliation，断言 `TaskExecution=present` 且 `IrreversibleAction=unknown`。已有 Hub operation 回归也在同一目标命令中复跑。
 - **验证命令与结果：** 在只绑定 loopback 随机端口、无数据卷的一次性 PostgreSQL 16 容器中运行：
 
   ```sh
@@ -890,7 +890,7 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
     go test ./internal/store/postgres -run '^TestPostgresTaskValidationFactsTreat(HubOperation|PendingRequestReconciliation)AsExecution$' -count=1
   ```
 
-  结果 `ok morde/server/internal/store/postgres 3.640s`；`gofmt` 与 `git diff --check` 通过。测试容器已停止并删除。
+  最终用例结果 `ok morde/server/internal/store/postgres 3.818s`；`gofmt` 与 `git diff --check` 通过。测试容器已停止并删除。
 - **补充审计与边界：** 只读调用链审计发现 Hostless live Workspace write 和 media publish 在 receipt Reserve、实际文件写入、receipt Commit 之间可与 Task cancellation 交错；目前取消可使 Commit 失败而 live 文件已写入。此情形涉及数据库与文件系统的持久状态协调，本轮未做不完整的 recheck/回滚修补，需按 H04/H05 状态机继续解决。Hub/sandbox 仍缺逐次审批身份或可信执行环境证明；Artifact 内容语义、真实 PC/iOS/Provider 与耐久验收未完成。执行类 Task 继续 `ApprovalHistoryVerified=false` / `IrreversibleAction=unknown`，H05 不勾选。
 
 ### 单次执行信息模板

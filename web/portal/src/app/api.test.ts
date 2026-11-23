@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError } from '../api/client';
+import { ApiError, requestFetch } from '../api/client';
 import { enterHostInNewTab, portalApi } from './api';
 import { projectApi } from './project-api';
 import { createMessageVariant, messageVariantContentTooLong } from './message-variants';
@@ -16,6 +16,24 @@ describe('typed Portal API client', () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ status: 'selection_required', conversation_id: '', version: 0 })));
 
     await expect(portalApi.mainConversation()).resolves.toEqual({ status: 'selection_required', conversation_id: null, version: 0 });
+  });
+
+  it('signals API transport failures and recovery to the client shell', async () => {
+    const events: string[] = [];
+    const onError = () => events.push('error');
+    const onRecovered = () => events.push('recovered');
+    window.addEventListener('morde:api-network-error', onError);
+    window.addEventListener('morde:api-network-recovered', onRecovered);
+    vi.stubGlobal('fetch', vi.fn().mockRejectedValueOnce(new TypeError('Failed to fetch')).mockResolvedValueOnce(Response.json({ ok: true })));
+
+    try {
+      await expect(requestFetch('/api/me')).rejects.toThrow('Failed to fetch');
+      await expect(requestFetch('/api/me')).resolves.toMatchObject({ status: 200 });
+      expect(events).toEqual(['error', 'recovered']);
+    } finally {
+      window.removeEventListener('morde:api-network-error', onError);
+      window.removeEventListener('morde:api-network-recovered', onRecovered);
+    }
   });
 
   it('reads owner-scoped memory history using the signed cursor and fixed memory route', async () => {

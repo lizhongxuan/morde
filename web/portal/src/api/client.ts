@@ -29,7 +29,14 @@ export async function requestFetch(input: RequestInfo | URL, init?: RequestInit)
   if (method !== "GET" && method !== "HEAD" && !(init?.body instanceof FormData)) {
     headers.set("Content-Type", headers.get("Content-Type") ?? "application/json");
   }
-  const response = await fetch(input, { ...init, headers, credentials: "include" });
+  let response: Response;
+  try {
+    response = await fetch(input, { ...init, headers, credentials: "include" });
+  } catch (error) {
+    if (error instanceof TypeError) window.dispatchEvent(new Event("morde:api-network-error"));
+    throw error;
+  }
+  window.dispatchEvent(new Event("morde:api-network-recovered"));
   const path = new URL(typeof input === "string" || input instanceof URL ? input : input.url, window.location.origin).pathname;
   if (response.status === 401 && path !== "/api/auth/login" && path !== "/api/me" && window.location.pathname !== "/login") {
     const next = `${window.location.pathname}${window.location.search}`;

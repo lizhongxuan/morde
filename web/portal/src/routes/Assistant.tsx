@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { ChangeEvent, CSSProperties, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
+import type { CSSProperties, FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
@@ -12,7 +12,7 @@ import { useMessageVariantOutbox } from '../app/use-message-variant-outbox';
 import type { MessageVariantOutboxEntry } from '../app/use-message-variant-outbox';
 import { buildMessageVariantTimeline, createMessageVariant, messageVariantActionLabel } from '../app/message-variants';
 import type { VersionableMessage } from '../app/message-variants';
-import { deliveryStatusText, routingFailureText, userVisibleRoutingStatusText } from '../app/message-status';
+import { deliveryStatusText, userVisibleRoutingStatusText } from '../app/message-status';
 import { clearProcessingRetryKey, processingRetryKey } from '../app/message-processing-retry';
 import { maxMessageBytes, needsMessageUpload, uploadMessage } from '../app/message-upload';
 import { conversationTitleFromText, firstOutboxConversationMessage, messageOutbox, outboxReceiptRequest } from '../app/message-outbox';
@@ -131,31 +131,6 @@ function AssistantOutboxRetryButton({ entry, sendMessage, label }: {
   return <button type="button" className="button button-small button-secondary" onClick={() => void sendMessage(entry, true)}>{label}</button>;
 }
 
-function AssistantTaskSupplementForm({ task, value, disabled, saving, needsWorkspaceTarget, workspaceID, workspaces, onWorkspaceChange, onChange, onSubmit }: {
-  task: Task; value: string; disabled: boolean; saving: boolean;
-  needsWorkspaceTarget: boolean; workspaceID: string; workspaces: { id: string; name: string; revision: number }[];
-  onWorkspaceChange: (workspaceID: string) => void;
-  onChange: (event: ChangeEvent<HTMLTextAreaElement>) => void;
-  onSubmit: (event: FormEvent<HTMLFormElement>, task: Task) => void;
-}) {
-  return <form className="task-supplement-form" aria-label="补充任务" onSubmit={(event) => onSubmit(event, task)}>
-    {needsWorkspaceTarget && <div className="task-supplement-target">
-      <label htmlFor={`task-supplement-workspace-${task.id}`}>保存到 Workspace</label>
-      <select id={`task-supplement-workspace-${task.id}`} aria-label="选择任务 Workspace" value={workspaceID}
-        required disabled={disabled} onChange={(event) => onWorkspaceChange(event.target.value)}>
-        <option value="">请选择可写 Workspace</option>
-        {workspaces.map((workspace) => <option key={workspace.id} value={workspace.id}>{workspace.name} · v{workspace.revision}</option>)}
-      </select>
-      <small>选择后会把这个任务绑定到该 Workspace，再继续保存文档。</small>
-    </div>}
-    <label htmlFor={`task-supplement-${task.id}`}>补充任务内容</label>
-    <textarea id={`task-supplement-${task.id}`} value={value} maxLength={maxMessageBytes} onChange={onChange} disabled={disabled} />
-    <button type="submit" className="button button-primary" disabled={(!value.trim() && !needsWorkspaceTarget) || (needsWorkspaceTarget && !workspaceID) || disabled || saving}>
-      {needsWorkspaceTarget ? '选择 Workspace 并继续' : '发送补充任务'}
-    </button>
-  </form>;
-}
-
 function AssistantConversationRow({ item, isMain, selected, recent, previewTitle, onSelect, onMakeMain, makeMainPending }: {
   item: Conversation; isMain?: boolean; selected: boolean; recent: boolean; previewTitle?: string | null; onSelect: (id: string) => void;
   onMakeMain?: (id: string) => void; makeMainPending?: boolean;
@@ -176,19 +151,13 @@ function AssistantConversationRow({ item, isMain, selected, recent, previewTitle
 }
 
 function conversationMessageStatus(message: AssistantDisplayMessage, task?: Task): string | null {
-  if (message.duplicate_of_message_id) return null;
-  const taskTitle = conversationTitleFromText(task?.objective);
-  const messageSource = taskTitle ? `任务“${taskTitle}”`
-    : message.task_id ? `关联任务 ${message.task_id}` : '此消息';
-  if (message.routing_status === 'pending' || message.routing_status === 'processing') return null;
+  if (message.duplicate_of_message_id || message.routing_status === 'pending' || message.routing_status === 'processing' ||
+    message.routing_status === 'failed' || message.routing_status === 'waiting_user' ||
+    task?.status === 'waiting_user' || message.delivery_status === 'unknown') return null;
   const routingStatus = userVisibleRoutingStatusText(message.routing_status);
-  if (routingStatus) return `${messageSource} · ${routingStatus}`;
-  if (task?.status === 'waiting_user') return `${messageSource} · ${safeTaskActivityText(taskStatusText(task, undefined), 300).value}`;
-  if (message.routing_status === 'waiting_user') return null;
-  if (message.delivery_status === 'applied') return null;
-  const deliveryStatus = message.delivery_status === 'pending' && task && terminalTaskStatuses.has(task.status)
-    ? '消息未处理，处理已结束' : deliveryStatusText(message.delivery_status);
-  return `${messageSource} · ${deliveryStatus}`;
+  if (routingStatus) return routingStatus;
+  if (message.delivery_status !== 'pending' || (task && terminalTaskStatuses.has(task.status))) return null;
+  return deliveryStatusText('pending');
 }
 
 function hasCompleteVerifiedArtifactProof(artifact: TaskArtifact): boolean {
@@ -614,7 +583,7 @@ function taskStatusText(task: Task, cloudTasksAvailable: boolean | undefined): s
   if (task.status === 'waiting_user' && task.waiting_reason === 'target_result_unknown') return '上次电脑操作的结果需要核对，暂不能重复执行。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_host_sync') return '任务等待目标云端电脑重新就绪并同步文件；确认版本已应用后才会完成。';
   if (task.status === 'waiting_user' && task.waiting_reason === 'model_context_limit') return '消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'dsh_recovery_unresolved') return 'AI 运行中断，无法确认本次执行结果。请停止任务后重试。';
+  if (task.status === 'waiting_user' && task.waiting_reason === 'dsh_recovery_unresolved') return 'AI 运行中断，无法确认本次执行结果。请核对任务状态后再继续。';
   if (task.status === 'waiting_user') return '任务正在等待你的确认或补充信息。';
   if (task.status === 'paused') return '任务已暂停。';
   if (task.status === 'pausing') return '正在安全暂停任务。';
@@ -745,15 +714,20 @@ function taskAgentActivityGroups(task: Task): TaskAgentActivityGroup[] {
     .sort((left, right) => left.sequence - right.sequence);
   const unassigned = (items: TaskStep[]): TaskAgentActivityGroup[] => items.length
     ? [{ id: 'unassigned', title: '归属未确认', currentActivity: null, steps: items }] : [];
+  const main = (items: TaskStep[]): TaskAgentActivityGroup[] => items.length
+    ? [{ id: 'main', title: 'MAIN', currentActivity: null, steps: items }] : [];
+  const fallback = (items: TaskStep[]): TaskAgentActivityGroup[] => [
+    ...main(items.filter((step) => !step.agent_id)),
+    ...unassigned(items.filter((step) => Boolean(step.agent_id))),
+  ];
   const agents = task.agents ?? [];
-  if (!agents.length) return !steps.length ? [] : steps.some((step) => step.agent_id)
-    ? unassigned(steps) : [{ id: 'main', title: 'MAIN', currentActivity: null, steps }];
+  if (!agents.length) return fallback(steps);
 
   const byID = new Map(agents.map((agent) => [agent.id, agent]));
   const roots = agents.filter((agent) => agent.parent_id === null && agent.role === 'main');
   if (byID.size !== agents.length || roots.length !== 1 || agents.some((agent) =>
     !agent.id || agent.task_revision < 0 || (agent.parent_id === null ? agent.role !== 'main' : agent.role !== 'subagent' || !byID.has(agent.parent_id))))
-    return unassigned(steps);
+    return fallback(steps);
 
   const byStepID = new Map(steps.map((step) => [step.id, step]));
   const children = agents.filter((agent) => agent.parent_id !== null).sort((left, right) => {
@@ -767,7 +741,7 @@ function taskAgentActivityGroups(task: Task): TaskAgentActivityGroup[] {
   const append = (agent: TaskAgent, path: number[]) => {
     if (visited.has(agent.id)) { invalidTree = true; return; }
     visited.add(agent.id);
-    const ownSteps = steps.filter((step) => step.agent_id === agent.id);
+    const ownSteps = steps.filter((step) => step.agent_id === agent.id || (agent.role === 'main' && !step.agent_id));
     const currentActivity = taskAgentCurrentActivity(agent);
     if (ownSteps.length || currentActivity) groups.push({ id: agent.id,
       title: path.length ? `SUBAGENT ${path.map((part) => String(part).padStart(2, '0')).join('.')}` : 'MAIN',
@@ -775,9 +749,9 @@ function taskAgentActivityGroups(task: Task): TaskAgentActivityGroup[] {
     children.filter((item) => item.parent_id === agent.id).forEach((child, index) => append(child, [...path, index + 1]));
   };
   append(roots[0]!, []);
-  if (invalidTree || visited.size !== agents.length) return unassigned(steps);
+  if (invalidTree || visited.size !== agents.length) return fallback(steps);
   const assignedStepIDs = new Set(groups.flatMap((group) => group.steps.map((step) => step.id)));
-  return [...groups, ...unassigned(steps.filter((step) => !assignedStepIDs.has(step.id)))];
+  return [...groups, ...unassigned(steps.filter((step) => Boolean(step.agent_id) && !assignedStepIDs.has(step.id)))];
 }
 
 type TaskFeedState = 'connected' | 'disconnected' | 'resyncing';
@@ -890,9 +864,6 @@ export function Assistant() {
   const [preparingAttachmentCount, setPreparingAttachmentCount] = useState(0);
   const [preparingAttachmentIDsForRender, setPreparingAttachmentIDsForRender] = useState<ReadonlySet<string>>(() => new Set());
   const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
-  const [taskSupplementDrafts, setTaskSupplementDrafts] = useState<Record<string, string>>({});
-  const [taskWorkspaceSelections, setTaskWorkspaceSelections] = useState<Record<string, string>>({});
-  const [supplementTaskID, setSupplementTaskID] = useState<string | null>(null);
   const [taskDetailTaskID, setTaskDetailTaskID] = useState<string | null>(null);
   const [taskDetailStepID, setTaskDetailStepID] = useState<string | null>(null);
   const [visibleTaskPanelCount, setVisibleTaskPanelCount] = useState(5);
@@ -1074,8 +1045,6 @@ export function Assistant() {
     staleTime: Infinity,
   });
   const models = useQuery({ queryKey: ['model-connections'], queryFn: portalApi.modelConnections, staleTime: 60_000, refetchOnMount: 'always' });
-  const workspaces = useQuery({ queryKey: ['assistant-workspaces'], queryFn: portalApi.workspaces, staleTime: 30_000 });
-  const workspaceItems = (workspaces.data?.items ?? []).filter((workspace) => workspace.state === 'ready' && !workspace.is_read_only);
   const mcpConnectors = useQuery({ queryKey: ['mcp-connectors'], queryFn: portalApi.mcpConnectors, retry: false });
   const availableModels = useQuery({ queryKey: ['available-models'], queryFn: portalApi.availableModels });
   const preferences = useQuery({ queryKey: ['user-preferences'], queryFn: portalApi.preferences });
@@ -1566,7 +1535,6 @@ export function Assistant() {
     { failed: Boolean(user) && mainConversation.isError, error: mainConversation.error },
     { failed: models.isError, error: models.error },
     { failed: availableModels.isError, error: availableModels.error },
-    { failed: workspaces.isError, error: workspaces.error },
     { failed: preferences.isError, error: preferences.error },
     { failed: hosts.isError, error: hosts.error },
     { failed: sharedHosts.isError, error: sharedHosts.error },
@@ -2222,7 +2190,7 @@ export function Assistant() {
     onError: (error, request) => handleTaskActionError(error, request.taskID),
   });
   const taskControl = useMutation({
-    mutationFn: async (request: { taskID: string; action: 'pause' | 'resume' | 'cancel'; expectedStatus: Task['status'];
+    mutationFn: async (request: { taskID: string; action: 'resume'; expectedStatus: Task['status'];
       expectedCurrentRevision: number | null; expectedDesiredRevision: number | null; actionScope: string; key: string }) => {
       const hasCurrentRevision = request.expectedCurrentRevision !== null;
       const hasDesiredRevision = request.expectedDesiredRevision !== null;
@@ -2245,17 +2213,11 @@ export function Assistant() {
         } : {}),
       }, request.key);
     },
-    onSuccess: async (response, request) => {
+    onSuccess: async (_response, request) => {
       clearTaskActionKey(request.actionScope, request.key);
       await client.invalidateQueries({ queryKey: ['task', request.taskID] });
       await client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
-      if (request.action === 'cancel' && response.status === 'cancelled' && response.unsettled_operation_ids.length === 0) {
-        notify('服务端已确认任务停止。', 'success');
-      } else if (request.action === 'cancel' && response.unsettled_operation_ids.length > 0) {
-        notify('停止请求已受理，等待任务状态更新。', 'info');
-      } else {
-        notify(request.action === 'pause' ? '暂停请求已受理，等待安全停止确认。' : request.action === 'resume' ? '继续请求已受理，等待任务状态更新。' : '停止请求已受理，仍需等待服务端确认任务状态。', 'info');
-      }
+      notify('继续请求已受理，等待任务状态更新。', 'info');
     },
     onError: (error, request) => handleTaskActionError(error, request.taskID),
   });
@@ -2561,46 +2523,7 @@ export function Assistant() {
     pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
   };
 
-  const submitTaskSupplement = (event: FormEvent<HTMLFormElement>, task: Task) => {
-    event.preventDefault();
-    const supplementalText = (taskSupplementDrafts[task.id] ?? '').trim();
-    const needsWorkspaceTarget = task.waiting_reason === 'workspace_unavailable' && !task.workspace_id;
-    const selectedWorkspaceID = needsWorkspaceTarget ? taskWorkspaceSelections[task.id] ?? '' : '';
-    const text = supplementalText || (needsWorkspaceTarget && selectedWorkspaceID
-      ? '请继续当前任务，并将结果保存到我选择的 Workspace。' : '');
-    if (savingMessageRef.current || !text || (needsWorkspaceTarget && !selectedWorkspaceID)) return;
-    if (new TextEncoder().encode(text).length > maxMessageBytes) {
-      notify('单条消息不能超过 8 MiB；完整内容仍保留在输入框中。', 'error');
-      return;
-    }
-    const id = newIdempotencyKey();
-    savingMessageRef.current = true;
-    setSavingMessage(true);
-    const previous = pendingMessageSave.current.then(async () => {
-      const targetMessages = task.conversation_id === conversationID && messages.data
-        ? conversationMessageItems : (await portalApi.conversationMessages(task.conversation_id)).items;
-      const pending: PendingConversationMessage = {
-        actorID: user?.id ?? '',
-        request: { client_message_id: id, content: text, reference_task_id: task.id,
-          ...(selectedWorkspaceID ? { workspace_id: selectedWorkspaceID, change_task_target: true } : {}) },
-        conversationID: task.conversation_id,
-        ...(capabilities.data?.service_instance_id ? { serviceInstanceID: capabilities.data.service_instance_id } : {}),
-        attachments: [], status: 'pending', createdAt: Date.now(),
-      };
-      const entry = await outbox.enqueue(pending, latestConversationClientMessageID(targetMessages));
-      if (activeOutboxScope.current === entry.scope) {
-        setTaskSupplementDrafts((current) => ({ ...current, [task.id]: '' }));
-        setSupplementTaskID(null);
-      }
-      void sendMessage(entry, false);
-    }).finally(() => {
-      savingMessageRef.current = false;
-      setSavingMessage(false);
-    });
-    pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
-  };
-
-  const submitTaskControl = (action: 'pause' | 'resume' | 'cancel', task: TaskSummary) => {
+  const submitTaskControl = (action: 'resume', task: TaskSummary) => {
     const actionScope = `${action}:${task.id}`;
     const expectedCurrentRevision = task.current_revision ?? null;
     const expectedDesiredRevision = task.desired_revision ?? null;
@@ -3141,26 +3064,10 @@ export function Assistant() {
         {['disconnected', 'resyncing'].includes(taskEventFeeds[task.id] ?? '') && !showConsolidatedNetworkError && <p role="status">连接中断，正在重连…</p>}
       </section>}
       {task.status === 'failed' && <p className="task-current-progress-message" role="alert">{progressText}</p>}
-      {busy && <div className="inline-actions task-activity-actions">
-        {task.status === 'paused' && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
-          onClick={() => submitTaskControl('resume', task)}>继续任务</button>}
-        {['queued', 'running', 'waiting_user'].includes(task.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
-          onClick={() => submitTaskControl('pause', task)}>暂停任务</button>}
-        {['queued', 'running', 'waiting_user', 'paused'].includes(task.status) && <button type="button" className="button button-secondary" disabled={taskControl.isPending}
-          onClick={() => submitTaskControl('cancel', task)}>{taskControl.isPending ? '正在停止…' : '停止任务'}</button>}
-        <button type="button" className="button button-secondary" onClick={() => setSupplementTaskID((current) => current === task.id ? null : task.id)}>
-          {supplementTaskID === task.id ? '收起补充任务' : '补充任务'}
-        </button>
+      {busy && task.status === 'paused' && <div className="inline-actions task-activity-actions">
+        <button type="button" className="button button-secondary" disabled={taskControl.isPending}
+          onClick={() => submitTaskControl('resume', task)}>{taskControl.isPending ? '正在继续…' : '继续任务'}</button>
       </div>}
-      {busy && supplementTaskID === task.id && task.waiting_reason !== 'project_recovery_unavailable' && <AssistantTaskSupplementForm
-        task={task} value={taskSupplementDrafts[task.id] ?? ''} disabled={savingMessage} saving={savingMessage}
-        needsWorkspaceTarget={task.waiting_reason === 'workspace_unavailable' && !task.workspace_id}
-        workspaceID={taskWorkspaceSelections[task.id] ?? ''} workspaces={workspaceItems}
-        onWorkspaceChange={(workspaceID) => setTaskWorkspaceSelections((current) => ({ ...current, [task.id]: workspaceID }))}
-        onSubmit={submitTaskSupplement}
-        onChange={(event) => setTaskSupplementDrafts((current) => ({ ...current, [task.id]: event.target.value }))} />}
-      {busy && supplementTaskID === task.id && task.waiting_reason === 'workspace_unavailable' && !task.workspace_id && workspaces.isError && !isTransientNetworkError(workspaces.error) &&
-        <FloatingError className="error-inline assistant-connector-error" role="alert">Workspace 列表暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void workspaces.refetch()}>重试</button></FloatingError>}
       {supplementEntries.map(({ message, scope }) => {
         const error = messageOutboxErrorForDisplay(message.error);
         return <div className="task-supplement-status" key={message.request.client_message_id}>
@@ -3199,8 +3106,7 @@ export function Assistant() {
               : task.artifacts.some(hasCompleteVerifiedArtifactProof) ? '在 Workbench 查看已核验产物' : '在 Workbench 只读观察'}</button>
           : <p className="muted" role="status">目标电脑当前不可用或未运行，暂不能打开 Workbench 观察页。</p>}
       </div>}
-      <section className="task-detail-work" aria-label="Agent 工作过程">
-        <div className="task-detail-work-heading"><h3>Agent 工作过程</h3></div>
+      <section className="task-detail-work" aria-label="任务工作项">
         {groups.length ? groups.map((group) => <section className="task-agent-group" key={group.id}>
           <h4><strong>{group.title}</strong><span aria-hidden="true" /></h4>
           {group.currentActivity && <p className="muted task-agent-current-activity" role="status">{group.currentActivity}</p>}
@@ -3492,8 +3398,6 @@ export function Assistant() {
                     (entry.operation.input.messageID === variantGroup.id || variantGroup.messageIDs.has(entry.operation.input.messageID))) : [];
                   const acceptedRetryStatus = retryAcceptedMessageIDs.has(message.id) &&
                     ['failed', 'pending', 'processing'].includes(message.routing_status ?? '') ? '正在重新处理消息' : null;
-                  const routingFailure = message.role === 'user' && message.routing_status === 'failed' && !message.duplicate_of_message_id && !acceptedRetryStatus
-                    ? routingFailureText(message.routing_failure_reason) : null;
                   const canRetryRouting = message.role === 'user' && message.routing_status === 'failed' && message.routing_failure_reason !== 'message_too_long'
                     && !message.related_task_id && !acceptedRetryStatus;
                   const routingStatus = message.role === 'user'
@@ -3537,11 +3441,10 @@ export function Assistant() {
                           disabled={groupOperations.some((item) => item.operation.status === 'sending')} onClick={() => void sendVariantOperation(entry)}>核对并重试</button>}
                       </div>)}
                     </article>
-                    {(routingFailure || canRetryRouting) && <div className={`chat-message-status${routingFailure ? ' chat-message-status-error' : ''}`} role={routingFailure ? 'alert' : 'status'}>
-                      {routingFailure && <span>{routingFailure}</span>}
-                      {canRetryRouting && <button type="button" className="button button-small button-secondary"
+                    {canRetryRouting && <div className="chat-message-status" role="status">
+                      <button type="button" className="button button-small button-secondary"
                         aria-label="重新处理这条消息" disabled={retryProcessing.isPending && retryProcessing.variables?.messageID === message.id}
-                        onClick={() => retryProcessing.mutate({ conversationID: message.conversation_id, messageID: message.id })}>重新处理这条消息</button>}
+                        onClick={() => retryProcessing.mutate({ conversationID: message.conversation_id, messageID: message.id })}>重新处理这条消息</button>
                     </div>}
                     {message.role === 'user' && (routingStatus || message.delivery_status === 'unknown') && <div className="chat-message-status" role="status">
                         {routingStatus}

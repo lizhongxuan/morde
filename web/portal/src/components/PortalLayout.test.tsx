@@ -58,6 +58,22 @@ describe('PortalLayout', () => {
     expect(openTabs.some((tab) => /云端电脑|文件/.test(tab.textContent ?? ''))).toBe(false);
   });
 
+  it('shows the breathing network status while offline or disconnected from the API', () => {
+    renderPortalLayout('/assistant');
+    expect(screen.queryByText('连接网络中')).not.toBeInTheDocument();
+
+    fireEvent(window, new Event('offline'));
+    expect(screen.getByText('连接网络中').closest('[role="status"]')).toBeInTheDocument();
+
+    fireEvent(window, new Event('online'));
+    expect(screen.queryByText('连接网络中')).not.toBeInTheDocument();
+
+    fireEvent(window, new Event('morde:api-network-error'));
+    expect(screen.getByText('连接网络中').closest('[role="status"]')).toBeInTheDocument();
+    fireEvent(window, new Event('morde:api-network-recovered'));
+    expect(screen.queryByText('连接网络中')).not.toBeInTheDocument();
+  });
+
   it('does not fetch approval items or surface approval errors outside the review page', () => {
     renderPortalLayout('/assistant');
 
