@@ -630,3 +630,90 @@ func TestCloudDSHCoordinatorFallsBackWhenGatewayCannotReportCapacity(t *testing.
 		t.Fatal("summary model must be unavailable when the gateway cannot report it")
 	}
 }
+
+func TestCloudDSHCoordinatorAcceptsTruncatedPreviewForLongMessage(t *testing.T) {
+	claim, value := coordinatorTestClaimAndContext()
+	full := strings.Repeat("这是一条很长的消息，需要按摘要预览来分类。", 100)
+	claim.Message.Content = full
+	preview, truncated := app.ConversationRouteTextPreview(full, app.ConversationRouteCurrentMessagePreviewBytes)
+	if !truncated {
+		t.Fatal("long test message was not reduced to a preview")
+	}
+	digest := sha256.Sum256([]byte(full))
+	value.Content = preview
+	value.ContentTruncated = true
+	value.CurrentMessageID = claim.Message.ID
+	value.ContentSHA256 = digest[:]
+	value.ContentBytes = int64(len(full))
+	disabled := domain.NewError(domain.CodeConflict, "owner execution is not enabled")
+	disabled.Details["state"] = "disabled"
+	models := &coordinatorTestModels{directDecision: app.ConversationRouteDecision{
+		Action: app.ConversationRouteReply, Reply: "收到", ModelOutput: `{"action":"reply"}`}}
+	manager := &coordinatorTestRuntimeManager{acquireErr: disabled}
+	coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{
+		Models: models, Checkpoints: &coordinatorTestCheckpoints{head: app.ConversationCoordinatorCheckpointHead{Through: -1}},
+	}, runtimes: manager}
+
+	decision, err := coordinator.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != app.ConversationRouteReply || decision.Reply != "收到" || models.directCalls != 1 {
+		t.Fatalf("truncated preview was not classified: decision=%+v, err=%v, direct calls=%d",
+			decision, err, models.directCalls)
+	}
+}
+
+func TestCloudDSHCoordinatorAcceptsShortAggregatedInput(t *testing.T) {
+	claim, value := coordinatorTestClaimAndContext()
+	merged := "用户为同一项工作提交了以下消息，请按顺序作为一个请求处理：\n\nhello\n\n--- 用户补充 ---\n\n补充一点"
+	rootDigest := sha256.Sum256([]byte(claim.Message.Content))
+	mergedDigest := sha256.Sum256([]byte(merged))
+	supplementDigest := sha256.Sum256([]byte("补充一点"))
+	value.Content = merged
+	value.ContentSources = []app.ConversationRouteMessageSource{{MessageID: claim.Message.ID,
+		Sequence: claim.Message.Sequence, ContentBytes: int64(len(claim.Message.Content)), ContentSHA256: rootDigest[:]},
+		{MessageID: "m2345678", Sequence: 2, ContentBytes: int64(len("补充一点")), ContentSHA256: supplementDigest[:]}}
+	value.ContentSHA256 = mergedDigest[:]
+	value.ContentBytes = int64(len(merged))
+	disabled := domain.NewError(domain.CodeConflict, "owner execution is not enabled")
+	disabled.Details["state"] = "disabled"
+	models := &coordinatorTestModels{directDecision: app.ConversationRouteDecision{
+		Action: app.ConversationRouteReply, Reply: "收到", ModelOutput: `{"action":"reply"}`}}
+	manager := &coordinatorTestRuntimeManager{acquireErr: disabled}
+	coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{
+		Models: models, Checkpoints: &coordinatorTestCheckpoints{head: app.ConversationCoordinatorCheckpointHead{Through: -1}},
+	}, runtimes: manager}
+
+	decision, err := coordinator.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != app.ConversationRouteReply || models.directCalls != 1 {
+		t.Fatalf("short aggregated input was not classified: decision=%+v, err=%v, direct calls=%d",
+			decision, err, models.directCalls)
+	}
+}
+
+func TestCloudDSHCoordinatorRejectsPreviewForAnotherMessage(t *testing.T) {
+	claim, value := coordinatorTestClaimAndContext()
+	full := strings.Repeat("另一条消息的内容", 200)
+	preview, truncated := app.ConversationRouteTextPreview(full, app.ConversationRouteCurrentMessagePreviewBytes)
+	if !truncated {
+		t.Fatal("test message was not reduced to a preview")
+	}
+	digest := sha256.Sum256([]byte(full))
+	value.Content = preview
+	value.ContentTruncated = true
+	value.CurrentMessageID = "m9999999"
+	value.ContentSHA256 = digest[:]
+	value.ContentBytes = int64(len(full))
+	models := &coordinatorTestModels{}
+	manager := &coordinatorTestRuntimeManager{}
+	coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{
+		Models: models, Checkpoints: &coordinatorTestCheckpoints{head: app.ConversationCoordinatorCheckpointHead{Through: -1}},
+	}, runtimes: manager}
+
+	if _, err := coordinator.ClassifyConversationRoute(context.Background(), claim, value); err == nil {
+		t.Fatal("coordinator accepted a preview bound to another message")
+	} else if domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("coordinator rejected the preview with the wrong code: %v", err)
+	}
+	if manager.acquireCalls != 0 {
+		t.Fatalf("mismatched preview crossed the runtime boundary: acquire=%d", manager.acquireCalls)
+	}
+}
