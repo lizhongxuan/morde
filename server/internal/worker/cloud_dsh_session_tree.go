@@ -2036,6 +2036,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if frame.cloudDSHIdentity != rootIdentity {
 				return errors.New("dsh runtime failure frame identity is invalid")
 			}
+			if frame.Reason != "" {
+				return fmt.Errorf("dsh reported an unavailable runtime: %s", frame.Reason)
+			}
 			return errors.New("dsh reported an unavailable runtime")
 		}
 		if frame.Type == "child_create" {
@@ -2180,11 +2183,26 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return err
 			}
 		case "model":
-			if (state.resume && state.readThrough != state.restoreThrough) || !state.history.allCallsReconciled() ||
-				frame.Through == nil || *frame.Through != state.through || state.through <= state.lastModel ||
-				len(pendingModels) >= cloudDSHMaxPendingModelCalls ||
-				!cloudDSHDigest(frame.Request, frame.SHA256) || !validCloudDSHModelRequest(frame.Request, value.ModelID, state.definitions) {
-				return errors.New("dsh model request is invalid")
+			if state.resume && state.readThrough != state.restoreThrough {
+				return errors.New("dsh model request resume state is invalid")
+			}
+			if !state.history.allCallsReconciled() {
+				return errors.New("dsh model request has unreconciled tool calls")
+			}
+			if frame.Through == nil || *frame.Through != state.through {
+				return errors.New("dsh model request through sequence is invalid")
+			}
+			if state.through <= state.lastModel {
+				return errors.New("dsh model request repeats a model call")
+			}
+			if len(pendingModels) >= cloudDSHMaxPendingModelCalls {
+				return errors.New("dsh model request exceeds pending model calls")
+			}
+			if !cloudDSHDigest(frame.Request, frame.SHA256) {
+				return errors.New("dsh model request digest is invalid")
+			}
+			if reason := cloudDSHModelRequestInvalidReason(frame.Request, value.ModelID, state.definitions); reason != "" {
+				return fmt.Errorf("dsh model request is invalid: %s", reason)
 			}
 			if cloudDSHRequestHasUnavailableAttachments(frame.Request, state.definitions) {
 				return cloudDSHModelResultError{category: "attachment_reader_unavailable"}

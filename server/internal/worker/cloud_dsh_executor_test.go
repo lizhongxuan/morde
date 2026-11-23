@@ -3982,6 +3982,42 @@ func TestCloudDSHExecutorRejectsUntrustedFramesAndMissingSupervisor(t *testing.T
 	}
 }
 
+func TestCloudDSHModelRequestInvalidReasonNamesTheFailedCheck(t *testing.T) {
+	tool := app.AgentToolDefinition{ModelTool: app.ModelTool{
+		Name: "echo_tool", Description: "Echo the input.",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"text":{"type":"string"}},"required":["text"],"additionalProperties":false}`),
+	}}
+	definitions := []app.AgentToolDefinition{tool}
+	valid, err := json.Marshal(map[string]any{
+		"provider": "morde", "model": "p1234567", "tools": cloudDSHToolPayload(definitions),
+		"messages": []map[string]any{{"role": "user", "content": []map[string]any{{"type": "text", "text": "Hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason := cloudDSHModelRequestInvalidReason(valid, "p1234567", definitions); reason != "" {
+		t.Fatalf("valid model request reported reason %q", reason)
+	}
+	if reason := cloudDSHModelRequestInvalidReason(valid, "p7654321", definitions); reason != "provider-or-model" {
+		t.Fatalf("wrong model reported reason %q", reason)
+	}
+	mismatched, err := json.Marshal(map[string]any{
+		"provider": "morde", "model": "p1234567",
+		"tools": []map[string]any{{"name": "echo_tool", "description": "Echo the input.",
+			"parameters": map[string]any{"type": "object", "properties": map[string]any{"text": map[string]any{"type": "string"}}, "required": []string{"other"}, "additionalProperties": false}}},
+		"messages": []map[string]any{{"role": "user", "content": []map[string]any{{"type": "text", "text": "Hi"}}}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reason := cloudDSHModelRequestInvalidReason(mismatched, "p1234567", definitions); reason != "tool-parameters-mismatch" {
+		t.Fatalf("mismatched tool parameters reported reason %q", reason)
+	}
+	if reason := cloudDSHModelRequestInvalidReason(valid, "p1234567", nil); reason != "tool-count" {
+		t.Fatalf("missing definitions reported reason %q", reason)
+	}
+}
+
 func TestCloudDSHToolDefinitionsAllowArgumentFreeTools(t *testing.T) {
 	noArguments := app.AgentToolDefinition{ModelTool: app.ModelTool{
 		Name: "no_arguments", Description: "A tool with no arguments.",

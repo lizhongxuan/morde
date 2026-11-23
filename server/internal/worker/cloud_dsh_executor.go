@@ -785,6 +785,7 @@ type cloudDSHFrame struct {
 	Phase               string          `json:"phase,omitempty"`
 	ActivityID          string          `json:"activity_id,omitempty"`
 	Code                string          `json:"code,omitempty"`
+	Reason              string          `json:"reason,omitempty"`
 	Summary             string          `json:"summary,omitempty"`
 	JobID               string          `json:"job_id,omitempty"`
 }
@@ -835,6 +836,13 @@ func readCloudDSHFrames(ctx context.Context, source io.Reader, out chan<- cloudD
 	}
 }
 
+// cloudDSHFrameOptionalFields lists frame keys that may appear in addition to
+// the required keys for a frame type. The task runtime reports a failure
+// reason on "failed" frames; older runtimes omit it.
+var cloudDSHFrameOptionalFields = map[string][]string{
+	"failed": {"reason"},
+}
+
 func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 	var frame cloudDSHFrame
 	if !utf8.Valid(raw) || !uniqueCloudDSHJSON(raw) {
@@ -867,13 +875,38 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 		"failed":                {"type", "code", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id"},
 	}
 	required, ok := fields[frame.Type]
-	if !ok || len(keys) != len(required) {
+	if !ok {
 		keyNames := make([]string, 0, len(keys))
 		for key := range keys {
 			keyNames = append(keyNames, key)
 		}
 		sort.Strings(keyNames)
 		return cloudDSHFrame{}, fmt.Errorf("unsupported dsh frame fields: type=%q keys=%v", frame.Type, keyNames)
+	}
+	for key := range keys {
+		allowed := false
+		for _, name := range required {
+			if key == name {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			for _, name := range cloudDSHFrameOptionalFields[frame.Type] {
+				if key == name {
+					allowed = true
+					break
+				}
+			}
+		}
+		if !allowed {
+			keyNames := make([]string, 0, len(keys))
+			for key := range keys {
+				keyNames = append(keyNames, key)
+			}
+			sort.Strings(keyNames)
+			return cloudDSHFrame{}, fmt.Errorf("unsupported dsh frame fields: type=%q keys=%v", frame.Type, keyNames)
+		}
 	}
 	for _, name := range required {
 		if _, ok := keys[name]; !ok {
@@ -1057,6 +1090,14 @@ func validCloudDSHToolDefinitions(definitions []app.AgentToolDefinition) bool {
 }
 
 func validCloudDSHModelRequest(raw []byte, modelID string, definitions []app.AgentToolDefinition) bool {
+	return cloudDSHModelRequestInvalidReason(raw, modelID, definitions) == ""
+}
+
+// cloudDSHModelRequestInvalidReason reports why a runtime model request fails
+// validation, or "" when it is valid. The reason names only the structural
+// check that failed; it never carries request content, tool arguments, or
+// message text.
+func cloudDSHModelRequestInvalidReason(raw []byte, modelID string, definitions []app.AgentToolDefinition) string {
 	type modelTool struct {
 		Name         string          `json:"name"`
 		Description  string          `json:"description"`
@@ -1087,14 +1128,25 @@ func validCloudDSHModelRequest(raw []byte, modelID string, definitions []app.Age
 		MaxTokens   *int              `json:"max_tokens"`
 		Temperature *float64          `json:"temperature"`
 	}
-	if !validCloudDSHToolDefinitions(definitions) || !uniqueCloudDSHJSON(raw) {
-		return false
+	if !validCloudDSHToolDefinitions(definitions) {
+		return "definitions"
+	}
+	if !uniqueCloudDSHJSON(raw) {
+		return "duplicate-json-keys"
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&request) != nil || decoder.Decode(new(any)) != io.EOF || request.Provider != "morde" ||
-		request.Model != modelID || request.Tools == nil || len(request.Tools) != len(definitions) || len(request.Messages) == 0 {
-		return false
+	if decoder.Decode(&request) != nil || decoder.Decode(new(any)) != io.EOF {
+		return "shape"
+	}
+	if request.Provider != "morde" || request.Model != modelID {
+		return "provider-or-model"
+	}
+	if request.Tools == nil || len(request.Tools) != len(definitions) {
+		return "tool-count"
+	}
+	if len(request.Messages) == 0 {
+		return "messages"
 	}
 	expectedTools := make(map[string]app.AgentToolDefinition, len(definitions))
 	for _, definition := range definitions {
@@ -1105,89 +1157,92 @@ func validCloudDSHModelRequest(raw []byte, modelID string, definitions []app.Age
 	for _, rawTool := range request.Tools {
 		var fields map[string]json.RawMessage
 		if json.Unmarshal(rawTool, &fields) != nil || (len(fields) != 3 && len(fields) != 4) {
-			return false
+			return "tool-fields"
 		}
 		for key := range fields {
 			if key != "name" && key != "description" && key != "parameters" && key != "deferLoading" {
-				return false
+				return "tool-field"
 			}
 		}
 		for _, key := range []string{"name", "description", "parameters"} {
 			if _, ok := fields[key]; !ok {
-				return false
+				return "tool-missing-field"
 			}
 		}
 		if _, ok := fields["deferLoading"]; ok {
 			var deferred bool
 			if json.Unmarshal(fields["deferLoading"], &deferred) != nil || deferred {
-				return false
+				return "tool-deferred"
 			}
 		}
 		var offered modelTool
 		if json.Unmarshal(rawTool, &offered) != nil || offered.DeferLoading {
-			return false
+			return "tool-shape"
 		}
 		definition, ok := expectedTools[offered.Name]
-		if !ok || offered.Description != definition.Description {
-			return false
+		if !ok {
+			return "tool-unknown"
+		}
+		if offered.Description != definition.Description {
+			return "tool-description"
 		}
 		if _, duplicate := allowed[offered.Name]; duplicate {
-			return false
+			return "tool-duplicate"
 		}
 		parameters, ok := canonicalCloudDSHJSON(offered.Parameters)
 		if !ok {
-			return false
+			return "tool-parameters"
 		}
 		want, ok := canonicalCloudDSHJSON(definition.Parameters)
 		if !ok || !bytes.Equal(parameters, want) {
-			return false
+			return "tool-parameters-mismatch"
 		}
 		allowed[offered.Name] = struct{}{}
 	}
 	for _, message := range request.Messages {
 		if message.Role != "system" && message.Role != "developer" && message.Role != "user" && message.Role != "assistant" && message.Role != "tool" {
-			return false
+			return "message-role"
 		}
 		if message.Role == "tool" {
 			if message.ToolCallID == "" || !cloudDSHID.MatchString(message.ToolCallID) {
-				return false
+				return "message-tool-call-id"
 			}
 		} else if message.ToolCallID != "" || message.IsError {
-			return false
+			return "message-tool-call"
 		}
 		for _, block := range message.Content {
 			switch block.Type {
 			case "text":
 			case "reasoning":
 				if message.Role != "assistant" || !utf8.ValidString(block.Text) || len(block.Text) > cloudDSHMaxText {
-					return false
+					return "reasoning-block"
 				}
 			case "tool-call":
 				if message.Role != "assistant" || !cloudDSHID.MatchString(block.ID) {
-					return false
+					return "tool-call-block"
 				}
 				if _, ok := allowed[block.Name]; !ok || !validCloudDSHJSONObject([]byte(block.Arguments)) {
-					return false
+					return "tool-call-block"
 				}
 			case "image":
 				if message.Role != "tool" || message.ToolCallID == "" || len(block.Attachment) == 0 {
-					return false
+					return "image-block"
 				}
 				_, data, err := decodeCloudDSHImageAttachment(block.Attachment)
 				if err != nil {
-					return false
+					return "image-attachment"
 				}
 				imageCount++
 				imageBytes += len(data)
 				if imageCount > cloudDSHMaxModelImageCount || imageBytes > cloudDSHMaxModelImageBytes {
-					return false
+					return "image-limit"
 				}
 			default:
-				return false
+				return "block-type"
 			}
 		}
 	}
-	return true
+	return ""
 }
 
 func canonicalCloudDSHJSON(raw []byte) ([]byte, bool) {
