@@ -45,6 +45,8 @@ var ErrCloudDSHCompletionPending = errors.New("dsh completion requires output ve
 // returning a tool result, so the dsh process must stop without failing it.
 var ErrCloudDSHWaitingForUser = errors.New("dsh task is waiting for user input")
 
+var errCloudDSHTerminalToolAttempt = errors.New("dsh tool attempt was durably terminated")
+
 var errCloudDSHModelResultUnavailable = errors.New("dsh model result is unavailable or contains an unauthorized tool")
 
 var errCloudDSHConnectionInterrupted = errors.New("dsh connection ended before a verified result")
@@ -644,7 +646,7 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	// A disconnected child is reclaimed from its durable checkpoint; the operation ledger decides whether a tool can be replayed.
 	if err != nil && !errors.Is(err, errCloudDSHConnectionInterrupted) && !errors.Is(err, errCloudDSHBackgroundOutputPending) &&
 		!errors.Is(err, ErrCloudDSHCompletionPending) && !errors.Is(err, errCloudDSHModelResultUnavailable) &&
-		!errors.Is(err, errCloudDSHPersonalMemoryChanged) && recoveringAgent && ctx.Err() == nil {
+		!errors.Is(err, errCloudDSHPersonalMemoryChanged) && !errors.Is(err, errCloudDSHTerminalToolAttempt) && recoveringAgent && ctx.Err() == nil {
 		if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
 			pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			err = errors.Join(err, recoveryTools.PauseRecovery(pauseCtx, value))
@@ -660,6 +662,9 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 		}
 	}
 	if errors.Is(err, ErrCloudDSHWaitingForUser) {
+		return nil
+	}
+	if errors.Is(err, errCloudDSHTerminalToolAttempt) {
 		return nil
 	}
 	return err

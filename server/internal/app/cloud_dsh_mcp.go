@@ -24,11 +24,12 @@ import (
 )
 
 const (
-	cloudDSHMCPToolPrefix      = "mcp_"
-	maxCloudDSHToolDefinitions = 64
-	maxCloudDSHMCPImageBytes   = 36 << 10
-	maxCloudDSHMCPImageWidth   = 1280
-	maxCloudDSHMCPImageHeight  = 720
+	cloudDSHMCPToolPrefix                = "mcp_"
+	maxCloudDSHToolDefinitions           = 64
+	maxCloudDSHMCPImageBytes             = 36 << 10
+	maxCloudDSHMCPImageWidth             = 1280
+	maxCloudDSHMCPImageHeight            = 720
+	maxCloudDSHTerminalRetryAfterSeconds = 24 * 60 * 60
 )
 
 type cloudDSHMCPOutput struct {
@@ -1014,7 +1015,23 @@ func cloudDSHMCPResult(status task.OperationStatus, output string) (AgentToolRes
 	if err != nil || len(modelOutput) > maxAgentToolOutputBytes {
 		return AgentToolResult{}, errors.New("MCP operation model output is invalid")
 	}
-	return AgentToolResult{Status: toolStatus, Output: string(modelOutput), Images: images}, nil
+	return AgentToolResult{Status: toolStatus, TerminalForAttempt: cloudDSHMCPTerminalForAttempt(value), Output: string(modelOutput), Images: images}, nil
+}
+
+func cloudDSHMCPTerminalForAttempt(value cloudDSHMCPOutput) bool {
+	if !value.IsError || value.UnsupportedContent || len(value.StructuredContent) == 0 {
+		return false
+	}
+	var signal struct {
+		Code               string `json:"code"`
+		TerminalForAttempt bool   `json:"terminal_for_attempt"`
+		RetryAfterSeconds  int64  `json:"retry_after_seconds"`
+	}
+	if json.Unmarshal(value.StructuredContent, &signal) != nil {
+		return false
+	}
+	return signal.Code == "connector_rate_limited" && signal.TerminalForAttempt && signal.RetryAfterSeconds > 0 &&
+		signal.RetryAfterSeconds <= maxCloudDSHTerminalRetryAfterSeconds
 }
 
 func validCloudDSHMCPImage(mediaType string, data []byte) bool {
@@ -1074,6 +1091,15 @@ func validCloudDSHMCPJSON(raw []byte) bool {
 
 func (b *CloudDSHToolBroker) commitMCPResult(ctx context.Context, current task.Task, step task.Step, usage task.Usage, name string, result AgentToolResult) (AgentToolResult, error) {
 	ctx = withTaskToolContentEvidence(ctx, name, result)
+	if result.TerminalForAttempt {
+		step.Status, step.Summary = task.StepFailed, "The connector rate limited this attempt; it was not retried."
+		if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+			"tool": name, "operation_status": result.Status, "reason": "connector_rate_limited",
+		}); err != nil {
+			return AgentToolResult{}, err
+		}
+		return result, nil
+	}
 	step.Status, step.Summary = task.StepSucceeded, "The cloud dsh MCP tool completed and its result was saved."
 	if result.Status == AgentToolFailed {
 		step.Status, step.Summary = task.StepFailed, "The MCP connector reported a definitive tool error."
@@ -1084,6 +1110,51 @@ func (b *CloudDSHToolBroker) commitMCPResult(ctx context.Context, current task.T
 		return AgentToolResult{}, err
 	}
 	return result, nil
+}
+
+func (b *CloudDSHToolBroker) FailTerminalToolAttempt(ctx context.Context, claimed task.Task, call ModelToolCall) error {
+	if call.Name != cloudDSHMCPCallToolName || call.TaskFence == nil {
+		return domain.InvalidArgument("terminal_tool_attempt", "terminal MCP result is not bound to a DSH tool call")
+	}
+	details, err := b.currentTaskDetails(ctx, claimed)
+	if err != nil {
+		return err
+	}
+	current, fence := details.Task, call.TaskFence
+	if current.Status == task.StatusFailed && current.Result == "The selected connector rate limited this attempt." {
+		return nil
+	}
+	if current.Status != task.StatusRunning || fence.TaskID != current.ID || fence.OwnerID != current.OwnerID ||
+		fence.InitiatorID != current.InitiatorID || fence.LeaseOwner != current.Lease.Owner || fence.LeaseVersion != current.Lease.Version ||
+		fence.AgentInstanceID != current.AgentInstanceID || fence.AgentGeneration != current.AgentGeneration ||
+		fence.AgentRootSessionID != current.AgentSessionID || fence.AuthorizationVersion != current.Authorization.Version {
+		return domain.NewError(domain.CodeInvalidState, "terminal MCP result no longer matches the active Task fence")
+	}
+	var failedStep *task.Step
+	for i := range details.Steps {
+		step := &details.Steps[i]
+		if step.AgentSessionID == fence.AgentSessionID && step.ToolCallKey == call.CallID &&
+			step.Status == task.StepFailed && step.TaskRevision != nil && current.CurrentRevision != nil &&
+			*step.TaskRevision == *current.CurrentRevision && step.Summary == "The connector rate limited this attempt; it was not retried." {
+			failedStep = step
+			break
+		}
+	}
+	if failedStep == nil {
+		return domain.NewError(domain.CodeInvalidState, "terminal MCP result has no matching failed Task step")
+	}
+	payload, err := json.Marshal(map[string]any{"status": task.StatusFailed, "reason": "connector_rate_limited"})
+	if err != nil {
+		return err
+	}
+	usage := boundedTaskUsage(current, cloneTaskUsage(current.Usage))
+	_, err = b.store.CommitTaskProgress(ctx, TaskProgress{
+		TaskID: current.ID, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
+		Status: task.StatusFailed, CurrentStep: failedStep.ID, Result: "The selected connector rate limited this attempt.",
+		Usage: usage, Steps: []task.Step{*failedStep},
+		Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: payload},
+	})
+	return err
 }
 
 func (b *CloudDSHToolBroker) pauseMCPUnknown(ctx context.Context, current task.Task, step task.Step, usage task.Usage, key, summary string) (AgentToolResult, error) {

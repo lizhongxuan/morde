@@ -86,6 +86,21 @@ func (f taskExecutorFunc) ExecuteTask(ctx context.Context, value task.Task) erro
 	return f(ctx, value)
 }
 
+type internalToolTaskExecutorStub struct {
+	called bool
+	claim  task.Task
+}
+
+func (s *internalToolTaskExecutorStub) ExecuteInternalToolTask(_ context.Context, claim task.Task) error {
+	s.called = true
+	s.claim = claim
+	return nil
+}
+
+func (*internalToolTaskExecutorStub) PublishPendingReplies(context.Context) (bool, error) {
+	return false, nil
+}
+
 type monitoredTaskLeaseStore struct {
 	*taskLeaseStoreStub
 	check func(context.Context, task.Task, time.Duration) error
@@ -105,6 +120,28 @@ func newTestTaskWorker(t *testing.T, store TaskLeaseStore, executor TaskExecutor
 		t.Fatalf("NewTaskWorker() error = %v", err)
 	}
 	return worker
+}
+
+func TestTaskWorkerDispatchesInternalToolWithoutCallingTaskAgent(t *testing.T) {
+	internal := &internalToolTaskExecutorStub{}
+	dshCalls := 0
+	worker, err := NewTaskWorker(TaskWorkerOptions{
+		Store: &taskLeaseStoreStub{}, Executor: taskExecutorFunc(func(context.Context, task.Task) error {
+			dshCalls++
+			return nil
+		}), InternalToolExecutor: internal, WorkerID: "worker-test", LeaseDuration: time.Minute, PollInterval: time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := validTaskClaim("worker-test")
+	claim.InternalTool = true
+	if err := worker.executeSafely(context.Background(), claim); err != nil {
+		t.Fatal(err)
+	}
+	if !internal.called || internal.claim.ID != claim.ID || dshCalls != 0 {
+		t.Fatalf("internal dispatch called=%t internal_task=%q dsh_calls=%d", internal.called, internal.claim.ID, dshCalls)
+	}
 }
 
 func validTaskClaim(workerID string) task.Task {

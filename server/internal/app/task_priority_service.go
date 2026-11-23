@@ -31,6 +31,9 @@ func (s *TaskService) SetPriority(ctx context.Context, principal identity.Princi
 	if err != nil {
 		return task.Task{}, err
 	}
+	if details.Task.InternalTool {
+		return task.Task{}, domain.NewError(domain.CodeNotFound, "task not found")
+	}
 	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return task.Task{}, hideTaskAccessError(err)
 	}

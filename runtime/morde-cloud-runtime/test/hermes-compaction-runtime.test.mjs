@@ -4,6 +4,7 @@ import { once } from 'node:events'
 import { createInterface } from 'node:readline'
 import test from 'node:test'
 import { estimateMessage, estimateToolsTokens } from '@deepseek-ai/dsh-token-meter/estimate'
+import { resolveCompactionContextWindow } from '../src/engine.mjs'
 
 const identityKeys = ['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
 const fence = frame => Object.fromEntries(identityKeys.map(key => [key, frame[key]]))
@@ -141,6 +142,63 @@ test('passes an 18 KB current message intact to the model within its context bud
     assert.ok(frames.some(frame => frame.type === 'settled'))
   })
 
+test('accepts a provider-resolved window without a frame window and fences it to the compaction plan', () => {
+  assert.equal(resolveCompactionContextWindow(8192, undefined, 8192), 8192)
+  for (const [providerWindow, frameWindow, plannedWindow] of [
+    [undefined, undefined, 8192],
+    [Number.MAX_SAFE_INTEGER + 1, undefined, Number.MAX_SAFE_INTEGER + 1],
+    [8192, undefined, 4096],
+    [8192, 4096, 8192],
+  ]) {
+    assert.throws(() => resolveCompactionContextWindow(providerWindow, frameWindow, plannedWindow), error =>
+      error.code === 'MODEL_CONTEXT_UNAVAILABLE')
+  }
+})
+
+test('provider overflow with an unknown context window fails without retrying or replacing source history',
+  { timeout: 15_000 }, async t => {
+    const start = {
+      type: 'start', version: 1, task_id: 'task_unknown_window', owner_id: 'owner_unknown_window',
+      agent_id: 'agent_unknown_window', generation: 1, authorization_version: 1,
+      session_id: 'session_unknown_window', task_revision: 1, model: 'test-model', tools: [], max_tokens: 512,
+      initial_message: { message_id: 'm1234567', content: 'Keep this task brief in the original session.', attachment_ids: [] },
+    }
+    const child = spawn(process.execPath, ['bin.mjs'], {
+      cwd: new URL('..', import.meta.url), env: { PATH: process.env.PATH, LANG: 'C.UTF-8' },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    })
+    t.after(() => child.kill())
+    const frames = []
+    const pages = []
+    let modelCalls = 0
+    const send = frame => child.stdin.write(`${JSON.stringify(frame)}\n`)
+    const lines = createInterface({ input: child.stdout })
+    lines.on('line', line => {
+      const frame = JSON.parse(line)
+      frames.push(frame)
+      if (frame.type === 'ready') send(start)
+      else if (frame.type === 'checkpoint') {
+        pages.push(frame)
+        send({ type: 'checkpoint_ack', ...fence(frame), id: frame.id, ok: true,
+          through_seq: frame.through_seq, sha256: frame.sha256 })
+      } else if (frame.type === 'model') {
+        modelCalls++
+        send({ type: 'model_end', ...fence(frame), id: frame.id, ok: false,
+          failure_code: 'CONTEXT_WINDOW_EXCEEDED' })
+      } else if (['settled', 'failed', 'protocol_error'].includes(frame.type)) child.stdin.end()
+    })
+    const [code] = await once(child, 'close')
+    assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+    assert.equal(modelCalls, 1, 'unknown capacity must not trigger an unbounded overflow retry')
+    const sourceEvents = pages.flatMap(page => JSON.parse(page.payload).events)
+    assert.ok(sourceEvents.some(event => event.type === 'user/message' &&
+      JSON.stringify(event).includes('Keep this task brief in the original session.')))
+    assert.equal(sourceEvents.some(event => event.type === 'compaction/summary'), false,
+      'unknown capacity must not produce a summary with an assumed budget')
+    assert.ok(frames.some(frame => frame.type === 'settled' && frame.state === 'failed') ||
+      frames.some(frame => frame.type === 'failed'), 'provider overflow must end as an explicit runtime failure')
+  })
+
 test('long task conversation survives repeated pressure compaction and keeps its early requirement',
   { timeout: 15_000 }, async t => {
     const start = {
@@ -204,6 +262,10 @@ test('long task conversation survives repeated pressure compaction and keeps its
     assert.ok(summaryInput.includes('followup-'))
     assert.ok(!summaryInput.includes('head-anchor'))
     assert.ok(!summaryInput.includes('followup-3'))
+    for (const summary of modelFrames.filter(frame => frame.request.max_tokens === 256)) {
+      assert.ok(!JSON.stringify(summary.request.messages).includes('head-anchor'),
+        'repeated compaction must keep the opening Task brief outside every summary range')
+    }
     const events = pages.flatMap(page => JSON.parse(page.payload).events)
     const summaries = events.filter(event => event.type === 'compaction/summary')
     assert.ok(summaries.length >= 2)

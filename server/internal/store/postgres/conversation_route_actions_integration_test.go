@@ -14,6 +14,7 @@ import (
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/worker"
 )
 
 type routeActionsTestFixture struct {
@@ -22,6 +23,17 @@ type routeActionsTestFixture struct {
 	conversation  conversation.Conversation
 	instanceID    string
 	authorization task.Authorization
+}
+
+type conversationRouteTestBroker struct {
+	calls int
+	call  app.ModelToolCall
+}
+
+func (b *conversationRouteTestBroker) Execute(_ context.Context, _ task.Task, call app.ModelToolCall) (app.AgentToolResult, error) {
+	b.calls++
+	b.call = call
+	return app.AgentToolResult{Status: app.AgentToolSucceeded, Output: `{"text":["已找到公开来源，内容可在会话中核对。"]}`}, nil
 }
 
 func newRouteActionsTestFixture(t *testing.T) routeActionsTestFixture {
@@ -71,6 +83,52 @@ func (f routeActionsTestFixture) receiveInConversation(t *testing.T, conversatio
 		t.Fatalf("claim message = %s found=%t err=%v", claim.Message.ID, found, err)
 	}
 	return claim
+}
+
+func TestConversationRoutePersistsAndRevalidatesLongMessagePageManifest(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	const totalBytes = 1 << 20
+	content := strings.Repeat("汉", totalBytes/3) + "x"
+	if len(content) != totalBytes {
+		t.Fatalf("long-message source bytes = %d, want %d", len(content), totalBytes)
+	}
+	claim := f.receive(t, "route-long-message-manifest", content, app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatal(err)
+	}
+	var taskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, claim.Message.ID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := f.store.ClaimNextTask(ctx, "long-message-manifest-worker", time.Minute)
+	if err != nil || !found || claimed.ID != taskID || claimed.ConversationContext == nil {
+		t.Fatalf("claim long-message Task = id:%s found:%t err:%v", claimed.ID, found, err)
+	}
+	manifest := claimed.ConversationContext.CurrentMessageSource
+	digest := sha256.Sum256([]byte(content))
+	if !app.ValidConversationMessageSourceManifest(manifest) || manifest.MessageID != claim.Message.ID ||
+		manifest.Sequence != claim.Message.Sequence || manifest.ContentBytes != totalBytes || manifest.TotalRunes != int64(len([]rune(content))) ||
+		len(manifest.Pages) > 33 || string(manifest.SHA256) != string(digest[:]) {
+		t.Fatalf("recovered long-message page manifest = %+v", manifest)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_messages SET content=$2 WHERE id=$1`, claim.Message.ID, content+"changed"); err != nil {
+		t.Fatal(err)
+	}
+	tx, err := f.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = readTaskConversationContext(ctx, tx, claimed)
+	_ = tx.Rollback(ctx)
+	if domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("recovery accepted source text that disagrees with its immutable page manifest: %v", err)
+	}
 }
 
 func TestConversationRouteSnapshotBoundsCandidateSetsWithoutBlockingRouting(t *testing.T) {
@@ -905,6 +963,132 @@ FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.messag
 	if routeState != "routed" || delivery != "applied" || taskID != "" || assistantCount != 1 || messageCount != 2 || storedAnswer != answer {
 		t.Fatalf("direct reply was not committed exactly once: route=%s delivery=%s task=%s assistants=%d messages=%d answer=%q",
 			routeState, delivery, taskID, assistantCount, messageCount, storedAnswer)
+	}
+}
+
+func TestConversationRouteDirectToolPersistsHiddenBrokerTask(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	claim := f.receive(t, "route-direct-tool-001", "请搜索公开网站关于日本央行利率政策的最新信息", app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	decision := app.ConversationRouteDecision{Action: app.ConversationRouteTool, ToolName: "morde_web_search",
+		ToolArguments: `{"query":"日本央行利率政策"}`,
+		ModelOutput:   `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`}
+	if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, decision); err != nil {
+		t.Fatal(err)
+	}
+
+	var taskID, sourceTaskID, delivery, routeState, callID, toolName string
+	var arguments []byte
+	if err := f.store.pool.QueryRow(ctx, `SELECT internal_tool.task_id,COALESCE(source.task_id,''),source.delivery_status,route.state,
+internal_tool.call_id,internal_tool.tool_name,internal_tool.arguments
+FROM conversation_route_internal_tool_calls internal_tool
+JOIN conversation_messages source ON source.id=internal_tool.message_id
+JOIN conversation_message_routes route ON route.message_id=source.id
+WHERE source.id=$1`, claim.Message.ID).Scan(&taskID, &sourceTaskID, &delivery, &routeState, &callID, &toolName, &arguments); err != nil {
+		t.Fatal(err)
+	}
+	if sourceTaskID != "" || delivery != "applied" || routeState != "routed" || toolName != "morde_web_search" ||
+		callID != "morde_route_tool_"+claim.Message.ID || string(arguments) != `{"query": "日本央行利率政策"}` {
+		t.Fatalf("direct route did not atomically persist an unlinked Broker call: task=%s source_task=%s delivery=%s route=%s call=%s tool=%s args=%s",
+			taskID, sourceTaskID, delivery, routeState, callID, toolName, arguments)
+	}
+	details, err := f.store.GetTask(ctx, taskID, f.ownerID)
+	if err != nil || !details.Task.InternalTool || details.Task.Status != task.StatusQueued || details.Task.HostID != "" || details.Task.WorkspaceID != "" {
+		t.Fatalf("stored route Task is not a hidden hostless Broker claim: task=%+v err=%v", details.Task, err)
+	}
+	global, err := f.store.ListTasks(ctx, f.ownerID, app.TaskListRequest{Page: app.PageRequest{Limit: 20}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range global.Items {
+		if item.ID == taskID {
+			t.Fatal("internal Broker Task appeared in the user's task list")
+		}
+	}
+	conversationTasks, err := f.store.ListConversationTasks(ctx, f.ownerID, "", f.conversation.ID, nil,
+		app.ConversationTaskViewPanel, app.PageRequest{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range conversationTasks.Items {
+		if item.ID == taskID {
+			t.Fatal("internal Broker Task appeared in the conversation task panel")
+		}
+	}
+	if _, err := f.store.GetTaskEventPage(ctx, f.ownerID, taskID, 0, 20); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("internal Broker Task event endpoint was not hidden: %v", err)
+	}
+
+	followUp := f.receive(t, "route-direct-tool-followup-001", "讲个笑话", app.ConversationRoutingInput{})
+	followUpSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, followUp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range followUpSnapshot.Context.Candidates {
+		if candidate.TaskID == taskID {
+			t.Fatal("internal Broker Task appeared in a later route's task candidates")
+		}
+	}
+	var queueStatus, executionLocation, executionState string
+	var executionEpoch, controlEpoch int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT t.status,t.execution_location,t.execution_epoch,control.state,control.epoch
+FROM tasks t JOIN owner_execution_controls control ON control.owner_id=t.initiator_id WHERE t.id=$1`, taskID).
+		Scan(&queueStatus, &executionLocation, &executionEpoch, &executionState, &controlEpoch); err != nil {
+		t.Fatal(err)
+	}
+	if queueStatus != string(task.StatusQueued) || executionLocation != "server" || executionEpoch != controlEpoch || executionState != "enabled" {
+		t.Fatalf("internal Broker Task is not in the claimable queue: status=%s location=%s execution_epoch=%d control=%s control_epoch=%d",
+			queueStatus, executionLocation, executionEpoch, executionState, controlEpoch)
+	}
+	claimed, found, err := f.store.ClaimNextTask(ctx, "route-direct-tool-worker", time.Minute)
+	if err != nil || !found || claimed.ID != taskID || !claimed.InternalTool {
+		var status, waitingReason string
+		_ = f.store.pool.QueryRow(ctx, `SELECT status,waiting_reason FROM tasks WHERE id=$1`, taskID).Scan(&status, &waitingReason)
+		t.Fatalf("internal Broker Task was not claimed with its durable marker: task=%+v found=%t err=%v stored_status=%s waiting_reason=%s",
+			claimed, found, err, status, waitingReason)
+	}
+	broker := &conversationRouteTestBroker{}
+	executor, err := worker.NewConversationRouteInternalToolExecutor(f.store, broker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.ExecuteInternalToolTask(ctx, claimed); err != nil {
+		t.Fatalf("execute hidden Task through the existing Broker boundary: %v", err)
+	}
+	if broker.calls != 1 || broker.call.CallID != callID || broker.call.Name != toolName || string(arguments) != broker.call.Arguments {
+		t.Fatalf("Broker call did not use its persisted idempotent payload: calls=%d call=%+v expected=%s/%s/%s",
+			broker.calls, broker.call, callID, toolName, arguments)
+	}
+	completed, err := f.store.GetTask(ctx, taskID, f.ownerID)
+	if err != nil || completed.Task.Status != task.StatusCompleted || !completed.Task.InternalTool ||
+		!strings.Contains(completed.Task.Result, "已找到公开来源") {
+		t.Fatalf("Broker result did not complete the internal Task: task=%+v err=%v", completed.Task, err)
+	}
+	var assistantCount int
+	var assistantTaskID, assistantContent string
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*),COALESCE(max(task_id),''),COALESCE(max(content),'')
+FROM conversation_messages WHERE conversation_id=$1 AND role='assistant' AND source_kind='conversation'`, f.conversation.ID).
+		Scan(&assistantCount, &assistantTaskID, &assistantContent); err != nil {
+		t.Fatal(err)
+	}
+	if assistantCount != 1 || assistantTaskID != "" || !strings.Contains(assistantContent, "已找到公开来源") {
+		t.Fatalf("Broker result was not published as an unlinked assistant reply: count=%d task_id=%q content=%q",
+			assistantCount, assistantTaskID, assistantContent)
+	}
+	recent, err := f.store.ListConversationTasks(ctx, f.ownerID, "", f.conversation.ID, nil,
+		app.ConversationTaskViewRecent, app.PageRequest{Limit: 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range recent.Items {
+		if item.ID == taskID {
+			t.Fatal("completed internal Broker Task appeared in the recent task panel")
+		}
 	}
 }
 

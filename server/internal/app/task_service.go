@@ -560,6 +560,9 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 	if err != nil {
 		return TaskDetails{}, err
 	}
+	if details.Task.InternalTool {
+		return TaskDetails{}, domain.NewError(domain.CodeNotFound, "task not found")
+	}
 	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskReadScope); err != nil {
 		return TaskDetails{}, hideTaskAccessError(err)
 	}
@@ -870,6 +873,9 @@ func (s *TaskService) RetryStep(ctx context.Context, principal identity.Principa
 	if err != nil {
 		return TaskStepRetryResult{}, err
 	}
+	if details.Task.InternalTool {
+		return TaskStepRetryResult{}, domain.NewError(domain.CodeNotFound, "task not found")
+	}
 	current := details.Task
 	authorization, err := s.authorizeTask(ctx, principal, current.HostID, taskControlScope)
 	if err != nil {
@@ -948,6 +954,9 @@ func (s *TaskService) RetryBatchItem(ctx context.Context, principal identity.Pri
 	if err != nil {
 		return err
 	}
+	if details.Task.InternalTool {
+		return domain.NewError(domain.CodeNotFound, "task not found")
+	}
 	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return hideTaskAccessError(err)
 	}
@@ -981,6 +990,9 @@ func (s *TaskService) RespondToPendingRequest(ctx context.Context, principal ide
 	details, err := s.store.GetTask(ctx, taskID, principal.UserID)
 	if err != nil {
 		return err
+	}
+	if details.Task.InternalTool {
+		return domain.NewError(domain.CodeNotFound, "task not found")
 	}
 	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return hideTaskAccessError(err)
@@ -1016,6 +1028,9 @@ func (s *TaskService) AnswerClarificationRequest(ctx context.Context, principal 
 	details, err := s.store.GetTask(ctx, taskID, principal.UserID)
 	if err != nil {
 		return err
+	}
+	if details.Task.InternalTool {
+		return domain.NewError(domain.CodeNotFound, "task not found")
 	}
 	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return hideTaskAccessError(err)
@@ -1101,6 +1116,13 @@ func (s *TaskService) ListEvents(ctx context.Context, principal identity.Princip
 	}
 	if after < 0 || limit < 1 || limit > maxEventPage {
 		return TaskEventPage{}, domain.InvalidArgument("after", "event cursor or limit is out of range")
+	}
+	details, err := s.store.GetTask(ctx, id, principal.UserID)
+	if err != nil {
+		return TaskEventPage{}, err
+	}
+	if details.Task.InternalTool {
+		return TaskEventPage{}, domain.NewError(domain.CodeNotFound, "task not found")
 	}
 	page, err := s.store.GetTaskEventPage(ctx, principal.UserID, id, after, limit)
 	if err != nil && domain.CodeOf(err) != domain.CodeEventCursorExpired {

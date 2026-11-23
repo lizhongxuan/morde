@@ -46,8 +46,15 @@ test('Hermes windows keep the system/head, last user and assistant, and whole to
     contextWindow: 4096, repeated: true,
   })
   assert.equal(repeated.start, 1)
-  const child = planHermesCompaction(rows, { contextWindow: 4096, pinTask: true })
-  assert.equal(child.start, 2)
+  const task = planHermesCompaction(rows, { contextWindow: 4096, pinTask: true })
+  assert.equal(task.start, 2)
+  const withContext = planHermesCompaction([
+    rows[0],
+    { role: 'user', tokens: 100, balancedBefore: true, isUserInput: false },
+    { role: 'user', tokens: 200, balancedBefore: true, isUserInput: true },
+    ...rows.slice(2),
+  ], { contextWindow: 4096, pinTask: true })
+  assert.equal(withContext.start, 3, 'pin the actual task input after trusted context')
 })
 
 test('DSH frame validation rejects an output cap that consumes the known context window', () => {

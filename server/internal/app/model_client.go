@@ -149,10 +149,11 @@ const (
 )
 
 type ModelClientError struct {
-	Kind         ModelClientErrorKind
-	Stage        string
-	ProviderCode string
-	RetryAfter   time.Duration
+	Kind                            ModelClientErrorKind
+	Stage                           string
+	ProviderCode                    string
+	RetryAfter                      time.Duration
+	RetryAfterExceedsDurableHorizon bool
 }
 
 func (e *ModelClientError) Error() string {

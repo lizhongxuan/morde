@@ -1310,6 +1310,15 @@ function persistencePlugin(durables) {
   }
 }
 
+export function resolveCompactionContextWindow(providerWindow, frameWindow, plannedWindow) {
+  if (!Number.isSafeInteger(providerWindow) || providerWindow < 2 ||
+      !Number.isSafeInteger(plannedWindow) || plannedWindow < 2 || providerWindow !== plannedWindow ||
+      frameWindow !== undefined && providerWindow !== frameWindow) {
+    throw new LlmError('model context capacity is unavailable or changed', 'MODEL_CONTEXT_UNAVAILABLE')
+  }
+  return providerWindow
+}
+
 export async function runAgent(ipc, frame) {
   if (!validStart(frame)) throw new Error('invalid start request')
   const coordinator = frame.context_role === 'coordinator'
@@ -1346,11 +1355,17 @@ export async function runAgent(ipc, frame) {
     retainTokens: compactionBudget.tailTokens,
     maxTokens: Math.min(2048, Math.max(256, Math.floor(frame.context_window_tokens * 0.0625))),
     maxOverflowRetries: 1,
+  } : !coordinator ? {
+    // Keep the Task's provider-confirmed overflow hook available; MordeCompactionEngine
+    // resolves the real window and fails explicitly when the provider cannot supply it.
+    auto: true,
+    maxOverflowRetries: 1,
   } : { auto: false }
   class MordeCompactionEngine extends BasicCompactionEngine {
     constructor(compactionCtx, config) {
       super(compactionCtx, config)
       this.summarySources = new WeakMap()
+      this.summaryContextWindows = new WeakMap()
     }
 
     async compactIfNeeded(agent, trigger, signal) {
@@ -1371,7 +1386,7 @@ export async function runAgent(ipc, frame) {
       return selectHermesCompactionRange(session, measurement, {
         contextWindow: contextWindow ?? frame.context_window_tokens,
         outputTokens: outputTokens || target?.maxTokens || frame.max_tokens || this.config.maxTokens,
-        pinTask: childOwners.has(session.id),
+        pinTask: !coordinator,
       })
     }
 
@@ -1401,7 +1416,7 @@ export async function runAgent(ipc, frame) {
       const coveredSeqs = new Set()
       for (let attempt = 0; attempt < attempts; attempt++) {
         const range = selectHermesCompactionRange(agent.session, measurement, {
-          contextWindow, outputTokens, pinTask: childOwners.has(agent.session.id),
+          contextWindow, outputTokens, pinTask: !coordinator,
         })
         if (!range) {
           if (requireBelowThreshold) throw new Error('no safe DSH compaction range is available')
@@ -1409,10 +1424,12 @@ export async function runAgent(ipc, frame) {
         }
         const originals = originalToolResultsForRange(agent.session, range.start, range.end)
         this.summarySources.set(agent.session, originals)
+        this.summaryContextWindows.set(agent.session, contextWindow)
         try {
           result = await this.compactRegion(range.start, range.end, agent, signal)
         } finally {
           this.summarySources.delete(agent.session)
+          this.summaryContextWindows.delete(agent.session)
         }
         const nextMeasurement = ctx.tokenMeter.measure(agent.session, header)
         if (!hermesCompactionMadeProgress(measurement.totalTokens, nextMeasurement.totalTokens,
@@ -1427,9 +1444,8 @@ export async function runAgent(ipc, frame) {
 
     async summarize(input, agent, signal) {
       const resolved = await ctx.llm.resolveModelInfo('morde', frame.model, signal)
-      if (resolved.context?.contextWindow !== frame.context_window_tokens) {
-        throw new LlmError('model context capacity is unavailable or changed', 'MODEL_CONTEXT_UNAVAILABLE')
-      }
+      const plannedContextWindow = this.summaryContextWindows.get(agent.session) ?? frame.context_window_tokens
+      resolveCompactionContextWindow(resolved.context?.contextWindow, frame.context_window_tokens, plannedContextWindow)
       const originals = this.summarySources.get(agent.session)
       const restored = input.messages.map(message => message.role === 'tool' && originals?.has(message.toolCallId)
         ? originals.get(message.toolCallId) : message)

@@ -648,35 +648,38 @@ func providerStatusError(status int, body []byte, apiKey string, zai bool, retry
 	}
 	err := &app.ModelClientError{Kind: kind, Stage: "provider_status", ProviderCode: code}
 	if kind == app.ModelErrorRateLimited {
-		err.RetryAfter, _ = parseProviderRetryAfter(retryAfterHeader, receivedAt)
+		err.RetryAfter, _, err.RetryAfterExceedsDurableHorizon = parseProviderRetryAfter(retryAfterHeader, receivedAt)
 	}
 	return err
 }
 
-func parseProviderRetryAfter(value string, now time.Time) (time.Duration, bool) {
+func parseProviderRetryAfter(value string, now time.Time) (time.Duration, bool, bool) {
+	const maxDurableRetryAfter = 24 * time.Hour
 	value = strings.TrimSpace(value)
 	if seconds, err := strconv.ParseUint(value, 10, 64); err == nil {
-		const maxDelay = 24 * time.Hour
-		if seconds > uint64(maxDelay/time.Second) {
-			return maxDelay, true
+		if seconds > uint64(maxDurableRetryAfter/time.Second) {
+			return 0, true, true
 		}
-		return time.Duration(seconds) * time.Second, true
+		return time.Duration(seconds) * time.Second, true, false
+	}
+	if value != "" && strings.Trim(value, "0123456789") == "" {
+		return 0, true, true
 	}
 	if value == "" {
-		return 0, false
+		return 0, false, false
 	}
 	when, err := http.ParseTime(value)
 	if err != nil {
-		return 0, false
+		return 0, false, false
 	}
 	delay := when.Sub(now)
 	if delay < 0 {
-		return 0, true
+		return 0, true, false
 	}
-	if delay > 24*time.Hour {
-		delay = 24 * time.Hour
+	if delay > maxDurableRetryAfter {
+		return 0, true, true
 	}
-	return delay, true
+	return delay, true, false
 }
 
 func readResponseBody(body io.Reader, limit int64) ([]byte, error) {

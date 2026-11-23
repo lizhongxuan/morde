@@ -3095,7 +3095,7 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
   });
 
-  it('reuses an accepted processing retry key after remount while the server still reports failure', async () => {
+  it('rotates an accepted processing retry key after remount if failure projection is stale', async () => {
     mockCommon({ conversations: [conversation], messages: [{ ...message, task_id: undefined,
       routing_status: 'failed', routing_failure_reason: 'model_unavailable', delivery_status: 'pending' }] });
     const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing').mockResolvedValue(undefined);
@@ -3111,7 +3111,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
     await user.click(await screen.findByRole('button', { name: '重新处理这条消息' }));
     await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
-    expect(retry.mock.calls[1]![2]).toBe(key);
+    expect(retry.mock.calls[1]![2]).not.toBe(key);
   });
 
   it('rotates the processing retry key after the server confirms routing progress', async () => {
@@ -3139,7 +3139,7 @@ describe('Assistant durable tasks', () => {
     expect(retry.mock.calls[1]![2]).not.toBe(firstKey);
   });
 
-  it('keeps result review retry idempotency scoped to the task until review progress is persisted', async () => {
+  it('rotates an accepted result review retry key after remount if failure projection is stale', async () => {
     const failedReviewTask: Task = { ...task, status: 'completed', result_review: {
       state: 'failed', source_task_id: task.id, source_task_revision: 1, source_event_sequence: 1,
       reply_message_id: null, trigger_message_id: message.id,
@@ -3160,7 +3160,7 @@ describe('Assistant durable tasks', () => {
     const secondDetail = await findTaskActivity(task.id);
     await user.click(within(secondDetail).getByRole('button', { name: '重试结果整理' }));
     await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
-    expect(retry.mock.calls[1]![2]).toBe(key);
+    expect(retry.mock.calls[1]![2]).not.toBe(key);
   });
 
   it('keeps an oversized message, explains the limit, and does not retry identical content', async () => {
@@ -4187,8 +4187,8 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, finished_at: null,
       waiting_reason: 'computer_unavailable', current_step: null, steps: [] });
     renderPage();
-    await openTaskDynamics();
-    expect(await screen.findByText(/目标云端电脑当前不可用或无法确认访问权限/)).toBeInTheDocument();
+    const activity = await findTaskActivity(task.id);
+    expect(await within(activity).findByText(/目标云端电脑当前不可用或无法确认访问权限/)).toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: '消息内容' })).toBeEnabled();
   });
 

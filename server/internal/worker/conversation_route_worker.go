@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -303,14 +304,12 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 				}
 			}
 		}
-		// The model answered but its output is not valid routing JSON,
-		// even after the repair retry. Use the same heuristic fallback
-		// instead of failing the route. The preview is empty only when
-		// the model returned no text at all; otherwise it shows the
-		// shape of the unusable output.
+		// The model output can contain user data, so log metadata only.
 		w.options.Logger.Warn("conversation route model output is invalid; applying heuristic fallback",
 			zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
-			zap.String("invalid_output_preview", decision.InvalidOutputPreview))
+			zap.String("failure_code", "invalid_model_output"),
+			zap.Int("invalid_output_length_bytes", decision.InvalidOutputLengthBytes),
+			zap.Bool("invalid_output_utf8_valid", decision.InvalidOutputUTF8Valid))
 		decision = conversationRouteClassifyFallback(classifyContext)
 	}
 	decision = safeConversationRouteDecision(classifyContext, decision)
@@ -357,11 +356,17 @@ func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error
 		routeErr.Details["reason"] != string(app.ModelErrorRateLimited) || routeErr.Details["stage"] != "provider_status" {
 		return 0, false
 	}
+	if routeErr.Details["retry_after_exceeds_durable_horizon"] == "true" || routeErr.RetryAfter > 24*time.Hour {
+		// The durable route queue supports at most 24 hours; do not retry earlier than the provider requested.
+		return 0, true
+	}
 	if routeErr.RetryAfter > 0 {
-		if routeErr.RetryAfter > 2*time.Minute {
-			return 0, true
+		retryAfter := routeErr.RetryAfter
+		delaySeconds := retryAfter / time.Second
+		if retryAfter%time.Second != 0 {
+			delaySeconds++
 		}
-		return ((routeErr.RetryAfter + time.Second - 1) / time.Second) * time.Second, true
+		return delaySeconds * time.Second, true
 	}
 	shift := min(max(claim.RouteAttempt-1, int64(0)), int64(2))
 	return time.Second << shift, true
@@ -370,9 +375,20 @@ func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error
 // conversationRouteHistoryPreviewBytes bounds one history entry when the
 // route context is shrunk to fit the model window. A preview keeps the
 // entry's identity plus its head and tail instead of blanking it outright.
-const conversationRouteHistoryPreviewBytes = 2048
+const conversationRouteHistoryPreviewBytes = app.ConversationRouteHistoryPreviewBytes
 
 func fitConversationRouteContext(value *app.ConversationRouteContext, contextWindow int) error {
+	history, err := app.PrepareConversationRouteHistory(value.History)
+	if err != nil {
+		return err
+	}
+	value.History = history
+	for _, item := range history {
+		if item.Truncated {
+			value.HistoryIncomplete = true
+			break
+		}
+	}
 	app.ProjectConversationRouteMessage(value, app.ConversationRouteCurrentMessagePreviewBytes)
 	for {
 		request, err := app.ConversationRouteModelRequest(*value)
@@ -403,6 +419,9 @@ func fitConversationRouteContext(value *app.ConversationRouteContext, contextWin
 		if app.ShortenConversationRouteMessage(value) {
 			continue
 		}
+		if trimConversationRouteHistoryReferences(value) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
@@ -410,13 +429,30 @@ func fitConversationRouteContext(value *app.ConversationRouteContext, contextWin
 	}
 }
 
-// previewConversationRouteHistory replaces the oldest oversized history
-// entry with a head-and-tail preview. Entries already marked truncated are
-// left alone; blanking them is the next step.
+// trimConversationRouteHistoryReferences drops the oldest already-blanked
+// references only after the summary is exhausted; the incomplete marker then
+// directs any missing historical detail to authorized source search.
+func trimConversationRouteHistoryReferences(value *app.ConversationRouteContext) bool {
+	if value == nil {
+		return false
+	}
+	for index, item := range value.History {
+		if item.Content != "" || !item.Truncated {
+			continue
+		}
+		value.History = append(value.History[:index], value.History[index+1:]...)
+		value.HistoryIncomplete = true
+		return true
+	}
+	return false
+}
+
+// previewConversationRouteHistory replaces the oldest oversized history body
+// with a head-and-tail view while preserving its original source digest.
 func previewConversationRouteHistory(value *app.ConversationRouteContext) bool {
 	for index := range value.History {
 		item := &value.History[index]
-		if item.Truncated || len(item.Content) <= conversationRouteHistoryPreviewBytes {
+		if len(item.Content) <= conversationRouteHistoryPreviewBytes {
 			continue
 		}
 		preview, truncated := app.ConversationRouteTextPreview(item.Content, conversationRouteHistoryPreviewBytes)
@@ -469,6 +505,8 @@ func (w *ConversationRouteWorker) observeRouteDecision(claim app.ConversationRou
 		action = "clarify"
 	case app.ConversationRouteReply:
 		action = "reply"
+	case app.ConversationRouteTool:
+		action = "tool"
 	}
 	w.metrics.actions.WithLabelValues(action, result).Inc()
 	if claim.AggregationStartedAt.IsZero() || result != "applied" || claim.AggregationStartedAt.After(time.Now()) {
@@ -626,7 +664,8 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 	clarify := app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "请说明要修改哪个任务，或是否开始一个新任务。"}
 	clarify.ModelOutput = decision.ModelOutput
 	if !app.ValidConversationRouteModelOutput(decision.ModelOutput) ||
-		decision.Action != app.ConversationRouteReply && decision.Reply != "" {
+		decision.Action != app.ConversationRouteReply && decision.Reply != "" ||
+		decision.Action != app.ConversationRouteTool && (decision.ToolName != "" || decision.ToolArguments != "") {
 		return clarify
 	}
 	if value.ContentTruncated && decision.Action != app.ConversationRouteNew && decision.Action != app.ConversationRouteClarify {
@@ -676,9 +715,18 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 			len(decision.DependencyTaskIDs) == 0 && len(decision.AggregateMessageIDs) == 0 && app.ValidConversationRouteReply(decision.Reply) {
 			return decision
 		}
+	case app.ConversationRouteTool:
+		if !decision.Acknowledge && decision.TaskID == "" && decision.TargetMessageID == "" && !decision.ExplicitNew &&
+			decision.ExpectedRevision == 0 && decision.Question == "" && decision.Reply == "" &&
+			len(decision.DependencyTaskIDs) == 0 && len(decision.AggregateMessageIDs) == 0 &&
+			app.ConversationRouteDirectToolContextEligible(value) &&
+			app.ValidConversationRouteDirectToolCall(decision.ToolName, json.RawMessage(decision.ToolArguments)) {
+			return decision
+		}
 	case app.ConversationRouteSteer:
 		if decision.Acknowledge || decision.TaskID == "" || decision.TargetMessageID != "" || decision.ExplicitNew || decision.Question != "" ||
 			decision.ExpectedRevision < 0 || len(decision.DependencyTaskIDs) != 0 || len(decision.AggregateMessageIDs) != 0 ||
+			conversationRouteHasHighRiskModificationIntent(value.Content) ||
 			!app.ValidConversationRouteSteerTarget(decision.TaskID, value) {
 			return clarify
 		}
@@ -774,6 +822,9 @@ func conversationRouteClassifyFallback(value app.ConversationRouteContext) app.C
 // acknowledgement, or a leading addition/correction marker. Anything else
 // is treated as uncertain and ends in a clarification question.
 func conversationRouteLooksLikeContinuation(content string) bool {
+	if conversationRouteHasHighRiskModificationIntent(content) {
+		return false
+	}
 	var normalized strings.Builder
 	for _, char := range strings.ToLower(content) {
 		if unicode.IsSpace(char) || unicode.IsPunct(char) || unicode.IsSymbol(char) {
@@ -791,6 +842,25 @@ func conversationRouteLooksLikeContinuation(content string) bool {
 	}
 	for _, marker := range []string{"补充", "追加", "再加", "加上", "改成", "换成", "调整一下", "修改一下"} {
 		if strings.HasPrefix(value, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func conversationRouteHasHighRiskModificationIntent(content string) bool {
+	value := strings.ToLower(content)
+	changeMarkers := []string{"改成", "改为", "换成", "换到", "更换", "切换", "调整", "修改", "变更", "增加", "减少", "提高", "降低", "设置", "设为", "替换", "移到", "改用", "补充", "追加", "授权", "批准", "发给", "发送给", "switch to", "change", "replace", "assign", "increase", "decrease", "grant", "revoke", "send to"}
+	for _, marker := range changeMarkers {
+		if !strings.Contains(value, marker) {
+			continue
+		}
+		for _, target := range []string{"电脑", "主机", "云桌面", "计算机", "workspace", "工作区", "项目", "目录", "文件夹", "文件", "路径", "folder", "directory", "file", "path", "recipient", "收件人", "联系人", "账号", "账户", "用户", "模型", "provider", "权限", "授权", "审批", "批准", "预算", "计划", "目标", "付款", "支付", "删除", "写入"} {
+			if strings.Contains(value, target) {
+				return true
+			}
+		}
+		if strings.Contains(value, "发给") || strings.Contains(value, "发送给") || strings.Contains(value, "send to") {
 			return true
 		}
 	}

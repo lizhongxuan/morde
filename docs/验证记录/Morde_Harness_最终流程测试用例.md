@@ -933,3 +933,11 @@ Tokenizer 与 token 统计来源：
 - [Morde Harness 实施任务 TODO](../Morde_Harness_实施任务_TODO.md) H00–H11，尤其 H06、H09–H11。
 - [Morde AI 对话长会话测试方案](../design/Morde-AI对话长会话测试方案.md) LC-01–LC-06。
 - [Morde PC 端 AI 对话测试用例](PC端AI对话测试用例-2026-11-12.md) 既有 PC 场景及历史执行记录。
+
+### M02 只读网页工具内部账本首切片验证（2026-11-23）
+
+- **范围：** 对显式、上下文完整的 `morde_web_search` / `morde_web_read`，验证路由创建隐藏内部 Task、绕过 DSH 后调用 Broker，并将结果作为普通助手消息写回原会话；其他工具仍走原 Task → DSH → Broker。
+- **自动化回归：** `cd server && go test ./internal/app ./internal/worker ./internal/domain/task ./cmd/portal -count=1` 通过；本地临时 PostgreSQL 下路由、聚合、停止和 Task Plan 定向集成回归通过（29.357 秒），覆盖隐藏任务视图、路由候选隔离、结果消息归属、附件-only 新 Task 及非法输出不持久化原文。另有 worker/app 定向回归验证高风险目标变更会澄清、非法模型输出不会进入决策 JSON 或日志；`make generate`、`git diff --check` 通过。
+- **步骤 2/9/10 当前工作区联调复跑：** app、worker、domain/task、portal 全量通过（app 最新 24.345 秒、worker 59.680 秒；domain/task 0.568 秒、portal 1.170 秒）；PostgreSQL 定向组通过（45.633 秒），覆盖 M02 路由/聚合、M09 短长限流与调用账本恢复、M10 长消息 manifest 恢复及未知用量对账。新增 M10 1 MiB 预算内搜索用例通过（0.652 秒），M10-03 服务端路径已实现；实际 PC E2E 与 PC/iOS 最终联调未完成，M02-08 仍保持待验收。
+- **全量回归限制：** `go test ./internal/store/postgres -count=1` 未通过，在 10 分钟包级超时前有 MCP 凭据集成用例报 `mcp connector operation fields are invalid`；MCP 相关失败需另行处理，不能据 M02 定向测试宣称 PostgreSQL 全包通过。
+- **客户端：** 已启动实际 `morde-pc` 并只读检查对话界面；本地 API/Broker 环境未启动，未发送消息，PC 端功能 E2E 未执行；iOS 未验收。未连接远程服务。

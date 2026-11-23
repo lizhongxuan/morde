@@ -149,7 +149,10 @@ type Task struct {
 	ConversationID string
 	// ToolsDisabled is set for text-only regeneration variants. It is transient
 	// claim metadata sourced from the conversation variant operation ledger.
-	ToolsDisabled     bool `json:"-"`
+	ToolsDisabled bool `json:"-"`
+	// InternalTool is transient claim metadata for a short-lived, user-hidden
+	// route call that must execute through the existing Broker without DSH.
+	InternalTool      bool `json:"-"`
 	HostID            string
 	ExecutionLocation string
 	ApplicationID     string
@@ -210,15 +213,34 @@ type DependencyResult struct {
 // stored with the Task's initial event, while Messages are rebuilt and checked
 // by the Store on each claim. Resumed agent sessions use their own checkpoint.
 type ConversationContext struct {
-	OwnerID         string
-	ProjectID       string
-	InitiatorID     string
-	ConversationID  string
-	Scope           string
-	ThroughSequence int64
-	Digest          []byte
-	Summary         *ConversationContextSummary
-	Messages        []ConversationContextMessage
+	OwnerID              string
+	ProjectID            string
+	InitiatorID          string
+	ConversationID       string
+	Scope                string
+	ThroughSequence      int64
+	Digest               []byte
+	Summary              *ConversationContextSummary
+	CurrentMessageSource *ConversationMessageSource `json:"-"`
+	Messages             []ConversationContextMessage
+}
+
+// ConversationMessageSource is the immutable page-hash manifest for a Task's
+// current long user message. It is persisted with the initial Task event and
+// loaded only after the source identity and full digest are revalidated.
+type ConversationMessageSource struct {
+	MessageID    string                          `json:"message_id"`
+	Sequence     int64                           `json:"sequence"`
+	ContentBytes int64                           `json:"content_bytes"`
+	TotalRunes   int64                           `json:"total_runes"`
+	SHA256       []byte                          `json:"sha256"`
+	Pages        []ConversationMessageSourcePage `json:"pages"`
+}
+
+type ConversationMessageSourcePage struct {
+	RuneOffset     int64  `json:"rune_offset"`
+	NextRuneOffset int64  `json:"next_rune_offset"`
+	SHA256         []byte `json:"sha256"`
 }
 
 // ConversationContextSummary is an immutable reference to the encrypted

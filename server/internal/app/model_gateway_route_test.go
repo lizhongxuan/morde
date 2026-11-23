@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -52,11 +53,91 @@ func routeGatewayFixture() (ConversationRouteClaim, ConversationRouteContext) {
 	return claim, ConversationRouteContext{ActorID: claim.Message.ActorID, RouteAttempt: 1, ModelID: "p1234567", Content: claim.Message.Content}
 }
 
+func TestLegacyRouteModelRequestOnlyAddsDirectToolContractForEligibleSearch(t *testing.T) {
+	query := "请搜索公开网站关于日本央行利率政策的最新信息"
+	eligible := ConversationRouteContext{ActorID: "u1234567", Content: query}
+	request, err := ConversationRouteModelRequest(eligible)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := legacyConversationRouteModelRequest(eligible, request)
+	if err != nil || !strings.Contains(legacy.Instructions, conversationRouteDirectToolInstructions) {
+		t.Fatalf("eligible legacy search request lost its direct-tool contract: err=%v instructions=%q", err, legacy.Instructions)
+	}
+
+	digest := sha256.Sum256([]byte(query))
+	for _, test := range []struct {
+		name    string
+		context ConversationRouteContext
+	}{
+		{"ordinary chat", ConversationRouteContext{ActorID: "u1234567", Content: "你好"}},
+		{"task reference", ConversationRouteContext{ActorID: "u1234567", Content: query, ReferenceTaskID: "q1234567"}},
+		{"attachments", ConversationRouteContext{ActorID: "u1234567", Content: query, CurrentMessageHasAttachments: true}},
+		{"unresolved predecessor", ConversationRouteContext{ActorID: "u1234567", Content: query, PreviousUnresolved: true}},
+		{"task control", ConversationRouteContext{ActorID: "u1234567", Content: query + "，顺便停止当前任务"}},
+		{"truncated message", ConversationRouteContext{ActorID: "u1234567", Content: query, CurrentMessageID: "m1234567",
+			ContentBytes: int64(len(query)), ContentSHA256: digest[:], ContentTruncated: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := ConversationRouteModelRequest(test.context)
+			if err != nil {
+				t.Fatalf("build route request: %v", err)
+			}
+			legacy, err := legacyConversationRouteModelRequest(test.context, request)
+			if err != nil {
+				t.Fatalf("build legacy route request: %v", err)
+			}
+			if strings.Contains(legacy.Instructions, conversationRouteDirectToolInstructions) {
+				t.Fatalf("ineligible legacy request received the direct-tool contract: %s", legacy.Instructions)
+			}
+		})
+	}
+}
+
+func TestLegacyRouteModelRequestPreservesIncompleteHistorySummary(t *testing.T) {
+	const summary = "较早要求：保留全部付款条件。"
+	summaryDigest := sha256.Sum256([]byte(summary))
+	sourcesDigest := sha256.Sum256([]byte("authorized source proof"))
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "历史里的第 400 条记录数值和校验值是什么？",
+		HistoryIncomplete: true, SummaryVersion: 3, SummaryText: summary, SummarySHA256: summaryDigest[:], SummarySourcesSHA256: sourcesDigest[:]}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := legacyConversationRouteModelRequest(value, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input struct {
+		Summary struct {
+			Version       int64  `json:"version"`
+			SHA256        string `json:"sha256"`
+			SourcesSHA256 string `json:"sources_sha256"`
+			Text          string `json:"text"`
+		} `json:"summary"`
+		HistoryIncomplete bool `json:"history_incomplete"`
+	}
+	if err := json.Unmarshal([]byte(legacy.Input[0].Text), &input); err != nil {
+		t.Fatal(err)
+	}
+	if input.Summary.Version != value.SummaryVersion || input.Summary.SHA256 != hex.EncodeToString(summaryDigest[:]) ||
+		input.Summary.SourcesSHA256 != hex.EncodeToString(sourcesDigest[:]) || input.Summary.Text != summary || !input.HistoryIncomplete ||
+		!strings.Contains(legacy.Instructions, conversationRouteHistorySearchTaskInstructions) ||
+		strings.Contains(legacy.Instructions, conversationRouteDirectToolInstructions) {
+		t.Fatalf("legacy conversion changed the incomplete-history summary path: input=%+v instructions=%q", input, legacy.Instructions)
+	}
+}
+
 func TestConversationRouteProviderErrorCarriesOnlyConfirmedRateLimitDelay(t *testing.T) {
 	providerErr := &ModelClientError{Kind: ModelErrorRateLimited, Stage: "provider_status", RetryAfter: 3 * time.Second}
 	var routeErr *domain.Error
 	if err := conversationRouteProviderError(providerErr); !errors.As(err, &routeErr) || routeErr.Code != domain.CodeRateLimited || routeErr.RetryAfter != 3*time.Second {
 		t.Fatalf("provider rate limit mapping = %#v, err=%v", routeErr, err)
+	}
+	providerErr = &ModelClientError{Kind: ModelErrorRateLimited, Stage: "provider_status", RetryAfterExceedsDurableHorizon: true}
+	if err := conversationRouteProviderError(providerErr); !errors.As(err, &routeErr) || routeErr.Code != domain.CodeRateLimited ||
+		routeErr.RetryAfter != 0 || routeErr.Details["retry_after_exceeds_durable_horizon"] != "true" {
+		t.Fatalf("over-horizon provider rate limit mapping = %#v, err=%v", routeErr, err)
 	}
 	providerErr.Stage = "transport"
 	if err := conversationRouteProviderError(providerErr); !errors.As(err, &routeErr) || routeErr.RetryAfter != 0 {

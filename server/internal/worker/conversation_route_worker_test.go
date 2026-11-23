@@ -183,6 +183,29 @@ func TestConversationRouteFailureLogIncludesSafeErrorCode(t *testing.T) {
 	}
 }
 
+func TestConversationRouteInvalidOutputLogContainsMetadataOnly(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	core, logs := observer.New(zap.WarnLevel)
+	worker.options.Logger = zap.New(core)
+	secret := "synthetic-private-model-output"
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+		Question: "请求暂时无法安全分类，请稍后重试。", InvalidOutput: true,
+		InvalidOutputLengthBytes: len(secret), InvalidOutputUTF8Valid: true}
+	stub.repairRequeues = 1
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 {
+		t.Fatalf("invalid output did not use the safe fallback: applied=%+v err=%v", stub.applied, err)
+	}
+	entries := logs.All()
+	if len(entries) != 1 {
+		t.Fatalf("invalid output log entries = %+v", entries)
+	}
+	fields := entries[0].ContextMap()
+	if fmt.Sprint(fields["invalid_output_length_bytes"]) != fmt.Sprint(len(secret)) || fields["invalid_output_utf8_valid"] != true ||
+		fields["failure_code"] != "invalid_model_output" || strings.Contains(fmt.Sprint(fields), secret) {
+		t.Fatalf("invalid output log leaked text or omitted safe metadata: %+v", fields)
+	}
+}
+
 func TestConversationRouteBudgetFailureLogIncludesStageAndCapacity(t *testing.T) {
 	stub := &routeWorkerStub{}
 	core, logs := observer.New(zap.WarnLevel)
@@ -589,6 +612,45 @@ func TestConversationRouteWorkerFallsBackToPreviousTaskOnClassifyFailure(t *test
 	}
 }
 
+func TestConversationRouteWorkerClarifiesHighRiskChangeOnClassifyFailure(t *testing.T) {
+	for _, content := range []string{
+		"换成另一台电脑",
+		"把工作目录换成 /workspace/new",
+		"补充一下，把收件人改成 Alice",
+		"调整一下任务计划和授权范围",
+	} {
+		t.Run(content, func(t *testing.T) {
+			worker, stub := newRouteWorkerTest(t)
+			routeWorkerFallbackSteerContext(stub)
+			stub.snapshot.Context.Content = content
+			stub.classifyErr = errors.New("provider unavailable")
+			if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
+				stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].TaskID != "" {
+				t.Fatalf("high-risk change was applied as a low-risk supplement: content=%q failures=%v applied=%+v err=%v",
+					content, stub.failures, stub.applied, err)
+			}
+		})
+	}
+}
+
+func TestSafeConversationRouteDecisionRejectsHighRiskSteer(t *testing.T) {
+	for _, content := range []string{"换成另一台电脑", "把工作目录换成 /workspace/new", "把收件人改成 Alice"} {
+		t.Run(content, func(t *testing.T) {
+			context := app.ConversationRouteContext{ActorID: "u1234567", Content: content}
+			stub := &routeWorkerStub{snapshot: app.ConversationRouteSnapshot{Context: context}}
+			routeWorkerFallbackSteerContext(stub)
+			context = stub.snapshot.Context
+			context.Content = content
+			decision := safeConversationRouteDecision(context, app.ConversationRouteDecision{
+				Action: app.ConversationRouteSteer, TaskID: "q1234567", ExpectedRevision: 1,
+			})
+			if decision.Action != app.ConversationRouteClarify || decision.TaskID != "" {
+				t.Fatalf("high-risk model steer survived safety validation: %+v", decision)
+			}
+		})
+	}
+}
+
 func TestConversationRouteWorkerFallsBackToNewTaskOnExplicitNewSignal(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	routeWorkerFallbackSteerContext(stub)
@@ -865,6 +927,9 @@ func TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits(t *testing
 		err.Details["reason"] = string(app.ModelErrorRateLimited)
 		err.Details["stage"] = "provider_status"
 		err.RetryAfter = delay
+		if delay > 24*time.Hour {
+			err.Details["retry_after_exceeds_durable_horizon"] = "true"
+		}
 		return err
 	}
 	for _, test := range []struct {
@@ -877,7 +942,9 @@ func TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits(t *testing
 		{name: "provider retry after", err: providerRateLimit(1500 * time.Millisecond), wantDelay: 2 * time.Second, wantHandler: true},
 		{name: "worker context cancelled after confirmed rejection", err: providerRateLimit(1500 * time.Millisecond), wantDelay: 2 * time.Second, wantHandler: true, cancelAfterClassify: true},
 		{name: "bounded fallback", err: providerRateLimit(0), wantDelay: time.Second, wantHandler: true},
-		{name: "provider delay exceeds automatic bound", err: providerRateLimit(3 * time.Minute), wantHandler: true},
+		{name: "long provider retry after", err: providerRateLimit(5 * time.Minute), wantDelay: 5 * time.Minute, wantHandler: true},
+		{name: "provider retry after at durable horizon", err: providerRateLimit(24 * time.Hour), wantDelay: 24 * time.Hour, wantHandler: true},
+		{name: "provider retry after beyond durable horizon ends route", err: providerRateLimit(48 * time.Hour), wantDelay: 0, wantHandler: true},
 		{name: "unclassified rate limit", err: domain.NewError(domain.CodeRateLimited, "rate limited")},
 	} {
 		t.Run(test.name, func(t *testing.T) {

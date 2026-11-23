@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -285,6 +286,98 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 	}
 }
 
+func TestCloudDSHMCPTerminalRateLimitFailsTaskAndReplaysLedgerResult(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	fixture.store.details.Task.HostID = ""
+	fixture.store.details.Task.WorkspaceID = ""
+	fixture.store.details.Task.InputRevision = nil
+	fixture.store.details.Task.WorkspaceCheckpointRevision = nil
+	fixture.store.details.Task.ExecutionLocation = "server"
+	current := fixture.store.details.Task
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-mcp", 1, "session-root"
+	revision := int64(5)
+	current.CurrentRevision, current.DesiredRevision = &revision, &revision
+	current.Authorization.Version = 2
+	fixture.store.details.Task = current
+	connectorID := "k1234567"
+	store := &cloudDSHMCPStoreStub{
+		cloudDSHBrokerTaskStore: &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store},
+		mcpConnectorStoreStub: &mcpConnectorStoreStub{values: map[string]MCPConnectorRecord{
+			connectorID: {ID: connectorID, OwnerID: fixture.store.details.Task.OwnerID, Name: "Synthetic", EndpointURL: "https://mcp.example.test", Enabled: true, Revision: 1},
+		}},
+		grants: []TaskMCPConnectorGrant{{TaskID: fixture.store.details.Task.ID, OwnerID: fixture.store.details.Task.OwnerID,
+			ConnectorOwnerID: fixture.store.details.Task.OwnerID, ConnectorID: connectorID, ConnectorRevision: 1, GrantVersion: 1}},
+	}
+	fixture.executor.store = store
+	client := &cloudDSHMCPClientStub{
+		tools: []MCPConnectorToolDefinition{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)}},
+		result: MCPConnectorToolResult{IsError: true,
+			StructuredContent: json.RawMessage(`{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":300}`),
+			Text:              []string{"synthetic provider detail"}},
+	}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, cloudDSHMCPCredentialStub{}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := store.details.Task
+	discoverSelectedMCPForTest(t, broker, claimed, connectorID)
+	call := selectedMCPCallForTest(t, "terminal-rate-limit-1", connectorID, "lookup", `{"query":"synthetic"}`)
+	call.TaskFence = &ModelTaskFence{TaskID: claimed.ID, OwnerID: claimed.OwnerID, InitiatorID: claimed.InitiatorID,
+		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, AgentInstanceID: claimed.AgentInstanceID,
+		AgentGeneration: claimed.AgentGeneration, AgentSessionID: claimed.AgentSessionID, AgentRootSessionID: claimed.AgentSessionID,
+		AuthorizationVersion: claimed.Authorization.Version}
+	if result, err := broker.Execute(context.Background(), claimed, call); err != nil || result.Status != AgentToolNeedsUser {
+		t.Fatalf("unapproved MCP action = %+v err=%v", result, err)
+	}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	claimed = store.details.Task
+	call.TaskFence.LeaseOwner, call.TaskFence.LeaseVersion = claimed.Lease.Owner, claimed.Lease.Version
+	client.onCall = func() { store.commitTaskProgressError = errors.New("synthetic task result commit failure") }
+	if _, err := broker.Execute(context.Background(), claimed, call); err == nil || client.callCalls != 1 {
+		t.Fatalf("first terminal result commit err=%v connector calls=%d", err, client.callCalls)
+	}
+	operation := store.operations[agentOperationKey(call.CallID)]
+	if operation.Status != task.OperationFailed || store.details.Task.Status != task.StatusRunning {
+		t.Fatalf("failed operation was not kept for reconciliation: operation=%+v task=%+v", operation, store.details.Task)
+	}
+	var storedResult cloudDSHMCPOutput
+	if err := json.Unmarshal([]byte(operation.Result), &storedResult); err != nil || !cloudDSHMCPTerminalForAttempt(storedResult) {
+		t.Fatalf("terminal rate-limit evidence was not retained in the operation ledger: result=%q err=%v", operation.Result, err)
+	}
+	var storedSignal struct {
+		RetryAfterSeconds int64 `json:"retry_after_seconds"`
+	}
+	if err := json.Unmarshal(storedResult.StructuredContent, &storedSignal); err != nil || storedSignal.RetryAfterSeconds != 300 {
+		t.Fatalf("persisted retry-after = %d, err=%v; want 300 seconds", storedSignal.RetryAfterSeconds, err)
+	}
+	store.commitTaskProgressError = nil
+	result, err := broker.Reconcile(context.Background(), claimed, call, nil)
+	if err != nil || result.Status != AgentToolFailed || !result.TerminalForAttempt || client.callCalls != 1 ||
+		store.details.Task.Status != task.StatusRunning || store.details.Task.WaitingReason != "" {
+		t.Fatalf("reconciled terminal result=%+v err=%v connector calls=%d task=%+v", result, err, client.callCalls, store.details.Task)
+	}
+	if err := broker.FailTerminalToolAttempt(context.Background(), claimed, call); err != nil {
+		t.Fatalf("persist terminal Task failure: %v", err)
+	}
+	if store.details.Task.Status != task.StatusFailed || store.details.Task.Result != "The selected connector rate limited this attempt." {
+		t.Fatalf("terminal Task state = %+v", store.details.Task)
+	}
+	if len(store.details.Steps) == 0 || store.details.Steps[len(store.details.Steps)-1].Status != task.StepFailed ||
+		store.details.Steps[len(store.details.Steps)-1].Summary != "The connector rate limited this attempt; it was not retried." {
+		t.Fatalf("terminal rate-limit step=%+v", store.details.Steps)
+	}
+	var event map[string]json.RawMessage
+	if err := json.Unmarshal(store.events[len(store.events)-1].Payload, &event); err != nil {
+		t.Fatal(err)
+	}
+	var status, reason string
+	if json.Unmarshal(event["status"], &status) != nil || json.Unmarshal(event["reason"], &reason) != nil ||
+		status != string(task.StatusFailed) || reason != "connector_rate_limited" ||
+		bytes.Contains(store.events[len(store.events)-1].Payload, []byte("synthetic provider detail")) {
+		t.Fatalf("terminal task result event=%s", store.events[len(store.events)-1].Payload)
+	}
+}
+
 func TestCloudDSHMCPBrokerPersistsUnknownWithoutReplaying(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	fixture.store.details.Task.HostID = ""
@@ -539,5 +632,24 @@ func TestCloudDSHMCPStructuredResultHasJSONComplexityLimits(t *testing.T) {
 	deep := strings.Repeat("[", maxAgentJSONDepth+2) + "0" + strings.Repeat("]", maxAgentJSONDepth+2)
 	if validCloudDSHMCPJSON([]byte(deep)) {
 		t.Fatal("structured result exceeded the nesting limit")
+	}
+}
+
+func TestCloudDSHMCPTerminalForAttemptRequiresExactBoundedRateLimitSignal(t *testing.T) {
+	for name, value := range map[string]cloudDSHMCPOutput{
+		"explicit marker":    {IsError: true, StructuredContent: json.RawMessage(`{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":300}`)},
+		"ordinary MCP error": {IsError: true, StructuredContent: json.RawMessage(`{"code":"connector_rate_limited","terminal_for_attempt":false,"retry_after_seconds":300}`)},
+		"plain isError":      {IsError: true, Text: []string{"rate limited"}},
+		"not an error":       {StructuredContent: json.RawMessage(`{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":300}`)},
+		"wrong code":         {IsError: true, StructuredContent: json.RawMessage(`{"code":"other","terminal_for_attempt":true,"retry_after_seconds":300}`)},
+		"missing delay":      {IsError: true, StructuredContent: json.RawMessage(`{"code":"connector_rate_limited","terminal_for_attempt":true}`)},
+		"zero delay":         {IsError: true, StructuredContent: json.RawMessage(`{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":0}`)},
+		"overlong delay":     {IsError: true, StructuredContent: json.RawMessage(`{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":86401}`)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := cloudDSHMCPTerminalForAttempt(value); got != (name == "explicit marker") {
+				t.Fatalf("terminal marker=%t", got)
+			}
+		})
 	}
 }

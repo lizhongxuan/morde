@@ -66,7 +66,7 @@ func TestConversationRouteModelRequestProjectsLargeCurrentMessages(t *testing.T)
 			if !input.MessageTruncated || input.MessageID != "m1234567" || input.MessageBytes != int64(len(content)) ||
 				input.MessageSHA256 != hex.EncodeToString(digest[:]) || len(request.Input[0].Text) > 12<<10 ||
 				!strings.Contains(input.Message, "START-ANCHOR") || !strings.Contains(input.Message, "END-ANCHOR") ||
-				strings.Contains(input.Message, "MIDDLE-ANCHOR") || !strings.Contains(request.Instructions, "morde_read_current_conversation_message") {
+				strings.Contains(input.Message, "MIDDLE-ANCHOR") || !strings.Contains(request.Instructions, "morde_search_current_conversation_message") {
 				t.Fatalf("large route input was not represented by a bounded, verifiable source reference: bytes=%d input=%+v requestBytes=%d",
 					size, input, len(request.Input[0].Text))
 			}
@@ -93,6 +93,7 @@ func TestConversationRouteTaskObjectiveReferencesLargeSource(t *testing.T) {
 	if len(objective) > 8<<10 || !strings.Contains(objective, "message_id=m1234567") ||
 		!strings.Contains(objective, "sha256="+hex.EncodeToString(digest[:])) ||
 		!strings.Contains(objective, "morde_read_current_conversation_message") ||
+		!strings.Contains(objective, "morde_search_current_conversation_message") ||
 		!strings.Contains(objective, "START-ANCHOR") || !strings.Contains(objective, "END-ANCHOR") ||
 		strings.Contains(objective, strings.Repeat("x", 4096)) {
 		t.Fatalf("large Task objective did not retain a bounded source pointer: objectiveBytes=%d", len(objective))

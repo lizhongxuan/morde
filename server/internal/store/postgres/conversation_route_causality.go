@@ -105,7 +105,7 @@ func (s *Store) RequeueConversationRouteAfterContextChange(ctx context.Context, 
 // HandleConversationRouteRateLimit releases only a model call explicitly
 // rejected by the provider, then retries or fails the route in the same transaction.
 func (s *Store) HandleConversationRouteRateLimit(ctx context.Context, claim app.ConversationRouteClaim, delay time.Duration) (bool, error) {
-	if ctx == nil || claim.Input.ResultReviewID != "" || delay < 0 || delay > 2*time.Minute ||
+	if ctx == nil || claim.Input.ResultReviewID != "" || delay < 0 || delay > 24*time.Hour ||
 		(delay > 0 && (delay < time.Second || delay%time.Second != 0)) {
 		return false, domain.InvalidArgument("route_rate_limit", "conversation route rate-limit handling is invalid")
 	}

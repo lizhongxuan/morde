@@ -1934,8 +1934,12 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					if initial != nil || !domain.ValidMessageID(message.ID) ||
 						(strings.TrimSpace(message.Content) == "" && len(message.AttachmentIDs) == 0) ||
 						!utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') ||
-						len(message.Content) > app.MaxConversationAgentInputBytes || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) ||
-						(message.Content != value.Objective && (strings.TrimSpace(message.Content) != "" || value.Objective != app.ConversationAttachmentOnlyObjective)) {
+						len(message.Content) > app.MaxConversationAgentInputBytes || !validCloudDSHMessageAttachmentIDs(message.AttachmentIDs) {
+						return errors.New("initial conversation message does not match the Task")
+					}
+					objectiveMatchesSource := message.Content == value.Objective ||
+						app.ConversationRouteTaskMessageObjective(message.ID, message.Content) == value.Objective
+					if !objectiveMatchesSource && (strings.TrimSpace(message.Content) != "" || value.Objective != app.ConversationAttachmentOnlyObjective) {
 						return errors.New("initial conversation message does not match the Task")
 					}
 					initial = message
@@ -2588,6 +2592,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err != nil {
 				return errors.New("dsh tool execution could not be confirmed")
 			}
+			if result.TerminalForAttempt && result.Status != app.AgentToolFailed {
+				return errors.New("dsh terminal tool result is not a failure")
+			}
 			if result.Status == app.AgentToolSuperseded {
 				if err := supersedeToolCall(ctx, result.SupersedingMessages, state.identity.SessionID, frame.CallID); err != nil {
 					return err
@@ -2633,6 +2640,19 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 			if !utf8.ValidString(result.Output) || len(result.Output) > cloudDSHMaxText {
 				return errors.New("dsh tool result exceeds the IPC limit")
+			}
+			if result.TerminalForAttempt {
+				if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
+					return err
+				}
+				finisher, ok := e.options.Tools.(app.AgentToolTerminalAttemptFinisher)
+				if !ok {
+					return errors.New("dsh terminal tool result finisher is unavailable")
+				}
+				if err := finisher.FailTerminalToolAttempt(ctx, value, call); err != nil {
+					return errors.New("dsh terminal tool result could not be persisted")
+				}
+				return errCloudDSHTerminalToolAttempt
 			}
 			toolImages, err := state.images.add(result.Images)
 			if err != nil {

@@ -1078,8 +1078,13 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
+	internalToolExecutor, err := worker.NewConversationRouteInternalToolExecutor(store, tools)
+	if err != nil {
+		return nil, err
+	}
 	taskWorker, err := worker.NewTaskWorker(worker.TaskWorkerOptions{
-		Store: store, Executor: executor, Lifecycle: accountRuntimes.Run, WorkerID: workerID + "-task",
+		Store: store, Executor: executor, InternalToolExecutor: internalToolExecutor,
+		Lifecycle: accountRuntimes.Run, WorkerID: workerID + "-task",
 		LeaseDuration: 30 * time.Second, PollInterval: 500 * time.Millisecond,
 		MaxConcurrentTasks: cfg.MaxConcurrentTasks, MaxConcurrentTasksPerOwner: cfg.MaxConcurrentPerOwner, Logger: logger, Metrics: metrics,
 	})

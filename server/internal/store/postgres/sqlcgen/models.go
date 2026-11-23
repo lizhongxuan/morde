@@ -536,6 +536,18 @@ type ConversationResultSource struct {
 	AuthorizationVersion int64              `json:"authorization_version"`
 }
 
+type ConversationRouteInternalToolCall struct {
+	TaskID           string             `json:"task_id"`
+	OwnerID          string             `json:"owner_id"`
+	MessageID        string             `json:"message_id"`
+	CallID           string             `json:"call_id"`
+	ToolName         string             `json:"tool_name"`
+	Arguments        []byte             `json:"arguments"`
+	ReplyMessageID   string             `json:"reply_message_id"`
+	ReplyPublishedAt pgtype.Timestamptz `json:"reply_published_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
 type ConversationRouteModelCall struct {
 	MessageID            string             `json:"message_id"`
 	ServiceInstanceID    pgtype.UUID        `json:"service_instance_id"`

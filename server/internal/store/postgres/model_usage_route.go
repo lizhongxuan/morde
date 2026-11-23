@@ -158,8 +158,16 @@ func conversationRouteHistoryProjectionMatches(expected, actual []app.Conversati
 		}
 		original := expected[index]
 		index++
-		if item.Content != original.Content && !(incomplete && item.Content == "" && item.Truncated) ||
-			item.Truncated != original.Truncated && !(incomplete && item.Truncated) {
+		contentMatches := item.Content == original.Content
+		blanked := incomplete && item.Content == "" && item.Truncated
+		canonicalPreview := false
+		if incomplete && item.Truncated && item.Content != "" && !contentMatches && int64(len(item.Content)) <= original.ContentBytes {
+			preview, truncated := app.ConversationRouteTextPreview(original.Content, app.ConversationRouteHistoryPreviewBytes)
+			canonicalPreview = truncated && item.Content == preview
+		}
+		if int64(len(item.Content)) > original.ContentBytes ||
+			(!contentMatches && !blanked && !canonicalPreview) ||
+			(item.Truncated != original.Truncated && !blanked && !canonicalPreview) {
 			return false
 		}
 		item.Content, item.Truncated = original.Content, original.Truncated

@@ -124,11 +124,18 @@ const (
 
 type AgentToolResult struct {
 	Status              AgentToolResultStatus
+	TerminalForAttempt  bool
 	WaitingReason       string
 	ExternalID          string
 	Output              string
 	Images              []ModelImage
 	SupersedingMessages []AgentConversationMessage
+}
+
+// AgentToolTerminalAttemptFinisher durably closes a Task after the worker has
+// resolved the DSH request that produced a terminal tool result.
+type AgentToolTerminalAttemptFinisher interface {
+	FailTerminalToolAttempt(context.Context, task.Task, ModelToolCall) error
 }
 
 type AgentVerificationRequest struct {

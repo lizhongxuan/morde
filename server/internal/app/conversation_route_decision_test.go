@@ -2,6 +2,7 @@ package app
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -32,7 +33,8 @@ func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 		!strings.Contains(request.Instructions, "only on expected duration, never on the topic") ||
 		!strings.Contains(request.Instructions, "text-only requests for small code snippets") ||
 		!strings.Contains(request.Instructions, "An explicit request to create, write, export, save, or deliver a file or document") ||
-		!strings.Contains(request.Instructions, "Explicit requests to search, browse, consult sources") ||
+		!strings.Contains(request.Instructions, "unless one bounded public read-only lookup is sufficient for the tool action") ||
+		strings.Contains(request.Instructions, conversationRouteDirectToolInstructions) ||
 		!strings.Contains(request.Instructions, "require a Task; do not replace requested work with a text-only answer") ||
 		!strings.Contains(request.Instructions, "ask for that exact information") {
 		t.Fatalf("direct chat and time rules missing from router instructions: %s", request.Instructions)
@@ -60,28 +62,27 @@ func TestConversationRouteModelRequestKeepsMinimumWindowOutputBudget(t *testing.
 	}
 }
 
-func TestConversationRouteInvalidOutputKeepsBoundedPreview(t *testing.T) {
+func TestConversationRouteInvalidOutputStoresOnlyMetadata(t *testing.T) {
 	context := ConversationRouteContext{ActorID: "u1234567", Content: "你看看上面那条信息说了什么"}
 	oversized := strings.Repeat("你", 6000)
 	decision := ParseConversationRouteDecisionForContext(oversized, context)
-	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputPreview != strings.Repeat("你", 1024) {
-		t.Fatalf("oversized model output lost its diagnostic preview: %+v", decision)
+	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputLengthBytes != len(oversized) || !decision.InvalidOutputUTF8Valid {
+		t.Fatalf("oversized model output metadata is incorrect: %+v", decision)
 	}
-	truncated := `{"action":"reply","reply":"你好`
-	decision = ParseConversationRouteDecisionForContext(truncated, context)
-	if !decision.InvalidOutput || decision.ModelOutput != truncated || decision.InvalidOutputPreview != "" {
-		t.Fatalf("short invalid model output was not retained verbatim: %+v", decision)
+	secret := "synthetic-private-model-output"
+	decision = ParseConversationRouteDecisionForContext(secret, context)
+	encoded, err := json.Marshal(decision)
+	if err != nil || !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputLengthBytes != len(secret) ||
+		!decision.InvalidOutputUTF8Valid || strings.Contains(string(encoded), secret) {
+		t.Fatalf("invalid model text was persisted with its metadata: decision=%+v encoded=%s err=%v", decision, encoded, err)
 	}
 	decision = ParseConversationRouteDecisionForContext("", context)
-	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputPreview != "" {
-		t.Fatalf("empty model output gained a stored value: %+v", decision)
+	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputLengthBytes != 0 || !decision.InvalidOutputUTF8Valid {
+		t.Fatalf("empty model output metadata is incorrect: %+v", decision)
 	}
 	decision = ParseConversationRouteDecisionForContext(string([]byte{0xff, 0xfe})+"abc", context)
-	if !decision.InvalidOutput || decision.InvalidOutputPreview == "" {
-		t.Fatalf("invalid UTF-8 model output lost its diagnostic preview: %+v", decision)
-	}
-	if decision.InvalidOutputPreview != "�abc" {
-		t.Fatalf("invalid UTF-8 preview was not sanitized: %q", decision.InvalidOutputPreview)
+	if !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputLengthBytes != 5 || decision.InvalidOutputUTF8Valid {
+		t.Fatalf("invalid UTF-8 model output metadata is incorrect: %+v", decision)
 	}
 }
 
@@ -520,6 +521,70 @@ func TestConversationRouteDirectReplyRequiresValidTargetlessText(t *testing.T) {
 	}
 }
 
+func TestConversationRouteDirectToolIsExplicitAndReadOnly(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "请搜索公开网站关于日本央行利率政策的最新信息"}
+	for _, test := range []struct {
+		name   string
+		output string
+	}{
+		{"search", `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`},
+		{"read", `{"action":"tool","tool_name":"morde_web_read","tool_arguments":{"url":"https://example.com/article"}}`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decision := ParseConversationRouteDecisionForContext(test.output, value)
+			if decision.Action != ConversationRouteTool || decision.ToolName == "" ||
+				!ValidConversationRouteDirectToolCall(decision.ToolName, json.RawMessage(decision.ToolArguments)) || decision.ModelOutput != test.output {
+				t.Fatalf("valid direct read-only tool call was rejected: %+v", decision)
+			}
+		})
+	}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil || !strings.Contains(request.Instructions, `"tool_name"`) ||
+		!strings.Contains(request.Instructions, `"morde_web_search"`) || !strings.Contains(request.Instructions, `action "tool"`) {
+		t.Fatalf("direct tool contract missing from model request: err=%v instructions=%s", err, request.Instructions)
+	}
+	truncatedDigest := sha256.Sum256([]byte(value.Content))
+	for _, restricted := range []struct {
+		name    string
+		context ConversationRouteContext
+	}{
+		{"ordinary chat", ConversationRouteContext{ActorID: value.ActorID, Content: "你好"}},
+		{"task reference", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, ReferenceTaskID: "q1234567"}},
+		{"attachments", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, CurrentMessageHasAttachments: true}},
+		{"unresolved predecessor", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, PreviousUnresolved: true}},
+		{"missing predecessor", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, PreviousMissing: true, PreviousUnresolved: true}},
+		{"unavailable reference", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, ReferenceTaskID: "q1234567", ReferenceUnavailable: true}},
+		{"truncated message", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, CurrentMessageID: "m1234567",
+			ContentBytes: int64(len(value.Content)), ContentSHA256: truncatedDigest[:], ContentTruncated: true}},
+		{"task control", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content + "，顺便停止当前任务"}},
+	} {
+		t.Run("instruction omitted: "+restricted.name, func(t *testing.T) {
+			request, err := ConversationRouteModelRequest(restricted.context)
+			if err != nil {
+				t.Fatalf("build route request: %v", err)
+			}
+			if strings.Contains(request.Instructions, conversationRouteDirectToolInstructions) {
+				t.Fatalf("ineligible request received the direct tool contract: %s", request.Instructions)
+			}
+		})
+	}
+	legacyRequest, err := legacyConversationRouteModelRequest(value, request)
+	if err != nil || !strings.Contains(legacyRequest.Instructions, conversationRouteDirectToolInstructions) {
+		t.Fatalf("legacy model request lost the bounded direct tool contract: err=%v instructions=%s", err, legacyRequest.Instructions)
+	}
+
+	for _, output := range []string{
+		`{"action":"tool","tool_name":"morde_personal_update","tool_arguments":{"field":"name"}}`,
+		`{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"news","unexpected":true}}`,
+		`{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"news"},"reply":"invented"}`,
+		`{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"news"},"acknowledge":true}`,
+	} {
+		if decision := ParseConversationRouteDecisionForContext(output, value); decision.Action != ConversationRouteClarify {
+			t.Errorf("unsafe direct tool output was accepted: %s => %+v", output, decision)
+		}
+	}
+}
+
 func TestConversationRouteDirectReplyCannotHideUnknownTaskControl(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "停止任务", ReferenceTaskID: "q1234567", ReferenceUnavailable: true}
 	decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"I cannot stop it."}`, value)
@@ -570,6 +635,23 @@ func TestConversationRouteRequestUsesOnlyAuthorizedTaskContext(t *testing.T) {
 		strings.Contains(request.Input[0].Text, "u1234567") {
 		t.Fatalf("routing request is invalid: %+v err=%v", request, err)
 	}
+	var historyInput struct {
+		History []struct {
+			MessageID     string `json:"message_id"`
+			Content       string `json:"content"`
+			ContentBytes  int64  `json:"content_bytes"`
+			ContentSHA256 string `json:"content_sha256"`
+		} `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(request.Input[0].Text), &historyInput); err != nil {
+		t.Fatal(err)
+	}
+	historyDigest := sha256.Sum256([]byte("整理财报"))
+	if len(historyInput.History) != 1 || historyInput.History[0].MessageID != "m1234567" ||
+		historyInput.History[0].Content != "整理财报" || historyInput.History[0].ContentBytes != int64(len("整理财报")) ||
+		historyInput.History[0].ContentSHA256 != hex.EncodeToString(historyDigest[:]) {
+		t.Fatalf("history source provenance was not passed to the classifier: %+v", historyInput.History)
+	}
 	value.Candidates[0].InitiatorID = "u7654321"
 	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("another actor's task was accepted into routing context: %v", err)
@@ -596,6 +678,56 @@ func TestConversationRouteRequestUsesOnlyAuthorizedTaskContext(t *testing.T) {
 	}
 }
 
+func TestConversationRouteHistoryPreviewCarriesOriginalSourceWithoutFullContent(t *testing.T) {
+	original := strings.Repeat("早期要求：保留合同中的期限、金额和付款条件。", 120)
+	digest := sha256.Sum256([]byte(original))
+	preview, truncated := ConversationRouteTextPreview(original, 128)
+	if !truncated {
+		t.Fatal("synthetic history was not truncated")
+	}
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "继续处理", History: []ConversationRouteHistory{{
+		MessageID: "m1234567", Sequence: 1, Role: conversation.RoleUser, Content: preview,
+		ContentBytes: int64(len(original)), SourceSHA256: digest[:], Truncated: true,
+	}}}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input struct {
+		HistoryIncomplete bool `json:"history_incomplete"`
+		History           []struct {
+			MessageID     string `json:"message_id"`
+			Content       string `json:"content"`
+			ContentBytes  int64  `json:"content_bytes"`
+			ContentSHA256 string `json:"content_sha256"`
+			Truncated     bool   `json:"content_truncated"`
+		} `json:"history"`
+	}
+	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
+		t.Fatal(err)
+	}
+	if !input.HistoryIncomplete || len(input.History) != 1 || input.History[0].MessageID != "m1234567" ||
+		input.History[0].Content != preview || input.History[0].ContentBytes != int64(len(original)) ||
+		input.History[0].ContentSHA256 != hex.EncodeToString(digest[:]) || !input.History[0].Truncated ||
+		strings.Contains(request.Input[0].Text, original) || !strings.Contains(request.Instructions, "morde_current_conversation_history_search") {
+		t.Fatalf("history preview lost its source integrity or exposed full text: input=%+v instructions=%q", input, request.Instructions)
+	}
+}
+
+func TestConversationRouteHistoryRejectsUnverifiableTruncation(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "继续", History: []ConversationRouteHistory{{
+		MessageID: "m1234567", Sequence: 1, Role: conversation.RoleUser, Content: "仅预览", Truncated: true,
+	}}}
+	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("truncated history without original digest was accepted: %v", err)
+	}
+	value.History[0] = ConversationRouteHistory{MessageID: "m1234567", Sequence: 1, Role: conversation.RoleUser,
+		Content: "完整内容", ContentBytes: int64(len("完整内容")), SourceSHA256: make([]byte, sha256.Size)}
+	if _, err := ConversationRouteModelRequest(value); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("history whose source hash does not match content was accepted: %v", err)
+	}
+}
+
 func TestConversationRouteRequestBindsSummaryAndUsesOnlyUncoveredHistory(t *testing.T) {
 	summary := "已确认的旧结论"
 	summaryDigest := sha256.Sum256([]byte(summary))
@@ -608,6 +740,7 @@ func TestConversationRouteRequestBindsSummaryAndUsesOnlyUncoveredHistory(t *test
 			{MessageID: "m3456789", Sequence: 3, Role: conversation.RoleUser, Content: "尾部"}}}
 	request, err := ConversationRouteModelRequest(value)
 	if err != nil || !strings.Contains(request.Input[0].Text, `"summary":{"sha256"`) ||
+		!strings.Contains(request.Input[0].Text, `"sources_sha256"`) ||
 		!strings.Contains(request.Input[0].Text, summary) {
 		t.Fatalf("summary was not bound into the route request: %+v err=%v", request, err)
 	}

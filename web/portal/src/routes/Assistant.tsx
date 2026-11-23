@@ -2117,6 +2117,7 @@ export function Assistant() {
       const retryScope = target.resultReview && target.taskID ? `result-review:${target.taskID}` : '';
       const key = processingRetryKey(instanceID, user.id, retryScope, target.conversationID, target.messageID);
       await portalApi.retryConversationMessageProcessing(target.conversationID, target.messageID, key, instanceID, user.id);
+      clearProcessingRetryKey(instanceID, user.id, retryScope, target.conversationID, target.messageID);
     },
     onSuccess: async (_value, target) => {
       if (target.resultReview && target.taskID) {

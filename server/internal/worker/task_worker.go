@@ -39,11 +39,17 @@ type TaskExecutor interface {
 	ExecuteTask(context.Context, task.Task) error
 }
 
+type InternalToolTaskExecutor interface {
+	ExecuteInternalToolTask(context.Context, task.Task) error
+	PublishPendingReplies(context.Context) (bool, error)
+}
+
 var errTaskExecutorPanicked = errors.New("task executor panicked")
 
 type TaskWorkerOptions struct {
 	Store                      TaskLeaseStore
 	Executor                   TaskExecutor
+	InternalToolExecutor       InternalToolTaskExecutor
 	Lifecycle                  func(context.Context) error
 	WorkerID                   string
 	LeaseDuration              time.Duration
@@ -57,6 +63,7 @@ type TaskWorkerOptions struct {
 type TaskWorker struct {
 	store                      TaskLeaseStore
 	executor                   TaskExecutor
+	internalToolExecutor       InternalToolTaskExecutor
 	lifecycle                  func(context.Context) error
 	workerID                   string
 	leaseDuration              time.Duration
@@ -106,7 +113,8 @@ func NewTaskWorker(options TaskWorkerOptions) (*TaskWorker, error) {
 		return nil, err
 	}
 	return &TaskWorker{
-		store: options.Store, executor: options.Executor, lifecycle: options.Lifecycle, workerID: options.WorkerID,
+		store: options.Store, executor: options.Executor, internalToolExecutor: options.InternalToolExecutor,
+		lifecycle: options.Lifecycle, workerID: options.WorkerID,
 		leaseDuration: options.LeaseDuration, pollInterval: options.PollInterval,
 		renewInterval: renewInterval, maxConcurrentTasks: options.MaxConcurrentTasks,
 		maxConcurrentTasksPerOwner: options.MaxConcurrentTasksPerOwner, logger: logger, metrics: metrics,
@@ -232,6 +240,14 @@ func (w *TaskWorker) runClaimLoopRecovering(ctx context.Context) {
 
 func (w *TaskWorker) runClaimLoop(ctx context.Context) {
 	for ctx.Err() == nil {
+		if w.internalToolExecutor != nil {
+			published, err := w.internalToolExecutor.PublishPendingReplies(ctx)
+			if err != nil && ctx.Err() == nil {
+				w.logger.Warn("publish pending internal route tool reply failed", zap.String("error_type", fmt.Sprintf("%T", err)))
+			} else if published {
+				continue
+			}
+		}
 		claimed, ok, err := w.store.ClaimNextTaskWithOwnerLimit(ctx, w.workerID, w.leaseDuration, w.maxConcurrentTasksPerOwner)
 		if ctx.Err() != nil {
 			break
@@ -384,6 +400,12 @@ func (w *TaskWorker) executeSafely(ctx context.Context, value task.Task) (result
 			result = errTaskExecutorPanicked
 		}
 	}()
+	if value.InternalTool {
+		if w.internalToolExecutor == nil {
+			return errors.New("internal route tool executor is unavailable")
+		}
+		return w.internalToolExecutor.ExecuteInternalToolTask(ctx, value)
+	}
 	result = w.executor.ExecuteTask(ctx, value)
 	return result
 }

@@ -390,8 +390,12 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 			decision := app.ParseConversationRouteDecisionForContext(frame.Result, value)
 			if lastModel.StopReason != "stop" || len(lastModel.ToolCalls) != 0 {
 				decision = app.ParseConversationRouteDecisionForContext("", value)
+				decision.InvalidOutputLengthBytes = len(frame.Result)
+				decision.InvalidOutputUTF8Valid = utf8.ValidString(frame.Result)
 			}
-			decision.ModelOutput = frame.Result
+			if !decision.InvalidOutput {
+				decision.ModelOutput = frame.Result
+			}
 			return decision, nil
 		case "coordinator_failed", "coordinator_terminated", "failed":
 			return app.ConversationRouteDecision{}, errors.New("DSH coordinator turn did not complete")

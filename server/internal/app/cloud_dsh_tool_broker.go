@@ -302,6 +302,9 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 			definitions = append(definitions, cloudDSHCurrentConversationHistoryDefinition())
 			if _, ok := b.store.(currentConversationMessageChunkStore); ok {
 				definitions = append(definitions, cloudDSHCurrentConversationMessageReadDefinition())
+				if ValidConversationMessageSourceManifest(details.Task.ConversationContext.CurrentMessageSource) {
+					definitions = append(definitions, cloudDSHCurrentConversationMessageSearchDefinition())
+				}
 			}
 		}
 		if !goalFollowupReadOnly {
@@ -373,6 +376,14 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 	}
 	if goalFollowupReadOnly {
 		definitions = filterGoalFollowupReadOnlyTools(definitions)
+	}
+	if !goalFollowupReadOnly && len(definitions)+len(selectedMCP)+1 > maxCloudDSHToolDefinitions {
+		for index, definition := range definitions {
+			if definition.Name == cloudDSHCurrentMessageSearchToolName {
+				definitions = append(definitions[:index], definitions[index+1:]...)
+				break
+			}
+		}
 	}
 	if len(definitions)+len(selectedMCP)+1 <= maxCloudDSHToolDefinitions {
 		definitions = append(definitions, selectedMCP...)
@@ -1031,6 +1042,9 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	if call.Name == cloudDSHCurrentMessageReadToolName {
 		return b.executeCurrentConversationMessageRead(ctx, claimed, call, recovering, checkpointOutput)
+	}
+	if call.Name == cloudDSHCurrentMessageSearchToolName {
+		return b.executeCurrentConversationMessageSearch(ctx, claimed, call, recovering, checkpointOutput)
 	}
 	if call.Name == cloudDSHRecentHistorySummaryToolName {
 		return b.executeRecentHistorySummary(ctx, claimed, call, recovering, checkpointOutput)

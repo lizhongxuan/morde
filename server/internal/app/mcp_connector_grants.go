@@ -86,6 +86,9 @@ func (s *TaskService) RevokeMCPConnectorGrant(ctx context.Context, principal ide
 	if err != nil {
 		return TaskMCPConnectorGrant{}, hideTaskAccessError(err)
 	}
+	if details.Task.InternalTool {
+		return TaskMCPConnectorGrant{}, domain.NewError(domain.CodeNotFound, "task not found")
+	}
 	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return TaskMCPConnectorGrant{}, hideTaskAccessError(err)
 	}

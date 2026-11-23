@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"unicode/utf8"
 
 	"morde/server/internal/app"
@@ -95,16 +96,17 @@ func taskContextSnapshotError(message string) error {
 }
 
 type taskConversationContextManifest struct {
-	OwnerID         string                           `json:"owner_id"`
-	ProjectID       string                           `json:"project_id,omitempty"`
-	InitiatorID     string                           `json:"initiator_id,omitempty"`
-	ConversationID  string                           `json:"conversation_id"`
-	Scope           string                           `json:"scope"`
-	ThroughSequence int64                            `json:"through_sequence"`
-	MessageCount    int                              `json:"message_count"`
-	MessageIDs      []string                         `json:"message_ids"`
-	DigestSHA256    string                           `json:"digest_sha256"`
-	Summary         *task.ConversationContextSummary `json:"summary,omitempty"`
+	OwnerID              string                           `json:"owner_id"`
+	ProjectID            string                           `json:"project_id,omitempty"`
+	InitiatorID          string                           `json:"initiator_id,omitempty"`
+	ConversationID       string                           `json:"conversation_id"`
+	Scope                string                           `json:"scope"`
+	ThroughSequence      int64                            `json:"through_sequence"`
+	MessageCount         int                              `json:"message_count"`
+	MessageIDs           []string                         `json:"message_ids"`
+	DigestSHA256         string                           `json:"digest_sha256"`
+	Summary              *task.ConversationContextSummary `json:"summary,omitempty"`
+	CurrentMessageSource *task.ConversationMessageSource  `json:"current_message_source,omitempty"`
 }
 
 func captureTaskConversationContext(ctx context.Context, tx pgx.Tx, ownerID, conversationID string) (task.ConversationContext, taskConversationContextManifest, error) {
@@ -267,11 +269,19 @@ func readTaskConversationContextWithProjectLock(ctx context.Context, tx pgx.Tx, 
 		return nil, taskContextSnapshotError("Task conversation context digest is invalid")
 	}
 	var firstTaskMessageSequence pgtype.Int8
-	err = tx.QueryRow(ctx, `SELECT MIN(m.sequence) FROM conversation_messages m
-WHERE m.task_id=$1 AND m.owner_id=$2 AND m.conversation_id=$3 AND m.role='user'
- AND m.source_kind<>'task_result_review'
- AND NOT EXISTS (SELECT 1 FROM task_revision_intents revision WHERE revision.message_id=m.id AND revision.task_id=m.task_id)`,
-		value.ID, value.OwnerID, value.ConversationID).Scan(&firstTaskMessageSequence)
+	err = tx.QueryRow(ctx, `SELECT MIN(source.message_sequence) FROM (
+ SELECT m.sequence AS message_sequence FROM conversation_messages m
+ WHERE m.task_id=$1 AND m.owner_id=$2 AND m.conversation_id=$3 AND m.role='user'
+  AND m.source_kind<>'task_result_review'
+  AND NOT EXISTS (SELECT 1 FROM task_revision_intents revision WHERE revision.message_id=m.id AND revision.task_id=m.task_id)
+ UNION ALL
+ SELECT m.sequence AS message_sequence FROM conversation_route_internal_tool_calls internal_tool
+ JOIN conversation_messages m ON m.id=internal_tool.message_id AND m.owner_id=internal_tool.owner_id
+ JOIN conversation_message_routes route ON route.message_id=m.id AND route.owner_id=m.owner_id
+ WHERE internal_tool.task_id=$1 AND internal_tool.owner_id=$2 AND m.conversation_id=$3
+  AND m.actor_id=$4 AND m.role='user' AND m.task_id IS NULL AND m.delivery_status='applied' AND route.state='routed'
+) source`,
+		value.ID, value.OwnerID, value.ConversationID, value.InitiatorID).Scan(&firstTaskMessageSequence)
 	if err != nil {
 		return nil, fmt.Errorf("read Task first message sequence: %w", err)
 	}
@@ -294,6 +304,35 @@ WHERE m.task_id=$1 AND m.owner_id=$2 AND m.conversation_id=$3 AND m.role='user'
 		manifest.ThroughSequence, messages, summary)
 	if manifest.MessageCount != len(contextValue.Messages) || !bytes.Equal(expectedDigest, contextValue.Digest) {
 		return nil, taskContextSnapshotError("Task conversation history no longer matches its fixed boundary")
+	}
+	if manifest.CurrentMessageSource == nil {
+		if strings.Contains(value.Objective, "morde_read_current_conversation_message") && strings.Contains(value.Objective, "message_id=") {
+			return nil, taskContextSnapshotError("Task long-message page manifest is unavailable; create a new task")
+		}
+	} else {
+		if !app.ValidConversationMessageSourceManifest(manifest.CurrentMessageSource) ||
+			manifest.CurrentMessageSource.Sequence != manifest.ThroughSequence+1 || value.ExecutionLocation != "server" {
+			return nil, taskContextSnapshotError("Task long-message page manifest is invalid")
+		}
+		var currentMessage string
+		source := manifest.CurrentMessageSource
+		err := tx.QueryRow(ctx, `SELECT m.content FROM conversation_messages m
+WHERE m.id=$1 AND m.owner_id=$2 AND m.actor_id=$3 AND m.conversation_id=$4 AND m.task_id=$5
+ AND m.sequence=$6 AND m.role='user' AND m.delivery_status IN ('pending','applied')
+ AND octet_length(m.content)<=$7`, source.MessageID, value.OwnerID, value.InitiatorID, value.ConversationID,
+			value.ID, source.Sequence, app.MaxConversationMessageBytes).Scan(&currentMessage)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, taskContextSnapshotError("Task long-message source is unavailable")
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read Task long-message source for manifest validation: %w", err)
+		}
+		rebuilt, err := app.BuildConversationMessageSourceManifest(source.MessageID, source.Sequence, currentMessage)
+		if err != nil || !app.ConversationMessageSourceManifestsEqual(source, rebuilt) ||
+			value.Objective != app.ConversationRouteTaskMessageObjective(source.MessageID, currentMessage) {
+			return nil, taskContextSnapshotError("Task long-message page manifest no longer matches its authorized source")
+		}
+		contextValue.CurrentMessageSource = source
 	}
 	return &contextValue, nil
 }

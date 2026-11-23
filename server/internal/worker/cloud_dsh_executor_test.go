@@ -464,6 +464,16 @@ type cloudDSHTestTools struct {
 	afterPause        func()
 }
 
+type cloudDSHTerminalTestTools struct {
+	*cloudDSHTestTools
+	finisherCalls int
+}
+
+func (t *cloudDSHTerminalTestTools) FailTerminalToolAttempt(context.Context, task.Task, app.ModelToolCall) error {
+	t.finisherCalls++
+	return nil
+}
+
 type cloudDSHTestToolsWithContext struct {
 	*cloudDSHTestTools
 	context string
@@ -1989,6 +1999,26 @@ func TestCloudDSHExecutorRunsAuthorizedToolAndReturnsDurableResultToNextModelCal
 	}
 	if !found {
 		t.Fatalf("next model request did not include the persisted tool result: %s", models.calls[1].RawRequest)
+	}
+}
+
+func TestCloudDSHExecutorStopsAfterDurableTerminalToolAttempt(t *testing.T) {
+	executor, _, store, _, models, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	tools := &cloudDSHTerminalTestTools{cloudDSHTestTools: &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}, result: app.AgentToolResult{
+		Status: app.AgentToolFailed, TerminalForAttempt: true, Output: "safe terminal status",
+	}}}
+	executor.options.Tools = tools
+	models.responses = []app.ModelResponse{{ToolCalls: []app.ModelToolCall{{CallID: "call_terminal_1", Name: tool.Name,
+		Arguments: `{"workspace_id":"w1234567","path":"README.md"}`}}, StopReason: "tool_calls",
+		Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 2}}}
+
+	if err := executor.ExecuteTask(context.Background(), value); err != nil {
+		t.Fatalf("durably terminated tool attempt returned error: %v", err)
+	}
+	if len(tools.calls) != 1 || len(models.calls) != 1 || len(tools.admissionCalls) != 2 || tools.finisherCalls != 1 || store.stopped != 1 {
+		t.Fatalf("tool calls=%d model calls=%d admissions=%d finisher=%d stopped=%d; want one dispatched tool, no follow-up model turn, and a stopped runtime",
+			len(tools.calls), len(models.calls), len(tools.admissionCalls), tools.finisherCalls, store.stopped)
 	}
 }
 

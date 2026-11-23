@@ -93,10 +93,15 @@ func conversationRouteProviderError(err error) error {
 		return routeErr
 	}
 	result := modelConnectionCheckError(err)
-	if errors.As(err, &clientErr) && clientErr.Kind == ModelErrorRateLimited && clientErr.Stage == "provider_status" && clientErr.RetryAfter > 0 {
+	if errors.As(err, &clientErr) && clientErr.Kind == ModelErrorRateLimited && clientErr.Stage == "provider_status" {
 		var routeErr *domain.Error
 		if errors.As(result, &routeErr) && routeErr.Code == domain.CodeRateLimited {
-			routeErr.RetryAfter = clientErr.RetryAfter
+			if clientErr.RetryAfter > 0 {
+				routeErr.RetryAfter = clientErr.RetryAfter
+			}
+			if clientErr.RetryAfterExceedsDurableHorizon {
+				routeErr.Details["retry_after_exceeds_durable_horizon"] = "true"
+			}
 		}
 	}
 	return result
@@ -406,6 +411,9 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request cannot be encoded")
 	}
 	request.Instructions = legacyConversationRouteInstructions + "\n\n" + conversationRouteAcknowledgementInstructions
+	if ConversationRouteDirectToolContextEligible(value) {
+		request.Instructions += "\n\n" + conversationRouteDirectToolInstructions
+	}
 	request.Instructions += "\n\n" + conversationRouteJSONModeExample
 	if value.PreviousUnresolved {
 		request.Instructions += "\n\n" + conversationRouteUnresolvedReplyInstructions

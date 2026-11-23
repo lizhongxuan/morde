@@ -20,6 +20,7 @@ WHERE tasks.conversation_id = $1
       SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
       WHERE pm.project_id = tasks.project_id AND pm.user_id = $3
     )))
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND tasks.status = 'waiting_user'
   AND ($4::text[] IS NULL OR tasks.host_id = ANY($4::text[]))
 GROUP BY tasks.host_id
@@ -67,6 +68,7 @@ SELECT COALESCE(tasks.host_id, '') AS host_id, count(*)::bigint AS task_count
 FROM task_pending_requests pending
 JOIN tasks ON tasks.id = pending.task_id
 WHERE pending.status = 'pending' AND (pending.expires_at IS NULL OR pending.expires_at > now())
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND ((tasks.project_id IS NULL AND tasks.owner_id = $1 AND tasks.initiator_id = tasks.owner_id)
     OR (tasks.project_id IS NOT NULL AND EXISTS (
       SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
@@ -186,6 +188,7 @@ WHERE tasks.conversation_id = $1
       SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
       WHERE pm.project_id = tasks.project_id AND pm.user_id = $3
     )))
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND tasks.status IN ('queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling')
   AND ($4::text[] IS NULL OR tasks.host_id = ANY($4::text[]))
   AND ($5::timestamptz IS NULL OR tasks.created_at < $5::timestamptz
@@ -294,6 +297,7 @@ WHERE tasks.conversation_id = $1
       SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
       WHERE pm.project_id = tasks.project_id AND pm.user_id = $3
     )))
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND (($4::text = 'active' AND tasks.status IN ('queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling'))
     OR ($4::text = 'recent' AND tasks.status IN ('completed', 'failed', 'cancelled'))
     OR ($4::text = 'panel' AND tasks.status IN ('queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling', 'completed', 'failed', 'cancelled')))
@@ -422,6 +426,7 @@ WHERE ((tasks.project_id IS NULL AND tasks.owner_id = $1 AND tasks.initiator_id 
       SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
       WHERE pm.project_id = tasks.project_id AND pm.user_id = $1
     )))
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND ($2::text[] IS NULL OR tasks.host_id = ANY($2::text[]))
   AND ($3::text = '' OR tasks.conversation_id = $3)
   AND ($4::timestamptz IS NULL OR pending.created_at < $4::timestamptz
@@ -676,6 +681,7 @@ WHERE ((tasks.project_id IS NULL AND tasks.owner_id = $1) OR (tasks.project_id I
     SELECT 1 FROM project_members pm JOIN users u ON u.id=pm.user_id AND u.status='approved'
     WHERE pm.project_id=tasks.project_id AND pm.user_id=$1
   )))
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND ($2::text[] IS NULL OR tasks.host_id = ANY($2::text[]))
   AND ($3 = '' OR tasks.status = $3)
   AND ($4::timestamptz IS NULL OR tasks.created_at < $4::timestamptz OR (tasks.created_at = $4::timestamptz AND tasks.id < $5))

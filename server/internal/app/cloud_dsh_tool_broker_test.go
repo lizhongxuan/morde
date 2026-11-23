@@ -825,6 +825,64 @@ func TestCloudDSHToolBrokerReconcilesApprovedActionAfterLostRuntimeReceipt(t *te
 	}
 }
 
+func TestCloudDSHToolBrokerKeepsUnknownWhenRuntimeOperationQueriesStayUnavailable(t *testing.T) {
+	fixture, store, broker, call := newCloudDSHApprovalFixture(t)
+	var operationPosts, operationGets int
+	fixture.wrap = func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodPost && request.URL.Path == "/runtime/v1/operations" {
+				operationPosts++
+			}
+			if request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/runtime/v1/operations/") {
+				operationGets++
+				// Keep the runtime journal result while dropping every read response.
+				recorded := httptest.NewRecorder()
+				next.ServeHTTP(recorded, request)
+				http.Error(writer, "simulated unavailable operation query", http.StatusServiceUnavailable)
+				return
+			}
+			next.ServeHTTP(writer, request)
+		})
+	}
+
+	first, err := broker.Execute(context.Background(), store.details.Task, call)
+	if err != nil || first.Status != AgentToolNeedsUser || operationPosts != 0 {
+		t.Fatalf("initial approval = %#v, %v; posts=%d; want pause before dispatch", first, err, operationPosts)
+	}
+	resumeCloudDSHApproval(fixture, store, task.PendingRequestApproved, task.PendingDecisionApprove)
+	unknown, err := broker.Reconcile(context.Background(), store.details.Task, call, nil)
+	if err != nil || unknown.Status != AgentToolUnknown || store.details.Task.Status != task.StatusWaitingUser ||
+		store.operation.Status != task.OperationUnknown || fixture.handlers["shell.exec"].calls.Load() != 1 || operationPosts != 1 {
+		t.Fatalf("unavailable query result = %#v, %v; task=%#v operation=%#v calls=%d posts=%d",
+			unknown, err, store.details.Task, store.operation, fixture.handlers["shell.exec"].calls.Load(), operationPosts)
+	}
+	reservedToolCalls := store.details.Task.Usage.ToolCalls
+	if reservedToolCalls < 1 {
+		t.Fatalf("unknown operation released its tool-call reservation: usage=%+v", store.details.Task.Usage)
+	}
+
+	expires := time.Now().Add(time.Minute).UTC()
+	store.mu.Lock()
+	store.details.Task.Status = task.StatusRunning
+	store.details.Task.WaitingReason = ""
+	store.details.Task.Lease = task.Lease{Owner: "worker-3", Version: 3, ExpiresAt: &expires}
+	claimed := store.details.Task
+	operation := store.operations[agentOperationKey(call.CallID)]
+	operation.LeaseVersion = claimed.Lease.Version
+	store.operations[operation.Key] = operation
+	store.operation = operation
+	store.mu.Unlock()
+
+	recovered, err := broker.Reconcile(context.Background(), claimed, call, nil)
+	if err != nil || recovered.Status != AgentToolUnknown || store.details.Task.Status != task.StatusWaitingUser ||
+		store.operation.Status != task.OperationUnknown || operationGets < 2 || fixture.handlers["shell.exec"].calls.Load() != 1 ||
+		operationPosts != 1 || store.details.Task.Usage.ToolCalls != reservedToolCalls {
+		t.Fatalf("still-unavailable query recovery = %#v, %v; task=%#v operation=%#v queries=%d calls=%d posts=%d reserved=%d",
+			recovered, err, store.details.Task, store.operation, operationGets, fixture.handlers["shell.exec"].calls.Load(), operationPosts,
+			store.details.Task.Usage.ToolCalls)
+	}
+}
+
 func TestCloudDSHToolBrokerChangedApprovedPayloadDoesNotDispatch(t *testing.T) {
 	fixture, store, broker, call := newCloudDSHApprovalFixture(t)
 	first, err := broker.Execute(context.Background(), store.details.Task, call)

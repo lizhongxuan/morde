@@ -63,6 +63,7 @@ type taskStoreStub struct {
 	actionCalls            int
 	events                 []task.Event
 	eventPage              *TaskEventPage
+	eventPageErr           error
 	storeErr               error
 	grantRevokeCalls       int
 	grantOwnerID           string
@@ -322,8 +323,12 @@ func (s *taskStoreStub) ListTaskEvents(context.Context, string, string, int64, i
 }
 
 func (s *taskStoreStub) GetTaskEventPage(_ context.Context, _ string, _ string, _ int64, _ int32) (TaskEventPage, error) {
+	pageErr := s.eventPageErr
+	if pageErr == nil {
+		pageErr = s.storeErr
+	}
 	if s.eventPage != nil {
-		return *s.eventPage, s.storeErr
+		return *s.eventPage, pageErr
 	}
 	status := s.details.Task.Status
 	if status == "" {
@@ -333,7 +338,7 @@ func (s *taskStoreStub) GetTaskEventPage(_ context.Context, _ string, _ string, 
 	if len(s.events) > 0 {
 		current = s.events[len(s.events)-1].Sequence
 	}
-	return TaskEventPage{HostID: s.details.Task.HostID, Status: status, CurrentSequence: current, Items: s.events}, s.storeErr
+	return TaskEventPage{HostID: s.details.Task.HostID, Status: status, CurrentSequence: current, Items: s.events}, pageErr
 }
 
 func (s *taskStoreStub) RetryFailedBatchItem(_ context.Context, record IdempotencyRecord, taskID, batchItemID string) error {
@@ -1054,9 +1059,9 @@ func TestTaskServiceListEventsValidatesEnvelopeAndAllowsUnknownType(t *testing.T
 
 func TestTaskServiceListEventsPreservesAndAuthorizesExpiredCursorSnapshot(t *testing.T) {
 	store := &taskStoreStub{
-		details:   TaskDetails{Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567"}},
-		eventPage: &TaskEventPage{HostID: "h1234567", Status: task.StatusRunning, CurrentSequence: 9},
-		storeErr:  domain.NewError(domain.CodeEventCursorExpired, "event cursor has expired"),
+		details:      TaskDetails{Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567"}},
+		eventPage:    &TaskEventPage{HostID: "h1234567", Status: task.StatusRunning, CurrentSequence: 9},
+		eventPageErr: domain.NewError(domain.CodeEventCursorExpired, "event cursor has expired"),
 	}
 	authorizer := &taskAuthorizerStub{}
 	service, err := NewTaskService(store, authorizer, &modelCatalogStub{configured: true})
@@ -1128,6 +1133,23 @@ func TestTaskServiceRedactsArtifactsAfterWorkspaceOwnershipTransfer(t *testing.T
 				t.Fatalf("non-owner retained artifact metadata: details=%#v page=%#v", details.Artifacts, page.Items)
 			}
 		})
+	}
+}
+
+func TestTaskServiceHidesInternalRouteTaskFromPublicSurfaces(t *testing.T) {
+	store := &taskStoreStub{details: TaskDetails{Task: task.Task{ID: "q1234567", OwnerID: "u1234567", Status: task.StatusRunning, InternalTool: true}}}
+	authorizer := &taskAuthorizerStub{}
+	service := &TaskService{store: store, authorizer: authorizer, executionAuthorizer: authorizer, actions: store}
+	principal := taskTestPrincipal()
+
+	if _, err := service.Get(context.Background(), principal, "q1234567"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("internal route Task detail error = %v, want not found", err)
+	}
+	if _, err := service.ListEvents(context.Background(), principal, "q1234567", 0, 10); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("internal route Task events error = %v, want not found", err)
+	}
+	if _, err := service.RequestAction(context.Background(), principal, "q1234567", task.ActionCancel, task.StatusRunning, "internal-task-cancel-001"); domain.CodeOf(err) != domain.CodeNotFound || store.actionCalls != 0 {
+		t.Fatalf("internal route Task action error=%v action_calls=%d, want hidden without mutation", err, store.actionCalls)
 	}
 }
 

@@ -745,17 +745,18 @@ func TestCoordinatorGatewayLeavesConfirmedRateLimitForAtomicRecovery(t *testing.
 
 func TestCoordinatorGatewaySettlesKnownIncompleteOutputForBoundedRepair(t *testing.T) {
 	for _, test := range []struct {
-		name     string
-		response ModelResponse
-		wantText string
+		name           string
+		response       ModelResponse
+		wantText       string
+		wantReplayText string
 	}{
 		{name: "truncated but parseable JSON", response: ModelResponse{
 			Text:       `{"action":"reply","task_id":"","question":"","reply":"OK"}`,
 			StopReason: "length", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3},
-		}, wantText: `{"action":"reply","task_id":"","question":"","reply":"OK"}`},
+		}, wantText: `{"action":"reply","task_id":"","question":"","reply":"OK"}`, wantReplayText: "INVALID_MODEL_OUTPUT"},
 		{name: "empty response", response: ModelResponse{
 			StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3},
-		}, wantText: "INVALID_MODEL_OUTPUT"},
+		}, wantText: "INVALID_MODEL_OUTPUT", wantReplayText: "INVALID_MODEL_OUTPUT"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			claim, value := routeGatewayFixture()
@@ -785,7 +786,7 @@ func TestCoordinatorGatewaySettlesKnownIncompleteOutputForBoundedRepair(t *testi
 					response, store.decision, store.unknown, store.usage, client.calls, err)
 			}
 			replayed, err := service.CompleteConversationCoordinatorModel(context.Background(), claim, value, "coord_session_12345678", 0, raw)
-			if err != nil || replayed.Text != response.Text || replayed.StopReason != "invalid_response" || client.calls != 1 {
+			if err != nil || replayed.Text != test.wantReplayText || replayed.StopReason != "invalid_response" || client.calls != 1 {
 				t.Fatalf("settled incomplete output was not replayed without dispatch: response=%+v replay=%+v calls=%d err=%v",
 					response, replayed, client.calls, err)
 			}

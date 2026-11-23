@@ -7,6 +7,7 @@ WHERE ((tasks.project_id IS NULL AND tasks.owner_id = $1) OR (tasks.project_id I
     SELECT 1 FROM project_members pm JOIN users u ON u.id=pm.user_id AND u.status='approved'
     WHERE pm.project_id=tasks.project_id AND pm.user_id=$1
   )))
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND ($2::text[] IS NULL OR tasks.host_id = ANY($2::text[]))
   AND ($3 = '' OR tasks.status = $3)
   AND ($4::timestamptz IS NULL OR tasks.created_at < $4::timestamptz OR (tasks.created_at = $4::timestamptz AND tasks.id < $5))
@@ -22,6 +23,7 @@ WHERE tasks.conversation_id = sqlc.arg(conversation_id)
       SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
       WHERE pm.project_id = tasks.project_id AND pm.user_id = sqlc.arg(actor_id)
     )))
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND tasks.status IN ('queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling')
   AND (sqlc.narg(host_ids)::text[] IS NULL OR tasks.host_id = ANY(sqlc.narg(host_ids)::text[]))
   AND (sqlc.narg(cursor_at)::timestamptz IS NULL OR tasks.created_at < sqlc.narg(cursor_at)::timestamptz
@@ -38,6 +40,7 @@ WHERE tasks.conversation_id = sqlc.arg(conversation_id)
       SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
       WHERE pm.project_id = tasks.project_id AND pm.user_id = sqlc.arg(actor_id)
     )))
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND ((sqlc.arg(task_view)::text = 'active' AND tasks.status IN ('queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling'))
     OR (sqlc.arg(task_view)::text = 'recent' AND tasks.status IN ('completed', 'failed', 'cancelled'))
     OR (sqlc.arg(task_view)::text = 'panel' AND tasks.status IN ('queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling', 'completed', 'failed', 'cancelled')))
@@ -66,6 +69,7 @@ WHERE tasks.conversation_id = sqlc.arg(conversation_id)
       SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
       WHERE pm.project_id = tasks.project_id AND pm.user_id = sqlc.arg(actor_id)
     )))
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND tasks.status = 'waiting_user'
   AND (sqlc.narg(host_ids)::text[] IS NULL OR tasks.host_id = ANY(sqlc.narg(host_ids)::text[]))
 GROUP BY tasks.host_id;
@@ -83,6 +87,7 @@ WHERE ((tasks.project_id IS NULL AND tasks.owner_id = sqlc.arg(actor_id) AND tas
       SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'
       WHERE pm.project_id = tasks.project_id AND pm.user_id = sqlc.arg(actor_id)
     )))
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND (sqlc.narg(host_ids)::text[] IS NULL OR tasks.host_id = ANY(sqlc.narg(host_ids)::text[]))
   AND (sqlc.arg(conversation_id)::text = '' OR tasks.conversation_id = sqlc.arg(conversation_id))
   AND (sqlc.narg(cursor_at)::timestamptz IS NULL OR pending.created_at < sqlc.narg(cursor_at)::timestamptz
@@ -95,6 +100,7 @@ SELECT COALESCE(tasks.host_id, '') AS host_id, count(*)::bigint AS task_count
 FROM task_pending_requests pending
 JOIN tasks ON tasks.id = pending.task_id
 WHERE pending.status = 'pending' AND (pending.expires_at IS NULL OR pending.expires_at > now())
+  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id = tasks.id)
   AND ((tasks.project_id IS NULL AND tasks.owner_id = sqlc.arg(actor_id) AND tasks.initiator_id = tasks.owner_id)
     OR (tasks.project_id IS NOT NULL AND EXISTS (
       SELECT 1 FROM project_members pm JOIN users u ON u.id = pm.user_id AND u.status = 'approved'

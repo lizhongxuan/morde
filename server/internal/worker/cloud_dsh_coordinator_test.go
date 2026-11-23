@@ -449,8 +449,9 @@ func TestCloudDSHCoordinatorRunsMatchingTextOnlyTurn(t *testing.T) {
 	models.response = app.ModelResponse{Text: output, StopReason: "length",
 		Usage: app.ModelUsage{Known: true, InputTokens: 10, OutputTokens: 5}}
 	decision, err = coordinator.ClassifyConversationRoute(context.Background(), claim, value)
-	if err != nil || !decision.InvalidOutput || decision.ModelOutput != output {
-		t.Fatalf("coordinator accepted a provider-truncated but parseable decision: decision=%+v err=%v", decision, err)
+	if err != nil || !decision.InvalidOutput || decision.ModelOutput != "" || decision.InvalidOutputLengthBytes != len(output) ||
+		!decision.InvalidOutputUTF8Valid {
+		t.Fatalf("coordinator retained a provider-truncated model output: decision=%+v err=%v", decision, err)
 	}
 }
 

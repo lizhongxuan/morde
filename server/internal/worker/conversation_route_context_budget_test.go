@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -20,7 +21,7 @@ func TestFitConversationRouteContextDropsHistoryTextButKeepsReferences(t *testin
 	for sequence := int64(1); sequence <= 8; sequence++ {
 		value.History = append(value.History, app.ConversationRouteHistory{
 			MessageID: fmt.Sprintf("m%07d", sequence), Sequence: sequence,
-			Role: conversation.RoleAssistant, Content: strings.Repeat("x", 1800), Truncated: true,
+			Role: conversation.RoleAssistant, Content: strings.Repeat("x", 1800),
 		})
 	}
 	if err := fitConversationRouteContext(&value, 4096); err != nil {
@@ -30,10 +31,12 @@ func TestFitConversationRouteContextDropsHistoryTextButKeepsReferences(t *testin
 		t.Fatalf("context fitting changed the current message or omitted the incomplete marker: %+v", value)
 	}
 	trimmed := false
-	for i, history := range value.History {
-		if history.MessageID == "" || history.Sequence != int64(i+1) {
+	var previousSequence int64
+	for _, history := range value.History {
+		if history.MessageID == "" || history.Sequence <= previousSequence {
 			t.Fatalf("history identity/order was lost: %+v", value.History)
 		}
+		previousSequence = history.Sequence
 		if history.Content == "" {
 			trimmed = true
 			if !history.Truncated {
@@ -50,7 +53,9 @@ func TestFitConversationRouteContextDropsHistoryTextButKeepsReferences(t *testin
 	}
 	var encoded struct {
 		History []struct {
-			MessageID string `json:"message_id"`
+			MessageID     string `json:"message_id"`
+			ContentBytes  int64  `json:"content_bytes"`
+			ContentSHA256 string `json:"content_sha256"`
 		} `json:"history"`
 	}
 	if err := json.Unmarshal([]byte(request.Input[0].Text), &encoded); err != nil {
@@ -62,6 +67,10 @@ func TestFitConversationRouteContextDropsHistoryTextButKeepsReferences(t *testin
 	for index, item := range encoded.History {
 		if item.MessageID != value.History[index].MessageID {
 			t.Fatalf("history reference %d = %q, want %q", index, item.MessageID, value.History[index].MessageID)
+		}
+		wantDigest := sha256.Sum256([]byte(strings.Repeat("x", 1800)))
+		if item.ContentBytes != 1800 || item.ContentSHA256 != hex.EncodeToString(wantDigest[:]) {
+			t.Fatalf("history source metadata %d changed while fitting: %+v", index, item)
 		}
 	}
 }
@@ -77,6 +86,44 @@ func TestFitConversationRouteContextDropsOversizedSummary(t *testing.T) {
 	if value.Content != "short current message" || value.SummaryVersion != 0 || value.SummaryText != "" ||
 		len(value.SummarySHA256) != 0 || len(value.SummarySourcesSHA256) != 0 || !value.HistoryIncomplete {
 		t.Fatalf("oversized summary was not removed with an incomplete-history marker: %+v", value)
+	}
+}
+
+func TestTrimConversationRouteHistoryReferencesMarksAuthorizedSearch(t *testing.T) {
+	firstSource := strings.Repeat("早期原始要求：保留版本号和数字。", 400)
+	secondSource := strings.Repeat("中间原始要求：保留交付格式。", 300)
+	firstDigest, secondDigest := sha256.Sum256([]byte(firstSource)), sha256.Sum256([]byte(secondSource))
+	original := []app.ConversationRouteHistory{
+		{MessageID: "m0000001", Sequence: 1, Role: conversation.RoleUser, Content: firstSource,
+			ContentBytes: int64(len(firstSource)), SourceSHA256: firstDigest[:]},
+		{MessageID: "m0000002", Sequence: 2, Role: conversation.RoleAssistant, Content: secondSource,
+			ContentBytes: int64(len(secondSource)), SourceSHA256: secondDigest[:]},
+		{MessageID: "m0000003", Sequence: 3, Role: conversation.RoleUser, Content: "最近的完整要求", ContentBytes: int64(len("最近的完整要求"))},
+	}
+	value := app.ConversationRouteContext{ActorID: "u1234567", ModelID: "p1234567", Content: "请回忆早期要求",
+		History: append([]app.ConversationRouteHistory(nil), original...)}
+	if !blankConversationRouteHistory(&value) || !blankConversationRouteHistory(&value) ||
+		value.History[0].Content != "" || value.History[1].Content != "" || !value.HistoryIncomplete {
+		t.Fatalf("history text was not safely blanked before reference trimming: %+v", value.History)
+	}
+	if !trimConversationRouteHistoryReferences(&value) || len(value.History) != 2 || !value.HistoryIncomplete ||
+		value.History[0].MessageID != "m0000002" || value.History[1].MessageID != "m0000003" {
+		t.Fatalf("oldest blank reference was not dropped with an incomplete marker: %+v", value)
+	}
+	if original[0].MessageID != "m0000001" || original[0].Content != firstSource || original[0].ContentBytes != int64(len(firstSource)) ||
+		!bytes.Equal(original[0].SourceSHA256, firstDigest[:]) || original[1].Content != secondSource {
+		t.Fatalf("dropping a model-context reference mutated the source snapshot: %+v", original[0])
+	}
+	request, err := app.ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(request.Instructions, "morde_current_conversation_history_search") ||
+		!strings.Contains(request.Instructions, "authorized conversation originals") ||
+		!strings.Contains(request.Input[0].Text, `"history_incomplete":true`) ||
+		strings.Contains(request.Input[0].Text, "m0000001") || !strings.Contains(request.Input[0].Text, "m0000002") {
+		t.Fatalf("incomplete history did not direct the classifier to authorized source search: instructions=%q input=%q",
+			request.Instructions, request.Input[0].Text)
 	}
 }
 
@@ -98,9 +145,16 @@ func TestFitConversationRouteContextKeepsSummaryWhilePreviewingHistory(t *testin
 		t.Fatalf("fitting dropped the summary before shrinking history: %+v", value)
 	}
 	previewed := false
-	for i, history := range value.History {
-		if history.MessageID == "" || history.Sequence != int64(i+1) {
+	var previousSequence int64
+	for _, history := range value.History {
+		if history.MessageID == "" || history.Sequence <= previousSequence {
 			t.Fatalf("history identity/order was lost: %+v", value.History)
+		}
+		previousSequence = history.Sequence
+		originalDigest := sha256.Sum256([]byte(strings.Repeat("x", 4000)))
+		if history.ContentBytes != 4000 || string(history.SourceSHA256) != string(originalDigest[:]) ||
+			history.ContentSHA256 != hex.EncodeToString(originalDigest[:]) {
+			t.Fatalf("history source metadata was not kept through preview/blanking: %+v", history)
 		}
 		if history.Content != "" && len(history.Content) < 4000 && history.Truncated {
 			previewed = true
@@ -115,6 +169,25 @@ func TestFitConversationRouteContextKeepsSummaryWhilePreviewingHistory(t *testin
 	}
 }
 
+func TestPreviewConversationRouteHistoryKeepsStoredSourceMetadata(t *testing.T) {
+	original := strings.Repeat("历史要求：保留开票日期、金额和付款方式。", 180)
+	digest := sha256.Sum256([]byte(original))
+	storedPreview, truncated := app.ConversationRouteTextPreview(original, 4096)
+	if !truncated {
+		t.Fatal("synthetic source did not require a stored preview")
+	}
+	value := app.ConversationRouteContext{History: []app.ConversationRouteHistory{{
+		MessageID: "m1234567", Sequence: 1, Role: conversation.RoleUser, Content: storedPreview,
+		ContentBytes: int64(len(original)), SourceSHA256: digest[:], Truncated: true,
+	}}}
+	wantPreview, _ := app.ConversationRouteTextPreview(storedPreview, app.ConversationRouteHistoryPreviewBytes)
+	if !previewConversationRouteHistory(&value) || value.History[0].Content != wantPreview ||
+		value.History[0].ContentBytes != int64(len(original)) || string(value.History[0].SourceSHA256) != string(digest[:]) ||
+		!value.History[0].Truncated || !value.HistoryIncomplete || int64(len(value.History[0].Content)) > value.History[0].ContentBytes {
+		t.Fatalf("stored history preview lost original source metadata: %+v", value)
+	}
+}
+
 func TestFitConversationRouteContextFitsMinimumWindowWithIncompleteHistoryAndCandidates(t *testing.T) {
 	value := app.ConversationRouteContext{ActorID: "u1234567", Content: "A30 path traversal: A30_TRAVERSAL_FETCH ../outside.pdf",
 		HistoryIncomplete: true, ServerReceivedAt: time.Now(), RequestCandidates: []app.ConversationRouteRequestCandidate{{
@@ -124,9 +197,12 @@ func TestFitConversationRouteContextFitsMinimumWindowWithIncompleteHistoryAndCan
 			Status: task.StatusRunning, Revision: 1,
 		}}}
 	for sequence := int64(1); sequence <= 7; sequence++ {
+		original := fmt.Sprintf("synthetic source %d with additional historical requirements", sequence)
+		digest := sha256.Sum256([]byte(original))
 		value.History = append(value.History, app.ConversationRouteHistory{
 			MessageID: fmt.Sprintf("m%07d", sequence), Sequence: sequence, TaskID: "t1234567",
 			TaskRevision: 1, EventSequence: sequence, Role: "assistant", Truncated: true,
+			ContentBytes: int64(len(original)), SourceSHA256: digest[:],
 		})
 	}
 	if err := fitConversationRouteContext(&value, 4096); err != nil {

@@ -218,6 +218,10 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 			return err
 		}
 		projected := []task.Task{rowTaskDomain(row)}
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls WHERE task_id=$1 AND owner_id=$2)`,
+			row.ID, row.OwnerID).Scan(&projected[0].InternalTool); err != nil {
+			return fmt.Errorf("read internal route tool visibility: %w", err)
+		}
 		if err := populateTaskRevisionProjection(ctx, tx, projected); err != nil {
 			return err
 		}
@@ -476,6 +480,14 @@ func (s *Store) taskEventPage(ctx context.Context, ownerID, taskID string, after
 		taskOwnerID, err = taskOwnerIDForActor(ctx, tx, taskID, ownerID, false, false)
 		if err != nil {
 			return err
+		}
+		var internalTool bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls WHERE task_id=$1 AND owner_id=$2)`,
+			taskID, taskOwnerID).Scan(&internalTool); err != nil {
+			return fmt.Errorf("read internal Task event visibility: %w", err)
+		}
+		if internalTool {
+			return missingTaskError()
 		}
 		err = tx.QueryRow(ctx, `SELECT COALESCE(host_id, ''), status, event_seq,project_id,initiator_id FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).
 			Scan(&result.HostID, &status, &current, &projectID, &initiatorID)
@@ -1113,6 +1125,10 @@ WHERE id=$1 AND current_revision=desired_revision RETURNING event_seq`, id, work
 			return fmt.Errorf("read claimed task: %w", err)
 		}
 		claimed = rowTaskDomain(row)
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls WHERE task_id=$1 AND owner_id=$2)`,
+			claimed.ID, claimed.OwnerID).Scan(&claimed.InternalTool); err != nil {
+			return fmt.Errorf("read internal route tool claim type: %w", err)
+		}
 		claimed.QueueEnteredAt = queueEnteredAt
 		if _, err := tx.Exec(ctx, `UPDATE conversation_message_variants SET state='running',updated_at=clock_timestamp()
 WHERE task_id=$1 AND state IN ('accepted','unknown')`, claimed.ID); err != nil {
@@ -1718,6 +1734,11 @@ FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 		if err != nil {
 			return fmt.Errorf("lock task for progress: %w", err)
 		}
+		var internalTool bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls WHERE task_id=$1 AND owner_id=$2)`,
+			current.ID, current.OwnerID).Scan(&internalTool); err != nil {
+			return fmt.Errorf("read internal route tool completion type: %w", err)
+		}
 		if err := verifyProjectTaskWorkspaceFence(ctx, tx, progress.TaskID, projectWorkspaceFence); err != nil {
 			return err
 		}
@@ -2309,7 +2330,7 @@ AND lease_expires_at > clock_timestamp() RETURNING event_seq`,
 			}
 		}
 		variantAssistantMessageID := ""
-		reviewableResult := progress.Status == task.StatusCompleted && progress.Event.Type == "task.result" &&
+		reviewableResult := !internalTool && progress.Status == task.StatusCompleted && progress.Event.Type == "task.result" &&
 			strings.TrimSpace(progress.Result) != "" && len(progress.Result) <= app.MaxAssistantMessageBytes &&
 			utf8.ValidString(progress.Result) && !strings.ContainsRune(progress.Result, '\x00')
 		if reviewableResult {
@@ -2389,8 +2410,17 @@ WHERE id=$1 AND task_id=$2 AND variant_operation_id=$3 AND output_task_revision=
 						return err
 					}
 				}
+				messageTaskID := current.ID
+				messageSourceKind := ""
+				messageDeliveryStatus := conversation.DeliveryStatus("")
+				if internalTool {
+					messageTaskID = ""
+					messageSourceKind = "conversation"
+					messageDeliveryStatus = conversation.DeliveryApplied
+				}
 				message := conversation.Message{ID: messageID, ConversationID: current.ConversationID, OwnerID: current.OwnerID,
-					ActorID: current.InitiatorID, Role: conversation.RoleAssistant, Content: progress.Result, TaskID: current.ID}
+					ActorID: current.InitiatorID, Role: conversation.RoleAssistant, Content: progress.Result, TaskID: messageTaskID, ModelID: current.ModelID,
+					SourceKind: messageSourceKind, DeliveryStatus: messageDeliveryStatus}
 				if !alreadySaved {
 					if messageID == snapshotID && snapshotID != "" {
 						updated, err := tx.Exec(ctx, `UPDATE conversation_messages SET content=$1,output_status='completed',output_result_event_sequence=$2
@@ -2418,8 +2448,10 @@ WHERE id=$3 AND task_id=$4 AND conversation_id=$5 AND owner_id=$6 AND actor_id=$
 					} else if err := insertMessage(ctx, tx, message); err != nil {
 						return err
 					}
-					if err := completeAssistantMessageSnapshot(ctx, tx, progress.TaskID, progress.CurrentStep, message); err != nil {
-						return err
+					if !internalTool {
+						if err := completeAssistantMessageSnapshot(ctx, tx, progress.TaskID, progress.CurrentStep, message); err != nil {
+							return err
+						}
 					}
 				}
 				variantAssistantMessageID = messageID

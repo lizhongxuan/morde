@@ -51,7 +51,7 @@ export function hermesCompactionMadeProgress(beforeTokens, afterTokens, shadowed
 
 // Input rows are current DSH surface order, priced by TokenMeter. isUserInput identifies
 // real user messages (including non-text input), isSummary identifies prior checkpoints,
-// and balancedBefore is DSH's tool-pair balance at that cut. A pinned child retains its
+// and balancedBefore is DSH's tool-pair balance at that cut. A pinned Task retains its
 // opening brief. The latest user input is never removed: DSH has no verbatim turn replay.
 export function planHermesCompaction(rows, { contextWindow, outputTokens = 0, repeated = false, pinTask = false }) {
   const { tailTokens } = hermesCompactionBudget(contextWindow, outputTokens)
@@ -62,7 +62,14 @@ export function planHermesCompaction(rows, { contextWindow, outputTokens = 0, re
 
   const systemHead = rows[0].role === 'system' ? 1 : 0
   const resumedSummary = rows.slice(systemHead, systemHead + 7).some(row => row.isSummary)
-  let start = Math.min(n, systemHead + (pinTask ? 1 : repeated || resumedSummary ? 0 : 3))
+  let start
+  if (pinTask) {
+    const taskBrief = rows.findIndex((row, index) => index >= systemHead && row.isUserInput)
+    start = taskBrief >= systemHead ? taskBrief + 1 : systemHead + 1
+  } else {
+    start = systemHead + (repeated || resumedSummary ? 0 : 3)
+  }
+  start = Math.min(n, start)
   while (start < n && !rows[start].balancedBefore) start++
   if (start >= n) return null
 

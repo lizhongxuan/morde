@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"strings"
 	"testing"
 	"time"
@@ -53,10 +54,12 @@ func TestH01LongPriorMessageUsesBoundedHistoryAndRequestPreviews(t *testing.T) {
 		t.Fatalf("long prior request was not represented by a bounded preview and full digest: bytes=%d truncated=%t digest=%x",
 			len(candidate.Content), candidate.ContentTruncated, candidate.ContentSHA256)
 	}
-	var historyFound, assistantReplyFound bool
+	var historyFound, historySourceIntegrity, assistantReplyFound bool
 	for _, item := range snapshot.Context.History {
 		if item.MessageID == prior.Message.ID {
 			historyFound = item.Truncated && len(item.Content) < len(priorText) && len(item.Content) <= 8192
+			historySourceIntegrity = item.ContentBytes == int64(len(priorText)) &&
+				string(item.SourceSHA256) == string(wantDigest[:]) && item.ContentSHA256 == hex.EncodeToString(wantDigest[:])
 		}
 		if item.Role == "assistant" && item.Content == "I have received the long request." {
 			assistantReplyFound = true
@@ -64,6 +67,9 @@ func TestH01LongPriorMessageUsesBoundedHistoryAndRequestPreviews(t *testing.T) {
 	}
 	if !historyFound {
 		t.Fatalf("long prior message was not preserved as a truncated history reference: %+v", snapshot.Context.History)
+	}
+	if !historySourceIntegrity {
+		t.Fatalf("route history did not retain the original source length and digest: %+v", snapshot.Context.History)
 	}
 	if !assistantReplyFound {
 		t.Fatalf("completed direct assistant reply was omitted from follow-up history: %+v", snapshot.Context.History)

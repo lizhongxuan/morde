@@ -722,24 +722,46 @@ func TestProviderRateLimitCarriesBoundedRetryAfter(t *testing.T) {
 	}
 }
 
+func TestProviderRateLimitMarksRetryAfterBeyondDurableHorizon(t *testing.T) {
+	client := newTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		response := jsonResponse(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_exceeded"}}`)
+		response.Header.Set("Retry-After", "172800")
+		return response, nil
+	}))
+	_, err := client.Complete(context.Background(), app.ModelRequest{
+		Endpoint: testEndpoint(), Input: []app.ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 10,
+	})
+	var providerErr *app.ModelClientError
+	if !errors.As(err, &providerErr) || providerErr.Kind != app.ModelErrorRateLimited ||
+		providerErr.RetryAfter != 0 || !providerErr.RetryAfterExceedsDurableHorizon {
+		t.Fatalf("over-horizon provider retry hint = %#v, err=%v", providerErr, err)
+	}
+}
+
 func TestParseProviderRetryAfter(t *testing.T) {
 	now := time.Date(2026, 11, 22, 12, 0, 0, 0, time.UTC)
 	for _, test := range []struct {
-		value string
-		want  time.Duration
-		ok    bool
+		value         string
+		want          time.Duration
+		ok            bool
+		beyondHorizon bool
 	}{
 		{value: "2", want: 2 * time.Second, ok: true},
 		{value: "0", want: 0, ok: true},
+		{value: "86400", want: 24 * time.Hour, ok: true},
+		{value: "172800", ok: true, beyondHorizon: true},
 		{value: now.Add(4 * time.Second).Format(http.TimeFormat), want: 4 * time.Second, ok: true},
+		{value: now.Add(48 * time.Hour).Format(http.TimeFormat), ok: true, beyondHorizon: true},
 		{value: now.Add(-time.Second).Format(http.TimeFormat), want: 0, ok: true},
-		{value: "99999999", want: 24 * time.Hour, ok: true},
+		{value: "99999999", ok: true, beyondHorizon: true},
+		{value: "18446744073709551616", ok: true, beyondHorizon: true},
 		{value: "invalid", want: 0, ok: false},
 		{value: "-2", want: 0, ok: false},
 	} {
-		got, ok := parseProviderRetryAfter(test.value, now)
-		if got != test.want || ok != test.ok {
-			t.Errorf("parseProviderRetryAfter(%q) = %s, %t; want %s, %t", test.value, got, ok, test.want, test.ok)
+		got, ok, beyondHorizon := parseProviderRetryAfter(test.value, now)
+		if got != test.want || ok != test.ok || beyondHorizon != test.beyondHorizon {
+			t.Errorf("parseProviderRetryAfter(%q) = %s, %t, %t; want %s, %t, %t",
+				test.value, got, ok, beyondHorizon, test.want, test.ok, test.beyondHorizon)
 		}
 	}
 }

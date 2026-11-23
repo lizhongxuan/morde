@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -40,18 +41,26 @@ type cloudDSHHistoryTaskStore struct {
 
 type cloudDSHCurrentMessageChunkTestStore struct {
 	TaskStore
-	messageID string
-	taskID    string
-	content   string
-	runes     []rune
+	messageID     string
+	taskID        string
+	content       string
+	runes         []rune
+	corrupt       bool
+	corruptOffset *int64
+	readErr       error
+	readOffsets   []int64
 }
 
 func (s *cloudDSHCurrentMessageChunkTestStore) ReadCurrentConversationMessageChunk(_ context.Context, current task.Task,
 	messageID string, runeOffset int64, maxRunes int) (CurrentConversationMessageChunk, error) {
+	if s.readErr != nil {
+		return CurrentConversationMessageChunk{}, s.readErr
+	}
 	if current.ID != s.taskID || messageID != s.messageID || current.ConversationContext == nil ||
 		runeOffset < 0 || runeOffset > int64(len(s.runes)) || maxRunes < 1 || maxRunes > MaxConversationMessageChunkRunes {
 		return CurrentConversationMessageChunk{}, domain.NewError(domain.CodeNotFound, "current conversation message is unavailable")
 	}
+	s.readOffsets = append(s.readOffsets, runeOffset)
 	start, end, bytes := int(runeOffset), int(runeOffset), 0
 	for end < len(s.runes) && end-start < maxRunes {
 		nextBytes := utf8.RuneLen(s.runes[end])
@@ -63,6 +72,12 @@ func (s *cloudDSHCurrentMessageChunkTestStore) ReadCurrentConversationMessageChu
 	}
 	digest := sha256.Sum256([]byte(s.content))
 	content := string(s.runes[start:end])
+	corrupt := s.corrupt || s.corruptOffset != nil && *s.corruptOffset == runeOffset
+	if corrupt && len(content) > 0 {
+		corrupted := []byte(content)
+		corrupted[0] ^= 1
+		content = string(corrupted)
+	}
 	return CurrentConversationMessageChunk{MessageID: s.messageID, TaskID: current.ID,
 		Sequence: current.ConversationContext.ThroughSequence + 1, Role: conversation.RoleUser,
 		RuneOffset: runeOffset, NextRuneOffset: int64(end), TotalRunes: int64(len(s.runes)), SHA256: digest[:], Content: content}, nil
@@ -373,6 +388,39 @@ func cloudDSHTestStringPointer(value string) *string {
 	return &value
 }
 
+func TestCloudDSHCurrentMessageReadDefinitionUsesCanonicalPageOffsets(t *testing.T) {
+	definition := cloudDSHCurrentConversationMessageReadDefinition()
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if json.Unmarshal(definition.Parameters, &schema) != nil {
+		t.Fatal("current message reader schema is invalid JSON")
+	}
+	if definition.Name != cloudDSHCurrentMessageReadToolName || schema.Properties["max_runes"] != nil ||
+		len(schema.Required) != 3 || schema.Required[0] != "message_id" || schema.Required[1] != "sha256" || schema.Required[2] != "rune_offset" ||
+		!strings.Contains(definition.Description, "at most 33 pages") || !strings.Contains(definition.Description, "in order") {
+		t.Fatalf("message reader schema did not enforce server-fixed canonical pages: definition=%+v schema=%+v", definition, schema)
+	}
+}
+
+func TestCloudDSHCurrentMessageSearchDefinitionRequiresBoundedQueryAndSource(t *testing.T) {
+	definition := cloudDSHCurrentConversationMessageSearchDefinition()
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if json.Unmarshal(definition.Parameters, &schema) != nil {
+		t.Fatal("current message search schema is invalid JSON")
+	}
+	if definition.Name != cloudDSHCurrentMessageSearchToolName || !definition.Strict ||
+		len(schema.Required) != 3 || schema.Required[0] != "message_id" || schema.Required[1] != "sha256" ||
+		schema.Required[2] != "query" || len(schema.Properties) != 3 ||
+		!strings.Contains(definition.Description, "without sending the full body to the model") {
+		t.Fatalf("message search schema did not bind a bounded query to the authorized source: definition=%+v schema=%+v", definition, schema)
+	}
+}
+
 func TestCloudDSHCurrentConversationHistorySearchReturnsMiddleOfLongMessage(t *testing.T) {
 	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
 	claimed.ConversationContext.ThroughSequence = 1
@@ -420,7 +468,7 @@ func TestCloudDSHCurrentConversationHistorySearchReturnsMiddleOfLongMessage(t *t
 	}
 }
 
-func TestCloudDSHCurrentMessageReaderReconstructsMoreThan200KiBExactly(t *testing.T) {
+func TestCloudDSHCurrentMessageReaderReconstructsOneMiBWithCanonicalPages(t *testing.T) {
 	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
 	claimed.ConversationContext.ThroughSequence = 0
 	configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
@@ -428,12 +476,17 @@ func TestCloudDSHCurrentMessageReaderReconstructsMoreThan200KiBExactly(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	const totalBytes = 200<<10 + 1
+	const totalBytes = 1 << 20
 	prefix, middle, suffix := "START-ANCHOR", "MIDDLE-ANCHOR", "END-ANCHOR"
-	firstRun := strings.Repeat("a", 8179)
-	remaining := totalBytes - len(prefix) - len(firstRun) - len("汉") - len(middle) - len(suffix)
-	content := prefix + firstRun + "汉" + strings.Repeat("b", remaining/2) + middle +
-		strings.Repeat("c", remaining-remaining/2) + suffix
+	fillUTF8 := func(size int) string {
+		return strings.Repeat("汉", size/3) + strings.Repeat("x", size%3)
+	}
+	firstRunBytes := MaxConversationMessageChunkBytes - len(prefix) - 1
+	firstRun := fillUTF8(firstRunBytes)
+	const middleByteOffset = MaxConversationMessageChunkBytes - 1 + 15*(MaxConversationMessageChunkBytes/3*3) + 999
+	leftFillBytes := middleByteOffset - len(prefix) - len(firstRun) - len("汉")
+	rightFillBytes := totalBytes - middleByteOffset - len(middle) - len(suffix)
+	content := prefix + firstRun + "汉" + fillUTF8(leftFillBytes) + middle + fillUTF8(rightFillBytes) + suffix
 	if len(content) != totalBytes {
 		t.Fatalf("fixture bytes=%d, want %d", len(content), totalBytes)
 	}
@@ -442,19 +495,38 @@ func TestCloudDSHCurrentMessageReaderReconstructsMoreThan200KiBExactly(t *testin
 	if !strings.Contains(objective, "sha256="+hex.EncodeToString(digest[:])) {
 		t.Fatal("long-message Task objective did not carry the expected source digest")
 	}
+	source, err := BuildConversationMessageSourceManifest(messageID, 1, content)
+	if err != nil || !ValidConversationMessageSourceManifest(source) || len(source.Pages) > 33 {
+		t.Fatalf("1 MiB source manifest = pages:%d err:%v", len(source.Pages), err)
+	}
+	claimed.ConversationContext.CurrentMessageSource = source
 	store := &cloudDSHCurrentMessageChunkTestStore{TaskStore: broker.store, messageID: messageID, taskID: claimed.ID,
 		content: content, runes: []rune(content)}
 	broker.store = store
 	var rebuilt strings.Builder
 	var offset int64
+	const maxExpectedChunkReads = 33
+	anchorChunks := make(map[string]int, 3)
+	firstPageArguments, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(digest[:]),
+		"rune_offset": source.Pages[0].RuneOffset})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_out_of_order",
+		Name: cloudDSHCurrentMessageReadToolName, Arguments: fmt.Sprintf(`{"message_id":%q,"sha256":%q,"rune_offset":%d}`,
+			messageID, hex.EncodeToString(digest[:]), source.Pages[1].RuneOffset)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState || len(baseStore.events) != 0 {
+		t.Fatalf("reader accepted a skipped first page: events=%d err=%v", len(baseStore.events), err)
+	}
 	for calls := 0; ; calls++ {
-		if calls >= 100 || offset > int64(len(store.runes)) {
+		if calls >= maxExpectedChunkReads || calls >= int(claimed.Budget.ToolCalls) || offset > int64(len(store.runes)) {
 			t.Fatalf("chunk reader did not make bounded forward progress: calls=%d offset=%d/%d", calls, offset, len(store.runes))
 		}
-		arguments, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(digest[:]),
-			"rune_offset": offset, "max_runes": MaxConversationMessageChunkRunes})
-		if err != nil {
-			t.Fatal(err)
+		arguments := firstPageArguments
+		if calls > 0 {
+			arguments, err = json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(digest[:]), "rune_offset": offset})
+			if err != nil {
+				t.Fatal(err)
+			}
 		}
 		result, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: fmt.Sprintf("long_read_%03d", calls),
 			Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}, false, nil)
@@ -467,24 +539,46 @@ func TestCloudDSHCurrentMessageReaderReconstructsMoreThan200KiBExactly(t *testin
 		}
 		if chunk.MessageID != messageID || chunk.Role != conversation.RoleUser || chunk.RuneOffset != offset ||
 			chunk.NextRuneOffset <= offset || chunk.TotalRunes != int64(len(store.runes)) ||
-			chunk.SHA256 != hex.EncodeToString(digest[:]) || !utf8.ValidString(chunk.Content) ||
+			chunk.Page != calls+1 || chunk.PageCount != len(source.Pages) || chunk.SHA256 != hex.EncodeToString(digest[:]) ||
+			chunk.ChunkSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(chunk.Content))) || !utf8.ValidString(chunk.Content) ||
 			len(chunk.Content) > MaxConversationMessageChunkBytes ||
 			chunk.NextRuneOffset-offset != int64(utf8.RuneCountInString(chunk.Content)) {
 			t.Fatalf("reader returned a discontinuous or oversized chunk: %+v", chunk)
 		}
+		for _, anchor := range []string{prefix, middle, suffix} {
+			if strings.Contains(chunk.Content, anchor) {
+				anchorChunks[anchor] = calls
+			}
+		}
 		if calls == 0 {
-			if len(chunk.Content) != 8179+len(prefix) {
-				t.Fatalf("first chunk split the boundary rune: bytes=%d, want before the three-byte rune", len(chunk.Content))
+			if len(chunk.Content) != MaxConversationMessageChunkBytes-1 {
+				t.Fatalf("first chunk split the boundary rune: bytes=%d, want %d", len(chunk.Content), MaxConversationMessageChunkBytes-1)
+			}
+			if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_duplicate",
+				Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState || len(baseStore.events) != 1 {
+				t.Fatalf("reader accepted a duplicate page: events=%d err=%v", len(baseStore.events), err)
+			}
+			if len(source.Pages) > 2 {
+				if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_skipped_middle",
+					Name: cloudDSHCurrentMessageReadToolName, Arguments: fmt.Sprintf(`{"message_id":%q,"sha256":%q,"rune_offset":%d}`,
+						messageID, hex.EncodeToString(digest[:]), source.Pages[2].RuneOffset)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState || len(baseStore.events) != 1 {
+					t.Fatalf("reader accepted a skipped middle page: events=%d err=%v", len(baseStore.events), err)
+				}
 			}
 			replay, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_replay",
 				Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}, true, cloudDSHTestStringPointer(result.Output))
 			if err != nil || replay.Output != result.Output || len(baseStore.events) != 1 {
 				t.Fatalf("checkpoint replay changed or recommitted the same source chunk: replay=%+v events=%d err=%v", replay, len(baseStore.events), err)
 			}
+			changedArguments, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(digest[:]),
+				"rune_offset": source.Pages[1].RuneOffset})
+			if err != nil {
+				t.Fatal(err)
+			}
 			store.content += "changed"
 			store.runes = []rune(store.content)
 			if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_changed_source",
-				Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState || len(baseStore.events) != 1 {
+				Name: cloudDSHCurrentMessageReadToolName, Arguments: string(changedArguments)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState || len(baseStore.events) != 1 {
 				t.Fatalf("changed source was mixed into a multi-chunk read: events=%d err=%v", len(baseStore.events), err)
 			}
 			store.content = content
@@ -496,11 +590,182 @@ func TestCloudDSHCurrentMessageReaderReconstructsMoreThan200KiBExactly(t *testin
 			break
 		}
 	}
+	if len(anchorChunks) != 3 || anchorChunks[prefix] == anchorChunks[middle] || anchorChunks[middle] == anchorChunks[suffix] ||
+		anchorChunks[prefix] == anchorChunks[suffix] {
+		t.Fatalf("1 MiB source anchors were not recovered from distinct chunks: anchors=%v rebuiltBytes=%d totalBytes=%d hasSuffix=%t",
+			anchorChunks, rebuilt.Len(), len(content), strings.Contains(rebuilt.String(), suffix))
+	}
 	if rebuilt.String() != content || !strings.HasPrefix(rebuilt.String(), prefix) ||
 		!strings.Contains(rebuilt.String(), middle) || !strings.HasSuffix(rebuilt.String(), suffix) ||
-		baseStore.details.Task.Usage.ToolCalls == 0 {
+		baseStore.details.Task.Usage.ToolCalls == 0 || sha256.Sum256([]byte(rebuilt.String())) != digest {
 		t.Fatalf("bounded reads did not reconstruct the immutable source and all anchors: bytes=%d want=%d toolCalls=%d",
 			rebuilt.Len(), len(content), baseStore.details.Task.Usage.ToolCalls)
+	}
+}
+
+func TestCloudDSHCurrentMessageSearchFindsOneMiBAnchorsWithinBoundedOutput(t *testing.T) {
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	claimed.ConversationContext.ThroughSequence = 0
+	configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const totalBytes = 1 << 20
+	anchors := []struct {
+		text   string
+		offset int
+	}{{"START-ANCHOR", 100}, {"QUARTER-ANCHOR", totalBytes / 4}, {"MIDDLE-ANCHOR", totalBytes / 2},
+		{"THREE-QUARTERS-ANCHOR", 3 * totalBytes / 4}, {"END-ANCHOR", totalBytes - 100 - len("END-ANCHOR")}}
+	contentBytes := bytes.Repeat([]byte{'<'}, totalBytes)
+	for _, anchor := range anchors {
+		copy(contentBytes[anchor.offset:], anchor.text)
+	}
+	content := string(contentBytes)
+	source, err := BuildConversationMessageSourceManifest(messageID, 1, content)
+	if err != nil || len(source.Pages) < 3 {
+		t.Fatalf("one MiB message source pages=%d err=%v", len(source.Pages), err)
+	}
+	claimed.ConversationContext.CurrentMessageSource = source
+	claimed.Budget.ModelTokens = 10_000
+	baseStore.details.Task = claimed
+	store := &cloudDSHCurrentMessageChunkTestStore{TaskStore: broker.store, messageID: messageID, taskID: claimed.ID,
+		content: content, runes: []rune(content)}
+	broker.store = store
+	definitions, err := broker.Definitions(context.Background(), claimed)
+	if err != nil || !containsAgentTool(definitions, cloudDSHCurrentMessageSearchToolName) {
+		t.Fatalf("current long-message search tool was not exposed: definitions=%v err=%v", definitions, err)
+	}
+	arguments, err := json.Marshal(cloudDSHCurrentMessageSearchArguments{MessageID: messageID, SHA256: hex.EncodeToString(source.SHA256),
+		Query: "START-ANCHOR QUARTER-ANCHOR MIDDLE-ANCHOR THREE-QUARTERS-ANCHOR END-ANCHOR"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_message_targeted_search",
+		Name: cloudDSHCurrentMessageSearchToolName, Arguments: string(arguments)}, false, nil)
+	if err != nil || result.Status != AgentToolSucceeded {
+		t.Fatalf("one MiB targeted search=%+v err=%v", result, err)
+	}
+	var output cloudDSHCurrentMessageSearchResult
+	if err := json.Unmarshal([]byte(result.Output), &output); err != nil {
+		t.Fatal(err)
+	}
+	if !output.Complete || output.Partial || output.PageCount != len(source.Pages) || output.ScannedPages != len(source.Pages) ||
+		len(output.Matches) != len(anchors) || len(result.Output) > cloudDSHCurrentMessageSearchMaxOutputBytes ||
+		strings.Contains(result.Output, strings.Repeat("\\u003c", 1024)) ||
+		baseStore.details.Task.Usage.ToolCalls != 1 || len(store.readOffsets) != len(source.Pages) {
+		t.Fatalf("targeted search did not return bounded complete results: output=%+v bytes=%d toolCalls=%d pagesRead=%d",
+			output, len(result.Output), baseStore.details.Task.Usage.ToolCalls, len(store.readOffsets))
+	}
+	seenPages := make(map[int]struct{}, len(output.Matches))
+	for _, match := range output.Matches {
+		if match.Page < 1 || match.Page > len(source.Pages) || match.PageSHA256 != hex.EncodeToString(source.Pages[match.Page-1].SHA256) ||
+			utf8.RuneCountInString(match.Content) > cloudDSHCurrentMessageSearchExcerptRunes {
+			t.Fatalf("search returned an invalid page citation or oversized excerpt: %+v", match)
+		}
+		seenPages[match.Page] = struct{}{}
+	}
+	for _, anchor := range anchors {
+		found := false
+		for _, match := range output.Matches {
+			found = found || strings.Contains(match.Content, anchor.text)
+		}
+		if !found {
+			t.Errorf("targeted search omitted anchor %q: matches=%+v", anchor.text, output.Matches)
+		}
+	}
+	if len(seenPages) != len(anchors) {
+		t.Fatalf("anchors were not tied to distinct pages: %+v", output.Matches)
+	}
+	corruptOffset := source.Pages[1].RuneOffset
+	store.corruptOffset = &corruptOffset
+	beforeEvents := len(baseStore.events)
+	if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_message_corrupt_search",
+		Name: cloudDSHCurrentMessageSearchToolName, Arguments: string(arguments)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState ||
+		baseStore.details.Task.Usage.ToolCalls != 1 || len(baseStore.events) != beforeEvents {
+		t.Fatalf("search returned partial results or committed progress after a corrupt page: toolCalls=%d events=%d err=%v",
+			baseStore.details.Task.Usage.ToolCalls, len(baseStore.events), err)
+	}
+}
+
+func TestCloudDSHCurrentMessageReaderRejectsCorruptPageBeforeReturningIt(t *testing.T) {
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	claimed.ConversationContext.ThroughSequence = 0
+	configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := strings.Repeat("verified page data ", 3000)
+	source, err := BuildConversationMessageSourceManifest(messageID, 1, content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed.ConversationContext.CurrentMessageSource = source
+	store := &cloudDSHCurrentMessageChunkTestStore{TaskStore: baseStore, messageID: messageID, taskID: claimed.ID,
+		content: content, runes: []rune(content), corrupt: true}
+	broker.store = store
+	arguments, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(source.SHA256), "rune_offset": int64(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongVersion, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": strings.Repeat("0", 64), "rune_offset": int64(0)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_wrong_source_version",
+		Name: cloudDSHCurrentMessageReadToolName, Arguments: string(wrongVersion)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState || len(baseStore.events) != 0 {
+		t.Fatalf("reader accepted a mismatched source digest: events=%d err=%v", len(baseStore.events), err)
+	}
+	if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_corrupt_page",
+		Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState ||
+		len(baseStore.events) != 0 || baseStore.details.Task.Usage.ToolCalls != 0 {
+		t.Fatalf("corrupted page reached the model or committed progress: events=%d tool_calls=%d err=%v",
+			len(baseStore.events), baseStore.details.Task.Usage.ToolCalls, err)
+	}
+}
+
+func TestCloudDSHCurrentMessageReaderKeepsOnlyVerifiedPagesAfterTimeout(t *testing.T) {
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	claimed.ConversationContext.ThroughSequence = 0
+	configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := strings.Repeat("verified page data ", 5000)
+	source, err := BuildConversationMessageSourceManifest(messageID, 1, content)
+	if err != nil || len(source.Pages) < 2 {
+		t.Fatalf("multi-page source manifest = %+v err=%v", source, err)
+	}
+	claimed.ConversationContext.CurrentMessageSource = source
+	store := &cloudDSHCurrentMessageChunkTestStore{TaskStore: broker.store, messageID: messageID, taskID: claimed.ID,
+		content: content, runes: []rune(content)}
+	broker.store = store
+	arguments, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(source.SHA256),
+		"rune_offset": source.Pages[0].RuneOffset})
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_before_timeout",
+		Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}, false, nil)
+	if err != nil || first.Status != AgentToolSucceeded || len(baseStore.events) != 1 {
+		t.Fatalf("first verified page=%+v events=%d err=%v", first, len(baseStore.events), err)
+	}
+	store.readErr = domain.NewError(domain.CodeUpstreamTimeout, "source read timed out")
+	nextArguments, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(source.SHA256),
+		"rune_offset": source.Pages[1].RuneOffset})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_timeout",
+		Name: cloudDSHCurrentMessageReadToolName, Arguments: string(nextArguments)}, false, nil); domain.CodeOf(err) != domain.CodeUpstreamTimeout {
+		t.Fatalf("timed-out page returned error %v", err)
+	}
+	readThrough, err := cloudDSHCurrentMessageReadThroughPage(baseStore.details.Steps, source)
+	if err != nil || readThrough != 1 || len(baseStore.events) != 1 || baseStore.details.Task.Usage.ToolCalls != 1 {
+		t.Fatalf("timeout exposed or committed an unverified page: read_through=%d events=%d calls=%d err=%v",
+			readThrough, len(baseStore.events), baseStore.details.Task.Usage.ToolCalls, err)
 	}
 }
 

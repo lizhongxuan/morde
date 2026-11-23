@@ -56,6 +56,9 @@ func (s *TaskService) RequestActionWithRevisionFence(
 	if err != nil {
 		return TaskActionResult{}, err
 	}
+	if details.Task.InternalTool {
+		return TaskActionResult{}, domain.NewError(domain.CodeNotFound, "task not found")
+	}
 	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return TaskActionResult{}, hideTaskAccessError(err)
 	}
