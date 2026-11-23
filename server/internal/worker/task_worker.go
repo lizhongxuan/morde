@@ -259,7 +259,7 @@ func (w *TaskWorker) runClaimLoop(ctx context.Context) {
 		w.metrics.observeClaim(claimed, time.Now())
 		if err := w.runClaimed(ctx, claimed); err != nil && ctx.Err() == nil {
 			if !errors.Is(err, errTaskExecutorPanicked) {
-				fields := []zap.Field{zap.String("task_id", claimed.ID), zap.String("error_type", fmt.Sprintf("%T", err))}
+				fields := []zap.Field{zap.String("task_id", claimed.ID), zap.String("error_type", fmt.Sprintf("%T", err)), zap.Error(err)}
 				var staged interface{ RuntimeStartupStage() string }
 				if errors.As(err, &staged) {
 					fields = append(fields, zap.String("runtime_startup_stage", staged.RuntimeStartupStage()))

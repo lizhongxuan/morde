@@ -29,6 +29,26 @@ func TestCloudDSHAgentStatusFrameRequiresExactFields(t *testing.T) {
 	}
 }
 
+func TestCloudDSHFailedFrameCarriesOptionalReason(t *testing.T) {
+	identity := `"task_id":"q1234567","owner_id":"u1234567","agent_id":"agent_1","generation":2,"authorization_version":1,"session_id":"session_1"`
+	frame, err := decodeCloudDSHFrame([]byte(`{"type":"failed","code":"runtime_unavailable",` + identity + `}`))
+	if err != nil || frame.Code != "runtime_unavailable" || frame.Reason != "" {
+		t.Fatalf("valid failed frame without reason = %#v, %v", frame, err)
+	}
+	frame, err = decodeCloudDSHFrame([]byte(`{"type":"failed","code":"runtime_unavailable",` + identity + `,"reason":"model execution requires an authorized session checkpoint"}`))
+	if err != nil || frame.Code != "runtime_unavailable" || frame.Reason != "model execution requires an authorized session checkpoint" {
+		t.Fatalf("valid failed frame with reason = %#v, %v", frame, err)
+	}
+	for _, raw := range []string{
+		`{"type":"failed","code":"runtime_unavailable",` + identity + `,"reason":"x","extra":true}`,
+		`{"type":"failed",` + identity + `,"reason":"x"}`,
+	} {
+		if _, err := decodeCloudDSHFrame([]byte(raw)); err == nil {
+			t.Fatalf("invalid failed frame accepted: %s", raw)
+		}
+	}
+}
+
 func TestCloudDSHAgentActivityFramesRequireExactFields(t *testing.T) {
 	identity := `"task_id":"q1234567","owner_id":"u1234567","agent_id":"agent_1","generation":2,"authorization_version":1,"session_id":"session_1"`
 	validActivity := `{"type":"agent_activity",` + identity + `,"task_revision":4,"observation_sequence":9,"phase":"tool","state":"waiting","activity_id":"call_123"}`

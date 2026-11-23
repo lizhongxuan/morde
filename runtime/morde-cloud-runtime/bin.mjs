@@ -17,9 +17,10 @@ try {
   const start = await ipc.start.promise
   const result = await runAgent(ipc, start)
   await ipc.send(result)
-} catch {
+} catch (error) {
   process.exitCode = 1
-  await ipc.send({ type: 'failed', code: 'runtime_unavailable' }).catch(() => {})
+  const reason = error instanceof Error ? error.message : String(error)
+  await ipc.send({ type: 'failed', code: 'runtime_unavailable', reason: reason.slice(0, 1024) }).catch(() => {})
 } finally {
   process.stdin.destroy()
 }
