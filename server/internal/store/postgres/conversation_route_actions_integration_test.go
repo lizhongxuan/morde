@@ -1191,32 +1191,100 @@ func TestConversationRouteStaleDecisionReclassifiesWithoutStoppingTask(t *testin
 	}
 }
 
+func createConversationRouteActionTask(t *testing.T, f routeActionsTestFixture, clientID, content string) string {
+	t.Helper()
+	ctx := context.Background()
+	claim := f.receive(t, clientID, content, app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatal(err)
+	}
+	var taskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, claim.Message.ID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	return taskID
+}
+
+func claimConversationRouteActionTask(t *testing.T, f routeActionsTestFixture, taskID, worker string) {
+	t.Helper()
+	claimed, found, err := f.store.ClaimNextTask(context.Background(), worker, time.Minute)
+	if err != nil || !found || claimed.ID != taskID || claimed.Status != task.StatusRunning {
+		t.Fatalf("claim running Task %s: claimed=%s status=%s found=%t err=%v", taskID, claimed.ID, claimed.Status, found, err)
+	}
+}
+
+func assertConversationRouteActionTaskState(t *testing.T, f routeActionsTestFixture, taskID string,
+	wantStatus task.Status, wantCurrentRevision, wantDesiredRevision int64) {
+	t.Helper()
+	var status string
+	var currentRevision, desiredRevision int64
+	if err := f.store.pool.QueryRow(context.Background(), `SELECT status,current_revision,desired_revision FROM tasks WHERE id=$1`, taskID).
+		Scan(&status, &currentRevision, &desiredRevision); err != nil {
+		t.Fatal(err)
+	}
+	if status != string(wantStatus) || currentRevision != wantCurrentRevision || desiredRevision != wantDesiredRevision {
+		t.Fatalf("Task %s state = status:%s current_revision:%d desired_revision:%d, want status:%s current_revision:%d desired_revision:%d",
+			taskID, status, currentRevision, desiredRevision, wantStatus, wantCurrentRevision, wantDesiredRevision)
+	}
+}
+
+func TestConversationRouteUpdateOnlyAdjustsReferencedRunningTask(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	first := createConversationRouteActionTask(t, f, "route-update-running-001", "Summarize the Q3 revenue trend")
+	second := createConversationRouteActionTask(t, f, "route-update-running-002", "Summarize the Q4 revenue trend")
+	claimConversationRouteActionTask(t, f, first, "route-update-running-worker-a")
+	claimConversationRouteActionTask(t, f, second, "route-update-running-worker-b")
+	assertConversationRouteActionTaskState(t, f, first, task.StatusRunning, 0, 0)
+	assertConversationRouteActionTaskState(t, f, second, task.StatusRunning, 0, 0)
+
+	claim := f.receive(t, "route-update-running-003", "Change the date range for Task A", app.ConversationRoutingInput{ReferenceTaskID: first})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
+	if err != nil || len(snapshot.Context.Candidates) != 2 {
+		t.Fatalf("running Task candidates = %+v err=%v", snapshot.Context.Candidates, err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	var targetRevision int64
+	targetFound := false
+	for _, candidate := range snapshot.Context.Candidates {
+		if candidate.TaskID == first {
+			targetRevision = candidate.Revision
+			targetFound = true
+			break
+		}
+	}
+	if !targetFound {
+		t.Fatalf("referenced Task %s is missing from candidates: %+v", first, snapshot.Context.Candidates)
+	}
+	if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteUpdate, TaskID: first, ExpectedRevision: targetRevision,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	assertConversationRouteActionTaskState(t, f, first, task.StatusPausing, 0, 1)
+	assertConversationRouteActionTaskState(t, f, second, task.StatusRunning, 0, 0)
+}
+
 func TestConversationRouteStopIsAuthorizedAndLeavesSiblingAlone(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
-	create := func(clientID, content string) string {
-		t.Helper()
-		claim := f.receive(t, clientID, content, app.ConversationRoutingInput{})
-		snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
-		if err != nil {
-			t.Fatal(err)
-		}
-		snapshot.Context.ModelID = "p1234567"
-		if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
-			t.Fatal(err)
-		}
-		var taskID string
-		if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, claim.Message.ID).Scan(&taskID); err != nil {
-			t.Fatal(err)
-		}
-		return taskID
-	}
-	first := create("route-stop-001", "Work on A")
-	second := create("route-stop-002", "Work on B")
-	claim := f.receive(t, "route-stop-003", "Stop A", app.ConversationRoutingInput{ReferenceTaskID: first})
+	first := createConversationRouteActionTask(t, f, "route-stop-001", "Summarize the Q3 revenue trend")
+	second := createConversationRouteActionTask(t, f, "route-stop-002", "Summarize the Q4 revenue trend")
+	claimConversationRouteActionTask(t, f, first, "route-stop-worker-a")
+	claimConversationRouteActionTask(t, f, second, "route-stop-worker-b")
+	assertConversationRouteActionTaskState(t, f, first, task.StatusRunning, 0, 0)
+	assertConversationRouteActionTaskState(t, f, second, task.StatusRunning, 0, 0)
+
+	claim := f.receive(t, "route-stop-003", "Stop Task A", app.ConversationRoutingInput{ReferenceTaskID: first})
 	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, claim)
 	if err != nil || len(snapshot.Context.Candidates) != 2 {
-		t.Fatalf("task candidates = %+v err=%v", snapshot, err)
+		t.Fatalf("running Task candidates = %+v err=%v", snapshot.Context.Candidates, err)
 	}
 	snapshot.Context.ModelID = "p1234567"
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteStop, TaskID: first}
@@ -1229,17 +1297,13 @@ func TestConversationRouteStopIsAuthorizedAndLeavesSiblingAlone(t *testing.T) {
 	if _, err := f.store.pool.Exec(ctx, `UPDATE tokens SET revoked_at=NULL WHERE id=$1`, f.authorization.TokenID); err != nil {
 		t.Fatal(err)
 	}
+	assertConversationRouteActionTaskState(t, f, first, task.StatusRunning, 0, 0)
+	assertConversationRouteActionTaskState(t, f, second, task.StatusRunning, 0, 0)
 	if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, decision); err != nil {
 		t.Fatal(err)
 	}
-	var firstStatus, secondStatus string
-	if err := f.store.pool.QueryRow(ctx, `SELECT a.status,b.status FROM tasks a JOIN tasks b ON b.id=$2 WHERE a.id=$1`, first, second).
-		Scan(&firstStatus, &secondStatus); err != nil {
-		t.Fatal(err)
-	}
-	if firstStatus != string(task.StatusCancelling) || secondStatus != string(task.StatusQueued) {
-		t.Fatalf("stop affected the wrong Task: first=%s second=%s", firstStatus, secondStatus)
-	}
+	assertConversationRouteActionTaskState(t, f, first, task.StatusCancelling, 0, 0)
+	assertConversationRouteActionTaskState(t, f, second, task.StatusRunning, 0, 0)
 }
 
 func TestConversationRouteRetryReusesMessageAndFencesIdempotency(t *testing.T) {

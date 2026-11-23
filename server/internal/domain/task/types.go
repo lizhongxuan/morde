@@ -305,6 +305,7 @@ type Step struct {
 	Summary        string
 	FailureReason  string
 	Retryable      bool
+	RetryAfterAt   *time.Time
 	AgentSessionID string
 	TaskRevision   *int64
 	ToolCallKey    string

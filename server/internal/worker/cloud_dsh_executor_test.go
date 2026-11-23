@@ -759,6 +759,40 @@ func cloudDSHWriteTool() app.AgentToolDefinition {
 	}}
 }
 
+func TestCloudDSHModelResponseFailureCategoryDistinguishesMalformedAndUnauthorizedResults(t *testing.T) {
+	definitions := []app.AgentToolDefinition{cloudDSHReadTool()}
+	baseCall := app.ModelToolCall{CallID: "call_1", Name: "file_read", Arguments: `{"path":"notes.txt"}`}
+	validToolResponse := app.ModelResponse{
+		ToolCalls: []app.ModelToolCall{baseCall}, Usage: app.ModelUsage{Known: true}, StopReason: "tool_calls",
+	}
+	for _, test := range []struct {
+		name        string
+		response    app.ModelResponse
+		definitions []app.AgentToolDefinition
+		want        string
+	}{
+		{name: "valid response", response: validToolResponse, definitions: definitions, want: ""},
+		{name: "unauthorized tool", response: func() app.ModelResponse {
+			value := validToolResponse
+			value.ToolCalls = []app.ModelToolCall{{CallID: "call_1", Name: "delete_everything", Arguments: `{}`}}
+			return value
+		}(), definitions: definitions, want: "unauthorized_tool"},
+		{name: "no tools authorized", response: validToolResponse, want: "unauthorized_tool"},
+		{name: "invalid tool arguments", response: func() app.ModelResponse {
+			value := validToolResponse
+			value.ToolCalls = []app.ModelToolCall{{CallID: "call_1", Name: "file_read", Arguments: `[]`}}
+			return value
+		}(), definitions: definitions, want: "invalid_response"},
+		{name: "invalid base response", response: app.ModelResponse{Text: "", Usage: app.ModelUsage{Known: true}, StopReason: "stop"}, want: "invalid_response"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := cloudDSHModelResponseFailureCategory(test.response, test.definitions); got != test.want {
+				t.Fatalf("cloudDSHModelResponseFailureCategory() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestCloudDSHStepRetryRequiresThePinnedFenceAndConfirmedFailure(t *testing.T) {
 	const arguments = `{"workspace_id":"w1234567","path":"notes.txt","content":"saved"}`
 	const canonicalArguments = `{"content":"saved","path":"notes.txt","workspace_id":"w1234567"}`
@@ -782,7 +816,6 @@ func TestCloudDSHStepRetryRequiresThePinnedFenceAndConfirmedFailure(t *testing.T
 		t.Fatal("current immutable retry fence was rejected")
 	}
 	for name, mutate := range map[string]func(*task.Task){
-		"consumed":         func(v *task.Task) { copied := *v.StepRetry; copied.Consumed = true; v.StepRetry = &copied },
 		"authorization":    func(v *task.Task) { v.Authorization.Version++ },
 		"revision":         func(v *task.Task) { changed := revision + 1; v.CurrentRevision = &changed },
 		"workspace":        func(v *task.Task) { changed := workspaceRevision + 1; v.WorkspaceCheckpointRevision = &changed },
@@ -798,6 +831,11 @@ func TestCloudDSHStepRetryRequiresThePinnedFenceAndConfirmedFailure(t *testing.T
 				t.Fatal("changed retry fence was admitted")
 			}
 		})
+	}
+	consumed := value
+	consumed.StepRetry = func() *task.StepRetryIntent { copied := *value.StepRetry; copied.Consumed = true; return &copied }()
+	if !validCloudDSHStepRetryForTask(consumed, now) {
+		t.Fatal("a consumed retry intent could not resume through its immutable call identity")
 	}
 
 	history := newCloudDSHCheckpointHistory(intent.AgentSessionID)

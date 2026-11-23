@@ -544,7 +544,7 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 				if activity != nil {
 					minimumReplies = 0
 					for _, scenario := range activity.required {
-						if scenario != "failed" && scenario != "approval" {
+						if scenario != "failed" && scenario != "approval" && scenario != "target-control" {
 							minimumReplies = 1
 							break
 						}
@@ -1496,28 +1496,31 @@ AND message.delivery_status='applied' AND route.state='routed'`, ownerID, conver
 // inputs and stages. POST /__morde_fixture/advance/{name}/{start|progress|
 // stream|complete|fail|approval} releases one stage, without a request body.
 // The search scenario uses a fixed local result and never accesses the network.
-// MORDE_BROWSER_ACTIVITY_SCENARIOS=search,failed,approval selects individual
+// MORDE_BROWSER_ACTIVITY_SCENARIOS=search,failed,approval,target-control selects individual
 // scenarios; omit it to require the full merge, separate, search, stream and
-// reconnect set. For a full run, merge-a and merge-b must complete within the
+// reconnect set. target-control waits for two similar independent Tasks, then
+// verifies that stopping B leaves A running. For a full run, merge-a and merge-b must complete within the
 // aggregation window; separate-a and separate-b must complete in order, more
 // than maxConversationResultWindow apart. Start stream before submitting
 // stream-other, then disconnect both clients using
 // POST /__morde_fixture/disconnect/stream before completing the pair.
 // GET /__morde_fixture/verify/{merge|separate|reconnect|search|stream|failed|
-// approval} checks result identity and ordering, reconnect cursors, or the
+// approval|target-control} checks result identity and ordering, reconnect cursors, or the
 // persisted accepted route and requested Task outcome. The fixture does not
 // pass until all selected checks succeed; visual deduplication still needs to
 // be checked in both clients after refresh/relaunch.
 var browserActivityObjectives = map[string]string{
-	"merge-a":      "跨端活动验收：合并 A",
-	"merge-b":      "跨端活动验收：合并 B",
-	"search":       "在本地示例索引中搜索 Morde 消息路由",
-	"separate-a":   "跨端活动验收：分开 A",
-	"separate-b":   "跨端活动验收：分开 B",
-	"stream":       "跨端活动验收：流式",
-	"stream-other": "跨端活动验收：流式后的独立任务",
-	"failed":       "跨端活动验收：已接单后任务失败",
-	"approval":     "跨端活动验收：等待用户授权",
+	"merge-a":          "跨端活动验收：合并 A",
+	"merge-b":          "跨端活动验收：合并 B",
+	"search":           "在本地示例索引中搜索 Morde 消息路由",
+	"separate-a":       "跨端活动验收：分开 A",
+	"separate-b":       "跨端活动验收：分开 B",
+	"stream":           "跨端活动验收：流式",
+	"stream-other":     "跨端活动验收：流式后的独立任务",
+	"failed":           "跨端活动验收：已接单后任务失败",
+	"approval":         "跨端活动验收：等待用户授权",
+	"target-control-a": "跨端活动验收：整理项目总结 A",
+	"target-control-b": "跨端活动验收：整理项目总结 B",
 }
 
 const browserActivityStreamPrefix = "跨端活动验收：流式回复第一段"
@@ -1654,12 +1657,13 @@ func browserActivitySelection(raw string) ([]string, []string, error) {
 	}
 
 	groups := map[string][]string{
-		"merge":    {"merge-a", "merge-b"},
-		"separate": {"separate-a", "separate-b"},
-		"search":   {"search"},
-		"stream":   {"stream", "stream-other"},
-		"failed":   {"failed"},
-		"approval": {"approval"},
+		"merge":          {"merge-a", "merge-b"},
+		"separate":       {"separate-a", "separate-b"},
+		"search":         {"search"},
+		"stream":         {"stream", "stream-other"},
+		"failed":         {"failed"},
+		"approval":       {"approval"},
+		"target-control": {"target-control-a", "target-control-b"},
 	}
 	var selected, required []string
 	seen := make(map[string]bool)
@@ -1694,6 +1698,8 @@ func TestBrowserActivitySelection(t *testing.T) {
 		{name: "failed only", input: "failed", selected: "failed", required: "failed"},
 		{name: "approval only", input: "approval", selected: "approval", required: "approval"},
 		{name: "failed and approval", input: "failed,approval", selected: "failed,approval", required: "failed,approval"},
+		{name: "target control starts two running tasks", input: "target-control",
+			selected: "target-control-a,target-control-b", required: "target-control"},
 		{name: "combined logical scenarios", input: "search, merge", selected: "search,merge-a,merge-b", required: "search,merge"},
 		{name: "reject reconnect without stream", input: "reconnect", wantErr: true},
 		{name: "reject duplicate", input: "search,search", wantErr: true},
@@ -2255,6 +2261,10 @@ func (a *browserAcceptanceActivity) serveControl(w http.ResponseWriter, r *http.
 		case "approval":
 			result["agent_acknowledged"], result["task_status"] = true, string(task.StatusWaitingUser)
 			result["waiting_reason"], result["pending_request_status"] = "approval_required", string(task.PendingRequestPending)
+		case "target-control":
+			result["target_task_id"] = a.runs["target-control-b"].current.ID
+			result["sibling_task_id"] = a.runs["target-control-a"].current.ID
+			result["target_status"], result["sibling_status"] = string(task.StatusCancelled), string(task.StatusRunning)
 		}
 		_ = json.NewEncoder(w).Encode(result)
 		return
@@ -2445,6 +2455,9 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 	if scenario == "reconnect" {
 		return a.verifyReconnect("stream")
 	}
+	if scenario == "target-control" {
+		return a.verifyTargetControl(ctx)
+	}
 	if scenario == "failed" || scenario == "approval" {
 		return a.verifyAcceptedOutcome(ctx, scenario)
 	}
@@ -2555,6 +2568,49 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 		}
 	} else if first.ID == second.ID || len(first.Sources) != 1 || len(second.Sources) != 1 {
 		return errors.New("results outside the grouping window were not published separately")
+	}
+	return nil
+}
+
+func (a *browserAcceptanceActivity) verifyTargetControl(ctx context.Context) error {
+	a.mu.Lock()
+	first, second := a.runs["target-control-a"], a.runs["target-control-b"]
+	if first == nil || second == nil || first.current.ID == "" || second.current.ID == "" ||
+		first.current.ID == second.current.ID || first.current.InitiatorID != second.current.InitiatorID ||
+		first.current.ConversationID != second.current.ConversationID || first.userMessageID == "" || second.userMessageID == "" {
+		a.mu.Unlock()
+		return errors.New("two distinct target-control Tasks in one conversation are required")
+	}
+	firstCurrent, secondCurrent := first.current, second.current
+	a.mu.Unlock()
+
+	firstDetails, err := a.store.GetTask(ctx, firstCurrent.ID, firstCurrent.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read sibling Task: %w", err)
+	}
+	secondDetails, err := a.store.GetTask(ctx, secondCurrent.ID, secondCurrent.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read stopped Task: %w", err)
+	}
+	if firstDetails.Task.Status != task.StatusRunning || secondDetails.Task.Status != task.StatusCancelled {
+		return fmt.Errorf("Task isolation mismatch: sibling=%s target=%s, want running/cancelled",
+			firstDetails.Task.Status, secondDetails.Task.Status)
+	}
+	for _, details := range []struct {
+		id              string
+		currentRevision *int64
+		desiredRevision *int64
+		started         *bool
+	}{
+		{id: firstDetails.Task.ID, currentRevision: firstDetails.Task.CurrentRevision,
+			desiredRevision: firstDetails.Task.DesiredRevision, started: firstDetails.CurrentRevisionStarted},
+		{id: secondDetails.Task.ID, currentRevision: secondDetails.Task.CurrentRevision,
+			desiredRevision: secondDetails.Task.DesiredRevision, started: secondDetails.CurrentRevisionStarted},
+	} {
+		if details.started == nil || !*details.started || details.currentRevision == nil || *details.currentRevision != 0 ||
+			details.desiredRevision == nil || *details.desiredRevision != 0 {
+			return fmt.Errorf("Task %s did not reach its expected active revision", details.id)
+		}
 	}
 	return nil
 }

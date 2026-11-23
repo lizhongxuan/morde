@@ -147623,6 +147623,20 @@
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "授權狀態已變更；請重新整理任務並再次確認授權。" } }
       }
     },
+    "Connector rate limit is active. Refresh the task before retrying." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Connector rate limit is active. Refresh the task before retrying." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "连接器限流尚未解除，请刷新任务后再试。" } }
+      }
+    },
+    "Connector retry is available after %@." : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Connector retry is available after %@." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "连接器最早可在 %@ 后重试。" } }
+      }
+    },
     "The target resource changed. Refresh the task and check its state before retrying." : {
       "extractionState" : "manual",
       "localizations" : {

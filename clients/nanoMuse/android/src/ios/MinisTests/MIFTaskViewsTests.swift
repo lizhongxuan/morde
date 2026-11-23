@@ -350,6 +350,7 @@ final class MIFTaskViewsTests: XCTestCase {
             ("side_effect_unknown", AppLocalized("This step may already have changed something. Check its result before retrying.")),
             ("authorization_changed", AppLocalized("Authorization changed. Refresh the task and check authorization before retrying.")),
             ("resource_changed", AppLocalized("The target resource changed. Refresh the task and check its state before retrying.")),
+            ("connector_rate_limited", AppLocalized("Connector rate limit is active. Refresh the task before retrying.")),
         ]
         for (reason, explanation) in knownReasons {
             let payload: [String: Any] = [
@@ -378,6 +379,16 @@ final class MIFTaskViewsTests: XCTestCase {
         let retryable = try JSONDecoder().decode(MordeTask.Step.self,
             from: JSONSerialization.data(withJSONObject: retryablePayload))
         XCTAssertNil(MIFTaskPresentation.stepFailureExplanation(retryable))
+
+        let delayedPayload: [String: Any] = [
+            "id": "s1234568", "sequence": 2, "kind": "tool", "status": "failed",
+            "title": "Connector call", "summary": "Rate limited", "created_at": "2026-11-04T00:00:01Z",
+            "retryable": false, "attempt": 1, "task_revision": 3, "failure_reason": "connector_rate_limited",
+            "retry_after_at": "2026-11-24T12:00:00Z",
+        ]
+        let delayedStep = try JSONDecoder().decode(MordeTask.Step.self,
+            from: JSONSerialization.data(withJSONObject: delayedPayload))
+        XCTAssertTrue(MIFTaskPresentation.stepFailureExplanation(delayedStep)?.contains("2026") == true)
     }
 
     func testChildJobLabelsKeepRunningFailureAndUnknownDistinct() {
@@ -540,7 +551,7 @@ final class MIFTaskViewsTests: XCTestCase {
         MordeTask.Step(id: id, sequence: sequence, kind: kind, status: status,
                        title: title, summary: summary, created_at: createdAt,
                        agent_id: nil, task_revision: nil, tool_name: nil, phase: nil,
-                       detail_state: nil, truncated: nil, retryable: nil, attempt: nil,
+                       detail_state: nil, truncated: nil, retryable: nil, retry_after_at: nil, attempt: nil,
                        failure_reason: nil, retry_of_step_id: nil)
     }
 

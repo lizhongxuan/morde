@@ -273,10 +273,18 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 }
 
 func listTaskStepsWithActivity(ctx context.Context, tx pgx.Tx, taskID string) ([]task.Step, error) {
-	rows, err := tx.Query(ctx, `SELECT id,task_id,sequence,attempt_no,COALESCE(retry_of_step_id,''),kind,status,title,summary,
-COALESCE(failure_reason,''),retryable,created_at,COALESCE(agent_session_id,''),task_revision,COALESCE(tool_call_key,''),
-COALESCE(tool_name,''),request_digest,COALESCE(phase,''),detail_state
-FROM task_steps WHERE task_id=$1 ORDER BY sequence`, taskID)
+	rows, err := tx.Query(ctx, `SELECT s.id,s.task_id,s.sequence,s.attempt_no,COALESCE(s.retry_of_step_id,''),s.kind,s.status,s.title,s.summary,
+COALESCE(s.failure_reason,''),s.retryable,s.created_at,COALESCE(s.agent_session_id,''),s.task_revision,COALESCE(s.tool_call_key,''),
+COALESCE(s.tool_name,''),s.request_digest,COALESCE(s.phase,''),s.detail_state,
+COALESCE(mcp.status,''),COALESCE(mcp.call_id,''),COALESCE(mcp.tool_name,''),mcp.request_hash,mcp.task_revision,mcp.result,mcp.updated_at,mcp.evidence_count
+FROM task_steps s JOIN tasks t ON t.id=s.task_id
+LEFT JOIN LATERAL (
+ SELECT status,call_id,tool_name,request_hash,task_revision,result,updated_at,count(*) OVER() AS evidence_count
+ FROM task_mcp_connector_operations
+ WHERE task_id=s.task_id AND owner_id=t.owner_id AND call_id=s.tool_call_key
+ ORDER BY updated_at DESC, id DESC LIMIT 1
+) mcp ON true
+WHERE s.task_id=$1 ORDER BY s.sequence`, taskID)
 	if err != nil {
 		return nil, err
 	}
@@ -284,15 +292,34 @@ FROM task_steps WHERE task_id=$1 ORDER BY sequence`, taskID)
 	steps := make([]task.Step, 0)
 	for rows.Next() {
 		var step task.Step
-		var revision pgtype.Int8
+		var revision, mcpTaskRevision, mcpEvidenceCount pgtype.Int8
+		var mcpStatus, mcpCallID, mcpToolName pgtype.Text
+		var mcpRequestHash []byte
+		var mcpResult pgtype.Text
+		var mcpUpdatedAt pgtype.Timestamptz
 		if err := rows.Scan(&step.ID, &step.TaskID, &step.Sequence, &step.Attempt, &step.RetryOfStepID, &step.Kind, &step.Status,
 			&step.Title, &step.Summary, &step.FailureReason, &step.Retryable, &step.CreatedAt, &step.AgentSessionID, &revision,
-			&step.ToolCallKey, &step.ToolName, &step.RequestDigest, &step.Phase, &step.DetailState); err != nil {
+			&step.ToolCallKey, &step.ToolName, &step.RequestDigest, &step.Phase, &step.DetailState,
+			&mcpStatus, &mcpCallID, &mcpToolName, &mcpRequestHash, &mcpTaskRevision, &mcpResult, &mcpUpdatedAt, &mcpEvidenceCount); err != nil {
 			return nil, err
 		}
 		if revision.Valid {
 			value := revision.Int64
 			step.TaskRevision = &value
+		}
+		if step.FailureReason == "connector_rate_limited" {
+			step.Retryable = false
+			if step.Status == task.StepFailed && mcpEvidenceCount.Valid && mcpEvidenceCount.Int64 == 1 &&
+				mcpStatus.Valid && mcpStatus.String == string(task.OperationFailed) &&
+				mcpCallID.Valid && mcpCallID.String == step.ToolCallKey && mcpToolName.Valid && mcpToolName.String == step.ToolName &&
+				mcpTaskRevision.Valid && revision.Valid && mcpTaskRevision.Int64 == revision.Int64 &&
+				bytes.Equal(mcpRequestHash, step.RequestDigest) && mcpResult.Valid {
+				if seconds, ok := app.MCPConnectorTerminalRetryAfterSeconds(mcpResult.String); ok && mcpUpdatedAt.Valid {
+					retryAt := mcpUpdatedAt.Time.Add(time.Duration(seconds) * time.Second)
+					step.RetryAfterAt = &retryAt
+					step.Retryable = !retryAt.After(time.Now())
+				}
+			}
 		}
 		steps = append(steps, step)
 	}
@@ -1540,9 +1567,13 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			!utf8.ValidString(call.Phase) || strings.ContainsRune(call.Phase, '\x00') {
 			return task.Event{}, domain.InvalidArgument("tool_call", "task tool call progress is invalid")
 		}
-		if (call.FailureReason != "" && call.FailureReason != "not_dispatched") ||
-			(call.Retryable && (call.FailureReason != "not_dispatched" || call.Phase != "prepare" || progress.Steps[0].Status != task.StepFailed)) ||
-			(call.FailureReason == "not_dispatched" && (call.Phase != "prepare" || progress.Steps[0].Status != task.StepFailed)) {
+		if (call.FailureReason != "" && call.FailureReason != "not_dispatched" && call.FailureReason != "connector_rate_limited") ||
+			(call.Retryable && (!((call.FailureReason == "not_dispatched" && call.Phase == "prepare") ||
+				(call.FailureReason == "connector_rate_limited" && call.Phase == "execute" && app.IsMCPConnectorStepRetryTool(call.ToolName))) ||
+				progress.Steps[0].Status != task.StepFailed)) ||
+			(call.FailureReason == "not_dispatched" && (call.Phase != "prepare" || progress.Steps[0].Status != task.StepFailed)) ||
+			(call.FailureReason == "connector_rate_limited" && (!call.Retryable || call.Phase != "execute" ||
+				progress.Steps[0].Status != task.StepFailed || !app.IsMCPConnectorStepRetryTool(call.ToolName))) {
 			return task.Event{}, domain.InvalidArgument("tool_call.failure", "task tool failure evidence is invalid")
 		}
 		if call.DetailState == "available" {
@@ -2103,6 +2134,16 @@ SELECT 1 FROM task_agent_sessions WHERE task_id=$1 AND step_id=$2 AND parent_ses
 			}
 			if childSessionStep {
 				return domain.NewError(domain.CodeForbidden, "task progress cannot change a child Agent Session step")
+			}
+			if step.FailureReason == "connector_rate_limited" {
+				if (progress.ToolCall != nil && (progress.ToolCall.CallKey != step.ToolCallKey || progress.ToolCall.ToolName != step.ToolName ||
+					!bytes.Equal(progress.ToolCall.RequestDigest, step.RequestDigest))) || step.Status != task.StepFailed || !step.Retryable ||
+					step.Phase != "execute" || !app.IsMCPConnectorStepRetryTool(step.ToolName) {
+					return domain.InvalidArgument("tool_call.failure", "connector rate-limit failure is not bound to its Task step")
+				}
+				if _, err := verifiedMCPConnectorRateLimitRetryAt(ctx, tx, current.OwnerID, current.ID, step); err != nil {
+					return err
+				}
 			}
 			if step.Attempt < 1 {
 				step.Attempt = 1

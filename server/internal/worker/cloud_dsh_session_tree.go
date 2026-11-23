@@ -1768,8 +1768,8 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					}
 					return cloudDSHModelResultErrorFor(result.err)
 				}
-				if !validCloudDSHModelResponse(result.response, pending.state.definitions) {
-					return cloudDSHModelResultErrorFor(nil)
+				if category := cloudDSHModelResponseFailureCategory(result.response, pending.state.definitions); category != "" {
+					return cloudDSHModelResultError{category: category}
 				}
 				if !steerPending && pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through {
 					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",

@@ -86,7 +86,7 @@ func (s *Store) RequestTaskStepRetry(ctx context.Context, record app.Idempotency
 		if err := verifyProjectTaskWorkspaceFence(ctx, tx, request.TaskID, projectFence); err != nil {
 			return err
 		}
-		if current.Status != string(task.StatusCompleted) || !current.FinishedAt.Valid || current.CurrentRevision != request.ExpectedTaskRevision ||
+		if (current.Status != string(task.StatusCompleted) && current.Status != string(task.StatusFailed)) || !current.FinishedAt.Valid || current.CurrentRevision != request.ExpectedTaskRevision ||
 			current.DesiredRevision != request.ExpectedTaskRevision || current.CheckpointThroughSeq < 0 || len(current.CheckpointDigest) != 32 ||
 			current.AgentSessionID == "" || current.AgentGeneration < 1 || current.AuthVersion < 1 || current.ExecutionEpoch < 1 {
 			return domain.NewError(domain.CodeConflict, "task checkpoint or revision is no longer retryable")
@@ -136,7 +136,7 @@ FROM task_steps WHERE task_id=$1 AND id=$2 FOR UPDATE`, request.TaskID, request.
 		}
 		source.RequestDigest = sourceDigest
 		source.Retryable = sourceRetryable
-		if source.Status != task.StepFailed || !source.Retryable || source.FailureReason != "not_dispatched" || source.Phase != "prepare" ||
+		if source.Status != task.StepFailed || !source.Retryable ||
 			source.Kind != "tool" || source.Attempt != request.ExpectedAttempt || source.TaskRevision == nil ||
 			*source.TaskRevision != request.ExpectedTaskRevision || source.AgentSessionID != current.AgentSessionID ||
 			len(source.RequestDigest) != 32 || source.ToolCallKey == "" || source.ToolName == "" {
@@ -145,15 +145,37 @@ FROM task_steps WHERE task_id=$1 AND id=$2 FOR UPDATE`, request.TaskID, request.
 		if !app.SupportsSafeTaskStepRetryTool(source.ToolName) {
 			return domain.NewError(domain.CodeConflict, "step tool does not support safe retry")
 		}
+		connectorRateLimitRetry := source.FailureReason == "connector_rate_limited" && source.Phase == "execute" &&
+			app.IsMCPConnectorStepRetryTool(source.ToolName) && current.Status == string(task.StatusFailed)
+		notDispatchedRetry := source.FailureReason == "not_dispatched" && source.Phase == "prepare" && current.Status == string(task.StatusCompleted)
+		if !connectorRateLimitRetry && !notDispatchedRetry {
+			return domain.NewError(domain.CodeConflict, "step failure is not safe to retry")
+		}
+		if connectorRateLimitRetry && current.UsageToolCalls >= int64(current.BudgetToolCalls) {
+			return domain.NewError(domain.CodeQuotaExceeded, "task tool call budget is exhausted")
+		}
+		if connectorRateLimitRetry {
+			retryAt, err := verifiedMCPConnectorRateLimitRetryAt(ctx, tx, current.OwnerID, current.ID, source)
+			if err != nil {
+				return err
+			}
+			if retryAt.After(time.Now()) {
+				return domain.NewError(domain.CodeConflict, "connector retry-after window has not elapsed")
+			}
+		}
 		sourceOperationKey := app.AgentOperationKey(source.ToolCallKey)
-		var sourceOperation, unsettledOperation, unknownStep bool
+		var sourceOperation, unsettledOperation, unknownStep, unsettledMCP, unsettledModel, pendingInput bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_operations WHERE task_id=$1 AND operation_key=$2),
 EXISTS(SELECT 1 FROM task_operations WHERE task_id=$1 AND status IN ('prepared','dispatched','unknown')),
-EXISTS(SELECT 1 FROM task_steps WHERE task_id=$1 AND status='unknown')`, request.TaskID, sourceOperationKey).
-			Scan(&sourceOperation, &unsettledOperation, &unknownStep); err != nil {
+			EXISTS(SELECT 1 FROM task_steps WHERE task_id=$1 AND status='unknown'),
+			EXISTS(SELECT 1 FROM task_mcp_connector_operations WHERE task_id=$1 AND status IN ('prepared','dispatched','unknown')),
+			EXISTS(SELECT 1 FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state IN ('dispatched','unknown')),
+			EXISTS(SELECT 1 FROM task_pending_requests WHERE task_id=$1 AND status='pending') OR
+			EXISTS(SELECT 1 FROM task_clarification_requests WHERE task_id=$1 AND status='pending')`, request.TaskID, sourceOperationKey).
+			Scan(&sourceOperation, &unsettledOperation, &unknownStep, &unsettledMCP, &unsettledModel, &pendingInput); err != nil {
 			return fmt.Errorf("verify prior tool side effects before retry: %w", err)
 		}
-		if sourceOperation || unsettledOperation || unknownStep {
+		if sourceOperation || unsettledOperation || unknownStep || unsettledMCP || unsettledModel || pendingInput {
 			return domain.NewError(domain.CodeConflict, "task has an operation whose side effects are not confirmed")
 		}
 		if err := verifyNoOtherUnledgeredFailures(ctx, tx, request.TaskID, source.ID); err != nil {
@@ -254,7 +276,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NULLIF($15,''),$16,$17,$1
 			intent.CheckpointThroughSequence, intent.CheckpointDigest, intent.ExpiresAt); err != nil {
 			return fmt.Errorf("persist task step retry intent: %w", err)
 		}
-		if err := updateTaskForStepRetry(ctx, tx, intent.TaskID, intent.AttemptStepID); err != nil {
+		if err := updateTaskForStepRetry(ctx, tx, intent.TaskID, intent.AttemptStepID, task.Status(current.Status)); err != nil {
 			return err
 		}
 		result = app.TaskStepRetryRecord{Intent: intent}
@@ -380,19 +402,43 @@ FROM task_steps WHERE task_id=$1 AND id=$2 FOR UPDATE`, intent.TaskID, intent.So
 			&sourceStatus, &sourcePhase, &sourceFailureReason, &sourceRetryable, &sourceCallID, &sourceToolName, &sourceDigest, &sourceRevision); err != nil {
 			return domain.NewError(domain.CodeConflict, "step retry source is unavailable")
 		}
-		if sourceStatus != string(task.StepFailed) || sourcePhase != "prepare" || sourceFailureReason != "not_dispatched" || !sourceRetryable ||
+		notDispatchedSource := sourcePhase == "prepare" && sourceFailureReason == "not_dispatched" &&
+			!app.IsMCPConnectorStepRetryTool(sourceToolName)
+		connectorRateLimitSource := sourcePhase == "execute" && sourceFailureReason == "connector_rate_limited" &&
+			app.IsMCPConnectorStepRetryTool(sourceToolName)
+		if sourceStatus != string(task.StepFailed) || !sourceRetryable || (!notDispatchedSource && !connectorRateLimitSource) ||
 			sourceCallID != intent.SourceCallID || sourceToolName != intent.ToolName || !sourceRevision.Valid || sourceRevision.Int64 != intent.TaskRevision ||
 			!bytes.Equal(sourceDigest, intent.RequestDigest) || !app.SupportsSafeTaskStepRetryTool(sourceToolName) {
 			return domain.NewError(domain.CodeConflict, "step retry source evidence changed")
 		}
-		var sourceOperation, unsettledOperation, unknownStep bool
+		if connectorRateLimitSource {
+			sourceRevisionValue := sourceRevision.Int64
+			source := task.Step{Status: task.StepFailed, FailureReason: sourceFailureReason, Retryable: sourceRetryable,
+				Phase: sourcePhase, ToolName: sourceToolName, ToolCallKey: sourceCallID, RequestDigest: sourceDigest,
+				TaskRevision: &sourceRevisionValue}
+			retryAt, err := verifiedMCPConnectorRateLimitRetryAt(ctx, tx, row.OwnerID, row.ID, source)
+			if err != nil {
+				return err
+			}
+			if retryAt.After(time.Now()) {
+				return domain.NewError(domain.CodeConflict, "connector retry-after window has not elapsed")
+			}
+		}
+		var sourceOperation, unsettledOperation, unknownStep, unsettledMCP, unsettledModel, pendingInput bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_operations WHERE task_id=$1 AND operation_key=$2),
-EXISTS(SELECT 1 FROM task_operations WHERE task_id=$1 AND status IN ('prepared','dispatched','unknown')),
-EXISTS(SELECT 1 FROM task_steps WHERE task_id=$1 AND status='unknown')`, row.ID, app.AgentOperationKey(intent.SourceCallID)).
-			Scan(&sourceOperation, &unsettledOperation, &unknownStep); err != nil {
+EXISTS(SELECT 1 FROM task_operations WHERE task_id=$1 AND status IN ('prepared','dispatched','unknown')
+  AND operation_key<>$3),
+			EXISTS(SELECT 1 FROM task_steps WHERE task_id=$1 AND status='unknown' AND id<>$4),
+			EXISTS(SELECT 1 FROM task_mcp_connector_operations WHERE task_id=$1 AND status IN ('prepared','dispatched','unknown')
+  AND call_id<>$5),
+			EXISTS(SELECT 1 FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state IN ('dispatched','unknown')),
+			EXISTS(SELECT 1 FROM task_pending_requests WHERE task_id=$1 AND status='pending') OR
+			EXISTS(SELECT 1 FROM task_clarification_requests WHERE task_id=$1 AND status='pending')`, row.ID,
+			app.AgentOperationKey(intent.SourceCallID), app.AgentOperationKey(intent.RetryCallID), intent.AttemptStepID, intent.RetryCallID).
+			Scan(&sourceOperation, &unsettledOperation, &unknownStep, &unsettledMCP, &unsettledModel, &pendingInput); err != nil {
 			return fmt.Errorf("recheck prior tool side effects before retry dispatch: %w", err)
 		}
-		if sourceOperation || unsettledOperation || unknownStep {
+		if sourceOperation || unsettledOperation || unknownStep || unsettledMCP || unsettledModel || pendingInput {
 			return domain.NewError(domain.CodeConflict, "task has an operation whose side effects are not confirmed")
 		}
 		var state string
@@ -404,15 +450,23 @@ AND source_step_id=$3 AND retry_call_id=$4 AND task_revision=$5 AND agent_sessio
 		if err != nil {
 			return domain.NewError(domain.CodeConflict, "step retry intent is unavailable")
 		}
-		if state != "pending" || !expiresAt.After(time.Now()) {
-			return domain.NewError(domain.CodeConflict, "step retry intent is expired or already consumed")
-		}
 		storedIntent, err := readTaskStepRetryIntent(ctx, tx, intent.AttemptStepID)
 		if err != nil {
 			return err
 		}
 		if !sameStepRetryIntent(storedIntent, intent) {
 			return domain.NewError(domain.CodeConflict, "step retry intent binding changed")
+		}
+		if state == "consumed" {
+			if !intent.Consumed || !storedIntent.Consumed {
+				return domain.NewError(domain.CodeConflict, "step retry intent was already consumed")
+			}
+			// Resume the same immutable call after approval or process recovery.
+			// Its original operation ID lets the Broker reconcile before dispatch.
+			return nil
+		}
+		if state != "pending" || intent.Consumed || !expiresAt.After(time.Now()) {
+			return domain.NewError(domain.CodeConflict, "step retry intent is expired or already consumed")
 		}
 		result, err := tx.Exec(ctx, `UPDATE task_step_retry_intents SET state='consumed',consumed_at=clock_timestamp(),updated_at=clock_timestamp()
 WHERE attempt_step_id=$1 AND state='pending'`, intent.AttemptStepID)
@@ -467,11 +521,14 @@ WHERE task_id=$1 AND task_revision=$2 ORDER BY created_at DESC,attempt_step_id D
 	return &intent, nil
 }
 
-func updateTaskForStepRetry(ctx context.Context, tx pgx.Tx, taskID, stepID string) error {
+func updateTaskForStepRetry(ctx context.Context, tx pgx.Tx, taskID, stepID string, expectedStatus task.Status) error {
+	if expectedStatus != task.StatusCompleted && expectedStatus != task.StatusFailed {
+		return domain.NewError(domain.CodeConflict, "task is no longer eligible for a safe step retry")
+	}
 	var sequence int64
 	err := tx.QueryRow(ctx, `UPDATE tasks SET status='queued',current_step=$2,waiting_reason='',lease_owner='',
-lease_expires_at=NULL,finished_at=NULL,updated_at=clock_timestamp(),event_seq=event_seq+1 WHERE id=$1 AND status='completed'
-RETURNING event_seq`, taskID, stepID).Scan(&sequence)
+lease_expires_at=NULL,finished_at=NULL,updated_at=clock_timestamp(),event_seq=event_seq+1 WHERE id=$1 AND status=$3
+RETURNING event_seq`, taskID, stepID, string(expectedStatus)).Scan(&sequence)
 	if err != nil {
 		return fmt.Errorf("queue task for step retry: %w", err)
 	}
@@ -597,6 +654,42 @@ OR prerequisite.result=''))`, taskID, ownerID, initiatorID, projectID).Scan(&blo
 	return nil
 }
 
+func verifiedMCPConnectorRateLimitRetryAt(ctx context.Context, tx pgx.Tx, ownerID, taskID string, source task.Step) (time.Time, error) {
+	if !app.IsMCPConnectorStepRetryTool(source.ToolName) || source.ToolCallKey == "" || source.TaskRevision == nil ||
+		len(source.RequestDigest) != 32 {
+		return time.Time{}, domain.NewError(domain.CodeConflict, "connector retry evidence is invalid")
+	}
+	rows, err := tx.Query(ctx, `SELECT status,call_id,tool_name,request_hash,task_revision,result,updated_at
+FROM task_mcp_connector_operations WHERE task_id=$1 AND owner_id=$2 AND call_id=$3 FOR SHARE`, taskID, ownerID, source.ToolCallKey)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("read connector retry evidence: %w", err)
+	}
+	defer rows.Close()
+	var count int
+	var status, callID, toolName, result string
+	var requestHash []byte
+	var taskRevision pgtype.Int8
+	var updatedAt time.Time
+	for rows.Next() {
+		count++
+		if err := rows.Scan(&status, &callID, &toolName, &requestHash, &taskRevision, &result, &updatedAt); err != nil {
+			return time.Time{}, fmt.Errorf("read connector retry evidence row: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return time.Time{}, fmt.Errorf("iterate connector retry evidence: %w", err)
+	}
+	if count != 1 || status != string(task.OperationFailed) || callID != source.ToolCallKey || toolName != source.ToolName ||
+		!taskRevision.Valid || taskRevision.Int64 != *source.TaskRevision || !bytes.Equal(requestHash, source.RequestDigest) {
+		return time.Time{}, domain.NewError(domain.CodeConflict, "connector retry is not backed by one exact failed operation")
+	}
+	seconds, ok := app.MCPConnectorTerminalRetryAfterSeconds(result)
+	if !ok {
+		return time.Time{}, domain.NewError(domain.CodeConflict, "connector retry result is not a verified rate limit")
+	}
+	return updatedAt.Add(time.Duration(seconds) * time.Second), nil
+}
+
 func verifyNoOtherUnledgeredFailures(ctx context.Context, tx pgx.Tx, taskID, sourceStepID string) error {
 	rows, err := tx.Query(ctx, `SELECT tool_call_key FROM task_steps WHERE task_id=$1 AND status='failed' AND tool_call_key IS NOT NULL
 AND id<>$2`, taskID, sourceStepID)
@@ -610,8 +703,9 @@ AND id<>$2`, taskID, sourceStepID)
 			return fmt.Errorf("read prior failed task tool call: %w", err)
 		}
 		var hasOperation bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_operations WHERE task_id=$1 AND operation_key=$2)`,
-			taskID, app.AgentOperationKey(callID)).Scan(&hasOperation); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_operations WHERE task_id=$1 AND operation_key=$2) OR
+EXISTS(SELECT 1 FROM task_mcp_connector_operations WHERE task_id=$1 AND call_id=$3)`,
+			taskID, app.AgentOperationKey(callID), callID).Scan(&hasOperation); err != nil {
 			return fmt.Errorf("check prior failed task operation: %w", err)
 		}
 		if !hasOperation {

@@ -73,6 +73,27 @@ func (b *CloudDSHToolBroker) currentServerTask(ctx context.Context, claimed task
 	return details, nil
 }
 
+func newMCPToolTaskStep(details TaskDetails, call ModelToolCall, status task.StepStatus, title, summary string) (task.Step, error) {
+	if currentStepID := details.Task.CurrentStep; currentStepID != "" {
+		arguments, err := validateAgentToolArguments(call.Arguments)
+		if err == nil {
+			digest, digestErr := agentOperationHash(call.Name, arguments)
+			if digestErr == nil {
+				for _, existing := range details.Steps {
+					if existing.ID != currentStepID || existing.Kind != "tool" || existing.RetryOfStepID == "" ||
+						existing.ToolCallKey != call.CallID || existing.ToolName != call.Name || !bytes.Equal(existing.RequestDigest, digest[:]) {
+						continue
+					}
+					existing.Status, existing.Title, existing.Summary = status, title, safeStepSummary(summary, "")
+					existing.Phase, existing.FailureReason, existing.Retryable = "", "", false
+					return existing, nil
+				}
+			}
+		}
+	}
+	return newAgentStep(details.Task.ID, maxStepSequence(details.Steps)+1, "tool", status, title, summary)
+}
+
 func canonicalMCPToolSchema(tools []MCPConnectorToolDefinition) ([]byte, []byte, error) {
 	if len(tools) > 256 {
 		return nil, nil, errors.New("MCP tool catalog exceeds its limit")
@@ -204,23 +225,23 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 	pending := details.PendingRequest
 	sameApproval := sameMCPConnectorApproval(pending, current, call, hash, fence)
 	if pending != nil && pending.Status == task.PendingRequestPending {
-		result, err := b.pauseForExistingMCPApproval(ctx, details, pending, source.remoteTool)
+		result, err := b.pauseForExistingMCPApproval(ctx, details, call, pending, source.remoteTool)
 		return nil, result, true, err
 	}
 	if sameApproval {
 		switch pending.Status {
 		case task.PendingRequestApproved:
 			if pending.Decision != task.PendingDecisionApprove {
-				result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
+				result, err := b.failMCPApprovalMismatch(ctx, details, call)
 				return nil, result, true, err
 			}
 			return pending, AgentToolResult{}, false, nil
 		case task.PendingRequestRejected:
 			if pending.Decision != task.PendingDecisionReject {
-				result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
+				result, err := b.failMCPApprovalMismatch(ctx, details, call)
 				return nil, result, true, err
 			}
-			step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
+			step, err := newMCPToolTaskStep(details, call, task.StepRunning,
 				"Run cloud dsh MCP tool: "+source.remoteTool, "The connected service was not called.")
 			if err != nil {
 				return nil, AgentToolResult{}, true, err
@@ -230,7 +251,7 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 		case task.PendingRequestExpired:
 			if pending.Decision != task.PendingDecisionReject || pending.ExpiresAt == nil || pending.RespondedAt == nil ||
 				pending.RespondedAt.Before(*pending.ExpiresAt) {
-				result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
+				result, err := b.failMCPApprovalMismatch(ctx, details, call)
 				return nil, result, true, err
 			}
 			operationKey := agentOperationKey(call.CallID)
@@ -240,7 +261,7 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 			}
 			_, lookupErr := operationStore.GetMCPConnectorOperation(ctx, current.OwnerID, current.ID, source.connectorID, operationKey)
 			if lookupErr == nil || (domain.CodeOf(lookupErr) != domain.CodeNotFound) || checkpointOutput != nil {
-				step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepUnknown,
+				step, err := newMCPToolTaskStep(details, call, task.StepUnknown,
 					"Review expired MCP approval", "The expired action has a prior result that must be reconciled safely.")
 				if err != nil {
 					return nil, AgentToolResult{}, true, err
@@ -249,7 +270,7 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 					"The expired MCP approval has a prior or checkpointed result that cannot be replayed safely.")
 				return nil, result, true, err
 			}
-			step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
+			step, err := newMCPToolTaskStep(details, call, task.StepRunning,
 				"Run cloud dsh MCP tool: "+source.remoteTool, "The approval expired before the connected service was called.")
 			if err != nil {
 				return nil, AgentToolResult{}, true, err
@@ -257,11 +278,11 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 			result, err := b.expireApprovedToolCall(ctx, current, step, cloneTaskUsage(current.Usage), request)
 			return nil, result, true, err
 		default:
-			result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
+			result, err := b.failMCPApprovalMismatch(ctx, details, call)
 			return nil, result, true, err
 		}
 	}
-	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
+	step, err := newMCPToolTaskStep(details, call, task.StepRunning,
 		"Run cloud dsh MCP tool: "+source.remoteTool, "Waiting for approval before calling the connected service.")
 	if err != nil {
 		return nil, AgentToolResult{}, true, err
@@ -273,9 +294,10 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 	return nil, result, true, err
 }
 
-func (b *CloudDSHToolBroker) pauseForExistingMCPApproval(ctx context.Context, details TaskDetails, pending *task.PendingRequest, remoteTool string) (AgentToolResult, error) {
+func (b *CloudDSHToolBroker) pauseForExistingMCPApproval(ctx context.Context, details TaskDetails, call ModelToolCall, pending *task.PendingRequest,
+	remoteTool string) (AgentToolResult, error) {
 	current := details.Task
-	step, err := newAgentStep(details.Task.ID, maxStepSequence(details.Steps)+1, "tool", task.StepWaitingUser,
+	step, err := newMCPToolTaskStep(details, call, task.StepWaitingUser,
 		"Run cloud dsh MCP tool: "+remoteTool, pending.Content)
 	if err != nil {
 		return AgentToolResult{}, err
@@ -538,8 +560,9 @@ func sameMCPConnectorApproval(pending *task.PendingRequest, current task.Task, c
 		pending.ToolName == call.Name && bytes.Equal(pending.RequestHash, requestHash) && samePendingApprovalFence(pending, fence)
 }
 
-func (b *CloudDSHToolBroker) failMCPApprovalMismatch(ctx context.Context, current task.Task, call ModelToolCall, steps []task.Step) (AgentToolResult, error) {
-	step, err := newAgentStep(current.ID, maxStepSequence(steps)+1, "tool", task.StepFailed,
+func (b *CloudDSHToolBroker) failMCPApprovalMismatch(ctx context.Context, details TaskDetails, call ModelToolCall) (AgentToolResult, error) {
+	current := details.Task
+	step, err := newMCPToolTaskStep(details, call, task.StepFailed,
 		"MCP approval no longer matches", "The external connector call changed after approval; it was not executed.")
 	if err != nil {
 		return AgentToolResult{}, err
@@ -588,7 +611,7 @@ func (b *CloudDSHToolBroker) executeMCPSourceWithApproval(ctx context.Context, d
 		}
 		if !sameMCPConnectorApproval(approval, current, call, approvalRequestHash, cloudDSHMCPApprovalFence(source)) ||
 			approval.Status != task.PendingRequestApproved || approval.Decision != task.PendingDecisionApprove {
-			return b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
+			return b.failMCPApprovalMismatch(ctx, details, call)
 		}
 		approvalID, approvalVersion = approval.ID, approval.Version
 	}
@@ -609,7 +632,7 @@ func (b *CloudDSHToolBroker) executeMCPSourceWithApproval(ctx context.Context, d
 		operation.ApprovalID != approvalID || operation.ApprovalVersion != approvalVersion ||
 		!bytes.Equal(operation.ApprovalRequestHash, approvalRequestHash) ||
 		!sameMCPConnectorOperationTaskSnapshot(operation, current)) {
-		step, stepErr := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepUnknown,
+		step, stepErr := newMCPToolTaskStep(details, call, task.StepUnknown,
 			"Review MCP connector recovery", "The prior MCP connector operation does not match this exact request.")
 		if stepErr != nil {
 			return AgentToolResult{}, stepErr
@@ -617,7 +640,7 @@ func (b *CloudDSHToolBroker) executeMCPSourceWithApproval(ctx context.Context, d
 		return b.pauseMCPUnknown(ctx, current, step, current.Usage, key, "The prior MCP connector operation does not match this exact request.")
 	}
 	if !hasOperation && recovering && checkpointOutput != nil {
-		step, stepErr := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepUnknown,
+		step, stepErr := newMCPToolTaskStep(details, call, task.StepUnknown,
 			"Review MCP connector recovery", "A checkpointed MCP result has no matching operation ledger entry.")
 		if stepErr != nil {
 			return AgentToolResult{}, stepErr
@@ -631,7 +654,7 @@ func (b *CloudDSHToolBroker) executeMCPSourceWithApproval(ctx context.Context, d
 	if usage.ToolCalls < 0 || usage.ToolCalls > current.Budget.ToolCalls {
 		return AgentToolResult{}, domain.NewError(domain.CodeQuotaExceeded, "task execution budget is exhausted")
 	}
-	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
+	step, err := newMCPToolTaskStep(details, call, task.StepRunning,
 		"Run cloud dsh MCP tool: "+source.remoteTool, "Checking the task grant, connector version, and call ledger.")
 	if err != nil {
 		return AgentToolResult{}, err
@@ -1034,6 +1057,27 @@ func cloudDSHMCPTerminalForAttempt(value cloudDSHMCPOutput) bool {
 		signal.RetryAfterSeconds <= maxCloudDSHTerminalRetryAfterSeconds
 }
 
+// MCPConnectorTerminalRetryAfterSeconds validates the durable MCP result before
+// the Store exposes a safe retry time or admits a retry intent. The task step's
+// retry flag alone is never evidence that a connector operation is replayable.
+func MCPConnectorTerminalRetryAfterSeconds(encoded string) (int64, bool) {
+	if encoded == "" || len(encoded) > maxAgentToolOutputBytes {
+		return 0, false
+	}
+	var value cloudDSHMCPOutput
+	if json.Unmarshal([]byte(encoded), &value) != nil || !cloudDSHMCPTerminalForAttempt(value) {
+		return 0, false
+	}
+	var signal struct {
+		RetryAfterSeconds int64 `json:"retry_after_seconds"`
+	}
+	if json.Unmarshal(value.StructuredContent, &signal) != nil || signal.RetryAfterSeconds < 1 ||
+		signal.RetryAfterSeconds > maxCloudDSHTerminalRetryAfterSeconds {
+		return 0, false
+	}
+	return signal.RetryAfterSeconds, true
+}
+
 func validCloudDSHMCPImage(mediaType string, data []byte) bool {
 	if len(data) < 4 || len(data) > maxCloudDSHMCPImageBytes {
 		return false
@@ -1092,6 +1136,7 @@ func validCloudDSHMCPJSON(raw []byte) bool {
 func (b *CloudDSHToolBroker) commitMCPResult(ctx context.Context, current task.Task, step task.Step, usage task.Usage, name string, result AgentToolResult) (AgentToolResult, error) {
 	ctx = withTaskToolContentEvidence(ctx, name, result)
 	if result.TerminalForAttempt {
+		ctx = withTaskToolResultEvidence(ctx, "execute", "connector_rate_limited")
 		step.Status, step.Summary = task.StepFailed, "The connector rate limited this attempt; it was not retried."
 		if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
 			"tool": name, "operation_status": result.Status, "reason": "connector_rate_limited",
@@ -1100,6 +1145,7 @@ func (b *CloudDSHToolBroker) commitMCPResult(ctx context.Context, current task.T
 		}
 		return result, nil
 	}
+	ctx = withTaskToolResultEvidence(ctx, "execute", "")
 	step.Status, step.Summary = task.StepSucceeded, "The cloud dsh MCP tool completed and its result was saved."
 	if result.Status == AgentToolFailed {
 		step.Status, step.Summary = task.StepFailed, "The MCP connector reported a definitive tool error."

@@ -4922,7 +4922,7 @@ struct MordeTask: Decodable, Identifiable {
         let title: String; let summary: String; let created_at: String
         let agent_id: String?; let task_revision: Int64?; let tool_name: String?
         let phase: String?; let detail_state: String?; let truncated: Bool?
-        let retryable: Bool?; let attempt: Int?; let failure_reason: String?; let retry_of_step_id: String?
+        let retryable: Bool?; let retry_after_at: String?; let attempt: Int?; let failure_reason: String?; let retry_of_step_id: String?
     }
     struct Artifact: Decodable, Identifiable {
         let id: String; let label: String; let media_type: String; let verified: Bool

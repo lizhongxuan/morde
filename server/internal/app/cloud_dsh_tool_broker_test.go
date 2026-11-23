@@ -1520,7 +1520,7 @@ func TestCloudDSHToolBrokerPausesUnresolvedRecoveryDurably(t *testing.T) {
 }
 
 func TestCloudDSHToolBrokerModelRecoveryStoresSafeFailureCategory(t *testing.T) {
-	for _, category := range []string{"timeout", "empty_response", "truncated_response"} {
+	for _, category := range []string{"timeout", "empty_response", "truncated_response", "invalid_response", "unauthorized_tool"} {
 		t.Run(category, func(t *testing.T) {
 			fixture := newRuntimeToolExecutorFixture(t, nil)
 			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}

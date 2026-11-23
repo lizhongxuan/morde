@@ -29,6 +29,39 @@ type cloudDSHMCPStoreStub struct {
 	markUnknownErr        error
 }
 
+func TestNewMCPToolTaskStepReusesExactQueuedRetryAttempt(t *testing.T) {
+	const taskID = "q1234567"
+	const sourceStepID = "s1234567"
+	const attemptStepID = "s7654321"
+	call := ModelToolCall{CallID: "morde_step_retry_" + attemptStepID, Name: cloudDSHMCPCallToolName, Arguments: `{}`}
+	digest, err := agentOperationHash(call.Name, json.RawMessage(call.Arguments))
+	if err != nil {
+		t.Fatal(err)
+	}
+	details := TaskDetails{Task: task.Task{ID: taskID, CurrentStep: attemptStepID}, Steps: []task.Step{{
+		ID: attemptStepID, TaskID: taskID, Sequence: 4, Attempt: 2, RetryOfStepID: sourceStepID,
+		Kind: "tool", Status: task.StepQueued, ToolCallKey: call.CallID, ToolName: call.Name, RequestDigest: digest[:],
+	}}}
+
+	step, err := newMCPToolTaskStep(details, call, task.StepRunning, "Run retried connector call", "Checking current approval.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if step.ID != attemptStepID || step.Sequence != 4 || step.Attempt != 2 || step.RetryOfStepID != sourceStepID ||
+		step.Status != task.StepRunning || step.ToolCallKey != call.CallID || step.ToolName != call.Name {
+		t.Fatalf("retry attempt was not updated in place: %+v", step)
+	}
+
+	call.Arguments = `{"different":true}`
+	changed, err := newMCPToolTaskStep(details, call, task.StepRunning, "Run connector call", "Checking current approval.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed.ID == attemptStepID {
+		t.Fatalf("retry step was reused for changed arguments: %+v", changed)
+	}
+}
+
 func (s *cloudDSHMCPStoreStub) AuthorizeProjectMCPConnector(_ context.Context, projectID, actorID, connectorOwnerID, connectorID string, expectedVersion int64) error {
 	s.projectAuthorizeCalls++
 	if !s.projectGrantActive || expectedVersion != s.projectGrantVersion || projectID != s.details.Task.ProjectID ||
@@ -649,6 +682,30 @@ func TestCloudDSHMCPTerminalForAttemptRequiresExactBoundedRateLimitSignal(t *tes
 		t.Run(name, func(t *testing.T) {
 			if got := cloudDSHMCPTerminalForAttempt(value); got != (name == "explicit marker") {
 				t.Fatalf("terminal marker=%t", got)
+			}
+		})
+	}
+}
+
+func TestMCPConnectorTerminalRetryAfterValidatesPersistedOutput(t *testing.T) {
+	tests := []struct {
+		name     string
+		encoded  string
+		want     int64
+		wantOkay bool
+	}{
+		{name: "valid result", encoded: `{"is_error":true,"structured_content":{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":300}}`, want: 300, wantOkay: true},
+		{name: "not an error", encoded: `{"is_error":false,"structured_content":{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":300}}`},
+		{name: "ordinary failure", encoded: `{"is_error":true,"structured_content":{"code":"connector_rate_limited","terminal_for_attempt":false,"retry_after_seconds":300}}`},
+		{name: "fractional delay", encoded: `{"is_error":true,"structured_content":{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":1.5}}`},
+		{name: "delay exceeds bound", encoded: `{"is_error":true,"structured_content":{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":86401}}`},
+		{name: "invalid json", encoded: `{"is_error":true`},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, ok := MCPConnectorTerminalRetryAfterSeconds(test.encoded)
+			if got != test.want || ok != test.wantOkay {
+				t.Fatalf("MCPConnectorTerminalRetryAfterSeconds() = (%d, %t), want (%d, %t)", got, ok, test.want, test.wantOkay)
 			}
 		})
 	}

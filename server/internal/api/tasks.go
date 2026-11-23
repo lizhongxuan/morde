@@ -464,6 +464,7 @@ type taskStepResponse struct {
 	Summary       string          `json:"summary"`
 	FailureReason *string         `json:"failure_reason,omitempty"`
 	Retryable     bool            `json:"retryable"`
+	RetryAfterAt  *time.Time      `json:"retry_after_at,omitempty"`
 	AgentID       *string         `json:"agent_id,omitempty"`
 	TaskRevision  *int64          `json:"task_revision,omitempty"`
 	ToolName      *string         `json:"tool_name,omitempty"`
@@ -1508,7 +1509,8 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		response.Steps = append(response.Steps, taskStepResponse{
 			ID: step.ID, Sequence: step.Sequence, Attempt: attempt, RetryOfStepID: optionalTaskText(step.RetryOfStepID),
 			Kind: step.Kind, Status: step.Status, Title: step.Title, FailureReason: optionalTaskText(step.FailureReason), Retryable: retryable,
-			Summary: step.Summary, CreatedAt: step.CreatedAt, AgentID: optionalTaskText(step.AgentSessionID), TaskRevision: step.TaskRevision,
+			RetryAfterAt: step.RetryAfterAt,
+			Summary:      step.Summary, CreatedAt: step.CreatedAt, AgentID: optionalTaskText(step.AgentSessionID), TaskRevision: step.TaskRevision,
 			ToolName: optionalTaskText(step.ToolName), Phase: optionalTaskText(step.Phase), DetailState: detailState,
 		})
 	}

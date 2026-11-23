@@ -365,7 +365,7 @@ export interface paths {
         put?: never;
         /**
          * Log in on a native client
-         * @description Approved accounts sign in with name and password. Desktop and iOS clients must first require ordered_client_login from /api/capabilities. Each ordered network attempt has a new Idempotency-Key and a strictly increasing attempt_generation persisted by the client before sending. The service binds client_instance_id to one installation and rejects stale generations. A retry after an unknown result increments the generation; the prior response may then contain a revoked credential and must be discarded. Revoked installations cannot be restored by a late login. For source compatibility only, Android requests that omit both ordered fields continue using the legacy server-ordered path; it is not advertised as a capability and does not fence delayed client intents. Legacy same-key Android retries rotate credentials on the same installation. A desktop login atomically issues installation-bound Client, Sync and user Web credentials; mobile login issues only Client. No portal cookie is set.
+         * @description Approved accounts sign in with name and password. Desktop and iOS clients must first require ordered_client_login from /api/capabilities. Each ordered network attempt has a new Idempotency-Key and a strictly increasing attempt_generation persisted by the client before sending. The service binds client_instance_id to one installation and rejects stale generations. A retry after an unknown result increments the generation; the prior response may then contain a revoked credential and must be discarded. Revoked installations cannot be restored by a late login. If the password is valid but the bound installation has since been revoked, the service returns 409 with error.details.reason=client_login_state_changed; the client may start a fresh ordered login stream without a renewal_installation_id. For source compatibility only, Android requests that omit both ordered fields continue using the legacy server-ordered path; it is not advertised as a capability and does not fence delayed client intents. Legacy same-key Android retries rotate credentials on the same installation. A desktop login atomically issues installation-bound Client, Sync and user Web credentials; mobile login issues only Client. No portal cookie is set.
          */
         post: operations["clientLogin"];
         delete?: never;
@@ -3912,7 +3912,7 @@ export interface paths {
         put?: never;
         /**
          * Queue one verified safe retry of a Task step
-         * @description Retries the exact persisted tool call only when the prior attempt is confirmed not dispatched and the current Task, authorization, Host, Workspace, resource and checkpoint fences still match. The request binds the expected Task revision and source attempt; the server reads the tool request digest from the persisted source step. Request parameters cannot replace tool arguments. Repeating the same Idempotency-Key returns the same attempt. Unknown or possibly partial side effects are rejected.
+         * @description Retries the exact persisted tool call only when the prior attempt is confirmed not dispatched, or a connector rate limit is proven by the failed MCP operation ledger and its retry-after window has elapsed. The current Task, authorization, Host, Workspace, resource and checkpoint fences must still match. The request binds the expected Task revision and source attempt; the server reads the tool request digest from the persisted source step. Request parameters cannot replace tool arguments. Repeating the same Idempotency-Key returns the same attempt. Unknown or possibly partial side effects are rejected.
          */
         post: operations["retryTaskStep"];
         delete?: never;
@@ -9483,9 +9483,14 @@ export interface components {
             title: string;
             summary: string;
             /** @enum {string|null} */
-            failure_reason?: "not_dispatched" | "tool_failed_after_dispatch" | "side_effect_unknown" | "authorization_changed" | "resource_changed" | null;
-            /** @description True only when persisted Host evidence confirms the tool attempt was not dispatched and no retry attempt has been created for this step. */
+            failure_reason?: "not_dispatched" | "tool_failed_after_dispatch" | "side_effect_unknown" | "authorization_changed" | "resource_changed" | "connector_rate_limited" | null;
+            /** @description True only when persisted evidence confirms this exact failed operation is safe to retry and any connector retry-after window has elapsed. */
             retryable: boolean;
+            /**
+             * Format: date-time
+             * @description Earliest user-triggered retry time derived from a verified connector rate-limit result.
+             */
+            retry_after_at?: string;
             /** @description Opaque Agent session ID that actually emitted this step. */
             agent_id?: string;
             /** Format: int64 */
@@ -9554,9 +9559,15 @@ export interface components {
             status: "running" | "idle" | "unknown";
             /** Format: date-time */
             observed_at: string | null;
-            /** @description Current activity phase, omitted when the observation is not current or trusted. */
+            /**
+             * @description Current Activity phase
+             * @enum {string}
+             */
             activity_phase?: "model" | "tool" | "subagent" | "checkpoint";
-            /** @description Current activity state paired with activity_phase; this is not an approval status. */
+            /**
+             * @description Current Activity state paired with activity_phase; never an approval status.
+             * @enum {string}
+             */
             activity_state?: "started" | "waiting" | "completed" | "failed" | "cancelled";
         };
         TaskStepDetail: {
@@ -11512,7 +11523,15 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            409: components["responses"]["Conflict"];
+            /** @description Login attempt conflict, including a revoked installation after successful password verification; client_login_state_changed permits a fresh ordered login stream without renewal_installation_id */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ErrorResponse"];
+                };
+            };
             422: components["responses"]["Error"];
             429: components["responses"]["RateLimited"];
             default: components["responses"]["Error"];

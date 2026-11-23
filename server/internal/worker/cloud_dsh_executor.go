@@ -672,7 +672,7 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 
 func validCloudDSHStepRetryForTask(value task.Task, now time.Time) bool {
 	intent := value.StepRetry
-	if intent == nil || intent.Consumed || !intent.ExpiresAt.After(now) || !domain.ValidTaskID(intent.TaskID) ||
+	if intent == nil || !intent.ExpiresAt.After(now) || !domain.ValidTaskID(intent.TaskID) ||
 		!domain.ValidUserID(intent.OwnerID) || !domain.ValidStepID(intent.SourceStepID) || !domain.ValidStepID(intent.AttemptStepID) ||
 		intent.TaskID != value.ID || intent.OwnerID != value.OwnerID || intent.Attempt < 2 ||
 		intent.RetryCallID != "morde_step_retry_"+intent.AttemptStepID || intent.SourceCallID == "" || len(intent.SourceCallID) > 256 ||
@@ -1272,22 +1272,25 @@ func validCloudDSHJSONObject(raw []byte) bool {
 	return json.Unmarshal(raw, &value) == nil && value != nil
 }
 
-func validCloudDSHModelResponse(response app.ModelResponse, definitions []app.AgentToolDefinition) bool {
+func cloudDSHModelResponseFailureCategory(response app.ModelResponse, definitions []app.AgentToolDefinition) string {
 	if !app.ValidDSHModelResponse(response) {
-		return false
+		return "invalid_response"
 	}
 	if len(response.ToolCalls) == 0 {
-		return true
+		return ""
 	}
 	if len(definitions) == 0 {
-		return false
+		return "unauthorized_tool"
 	}
 	for _, call := range response.ToolCalls {
-		if !cloudDSHToolAllowed(definitions, call.Name) || !validCloudDSHJSONObject([]byte(call.Arguments)) {
-			return false
+		if !cloudDSHToolAllowed(definitions, call.Name) {
+			return "unauthorized_tool"
+		}
+		if !validCloudDSHJSONObject([]byte(call.Arguments)) {
+			return "invalid_response"
 		}
 	}
-	return true
+	return ""
 }
 
 func cloudDSHToolAllowed(definitions []app.AgentToolDefinition, name string) bool {

@@ -5666,7 +5666,7 @@ paths:
       tags: [Tasks]
       operationId: retryTaskStep
       summary: Queue one verified safe retry of a Task step
-      description: Retries the exact persisted tool call only when the prior attempt is confirmed not dispatched and the current Task, authorization, Host, Workspace, resource and checkpoint fences still match. The request binds the expected Task revision and source attempt; the server reads the tool request digest from the persisted source step. Request parameters cannot replace tool arguments. Repeating the same Idempotency-Key returns the same attempt. Unknown or possibly partial side effects are rejected.
+      description: Retries the exact persisted tool call only when the prior attempt is confirmed not dispatched, or a connector rate limit is proven by the failed MCP operation ledger and its retry-after window has elapsed. The current Task, authorization, Host, Workspace, resource and checkpoint fences must still match. The request binds the expected Task revision and source attempt; the server reads the tool request digest from the persisted source step. Request parameters cannot replace tool arguments. Repeating the same Idempotency-Key returns the same attempt. Unknown or possibly partial side effects are rejected.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - name: Idempotency-Key
@@ -12714,8 +12714,9 @@ components:
         status: { $ref: '#/components/schemas/TaskStepStatus' }
         title: { type: string }
         summary: { type: string }
-        failure_reason: { type: [string, 'null'], enum: [not_dispatched, tool_failed_after_dispatch, side_effect_unknown, authorization_changed, resource_changed, null] }
-        retryable: { type: boolean, description: True only when persisted Host evidence confirms the tool attempt was not dispatched and no retry attempt has been created for this step. }
+        failure_reason: { type: [string, 'null'], enum: [not_dispatched, tool_failed_after_dispatch, side_effect_unknown, authorization_changed, resource_changed, connector_rate_limited, null] }
+        retryable: { type: boolean, description: True only when persisted evidence confirms this exact failed operation is safe to retry and any connector retry-after window has elapsed. }
+        retry_after_at: { type: string, format: date-time, description: Earliest user-triggered retry time derived from a verified connector rate-limit result. }
         agent_id: { type: string, maxLength: 128, description: Opaque Agent session ID that actually emitted this step. }
         task_revision: { type: integer, format: int64, minimum: 0 }
         tool_name: { type: string, maxLength: 128 }

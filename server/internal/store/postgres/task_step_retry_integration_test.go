@@ -43,6 +43,11 @@ AND column_name IN ('attempt_no','retry_of_step_id','failure_reason','retryable'
 AND indexname='task_step_retry_intents_one_pending_source' AND indexdef LIKE '%UNIQUE%')`).Scan(&pendingSourceUnique); err != nil || !pendingSourceUnique {
 		t.Fatalf("one-pending-retry-per-source unique index exists=%t err=%v", pendingSourceUnique, err)
 	}
+	var connectorCallLookupIndex bool
+	if err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_indexes WHERE schemaname='public' AND tablename='task_mcp_connector_operations'
+AND indexname='task_mcp_connector_operations_call_id_lookup_idx')`).Scan(&connectorCallLookupIndex); err != nil || !connectorCallLookupIndex {
+		t.Fatalf("connector call-id lookup index exists=%t err=%v", connectorCallLookupIndex, err)
+	}
 }
 
 func TestPostgresTaskStepRetryConcurrentSameKeyCreatesOneAttempt(t *testing.T) {
@@ -222,5 +227,205 @@ WHERE datname=current_database() AND wait_event_type='Lock' AND query LIKE $1`, 
 	if err := pool.QueryRow(ctx, `SELECT status,current_step FROM tasks WHERE id=$1`, claimed.ID).Scan(&status, &currentStep); err != nil ||
 		status != "queued" || currentStep != values[0].Intent.AttemptStepID {
 		t.Fatalf("retry Task status/current step=%q/%q err=%v", status, currentStep, err)
+	}
+}
+
+func TestPostgresMCPConnectorRateLimitStepRetryWaitsForExactLedgerEvidence(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, owner.ID, host.ControlAI, 0)
+	setAgentTestHostRuntime(t, store, hostValue, "mcp-rate-limit-retry-runtime")
+	if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, hostValue.RuntimeGeneration); err != nil {
+		t.Fatalf("record Host Runtime heartbeat: %v", err)
+	}
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "mcp-rate-limit-step-retry", "retry an explicitly terminal MCP rate limit")
+	submission.Task.ExecutionLocation = "server"
+	createdTask, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit MCP retry Task: %v", err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "mcp-rate-limit-retry-worker", time.Minute)
+	if err != nil || !found || claimed.ID != createdTask.Task.ID {
+		t.Fatalf("claim MCP retry Task: found=%t task=%q err=%v", found, claimed.ID, err)
+	}
+	supervisorKey := bytes.Repeat([]byte{0x4d}, 32)
+	authenticator, err := app.NewAgentStopAuthenticator("mcp-rate-limit-retry-supervisor", supervisorKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := app.NewAgentInstanceService(store, authenticator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, replayed, err := instances.Start(ctx, app.AgentInstanceStart{
+		Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: claimed.OwnerID, InitiatorID: claimed.InitiatorID,
+			AgentInstanceID: "agent-mcp-rate-limit-retry", AgentSessionID: "session-mcp-rate-limit-retry",
+			SupervisorID: "mcp-rate-limit-retry-supervisor", LeaseOwner: claimed.Lease.Owner,
+			LeaseVersion: claimed.Lease.Version, AuthorizationVersion: claimed.Authorization.Version,
+			EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"},
+		SupervisorNonce: bytes.Repeat([]byte{0x27}, 32), LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || replayed {
+		t.Fatalf("start MCP retry Agent: replayed=%t err=%v", replayed, err)
+	}
+	f := selectedMCPAgentFixture{route: routeActionsTestFixture{store: store, ownerID: owner.ID}, task: claimed, fence: started.Fence}
+	const connectorID = "k1234567"
+	var revision int64
+	if err := pool.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, f.task.ID).Scan(&revision); err != nil {
+		t.Fatalf("read Task revision: %v", err)
+	}
+	checkpointDigest := hashBytes("mcp-rate-limit-retry-checkpoint")
+	if _, err := pool.Exec(ctx, `UPDATE tasks SET status='failed',finished_at=clock_timestamp(),result='connector rate limit',
+lease_owner='',lease_expires_at=NULL,current_revision=$2,desired_revision=$2,checkpoint_through_seq=0,checkpoint_digest=$3 WHERE id=$1`,
+		f.task.ID, revision, checkpointDigest); err != nil {
+		t.Fatalf("prepare failed Task checkpoint: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE task_agent_sessions SET checkpoint_through_seq=0,checkpoint_digest=$3
+WHERE task_id=$1 AND session_id=$2`, f.task.ID, f.fence.AgentSessionID, checkpointDigest); err != nil {
+		t.Fatalf("prepare Agent Session checkpoint: %v", err)
+	}
+
+	sourceStepID := mustID(t, domain.NewStepID)
+	callID := "mcp-rate-limit-call-001"
+	requestDigest := hashBytes("mcp_call:{\"query\":\"synthetic\"}")
+	if _, err := f.route.store.pool.Exec(ctx, `INSERT INTO task_steps
+(id,task_id,sequence,kind,status,title,summary,agent_session_id,task_revision,tool_call_key,tool_name,request_digest,phase,
+detail_state,attempt_no,failure_reason,retryable)
+VALUES ($1,$2,1,'tool','failed','Call selected connector','Connector was rate limited',$3,$4,$5,'mcp_call',$6,'execute',
+'not_recorded',1,'connector_rate_limited',true)`, sourceStepID, f.task.ID, f.fence.AgentSessionID, revision, callID, requestDigest); err != nil {
+		t.Fatalf("insert failed connector Task step: %v", err)
+	}
+	result := `{"is_error":true,"structured_content":{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":300}}`
+	if _, err := pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
+(id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
+host_id,workspace_id,binding_version,task_revision,call_id,operation_key,tool_name,request_hash,status,result)
+VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,'mcp_call',$13,'failed',$14)`,
+		mustID(t, domain.NewOperationID), f.task.ID, f.route.ownerID, connectorID, int64(1), int64(0), int64(1), f.task.Lease.Version, f.task.HostID, revision,
+		callID, "rate-limit-source-operation", requestDigest, result); err != nil {
+		t.Fatalf("insert failed connector operation evidence: %v", err)
+	}
+
+	details, err := f.route.store.GetTask(ctx, f.task.ID, f.route.ownerID)
+	if err != nil {
+		t.Fatalf("read failed Task: %v", err)
+	}
+	var projected *task.Step
+	for i := range details.Steps {
+		if details.Steps[i].ID == sourceStepID {
+			projected = &details.Steps[i]
+			break
+		}
+	}
+	if projected == nil || projected.Retryable || projected.RetryAfterAt == nil || !projected.RetryAfterAt.After(time.Now()) {
+		t.Fatalf("step retry projection before retry-after = %+v; want disabled with a future retry time", projected)
+	}
+
+	attemptStepID := mustID(t, domain.NewStepID)
+	record := app.IdempotencyRecord{OwnerID: f.route.ownerID, Operation: "task.step.retry", Key: "mcp-retry-after-window",
+		RequestHash: hashBytes("mcp-retry-after-window"), RelatedID: sourceStepID}
+	request := app.TaskStepRetryRequest{TaskID: f.task.ID, StepID: sourceStepID, ExpectedTaskRevision: revision, ExpectedAttempt: 1,
+		AttemptStepID: attemptStepID, RetryCallID: "morde_step_retry_" + attemptStepID}
+	if _, err := f.route.store.RequestTaskStepRetry(ctx, record, request); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("retry during Retry-After window err=%v; want conflict", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE task_mcp_connector_operations SET updated_at=clock_timestamp()-interval '6 minutes'
+WHERE task_id=$1 AND call_id=$2`, f.task.ID, callID); err != nil {
+		t.Fatalf("expire connector Retry-After window: %v", err)
+	}
+	details, err = f.route.store.GetTask(ctx, f.task.ID, f.route.ownerID)
+	if err != nil {
+		t.Fatalf("read Task after Retry-After window: %v", err)
+	}
+	for _, step := range details.Steps {
+		if step.ID == sourceStepID && (!step.Retryable || step.RetryAfterAt == nil || step.RetryAfterAt.After(time.Now())) {
+			t.Fatalf("step retry projection after Retry-After window = %+v; want enabled with an elapsed retry time", step)
+		}
+	}
+
+	if _, err := pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
+(id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
+host_id,workspace_id,binding_version,task_revision,call_id,operation_key,tool_name,request_hash,status,result)
+VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,'mcp_call',$13,'failed',$14)`,
+		mustID(t, domain.NewOperationID), f.task.ID, f.route.ownerID, connectorID, int64(1), int64(0), int64(1), f.task.Lease.Version, f.task.HostID, revision,
+		callID, "duplicate-call-id-evidence", requestDigest, result); err != nil {
+		t.Fatalf("insert duplicate call-id evidence: %v", err)
+	}
+	if _, err := f.route.store.RequestTaskStepRetry(ctx, record, request); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("retry with duplicate ledger evidence err=%v; want conflict", err)
+	}
+	details, err = f.route.store.GetTask(ctx, f.task.ID, f.route.ownerID)
+	if err != nil {
+		t.Fatalf("read Task with duplicate call-id evidence: %v", err)
+	}
+	for _, step := range details.Steps {
+		if step.ID == sourceStepID && step.Retryable {
+			t.Fatalf("duplicate call-id evidence exposed an enabled retry: %+v", step)
+		}
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM task_mcp_connector_operations WHERE task_id=$1 AND operation_key='duplicate-call-id-evidence'`, f.task.ID); err != nil {
+		t.Fatalf("remove duplicate call-id evidence: %v", err)
+	}
+
+	unknownCallID := "mcp-unknown-unrelated-001"
+	if _, err := pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
+(id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
+host_id,workspace_id,binding_version,task_revision,call_id,operation_key,tool_name,request_hash,status)
+VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,'mcp_call',$13,'unknown')`,
+		mustID(t, domain.NewOperationID), f.task.ID, f.route.ownerID, connectorID, int64(1), int64(0), int64(1), f.task.Lease.Version, f.task.HostID, revision,
+		unknownCallID, "unrelated-unknown-operation", hashBytes("unrelated request")); err != nil {
+		t.Fatalf("insert unrelated unknown operation: %v", err)
+	}
+	if _, err := f.route.store.RequestTaskStepRetry(ctx, record, request); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("retry with unrelated unknown operation err=%v; want conflict", err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM task_mcp_connector_operations WHERE task_id=$1 AND call_id=$2`, f.task.ID, unknownCallID); err != nil {
+		t.Fatalf("remove unrelated unknown operation: %v", err)
+	}
+
+	created, err := f.route.store.RequestTaskStepRetry(ctx, record, request)
+	if err != nil || created.Replayed || created.Intent.AttemptStepID != attemptStepID || created.Intent.RetryCallID != request.RetryCallID {
+		t.Fatalf("create verified connector retry: intent=%+v replayed=%t err=%v", created.Intent, created.Replayed, err)
+	}
+	replayResult, err := f.route.store.RequestTaskStepRetry(ctx, record, request)
+	if err != nil || !replayResult.Replayed || replayResult.Intent.AttemptStepID != created.Intent.AttemptStepID {
+		t.Fatalf("replay connector retry: intent=%+v replayed=%t err=%v", replayResult.Intent, replayResult.Replayed, err)
+	}
+	details, err = f.route.store.GetTask(ctx, f.task.ID, f.route.ownerID)
+	if err != nil {
+		t.Fatalf("read retried Task: %v", err)
+	}
+	if details.Task.Status != task.StatusQueued || details.Task.CurrentStep != attemptStepID {
+		t.Fatalf("Task status/current step=%q/%q; want queued retry attempt %q", details.Task.Status, details.Task.CurrentStep, attemptStepID)
+	}
+	var sourceFound, attemptFound bool
+	for _, step := range details.Steps {
+		if step.ID == sourceStepID {
+			sourceFound = true
+			if step.Status != task.StepFailed || step.RetryOfStepID != "" {
+				t.Fatalf("source failure was overwritten: %+v", step)
+			}
+		}
+		if step.ID == attemptStepID {
+			attemptFound = true
+			if step.Status != task.StepQueued || step.RetryOfStepID != sourceStepID || step.Attempt != 2 {
+				t.Fatalf("retry attempt lost its source binding: %+v", step)
+			}
+		}
+	}
+	if !sourceFound || !attemptFound {
+		t.Fatalf("source/retry step present=%t/%t", sourceFound, attemptFound)
+	}
+	var retrySteps, intents int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM task_steps WHERE task_id=$1 AND retry_of_step_id=$2`, f.task.ID, sourceStepID).Scan(&retrySteps); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM task_step_retry_intents WHERE task_id=$1 AND source_step_id=$2`, f.task.ID, sourceStepID).Scan(&intents); err != nil {
+		t.Fatal(err)
+	}
+	if retrySteps != 1 || intents != 1 {
+		t.Fatalf("retry step/intent count=%d/%d; want one each", retrySteps, intents)
 	}
 }

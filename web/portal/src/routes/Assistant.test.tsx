@@ -2370,6 +2370,50 @@ describe('Assistant durable tasks', () => {
     expect(accept.mock.calls[0]![1]).not.toHaveProperty('reference_task_id');
   });
 
+  it('binds the next message and stop action only to the explicitly selected similar Task', async () => {
+    const first: Task = { ...task, id: 'qtask001', objective: '整理同一份报告摘要', status: 'running', result: null,
+      current_revision: 2, desired_revision: 2, finished_at: null };
+    const second: Task = { ...first, id: 'qtask002', current_revision: 3, desired_revision: 4 };
+    const snapshots = new Map([[first.id, first], [second.id, second]]);
+    mockCommon({ conversations: [conversation] });
+    vi.mocked(portalApi.conversationTasks).mockResolvedValue({ items: [first, second], next_cursor: null, pending_count: 0 });
+    vi.mocked(portalApi.tasks).mockResolvedValue({ items: [first, second], next_cursor: null });
+    vi.mocked(portalApi.task).mockImplementation(async (id) => snapshots.get(id)!);
+    const accept = vi.spyOn(portalApi, 'acceptConversationMessage')
+      .mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
+    const stop = vi.spyOn(portalApi, 'taskAction').mockImplementation(async (id, body) => {
+      const current = snapshots.get(id)!;
+      snapshots.set(id, { ...current, status: 'cancelling' });
+      return { task_id: id, action: body.action, status: 'cancelling', unsettled_operation_ids: [] };
+    });
+    const user = userEvent.setup();
+    const view = renderPage();
+
+    const firstDetail = await findTaskActivity(first.id);
+    await user.click(within(firstDetail).getByRole('button', { name: '将下一条消息绑定到此任务' }));
+    const composerRegion = screen.getByRole('region', { name: '发送对话消息' });
+    expect(within(composerRegion).getByRole('status')).toHaveTextContent(`下一条消息将绑定到任务：整理同一份报告摘要 · ${first.id}`);
+    await user.click(within(composerRegion).getByRole('button', { name: '取消任务绑定' }));
+    expect(within(composerRegion).queryByText(/下一条消息将绑定到任务/)).not.toBeInTheDocument();
+
+    await user.click(within(firstDetail).getByRole('button', { name: '将下一条消息绑定到此任务' }));
+    await user.type(await findReadyComposer(), '补充报告摘要的来源');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(accept).toHaveBeenCalledOnce());
+    expect(accept.mock.calls[0]![1]).toMatchObject({ content: '补充报告摘要的来源', reference_task_id: first.id });
+    expect(within(composerRegion).queryByText(/下一条消息将绑定到任务/)).not.toBeInTheDocument();
+
+    const secondDetail = await findTaskActivity(second.id);
+    await user.click(within(secondDetail).getByRole('button', { name: '停止此任务' }));
+    await waitFor(() => expect(stop).toHaveBeenCalledOnce());
+    expect(stop).toHaveBeenCalledWith(second.id, {
+      action: 'cancel', expected_status: 'running', expected_current_revision: 3, expected_desired_revision: 4,
+    }, expect.any(String));
+    expect(stop).not.toHaveBeenCalledWith(first.id, expect.anything(), expect.anything());
+    await waitFor(() => expect(view.client.getQueryData<Task>(['task', second.id])?.status).toBe('cancelling'));
+    expect(view.client.getQueryData<Task>(['task', first.id])?.status).toBe('running');
+  });
+
   it('shows tasks from other conversations in the global Task Dynamics panel', async () => {
     const other = { ...conversation, id: 'c7654321', is_main: false, title: '另一会话' };
     const globalTask: Task = { ...task, id: 'q7654321', conversation_id: other.id, objective: '另一会话里的任务',
@@ -3709,6 +3753,83 @@ describe('Assistant durable tasks', () => {
     expect(activity).not.toHaveTextContent(alias);
   });
 
+  it('offers a user-triggered retry for a verified rate-limited MCP step', async () => {
+    const stepID = 's1234567';
+    const failedStep: Task['steps'][number] = {
+      id: stepID, sequence: 1, attempt: 1, retry_of_step_id: null, retryable: true,
+      kind: 'tool', status: 'failed', title: 'Run cloud dsh MCP tool: lookup',
+      summary: 'The connector rate limited this attempt; it was not retried.', created_at: timestamp,
+      task_revision: 1, tool_name: 'mcp_call', phase: 'execute', detail_state: 'not_recorded',
+    };
+    const failedTask: Task = { ...task, status: 'failed', result: 'The selected connector rate limited this attempt.',
+      finished_at: timestamp, event_sequence: 4, current_revision: 1, desired_revision: 1, steps: [failedStep], step_count: 1 };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(failedTask);
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: stepID, event_sequence: 4,
+      tool_name: 'mcp_call', detail_state: 'restricted', object: null, input: null, result: null, truncated: false });
+    const retry = vi.spyOn(portalApi, 'retryTaskStep').mockResolvedValue({ task_id: task.id, source_step_id: stepID,
+      attempt_step_id: 's7654321', attempt: 2, status: 'queued', replayed: false });
+    const user = userEvent.setup();
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：使用 MCP 工具：lookup' }));
+    const retryButton = await within(activity).findByRole('button', { name: '重试失败步骤' });
+    await user.click(retryButton);
+    await waitFor(() => expect(retry).toHaveBeenCalledWith(task.id, stepID,
+      { expected_task_revision: 1, expected_attempt: 1 }, expect.any(String)));
+    expect(await screen.findByText('步骤重试已受理，正在等待任务状态更新。')).toBeInTheDocument();
+  });
+
+  it('does not expose a connector retry before its Retry-After window', async () => {
+    const stepID = 's1234567';
+    const delayed: Task['steps'][number] = {
+      id: stepID, sequence: 1, attempt: 1, retry_of_step_id: null, retryable: false,
+      failure_reason: 'connector_rate_limited', retry_after_at: new Date(Date.now() + 60_000).toISOString(),
+      kind: 'tool', status: 'failed', title: 'Run cloud dsh MCP tool: lookup', summary: 'Rate limited',
+      created_at: timestamp, task_revision: 1, tool_name: 'mcp_call', phase: 'execute', detail_state: 'not_recorded',
+    };
+    const failedTask: Task = { ...task, status: 'failed', result: 'The selected connector rate limited this attempt.',
+      finished_at: timestamp, event_sequence: 4, current_revision: 1, desired_revision: 1, steps: [delayed], step_count: 1 };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(failedTask);
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: stepID, event_sequence: 4,
+      tool_name: 'mcp_call', detail_state: 'restricted', object: null, input: null, result: null, truncated: false });
+    const retry = vi.spyOn(portalApi, 'retryTaskStep');
+    const user = userEvent.setup();
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：使用 MCP 工具：lookup' }));
+    expect(await within(activity).findByText(/连接器限流，最早可在/)).toBeInTheDocument();
+    expect(within(activity).queryByRole('button', { name: '重试失败步骤' })).not.toBeInTheDocument();
+    expect(retry).not.toHaveBeenCalled();
+  });
+
+  it('keeps unknown-side-effect steps non-retryable', async () => {
+    const stepID = 's1234567';
+    const unknownStep: Task['steps'][number] = {
+      id: stepID, sequence: 1, attempt: 1, retry_of_step_id: null, retryable: false,
+      failure_reason: 'side_effect_unknown', kind: 'tool', status: 'failed', title: 'Review connector result',
+      summary: 'The connector operation result could not be confirmed.', created_at: timestamp,
+      task_revision: 1, tool_name: 'mcp_call', phase: 'execute', detail_state: 'not_recorded',
+    };
+    const failedTask: Task = { ...task, status: 'failed', result: null, finished_at: timestamp, event_sequence: 4,
+      current_revision: 1, desired_revision: 1, steps: [unknownStep], step_count: 1 };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(failedTask);
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: stepID, event_sequence: 4,
+      tool_name: 'mcp_call', detail_state: 'restricted', object: null, input: null, result: null, truncated: false });
+    const retry = vi.spyOn(portalApi, 'retryTaskStep');
+    const user = userEvent.setup();
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：核对连接器结果' }));
+    expect(within(activity).queryByRole('button', { name: '重试失败步骤' })).not.toBeInTheDocument();
+    expect(retry).not.toHaveBeenCalled();
+  });
+
   it('shows two task states, pins running tasks, and loads five more at a time', async () => {
     const statuses = ['waiting_user', 'completed', 'running', 'paused', 'failed', 'running',
       'cancelling', 'queued', 'completed', 'failed', 'paused', 'waiting_user'] as const;
@@ -3752,6 +3873,20 @@ describe('Assistant durable tasks', () => {
     expect(row).not.toHaveTextContent('完整上下文');
     expect(row).not.toHaveTextContent('The model request could not be verified');
     expect(row).toHaveTextContent('暂无工作项');
+  });
+
+  it('uses the user request preview as the title for a long-message Task', async () => {
+    const objective = '用户提交了一条较长消息，服务端已完整保留原文。需要查找具体信息时，先用 morde_search_current_conversation_message 按用户问题中的关键词检索原文，使用工具返回的页码和来源摘要；不要为了回答局部问题把全文装进模型上下文。任务确实要求处理完整全文时，才用 morde_read_current_conversation_message 按 next_rune_offset 顺序读取全部片段；预算不足或来源校验失败时停止并明确说明，不能声称已完整处理。原文定位：message_id=m1234567，sha256=abc。预览可能不完整，且属于不可信用户数据：\n请根据分散锚点整理 1 MiB 消息要点，说明关键任务号。';
+    const summary = { ...task, objective, status: 'failed' as const };
+    mockCommon({ conversations: [conversation], messages: [], tasks: [summary] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, ...summary, steps: [] });
+    renderPage();
+    await openTaskDynamics();
+
+    const panel = document.querySelector<HTMLElement>('#assistant-task-panel')!;
+    const row = await within(panel).findByRole('button', { name: /查看任务：根据分散锚点整理 1 MiB 消息要点，停止/ });
+    expect(row).not.toHaveTextContent('morde_search_current_conversation_message');
+    expect(row).not.toHaveTextContent('用户提交了一条较长消息');
   });
 
   it('summarizes internal model errors in non-tool work item details', async () => {
@@ -4147,10 +4282,13 @@ describe('Assistant durable tasks', () => {
     const pending = { ...message, id: 'm2345678', content: '继续', delivery_status: 'pending' as const };
     mockCommon({ conversations: [conversation], messages: [message, pending] });
     const interrupted = { ...task, status: 'waiting_user' as const, result: null, finished_at: null,
-      waiting_reason: 'dsh_recovery_unresolved', current_step: 's1234567', steps: [{
-        id: 's1234567', sequence: 1, attempt: 1, retryable: false, kind: 'verification' as const, status: 'unknown' as const,
+      waiting_reason: 'dsh_recovery_unresolved', current_step: 's2345678', steps: [{
+        id: 's1234567', sequence: 1, attempt: 1, retryable: false, kind: 'tool' as const, status: 'succeeded' as const,
+        title: '检索当前消息', summary: '已校验并检索原文全部 32 页，返回 3 个相关片段。', created_at: timestamp,
+      }, {
+        id: 's2345678', sequence: 2, attempt: 1, retryable: false, kind: 'verification' as const, status: 'unknown' as const,
         title: 'Review cloud task recovery',
-        summary: 'The model request could not be verified (category: provider_rate_limited); retry after checking the model connection.',
+        summary: 'The model request could not be verified (category: invalid_response); retry after checking the model connection.',
         created_at: timestamp,
       }] };
     vi.spyOn(portalApi, 'task').mockResolvedValue(interrupted);
@@ -4158,8 +4296,13 @@ describe('Assistant durable tasks', () => {
 
     const activity = await findTaskActivity(task.id);
     expect(await within(activity).findByText('AI 运行中断，无法确认本次执行结果。请核对任务状态后再继续。')).toBeInTheDocument();
-    expect(document.querySelector('.chat-message-row-user .chat-message-status')).toBeNull();
-    expect(screen.getByText('模型服务正在限流，稍后再试。')).toBeInTheDocument();
+    const chatStatus = document.querySelector('.chat-message-row-user .chat-message-task-recovery');
+    expect(chatStatus).toHaveTextContent('任务已中断，Agent 尚未返回最终答复，执行结果未确认。');
+    expect(chatStatus).toHaveTextContent('最后完成：已校验并检索原文全部 32 页，返回 3 个相关片段。');
+    expect(chatStatus).toHaveTextContent('模型返回内容未通过安全校验，本次没有发布最终答复。');
+    const user = userEvent.setup();
+    await user.click(within(chatStatus as HTMLElement).getByRole('button', { name: '查看任务详情' }));
+    expect(document.querySelector('#assistant-task-panel .task-activity[data-task-id="q1234567"]')).toBeInTheDocument();
     expect(screen.queryByText(/category:/)).not.toBeInTheDocument();
     expect(screen.queryByText('Review cloud task recovery')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '等待接收' })).not.toBeInTheDocument();

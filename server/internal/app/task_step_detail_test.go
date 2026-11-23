@@ -142,6 +142,39 @@ func TestTaskToolCallProgressSealsValidatedSearchQuery(t *testing.T) {
 	}
 }
 
+func TestTaskToolCallProgressMarksOnlyExplicitConnectorRateLimitRetryable(t *testing.T) {
+	const ownerID, taskID, stepID = "u1234567", "q1234567", "s1234567"
+	const leaseOwner, agentID, sessionID = "lease-owner", "agent_1", "session_1"
+	const leaseVersion, generation, authorizationVersion, revision int64 = 4, 2, 3, 5
+	current := task.Task{ID: taskID, OwnerID: ownerID, InitiatorID: ownerID, AgentInstanceID: agentID,
+		AgentGeneration: generation, AgentSessionID: sessionID, CurrentRevision: int64Pointer(revision),
+		Authorization: task.Authorization{Version: authorizationVersion}, Lease: task.Lease{Owner: leaseOwner, Version: leaseVersion}}
+	call := ModelToolCall{CallID: "connector-call-1", Name: cloudDSHMCPCallToolName, Arguments: `{"connector_id":"k1234567"}`,
+		TaskFence: &ModelTaskFence{TaskID: taskID, OwnerID: ownerID, InitiatorID: ownerID, LeaseOwner: leaseOwner,
+			LeaseVersion: leaseVersion, AgentInstanceID: agentID, AgentGeneration: generation, AgentSessionID: sessionID,
+			AuthorizationVersion: authorizationVersion}}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, nil)
+	ctx = withTaskToolResultEvidence(ctx, "execute", "connector_rate_limited")
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok {
+		t.Fatal("valid fenced connector call did not produce task activity")
+	}
+	progress, err := taskToolCallProgress(activity, task.Step{ID: stepID, Status: task.StepFailed, Phase: "prepare",
+		Summary: "The connector rate limited this attempt; it was not retried."})
+	if err != nil || progress == nil || progress.FailureReason != "connector_rate_limited" || !progress.Retryable || progress.Phase != "execute" {
+		t.Fatalf("connector rate-limit task progress = %+v, err=%v", progress, err)
+	}
+	if !IsMCPConnectorStepRetryTool(progress.ToolName) || !SupportsSafeTaskStepRetryTool(progress.ToolName) {
+		t.Fatalf("MCP connector retry tool was not admitted: %q", progress.ToolName)
+	}
+	ordinaryContext := withTaskToolResultEvidence(withCloudDSHToolActivity(context.Background(), current, call, nil), "execute", "")
+	ordinaryActivity, _ := cloudDSHToolActivityFromContext(ordinaryContext)
+	ordinary, err := taskToolCallProgress(ordinaryActivity, task.Step{ID: stepID, Status: task.StepFailed, Phase: "prepare"})
+	if err != nil || ordinary == nil || ordinary.FailureReason != "" || ordinary.Retryable {
+		t.Fatalf("ordinary dispatched MCP failure became retryable: progress=%+v err=%v", ordinary, err)
+	}
+}
+
 func TestTaskToolCallProgressStoresOnlySafeShellExecutionEvidence(t *testing.T) {
 	sealer, err := NewSealer(bytes.Repeat([]byte{8}, 32))
 	if err != nil {

@@ -397,6 +397,17 @@ enum MIFTaskPresentation {
             return AppLocalized("Authorization changed. Refresh the task and check authorization before retrying.")
         case "resource_changed":
             return AppLocalized("The target resource changed. Refresh the task and check its state before retrying.")
+        case "connector_rate_limited":
+            if let retryAfter = step.retry_after_at,
+               let date = ISO8601DateFormatter().date(from: retryAfter) {
+                let formatter = DateFormatter()
+                formatter.locale = Locale(identifier: "zh_CN")
+                formatter.timeZone = TimeZone(identifier: "Asia/Shanghai")
+                formatter.dateStyle = .medium
+                formatter.timeStyle = .short
+                return String(format: AppLocalized("Connector retry is available after %@."), formatter.string(from: date))
+            }
+            return AppLocalized("Connector rate limit is active. Refresh the task before retrying.")
         default:
             return nil
         }

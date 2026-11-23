@@ -69,6 +69,8 @@ type cloudDSHToolActivity struct {
 	displayObject   string
 	shellExecution  *TaskStepShellExecutionEvidence
 	contentEvidence *TaskStepContentEvidence
+	phaseOverride   string
+	failureReason   string
 }
 
 const maxTaskStepContentEvidencePreviewBytes = 4096
@@ -96,6 +98,15 @@ func withCloudDSHToolActivity(ctx context.Context, current task.Task, call Model
 func cloudDSHToolActivityFromContext(ctx context.Context) (cloudDSHToolActivity, bool) {
 	value, ok := ctx.Value(cloudDSHToolActivityKey{}).(cloudDSHToolActivity)
 	return value, ok
+}
+
+func withTaskToolResultEvidence(ctx context.Context, phase, failureReason string) context.Context {
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok {
+		return ctx
+	}
+	activity.phaseOverride, activity.failureReason = phase, failureReason
+	return context.WithValue(ctx, cloudDSHToolActivityKey{}, activity)
 }
 
 func withTaskToolShellExecutionEvidence(ctx context.Context, name string, result AgentToolResult) context.Context {
@@ -206,6 +217,9 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 	if step.Phase == "prepare" {
 		phase = step.Phase
 	}
+	if activity.phaseOverride != "" {
+		phase = activity.phaseOverride
+	}
 	progress := &TaskToolCallProgress{AgentSessionID: fence.AgentSessionID, AgentInstanceID: fence.AgentInstanceID,
 		AgentGeneration: fence.AgentGeneration, AuthorizationVersion: fence.AuthorizationVersion,
 		TaskRevision: *activity.current.CurrentRevision, CallKey: activity.call.CallID, ToolName: activity.call.Name,
@@ -218,7 +232,9 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 		}
 		progress.ContentEvidenceSHA256 = contentDigest
 	}
-	if step.Status == task.StepFailed && phase == "prepare" {
+	if step.Status == task.StepFailed && activity.failureReason == "connector_rate_limited" {
+		progress.FailureReason, progress.Retryable = activity.failureReason, true
+	} else if step.Status == task.StepFailed && phase == "prepare" {
 		progress.FailureReason, progress.Retryable = "not_dispatched", true
 	}
 	if activity.sealer != nil {
@@ -236,7 +252,11 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 // runner can bind a tool name to its task operation journal.
 func SupportsSafeTaskStepRetryTool(name string) bool {
 	_, ok := runtimeToolMappingByName(name)
-	return ok
+	return ok || IsMCPConnectorStepRetryTool(name)
+}
+
+func IsMCPConnectorStepRetryTool(name string) bool {
+	return name == cloudDSHMCPCallToolName
 }
 
 // MatchesTaskStepRetryCall binds the one-time retry identity to the exact

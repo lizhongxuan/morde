@@ -398,6 +398,7 @@ function mergeTaskAssistantMessages(items: ConversationMessage[], tasks: Task[])
 }
 
 const terminalTaskStatuses = new Set<Task['status']>(['completed', 'failed', 'cancelled']);
+const cancellableTaskStatuses = new Set<Task['status']>(['queued', 'running', 'waiting_user', 'paused']);
 type ConversationFileItem =
   | { kind: 'attachment'; key: string; attachmentID: string; messageID: string; index: number; createdAt: string }
   | { kind: 'artifact'; key: string; taskID: string; taskTitle: string; artifact: TaskArtifact };
@@ -493,6 +494,8 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
   const client = useQueryClient();
   const { notify, dismiss } = useToast();
   const [accessRevoked, setAccessRevoked] = useState(false);
+  const [retryingStep, setRetryingStep] = useState(false);
+  const retryStepKey = useRef<string | null>(null);
   const queryKey = ['task-step-detail', actorID, serviceInstanceID, conversationID, task.id, step.id] as const;
   const detail = useQuery({
     queryKey,
@@ -515,6 +518,14 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
       (query.state.data && query.state.data.event_sequence < task.event_sequence) ? 1500 : false,
   });
   const refetchDetail = detail.refetch;
+  useEffect(() => {
+    const retryAt = step.retry_after_at ? Date.parse(step.retry_after_at) : NaN;
+    if (!Number.isFinite(retryAt) || retryAt <= Date.now()) return;
+    const timer = window.setTimeout(() => {
+      void client.invalidateQueries({ queryKey: ['task', task.id] });
+    }, Math.min(retryAt - Date.now() + 250, 2_147_000_000));
+    return () => window.clearTimeout(timer);
+  }, [client, step.retry_after_at, task.id]);
   const inaccessible = isResourceNoLongerAccessible(detail.error);
   if (inaccessible && !accessRevoked) setAccessRevoked(true);
   useEffect(() => {
@@ -548,6 +559,34 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
   const safeObject = object !== null ? safeTaskActivityText(object) : null;
   const safeInput = data.input !== null ? safeTaskActivityText(data.input) : null;
   const safeResult = data.result !== null ? safeTaskActivityText(data.result) : null;
+  const canRetryStep = step.status === 'failed' && step.retryable && Number.isSafeInteger(step.task_revision) &&
+    Number.isSafeInteger(step.attempt) && (task.current_revision === undefined || task.current_revision === step.task_revision);
+  const retryStep = async () => {
+    if (!canRetryStep || retryingStep || step.task_revision === undefined || step.attempt === undefined) return;
+    const key = retryStepKey.current ?? newIdempotencyKey();
+    retryStepKey.current = key;
+    setRetryingStep(true);
+    try {
+      await portalApi.retryTaskStep(task.id, step.id, {
+        expected_task_revision: step.task_revision,
+        expected_attempt: step.attempt,
+      }, key);
+      if (retryStepKey.current === key) retryStepKey.current = null;
+      await Promise.all([
+        client.invalidateQueries({ queryKey: ['task', task.id] }),
+        client.invalidateQueries({ queryKey: ['assistant-account-tasks'] }),
+        client.invalidateQueries({ queryKey: ['conversation-tasks', conversationID] }),
+      ]);
+      notify('步骤重试已受理，正在等待任务状态更新。', 'info');
+    } catch (error) {
+      notify(errorDetails(error).message, 'error');
+      if (errorDetails(error).code === 'conflict') {
+        await client.invalidateQueries({ queryKey: ['task', task.id] });
+      }
+    } finally {
+      setRetryingStep(false);
+    }
+  };
   return <div className="task-step-detail" aria-label="动作详情">
     {safeToolName && <p><strong>工具</strong> {safeToolName.value}</p>}
     <p><strong>时间</strong> {formatDate(step.created_at)}</p>
@@ -558,6 +597,12 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
       {data.object === null && data.input === null && data.result === null && <p>没有可展示的输入或结果。</p>}
       {(data.truncated || [safeToolName, safeObject, safeInput, safeResult].some((field) => field?.truncated)) && <p>详情已截断。</p>}
     </>}
+    {step.failure_reason === 'connector_rate_limited' && step.retry_after_at && !step.retryable &&
+      <p role="status">连接器限流，最早可在 {formatDate(step.retry_after_at)} 后手动重试。</p>}
+    {canRetryStep && <button type="button" className="button button-small button-secondary"
+      aria-label="重试失败步骤" aria-busy={retryingStep} disabled={retryingStep} onClick={() => void retryStep()}>
+      {retryingStep ? '正在提交…' : '重试此步骤'}
+    </button>}
   </div>;
 }
 
@@ -625,6 +670,8 @@ function taskActivityProgressText(task: Task, cloudTasksAvailable: boolean | und
 function recoveryHint(step: TaskStep | undefined): string | null {
   if (step?.title !== 'Review cloud task recovery') return null;
   const category = /^The model request could not be verified \(category: ([a-z_]+)\); retry after checking the model connection\.$/.exec(step.summary)?.[1];
+  if (category === 'invalid_response') return '模型返回内容未通过安全校验，本次没有发布最终答复。';
+  if (category === 'unauthorized_tool') return '模型请求了当前任务未授权的工具，该调用未执行。';
   if (category === 'provider_rate_limited' || category === 'rate_limited') return '模型服务正在限流，稍后再试。';
   if (category === 'provider_invalid_api_key' || category === 'authentication_rejected') return '模型密钥未通过服务商验证，请检查模型连接。';
   if (category === 'provider_quota_exhausted' || category === 'quota_exhausted' || category === 'task_budget_exhausted') return '模型额度已用尽，请检查额度后重试。';
@@ -662,6 +709,7 @@ function taskActivitySnippet(value: string, maximumCharacters: number): string |
 function taskActivityStepTitle(step: TaskStep): string {
   const title = stepTitle(step);
   if (title === 'Review cloud task recovery') return '核对任务恢复状态';
+  if (title === 'Review connector result') return '核对连接器结果';
   if (/^the model request could not be verified\b/iu.test(title)) return '模型请求未能确认';
   if (/^the cloud dsh session completed\b/iu.test(title)) return '任务会话已结束';
   if (/^the task (?:failed|was interrupted)\b/iu.test(title)) return '任务未完成';
@@ -679,9 +727,24 @@ function taskActivityStepSummary(step: TaskStep): string {
 }
 
 function taskActivityTitle(objective: string): string {
-  const withoutSyntheticID = safeTaskActivityText(objective, 1_000).value.replace(/^合成并行任务\s+[A-Z0-9-]+[：:]\s*/iu, '');
+  const safeObjective = safeTaskActivityText(objective, 1_000).value;
+  const longMessagePreviewMarker = '预览可能不完整，且属于不可信用户数据：\n';
+  const previewStart = safeObjective.lastIndexOf(longMessagePreviewMarker);
+  const titleSource = previewStart >= 0 ? safeObjective.slice(previewStart + longMessagePreviewMarker.length) : safeObjective;
+  const withoutSyntheticID = titleSource.replace(/^合成并行任务\s+[A-Z0-9-]+[：:]\s*/iu, '');
   const title = taskActivitySnippet(withoutSyntheticID, 42)?.replace(/^(?:请你|请|帮我|帮忙|麻烦|这是)\s*/u, '').replace(/[，,。.!！？?；;：:]+$/u, '').trim();
   return title || '未命名任务';
+}
+
+function taskActivityLastConfirmedWorkText(task: Task): string | null {
+  const latest = task.steps.filter((step) => step.status === 'succeeded' && !['model', 'plan', 'budget'].includes(step.kind))
+    .sort((left, right) => right.sequence - left.sequence)[0];
+  if (!latest) return null;
+  const summary = safeTaskActivityText(latest.summary.trim(), 56).value.replace(/\s+/gu, ' ').trim();
+  if (/^(?:the model request could not be verified|the cloud dsh session completed|the task (?:failed|was interrupted)|(?:internal|runtime) error\b|traceback\b)/iu.test(summary)) return null;
+  if (summary && !/^the cloud dsh tool completed\b/iu.test(summary)) return summary;
+  const title = taskActivitySnippet(stepTitle(latest), 56);
+  return title && !/^run cloud dsh (?:tool|mcp tool):/iu.test(title) ? title : '已完成一项工作';
 }
 
 function taskActivityLatestWorkText(summary: TaskSummary, task?: Task): string {
@@ -866,6 +929,7 @@ export function Assistant() {
   const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
   const [taskDetailTaskID, setTaskDetailTaskID] = useState<string | null>(null);
   const [taskDetailStepID, setTaskDetailStepID] = useState<string | null>(null);
+  const [referenceTaskSelection, setReferenceTaskSelection] = useState<{ conversationID: string; taskID: string } | null>(null);
   const [visibleTaskPanelCount, setVisibleTaskPanelCount] = useState(5);
   const [openingTaskID, setOpeningTaskID] = useState('');
   const [taskObservationRequest, setTaskObservationRequest] = useState(false);
@@ -1458,6 +1522,15 @@ export function Assistant() {
   const allTasks = taskQueries.flatMap((query) => query.data && !isResourceNoLongerAccessible(query.error) ? [query.data] : []);
   const tasks = allTasks.filter((task) => task.conversation_id === conversationID);
   const allTasksByID = new Map(allTasks.map((task) => [task.id, task]));
+  const selectedReferenceTask = referenceTaskSelection?.conversationID === conversationID
+    ? allTasksByID.get(referenceTaskSelection.taskID) : undefined;
+  useEffect(() => {
+    if (referenceTaskSelection && referenceTaskSelection.conversationID !== conversationID) {
+      // A Task reference is a one-message intent and must not follow the user to another conversation.
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setReferenceTaskSelection(null);
+    }
+  }, [conversationID, referenceTaskSelection]);
   useEffect(() => {
     const serviceInstanceID = capabilities.data?.service_instance_id;
     const actorID = user?.id;
@@ -2191,7 +2264,7 @@ export function Assistant() {
     onError: (error, request) => handleTaskActionError(error, request.taskID),
   });
   const taskControl = useMutation({
-    mutationFn: async (request: { taskID: string; action: 'resume'; expectedStatus: Task['status'];
+    mutationFn: async (request: { taskID: string; conversationID: string; action: 'resume' | 'cancel'; expectedStatus: Task['status'];
       expectedCurrentRevision: number | null; expectedDesiredRevision: number | null; actionScope: string; key: string }) => {
       const hasCurrentRevision = request.expectedCurrentRevision !== null;
       const hasDesiredRevision = request.expectedDesiredRevision !== null;
@@ -2200,10 +2273,17 @@ export function Assistant() {
           !Number.isSafeInteger(request.expectedDesiredRevision) || request.expectedDesiredRevision! < 0))) {
         throw new Error('任务修订信息不完整或无效，请刷新状态后重试。');
       }
+      if (request.action === 'cancel' && (!hasCurrentRevision || !cancellableTaskStatuses.has(request.expectedStatus))) {
+        throw new Error('任务状态或修订信息不符合停止条件，请刷新状态后重试。');
+      }
       const latest = await portalApi.task(request.taskID);
-      if (latest.status !== request.expectedStatus || (latest.current_revision ?? null) !== request.expectedCurrentRevision
+      if (latest.id !== request.taskID || latest.conversation_id !== request.conversationID ||
+        latest.status !== request.expectedStatus || (latest.current_revision ?? null) !== request.expectedCurrentRevision
         || (latest.desired_revision ?? null) !== request.expectedDesiredRevision) {
         throw new ApiError({ message: '任务状态或修订已变化', code: 'conflict', status: 409 });
+      }
+      if (request.action === 'cancel' && !cancellableTaskStatuses.has(latest.status)) {
+        throw new ApiError({ message: '任务状态已变化', code: 'conflict', status: 409 });
       }
       return portalApi.taskAction(request.taskID, {
         action: request.action,
@@ -2216,9 +2296,13 @@ export function Assistant() {
     },
     onSuccess: async (_response, request) => {
       clearTaskActionKey(request.actionScope, request.key);
-      await client.invalidateQueries({ queryKey: ['task', request.taskID] });
-      await client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
-      notify('继续请求已受理，等待任务状态更新。', 'info');
+      await client.invalidateQueries({ queryKey: ['task', request.taskID], exact: true });
+      if (request.action === 'resume') {
+        await client.invalidateQueries({ queryKey: ['assistant-account-tasks'] });
+        notify('继续请求已受理，等待任务状态更新。', 'info');
+      } else {
+        notify('停止请求已受理，正在等待服务端确认任务状态。', 'info');
+      }
     },
     onError: (error, request) => handleTaskActionError(error, request.taskID),
   });
@@ -2470,6 +2554,7 @@ export function Assistant() {
     if (savingMessageRef.current || preparingAttachmentCountRef.current > 0 || composerAttachments.some((item) => item.needsPreparation)) return;
     const text = content;
     if (!text.trim() && !composerAttachments.length) return;
+    const referenceTaskForMessage = referenceTaskSelection?.conversationID === conversationID ? referenceTaskSelection : null;
     const effectiveText = text.trim() ? text : '请阅读并处理我附加的文件。';
     const timeZone = browserIanaTimeZone();
     if (new TextEncoder().encode(effectiveText).length > maxMessageBytes) {
@@ -2494,6 +2579,7 @@ export function Assistant() {
         actorID: user?.id ?? '',
         request: {
           client_message_id: id, content: effectiveText,
+          ...(referenceTaskForMessage ? { reference_task_id: referenceTaskForMessage.taskID } : {}),
           ...(timeZone ? { time_zone: timeZone } : {}),
           ...(submissionModelID ? { model_id: submissionModelID } : {}),
           ...(preferredHostID ? { host_id: preferredHostID } : {}),
@@ -2506,6 +2592,10 @@ export function Assistant() {
       };
       const serverPredecessor = latestConversationClientMessageID(conversationMessageItems);
       const entry = await outbox.enqueue(message, serverPredecessor);
+      if (referenceTaskForMessage) {
+        setReferenceTaskSelection((current) => current?.conversationID === referenceTaskForMessage.conversationID &&
+          current.taskID === referenceTaskForMessage.taskID ? null : current);
+      }
       if (activeOutboxScope.current === entry.scope) {
         setContent((current) => current === text ? '' : current);
         setComposerAttachments((current) => current.filter((item) => !attachments.some((attachment) => attachment.id === item.id)));
@@ -2524,13 +2614,20 @@ export function Assistant() {
     pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
   };
 
-  const submitTaskControl = (action: 'resume', task: TaskSummary) => {
+  const submitTaskControl = (action: 'resume' | 'cancel', task: TaskSummary) => {
+    if (action === 'cancel' && (task.initiator_id !== user?.id || !cancellableTaskStatuses.has(task.status))) return;
     const actionScope = `${action}:${task.id}`;
     const expectedCurrentRevision = task.current_revision ?? null;
     const expectedDesiredRevision = task.desired_revision ?? null;
+    if (action === 'cancel' && (expectedCurrentRevision === null || expectedDesiredRevision === null ||
+      !Number.isSafeInteger(expectedCurrentRevision) || expectedCurrentRevision < 0 ||
+      !Number.isSafeInteger(expectedDesiredRevision) || expectedDesiredRevision < 0)) {
+      notify('任务修订信息暂不可确认，请刷新状态后再停止。', 'error');
+      return;
+    }
     const fingerprint = JSON.stringify({ action, expected_status: task.status,
       current_revision: expectedCurrentRevision, desired_revision: expectedDesiredRevision });
-    taskControl.mutate({ taskID: task.id, action, expectedStatus: task.status,
+    taskControl.mutate({ taskID: task.id, conversationID: task.conversation_id, action, expectedStatus: task.status,
       expectedCurrentRevision, expectedDesiredRevision, actionScope,
       key: taskActionKey(actionScope, fingerprint) });
   };
@@ -2980,6 +3077,12 @@ export function Assistant() {
     const isRunning = taskActivityIsExecuting(task.status);
     const title = taskActivityTitle(task.objective);
     const busy = !terminalTaskStatuses.has(task.status);
+    const canCancelTask = task.initiator_id === user?.id && cancellableTaskStatuses.has(task.status);
+    const hasTaskRevisionFence = Number.isSafeInteger(task.current_revision) && (task.current_revision ?? -1) >= 0 &&
+      Number.isSafeInteger(task.desired_revision) && (task.desired_revision ?? -1) >= 0;
+    const taskActionPending = taskControl.isPending && taskControl.variables?.taskID === task.id;
+    const selectedForNextMessage = referenceTaskSelection?.conversationID === task.conversation_id &&
+      referenceTaskSelection.taskID === task.id;
     const currentStep = task.steps.find((step) => step.id === task.current_step);
     const recoveryMessage = task.waiting_reason === 'dsh_recovery_unresolved' ? recoveryHint(currentStep) : null;
     const progressText = taskActivityProgressText(task, cloudTasksAvailable);
@@ -3006,6 +3109,12 @@ export function Assistant() {
           {isRunning ? '执行中' : task.status === 'failed' ? '失败' : '停止'}
         </span>
       </header>
+      {task.conversation_id === conversationID && task.initiator_id === user?.id && <div className="inline-actions task-activity-actions">
+        <button type="button" className="button button-small button-secondary" aria-pressed={selectedForNextMessage}
+          onClick={() => setReferenceTaskSelection({ conversationID: task.conversation_id, taskID: task.id })}>
+          {selectedForNextMessage ? '下一条消息已绑定此任务' : '将下一条消息绑定到此任务'}
+        </button>
+      </div>}
       {task.status === 'queued' && task.queue_priority && <section className="task-activity-k2 task-queue-priority" aria-label="任务优先级">
         <h3>排队优先级</h3>
         <p>当前：{taskQueuePriorityText(task.queue_priority)}</p>
@@ -3065,9 +3174,16 @@ export function Assistant() {
         {['disconnected', 'resyncing'].includes(taskEventFeeds[task.id] ?? '') && !showConsolidatedNetworkError && <p role="status">连接中断，正在重连…</p>}
       </section>}
       {task.status === 'failed' && <p className="task-current-progress-message" role="alert">{progressText}</p>}
+      {canCancelTask && <div className="inline-actions task-activity-actions">
+        <button type="button" className="button button-small button-secondary" aria-busy={taskActionPending && taskControl.variables?.action === 'cancel'}
+          disabled={taskActionPending || !hasTaskRevisionFence} onClick={() => submitTaskControl('cancel', task)}>
+          {taskActionPending && taskControl.variables?.action === 'cancel' ? '正在停止…' : '停止此任务'}
+        </button>
+        {!hasTaskRevisionFence && <small role="status">任务修订信息暂不可确认，刷新后才能安全停止。</small>}
+      </div>}
       {busy && task.status === 'paused' && <div className="inline-actions task-activity-actions">
-        <button type="button" className="button button-secondary" disabled={taskControl.isPending}
-          onClick={() => submitTaskControl('resume', task)}>{taskControl.isPending ? '正在继续…' : '继续任务'}</button>
+        <button type="button" className="button button-secondary" disabled={taskActionPending}
+          onClick={() => submitTaskControl('resume', task)}>{taskActionPending ? '正在继续…' : '继续任务'}</button>
       </div>}
       {supplementEntries.map(({ message, scope }) => {
         const error = messageOutboxErrorForDisplay(message.error);
@@ -3392,6 +3508,12 @@ export function Assistant() {
                 </div>}
                 {displayMessages.map((message, index) => {
                   const messageTask = tasksByID.get(message.task_id ?? message.related_task_id ?? '');
+                  const recoveryTask = message.role === 'user' && message.task_id ? allTasksByID.get(message.task_id) : undefined;
+                  const recoveryStep = recoveryTask?.steps.find((step) => step.id === recoveryTask.current_step) ??
+                    (recoveryTask ? [...recoveryTask.steps].reverse().find((step) => step.title === 'Review cloud task recovery') : undefined);
+                  const showRecoveryStatus = recoveryTask?.status === 'waiting_user' && recoveryTask.waiting_reason === 'dsh_recovery_unresolved';
+                  const recoveryLastWorkText = showRecoveryStatus && recoveryTask ? taskActivityLastConfirmedWorkText(recoveryTask) : null;
+                  const recoveryHintText = showRecoveryStatus ? recoveryHint(recoveryStep) : null;
                   const variantGroupID = variantTimeline.groupByMessageID.get(message.id);
                   const variantGroup = variantGroupID ? variantTimeline.groups.get(variantGroupID) : undefined;
                   const selectedVariantVersion = variantGroup ? selectedMessageVariantVersions[variantGroup.id] ?? variantGroup.latestVersion : 1;
@@ -3414,6 +3536,9 @@ export function Assistant() {
                     {message.role === 'assistant' && <strong className="chat-message-author">Morde</strong>}
                     <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}${message.role === 'user' && message.agent_acknowledged === true ? ' chat-message-user-received' : ''}`}
                       aria-label={message.role === 'assistant' ? 'Morde 的回复' : '你的消息'} tabIndex={message.role === 'assistant' ? 0 : undefined}>
+                      {canRetryRouting && <button type="button" className="message-retry" aria-label="重新处理这条消息" title="重新处理"
+                        disabled={retryProcessing.isPending && retryProcessing.variables?.messageID === message.id}
+                        onClick={() => retryProcessing.mutate({ conversationID: message.conversation_id, messageID: message.id })}>!</button>}
                       {message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <UserMessageContent content={message.content} />}
                       {message.attachment_ids?.length ? <small className="chat-message-attachments">附件 · {message.attachment_ids.length}
                         {message.attachment_ids.map((attachmentID, index) => <span key={attachmentID}> · <a
@@ -3442,11 +3567,6 @@ export function Assistant() {
                           disabled={groupOperations.some((item) => item.operation.status === 'sending')} onClick={() => void sendVariantOperation(entry)}>核对并重试</button>}
                       </div>)}
                     </article>
-                    {canRetryRouting && <div className="chat-message-status" role="status">
-                      <button type="button" className="button button-small button-secondary"
-                        aria-label="重新处理这条消息" disabled={retryProcessing.isPending && retryProcessing.variables?.messageID === message.id}
-                        onClick={() => retryProcessing.mutate({ conversationID: message.conversation_id, messageID: message.id })}>重新处理这条消息</button>
-                    </div>}
                     {message.role === 'user' && (routingStatus || message.delivery_status === 'unknown') && <div className="chat-message-status" role="status">
                         {routingStatus}
                         {message.delivery_status === 'unknown' && <button type="button" className="button button-small button-secondary"
@@ -3455,6 +3575,17 @@ export function Assistant() {
                             if (message.task_id) void client.invalidateQueries({ queryKey: ['task', message.task_id] });
                           }}>核对状态</button>}
                       </div>}
+                    {showRecoveryStatus && recoveryTask && <div className="chat-message-status chat-message-task-recovery" role="status">
+                      <span>任务已中断，Agent 尚未返回最终答复，执行结果未确认。</span>
+                      {recoveryLastWorkText && <span>最后完成：{recoveryLastWorkText}</span>}
+                      {recoveryHintText && <span>{recoveryHintText}</span>}
+                      <button type="button" className="button button-small button-secondary" onClick={() => {
+                        setTaskDetailStepID(null);
+                        setTaskDetailTaskID(recoveryTask.id);
+                        setTaskPanelTab('tasks');
+                        setTaskPanelOpen(true);
+                      }}>查看任务详情</button>
+                    </div>}
                     {message.role === 'assistant' && <time className="assistant-reply-time" dateTime={message.created_at} aria-label={`回复时间：${formatDate(message.created_at)}`}>{formatDate(message.created_at)}</time>}
                     </div></div>
                     {thinkingMessageIDs.has(message.id) && <div className="chat-message-row chat-message-row-assistant chat-thinking-row" role="status" aria-label="Morde 正在思考">
@@ -3483,6 +3614,12 @@ export function Assistant() {
         <section className="assistant-composer" aria-label="发送对话消息">
           <form onSubmit={submit}>
             {!composerDraftReady && <p className="muted" role="status">正在恢复此会话草稿…</p>}
+            {referenceTaskSelection?.conversationID === conversationID && <div className="task-supplement-status" role="status">
+              <span>下一条消息将绑定到任务：{selectedReferenceTask ? taskActivityTitle(selectedReferenceTask.objective) : '目标任务'} · {referenceTaskSelection.taskID}</span>
+              <button type="button" className="button button-small button-secondary" aria-label="取消任务绑定"
+                onClick={() => setReferenceTaskSelection((current) => current?.conversationID === conversationID &&
+                  current.taskID === referenceTaskSelection.taskID ? null : current)}>取消绑定</button>
+            </div>}
             {composerDraftError && <FloatingError className="error-inline" role="alert">草稿尚未可靠保存：{composerDraftError}。当前输入仍保留在页面中。</FloatingError>}
             <label className="sr-only" htmlFor="assistant-content">消息内容</label>
             <textarea ref={composerTextarea} id="assistant-content" value={visibleComposerContent} style={{ resize: 'none' }} onChange={(event) => {
