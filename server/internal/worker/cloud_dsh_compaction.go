@@ -51,6 +51,18 @@ type CloudDSHConversationSummaryResult struct {
 	Through   int64
 }
 
+// ResolveConversationSummaryModel reports the summary model through the model
+// gateway. The route worker's summary maintenance needs this method; without
+// the delegation it silently skips compaction and no summary is ever produced.
+func (c *CloudDSHConversationCoordinator) ResolveConversationSummaryModel(ctx context.Context,
+	claim app.ConversationRouteClaim) (string, int, error) {
+	models, ok := c.options.Models.(CloudDSHConversationSummaryModelGateway)
+	if !ok || ctx == nil {
+		return "", 0, domain.NewError(domain.CodeUnsupported, "conversation summary model is unavailable")
+	}
+	return models.ResolveConversationSummaryModel(ctx, claim)
+}
+
 func (c *CloudDSHConversationCoordinator) EstimateConversationSummaryTokenPressure(ctx context.Context,
 	request CloudDSHConversationSummaryEstimateRequest) ([]int, error) {
 	models, ok := c.options.Models.(CloudDSHConversationSummaryModelGateway)

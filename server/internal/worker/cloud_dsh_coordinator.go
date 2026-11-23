@@ -134,6 +134,21 @@ func (c *CloudDSHConversationCoordinator) ResolveConversationRouteModel(ctx cont
 	return c.options.Models.ResolveConversationRouteModel(ctx, claim)
 }
 
+// ResolveConversationRouteContextWindow reports the selected model's configured
+// capacity through the model gateway. The route worker sizes classification input
+// against this window; without the delegation the worker silently falls back to
+// the 4096-token minimum and long conversations fail before classification.
+func (c *CloudDSHConversationCoordinator) ResolveConversationRouteContextWindow(ctx context.Context,
+	claim app.ConversationRouteClaim, modelID string) (int, bool, error) {
+	resolver, ok := c.options.Models.(interface {
+		ResolveConversationRouteContextWindow(context.Context, app.ConversationRouteClaim, string) (int, bool, error)
+	})
+	if !ok {
+		return 4096, false, nil
+	}
+	return resolver.ResolveConversationRouteContextWindow(ctx, claim, modelID)
+}
+
 func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim,
 	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
 	if ctx == nil || value.ModelID == "" || claim.Message.ID == "" || value.ActorID != claim.Message.ActorID || value.Content != claim.Message.Content {
