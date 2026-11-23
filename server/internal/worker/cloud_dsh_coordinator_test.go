@@ -16,19 +16,22 @@ import (
 )
 
 type coordinatorTestModels struct {
-	completeCalls   int
-	recoverCalls    int
-	directCalls     int
-	directDecision  app.ConversationRouteDecision
-	directErr       error
-	response        app.ModelResponse
-	request         json.RawMessage
-	summaryModelID  string
-	summaryWindow   int
-	summaryResponse app.ModelResponse
-	summaryCalls    int
-	summaryFence    app.ConversationSummaryModelFence
-	summaryRequest  json.RawMessage
+	completeCalls    int
+	recoverCalls     int
+	directCalls      int
+	directDecision   app.ConversationRouteDecision
+	directErr        error
+	response         app.ModelResponse
+	request          json.RawMessage
+	summaryModelID   string
+	summaryWindow    int
+	routeWindow      int
+	routeWindowKnown bool
+	routeWindowErr   error
+	summaryResponse  app.ModelResponse
+	summaryCalls     int
+	summaryFence     app.ConversationSummaryModelFence
+	summaryRequest   json.RawMessage
 }
 
 func (m *coordinatorTestModels) ClassifyConversationRoute(context.Context, app.ConversationRouteClaim,
@@ -39,6 +42,10 @@ func (m *coordinatorTestModels) ClassifyConversationRoute(context.Context, app.C
 
 func (m *coordinatorTestModels) ResolveConversationRouteModel(context.Context, app.ConversationRouteClaim) (string, error) {
 	return "p1234567", nil
+}
+
+func (m *coordinatorTestModels) ResolveConversationRouteContextWindow(context.Context, app.ConversationRouteClaim, string) (int, bool, error) {
+	return m.routeWindow, m.routeWindowKnown, m.routeWindowErr
 }
 
 func (m *coordinatorTestModels) RecoverConversationCoordinatorModelOutput(context.Context,
@@ -566,5 +573,60 @@ func TestCloudDSHCoordinatorEstimatesSummaryPressureWithoutModelOrCheckpoint(t *
 		runtime.startRequest["resume"] != false || runtime.stopCalls != 1 || runtime.writeCalls != 0 || models.summaryCalls != 0 {
 		t.Fatalf("summary estimate counts=%v start=%+v starts=%d stops=%d writes=%d model_calls=%d err=%v",
 			counts, runtime.startRequest, runtime.startCalls, runtime.stopCalls, runtime.writeCalls, models.summaryCalls, err)
+	}
+}
+
+// coordinatorMinimalModels implements only CloudDSHCoordinatorModelGateway: it
+// cannot report a route context window or a summary model.
+type coordinatorMinimalModels struct{}
+
+func (coordinatorMinimalModels) ResolveConversationRouteModel(context.Context, app.ConversationRouteClaim) (string, error) {
+	return "p1234567", nil
+}
+
+func (coordinatorMinimalModels) RecoverConversationCoordinatorModelOutput(context.Context, app.ConversationRouteClaim,
+	app.ConversationRouteContext) (app.ModelResponse, error) {
+	return app.ModelResponse{}, errors.New("unexpected coordinator model recovery")
+}
+
+func (coordinatorMinimalModels) CompleteConversationCoordinatorModel(context.Context, app.ConversationRouteClaim,
+	app.ConversationRouteContext, string, int64, json.RawMessage) (app.ModelResponse, error) {
+	return app.ModelResponse{}, errors.New("unexpected coordinator model call")
+}
+
+func TestCloudDSHCoordinatorExposesRouteWindowAndSummaryModel(t *testing.T) {
+	claim, _ := coordinatorTestClaimAndContext()
+	models := &coordinatorTestModels{routeWindow: 1_048_576, routeWindowKnown: true,
+		summaryModelID: "p1234567", summaryWindow: 1_048_576}
+	coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{Models: models}}
+	if _, ok := any(coordinator).(interface {
+		ResolveConversationRouteContextWindow(context.Context, app.ConversationRouteClaim, string) (int, bool, error)
+	}); !ok {
+		t.Fatal("coordinator must expose the route context window or the worker falls back to the 4096-token minimum")
+	}
+	if _, ok := any(coordinator).(interface {
+		ResolveConversationSummaryModel(context.Context, app.ConversationRouteClaim) (string, int, error)
+	}); !ok {
+		t.Fatal("coordinator must expose the summary model or the worker silently skips compaction")
+	}
+	window, known, err := coordinator.ResolveConversationRouteContextWindow(context.Background(), claim, "p1234567")
+	if err != nil || !known || window != 1_048_576 {
+		t.Fatalf("route window = %d, known=%v, err=%v", window, known, err)
+	}
+	modelID, summaryWindow, err := coordinator.ResolveConversationSummaryModel(context.Background(), claim)
+	if err != nil || modelID != "p1234567" || summaryWindow != 1_048_576 {
+		t.Fatalf("summary model = %s, window=%d, err=%v", modelID, summaryWindow, err)
+	}
+}
+
+func TestCloudDSHCoordinatorFallsBackWhenGatewayCannotReportCapacity(t *testing.T) {
+	claim, _ := coordinatorTestClaimAndContext()
+	coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{Models: coordinatorMinimalModels{}}}
+	window, known, err := coordinator.ResolveConversationRouteContextWindow(context.Background(), claim, "p1234567")
+	if err != nil || known || window != 4096 {
+		t.Fatalf("route window = %d, known=%v, err=%v", window, known, err)
+	}
+	if _, _, err := coordinator.ResolveConversationSummaryModel(context.Background(), claim); err == nil {
+		t.Fatal("summary model must be unavailable when the gateway cannot report it")
 	}
 }
