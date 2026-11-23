@@ -149,9 +149,32 @@ func (c *CloudDSHConversationCoordinator) ResolveConversationRouteContextWindow(
 	return resolver.ResolveConversationRouteContextWindow(ctx, claim, modelID)
 }
 
+// coordinatorRouteContentMatchesClaim checks that the classify context belongs
+// to this claim. The route carries a bounded preview by design for messages
+// over 2048 bytes, so a truncated context can never equal the full message
+// text; instead the preview must name this claim's message, either as the
+// current message or as the first source of an aggregated input. The model
+// request builder validates the preview's digest and length binding right
+// after this check, so this function only establishes identity, not shape.
+func coordinatorRouteContentMatchesClaim(value app.ConversationRouteContext, claim app.ConversationRouteClaim) bool {
+	if !value.ContentTruncated {
+		if value.Content == claim.Message.Content {
+			return true
+		}
+		// Aggregated input: the merged text differs from the root message
+		// by design. The first source is the root and must name this claim.
+		return len(value.ContentSources) > 0 && value.ContentSources[0].MessageID == claim.Message.ID
+	}
+	if value.CurrentMessageID == claim.Message.ID {
+		return true
+	}
+	return len(value.ContentSources) > 0 && value.ContentSources[0].MessageID == claim.Message.ID
+}
+
 func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim,
 	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
-	if ctx == nil || value.ModelID == "" || claim.Message.ID == "" || value.ActorID != claim.Message.ActorID || value.Content != claim.Message.Content {
+	if ctx == nil || value.ModelID == "" || claim.Message.ID == "" || value.ActorID != claim.Message.ActorID ||
+		!coordinatorRouteContentMatchesClaim(value, claim) {
 		return app.ConversationRouteDecision{}, domain.InvalidArgument("coordinator", "coordinator route context is invalid")
 	}
 	identity := cloudDSHCoordinatorIdentity(claim, value)

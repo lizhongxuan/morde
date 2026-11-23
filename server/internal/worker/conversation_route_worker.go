@@ -175,7 +175,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 				}
 				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 2*time.Second)
 			}
-			w.options.Logger.Warn("conversation summary compaction skipped", zap.String("job", "conversation_route"))
+			w.options.Logger.Warn("conversation summary compaction skipped", zap.String("job", "conversation_route"), zap.Error(err))
 		} else if compacted {
 			snapshot, err = w.options.Actions.LoadConversationRouteSnapshot(routeCtx, claim)
 			if err != nil {
