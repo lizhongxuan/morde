@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light">
+<title>Morde 复刻 Muse：最终流程与开发设计</title>
+<style>
+  :root{--bg:#f8faff;--side:#eff6ff;--surface:#fff;--ink:#334155;--muted:#64748b;--line:#dbeafe;--line-strong:#bfdbfe;--blue:#2563eb;--deep:#1d4ed8;--warning:#b45309;--warning-bg:#fef3c7;--success:#047857;--success-bg:#d1fae5;--danger:#b91c1c;--danger-bg:#fee2e2;--font:"Yuanti SC","PingFang SC","Microsoft YaHei",system-ui,-apple-system,"Segoe UI",sans-serif;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  *{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.75 var(--font)}
+  a{color:var(--deep);text-decoration-thickness:1px;text-underline-offset:3px}a:focus-visible,summary:focus-visible{outline:3px solid var(--blue);outline-offset:3px}
+  .page{max-width:1320px;margin:auto;padding:40px 24px 88px}header{max-width:1050px;margin-bottom:28px}.eyebrow{color:var(--blue);font-size:13px;font-weight:700;letter-spacing:.08em}h1{font-size:clamp(28px,4vw,40px);line-height:1.22;margin:8px 0 14px}h2{font-size:24px;line-height:1.35;margin:0 0 10px}h3{font-size:18px;line-height:1.4;margin:0}p{margin:8px 0}code{font-family:var(--mono);font-size:.87em;color:var(--deep);background:var(--side);padding:1px 4px;border-radius:6px;overflow-wrap:anywhere}
+  .lede{font-size:16px;color:var(--muted);max-width:920px}.notice,.figure,.step,.crosscut,.boundary{background:var(--surface);border:1px solid var(--line-strong);border-radius:20px;padding:20px 24px;box-shadow:0 8px 20px rgba(96,165,250,.08)}
+  .notice{margin:22px 0}.notice strong{color:var(--deep)}.meta{color:var(--muted);font-size:13px}.nav{display:flex;flex-wrap:wrap;gap:8px;margin:20px 0 28px}.nav a{padding:5px 12px;background:var(--side);border:1px solid var(--line);border-radius:999px;text-decoration:none;font-size:13px;font-weight:700}.nav a:hover{background:#dbeafe}
+  .section{margin-top:36px}.figure{margin-top:16px}.figure h3{margin-bottom:4px}.figure p{color:var(--muted);font-size:13px}.svg-scroll{overflow-x:auto;margin:10px -4px 0}.svg-scroll svg{display:block;min-width:1120px;width:100%;height:auto;font-family:var(--font)}
+  .svg-text{fill:var(--ink);font-size:17px;font-weight:700}.svg-sub{fill:var(--muted);font-size:13px}.svg-label{fill:var(--deep);font-size:13px;font-weight:700}.svg-status{fill:var(--warning);font-size:12px;font-weight:700}.svg-status-blue{fill:var(--deep);font-size:12px;font-weight:700}.svg-status-red{fill:var(--danger);font-size:12px;font-weight:700}
+  .legend{display:flex;gap:12px 18px;flex-wrap:wrap;margin:14px 0;color:var(--muted);font-size:13px}.badge{display:inline-block;padding:1px 9px;border-radius:999px;font-size:12px;font-weight:700;white-space:nowrap}.reuse{background:#dbeafe;color:var(--deep)}.change{background:var(--warning-bg);color:var(--warning)}.pending{background:var(--danger-bg);color:var(--danger)}.method{background:var(--success-bg);color:var(--success)}
+  .crosscut{margin-top:16px;display:grid;grid-template-columns:1fr 1fr;gap:18px}.crosscut h3{margin:0 0 6px}.crosscut p{margin:0;color:var(--muted)}
+  .step{margin:16px 0;padding:0;scroll-margin-top:16px;overflow:hidden}.step summary{cursor:pointer;list-style:none;display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:18px 22px;background:var(--side)}.step summary::-webkit-details-marker{display:none}.step summary::after{content:'收起';margin-left:auto;color:var(--muted);font-size:12px}.step:not([open]) summary::after{content:'展开'}
+  .num{color:var(--blue);font:700 13px var(--mono)}.body{padding:14px 22px 20px}.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:10px 32px}.field{padding:4px 0}.field h4{margin:0 0 4px;font-size:14px;color:var(--deep)}.field p{margin:0}.field ul{margin:2px 0 0;padding-left:20px}.field li{margin:3px 0}.source{font-size:13px;overflow-wrap:anywhere}.source a{overflow-wrap:anywhere}
+  .boundary{margin:16px 0}.boundary ul{padding-left:22px;margin:6px 0}.fine{font-size:13px;color:var(--muted)}.foot{border-top:1px solid var(--line-strong);padding-top:18px;margin-top:36px;color:var(--muted);font-size:13px}
+  @media(max-width:760px){.page{padding:24px 16px 60px}.grid,.crosscut{grid-template-columns:1fr}.figure,.notice,.crosscut,.boundary{padding:16px}.step summary{padding:16px}.body{padding:12px 16px 18px}}
+  @media print{body{background:white}.page{max-width:none;padding:0}.nav{display:none}.step,.figure,.notice,.boundary,.crosscut{box-shadow:none;break-inside:avoid}.svg-scroll{overflow:visible}.svg-scroll svg{min-width:0}}
+  @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}}
+</style>
+</head>
+<body>
+<main class="page">
+  <header>
+    <div class="eyebrow">MORDE HARNESS · MUSE 对照设计</div>
+    <h1>Morde 复刻 Muse：最终流程与开发设计</h1>
+    <p class="lede">把 Muse 的 11 个步骤映射到 Morde 的 PC、iOS、服务端和 DSH 执行链路。点击图中带编号的节点，可跳到对应开发设计。</p>
+    <p class="meta">核对基线：Morde 本地 HEAD <code>a616e01a</code>；本地 DSH 源码 <code>fcc0ad4621</code>，包版本与 Morde 锁文件均为 <code>0.2.2-rc.1</code>。文档状态为本次只读核对，线上运行版本需另查。</p>
+  </header>
+
+  <div class="notice">
+    <strong>这是基于 Muse 资料的目标设计，不是上线或验收结论。</strong>设计只参考本目录的逆向材料与 <code>project/</code> 下的开源源码；Morde 当前源码仅用于判断已有能力和需要改动的入口。蓝色表示代码中已有基础，橙色表示需对照完善，红色表示源码核对出的具体差距；代码存在不等于端到端通过。
+  </div>
+  <nav class="nav" aria-label="页面导航">
+    <a href="#flow">最终流程图</a><a href="#step-01">01 收件</a><a href="#step-02">02 路由</a><a href="#step-03">03 协作</a><a href="#step-04">04 工具</a><a href="#step-05">05 审批</a><a href="#step-06">06 验证</a><a href="#step-07">07 交付</a><a href="#step-08">08 记忆</a><a href="#step-09">09 失败</a><a href="#step-10">10 上下文</a><a href="#step-11">11 工程改进</a><a href="#boundaries">边界与次序</a>
+  </nav>
+
+  <section id="flow" class="section">
+    <h2>最终流程图</h2>
+    <p>编号沿用 Muse 11 步；实际执行顺序是先 10 上下文、再 02 路由，工具执行前先经过 05 授权。简单工具不必创建可见的长期 Task，但仍须经过受控执行入口。</p>
+    <div class="legend"><span><span class="badge reuse">已有基础</span> 复用并验证</span><span><span class="badge change">需完善</span> 对照目标补齐</span><span><span class="badge pending">明确差距</span> 源码中存在限制</span></div>
+    <article class="figure">
+      <h3>图 A · 收件、上下文与路由</h3>
+      <p>所有消息先受理；后台任务不会阻塞前台普通问答。节点可点击查看设计。</p>
+      <div class="svg-scroll">
+      <svg viewBox="0 0 1120 620" role="img" aria-labelledby="morde-intake-title morde-intake-desc">
+        <title id="morde-intake-title">Morde 收件与路由流程</title>
+        <desc id="morde-intake-desc">PC 与 iOS 消息先持久收件、装配上下文，再分流为普通对话、任务控制或受控执行。</desc>
+        <defs><marker id="arr-a" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L10 5 L0 10 Z" fill="#64748b"/></marker></defs>
+        <g fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arr-a)">
+          <path d="M560 88 V120"/><path d="M560 184 V216"/><path d="M560 280 V312"/>
+          <path d="M436 360 H180 Q172 360 172 368 V456"/>
+          <path d="M560 408 V456"/>
+          <path d="M684 360 H940 Q948 360 948 368 V456"/>
+        </g>
+        <rect x="264" y="335" width="104" height="24" rx="6" fill="#f8faff"/><text x="316" y="352" text-anchor="middle" class="svg-label">普通对话</text>
+        <rect x="444" y="420" width="100" height="24" rx="6" fill="#f8faff"/><text x="494" y="437" text-anchor="middle" class="svg-label">查询 / 控制</text>
+        <rect x="752" y="335" width="104" height="24" rx="6" fill="#f8faff"/><text x="804" y="352" text-anchor="middle" class="svg-label">需要执行</text>
+        <g><rect x="408" y="32" width="304" height="56" rx="20" fill="#dbeafe" stroke="#60a5fa"/><text x="560" y="67" text-anchor="middle" class="svg-text">PC / iOS · 用户消息</text></g>
+        <a href="#step-01"><rect x="400" y="120" width="320" height="64" rx="16" fill="#fff" stroke="#60a5fa"/><text x="416" y="146" class="svg-text">01 收件与会话</text><text x="416" y="169" class="svg-sub">校验身份 · 持久化 · 幂等 · 定序</text><text x="702" y="147" text-anchor="end" class="svg-status-blue">待验收</text></a>
+        <a href="#step-10"><rect x="400" y="216" width="320" height="64" rx="16" fill="#fff" stroke="#60a5fa"/><text x="416" y="242" class="svg-text">10 上下文管理</text><text x="416" y="265" class="svg-sub">摘要 + 近期历史 + 授权原文</text><text x="702" y="243" text-anchor="end" class="svg-status">需核验</text></a>
+        <a href="#step-02"><path d="M560 312 L684 360 L560 408 L436 360 Z" fill="#eff6ff" stroke="#60a5fa" stroke-width="1.5"/><text x="560" y="355" text-anchor="middle" class="svg-text">02 意图路由</text><text x="560" y="377" text-anchor="middle" class="svg-status">需核对 / 补强</text></a>
+        <g><rect x="32" y="456" width="280" height="100" rx="16" fill="#fff" stroke="#bfdbfe"/><text x="48" y="484" class="svg-text">普通问答</text><text x="48" y="509" class="svg-sub">文本模型直接回复原会话</text><text x="48" y="532" class="svg-sub">不依赖启动云端电脑</text></g>
+        <g><rect x="420" y="456" width="280" height="124" rx="16" fill="#fff" stroke="#bfdbfe"/><text x="436" y="484" class="svg-text">查询 / 修改 / 停止 / 澄清</text><text x="436" y="509" class="svg-sub">查状态；目标不清先澄清</text><text x="436" y="532" class="svg-sub">明确修改 → 原 Task（图 B）</text><text x="436" y="555" class="svg-sub">停止只作用于指定 Task</text></g>
+        <g><rect x="808" y="456" width="280" height="100" rx="16" fill="#fff" stroke="#bfdbfe"/><text x="824" y="484" class="svg-text">有界工具 / 复杂任务</text><text x="824" y="509" class="svg-sub">简单工具进入 05 Broker</text><text x="824" y="532" class="svg-sub">复杂任务进入 03 DSH → 图 B</text></g>
+      </svg>
+      </div>
+    </article>
+    <article class="figure">
+      <h3>图 B · 执行、验证与交付</h3>
+      <p>图中主线是复杂 Task；有界工具可从左上直接进入 Broker。审批等待和结果未知均须保留真实状态。</p>
+      <div class="svg-scroll">
+      <svg viewBox="0 0 1120 860" role="img" aria-labelledby="morde-execute-title morde-execute-desc">
+        <title id="morde-execute-title">Morde 执行与交付流程</title>
+        <desc id="morde-execute-desc">DSH 任务经过 Broker 授权、工具执行和证据门禁后回原会话，简单工具直接经过 Broker。</desc>
+        <defs><marker id="arr-b" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto" markerUnits="userSpaceOnUse"><path d="M0 0 L10 5 L0 10 Z" fill="#64748b"/></marker></defs>
+        <g fill="none" stroke="#64748b" stroke-width="2" marker-end="url(#arr-b)">
+          <path d="M560 112 V160"/><path d="M272 192 H400"/><path d="M720 192 H808"/><path d="M560 224 V272"/>
+          <path d="M560 336 V384"/><path d="M400 304 H172 Q164 304 164 312 V384"/>
+          <path d="M560 448 V496"/><path d="M560 560 V608"/>
+        </g>
+        <path d="M720 304 H1088 Q1100 304 1100 292 V92 Q1100 80 1088 80 H720" fill="none" stroke="#64748b" stroke-width="2" stroke-dasharray="5 4" marker-end="url(#arr-b)"/>
+        <rect x="216" y="174" width="104" height="22" rx="6" fill="#f8faff"/><text x="268" y="190" text-anchor="middle" class="svg-label">简单工具</text>
+        <rect x="726" y="166" width="74" height="22" rx="6" fill="#f8faff"/><text x="763" y="182" text-anchor="middle" class="svg-label">未放行</text>
+        <rect x="284" y="280" width="100" height="22" rx="6" fill="#f8faff"/><text x="334" y="296" text-anchor="middle" class="svg-label">普通工具</text>
+        <rect x="572" y="352" width="76" height="22" rx="6" fill="#f8faff"/><text x="610" y="368" text-anchor="middle" class="svg-label">当前产物</text>
+        <rect x="864" y="270" width="104" height="22" rx="6" fill="#f8faff"/><text x="916" y="286" text-anchor="middle" class="svg-label">按需继续推理</text>
+        <a href="#step-03"><rect x="400" y="48" width="320" height="64" rx="16" fill="#fff" stroke="#60a5fa"/><text x="416" y="75" class="svg-text">03 DSH 主 Agent / 子 Agent</text><text x="416" y="98" class="svg-sub">复杂 Task · 受控并发与检查点</text><text x="702" y="75" text-anchor="end" class="svg-status-red">需支持两层</text></a>
+        <a href="#step-05"><rect x="400" y="160" width="320" height="64" rx="16" fill="#fff" stroke="#60a5fa"/><text x="416" y="187" class="svg-text">05 Go Broker 授权 / 审批</text><text x="416" y="210" class="svg-sub">目标 · 版本 · 权限 · 预算</text><text x="702" y="187" text-anchor="end" class="svg-status">需补验</text></a>
+        <g><rect x="808" y="160" width="280" height="80" rx="16" fill="#fef3c7" stroke="#f59e0b"/><text x="824" y="188" class="svg-text">待审批 / 拒绝 / 超预算</text><text x="824" y="212" class="svg-sub">保存状态；有效批准后回 05 复核</text></g>
+        <a href="#step-04"><rect x="400" y="272" width="320" height="64" rx="16" fill="#fff" stroke="#60a5fa"/><text x="416" y="299" class="svg-text">04 意图 / 执行 / 对账</text><text x="416" y="322" class="svg-sub">steer 栅栏 · 先记意图 · 保存回执</text><text x="702" y="299" text-anchor="end" class="svg-status-red">需补详情</text></a>
+        <g><rect x="32" y="384" width="264" height="80" rx="16" fill="#fff" stroke="#bfdbfe"/><text x="48" y="412" class="svg-text">有界工具的确定结果</text><text x="48" y="437" class="svg-sub">回前台会话；沿用 Broker 权限</text></g>
+        <a href="#step-06"><rect x="400" y="384" width="320" height="64" rx="16" fill="#fff" stroke="#60a5fa"/><text x="416" y="411" class="svg-text">06 证据验证门禁</text><text x="416" y="434" class="svg-sub">任务修订 · 产物版本 · 实际环境</text><text x="702" y="411" text-anchor="end" class="svg-status-red">需补内容</text></a>
+        <a href="#step-07"><rect x="400" y="496" width="320" height="64" rx="16" fill="#fff" stroke="#60a5fa"/><text x="416" y="523" class="svg-text">07 持久化并交付原会话</text><text x="416" y="546" class="svg-sub">完成前重检 steer · 单次回执</text><text x="702" y="523" text-anchor="end" class="svg-status">需补验</text></a>
+        <a href="#step-08"><rect x="400" y="608" width="320" height="64" rx="16" fill="#fff" stroke="#60a5fa" stroke-dasharray="5 4"/><text x="416" y="635" class="svg-text">08 经验候选</text><text x="416" y="658" class="svg-sub">按需提取 · 验证与授权后复用</text><text x="702" y="635" text-anchor="end" class="svg-status">需完善</text></a>
+        <text x="560" y="730" text-anchor="middle" class="svg-sub">06 不通过或证据不足：明确反馈；可修且仍获准时回 03。</text>
+        <text x="560" y="755" text-anchor="middle" class="svg-sub">已派发结果未知：先按原操作身份对账；无法确认则等待，不重放。</text>
+        <text x="560" y="780" text-anchor="middle" class="svg-sub">03 / 04 / 07 遇到新 steer：按锁内快照和检查点栅栏处理，不能发布旧结果。</text>
+      </svg>
+      </div>
+    </article>
+    <div class="crosscut">
+      <div><h3><a href="#step-09">09 失败、限流与恢复</a> <span class="badge change">贯穿全流程</span></h3><p>失败留痕；已派发结果未知先对账；可安全重试的错误才进入有界恢复。</p></div>
+      <div><h3><a href="#step-11">11 Bug 发现与处理</a> <span class="badge method">工程流程</span></h3><p>发现、复现、验证根因、回归和记录。它不是附加的 Agent Runtime。</p></div>
+    </div>
+  </section>
+
+  <section class="section" id="details">
+    <h2>11 个步骤：现状、开发设计与源码参考</h2>
+    <p class="fine">“参考”指本地已找到的模块或函数，借鉴的是后面说明的机制；并不表示已移植或版本兼容。Muse 用例编号需先筛选出 Morde 适用部分。</p>
+
+    <details class="step" id="step-01" open><summary><span class="num">01</span><h3>收件与会话</h3><span class="badge reuse">复用 / 端到端待验收</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>代码可见服务端消息受理、幂等和会话序号，PC/iOS 均有本地待发与恢复机制。两端能否在同一会话持续接续消息、任务进度和结果，仍须从实际客户端完整验收。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>先验证身份、会话归属和内容，再在同一事务内保存消息、稳定客户端 ID、请求摘要和路由状态；同 ID 同内容返回原记录，不同内容报冲突。按服务端序号显示；客户端重启先用原 ID 查受理结果，再决定重试。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../server/internal/app/conversation_message_routing.go"><code>TaskService.AcceptConversationMessage</code></a>；<a href="../../../server/internal/store/postgres/conversation_message_routing.go"><code>Store.AcceptConversationMessage</code></a>；<a href="../../../web/portal/src/app/message-outbox.ts"><code>enqueueOutboxMessage</code></a>；<a href="../../../clients/nanoMuse/android/src/ios/Morde/MordeCredentialExpiry.swift"><code>MordeMessageOutbox</code></a>。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/openclaw/src/channels/session.ts">OpenClaw · <code>recordInboundSession</code></a>：参考收件后的会话归属；<a href="../../../project/LibreChat/packages/data-schemas/src/methods/conversation.ts">LibreChat · <code>createConversationMethods</code> / <code>getConvo</code></a>：参考会话读取。多租户与幂等继续由 Morde 实现。</p><h4>验收</h4><p>同账号 PC/iOS 接续同一会话；重发同 ID 无重复消息和 Task；并发定序、重启恢复、两账号隔离。参考 TC-1.1、TC-1.7。</p></div>
+    </div></div></details>
+
+    <details class="step" id="step-02" open><summary><span class="num">02</span><h3>意图路由与任务拆分</h3><span class="badge change">需核对 / 补强</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>已有分类、非法输出修复/兜底、聚合和 Task 创建链路。Muse 的分类与归并算法未知；现有“Planner 独立文件、60 秒窗口、缺验收标准就必问”的建议不能视作现状或已确认规则。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>分类输出应绑定已受理消息、会话和当前任务快照；分成回复、查询、明确修改/停止、简单工具、新 Task 和澄清。新 Task 记录目标、范围、验收、预算与回传会话；只在确有必要且无法推定时追问。先复用已有聚合/计划字段，实测误归并和遗漏后再决定是否增加判定机制。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../server/internal/worker/conversation_route_worker.go"><code>ConversationRouteWorker.RunOnce</code> / <code>safeConversationRouteDecision</code></a>；<a href="../../../server/internal/worker/cloud_dsh_coordinator.go"><code>ClassifyConversationRoute</code></a>；<a href="../../../server/internal/store/postgres/conversation_route_actions.go"><code>ApplyConversationRoute</code> / <code>createConversationRouteTask</code></a>；<a href="../../../server/internal/app/cloud_dsh_task_plan.go"><code>executeTaskPlan</code></a>。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/magentic-ui/src/magentic_ui/teams/omniagent/_user_interjection.py">Magentic-UI · <code>format_user_interjection</code></a>：参考补充消息的上下文表达；<a href="../../../project/langgraph/libs/langgraph/langgraph/graph/state.py">LangGraph · <code>StateGraph.compile</code></a>：参考显式状态边界，不引入图运行时。材料中的 Microsoft Agent Framework 双账本代码未在本地对应源码中核实；Magentic-UI 不等同该框架。</p><h4>验收</h4><p>普通问答不启动云电脑；追问、停止、新任务不串线；指代不清澄清；非法输出有界恢复。参考 TC-2.1–2.12 中适用项。</p></div>
+    </div></div></details>
+
+    <details class="step" id="step-03" open><summary><span class="num">03</span><h3>并发派发与主 Agent 协调</h3><span class="badge pending">明确差距：子 Agent 暂不能再委派</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>Muse 资料观察到 root → 子 Agent → 孙 Agent 两层派生。Morde 当前 <code>validDelegateArguments</code> 排除 <code>dsh_delegate</code>，<code>validateChildSession</code> 拒绝子 Session 获得该工具；因此现有运行链无法照此继续派生。存储层有父子关系与祖先校验，需连同运行时和恢复链一起扩展。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>目标支持 root → 协调员 → worker，根 Task 保留最终责任。每层持久记录父 Session、深度、派生身份、工具范围、预算和根检查点；权限只可收窄。独立 worker 并行，依赖任务等待前置结果；结果、证据和失败逐层回传。参考 nanoMuse 的 10 并发作为候选值，按负载验证；Muse 实际上限未知。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../runtime/morde-cloud-runtime/src/engine.mjs"><code>validDelegateArguments</code> / <code>validateChildSession</code> / <code>runAgent</code></a>；<a href="../../../server/internal/worker/cloud_dsh_session_tree.go"><code>createCloudDSHChildSession</code> 与结算/恢复</a>；<a href="../../../server/internal/app/agent_sessions.go"><code>AgentChildSessionService</code></a>；<a href="../../../server/internal/store/postgres/agent_sessions.go"><code>CreateAgentChildSession</code></a>；<a href="../../../server/internal/store/postgres/task_agent_tool_admission.go">根检查点授权栅栏</a>。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/deepseek-harness/packages/subagent/subagent/src/depth.ts">DSH · <code>delegationDepthOf</code> / <code>assertSubagentMaxDepth</code></a>；<a href="../../../project/deepseek-harness/packages/subagent/subagent/src/manager.ts"><code>SubagentManager.startLocal</code></a>；<a href="../../../project/deepseek-harness/packages/subagent/subagent/src/index.ts"><code>maxDepth</code> 配置</a>：本地插件源码默认为 1，目标两层需显式配置并接入；安装或注册本身不等于 Morde 的授权、账本和恢复已接通。<a href="../../../project/magentic-ui/src/magentic_ui/teams/omniagent/_handoff.py">Magentic-UI · <code>build_handoff</code></a>：参考逐层回传。</p><h4>验收</h4><p>实际创建 depth 1 与 depth 2；至少两个 worker 真并行并汇总；取消隔离、重启恢复、权限和预算不越过父级。参考 TC-3.1–3.13。</p></div>
+    </div></div></details>
+
+    <details class="step" id="step-04" open><summary><span class="num">04</span><h3>工具执行与工作项</h3><span class="badge pending">明确差距：工作项详情需扩展</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>Broker 已有调用接纳、执行和对账。<code>TaskStepDetailDocument</code> 当前保存对象、输入/结果摘要和部分证据；Shell 证据有退出码、输出字节数与截断标记，并非 Muse 报告中的完整命令、执行目录、耗时和输出。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>按工具类型补执行位置、原始命令/参数、退出码、耗时、工作目录、输出和结论；不适用或取不到时明确标记。沿用加密详情与按用户授权读取，长输出附截断说明及安全回查方式。调用前持久化操作意图，结果未知先对账，不重复副作用。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../server/internal/app/task_store.go"><code>TaskStepDetailDocument</code> / <code>TaskStepShellExecutionEvidence</code></a>；<a href="../../../server/internal/app/task_step_detail.go"><code>taskToolCallProgress</code> / <code>taskToolShellExecutionEvidence</code></a>；<a href="../../../server/internal/app/task_service.go"><code>GetStepDetail</code></a>；<a href="../../../server/internal/app/cloud_dsh_tool_broker.go"><code>Execute</code> / <code>Reconcile</code></a>；对应 API、PC/iOS 详情视图。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/magentic-ui/src/magentic_ui/teams/omniagent/_bash_observers.py">Magentic-UI · <code>enrich</code></a>：参考执行结果补充观察；<a href="../../../project/nanoMuse/android/src/ios/Agent/ToolLoopDetector.swift">nanoMuse · <code>ToolLoopDetector.check/record</code></a>：参考防循环，不直接移植其单机内存状态。<a href="../../../project/OpenHands/src/components/conversation-events/chat/group-events.ts">OpenHands Agent Canvas · <code>groupEvents</code></a>：参考前端工作项分组，本地目录不是完整 Agent 后端源码。</p><h4>验收</h4><p>工具调用可查看适用详情；运行、失败、取消均留痕；结果未知不重放；新 steer 不让旧调用越过栅栏。参考 TC-4.1–4.14。</p></div>
+    </div></div></details>
+
+    <details class="step" id="step-05" open><summary><span class="num">05</span><h3>授权、预算与审批</h3><span class="badge change">复用 / 披露与真实入口待验收</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>代码中已有 Broker 和绑定具体工具调用的 <code>PendingRequest</code>；审批卡披露、动作范围授权、费用来源和端到端生效情况需逐项核对，未知成本不能写成 0。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>技术执行范围与审批策略分开判断；审批绑定账号、目标、具体动作/参数、Task 修订和授权版本。待批、拒绝、超时、撤权或预算不足时保存状态且不执行；获批后再次校验身份、预算和 steer。卡片显示已知对象、影响、成本和拒绝后果，缺失明确标未知。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../server/internal/app/cloud_dsh_tool_broker.go"><code>CloudDSHToolBroker.Execute</code></a>；<a href="../../../server/internal/app/task_approvals.go"><code>ListTaskApprovals</code></a>；<a href="../../../server/internal/store/postgres/task_approvals.go">审批持久化</a>；<a href="../../../web/portal/src/components/TaskApprovalCard.tsx">PC 审批卡</a>；<a href="../../../clients/nanoMuse/android/src/ios/NanoMuse/MIFApprovalViews.swift">iOS 审批视图</a>。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/codex/codex-rs/protocol/src/protocol.rs">Codex · <code>AskForApproval</code> / <code>SandboxPolicy</code></a>：参考两类决策分离；<a href="../../../project/hermes-agent/tools/approval.py">Hermes · <code>request_tool_approval</code></a>：参考审批请求表达；<a href="../../../project/claude-agent-sdk-python/src/claude_agent_sdk/types.py">Claude Agent SDK · <code>PermissionResultAllow</code> / <code>PermissionResultDeny</code></a>：参考明确的允许和拒绝接口，不替代 DSH。单机授权、绕过模式和模型代批不引入服务端。</p><h4>验收</h4><p>错目标、过期批准、撤权、拒绝和超预算均不派发；PC/iOS 展示真实审批与未知费用。参考 TC-5.1–5.17 中适用项。</p></div>
+    </div></div></details>
+
+    <details class="step" id="step-06" open><summary><span class="num">06</span><h3>结果验证</h3><span class="badge pending">明确差距：产物内容未进入当前复核包</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>代码中已有验证 Worker、修订和结果栅栏。<code>reviewInput</code> 对 Artifact 构造 <code>artifact_metadata_only</code>，复核提示也明确不含产物字节；因此当前这条路径不能证明产物内容正确。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>为适用任务收集真实检查与读回证据，绑定 Task 修订、尝试、来源调用、产物版本和执行环境。补充按复核任务和当前授权读取产物的本地检查路径，校验版本、来源及摘要后生成可追溯的检查结果；由服务端硬规则区分通过、失败和待验证。模型复核仅作辅助。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../server/internal/worker/task_validation_review_worker.go"><code>review</code> / <code>reviewInput</code></a>；<a href="../../../server/internal/app/task_validation_verdict.go"><code>EvaluateTaskValidationReview</code></a>；<a href="../../../server/internal/store/postgres/task_validation_review.go"><code>CompleteTaskValidationReview</code></a>；<a href="../../../server/internal/store/postgres/conversation_result_review.go"><code>conversationTaskResultValidationStateInTx</code></a>。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/magentic-ui/src/magentic_ui/teams/omniagent/_verifier.py">Magentic-UI · <code>decide_verifier_class</code> / <code>diff_states</code></a>：参考操作前后状态取证，不视为通用验收系统。独立换模型家族并非 Muse 已证实机制，不能替代硬门禁。</p><h4>验收</h4><p>旧修订、错环境、只有模型自述均不通过；区分已执行、待验证和验收通过。参考 TC-6.1–6.9。</p></div>
+    </div></div></details>
+
+    <details class="step" id="step-07" open><summary><span class="num">07</span><h3>交付与用户提问</h3><span class="badge change">复用 / 客户端展示待补验</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>已有原会话结果发布和单次回执方向；任务状态与验收状态的端上展示、跨端恢复及真实入口仍需核对。Muse 回复长度和提问比例是观察值，不设为 Morde 硬指标。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>Task 完成前在锁内重检 pending/applied steer 与完成候选 fence；有新输入则恢复同一 Session。确认后先持久化一份回执，再发回原会话；回复包含结果要点、产物、证据和未完成项。PC/iOS 展示执行中、待批、失败、待验证和已通过等真实状态。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../server/internal/store/postgres/conversation_result_review.go"><code>publishConversationResultReviewInTx</code></a>；<a href="../../../web/portal/src/routes/Assistant.tsx">PC Assistant</a>；<a href="../../../clients/nanoMuse/android/src/ios/Morde/MordeApp.swift">iOS MordeApp</a>。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/LibreChat/packages/api/src/channels/artifacts.ts">LibreChat · <code>createChannelArtifactService</code></a>：参考按会话读取产物；<a href="../../../project/LibreChat/client/src/store/artifacts.ts"><code>artifactByIdSelector</code> / <code>visibleArtifacts</code></a>：参考展示状态。客户端使用 Morde 统一蓝色样式。</p><h4>验收</h4><p>回执只发布一次，断线后可恢复；新 steer 不发布旧结果；两端能区分完成与验收。参考 TC-7.1–7.12 中适用项。</p></div>
+    </div></div></details>
+
+    <details class="step" id="step-08" open><summary><span class="num">08</span><h3>记忆与纠正沉淀</h3><span class="badge change">需对照完善记忆与经验</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>代码可见会话历史检索、摘要及个人记忆历史。Muse 采用可读记忆与索引双轨并保留纠正关系；Morde 是否覆盖全部写入、索引、整理和遗忘链路须逐项核对。Muse 具体写入与去重规则未知。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>设计按用户隔离的可读记忆与检索索引，记录来源、范围、版本和纠正的 <code>supersedes</code> 关系；后台整理不阻塞对话。删除需确认范围并同步清理索引。可执行经验先形成候选，经过验证和授权后启用，支持撤销和回退；不复用旧审批。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../server/internal/app/cloud_dsh_history_tools.go"><code>searchCurrentConversationHistory</code></a>；<a href="../../../server/internal/app/personal_memory_history.go"><code>GetMemoryHistory</code></a>；<a href="../../../server/internal/app/cloud_dsh_skills.go"><code>executeSkillRead</code></a>；在现有记忆、授权与版本机制内对照补齐候选流程。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/openclaw/src/memory/memory-artifact-provenance.ts">OpenClaw · <code>recordMemoryArtifactWriteProvenance</code></a>：参考记忆来源；<a href="../../../project/agno/libs/agno/agno/memory/manager.py">Agno · <code>MemoryManager.search_user_memories</code> / <code>delete_user_memory</code></a>：参考按用户查找与删除。不能照搬单机文件权限。</p><h4>验收</h4><p>授权撤销后查不到旧记忆；纠正能追溯旧版本；删除覆盖可读内容与索引；候选未批准不生效。参考 TC-8.1–8.12 中适用项。</p></div>
+    </div></div></details>
+
+    <details class="step" id="step-09" open><summary><span class="num">09</span><h3>失败、限流与恢复</h3><span class="badge change">需补真实故障验收</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>代码中可见部分错误分类、明确 429 的有限恢复、操作对账和活动状态；仍须核对真实 Provider、Host、客户端及长时间运行时的表现。Muse 自动重试和降级阈值未知。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>统一记录阶段、原因码、调用身份、租户、耗时和结果状态；按错误是否可安全重放决定恢复。明确 429 沿用当前路由层有限重试；超时、断流、已派发操作或用量未知先对账。已展示的文本保留并标中断，等待审批不算失败。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../server/internal/worker/conversation_route_worker.go"><code>conversationRouteRateLimitDelay</code> / <code>failRoute</code></a>；<a href="../../../server/internal/worker/cloud_dsh_executor.go"><code>cloudDSHModelErrorCategory</code></a>；<a href="../../../server/internal/app/cloud_dsh_tool_broker.go"><code>Reconcile</code></a>。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/hermes-agent/agent/error_classifier.py">Hermes · <code>classify_api_error</code></a>；<a href="../../../project/hermes-agent/agent/retry_utils.py"><code>parse_retry_after_seconds</code> / <code>jittered_backoff</code></a>：参考分类和退避。阈值、账本及重试拥有方按 Morde 设计，不叠加多层自动重试。</p><h4>验收</h4><p>429、断流、取消、授权失效和结果未知分别处理；已生效但回执丢失不重复操作。参考 TC-9.1–9.8。</p></div>
+    </div></div></details>
+
+    <details class="step" id="step-10" open><summary><span class="num">10</span><h3>上下文管理</h3><span class="badge change">已有两层能力 / 真实长会话待验收</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>代码中可见跨 Task 摘要、授权历史检索和 DSH Session 压缩；需以真实模型窗口和 PC/iOS 累计历史验证整体效果。Muse 的压缩算法与触发阈值未知。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>路由层按模型窗口装配摘要、近期历史和当前消息，保留原文 ID、长度与摘要；超长当前消息通过授权分段读取完整原文。Task 层复用 DSH 修剪和压缩，保留工具调用/结果配对及最新要求。压缩失败保留原文和旧摘要，无进展不得反复压缩；无法取得必要历史时说明。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../server/internal/worker/conversation_route_worker.go"><code>fitConversationRouteContext</code></a>；<a href="../../../server/internal/worker/conversation_summary_maintenance.go"><code>compactConversationSummary</code></a>；<a href="../../../server/internal/app/cloud_dsh_history_tools.go"><code>executeCurrentConversationMessageRead</code></a>；<a href="../../../runtime/morde-cloud-runtime/src/engine.mjs"><code>MordeCompactionEngine</code> / <code>ToolResultPruner</code></a>。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/deepseek-harness/packages/compaction/compaction-basic/src/index.ts">DSH · <code>BasicCompactionEngine.compactIfNeeded</code></a>；<a href="../../../project/hermes-agent/agent/context_compressor_window.py">Hermes · <code>_plan_compaction_window</code> / <code>summary_view</code></a>：参考保护头尾及完整工具组。Morde 不照搬 Hermes 原地改写或固定阈值。</p><h4>验收</h4><p>真实累计历史超过模型单次窗口后，早期要求可回查；压缩失败、重启、撤权和跨账号隔离保持正确。参考 TC-10.1–10.20 中适用项。</p></div>
+    </div></div></details>
+
+    <details class="step" id="step-11" open><summary><span class="num">11</span><h3>Bug 发现与处理</h3><span class="badge method">工程方法 / 持续执行</span></summary><div class="body"><div class="grid">
+      <div class="field"><h4>现状与要修改的地方</h4><p>逆向材料的五步法来自排查案例，没有足够证据证明它是 Muse 的产品机制。Morde 代码中已有自动化测试；是否覆盖实际问题和完整调用链，应以本次复现及执行结果为准。</p></div>
+      <div class="field"><h4>设计与开发</h4><p>记录现象和版本 → 本地复现并区分环境 → 验证根因 → 先补能捕获根因的回归再修复 → 记录实际结果、未测项和回退。脱敏记录阶段与原因码；需要扩大观测工具时先核对项目依赖及授权，不让评测自行改代码。</p></div>
+      <div class="field source"><h4>Morde 落点</h4><p><a href="../../../server/internal/store/postgres/conversation_message_routing_integration_test.go"><code>TestConversationMessageReceiptIsAtomicAndScoped</code></a> 是现有回归示例；针对实际缺口在对应服务端、DSH 和客户端测试目录补可复现用例。</p></div>
+      <div class="field source"><h4>开源参考</h4><p><a href="../../../project/hermes-agent/tests/gateway/test_session_busy_controls.py">Hermes · <code>test_corrections_are_generation_fenced_and_consumed_by_same_provider_loop</code></a>：参考围绕消息代次编写回归。五步法为团队方法，不宣称来自某个开源产品。</p><h4>验收</h4><p>每个缺陷能追到复现、根因、修改、回归和实际生效状态；未执行项如实记录。参考 TC-11.1–11.10。</p></div>
+    </div></div></details>
+  </section>
+
+  <section id="boundaries" class="section"><h2>实施边界与次序</h2><div class="boundary">
+    <ol>
+      <li><strong>先闭环基础体验：</strong>核对收件与路由，补齐工具工作项和审批，再完成可恢复的两层子 Agent 协作、真实证据验证及原会话交付。</li>
+      <li><strong>再完善长期能力：</strong>验证长会话压缩、失败恢复和记忆整理，以真实缺口扩充评测。独立验证模型、全量事件迁移、固定并发数、固定 60 秒合并窗口和强制 top-k 均为设计候选，需另行验证。</li>
+      <li><strong>PC 文件夹同步独立于普通问答：</strong>用户在 <code>morde-pc</code> 手动选择并触发，单向同步到其固定默认云电脑的 <code>~/workspace/project/&lt;项目名&gt;/</code>；冲突、失权或源目录不可访问时保留内容并提示，默认电脑不可用时不得切换目标，不因普通聊天启动同步。</li>
+      <li><strong>产品与安全边界：</strong>普通用户端只有 PC/iOS，管理 Web 用于管理；DSH 为唯一 Agent Runtime。所有工具副作用经过 Morde 授权、审批、预算、操作记录和租户隔离。</li>
+      <li><strong>文件和来源：</strong>本次只使用本地源码。<code>project/</code> 下除 DSH 外多数是无独立 Git 元数据的源码快照，无法仅凭目录确认其上游提交。实际移植前核对目标文件版本、许可证及测试。</li>
+    </ol>
+    <p>本地 OpenHands 为 Agent Canvas 前端源码，Claude Agent SDK 可参考权限合同；未找到 Microsoft Agent Framework 的独立源码。Magentic-UI 是本地参考项目，不等同 Microsoft Agent Framework。</p>
+  </div></section>
+  <footer class="foot">设计依据：<a href="muse-harness-reverse-engineering.md">Muse 逆向工程</a> · <a href="morde-muse-replication-design.md">Muse 复刻设计</a> · <a href="muse-steps-open-source-mapping.md">开源映射</a> · <a href="muse-harness-replication-test-cases.md">复刻测试用例</a> · <a href="muse-steps-replication-record.md">11 步记录</a> · <a href="实施任务TODO/00-总大纲.md">实施任务总大纲</a>；具体项目函数见各步骤的源码链接。</footer>
+</main>
+</body>
+</html>

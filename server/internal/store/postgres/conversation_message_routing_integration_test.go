@@ -137,3 +137,58 @@ func TestConversationMessageReceiptIsAtomicAndScoped(t *testing.T) {
 		t.Fatalf("receipt committed messages=%d routes=%d tasks=%d", messages, routes, tasks)
 	}
 }
+
+func TestConversationMessageReceiptRollsBackWhenRouteReceiptFails(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx := context.Background()
+	instanceID, err := store.ServiceInstanceID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := createTestUser(t, store, 1, 1000, 2048)
+	conv := createMainConversationForTest(t, store, owner.ID)
+	hash := sha256.Sum256([]byte("atomic receipt failure"))
+	receipt := app.ConversationMessageReceipt{
+		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: owner.ID, ActorID: owner.ID,
+			ConversationID: conv.ID, Role: conversation.RoleUser, Content: "atomic receipt failure"},
+		ServiceInstanceID: instanceID, ClientID: "client-message-failure", RequestHash: hash[:],
+		Authorization: task.Authorization{Kind: "session", Version: 1},
+	}
+	if _, err := pool.Exec(ctx, `CREATE FUNCTION reject_test_conversation_route() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	IF NEW.client_message_id = 'client-message-failure' THEN
+		RAISE EXCEPTION 'injected route receipt failure';
+	END IF;
+	RETURN NEW;
+END
+$$`); err != nil {
+		t.Fatalf("create route failure trigger function: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE TRIGGER reject_test_conversation_route BEFORE INSERT ON conversation_message_routes
+FOR EACH ROW EXECUTE FUNCTION reject_test_conversation_route()`); err != nil {
+		t.Fatalf("create route failure trigger: %v", err)
+	}
+	if _, _, err := store.AcceptConversationMessage(ctx, receipt); err == nil {
+		t.Fatal("receipt unexpectedly succeeded while its route insert was rejected")
+	}
+	var messages, routes, sequence int
+	if err := pool.QueryRow(ctx, `SELECT
+(SELECT count(*) FROM conversation_messages WHERE conversation_id=$1),
+(SELECT count(*) FROM conversation_message_routes WHERE conversation_id=$1),
+(SELECT message_seq FROM conversations WHERE id=$1)`, conv.ID).Scan(&messages, &routes, &sequence); err != nil {
+		t.Fatal(err)
+	}
+	if messages != 0 || routes != 0 || sequence != 0 {
+		t.Fatalf("failed receipt left partial state: messages=%d routes=%d sequence=%d", messages, routes, sequence)
+	}
+	if _, err := pool.Exec(ctx, `DROP TRIGGER reject_test_conversation_route ON conversation_message_routes`); err != nil {
+		t.Fatalf("drop route failure trigger: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `DROP FUNCTION reject_test_conversation_route()`); err != nil {
+		t.Fatalf("drop route failure trigger function: %v", err)
+	}
+	accepted, replayed, err := store.AcceptConversationMessage(ctx, receipt)
+	if err != nil || replayed || accepted.Sequence != 1 || accepted.ClientMessageID != receipt.ClientID {
+		t.Fatalf("retry after rolled back receipt = %+v, replayed=%t, err=%v", accepted, replayed, err)
+	}
+}
