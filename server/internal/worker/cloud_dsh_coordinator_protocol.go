@@ -283,7 +283,7 @@ func validCloudDSHTaskValidationReviewEventFrame(kind string, frame map[string]j
 		return false
 	}
 	var value cloudDSHTaskValidationReviewFrame
-	encoded, err := json.Marshal(frame)
+	encoded, err := marshalCloudDSHRawFrame(frame)
 	if err != nil {
 		return false
 	}
@@ -564,7 +564,7 @@ func (s *cloudDSHAccountRuntimeSession) routeTaskValidationReviewFrame(kind stri
 	for _, key := range []string{"server_instance_id", "runtime_id", "runtime_generation", "runtime_sequence"} {
 		delete(frame, key)
 	}
-	encoded, err := json.Marshal(frame)
+	encoded, err := marshalCloudDSHRawFrame(frame)
 	if err != nil {
 		return errors.New("Task validation review frame could not be decoded")
 	}

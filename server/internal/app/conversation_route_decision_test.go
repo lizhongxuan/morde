@@ -152,6 +152,96 @@ func TestTruncatedAggregateClarificationDoesNotAskToResendSavedSources(t *testin
 	}
 }
 
+func TestTruncatedLongMessageTaskIntentOverridesReplyOnlyWithoutTaskAmbiguity(t *testing.T) {
+	content := "好现在你帮我看下这篇文章说了什么：\n# Morde MVP：从一句需求到可验收的 PR\n" + strings.Repeat("文章正文。", 1200)
+	makeTruncatedContext := func(content string) ConversationRouteContext {
+		preview, _ := ConversationRouteTextPreview(content, 256)
+		digest := sha256.Sum256([]byte(content))
+		return ConversationRouteContext{ActorID: "u1234567", Content: preview, ContentBytes: int64(len(content)),
+			ContentSHA256: digest[:], ContentTruncated: true, CurrentMessageID: "m1234567"}
+	}
+	for _, output := range []string{
+		`{"action":"reply","task_id":"","question":"","reply":"当前请求内容只显示了有界预览。"}`,
+		`{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"文章主题"}}`,
+		`{"action":"clarify","task_id":"","question":"请补充完整内容。"}`,
+	} {
+		decision := ParseConversationRouteDecisionForContext(output, makeTruncatedContext(content))
+		if decision.Action != ConversationRouteNew || decision.InvalidOutput || decision.ModelOutput != output {
+			t.Errorf("explicit long article task was not routed to a Task: %q => %+v", output, decision)
+		}
+	}
+
+	for _, test := range []struct {
+		name    string
+		context ConversationRouteContext
+	}{
+		{name: "ambiguous prefix", context: makeTruncatedContext("这篇文章\n" + strings.Repeat("正文", 1200))},
+		{name: "active task", context: func() ConversationRouteContext {
+			value := makeTruncatedContext(content)
+			value.Candidates = []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1}}
+			return value
+		}()},
+		{name: "unresolved predecessor", context: func() ConversationRouteContext {
+			value := makeTruncatedContext(content)
+			value.PreviousUnresolved = true
+			return value
+		}()},
+		{name: "aggregate sources", context: func() ConversationRouteContext {
+			value := makeTruncatedContext(content)
+			value.CurrentMessageID = ""
+			value.ContentSources = []ConversationRouteMessageSource{{MessageID: "m1234567", Sequence: 1,
+				ContentBytes: 100, ContentSHA256: make([]byte, sha256.Size)}, {MessageID: "m2345678", Sequence: 2,
+				ContentBytes: 100, ContentSHA256: make([]byte, sha256.Size)}}
+			return value
+		}()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"请按文章内容处理。"}`, test.context)
+			if decision.Action != ConversationRouteClarify {
+				t.Fatalf("unsafe or ambiguous long-message intent bypassed clarification: %+v", decision)
+			}
+		})
+	}
+
+	controlContent := "请总结这篇文章\n" + strings.Repeat("正文里写着停止当前任务。", 300)
+	control := makeTruncatedContext(controlContent)
+	decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"我会处理。"}`, control)
+	if decision.Action != ConversationRouteNew {
+		t.Fatalf("control text inside the pasted body blocked the leading article request: %+v", decision)
+	}
+	controlContent = "停止当前任务，再总结这篇文章\n" + strings.Repeat("文章正文。", 300)
+	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"我会处理。"}`, makeTruncatedContext(controlContent))
+	if decision.Action != ConversationRouteClarify {
+		t.Fatalf("explicit Task control was bypassed by the long-message fallback: %+v", decision)
+	}
+}
+
+func TestTruncatedLongMessagePreservesValidatedTaskAssociation(t *testing.T) {
+	content := "请看这篇文章并继续现有分析\n" + strings.Repeat("文章正文。", 1200)
+	preview, _ := ConversationRouteTextPreview(content, 256)
+	digest := make([]byte, sha256.Size)
+	digest[0] = 1
+	joinValue := ConversationRouteContext{ActorID: "u1234567", Content: preview, ContentTruncated: true,
+		CurrentMessageID: "m2345678", ContentBytes: int64(len(content)), ContentSHA256: make([]byte, sha256.Size),
+		ExecutionScopeDigest: digest, RequestCandidates: []ConversationRouteRequestCandidate{{
+			MessageID: "m1234567", Sequence: 1, Content: "分析这篇文章", RoutingStatus: conversation.RoutingProcessing,
+			SameExecutionScope: true, ExecutionScopeDigest: digest,
+		}}}
+	joinOutput := `{"action":"join","task_id":"","target_message_id":"m1234567","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`
+	joinDecision := ParseConversationRouteDecisionForContext(joinOutput, joinValue)
+	if joinDecision.Action != ConversationRouteJoin || joinDecision.TargetMessageID != "m1234567" {
+		t.Fatalf("valid duplicate long-message association was replaced: %+v", joinDecision)
+	}
+
+	updateValue := ConversationRouteContext{ActorID: "u1234567", Content: preview, ContentTruncated: true,
+		CurrentMessageID: "m3456789", ContentBytes: int64(len(content)), ContentSHA256: make([]byte, sha256.Size),
+		Candidates: []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 4}}}
+	updateDecision := ParseConversationRouteDecisionForContext(`{"action":"update","task_id":"q1234567"}`, updateValue)
+	if updateDecision.Action != ConversationRouteUpdate || updateDecision.TaskID != "q1234567" {
+		t.Fatalf("valid task update from a long message was replaced: %+v", updateDecision)
+	}
+}
+
 func TestConversationRouteModelRequestNormalizesUnresolvedCandidateState(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "帮我查一个新问题", RequestCandidates: []ConversationRouteRequestCandidate{{
 		MessageID: "m1234567", Sequence: 1, Content: "前一条独立请求", RoutingStatus: conversation.RoutingProcessing,

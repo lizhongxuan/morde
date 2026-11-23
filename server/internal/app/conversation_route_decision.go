@@ -717,10 +717,11 @@ func ParseConversationRouteDecisionForContext(text string, value ConversationRou
 		return decision
 	}
 	if value.ContentTruncated && decision.Action != ConversationRouteNew {
-		if ConversationRouteHasExplicitLongMessageTaskIntent(value) {
+		if (decision.Action == ConversationRouteReply || decision.Action == ConversationRouteTool || decision.Action == ConversationRouteClarify) &&
+			ConversationRouteHasExplicitLongMessageTaskIntent(value) {
 			return ConversationRouteDecision{Action: ConversationRouteNew, ModelOutput: decision.ModelOutput}
 		}
-		if decision.Action != ConversationRouteClarify {
+		if decision.Action != ConversationRouteClarify && !conversationRouteHasValidatedTaskAssociation(decision.Action) {
 			question := "当前请求内容只显示了有界预览。请重新说明要执行的任务，或先补充完整内容。"
 			if len(value.ContentSources) != 0 {
 				question = "同一项请求的完整消息已保存，但当前只显示有界预览。请确认是否按顺序作为一项任务处理。"
@@ -773,8 +774,18 @@ func ParseConversationRouteDecisionForContext(text string, value ConversationRou
 // long message. It never derives a Task control action from the pasted source.
 func ConversationRouteHasExplicitLongMessageTaskIntent(value ConversationRouteContext) bool {
 	return value.ContentTruncated && len(value.ContentSources) == 0 && value.ResultReview == nil &&
-		value.ReferenceTaskID == "" && !value.ReferenceUnavailable &&
+		value.ReferenceTaskID == "" && !value.ReferenceUnavailable && !value.PreviousMissing &&
+		!value.PreviousUnresolved && !value.CandidateSetIncomplete && len(value.Candidates) == 0 &&
 		conversationRouteHasExplicitLongMessageTaskIntent(value.Content)
+}
+
+func conversationRouteHasValidatedTaskAssociation(action ConversationRouteAction) bool {
+	switch action {
+	case ConversationRouteJoin, ConversationRouteUpdate, ConversationRouteSteer:
+		return true
+	default:
+		return false
+	}
 }
 
 // conversationRouteHasExplicitLongMessageTaskIntent recognizes a substantive

@@ -947,6 +947,9 @@ Tokenizer 与 token 统计来源：
 - **环境与边界：** 使用本机 `make pc` 启动的实际 `morde-pc`，连接用户指定的测试服务；新建一条独立旁聊，只发送合成文本，不使用普通用户 Web、不上传文件、不改远端代码或数据库。服务端部署版本未核实，因此本节只记录该测试服务的用户侧行为，不代表当前工作区代码的端到端结果。
 - **普通回复：** 发送“只回复 M02 连通测试收到，不调用工具或创建执行任务”，PC 显示精确回复 `M02连通测试收到`，通过此项冒烟验证。
 - **显式只读搜索：** 发送只读请求，要求搜索 PostgreSQL 官方 `jsonb` 文档并只返回标题和官方 URL。PC 显示了用户可见的 Task 详情/工作项，而不是隐藏的短命内部 Task 直达 Broker；助手称当前没有可用网页搜索工具，并明确给出的 URL 未经实时抓取核实。没有证据表明搜索已执行，故此项失败，不能算来源验证通过。
+- **本轮追加 PC 连通性（2026-11-23）：** 再用 `make pc` 与新的隔离 profile 登录同一远端测试服务；在新旁聊发送“连通性验收：请只回复‘收到M02-E2E’，不要调用工具、云端电脑或创建 Task。”PC 显示原消息和精确回复 `收到M02-E2E`。未核验远端 Task 数据库/API 或工具状态，因此只确认登录和一轮普通对话往返，不据此断言服务端没有创建隐藏记录，也不作为当前工作区服务端实现验收。未上传文件、修改远端代码或数据库。
+- **远端能力探针：** 只读 `GET /api/capabilities` 返回 HTTP 200，列出 `conversation_auto_routing_v1`、`cloud_tasks` 等功能，`default_max_request_bytes` 为 1 MiB；该接口未提供部署 commit/build 版本，故仍无法将远端行为映射到当前工作区源码。
+- **远端源码核对：** 只读 SSH 检查 `/opt/morde-src` 的 `HEAD` 为 `65aa55f4138e8873e98f4e4b5c95765d830b4785`，与本地 `HEAD` 相同，远端树干净；本地 `server/internal/app/conversation_route_decision.go` 等路由实现仍有未提交改动。未证实服务进程实际使用该源码构建，不能把远端视为包含本地改动的部署。未改远端数据库、配置或代码，也未传输文件。
 - **输入安全：** macOS 拼音输入把一次未提交的草稿转成错误字符；确认该草稿未发送，随后在独立测试旁聊清空，并核实输入框为空且发送按钮禁用。错误草稿未形成用户消息。
 - **结论与未覆盖：** 远端测试服务的简单工具行为不符合当前 M02-06 目标；由于远端服务版本未知，不能据此判定当前工作区代码失败，也不能据此验收本地实现。**截至该探针记录时**，M02-02 双运行 Task、M02-08 当前工作区后端 PC E2E 与 iOS 均待验证；M02-02 随后由下方本机 PostgreSQL、PC 和 iOS 记录完成，M02-08 仍待最终联调。该测试旁聊和可见 Task 留在测试账号中，未做远端删除。
 
@@ -956,6 +959,12 @@ Tokenizer 与 token 统计来源：
 - **PostgreSQL：** 在 `initdb` 创建的一次性临时集群中，PostgreSQL 仅绑定 `127.0.0.1` 随机端口；Go 测试 helper 为用例创建独立随机数据库并运行全部迁移。更新 `TestPostgresMCPConnectorRateLimitStepRetryWaitsForExactLedgerEvidence`，覆盖等待期前拒绝、等待期结束但 Agent 停止未确认时详情/API 仍关闭、确认匹配停止收据后启用、重复 call ID 账本拒绝、无关 unknown MCP operation 拒绝、失败来源保留、同键 replay 只创建一项；`TestPostgresTaskStepRetryMigration` 验证 migration 00231 和 call ID 查找索引，`TestPostgresTaskStepRetryConcurrentSameKeyCreatesOneAttempt` 通过。新测试实际调用 GetTask 投影与 `RequestTaskStepRetry`，不是浏览器/纯 mock 数据。临时集群测试后停止，目录由临时目录作用域清理。
 - **其他定向回归：** `go test ./internal/app ./internal/api ./internal/worker -run 'Test(NewMCPToolTaskStepReusesExactQueuedRetryAttempt|CloudDSHMCPTerminalRateLimitFailsTaskAndReplaysLedgerResult|CloudDSHMCPTerminalForAttemptRequiresExactBoundedRateLimitSignal|MCPConnectorTerminalRetryAfterValidatesPersistedOutput|TaskToolCallProgressMarksOnlyExplicitConnectorRateLimitRetryable|CloudDSHStepRetryRequiresThePinnedFenceAndConfirmedFailure|CloudDSHExecutorStopsAfterDurableTerminalToolAttempt|TaskStepProjectionDisablesRetryAfterAttemptExists|TaskStepRetryRouteBindsRequestAndRejectsReplacementArguments)$' -count=1` 通过；Portal `Assistant.test.tsx` 209/209、`npm run typecheck`、`npm run build:pc` 通过。桌面 `make pc` 的 Portal/Workbench/desktop TypeScript build 阶段完成。
 - **客户端/外部边界：** `make pc` 使用独立 `MORDE_TEST_USER_DATA` 启动隔离 Electron 后，Arc 没有发现可交互窗口；仅停止本次隔离启动进程，既有 Electron 进程未触碰。因此没有验证 Task retry 按钮到真实状态变化；iOS 原生 Task retry 也未实测，不能把客户端验收记为通过。未连接远端服务、真实 Provider 或连接器，没有使用聊天中曾出现的密钥或发送文件；`git diff --check` 通过。M09-06 保持进行中，M09-02/M09-04 客户端故障链路保持待验收。
+
+### S09-2 M09-06 PC Task 入口复测（2026-11-23）
+
+- **操作：** 使用 `make pc` 和全新隔离 profile 连接本地 PostgreSQL/HTTP 合成夹具；在 PC 输入 M09-06 合成目标。夹具的 `start`、`progress`、`fail` 请求均返回 204，PC 任务列表出现对应任务卡。
+- **结果：** 通过 Arc/Accessibility 激活任务卡时，任务侧栏收起且未进入详情；无法到达失败连接器工作项，故没有点击重试、没有产生可验收的 retry attempt，也没有调用 `verify/mcp-retry` 或进行数据库最终核对。Go 集成测试运行 434 秒后由本轮手动中止，退出码 130；不得记作 PC 重试通过。
+- **清理与状态：** 已停止本轮 PC 和本地夹具，并删除隔离 profile/临时数据库目录；未访问远端服务或真实连接器。M09-06 仍进行中，PC 任务详情导航和重试后的持久状态、iOS 原生恢复均待验收。
 
 ### M02-02 双运行 Task 目标绑定与停止隔离验收（2026-11-23）
 
@@ -983,4 +992,12 @@ Tokenizer 与 token 统计来源：
 - **现象：**用户在实际 `morde-pc` 提交“帮我看下这篇文章说了什么”及长文章正文后，助手回复“当前请求内容只显示了有界预览。请重新说明要执行的任务，或先补充完整内容。”截图显示该回复，没有出现 Task 进度。
 - **原因：**路由模型请求已包含“实质工作选择 new Task、Task Agent 可按授权搜索原始长消息”的说明；模型仍把它判成普通回复。`ParseConversationRouteDecisionForContext` 随后按截断预览保护规则将其改为澄清。该消息在路由层只以首段预览分类，原始消息身份仍由消息 ID 与 SHA-256 绑定，Task Agent 的搜索/读取工具可按授权取回来源。只读查看 Portal 日志未发现 `conversation route failed`，因此没有证据表明是 Provider 或工具执行失败；此请求未进入 Task，也未调用原文搜索工具。
 - **本地修正：**新增有界首段意图判断；当截断消息明确要求总结、分析、解释文章/原文时，即使模型误选 `reply`、`tool` 或 `clarify`，将其路由为新 Task。模糊长消息、已有 Task 控制请求及多消息聚合仍遵守原澄清规则。另在 DSH Executor 记录 Broker 正常返回的连接器终止限流结果，并把安全解析后的等待秒数放入 Task 步骤事件。日志不记录消息/文章正文、工具参数、连接器原始错误或凭据。
-- **验证和边界：**本轮只检查源码与用户提供的 PC 截图；未运行测试，未部署或修改远端服务，也未通过普通用户 Web 代测。`morde-pc` 当前没有可供本轮控制的交互窗口，因此不能做实际 PC 复验。修复状态为本地已编辑、代码与 PC 验收待验证；明确长文章请求是否能由 Task 检索并给出带来源答案仍归 M10-03/M10-06 验收。
+- **本地回归：**`go test ./internal/app -run '^(TestTruncatedLongMessageTaskIntentOverridesReplyOnlyWithoutTaskAmbiguity|TestTruncatedLongMessagePreservesValidatedTaskAssociation|TestTruncatedAggregateClarificationDoesNotAskToResendSavedSources|TestConversationRouteJoinRequiresAuthorizedSameScopeCandidate)$' -count=1` 通过；`go test ./internal/worker -run '^(TestConversationRouteWorkerFallbackRoutesExplicitLongArticleWithoutTaskAmbiguity|TestConversationRouteWorkerRoutesLongMessagesAndExplainsStorageLimit)$' -count=1` 通过；另 `go test ./internal/app ./internal/worker -count=1` 通过。覆盖 `reply/tool/clarify` 误分类、模糊/控制/聚合边界、有效 `join/update` 关联、分类失败兜底，以及原消息 ID、字节数和 SHA-256 保留。
+- **实际 PC 与边界：**`make pc` 构建 Portal/Workbench 并启动实际 `morde-pc`，窗口显示已有长文章会话；本轮没有重新发送请求。服务端构建号未核实，本机没有 Cloud DSH/Guardian 运行端点，故客户端观察不算当前工作区的 Task E2E。修复只在本地，没有部署或修改远端服务；没有使用普通用户 Web 或 iOS 代测。明确长文章请求能否由新 Task 检索并给出带来源答案仍归 M10-03/M10-06 验收。
+
+### M10 模型请求摘要转发修复（2026-11-23）
+
+- **根因：**只读核对测试服务器日志，截图所示 Task 在 16:46:38 因 `dsh model request digest is invalid` 停止，随后心跳与活动不匹配。服务端账号 Runtime 用 Go JSON 重编码嵌套请求，特殊字符的字节表示改变，导致与 Node DSH 计算的原始 SHA-256 不一致。服务器源码提交和对应文件哈希与本地修复前一致。
+- **修复：**转发任务、会话路由和结果审核帧时保留每个 JSON 值原始字节；审核阶段也对原字节校验。保留消息身份、请求形状和摘要校验，不放行篡改的请求或工具参数。
+- **验证：**`TestAccountAgentRuntimePreservesModelRequestBytes` 覆盖特殊字符、长文本、任务工具参数、路由、审核及错误摘要；`TestCloudDSHExecutorAcceptsLongRequestWithSpecialCharacters` 通过真实 Node DSH 和完整 Executor 验证请求到模型网关。`TestAccountRuntimePostgresAndRealNodeContinueAfterFirstTaskContextEnds`、`TestAccountRuntimePostgresAndRealNodeRecoverAfterManagerRestart` 在本机 PostgreSQL 和真实 Node DSH 进程下通过，验证长文本原文、摘要及重启恢复。1 MiB 搜索/读取、长文章路由聚焦测试和 PostgreSQL 长消息 manifest/来源校验测试通过。
+- **边界：**实际 PC 窗口仍连接未部署修复的测试服务；本机缺少独立 DSH Docker/Guardian，未完成从 PC 发送长消息到最终回复的验收。未上传文件、未部署或修改服务器。`make test race cover`、`go vet ./...`、`make generate` 和 worker 增量 lint 通过；全量测试未设置 PostgreSQL 集成环境，除上列定向数据库验证外相应用例跳过。完整 `make lint` 仍有仓库既存的 24 项问题，均未指向此次修改文件。

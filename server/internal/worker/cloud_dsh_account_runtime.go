@@ -12,6 +12,7 @@ import (
 	"io"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -650,6 +651,26 @@ func (s *cloudDSHAccountRuntimeSession) route() {
 	s.fail(errors.New("account Agent Runtime output closed"))
 }
 
+// Request and tool argument digests cover their original JSON bytes, not a re-encoding.
+func marshalCloudDSHRawFrame(frame map[string]json.RawMessage) ([]byte, error) {
+	var output bytes.Buffer
+	output.WriteByte('{')
+	for key, value := range frame {
+		if !utf8.Valid(value) || !json.Valid(value) {
+			return nil, errors.New("account Agent Runtime frame contains invalid JSON")
+		}
+		if output.Len() > 1 {
+			output.WriteByte(',')
+		}
+		name, _ := json.Marshal(key)
+		output.Write(name)
+		output.WriteByte(':')
+		output.Write(value)
+	}
+	output.WriteByte('}')
+	return output.Bytes(), nil
+}
+
 func (s *cloudDSHAccountRuntimeSession) routeFrame(raw []byte) error {
 	var frame map[string]json.RawMessage
 	if !uniqueCloudDSHJSON(raw) || json.Unmarshal(raw, &frame) != nil || frame == nil {
@@ -750,7 +771,7 @@ func (s *cloudDSHAccountRuntimeSession) routeFrame(raw []byte) error {
 	for _, key := range []string{"server_instance_id", "runtime_id", "runtime_generation", "runtime_sequence"} {
 		delete(frame, key)
 	}
-	encoded, err := json.Marshal(frame)
+	encoded, err := marshalCloudDSHRawFrame(frame)
 	if err != nil {
 		return errors.New("account Agent Runtime Task frame could not be decoded")
 	}
@@ -840,7 +861,7 @@ func (s *cloudDSHAccountRuntimeSession) routeCoordinatorFrame(kind string, frame
 	for _, key := range []string{"server_instance_id", "runtime_id", "runtime_generation", "runtime_sequence", "container_pid"} {
 		delete(frame, key)
 	}
-	encoded, err := json.Marshal(frame)
+	encoded, err := marshalCloudDSHRawFrame(frame)
 	if err != nil {
 		return errors.New("account Agent Runtime coordinator frame could not be decoded")
 	}

@@ -1035,6 +1035,44 @@ func TestConversationRouteWorkerRoutesLongMessagesAndExplainsStorageLimit(t *tes
 	}
 }
 
+func TestConversationRouteWorkerFallbackRoutesExplicitLongArticleWithoutTaskAmbiguity(t *testing.T) {
+	content := "好现在你帮我看下这篇文章说了什么：\n# Morde MVP\n" + strings.Repeat("文章正文。", 24_000)
+	for _, test := range []struct {
+		name            string
+		activeCandidate bool
+		want            app.ConversationRouteAction
+	}{
+		{name: "independent long article", want: app.ConversationRouteNew},
+		{name: "active task remains ambiguous", activeCandidate: true, want: app.ConversationRouteClarify},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			worker, stub := newRouteWorkerTest(t)
+			stub.snapshot.Context.Content = content
+			stub.claim.Message.Content = content
+			stub.classifyErr = errors.New("synthetic route provider unavailable")
+			if test.activeCandidate {
+				stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{
+					TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1,
+				}}
+			}
+			if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 || len(stub.failures) != 0 {
+				t.Fatalf("long-message classification fallback failed: applied=%+v failures=%v err=%v", stub.applied, stub.failures, err)
+			}
+			if got := stub.applied[0].Action; got != test.want {
+				t.Fatalf("long-message fallback action = %s, want %s; classified=%+v", got, test.want, stub.classified)
+			}
+			if !stub.classified.ContentTruncated || stub.classified.CurrentMessageID != stub.claim.Message.ID {
+				t.Fatalf("fallback did not retain the original message identity: %+v", stub.classified)
+			}
+			digest := sha256.Sum256([]byte(content))
+			if stub.classified.ContentBytes != int64(len(content)) || !bytes.Equal(stub.classified.ContentSHA256, digest[:]) {
+				t.Fatalf("fallback did not retain the full message size and digest: bytes=%d digest=%x, want bytes=%d digest=%x",
+					stub.classified.ContentBytes, stub.classified.ContentSHA256, len(content), digest)
+			}
+		})
+	}
+}
+
 func TestConversationRouteWorkerRoutesClaimedProjectAttachment(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	stub.claim.Input.ProjectID = "project-test"

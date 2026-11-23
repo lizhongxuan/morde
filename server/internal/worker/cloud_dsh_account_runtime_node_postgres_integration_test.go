@@ -346,7 +346,8 @@ func f01RunNodeAccountTaskControlled(ctx context.Context, manager *CloudDSHAccou
 	}
 	identity := map[string]any{"task_id": fence.TaskID, "owner_id": fence.OwnerID, "agent_id": fence.AgentInstanceID,
 		"session_id": fence.AgentSessionID, "generation": fence.AgentGeneration, "authorization_version": fence.AuthorizationVersion}
-	start := map[string]any{"type": "start", "version": 1, "task_revision": 1, "model": "f01-local-model", "tools": []any{}, "prompt": "Answer with one sentence."}
+	prompt := "Summarize: " + strings.Repeat("长文章 <tag> & 内容。", 256) + "\u2028\u2029"
+	start := map[string]any{"type": "start", "version": 1, "task_revision": 1, "model": "f01-local-model", "tools": []any{}, "prompt": prompt}
 	for key, value := range identity {
 		start[key] = value
 	}
@@ -356,11 +357,12 @@ func f01RunNodeAccountTaskControlled(ctx context.Context, manager *CloudDSHAccou
 	models := 0
 	for {
 		var frame struct {
-			Type       string `json:"type"`
-			ID         string `json:"id"`
-			ThroughSeq int64  `json:"through_seq"`
-			SHA256     string `json:"sha256"`
-			State      string `json:"state"`
+			Type       string          `json:"type"`
+			ID         string          `json:"id"`
+			ThroughSeq int64           `json:"through_seq"`
+			SHA256     string          `json:"sha256"`
+			State      string          `json:"state"`
+			Request    json.RawMessage `json:"request"`
 		}
 		if err := f01ReadNodeAccountFrame(reader, &frame); err != nil {
 			return fmt.Errorf("read Task frame: %w", err)
@@ -379,6 +381,28 @@ func f01RunNodeAccountTaskControlled(ctx context.Context, manager *CloudDSHAccou
 				return fmt.Errorf("acknowledge Task checkpoint: %w", err)
 			}
 		case "model":
+			if !cloudDSHDigest(frame.Request, frame.SHA256) {
+				return errors.New("real Node model request digest does not match the forwarded bytes")
+			}
+			var request struct {
+				Messages []struct {
+					Content []struct {
+						Text string `json:"text"`
+					} `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.Unmarshal(frame.Request, &request); err != nil {
+				return fmt.Errorf("decode real Node model request: %w", err)
+			}
+			found := false
+			for _, message := range request.Messages {
+				for _, block := range message.Content {
+					found = found || strings.Contains(block.Text, prompt)
+				}
+			}
+			if !found {
+				return errors.New("real Node model request lost the long prompt")
+			}
 			models++
 			if modelRequested != nil {
 				select {
