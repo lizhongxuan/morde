@@ -197,7 +197,7 @@ struct MIFApprovalInboxRoom: View {
     private func approvalCard(_ approval: MIFApprovalEntry) -> some View {
         let task = approval.task
         let pending = approval.pending
-        let decisionWasAccepted = submissionLedger.contains(approval.id, scopeKey: store.scopeKey)
+        let acceptedDecision = submissionLedger.acceptedDecision(approval.id, scopeKey: store.scopeKey)
         let summaryLine = [pending.object, pending.content.isEmpty ? nil : pending.content]
             .compactMap { $0?.isEmpty == false ? $0 : nil }.joined(separator: " · ")
 
@@ -256,8 +256,8 @@ struct MIFApprovalInboxRoom: View {
                             .foregroundStyle(NanoMuseTones.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
                             .padding(.top, 14)
-                    } else if decisionWasAccepted {
-                        Text(AppLocalized("Decision submitted; final status depends on refreshed task details."))
+                    } else if let acceptedDecision {
+                        Text(MIFApprovalDecisionPresentation.acceptedMessage(decision: acceptedDecision))
                             .font(.system(size: 14.5, weight: .semibold))
                             .foregroundStyle(NanoMuseTones.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
@@ -268,6 +268,11 @@ struct MIFApprovalInboxRoom: View {
                             .foregroundStyle(NanoMuseTones.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
                     } else {
+                        Text(MIFApprovalDecisionPresentation.scopeNotice)
+                            .font(.footnote)
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("mif.approval.scope-notice")
                         HStack(spacing: 8) {
                             approvalActionButton(AppLocalized("Reject"), isPrimary: false, isReject: true,
                                                  id: "mif.approval.reject.\(approval.id)", title: pending.title) {
@@ -293,6 +298,7 @@ struct MIFApprovalInboxRoom: View {
         .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
         .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous).strokeBorder(NanoMuseTones.hairline))
         .shadow(color: NanoMuseTones.action.opacity(0.12), radius: 12, y: 5)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("mif.approval.card.\(approval.id)")
     }
 
@@ -383,6 +389,12 @@ struct MIFApprovalInboxRoom: View {
                         Text(line.element)
                             .font(.system(size: 14))
                             .lineSpacing(5)
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    if pending.canRespond(taskStatus: task.status) {
+                        Text(MIFApprovalDecisionPresentation.scopeNotice)
+                            .font(.system(size: 14))
                             .foregroundStyle(NanoMuseTones.secondaryText)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -568,6 +580,7 @@ struct MIFApprovalInboxRoom: View {
     @MainActor
     private func respond(to approval: MIFApprovalEntry, decision: String) async {
         guard MIFApprovalInboxPolicy.canRespond(pending: approval.pending, taskStatus: approval.task.status) else { return }
+        guard let decisionValue = MIFApprovalDecision(rawValue: decision) else { return }
         guard !isSubmitting, let scopeKey = store.scopeKey else { return }
         isSubmitting = true
         defer { isSubmitting = false }
@@ -578,7 +591,7 @@ struct MIFApprovalInboxRoom: View {
                                                     decision: decision)
         guard store.scopeKey == scopeKey else { return }
         if accepted {
-            submissionLedger.markAccepted(approval.id, scopeKey: scopeKey)
+            submissionLedger.markAccepted(approval.id, decision: decisionValue, scopeKey: scopeKey)
         }
 
         let callbackMessage = store.actionErrors[approval.task.id]
@@ -586,12 +599,12 @@ struct MIFApprovalInboxRoom: View {
             details[approval.task.id] = refreshed
             actionMessage = taskStillHasPendingRequest(refreshed, matching: approval)
                 ? nil
-                : AppLocalized("Decision submitted; final status depends on refreshed task details.")
+                : MIFApprovalDecisionPresentation.acceptedMessage(decision: decisionValue)
             publishConfirmedCount(for: scopeKey)
             return
         }
         actionMessage = accepted
-            ? AppLocalized("Decision submitted; status refresh is not confirmed.")
+            ? MIFApprovalDecisionPresentation.acceptedMessage(decision: decisionValue)
             : (callbackMessage ?? AppLocalized("Result not confirmed; retrying the same decision will reuse the client's saved request."))
 
         // The callback owns approval retries and its idempotency key; this read only confirms the current snapshot.
@@ -604,7 +617,8 @@ struct MIFApprovalInboxRoom: View {
             if accepted, taskStillHasPendingRequest(detail, matching: approval) {
                 actionMessage = nil
             } else if accepted {
-                actionMessage = String(format: AppLocalized("Decision submitted; final status depends on refreshed task details. Current status: %@"), detail.statusLabel)
+                actionMessage = MIFApprovalDecisionPresentation.acceptedMessage(
+                    decision: decisionValue, currentStatus: detail.statusLabel)
             } else if let callbackMessage {
                 actionMessage = String(format: AppLocalized("%@ Current task status: %@"), callbackMessage, detail.statusLabel)
             } else {
@@ -616,7 +630,7 @@ struct MIFApprovalInboxRoom: View {
             failedTaskIDs.insert(approval.task.id)
             onConfirmedCount?(.unknown)
             actionMessage = accepted
-                ? AppLocalized("Decision accepted, but current status cannot be confirmed; approval count is unknown. Refresh task details to check.")
+                ? MIFApprovalDecisionPresentation.acceptedMessage(decision: decisionValue)
                 : AppLocalized("Approval result is unknown and status refresh failed; approval count is unknown. Retrying the same decision will reuse the client's saved request.")
         }
     }
@@ -779,20 +793,45 @@ typealias MIFApprovalRoom = MIFApprovalInboxRoom
 
 struct MIFApprovalSubmissionLedger {
     private(set) var scopeKey: String? = nil
-    private(set) var acceptedApprovalIDs = Set<String>()
+    private(set) var acceptedDecisionsByApprovalID: [String: MIFApprovalDecision] = [:]
 
     mutating func use(scopeKey: String?) {
         guard self.scopeKey != scopeKey else { return }
         self.scopeKey = scopeKey
-        acceptedApprovalIDs.removeAll()
+        acceptedDecisionsByApprovalID.removeAll()
     }
 
-    mutating func markAccepted(_ approvalID: String, scopeKey: String) {
+    mutating func markAccepted(_ approvalID: String, decision: MIFApprovalDecision, scopeKey: String) {
         guard self.scopeKey == scopeKey else { return }
-        acceptedApprovalIDs.insert(approvalID)
+        acceptedDecisionsByApprovalID[approvalID] = decision
     }
 
-    func contains(_ approvalID: String, scopeKey: String?) -> Bool {
-        self.scopeKey == scopeKey && acceptedApprovalIDs.contains(approvalID)
+    func acceptedDecision(_ approvalID: String, scopeKey: String?) -> MIFApprovalDecision? {
+        guard self.scopeKey == scopeKey else { return nil }
+        return acceptedDecisionsByApprovalID[approvalID]
+    }
+}
+
+enum MIFApprovalDecision: String, Equatable {
+    case approve
+    case reject
+}
+
+enum MIFApprovalDecisionPresentation {
+    static var scopeNotice: String {
+        AppLocalized("This approval applies only to the operation shown. Approving lets the task attempt it; it does not mean the task is complete. Rejecting prevents this operation from running.")
+    }
+
+    static func acceptedMessage(decision: MIFApprovalDecision, currentStatus: String? = nil) -> String {
+        switch (decision, currentStatus) {
+        case (.approve, .some(let status)):
+            return String(format: AppLocalized("You approved this operation; current Task status: %@. The outcome has not been confirmed."), status)
+        case (.reject, .some(let status)):
+            return String(format: AppLocalized("You rejected this operation; current Task status: %@. The outcome has not been confirmed."), status)
+        case (.approve, .none):
+            return AppLocalized("You approved this operation; the Task outcome has not been confirmed.")
+        case (.reject, .none):
+            return AppLocalized("You rejected this operation; the Task outcome has not been confirmed.")
+        }
     }
 }

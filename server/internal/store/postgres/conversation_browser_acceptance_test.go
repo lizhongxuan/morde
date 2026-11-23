@@ -109,7 +109,7 @@ func TestConversationBrowserAcceptance(t *testing.T) {
 		t.Fatal(err)
 	}
 	crossClientAcceptance := os.Getenv("MORDE_BROWSER_CROSS_CLIENT") == "1"
-	model := browserAcceptanceModel{}
+	model := browserAcceptanceModel{routeRetry: &browserAcceptanceRouteRetryModel{}}
 	if crossClientAcceptance {
 		model.routeBarrier = &browserAcceptanceRouteBarrier{expected: 4, ready: make(chan struct{})}
 	}
@@ -731,6 +731,19 @@ const browserAcceptanceLongHistorySentinel = "ORCHID-PC-HISTORY-SENTINEL-8472"
 type browserAcceptanceModel struct {
 	nativeAcceptanceModel
 	routeBarrier *browserAcceptanceRouteBarrier
+	routeRetry   *browserAcceptanceRouteRetryModel
+}
+
+type browserAcceptanceRouteRetryModel struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (model *browserAcceptanceRouteRetryModel) failFirstRouteCall() bool {
+	model.mu.Lock()
+	defer model.mu.Unlock()
+	model.calls++
+	return model.calls == 1
 }
 
 type browserAcceptanceRouteBarrier struct {
@@ -1361,6 +1374,14 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 				PriorRequests []app.ConversationRouteRequestCandidate `json:"prior_requests"`
 			}
 			if json.Unmarshal([]byte(request.Input[0].Text), &input) == nil {
+				if input.Message == browserActivityObjectives["route-retry"] && model.routeRetry != nil {
+					if model.routeRetry.failFirstRouteCall() {
+						return app.ModelResponse{}, &app.ModelClientError{Kind: app.ModelErrorRateLimited,
+							Stage: "provider_status", RetryAfterExceedsDurableHorizon: true}
+					}
+					return app.ModelResponse{Text: `{"action":"reply","task_id":"","target_message_id":"","aggregate_message_ids":[],"explicit_new":false,"question":"","reply":"本地验收：消息路由恢复成功。","dependency_task_ids":[],"acknowledge":false}`, StopReason: "stop",
+						Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 8}}, nil
+				}
 				for name, objective := range browserActivityObjectives {
 					if name != "search" && input.Message == objective {
 						return app.ModelResponse{Text: `{"action":"new","task_id":"","question":"","acknowledge":true}`, StopReason: "stop",
@@ -1586,6 +1607,7 @@ var browserActivityObjectives = map[string]string{
 	"failed":           "跨端活动验收：已接单后任务失败",
 	"approval":         "跨端活动验收：等待用户授权",
 	"mcp-retry":        "跨端活动验收：连接器限流后手动重试",
+	"route-retry":      "跨端活动验收：消息路由限流后显式重试",
 	"target-control-a": "跨端活动验收：整理项目总结 A",
 	"target-control-b": "跨端活动验收：整理项目总结 B",
 }
@@ -1744,6 +1766,7 @@ func browserActivitySelection(raw string) ([]string, []string, error) {
 		"failed":         {"failed"},
 		"approval":       {"approval"},
 		"mcp-retry":      {"mcp-retry"},
+		"route-retry":    {"route-retry"},
 		"target-control": {"target-control-a", "target-control-b"},
 	}
 	var selected, required []string
@@ -1779,6 +1802,7 @@ func TestBrowserActivitySelection(t *testing.T) {
 		{name: "failed only", input: "failed", selected: "failed", required: "failed"},
 		{name: "approval only", input: "approval", selected: "approval", required: "approval"},
 		{name: "MCP rate-limit retry only", input: "mcp-retry", selected: "mcp-retry", required: "mcp-retry"},
+		{name: "message route retry only", input: "route-retry", selected: "route-retry", required: "route-retry"},
 		{name: "failed and approval", input: "failed,approval", selected: "failed,approval", required: "failed,approval"},
 		{name: "target control starts two running tasks", input: "target-control",
 			selected: "target-control-a,target-control-b", required: "target-control"},
@@ -2631,6 +2655,41 @@ func (a *browserAcceptanceActivity) disconnect(name string) error {
 	return nil
 }
 
+func (a *browserAcceptanceActivity) verifyRouteRetryAccepted(ctx context.Context) error {
+	var messageID, routeState, failureReason, taskID string
+	var routeAttempt int64
+	err := a.store.pool.QueryRow(ctx, `SELECT message.id,route.state,route.failure_reason,route.route_attempt,COALESCE(message.task_id,'')
+FROM conversation_message_routes route JOIN conversation_messages message ON message.id=route.message_id
+WHERE route.conversation_id=$1 AND message.role='user' AND message.content=$2`,
+		a.conversationID, browserActivityObjectives["route-retry"]).
+		Scan(&messageID, &routeState, &failureReason, &routeAttempt, &taskID)
+	if err != nil {
+		return fmt.Errorf("load original route retry message: %w", err)
+	}
+	var matchingUserMessages, replies, modelCalls, rejectedFirstCalls, settledRetryCalls int
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages
+WHERE conversation_id=$1 AND role='user' AND content=$2`, a.conversationID, browserActivityObjectives["route-retry"]).Scan(&matchingUserMessages); err != nil {
+		return fmt.Errorf("count original route retry messages: %w", err)
+	}
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages
+WHERE conversation_id=$1 AND role='assistant' AND content=$2`, a.conversationID, "本地验收：消息路由恢复成功。").Scan(&replies); err != nil {
+		return fmt.Errorf("count route retry replies: %w", err)
+	}
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*),
+count(*) FILTER (WHERE attempt=1 AND state='rejected'),
+count(*) FILTER (WHERE attempt=2 AND state='settled')
+FROM conversation_route_model_calls WHERE message_id=$1 AND phase='normal'`, messageID).
+		Scan(&modelCalls, &rejectedFirstCalls, &settledRetryCalls); err != nil {
+		return fmt.Errorf("read route retry model-call evidence: %w", err)
+	}
+	if routeState != "routed" || routeAttempt != 2 || failureReason != "" || taskID != "" ||
+		matchingUserMessages != 1 || replies != 1 || modelCalls != 2 || rejectedFirstCalls != 1 || settledRetryCalls != 1 {
+		return fmt.Errorf("message route retry state=%q attempt=%d failure=%q task=%q users=%d replies=%d calls=%d first_rejected=%d retry_settled=%d",
+			routeState, routeAttempt, failureReason, taskID, matchingUserMessages, replies, modelCalls, rejectedFirstCalls, settledRetryCalls)
+	}
+	return nil
+}
+
 func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario string) error {
 	if scenario == "reconnect" {
 		return a.verifyReconnect("stream")
@@ -2643,6 +2702,9 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 	}
 	if scenario == "mcp-retry" {
 		return a.verifyMCPRetryAccepted(ctx)
+	}
+	if scenario == "route-retry" {
+		return a.verifyRouteRetryAccepted(ctx)
 	}
 	var names []string
 	switch scenario {

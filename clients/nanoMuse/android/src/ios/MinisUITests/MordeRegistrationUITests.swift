@@ -255,18 +255,44 @@ final class MordeRegistrationUITests: XCTestCase {
         XCTAssertTrue(approvalsTab.waitForExistence(timeout: 10))
         approvalsTab.tap()
 
-        let approvalCount = app.staticTexts["mif.approval.count"]
-        XCTAssertTrue(approvalCount.waitForExistence(timeout: 15))
-        XCTAssertTrue(approvalCount.label.contains("1"))
-        XCTAssertFalse(app.buttons["mif.approval.approve.q0000102:r0000002:1"].exists)
-        XCTAssertFalse(app.descendants(matching: .any).matching(identifier: "mif.approval.partial").firstMatch.exists)
+        app.terminate()
+    }
+
+    func testTaskDynamicsRowsKeepApprovalClarificationAndUnknownResultDistinct() throws {
+        let app = try launchTaskActionFixture(extraArguments: ["-morde.localTaskPagesTransitionStatusFixture"])
+        openTasksRootTab(app)
+
+        let expectedLabels = [
+            ("q0000004", "等你审批"),
+            ("q0000005", "等待你补充信息"),
+            ("q0000006", "操作结果待核对"),
+        ]
+        for (taskID, expectedLabel) in expectedLabels {
+            let status = app.staticTexts["morde.tasks.row.status.\(taskID)"]
+            for _ in 0..<12 where !status.exists { app.swipeUp() }
+            XCTAssertTrue(status.waitForExistence(timeout: 10), "Missing task status for \(taskID).")
+            XCTAssertEqual(status.label, expectedLabel, taskID)
+        }
+        app.terminate()
+    }
+
+    func testApprovalInboxExplainsScopeAndRejectOutcome() throws {
+        let app = try launchTaskActionFixture(extraArguments: [])
+        app.buttons["morde.shell.tab.approvals"].tap()
 
         let reject = app.buttons["mif.approval.reject.q0000101:r0000001:1"]
-        XCTAssertTrue(reject.waitForExistence(timeout: 10))
+        XCTAssertTrue(reject.waitForExistence(timeout: 15))
+        let scopeNotice = app.descendants(matching: .any)
+            .matching(identifier: "mif.approval.scope-notice").firstMatch
+        XCTAssertTrue(scopeNotice.waitForExistence(timeout: 10))
+        XCTAssertTrue(scopeNotice.label.contains("当前显示的操作"))
+
         reject.tap()
-        let emptyInbox = app.staticTexts["mif.approval.empty"]
-        XCTAssertTrue(emptyInbox.waitForExistence(timeout: 15))
-        XCTAssertTrue(approvalCount.label.contains("0"))
+        let decisionResult = app.descendants(matching: .any)
+            .matching(identifier: "mif.approval.action-result").firstMatch
+        XCTAssertTrue(decisionResult.waitForExistence(timeout: 15))
+        XCTAssertTrue(decisionResult.label.contains("已拒绝"))
+        XCTAssertTrue(decisionResult.label.contains("结果尚未确认"))
         app.terminate()
     }
 
@@ -385,13 +411,17 @@ final class MordeRegistrationUITests: XCTestCase {
         approvalRow.tap()
         let approve = app.buttons["morde.task.approval.approve.r0000001"]
         XCTAssertTrue(approve.waitForExistence(timeout: 10))
+        let scopeNotice = app.descendants(matching: .any)
+            .matching(identifier: "morde.task.approval.scope-notice").firstMatch
+        XCTAssertTrue(scopeNotice.waitForExistence(timeout: 10))
+        let actionCost = app.staticTexts["morde.task.approval.disclosure.1"]
+        XCTAssertTrue(actionCost.waitForExistence(timeout: 10))
+        XCTAssertTrue(actionCost.label.contains("未知"))
         approve.tap()
-        let approvalStatus = app.staticTexts["morde.task.status"]
-        let approvalRefreshed = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "label CONTAINS %@", "Local decision refreshed"),
-            object: approvalStatus)
-        XCTAssertEqual(XCTWaiter.wait(for: [approvalRefreshed], timeout: 15), .completed)
-
+        let decisionResult = app.descendants(matching: .any)
+            .matching(identifier: "morde.task.approval.result").firstMatch
+        XCTAssertTrue(decisionResult.waitForExistence(timeout: 15))
+        XCTAssertTrue(decisionResult.label.contains("已允许"))
         app.buttons["返回"].tap()
         let clarificationRow = app.buttons["morde.tasks.row.q0000102"]
         XCTAssertTrue(clarificationRow.waitForExistence(timeout: 10))
@@ -407,11 +437,10 @@ final class MordeRegistrationUITests: XCTestCase {
         answer.typeText("Use a PDF.")
         XCTAssertTrue(send.isEnabled)
         send.tap()
-        let clarificationStatus = app.staticTexts["morde.task.status"]
-        let clarificationRefreshed = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "label CONTAINS %@", "Local clarification response received"),
-            object: clarificationStatus)
-        XCTAssertEqual(XCTWaiter.wait(for: [clarificationRefreshed], timeout: 15), .completed)
+        let clarificationResolved = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "exists == false"),
+            object: app.staticTexts["morde.task.clarification.question"])
+        XCTAssertEqual(XCTWaiter.wait(for: [clarificationResolved], timeout: 15), .completed)
         app.terminate()
     }
 

@@ -37,6 +37,17 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
         app.terminate()
     }
 
+    func testConnectorRateLimitRetryWaitShowsDeadlineWithoutRetryAction() {
+        let app = openRetryableTaskStepFixture(
+            extraArguments: ["-morde.localTaskConnectorRateLimitWaitFixture"], expectsRetry: false)
+        let deadline = app.staticTexts["morde.task.step.failureReason.s0000007"]
+        XCTAssertTrue(deadline.waitForExistence(timeout: 10))
+        XCTAssertTrue(deadline.label.contains("2099"), "The future Retry-After deadline must remain visible.")
+        XCTAssertFalse(app.buttons["morde.task.step.retry.s0000007"].exists,
+                       "A rate-limited step must not expose retry before retry_after_at.")
+        app.terminate()
+    }
+
     func testUnresolvedRecoveryMessageOpensItsTaskDetails() {
         let app = launchExecutionFixture(extraArguments: [
             "-morde.localTaskPagesUnresolvedRecoveryFixture",
@@ -47,6 +58,8 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
 
         XCTAssertTrue(status.waitForExistence(timeout: 15),
                       "The source message must say that no final answer was returned and the result is unconfirmed.")
+        XCTAssertFalse(app.buttons["morde.chat.message.retry-processing.m0000012"].exists,
+                       "A Task-linked unknown result must not expose message-route retry.")
         XCTAssertTrue(lastWork.waitForExistence(timeout: 10))
         XCTAssertTrue(lastWork.label.contains("Found the current release requirements."))
         XCTAssertFalse(app.staticTexts.containing(NSPredicate(format: "label CONTAINS %@", "private provider failure details")).firstMatch.exists,
@@ -562,7 +575,7 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
         return app
     }
 
-    private func openRetryableTaskStepFixture(extraArguments: [String]) -> XCUIApplication {
+    private func openRetryableTaskStepFixture(extraArguments: [String], expectsRetry: Bool = true) -> XCUIApplication {
         let app = launchExecutionFixture(extraArguments: ["-morde.localTaskPagesStatusFixture"] + extraArguments)
         let tasksTab = app.buttons["morde.shell.tab.tasks"]
         XCTAssertTrue(tasksTab.waitForExistence(timeout: 10))
@@ -585,11 +598,18 @@ final class MIFWorkItemAcceptanceUITests: XCTestCase {
         let sourceStep = app.buttons["morde.taskDynamics.workItem.s0000007"]
         XCTAssertTrue(sourceStep.waitForExistence(timeout: 15))
         sourceStep.tap()
-        XCTAssertTrue(app.buttons["morde.task.step.retry.s0000007"].waitForExistence(timeout: 15))
         let detail = app.scrollViews["morde.taskDynamics.workItem.detailScroll"]
         let retry = app.buttons["morde.task.step.retry.s0000007"]
-        for _ in 0..<8 where !retry.isHittable { detail.swipeUp() }
-        XCTAssertTrue(retry.isHittable)
+        if expectsRetry {
+            XCTAssertTrue(retry.waitForExistence(timeout: 15))
+            for _ in 0..<8 where !retry.isHittable { detail.swipeUp() }
+            XCTAssertTrue(retry.isHittable)
+        } else {
+            XCTAssertFalse(retry.waitForExistence(timeout: 2))
+            for _ in 0..<8 where !app.staticTexts["morde.task.step.failureReason.s0000007"].exists {
+                detail.swipeUp()
+            }
+        }
         return app
     }
 

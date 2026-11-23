@@ -255,7 +255,7 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertEqual(merged.first?.status, "completed")
     }
 
-    func testTaskDynamicsPinsRunningAndUsesOnlyTwoTaskStates() {
+    func testTaskDynamicsPinsRunningAndPreservesWaitingAndTerminalStatusReasons() {
         let tasks = [makeTask(id: "q1111111", status: "waiting_user"),
                      makeTask(id: "q2222222", status: "running"),
                      makeTask(id: "q3333333", status: "paused"),
@@ -265,9 +265,21 @@ final class MIFTaskViewsTests: XCTestCase {
                        ["q2222222", "q4444444", "q1111111", "q3333333"])
         XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("running"), AppLocalized("Task executing"))
         XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("cancelling"), AppLocalized("Task executing"))
-        for status in ["queued", "waiting_user", "paused", "completed", "failed", "future_status"] {
-            XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel(status), AppLocalized("Task stopped"), status)
-        }
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("queued"), AppLocalized("Queued"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("waiting_user", waitingReason: "approval_required"),
+                       AppLocalized("Waiting for approval"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("waiting_user", waitingReason: "clarification_required"),
+                       AppLocalized("Waiting for your input"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("waiting_user", waitingReason: "mcp_result_unknown"),
+                       AppLocalized("Operation result needs review"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("waiting_user", waitingReason: "dsh_recovery_unresolved"),
+                       AppLocalized("Operation result needs review"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("waiting_user"), AppLocalized("Waiting for you"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("paused"), AppLocalized("Paused"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("completed"), AppLocalized("Completed"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("failed"), AppLocalized("Task failed"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("cancelled"), AppLocalized("Cancelled"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("future_status"), AppLocalized("Status unknown"))
         XCTAssertEqual(MIFTaskDynamicsPresentation.latestWorkSummary(
             makeTask(id: "q5555555", status: "running", currentStep: "Run cloud dsh tool: morde_web_search")),
             AppLocalized("Search the web"))

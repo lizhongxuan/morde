@@ -97,8 +97,22 @@ VALUES ('q1234567',$1,'agent-1',2,'session-1','session-1',0,0,$2,decode('01','he
 	if err != nil || !budget.HasUnknown || budget.UsedTokens != reserved {
 		t.Fatalf("budget while Task model usage is unknown = %+v err=%v", budget, err)
 	}
-	if _, err := gateway.Complete(ctx, call); err == nil || model.calls != 1 {
-		t.Fatalf("checkpoint recovery redispatched unknown Task call: provider calls=%d err=%v", model.calls, err)
+	// Rebuild both services while keeping only the PostgreSQL state and the
+	// synthetic provider fixture. A restarted Gateway must honor the durable
+	// unknown reservation instead of dispatching the same immutable call again.
+	restartedModels, err := app.NewModelConnectionService(store, sealer, model, []string{"model.example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	restartedGateway, err := app.NewModelGatewayService(store, restartedModels, model)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restartedGateway.SetModelResponseSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := restartedGateway.Complete(ctx, call); err == nil || model.calls != 1 {
+		t.Fatalf("reconstructed Gateway redispatched unknown Task call: provider calls=%d err=%v", model.calls, err)
 	}
 
 	unknown, err := adminService.ListUnknown(ctx, admin, owner.UserID, 10)
@@ -121,8 +135,8 @@ VALUES ('q1234567',$1,'agent-1',2,'session-1','session-1',0,0,$2,decode('01','he
 	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id='q1234567'`).Scan(&taskUsage); err != nil || taskUsage != 13 {
 		t.Fatalf("reconciled Task model usage=%d err=%v", taskUsage, err)
 	}
-	if _, err := gateway.Complete(ctx, call); err == nil || model.calls != 1 {
-		t.Fatalf("reconciled Task call without a stored response was redispatched: provider calls=%d err=%v", model.calls, err)
+	if _, err := restartedGateway.Complete(ctx, call); err == nil || model.calls != 1 {
+		t.Fatalf("reconciled Task call without a stored response was redispatched after Gateway reconstruction: provider calls=%d err=%v", model.calls, err)
 	}
 	var responseCount int
 	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_model_call_responses WHERE owner_id=$1 AND source='task' AND call_id=$2`,

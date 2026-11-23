@@ -11,7 +11,8 @@ import (
 
 func TestConversationMessageAssociationResponseFieldsAreOptionalAndScoped(t *testing.T) {
 	message := conversation.Message{ID: "m1234567", ConversationID: "c1234567", Sequence: 2,
-		Role: conversation.RoleUser, Content: "same request", CreatedAt: time.Now().UTC()}
+		OwnerID: "u1234567", ActorID: "u1234567", Role: conversation.RoleUser,
+		Content: "same request", CreatedAt: time.Now().UTC()}
 	view, err := toMessageResponse(message)
 	if err != nil {
 		t.Fatal(err)
@@ -32,6 +33,9 @@ func TestConversationMessageAssociationResponseFieldsAreOptionalAndScoped(t *tes
 	}
 	if body["agent_acknowledged"] != false {
 		t.Fatalf("unacknowledged message projection = %v, want false", body["agent_acknowledged"])
+	}
+	if body["actor_id"] != message.ActorID {
+		t.Fatalf("authenticated conversation message actor = %v, want %q", body["actor_id"], message.ActorID)
 	}
 	message.AgentAcknowledged = true
 	view, err = toMessageResponse(message)

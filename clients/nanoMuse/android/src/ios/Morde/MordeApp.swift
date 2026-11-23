@@ -62,6 +62,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let taskPagesStatusFixtureLaunchArgument = "-morde.localTaskPagesStatusFixture"
     static let taskStepRetryFixtureLaunchArgument = "-morde.localTaskStepRetryFixture"
     static let taskConnectorRateLimitRetryFixtureLaunchArgument = "-morde.localTaskConnectorRateLimitRetryFixture"
+    static let taskConnectorRateLimitWaitFixtureLaunchArgument = "-morde.localTaskConnectorRateLimitWaitFixture"
     static let taskStepRetryFailureFixtureLaunchArgument = "-morde.localTaskStepRetryFailureFixture"
     static let taskPagesLongListFixtureLaunchArgument = "-morde.localTaskPagesLongListFixture"
     static let taskPagesTransitionStatusFixtureLaunchArgument = "-morde.localTaskPagesTransitionStatusFixture"
@@ -1541,8 +1542,11 @@ private final class MordeAuthURLProtocol: URLProtocol {
             let isFailed = id == "q0000006"
             let isConnectorRateLimitRetryFixture = ProcessInfo.processInfo.arguments.contains(
                 Self.taskConnectorRateLimitRetryFixtureLaunchArgument)
+            let isConnectorRateLimitWaitFixture = ProcessInfo.processInfo.arguments.contains(
+                Self.taskConnectorRateLimitWaitFixtureLaunchArgument)
+            let isConnectorRateLimitFixture = isConnectorRateLimitRetryFixture || isConnectorRateLimitWaitFixture
             let isStepRetryFixture = isFailed && (ProcessInfo.processInfo.arguments.contains(Self.taskStepRetryFixtureLaunchArgument) ||
-                isConnectorRateLimitRetryFixture)
+                isConnectorRateLimitFixture)
             let stepRetryAccepted = isStepRetryFixture && taskStepRetryAcceptedSnapshot
             let status = isCompleted ? "completed" : (isFailed ? "failed" : "cancelled")
             let objective = isCompleted ? "Completed task fixture" :
@@ -1580,16 +1584,17 @@ private final class MordeAuthURLProtocol: URLProtocol {
                     "title": "Review failed output", "summary": "A local synthetic failure.",
                     "created_at": "2026-11-04T00:00:01Z"]
                 if isStepRetryFixture {
-                    if isConnectorRateLimitRetryFixture {
+                    if isConnectorRateLimitFixture {
                         failedStep["title"] = "Call MCP connector"
                         failedStep["summary"] = "The connector rate limited this attempt."
                         failedStep["tool_name"] = "mcp_call"
-                        failedStep["retry_after_at"] = "2026-11-04T00:00:02Z"
+                        failedStep["retry_after_at"] = isConnectorRateLimitWaitFixture
+                            ? "2099-01-01T00:00:00Z" : "2026-11-04T00:00:02Z"
                     }
-                    failedStep["retryable"] = !stepRetryAccepted
+                    failedStep["retryable"] = isConnectorRateLimitWaitFixture ? false : !stepRetryAccepted
                     failedStep["attempt"] = 1
                     failedStep["task_revision"] = 1
-                    failedStep["failure_reason"] = isConnectorRateLimitRetryFixture
+                    failedStep["failure_reason"] = isConnectorRateLimitFixture
                         ? "connector_rate_limited" : "synthetic_failure"
                     failedStep["retry_of_step_id"] = NSNull()
                 }
@@ -3367,6 +3372,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
                   let taskID = request.url?.path.split(separator: "/").last.map(String.init),
                   request.url?.path == "/api/tasks/\(taskID)", request.httpMethod == "GET",
                   (ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesTaskDetailRequestsFixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.taskPagesStatusFixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument) ||
                    ProcessInfo.processInfo.arguments.contains(Self.approvalPollingFixtureLaunchArgument)) {
@@ -4036,11 +4042,6 @@ private final class MordeAuthURLProtocol: URLProtocol {
             cancellingPending["waiting_reason"] = NSNull()
             cancellingPending["stop_request"] = ["status": "pending", "unsettled_operation_ids": [String]()]
 
-            var cancellingCompleted = Self.taskPagesSummary(
-                id: "q0000003", status: "cancelling", objective: "Task cancellation acknowledged fixture")
-            cancellingCompleted["waiting_reason"] = NSNull()
-            cancellingCompleted["stop_request"] = ["status": "completed", "unsettled_operation_ids": [String]()]
-
             var approval = Self.taskPagesSummary(
                 id: "q0000004", status: "waiting_user", objective: "Approval wait fixture")
             approval["waiting_reason"] = "approval_required"
@@ -4053,7 +4054,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 id: "q0000006", status: "waiting_user", objective: "Unknown operation result fixture")
             operationResult["waiting_reason"] = "mcp_result_unknown"
 
-            let items = [pausing, cancellingPending, cancellingCompleted, approval, clarification, operationResult]
+            let items = [pausing, cancellingPending, approval, clarification, operationResult]
             statusCode = 200
             body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": NSNull()])) ?? Data()
         } else if isFixtureOrigin, request.url?.path == "/api/tasks", request.httpMethod == "GET",
@@ -20049,6 +20050,8 @@ private struct MordeProjectsRoom: View {
     @State private var projectConversationHostID = ""
     @State private var projectConversationWorkspaceID = ""
     @State private var projectAppendTaskID = ""
+    @State private var projectConversationApprovalResultID: String?
+    @State private var projectConversationApprovalResult: String?
     @State private var projectAttachmentDrafts: [String: [MordeOutboxAttachment]] = [:]
     @State private var projectAttachmentImportKey: String?
     @State private var showProjectAttachmentImporter = false
@@ -20684,6 +20687,7 @@ private struct MordeProjectsRoom: View {
         .onAppear { startLocalProjectAttachmentFixtureIfNeeded() }
         .onChange(of: client.selectedProjectID) { _ in
             clearProjectAttachmentPreview()
+            projectConversationApprovalResultID = nil; projectConversationApprovalResult = nil
             ownerTransferUserID = ""; resourceID = ""; memberToRemove = nil
             workItemDeliveryConfirmation = nil
             workItemTitle = ""; workItemDescription = ""; blockingWorkItemID = nil; blockedReason = ""
@@ -20697,6 +20701,7 @@ private struct MordeProjectsRoom: View {
         }
         .onChange(of: client.selectedProjectConversationID) { _ in
             clearProjectAttachmentPreview()
+            projectConversationApprovalResultID = nil; projectConversationApprovalResult = nil
             projectConversationDraft = ""; projectConversationAnswer = ""; projectAppendTaskID = ""
             startLocalProjectAttachmentFixtureIfNeeded()
         }
@@ -21188,6 +21193,15 @@ private struct MordeProjectsRoom: View {
             if let object = pending.object, !object.isEmpty { Text(object).font(.footnote) }
             Text(pending.content)
             Text(pending.impact).font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
+            Text(MIFApprovalDecisionPresentation.scopeNotice)
+                .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
+                .fixedSize(horizontal: false, vertical: true)
+            if projectConversationApprovalResultID == pending.id, let projectConversationApprovalResult {
+                Text(projectConversationApprovalResult)
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("morde.projectConversation.approval.result")
+            }
             LabeledContent(AppLocalized("Risk"), value: MordeTaskApprovalDisclosurePresentation.text(pending.disclosures?.risk))
             LabeledContent(AppLocalized("Cost of this action"), value: MordeTaskApprovalDisclosurePresentation.cost(pending.disclosures?.this_cost))
             LabeledContent(AppLocalized("Cumulative cost"), value: MordeTaskApprovalDisclosurePresentation.cost(pending.disclosures?.cumulative_cost))
@@ -21223,24 +21237,44 @@ private struct MordeProjectsRoom: View {
                         },
                         onDecision: { decision in
                             client.projectConversationTask = task
-                            return await client.respondToProjectConversationApproval(
+                            projectConversationApprovalResultID = pending.id
+                            projectConversationApprovalResult = nil
+                            let decisionValue = MIFApprovalDecision(rawValue: decision)
+                            let accepted = await client.respondToProjectConversationApproval(
                                 taskID: task.id, approvalID: pending.id, version: pending.version, decision: decision)
+                            if accepted, let decisionValue {
+                                projectConversationApprovalResult = MIFApprovalDecisionPresentation.acceptedMessage(
+                                    decision: decisionValue, currentStatus: client.projectConversationTask?.statusLabel)
+                            }
+                            return accepted
                         })
                 } else if canManageProjectConversationTask {
                     HStack {
                         Button("批准") {
                             Task {
                                 client.projectConversationTask = task
-                                _ = await client.respondToProjectConversationApproval(
+                                projectConversationApprovalResultID = pending.id
+                                projectConversationApprovalResult = nil
+                                let accepted = await client.respondToProjectConversationApproval(
                                     taskID: task.id, approvalID: pending.id, version: pending.version, decision: "approve")
+                                if accepted {
+                                    projectConversationApprovalResult = MIFApprovalDecisionPresentation.acceptedMessage(
+                                        decision: .approve, currentStatus: client.projectConversationTask?.statusLabel)
+                                }
                             }
                         }
                         .accessibilityIdentifier("morde.projectConversation.approval.approve.\(pending.id)")
                         Button("拒绝", role: .destructive) {
                             Task {
                                 client.projectConversationTask = task
-                                _ = await client.respondToProjectConversationApproval(
+                                projectConversationApprovalResultID = pending.id
+                                projectConversationApprovalResult = nil
+                                let accepted = await client.respondToProjectConversationApproval(
                                     taskID: task.id, approvalID: pending.id, version: pending.version, decision: "reject")
+                                if accepted {
+                                    projectConversationApprovalResult = MIFApprovalDecisionPresentation.acceptedMessage(
+                                        decision: .reject, currentStatus: client.projectConversationTask?.statusLabel)
+                                }
                             }
                         }
                         .accessibilityIdentifier("morde.projectConversation.approval.reject.\(pending.id)")

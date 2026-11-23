@@ -1068,20 +1068,82 @@ Tokenizer 与 token 统计来源：
 - **投影缺陷修复：**精确且唯一的终止 MCP 账本证据现可独立投影 `RetryAfterAt`；Agent 停止收据只参与 `Retryable` 准入判定。等待尚未结束时显示截止时间但不允许重试；等待结束而 Agent 停止未确认时仍不允许重试。原有 `TestPostgresMCPConnectorRateLimitStepRetryWaitsForExactLedgerEvidence` 在合并定向组内通过。`taskDomain` 还补映射 `CurrentRevision`，以便真实 `ClaimNextTask` 返回并校验排队的 retry intent；成功重试集成用例通过。
 - **Retry-After 超限边界：**模型响应头解析测试覆盖未来 HTTP 日期和超大整数；新增 PostgreSQL 用例从解析后的 `ModelClientError` 经 Gateway、Worker 验证路由保持失败且新 Worker 不再领取。两部分测试分层覆盖；没有将其描述为单一 HTTP 响应头到数据库的端到端测试。
 - **M09 worker 定向回归（2026-11-23）：**此前受步骤 06 `TaskValidationReview` 编译错误阻断的 worker 检查现已恢复。当前工作区运行 `go test ./internal/worker -run '^(TestCloudDSHStepRetryRequiresThePinnedFenceAndConfirmedFailure|TestCloudDSHExecutorStopsAfterDurableTerminalToolAttempt|TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits|TestConversationRouteWorkerInvalidOutputWithInterruptedDuplicateExplainsRecovery)$' -count=1` 通过（4 项，2.136 秒）；证明当前 worker 包可编译并通过这四项 M09 相关定向用例，不替代其它 Worker 或跨端验收。
-- **iOS loopback UI 验收边界：**`xcodebuild build-for-testing -scheme morde` 编译成功，包含 `testLocalPortalRetriesConnectorRateLimitFromNativeTaskDetail`。实际测试两次在 Xcode 读取 `MordeT03LongMessageResumeTemp` test plan 阶段失败，未执行 UI 用例；Go 本地夹具以 `messages=0 replies=0` 退出。`-showTestPlans` 可列出该方案，但 `xcodebuild test` 仍报无法读取；测试计划文件已恢复原内容和 `0644` 权限。该结果仅为工具链阻塞，不是功能通过或功能失败。iOS 原生 fixture UI 用例此前通过，但 iOS 客户端到真实本地服务/PostgreSQL 的闭环仍未验收。
+- **iOS loopback UI 首轮尝试（后续由 S09-6 成功结果更新）：**`xcodebuild build-for-testing -scheme morde` 编译成功，包含 `testLocalPortalRetriesConnectorRateLimitFromNativeTaskDetail`。首次两次测试在 Xcode 读取 `MordeT03LongMessageResumeTemp` test plan 阶段失败，未执行 UI 用例；Go 本地夹具以 `messages=0 replies=0` 退出。`-showTestPlans` 可列出该方案，但当时 `xcodebuild test` 仍报无法读取；测试计划文件已恢复原内容和 `0644` 权限。该次结果仅说明最初的工具链尝试未进入业务断言；随后改用基础 `morde` scheme 的本地 loopback 验收已通过，当前状态见 S09-6。
 - **iOS fixture 回归复测边界：**另用基础 `morde` scheme 请求未决 Task 入口、路由失败重试、超长消息不可原样重试三条原生 UI 用例。并行测试时 Xcode 测试 worker/模拟器 clone 未能启动；改为串行单条后，Simulator launcher 返回 `NSMachErrorDomain -308`（Mach IPC server died），测试未执行 UI 断言。中断的本地结果包已清理，专用模拟器已回到 Shutdown；此前通过的 fixture UI 结果仍按其原范围记录，不由本次失败重跑覆盖。
 - **清理与边界：**一次性 PostgreSQL 容器及 Go 本地服务已停止；测试计划恢复；未访问用户提供的远端测试服务、没有调用真实 Provider/MCP、没有使用用户提供的密钥或凭据、没有上传文件。
+
+### S09-6 iOS Task/MCP 限流重试本地服务闭环（2026-11-23）
+
+- **范围与执行：**使用基础 `morde` scheme 在隔离 iPhone 17e Simulator 上运行 `MinisUITests/IOS04CloudAcceptanceUITests/testLocalPortalRetriesConnectorRateLimitFromNativeTaskDetail`，服务地址为 loopback；测试账号、活动 token、任务和连接器结果均由本地合成 fixture 生成。用户消息由 iOS 发到本地 Morde 服务，Go fixture 推进 `start`、`progress`、`fail`，随后从原生 Task 列表进入失败 Task 与 MCP 工作项详情并点击重试；Go fixture 最后查询本地 PostgreSQL。
+- **结果：**`xcodebuild test` 退出码 0，xcresult `/tmp/morde-m09-ios-mcp-retry-loopback-navfix-20261123.xcresult` 为 1 passed、0 failed、0 skipped，UI 用例耗时 53.61 秒。原生界面中键盘遮住底部 Tasks tab，因此用现有导航抽屉打开任务列表；测试源已保留该可靠导航修正。Go `TestConversationBrowserAcceptance` 使用 `MORDE_BROWSER_ACTIVITY_SCENARIOS=mcp-retry` 对同一 run 作最终断言，通过（`ok morde/server/internal/store/postgres 177.098s`）。
+- **持久状态断言：**Task 进入 `running`；原 MCP 来源步骤仍为 `failed/connector_rate_limited`；新重试步骤为 `queued`、`attempt=2` 且 `retry_of_step_id` 指向来源；只有一条连接器操作账本记录。该用例验证的是 iOS 原生操作 → 本地 Morde API/Worker → PostgreSQL 的合成闭环，不调用真实 Provider 或 MCP 连接器，也不覆盖消息路由重试、审批、中断、未知副作用对账或跨账号隔离。
+- **首轮失败与清理：**先前通过临时测试计划注入环境的两次尝试被 Xcode test plan 读取错误拦截，fixture 收到 0 条消息；后续使用一次性本地 fixture 配置在基础 `morde` scheme 成功执行。临时测试配置、测试计划和包含临时值的 DerivedData 已还原/删除；测试文件只保留抽屉导航修正。停止并删除本地 Go/PostgreSQL fixture；只清理本轮启动的 iPhone 17e Simulator，没有访问用户提供的远端服务或数据库，没有调用真实 Provider/MCP，没有使用用户提供的凭据/API key，也未发送或上传文件。
+
+### S09-7 iOS 原消息路由失败后显式重试闭环（2026-11-23）
+
+- **首轮失败与缺陷定位：**使用新的本地 `route-retry` 合成场景，在原消息的路由分类调用返回超出 24 小时持久队列期限的限流错误。数据库已持久为 `failed/model_unavailable`、`route_attempt=1`、无 Task，但 iOS 没有显示重试按钮，首轮 UI 用例失败。排查发现个人会话 `messageResponse` 没有返回 `actor_id`；iOS 的 `canRetryProcessing` 要求消息归当前登录用户，因此真实 API 响应无法开放入口。
+- **修复与验证：**个人会话消息响应现在包含已认证消息的 `actor_id`（可选字段，项目会话仍沿用其既有 ActorID 投影）；`TestConversationMessageAssociationResponseFieldsAreOptionalAndScoped` 增加 actor 字段断言。`go test ./internal/api -run 'TestConversationMessageAssociationResponseFieldsAreOptionalAndScoped|TestProjectConversation' -count=1` 通过；`go test ./internal/store/postgres -run '^TestBrowserActivitySelection$' -count=1` 通过；`TestProjectConversationMembersShareHistoryAndTasksKeepInitiator` 通过，并确认非成员读取 Task 事件返回 not found。
+- **iOS 原生闭环：**基础 `morde` scheme 下运行 `IOS04CloudAcceptanceUITests.testLocalPortalRetriesRouteFailureFromOriginalMessageWithoutResending`，xcresult `/tmp/morde-m09-ios-route-retry-loopback-20261123-second.xcresult` 通过（1 passed、0 failed）。iOS 从同一失败原消息点击重试后收到本地合成回复；Go `TestConversationBrowserAcceptance` 最终通过（235.611 秒），PostgreSQL 断言原用户消息只有一条、无 Task、路由为 `routed` 且 `route_attempt=2`、首次模型调用为 `rejected`、重试模型调用为 `settled`、assistant 回复只有一条。即一次显式重试复用了原消息，没有重复提交消息。
+- **边界与清理：**首轮失败结果包 `/tmp/morde-m09-ios-route-retry-loopback-20261123.xcresult` 保留为缺陷定位证据；修复后的通过结果包见上。Xcode 不传入此 UI runner 所需的 shell 环境变量，本次通过一次性本地 fixture 值运行后立即还原测试源码；源码没有保留本地账号、密码、端口或活动 token。临时 PostgreSQL 容器已停止删除，iPhone 17e Simulator 已关闭；未访问远端、未调用真实 Provider/MCP、未使用用户提供的密钥/凭据、未发送或上传文件。
+
+### S09-8 iOS 未决恢复消息打开关联 Task 详情（2026-11-23）
+
+- **验证：**在 iPhone 17e 模拟器运行 `MinisUITests/MIFWorkItemAcceptanceUITests/testUnresolvedRecoveryMessageOpensItsTaskDetails`。xcresult `/tmp/morde-m09-ios-state-label-pass-20261123.xcresult` 显示 1 passed、0 failed、0 skipped，用例耗时 48.99 秒。
+- **断言：**原用户消息显示没有最终答复且结果未确认；显示最后确认工作；隐藏原始 Provider 错误；点击入口后进入目标 Task 详情，并核对 Task 标题。
+- **边界：**这是本地原生 UI fixture，不访问 Morde 服务或 PostgreSQL，不验证服务端状态同步、跨设备一致性或审批/中断/未知副作用链路。
+
+### S09-9 iOS Task 等待原因呈现与消息重试门禁（2026-11-23）
+
+- **缺陷与修复：**只读审查发现 Task 动态列表/详情将非运行状态统一显示为“Task stopped”，使 `waiting_user` 审批、澄清和 MCP 未知结果看似已停止。`MIFTaskDynamicsPresentation.statusLabel` 现复用 `MordeTaskStatusPresentation` 的状态/等待原因本地化；动态列表、详情和 VoiceOver 状态标签使用相同原因。另补齐 `current_step` 的安全可读摘要回退，避免运行中的任务卡仅显示通用文案。
+- **原生验证：**使用 iPhone 17e Simulator 串行运行 `MIFTaskViewsTests.testTaskDynamicsPinsRunningAndPreservesWaitingAndTerminalStatusReasons`、`MordeRegistrationUITests.testTaskDynamicsRowsKeepApprovalClarificationAndUnknownResultDistinct`、`MIFWorkItemAcceptanceUITests.testUnresolvedRecoveryMessageOpensItsTaskDetails`。xcresult `/tmp/morde-m09-ios-state-label-pass-20261123.xcresult` 显示 3 passed、0 failed、0 skipped。列表 UI 断言分别检查“等你审批”“等待你补充信息”“操作结果待核对”；未决恢复原消息保留结果未知提示、隐藏 Provider 原始错误、打开关联 Task，且没有“重新处理消息”的按钮。
+- **夹具修正：**首轮 UI 断言发现未知结果项位于任务页第六项，超出每页五项限制；状态 fixture 调整为单页五个 Task 后复测通过。单测同时覆盖 `current_step` 摘要回退。
+- **边界：**这组 UI fixture 不访问服务/PostgreSQL，不验证审批/澄清后服务端状态转换、断流与中断、未知操作对账或 PC/iOS 跨端一致性。首轮并行运行因模拟器克隆失败，第二轮因 XCTest worker 未启动而中断，均未进入有效断言；本节记录的串行复测为最终结果。
+
+### S09-10 M09-03 模型用量未知跨 Gateway 重建（2026-11-23）
+
+- **补充：**`TestPostgresTaskModelUnknownUsageStaysReservedAcrossRecoveryAndReconcilesOnce` 在第一次 Task Provider 请求留下 `unknown` 用量及预算预留后，重建 Model Connection Service 与 Model Gateway，再使用同一 Task fence、session 和 call ID 恢复。PostgreSQL 仍阻止第二次 Provider 派发，合成 Provider 调用数保持 1；管理员按可信用量对账后只结算一次，重建后的 Gateway 也不会因为没有可恢复响应而重放请求或伪造回答。
+- **验证：**在 `server/` 执行 `go test ./internal/store/postgres -run '^TestPostgresTaskModelUnknownUsageStaysReservedAcrossRecoveryAndReconcilesOnce$' -count=1 -timeout=5m`，通过（`ok morde/server/internal/store/postgres 0.896s`）。
+- **边界：**使用一次性本地 PostgreSQL 和合成 Provider；该用例重建 Gateway/模型连接服务，不是完整 DSH Worker、Runtime 或进程重启。MCP 丢回执目前仍由内存 Broker 测试和独立 PostgreSQL ledger 测试分开覆盖，真实连接器、远程服务和客户端没有参与。
+
+### S09-11 M09-01 异账号步骤详情与事件流 API 隔离（2026-11-23）
+
+- **实现与断言：**扩展 `TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord`。拥有者仍通过 Task API 读到本人加密存储的工具详情；另一个已认证用户请求相同 Task/step 和 `/events` 时均返回 404，响应体不包含步骤输入或结果。
+- **验证：**在 `server/` 执行 `go test ./internal/store/postgres -run '^TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord$' -count=1 -timeout=5m`，通过（`ok morde/server/internal/store/postgres 1.023s`）。
+- **边界：**使用一次性本地 PostgreSQL 和合成身份；覆盖步骤详情与 Task event stream 的 API 隔离，不覆盖 PC/iOS 客户端入口或已派发操作失败后的恢复链路。
+
 
 ### S05 审批卡单次决策说明与本地回归（2026-11-23）
 
 - **实现：**PC `TaskApprovalCard` 明确审批只覆盖当前展示的操作、拒绝后该操作不执行、批准只会继续尝试且不代表任务已完成；Review 详情弹窗可直接提交允许/拒绝。成功反馈区分“已允许本次操作”和“已拒绝本次操作”，同时不声称 Task 已完成。无可信 action-level 成本来源时仍显示“未知”。
 - **本地验证：**`TaskApprovalCard.test.tsx`、`Reviews.test.tsx`、`Assistant.test.tsx` 定向组通过（236 项）；API/app/PostgreSQL 精确绑定、到期、并发、预算与 steer 定向用例通过；Portal `npm run build:pc` 和 `git diff --check` 通过。`TaskApprovalCard.tsx` 及组件测试的定向 ESLint 通过。扩展至完整 `Assistant.tsx`/`Reviews.tsx` 的 ESLint 检查仍在其他共享路由代码行触发 React Hooks/ref 规则错误，不计为整路 lint 通过。
 - **实际 PC 观察：**使用隔离 profile 和 loopback 合成服务启动 `make pc`。先由夹具确认 Task 为 `waiting_user/pending`，再从 PC 待审批卡点“拒绝”；本地审批响应 POST 到达 API，Task 进入 `running`，卡片不再可操作。夹具没有模拟 Agent 消化拒绝后的回复；本轮最终因 5 分钟验收上限超时，因此只记实际 PC UI/响应观察，不计自动 E2E 通过。拒绝不派发由 `TestCloudDSHToolBrokerRejectedApprovalReturnsWithoutDispatch` 覆盖。
-- **边界：**iOS 交互未验；H05 的全动作策略与独立账本覆盖仍未闭合。现有 Host、外部 MCP、Workspace/media 精确绑定不等同于所有不可逆动作都已有逐次审批；Hub target grant 不等于本次批准，未枚举 action class 继续保持 `unknown` / fail-closed。未访问远端测试站/Host、未调用真实 Provider、未使用用户提供的密钥、未发送/上传文件。
+- **iOS 原生本地 UI（2026-11-23）：**`MIFApprovalViewsTests` 20/20 通过；iPhone 18 Pro Simulator（iOS 27.2）上的 `testApprovalInboxExplainsScopeAndRejectOutcome` 与 `testTaskDetailsHandleApprovalAndClarificationRequests` 分别通过。审批收件箱用例检查范围提示并提交拒绝；Task 动态详情用例检查披露缺失时显示未知成本、提交允许并看到非完成反馈，再提交澄清并确认刷新后请求消失。测试走 URLProtocol 本地合成 fixture，不是真实 API/Agent E2E。结果包：`/tmp/morde-step05-ios-approval-ui-final-v2.xcresult`、`/tmp/morde-step05-ios-detail-ui-final-v4.xcresult`。
+- **iOS 修正：**Task 列表实际进入动态详情页，原先该页不展示审批/澄清；现已接入两类请求视图。审批卡父元素切换为包含式无障碍节点，保留卡片内容与动作按钮各自标识。模拟器记录到一条 `Invalid frame dimension (negative or non-finite)` SwiftUI runtime warning；两条最终聚焦 UI 用例均通过，warning 来源未定位。
+- **边界（当时状态）：**该次审批卡验收尚未闭合全动作策略与独立账本；Hub target grant 不等于本次批准，未枚举 action class 继续保持 `unknown` / fail-closed。后续策略和账本覆盖见“S05-2 动作审批策略与独立账本覆盖”。未访问远端测试站/Host、未调用真实 Provider、未使用用户提供的密钥、未发送/上传文件。
 
 ### M06 产物内容读回与验证状态栅栏（2026-11-23）
 
 - **实现：**验证 worker 现在只读取当前 Task 结果证据明确引用、绑定唯一成功来源调用的 Artifact 固定 Workspace 版本；读取前后检查 claim，按真实字节流校验长度和 SHA-256，最多读取 8 MiB/件、每次复核合计 16 MiB。仅将最多 4 KiB 的可读文本预览送入现有无工具 DSH 复核会话；超预算产物只提供元数据并标记未读，整文件不存入报告/数据库，二进制和截断预览不会作为完整内容证据。提交时复核 Task、结果事件、来源步骤、当前授权和 Workspace fence；当前 Workspace 文件内容或版本发生变化时，Task 投影和原会话回执不再展示旧 validation 结论。Portal 独立展示 `Task.validation`，与执行状态、ResultReview 分开。
 - **通过的本地验证：**`cd server && go test ./internal/app -count=1`（40.044 秒）、`go test ./internal/worker -count=1`（156.091 秒）、`go test ./internal/store/postgres -count=1`（无 DSN 的包测试通过，数据库集成用例会跳过）；随后在一次性本地 PostgreSQL 16 容器（仅绑定 `127.0.0.1`）运行步骤 06 五个定向集成用例，覆盖迁移加载、claim/完成栅栏、内容证据绑定，以及正确当前文件为 PASS、文件内容修改后回到 pending，全部通过。Portal `npm --prefix web/portal test -- src/routes/Assistant.test.tsx -t 'shows Task validation separately|shows Task validation|unknown Task validation|waits for Task completion'`（7/7）；`make pc` 的 Portal、Workbench、Electron 编译阶段通过；`git diff --check` 通过。
-- **客户端尝试：**`make pc` 在 Electron 启动时遇到既有 `morde-pc` 单实例，观察到的窗口仍显示先前中断的旧任务。本轮没有进入或操作该任务，也没有在 PC 中创建合成 Task。当前 Portal/Workbench 构建成功，但新 validation UI 的实际 PC 业务流仍未验收；不能以组件测试或旧窗口观察替代。
-- **未覆盖与安全边界：**撤权/工作区并发更新、旧结果事件及错误/未知审批证据判定尚缺数据库集成回归。没有调用模型、用户提供的 API key/远端测试站或机器；没有发送/上传文件。实际错误文件与正确文件内容对比、截断/超读取预算文件保持 pending、PC 来源显示及真实 DSH review session 场景待可用本地环境后验证。
+- **客户端尝试：**使用 `MORDE_TEST_USER_DATA=/tmp/morde-step06-pc-profile`、本地 loopback acceptance fixture 再次运行 `make pc`；Portal、Workbench 和 Electron 编译完成，Electron 主进程及 helper 已启动，但 arc-cua 没有暴露一个可观察的独立窗口，应用列表仍只有原 `morde-pc` 窗口（其中显示先前中断的旧任务）。只中断了本次隔离启动，没有进入旧窗口、发送消息或创建合成 Task。实际 PC validation UI 业务流仍未验收；不能以组件测试或旧窗口观察替代。
+- **本地回归边界：**上述本地实现与数据库回归未调用模型、用户提供的 API key、远端测试站或机器，也没有发送/上传文件。错误/正确内容对比、截断/超读取预算文件保持 pending、PC 来源显示及真实 DSH review session 场景仍待验证；后续云端 PC 尝试单独记录于下一节。
+
+### M06 云端 PC 合成任务部分实测（2026-11-23）
+
+- **入口与请求：**使用实际 `morde-pc` 连接用户指定的云端服务，在隔离旁聊提交合成文件创建及读回比较请求。没有通过普通用户 Web/iOS 操作，没有修改远端数据库，也没有上传本地文件。
+- **云端版本：**只读核对 `/opt/morde-src` HEAD 为 `30dc339`、工作区干净，与本地 HEAD `30dc3399` 相同；Portal 执行文件 `/opt/morde/bin/portal` 修改时间 20:17:21，systemd 启动时间 20:17:52，源码提交时间 20:15:44。没有从二进制元数据独立确认构建提交，仅将源码与时间作为版本一致性佐证。
+- **原 Task 观察结果：**PC 工作项详情显示 `file_write` 已完成、执行位置为“云端电脑”；Task `quny0r0t` 的 `Task.validation` 为“待验证”。任务卡显示中断且未返回最终答复；“核对任务恢复状态”为待确认，原因是模型服务未返回可确认的结果。随后用 PC 的 Workbench 只读观察确认 Task 状态“等待确认”、已确认事件序号 31、没有新事件且没有可显示的已核验产物。界面未展示写入正文、读回值或逐字比较。
+- **后续尝试：**原旁聊的只读跟进被路由为“分类暂时不可用”，没有生成读回 Task。再次明确要求续接原 Task、只读且不重写后，Morde 要求指定目标 Task；随后在消息中明确指定 `quny0r0t`，仍收到“分类暂时不可用，请说明要操作哪个任务”。只读 Portal 日志在该时间段记录 1 条 `conversation route model output is invalid`（`failure_code=invalid_model_output`、187 字节、UTF-8 有效）；未读取原始模型输出，Worker 走澄清兜底，未确认新 Task/工具调用。另建隔离旁聊后，独立只读 Task 的 `Task.validation` 显示“待验证”；`file_find` 完成，`file_read` 失败（Host runtime definitive tool failure）。该请求跨越 Task 边界，不能作为原 Task 的读回证据，也不能判断原文件内容。
+- **结论与边界：**只确认原 Task 写入工作项完成、验证状态仍 pending、Workbench 没有已核验产物；不证明写入内容正确或通过。未重放写入或删除结果未知的合成文件。Step06 PC 端到端验收及 M06-01–04 保持未完成；当前没有证据确认本地验证代码有缺陷，Task 等待确认使完整实测尚未闭合。
+
+### S05-2 动作审批策略与独立账本覆盖（2026-11-23）
+
+- **策略补齐：**按副作用类型明确逐次审批、固定只读 Task scope、Task+目标 scope 三类门禁，并在步骤 05 TODO 中逐类映射持久账本。Hub `command` 需同时具备当前 Task `computer.operate` scope 与目标设备 grant；target grant 不是逐次用户批准。每个 Hub 调用仍有独立 `task_hub_operations` 记录，由 operation key 稳定映射 CallID，绑定 Task/目标/授权版本、请求摘要、lease 和结果；prepare/dispatch 事务复核 Task 授权和目标有效性，目标端再复核 grant。Host `runtimeToolRisk` 的 moderate 类依赖当前 Task scope/Host fence；browser Enter/Backspace/Delete 以及 sensitive/未知 action 走逐次精确批准；外部 MCP 与 Workspace/media 写入绑定 approval。个人写入仅在 owner 的个人 Task 中按用户意图和目标修订执行，并在 Task 事件事务中记录 CallID/Mutation。Hub `file.put` 不暴露为 DSH 工具；未注册 action 拒绝。
+- **本地回归：**`cd server && go test ./internal/app -run '^(TestRuntimeToolRiskTiers|TestRuntimeToolExecutorPrepareShowsBoundedSensitiveActionPreviewWithoutDispatch|TestCloudDSHHub|TestCloudDSHPersonal)' -count=1` 通过。分类用例确认 browser Enter/Backspace/Delete 为 sensitive、Tab/方向键为 moderate。使用一次性 PostgreSQL 16.15 容器（仅绑定 `127.0.0.1`、无数据卷）执行 11 项 Hub operation 幂等/目标复核、Host exact approval、MCP exact approval、Workspace publish approval/responder 与 Hub 执行事实定向集成用例，全部通过（47.364 秒）：
+
+  ```text
+  cd server && CH_TEST_DATABASE_URL=<loopback disposable PostgreSQL DSN> go test ./internal/store/postgres -run '^(TestPostgresHubTaskOperationIsIdempotentAndTerminal|TestPostgresHubTaskOperationRechecksTargetBeforeDispatch|TestPostgresApprovedTaskOperationBindingAllowsExactDispatchAndReplay|TestPostgresTaskOperationRequiresExactApprovedBinding|TestPostgresTaskOperationDispatchRejectsRevisionChangedAfterApproval|TestPostgresMCPConnectorApprovalBindingIsExactAndRecheckedAtDispatch|TestTaskWorkspacePublishMediaApprovalBindingIsExactAndRecheckedAtCommit|TestTaskWorkspacePublishHostlessWriteApprovalBindingRejectsMissingOrChangedReplay|TestTaskWorkspacePublishRequiresApprovalResponderAtCommit|TestTaskWorkspacePublishRejectsNonApprovedMediaBeforeReservationAndCommit|TestPostgresTaskValidationFactsTreatHubOperationAsExecution)$' -count=1 -timeout=10m
+  # ok morde/server/internal/store/postgres 47.364s
+  ```
+
+- **格式与边界：**修改的 Go 文件 `gofmt -d` 无差异，`git diff --check` 通过。测试容器已停止删除；本轮未访问远端服务或 Host、未调用真实 Provider/MCP、未使用用户密钥，也未发送/上传文件。此记录只关闭 M05-05 的动作策略/账本映射；完整 PC/iOS + Agent E2E 仍未完成，执行类验证在无法证明审批覆盖时仍须保持 `unknown/pending`。

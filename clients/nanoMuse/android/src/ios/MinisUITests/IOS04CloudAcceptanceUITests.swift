@@ -184,6 +184,59 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
         app.terminate()
     }
 
+    func testLocalPortalRetriesRouteFailureFromOriginalMessageWithoutResending() async throws {
+        guard let account = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_USER"],
+              let password = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_PASSWORD"],
+              let server = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_SERVER"],
+              let url = URL(string: server), url.scheme == "http",
+              ["localhost", "127.0.0.1"].contains(url.host ?? ""),
+              let port = url.port, (1...65535).contains(port),
+              let token = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_ACTIVITY_TOKEN"],
+              !token.isEmpty else {
+            throw XCTSkip("Set the generated local Portal credentials, loopback URL, and activity token.")
+        }
+
+        let objective = "跨端活动验收：消息路由限流后显式重试"
+        let app = XCUIApplication()
+        app.launchArguments = ["-morde.server", server]
+        app.launch()
+
+        let accountField = app.textFields["morde.auth.username"]
+        if accountField.waitForExistence(timeout: 5) {
+            enterLocalPortalCredentials(app: app, account: account, password: password)
+            let loginFormDismissed = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "exists == false"), object: accountField)
+            await fulfillment(of: [loginFormDismissed], timeout: 30)
+        }
+
+        let chatTab = app.buttons["morde.shell.tab.chat"]
+        XCTAssertTrue(chatTab.waitForExistence(timeout: 30))
+        chatTab.tap()
+        let composer = app.descendants(matching: .any).matching(identifier: "morde.chat.composer").firstMatch
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        composer.tap()
+        composer.typeText(objective)
+        let send = app.buttons["morde.task.send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        XCTAssertTrue(send.isEnabled)
+        send.tap()
+
+        let originalMessage = app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", objective))
+        let retry = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "morde.chat.message.retry-processing.")).firstMatch
+        XCTAssertTrue(retry.waitForExistence(timeout: 45), "The same persisted route-failed message should expose retry.")
+        XCTAssertEqual(originalMessage.count, 1, "The failed original should remain a single timeline message.")
+        retry.tap()
+
+        let reply = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "本地验收：消息路由恢复成功。")).firstMatch
+        XCTAssertTrue(reply.waitForExistence(timeout: 45), "The explicit retry should route the original message to a reply.")
+        XCTAssertEqual(originalMessage.count, 1, "Retry must reuse the original message instead of resending it.")
+        XCTAssertTrue(retry.waitForNonExistence(timeout: 10))
+        try await verifyFixture("route-retry", server: url, token: token)
+        app.terminate()
+    }
+
     func testLocalPortalLongMessageUploadResumesAfterAppRestart() async throws {
         guard let account = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_USER"],
               let password = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_PASSWORD"],

@@ -355,16 +355,37 @@ final class MIFApprovalViewsTests: XCTestCase {
     func testAcceptedDecisionIsScopedAndPersistsAcrossRefreshes() {
         var ledger = MIFApprovalSubmissionLedger()
         ledger.use(scopeKey: "account-a")
-        ledger.markAccepted("task:approval:1", scopeKey: "account-a")
+        ledger.markAccepted("task:approval:1", decision: .reject, scopeKey: "account-a")
 
-        XCTAssertTrue(ledger.contains("task:approval:1", scopeKey: "account-a"))
+        XCTAssertEqual(ledger.acceptedDecision("task:approval:1", scopeKey: "account-a"), .reject)
 
         ledger.use(scopeKey: "account-a")
-        XCTAssertTrue(ledger.contains("task:approval:1", scopeKey: "account-a"))
+        XCTAssertEqual(ledger.acceptedDecision("task:approval:1", scopeKey: "account-a"), .reject)
+        ledger.markAccepted("task:approval:2", decision: .approve, scopeKey: "account-a")
+        XCTAssertEqual(ledger.acceptedDecision("task:approval:2", scopeKey: "account-a"), .approve)
 
         ledger.use(scopeKey: "account-b")
-        XCTAssertFalse(ledger.contains("task:approval:1", scopeKey: "account-b"))
-        XCTAssertFalse(ledger.contains("task:approval:1", scopeKey: "account-a"))
+        XCTAssertNil(ledger.acceptedDecision("task:approval:1", scopeKey: "account-b"))
+        XCTAssertNil(ledger.acceptedDecision("task:approval:1", scopeKey: "account-a"))
+    }
+
+    func testDecisionPresentationDistinguishesApproveAndRejectWithoutClaimingCompletion() {
+        XCTAssertEqual(
+            MIFApprovalDecisionPresentation.scopeNotice,
+            AppLocalized("This approval applies only to the operation shown. Approving lets the task attempt it; it does not mean the task is complete. Rejecting prevents this operation from running.")
+        )
+
+        let approved = MIFApprovalDecisionPresentation.acceptedMessage(decision: .approve)
+        let rejected = MIFApprovalDecisionPresentation.acceptedMessage(decision: .reject)
+        XCTAssertEqual(approved, AppLocalized("You approved this operation; the Task outcome has not been confirmed."))
+        XCTAssertEqual(rejected, AppLocalized("You rejected this operation; the Task outcome has not been confirmed."))
+        XCTAssertNotEqual(approved, rejected)
+
+        let withStatus = MIFApprovalDecisionPresentation.acceptedMessage(decision: .reject, currentStatus: "running")
+        XCTAssertEqual(
+            withStatus,
+            String(format: AppLocalized("You rejected this operation; current Task status: %@. The outcome has not been confirmed."), "running")
+        )
     }
 
     private func task(id: String, status: String = "waiting_user", pending: String,

@@ -193229,6 +193229,301 @@
         "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "流式输出中" } },
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "串流輸出中" } }
       }
+    },
+    "This approval applies only to the operation shown. Approving lets the task attempt it; it does not mean the task is complete. Rejecting prevents this operation from running.": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Diese Freigabe gilt nur für den angezeigten Vorgang. Bei Zustimmung versucht die Aufgabe, ihn auszuführen; das bedeutet nicht, dass sie abgeschlossen ist. Bei Ablehnung wird dieser Vorgang nicht ausgeführt."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "This approval applies only to the operation shown. Approving lets the task attempt it; it does not mean the task is complete. Rejecting prevents this operation from running."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Esta aprobación solo se aplica a la operación mostrada. Si la apruebas, la tarea intentará ejecutarla, pero eso no significa que la tarea haya terminado. Si la rechazas, esta operación no se ejecutará."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Cette approbation s’applique uniquement à l’opération affichée. Si vous l’approuvez, la tâche tentera de l’exécuter, sans que cela signifie qu’elle est terminée. Si vous la refusez, cette opération ne sera pas exécutée."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "この承認は表示された操作のみに適用されます。承認するとタスクは実行を試みますが、タスクの完了を意味するものではありません。拒否すると、この操作は実行されません。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 승인은 표시된 작업에만 적용됩니다. 승인하면 작업이 실행을 시도하지만, 작업 완료를 의미하지는 않습니다. 거부하면 이 작업은 실행되지 않습니다."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Это подтверждение относится только к показанной операции. После подтверждения задача попробует выполнить её, но это не означает завершение задачи. При отклонении операция не будет выполнена."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此审批仅适用于当前显示的操作。允许后任务会尝试执行，但不代表任务已完成；拒绝后本次操作不会运行。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "此核准僅適用於目前顯示的操作。核准後，任務會嘗試執行，但不代表任務已完成；拒絕後，此操作不會執行。"
+          }
+        }
+      }
+    },
+    "You approved this operation; the Task outcome has not been confirmed.": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sie haben diesen Vorgang genehmigt; das Ergebnis der Aufgabe wurde noch nicht bestätigt."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You approved this operation; the Task outcome has not been confirmed."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Has aprobado esta operación; todavía no se ha confirmado el resultado de la tarea."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vous avez approuvé cette opération ; le résultat de la tâche n’est pas encore confirmé."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "この操作を承認しました。タスクの結果はまだ確認されていません。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 작업을 승인했습니다. 작업 결과는 아직 확인되지 않았습니다."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Вы разрешили эту операцию; результат задачи ещё не подтверждён."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你已允许本次操作；任务结果尚未确认。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你已核准此操作；任務結果尚未確認。"
+          }
+        }
+      }
+    },
+    "You rejected this operation; the Task outcome has not been confirmed.": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sie haben diesen Vorgang abgelehnt; das Ergebnis der Aufgabe wurde noch nicht bestätigt."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You rejected this operation; the Task outcome has not been confirmed."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Has rechazado esta operación; todavía no se ha confirmado el resultado de la tarea."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vous avez refusé cette opération ; le résultat de la tâche n’est pas encore confirmé."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "この操作を拒否しました。タスクの結果はまだ確認されていません。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 작업을 거부했습니다. 작업 결과는 아직 확인되지 않았습니다."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Вы отклонили эту операцию; результат задачи ещё не подтверждён."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你已拒绝本次操作；任务结果尚未确认。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你已拒絕此操作；任務結果尚未確認。"
+          }
+        }
+      }
+    },
+    "You approved this operation; current Task status: %@. The outcome has not been confirmed.": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sie haben diesen Vorgang genehmigt; der aktuelle Aufgabenstatus ist %@. Das Ergebnis wurde noch nicht bestätigt."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You approved this operation; current Task status: %@. The outcome has not been confirmed."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Has aprobado esta operación; el estado actual de la tarea es %@. El resultado aún no está confirmado."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vous avez approuvé cette opération ; le statut actuel de la tâche est %@. Le résultat n’est pas encore confirmé."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "この操作を承認しました。現在のタスク状態: %@。結果はまだ確認されていません。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 작업을 승인했습니다. 현재 작업 상태: %@. 결과는 아직 확인되지 않았습니다."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Вы разрешили эту операцию; текущий статус задачи: %@. Результат ещё не подтверждён."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你已允许本次操作；当前任务状态：%@，最终结果尚未确认。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你已核准此操作；目前任務狀態：%@，最終結果尚未確認。"
+          }
+        }
+      }
+    },
+    "You rejected this operation; current Task status: %@. The outcome has not been confirmed.": {
+      "extractionState": "manual",
+      "localizations": {
+        "de": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Sie haben diesen Vorgang abgelehnt; der aktuelle Aufgabenstatus ist %@. Das Ergebnis wurde noch nicht bestätigt."
+          }
+        },
+        "en": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "You rejected this operation; current Task status: %@. The outcome has not been confirmed."
+          }
+        },
+        "es": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Has rechazado esta operación; el estado actual de la tarea es %@. El resultado aún no está confirmado."
+          }
+        },
+        "fr": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Vous avez refusé cette opération ; le statut actuel de la tâche est %@. Le résultat n’est pas encore confirmé."
+          }
+        },
+        "ja": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "この操作を拒否しました。現在のタスク状態: %@。結果はまだ確認されていません。"
+          }
+        },
+        "ko": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "이 작업을 거부했습니다. 현재 작업 상태: %@. 결과는 아직 확인되지 않았습니다."
+          }
+        },
+        "ru": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "Вы отклонили эту операцию; текущий статус задачи: %@. Результат ещё не подтверждён."
+          }
+        },
+        "zh-Hans": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你已拒绝本次操作；当前任务状态：%@，最终结果尚未确认。"
+          }
+        },
+        "zh-Hant": {
+          "stringUnit": {
+            "state": "translated",
+            "value": "你已拒絕此操作；目前任務狀態：%@，最終結果尚未確認。"
+          }
+        }
+      }
     }
   },
   "version" : "1.0"

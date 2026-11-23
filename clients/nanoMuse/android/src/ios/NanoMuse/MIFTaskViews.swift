@@ -64,8 +64,11 @@ enum MIFTaskDynamicsPresentation {
         task.status == "waiting_user" && task.waiting_reason == "dsh_recovery_unresolved"
     }
 
-    static func statusLabel(_ status: String) -> String {
-        AppLocalized(isExecuting(status) ? "Task executing" : "Task stopped")
+    static func statusLabel(_ status: String, waitingReason: String? = nil) -> String {
+        let key = isExecuting(status)
+            ? "Task executing"
+            : MordeTaskStatusPresentation.localizationKey(status: status, waitingReason: waitingReason)
+        return NSLocalizedString(key, bundle: AppBundle.current, comment: "Task status")
     }
 
     static func orderedTasks(_ tasks: [MordeTask]) -> [MordeTask] {
@@ -98,7 +101,12 @@ enum MIFTaskDynamicsPresentation {
             title.range(of: #"^(the model request|the cloud dsh session|review cloud task recovery)"#,
                         options: [.regularExpression, .caseInsensitive]) == nil ? title : nil
         }
-        let value = readableSummary ?? readableTitle
+        let currentStepTitle = task.current_step.map(MordeTaskStepPresentation.title)
+        let readableCurrentStepTitle = currentStepTitle.flatMap { title in
+            title.range(of: #"^(the model request|the cloud dsh session|review cloud task recovery)"#,
+                        options: [.regularExpression, .caseInsensitive]) == nil ? title : nil
+        }
+        let value = readableSummary ?? readableTitle ?? readableCurrentStepTitle
             ?? (task.status == "running" ? AppLocalized("Processing your request.") : AppLocalized("No recorded steps"))
         return MIFTaskDynamicsSafeText.make(value, maximumCharacters: 56).value
     }
@@ -1860,6 +1868,8 @@ struct MIFTaskDetailView: View {
     @State private var fileFetchToDelete: MordeTaskFileFetch?
     @State private var fileFetchActionError: String?
     @State private var isPerformingFileFetchAction = false
+    @State private var approvalActionID: String?
+    @State private var approvalActionMessage: String?
     @FocusState private var isClarificationFocused: Bool
 
     private var taskSecondaryText: Color {
@@ -1974,6 +1984,8 @@ struct MIFTaskDetailView: View {
             fileFetchToCancel = nil
             fileFetchToDelete = nil
             fileFetchActionError = nil
+            approvalActionID = nil
+            approvalActionMessage = nil
         }
         .task(id: "\(store.scopeKey ?? "")-\(taskID)") {
             await loadDetail(scope: store.scopeKey, taskID: taskID)
@@ -2005,6 +2017,13 @@ struct MIFTaskDetailView: View {
             }
             if let detailError {
                 MIFTaskInlineError(message: detailError)
+            }
+            if approvalActionID != nil, let approvalActionMessage {
+                Text(approvalActionMessage)
+                    .font(.footnote)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .accessibilityIdentifier("morde.task.approval.result")
             }
             if taskDynamicsMode {
                 taskDynamicsContent(task)
@@ -2042,7 +2061,7 @@ struct MIFTaskDetailView: View {
         let stepsByID = Dictionary(grouping: steps, by: \.id)
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Text(MIFTaskDynamicsPresentation.statusLabel(task.status))
+                Text(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason))
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(MIFTaskDynamicsPresentation.isExecuting(task.status)
                         ? NanoMuseTones.actionText : NanoMuseTones.secondaryText)
@@ -2099,6 +2118,9 @@ struct MIFTaskDetailView: View {
         .padding(.top, 8)
         .accessibilityElement(children: .contain)
         .accessibilityIdentifier("morde.taskDynamics.process")
+
+        taskPendingRequest(task)
+        taskClarification(task)
     }
 
     private var actionOptions: [MIFTaskActionOption] {
@@ -2272,10 +2294,18 @@ struct MIFTaskDetailView: View {
                         .font(.footnote)
                         .foregroundStyle(NanoMuseTones.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text(AppLocalized("This tool did not provide cost, alternatives, or a revocation method."))
+                    Text(MIFApprovalDecisionPresentation.scopeNotice)
                         .font(.footnote)
                         .foregroundStyle(NanoMuseTones.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("morde.task.approval.scope-notice")
+                    ForEach(Array(MordeTaskApprovalDisclosurePresentation.lines(pending.disclosures).enumerated()), id: \.offset) { index, line in
+                        Text(line)
+                            .font(.footnote)
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("morde.task.approval.disclosure.\(index)")
+                    }
 
                     if let expiresAt = pending.expirationDate {
                         Text(String(format: AppLocalized("Expires: %@"), expiresAt.formatted(date: .abbreviated, time: .shortened)))
@@ -2393,9 +2423,17 @@ struct MIFTaskDetailView: View {
         guard let scope = loadedScopeKey, scope == store.scopeKey, taskID == self.taskID,
               !store.actionInFlight, !isLoadingDetail, detailError == nil,
               let task = store.details[taskID],
-              MIFApprovalInboxPolicy.canRespond(pending: pending, taskStatus: task.status) else { return }
-        _ = await store.respondToApproval(taskID: taskID, approvalID: pending.id,
-                                          version: pending.version, decision: decision)
+              MIFApprovalInboxPolicy.canRespond(pending: pending, taskStatus: task.status),
+              let decisionValue = MIFApprovalDecision(rawValue: decision) else { return }
+        approvalActionID = pending.id
+        approvalActionMessage = nil
+        let accepted = await store.respondToApproval(taskID: taskID, approvalID: pending.id,
+                                                     version: pending.version, decision: decision)
+        guard scope == store.scopeKey, taskID == self.taskID else { return }
+        if accepted {
+            approvalActionMessage = MIFApprovalDecisionPresentation.acceptedMessage(
+                decision: decisionValue, currentStatus: store.details[taskID]?.statusLabel)
+        }
     }
 
     @ViewBuilder
@@ -3020,7 +3058,7 @@ private struct MIFTaskListRow: View {
                     .padding(.bottom, 4)
                     .accessibilityIdentifier("morde.tasks.row.detail.\(task.id)")
                 HStack(spacing: 8) {
-                    Text(MIFTaskDynamicsPresentation.statusLabel(task.status))
+                    Text(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason))
                         .foregroundStyle(MIFTaskDynamicsPresentation.isExecuting(task.status)
                             ? NanoMuseTones.actionText : NanoMuseTones.muted)
                         .accessibilityIdentifier("morde.tasks.row.status.\(task.id)")
@@ -3050,13 +3088,13 @@ private struct MIFTaskListRow: View {
                 ProgressView().controlSize(.small).tint(.white)
             }
             .frame(width: 44, height: 44)
-            .accessibilityLabel(MIFTaskDynamicsPresentation.statusLabel(task.status))
+            .accessibilityLabel(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason))
         } else {
             Circle()
                 .fill(IconPalette.plainBackground)
                 .frame(width: 44, height: 44)
                 .overlay(RoundedRectangle(cornerRadius: 2).fill(IconPalette.stop).frame(width: 8, height: 8))
-                .accessibilityLabel(MIFTaskDynamicsPresentation.statusLabel(task.status))
+                .accessibilityLabel(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason))
         }
     }
 }

@@ -162,6 +162,11 @@ type hubTaskTool struct {
 	params json.RawMessage
 }
 
+// Hub read actions require both Task computer.observe scope and the live target
+// grant. command requires computer.operate plus that grant; the grant is not a
+// per-call approval. Every dispatched action is independently keyed and hashed
+// in task_hub_operations, and the target rechecks the grant from TaskContext.
+// file.put intentionally remains outside this DSH tool catalog.
 var hubTaskTools = []hubTaskTool{
 	{action: hub.ActionScreenshot, scope: identity.ScopeComputerObserve, base: "morde_hub_screenshot", params: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)},
 	{action: hub.ActionFiles, scope: identity.ScopeComputerObserve, base: "morde_hub_files", params: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string","maxLength":1024}},"additionalProperties":false}`)},

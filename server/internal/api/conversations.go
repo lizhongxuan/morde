@@ -60,6 +60,7 @@ type mainConversationResponse struct {
 type messageResponse struct {
 	ID                        string                            `json:"id"`
 	ConversationID            string                            `json:"conversation_id"`
+	ActorID                   string                            `json:"actor_id,omitempty"`
 	Sequence                  int64                             `json:"sequence"`
 	Role                      conversation.Role                 `json:"role"`
 	Content                   string                            `json:"content"`
@@ -623,7 +624,8 @@ func toScopedMessageResponse(value conversation.Message, projectScope bool) (mes
 		}
 	}
 	return messageResponse{
-		ID: value.ID, ConversationID: value.ConversationID, Sequence: value.Sequence, Role: value.Role, Content: value.Content,
+		ID: value.ID, ConversationID: value.ConversationID, ActorID: value.ActorID,
+		Sequence: value.Sequence, Role: value.Role, Content: value.Content,
 		TaskID: value.TaskID, DuplicateOfMessageID: value.DuplicateOfMessageID, RelatedTaskID: value.RelatedTaskID,
 		AttachmentIDs:   append([]string(nil), value.AttachmentIDs...),
 		ClientMessageID: value.ClientMessageID, RoutingStatus: value.RoutingStatus, RoutingFailureReason: value.RoutingFailureReason,

@@ -107,6 +107,37 @@ func TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord(t *testing.T) 
 		got.Input == nil || *got.Input != document.Input || got.Result == nil || *got.Result != document.Result || got.EventSequence < 1 {
 		t.Fatalf("authorized HTTP task detail=%+v err=%v body=%s", got, err, response.Body.String())
 	}
+
+	stranger := createPreRetirementTestUser(t, fixture.store, 8, 20_000, 40_000)
+	foreignRouter, err := api.New(api.Deps{
+		Hosts: k4FixtureHostService{}, TLSAuthorizer: k4FixtureHostService{},
+		Verifier: k4FixtureVerifier{ownerID: stranger.ID}, Auth: k4FixtureAuth{}, Tasks: tasks,
+	}, api.Options{Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), APIMaxBodyBytes: 1 << 20,
+		MCPMaxBodyBytes: 1 << 20, SessionTTL: time.Hour, HostScheme: "http", PortalDomain: "morde.test",
+		HostSuffix: "hosts.invalid", PreviewPortMin: 1024})
+	if err != nil {
+		t.Fatalf("create foreign-principal task detail API: %v", err)
+	}
+	foreignCredential, _, err := identity.NewCredential(identity.KindSession, testSessionTokenID(stranger.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreignRequest := httptest.NewRequest(http.MethodGet, "/api/tasks/"+current.Task.ID+"/steps/"+stepID, nil)
+	foreignRequest.AddCookie(&http.Cookie{Name: "ch_portal", Value: foreignCredential})
+	foreignResponse := httptest.NewRecorder()
+	foreignRouter.ServeHTTP(foreignResponse, foreignRequest)
+	if foreignResponse.Code != http.StatusNotFound || strings.Contains(foreignResponse.Body.String(), document.Input) ||
+		strings.Contains(foreignResponse.Body.String(), document.Result) {
+		t.Fatalf("foreign owner task detail response=%d body=%s; want not found without private detail", foreignResponse.Code, foreignResponse.Body.String())
+	}
+	foreignEventsRequest := httptest.NewRequest(http.MethodGet, "/api/tasks/"+current.Task.ID+"/events?after=0", nil)
+	foreignEventsRequest.AddCookie(&http.Cookie{Name: "ch_portal", Value: foreignCredential})
+	foreignEventsResponse := httptest.NewRecorder()
+	foreignRouter.ServeHTTP(foreignEventsResponse, foreignEventsRequest)
+	if foreignEventsResponse.Code != http.StatusNotFound || strings.Contains(foreignEventsResponse.Body.String(), document.Input) ||
+		strings.Contains(foreignEventsResponse.Body.String(), document.Result) {
+		t.Fatalf("foreign owner task event stream response=%d body=%s; want not found without private detail", foreignEventsResponse.Code, foreignEventsResponse.Body.String())
+	}
 }
 
 func TestPostgresTaskStepDetailStoresFullCapturedOutputAboveLegacyLimit(t *testing.T) {

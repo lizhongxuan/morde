@@ -369,15 +369,19 @@ func (e *RuntimeToolExecutor) hasCurrentRuntimeToolApproval(ctx context.Context,
 	return true, nil
 }
 
+// runtimeToolRisk is the Host-side approval policy: safe reads use the fixed
+// read scope, moderate actions require the current Task scope and Host control
+// fence, and sensitive or unclassified actions require exact per-call approval.
+// Keep this mapping aligned with the Step 05 authorization matrix.
 func runtimeToolRisk(name string, arguments json.RawMessage) runtimeToolRiskTier {
 	switch name {
 	case runtimeToolFileRead, runtimeToolFileList, runtimeToolFileFind, runtimeToolBrowserSnapshot,
 		runtimeToolBrowserScreenshot, runtimeToolDesktopScreenshot, runtimeToolWindowList, runtimeToolBrowserObserveField:
 		return runtimeToolRiskSafe
 	case runtimeToolFileWrite, runtimeToolBrowserOpenTab, runtimeToolBrowserNavigate, runtimeToolBrowserUserHandoff, runtimeToolBrowserClick,
-		runtimeToolBrowserPressKey, runtimeToolWindowActivate:
+		runtimeToolWindowActivate:
 		return runtimeToolRiskModerate
-	case runtimeToolDesktopPressKey:
+	case runtimeToolBrowserPressKey, runtimeToolDesktopPressKey:
 		var input struct {
 			Key string `json:"key"`
 		}
