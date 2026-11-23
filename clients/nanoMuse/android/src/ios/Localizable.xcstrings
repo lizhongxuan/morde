@@ -79463,6 +79463,19 @@
         }
       }
     },
+    "Last confirmed work" : {
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Zuletzt bestätigte Arbeit" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Last confirmed work" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Último trabajo confirmado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Dernière activité confirmée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "最後に確認できた作業" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "마지막으로 확인된 작업" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Последняя подтверждённая работа" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "最后确认的工作" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "最後確認的工作" } }
+      }
+    },
     "Last seen: %@" : {
       "extractionState" : "stale",
       "localizations" : {
@@ -109903,7 +109916,17 @@
       }
     },
     "Open task details and activity" : {
-
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Aufgabendetails und Aktivität öffnen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Open task details and activity" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Abrir detalles y actividad de la tarea" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Ouvrir les détails et l’activité de la tâche" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "タスクの詳細とアクティビティを開く" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업 세부 정보 및 활동 열기" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Открыть сведения и журнал задачи" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "查看任务详情和动态" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "查看任務詳細資料和動態" } }
+      }
     },
     "Open Terminal" : {
       "extractionState" : "stale",
@@ -153235,6 +153258,19 @@
             "value" : "此專案中的任務"
           }
         }
+      }
+    },
+    "Task interrupted. No final answer was returned; the result is unconfirmed." : {
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Aufgabe unterbrochen. Es wurde keine endgültige Antwort zurückgegeben; das Ergebnis ist unbestätigt." } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Task interrupted. No final answer was returned; the result is unconfirmed." } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Tarea interrumpida. No se devolvió una respuesta final; el resultado no está confirmado." } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Tâche interrompue. Aucune réponse finale n’a été renvoyée ; le résultat n’est pas confirmé." } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "タスクが中断されました。最終回答は返されておらず、実行結果は未確認です。" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업이 중단되었습니다. 최종 답변이 반환되지 않았으며 실행 결과가 확인되지 않았습니다." } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Задача прервана. Итоговый ответ не получен; результат выполнения не подтверждён." } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "任务已中断，Agent 尚未返回最终答复，执行结果未确认。" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "任務已中斷，Agent 尚未回覆最終答覆，執行結果未確認。" } }
       }
     },
     "Task interrupted by a new message" : {

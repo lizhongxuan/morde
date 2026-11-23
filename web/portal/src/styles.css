@@ -380,7 +380,6 @@ tbody tr:last-child td { border-bottom: 0; }
 .assistant-target-row { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; margin-bottom: 12px; padding: 10px 12px; border: 1px solid #e4eaf0; border-radius: 9px; background: #f8fafc; }
 .assistant-target-row label { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--muted); font-size: .82rem; }
 .assistant-target-row select { min-width: 0; max-width: 72%; min-height: 34px; padding: 5px 28px 5px 9px; border-color: #d4dce6; border-radius: 7px; font-size: .84rem; }
-.assistant-task-target { margin: 0 0 10px; color: var(--muted); font-size: .85rem; }
 .assistant-host-lock { max-width: 200px; font-size: .78rem; overflow-wrap: anywhere; }
 .assistant-send { flex: 0 0 auto; min-height: 38px; }
 .assistant-setup-notice { margin-bottom: 10px; display: flex; align-items: center; flex-wrap: wrap; gap: 9px 12px; }
@@ -1283,11 +1282,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .task-panel-detail .task-activity-heading strong { display: block; color: #29384f; font-size: 16px; line-height: 1.4; overflow-wrap: anywhere; }
 .assistant-page .task-panel-detail .task-activity-heading small { display: block; margin-top: 5px; color: #8794a8; font-size: 12px; line-height: 1.4; }
 .assistant-page .task-panel-detail .task-activity-heading > span { max-width: 42%; text-align: right; }
-.assistant-page .task-current-progress { min-height: 70px; padding: 0 0 12px; border-bottom: 1px solid #edf0f4; }
-.assistant-page .task-current-progress h3,
 .assistant-page .task-panel-detail .task-activity-k2 h3 { margin: 0 0 5px; color: #60728b; font-size: 13px; }
-.assistant-page .task-current-progress p { margin: 0; color: #29384f; font-size: 14px; line-height: 1.55; overflow-wrap: anywhere; }
-.assistant-page .task-current-progress p + p { margin-top: 5px; }
 .assistant-page .task-activity-evidence > p,
 .assistant-page .task-activity-evidence-performance { margin: 0; color: #75839a; font-size: 12px; line-height: 1.5; overflow-wrap: anywhere; }
 .assistant-page .task-activity-evidence ol { margin: 8px 0 0; padding-left: 22px; display: grid; gap: 10px; }
@@ -2510,8 +2505,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .morde-shell:not(.morde-admin-shell) .morde-page .assistant-composer form { color: var(--ink); border-color: var(--line); background: var(--surface); }
   .morde-shell:not(.morde-admin-shell) .morde-page .assistant-sidebar { color: var(--ink); border-color: var(--line) !important; background: var(--pc-surface-soft); }
   .morde-shell:not(.morde-admin-shell) .morde-page .assistant-sidebar .conversation-item.is-selected { color: var(--pc-blue-text); border-color: var(--line); background: var(--pc-blue-bg); }
-  .morde-shell:not(.morde-admin-shell) .morde-page .assistant-page .chat-message,
-  .morde-shell:not(.morde-admin-shell) .morde-page .assistant-page .task-current-progress p { color: var(--ink); }
+  .morde-shell:not(.morde-admin-shell) .morde-page .assistant-page .chat-message { color: var(--ink); }
   .morde-shell:not(.morde-admin-shell) .morde-page .assistant-page .chat-message-user { color: #dce8f7; background: #2b405a; }
   .morde-shell:not(.morde-admin-shell) .morde-page .assistant-page .chat-message-expand { color: var(--pc-blue-text); }
   .morde-shell:not(.morde-admin-shell) .morde-page .assistant-page .chat-message-assistant { color: var(--ink); background: var(--pc-surface-soft); }

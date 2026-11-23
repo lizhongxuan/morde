@@ -416,7 +416,9 @@ func TestCloudDSHCurrentMessageSearchDefinitionRequiresBoundedQueryAndSource(t *
 	if definition.Name != cloudDSHCurrentMessageSearchToolName || !definition.Strict ||
 		len(schema.Required) != 3 || schema.Required[0] != "message_id" || schema.Required[1] != "sha256" ||
 		schema.Required[2] != "query" || len(schema.Properties) != 3 ||
-		!strings.Contains(definition.Description, "without sending the full body to the model") {
+		!strings.Contains(definition.Description, "without sending the full body to the model") ||
+		!strings.Contains(definition.Description, "half-open original-message rune ranges") ||
+		!strings.Contains(definition.Description, "every canonical page each excerpt spans") {
 		t.Fatalf("message search schema did not bind a bounded query to the authorized source: definition=%+v schema=%+v", definition, schema)
 	}
 }
@@ -660,8 +662,20 @@ func TestCloudDSHCurrentMessageSearchFindsOneMiBAnchorsWithinBoundedOutput(t *te
 	seenPages := make(map[int]struct{}, len(output.Matches))
 	for _, match := range output.Matches {
 		if match.Page < 1 || match.Page > len(source.Pages) || match.PageSHA256 != hex.EncodeToString(source.Pages[match.Page-1].SHA256) ||
-			utf8.RuneCountInString(match.Content) > cloudDSHCurrentMessageSearchExcerptRunes {
+			utf8.RuneCountInString(match.Content) > cloudDSHCurrentMessageSearchExcerptRunes ||
+			match.ExcerptStartRune >= match.ExcerptEndRune || match.ExcerptEndRune > source.TotalRunes || len(match.SourcePages) == 0 ||
+			match.SourcePages[0].Page != match.Page {
 			t.Fatalf("search returned an invalid page citation or oversized excerpt: %+v", match)
+		}
+		for _, reference := range match.SourcePages {
+			if reference.Page < 1 || reference.Page > len(source.Pages) {
+				t.Fatalf("search returned an out-of-range excerpt page citation: %+v", match)
+			}
+			page := source.Pages[reference.Page-1]
+			if reference.RuneOffset != page.RuneOffset || reference.PageSHA256 != hex.EncodeToString(page.SHA256) ||
+				page.NextRuneOffset <= match.ExcerptStartRune || page.RuneOffset >= match.ExcerptEndRune {
+				t.Fatalf("search returned an unverifiable excerpt page citation: %+v", match)
+			}
 		}
 		seenPages[match.Page] = struct{}{}
 	}
@@ -685,6 +699,104 @@ func TestCloudDSHCurrentMessageSearchFindsOneMiBAnchorsWithinBoundedOutput(t *te
 		baseStore.details.Task.Usage.ToolCalls != 1 || len(baseStore.events) != beforeEvents {
 		t.Fatalf("search returned partial results or committed progress after a corrupt page: toolCalls=%d events=%d err=%v",
 			baseStore.details.Task.Usage.ToolCalls, len(baseStore.events), err)
+	}
+}
+
+func TestCloudDSHCurrentMessageSearchCitesCrossPageExcerptAndReplaysCheckpoint(t *testing.T) {
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	claimed.ConversationContext.ThroughSequence = 0
+	configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	query := "MordeBoundaryAnchor"
+	left, right := query[:len(query)/2], query[len(query)/2:]
+	const prefix = "前文汉字"
+	content := prefix + strings.Repeat("x", MaxConversationMessageChunkBytes-len(prefix)-len(left)) + left + right + strings.Repeat("y", 128)
+	source, err := BuildConversationMessageSourceManifest(messageID, 1, content)
+	if err != nil || len(source.Pages) != 2 {
+		t.Fatalf("cross-page source pages=%d err=%v", len(source.Pages), err)
+	}
+	claimed.ConversationContext.CurrentMessageSource = source
+	baseStore.details.Task = claimed
+	store := &cloudDSHCurrentMessageChunkTestStore{TaskStore: broker.store, messageID: messageID, taskID: claimed.ID,
+		content: content, runes: []rune(content)}
+	broker.store = store
+	arguments, err := json.Marshal(cloudDSHCurrentMessageSearchArguments{MessageID: messageID,
+		SHA256: hex.EncodeToString(source.SHA256), Query: query})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "cross_page_current_message_search", Name: cloudDSHCurrentMessageSearchToolName,
+		Arguments: string(arguments)}
+	result, err := broker.execute(context.Background(), claimed, call, false, nil)
+	if err != nil || result.Status != AgentToolSucceeded {
+		t.Fatalf("cross-page search=%+v err=%v", result, err)
+	}
+	var output cloudDSHCurrentMessageSearchResult
+	if err := json.Unmarshal([]byte(result.Output), &output); err != nil {
+		t.Fatal(err)
+	}
+	if len(output.Matches) != 1 {
+		t.Fatalf("cross-page query returned unexpected matches: %+v", output.Matches)
+	}
+	match := output.Matches[0]
+	if !strings.Contains(match.Content, query) || match.Page != 1 || match.PageSHA256 != hex.EncodeToString(source.Pages[0].SHA256) ||
+		match.ExcerptStartRune >= source.Pages[0].NextRuneOffset || match.ExcerptEndRune <= source.Pages[1].RuneOffset ||
+		len(match.SourcePages) != 2 {
+		t.Fatalf("cross-page excerpt lacks a complete source range: %+v", match)
+	}
+	for index, reference := range match.SourcePages {
+		page := source.Pages[index]
+		if reference.Page != index+1 || reference.RuneOffset != page.RuneOffset ||
+			reference.PageSHA256 != hex.EncodeToString(page.SHA256) {
+			t.Fatalf("cross-page source reference %d does not match the canonical manifest: %+v", index, reference)
+		}
+	}
+	runes := []rune(content)
+	if match.Content != "…"+string(runes[match.ExcerptStartRune:match.ExcerptEndRune]) {
+		t.Fatalf("excerpt cannot be reconstructed from its cited source range: match=%+v", match)
+	}
+	if baseStore.details.Task.Usage.ToolCalls != 1 || len(baseStore.events) != 1 {
+		t.Fatalf("successful search usage/events=%d/%d, want one each", baseStore.details.Task.Usage.ToolCalls, len(baseStore.events))
+	}
+	usageAfterCommit, eventsAfterCommit := baseStore.details.Task.Usage.ToolCalls, len(baseStore.events)
+	for name, checkpoint := range map[string]string{"current": result.Output} {
+		replayed, err := broker.execute(context.Background(), claimed, call, true, &checkpoint)
+		if err != nil || replayed.Status != AgentToolSucceeded || replayed.Output != checkpoint ||
+			baseStore.details.Task.Usage.ToolCalls != usageAfterCommit || len(baseStore.events) != eventsAfterCommit {
+			t.Fatalf("%s checkpoint replay=%+v err=%v usage/events=%d/%d", name, replayed, err,
+				baseStore.details.Task.Usage.ToolCalls, len(baseStore.events))
+		}
+	}
+	var legacy cloudDSHCurrentMessageSearchResult
+	if err := json.Unmarshal([]byte(result.Output), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	for index := range legacy.Matches {
+		legacy.Matches[index].SourcePages = nil
+		legacy.Matches[index].ExcerptStartRune = 0
+		legacy.Matches[index].ExcerptEndRune = 0
+	}
+	legacyOutput, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyCheckpoint := string(legacyOutput)
+	if replayed, err := broker.execute(context.Background(), claimed, call, true, &legacyCheckpoint); err != nil || replayed.Output != legacyCheckpoint {
+		t.Fatalf("legacy cross-page checkpoint was not safely replayed: result=%+v err=%v", replayed, err)
+	}
+	changedCheckpoint := `{"changed":true}`
+	if _, err := broker.execute(context.Background(), claimed, call, true, &changedCheckpoint); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("changed search checkpoint was accepted: %v", err)
+	}
+	store.corrupt = true
+	if _, err := broker.execute(context.Background(), claimed, call, true, &result.Output); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("search replay accepted a changed source page: %v", err)
+	}
+	if baseStore.details.Task.Usage.ToolCalls != usageAfterCommit || len(baseStore.events) != eventsAfterCommit {
+		t.Fatalf("rejected replay changed usage/events: usage=%d events=%d", baseStore.details.Task.Usage.ToolCalls, len(baseStore.events))
 	}
 }
 

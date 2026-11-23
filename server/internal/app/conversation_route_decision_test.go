@@ -176,9 +176,10 @@ func TestTruncatedLongMessageTaskIntentOverridesReplyOnlyWithoutTaskAmbiguity(t 
 		context ConversationRouteContext
 	}{
 		{name: "ambiguous prefix", context: makeTruncatedContext("这篇文章\n" + strings.Repeat("正文", 1200))},
-		{name: "active task", context: func() ConversationRouteContext {
+		{name: "explicit task reference", context: func() ConversationRouteContext {
 			value := makeTruncatedContext(content)
 			value.Candidates = []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1}}
+			value.ReferenceTaskID = "q1234567"
 			return value
 		}()},
 		{name: "unresolved predecessor", context: func() ConversationRouteContext {
@@ -213,6 +214,62 @@ func TestTruncatedLongMessageTaskIntentOverridesReplyOnlyWithoutTaskAmbiguity(t 
 	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"我会处理。"}`, makeTruncatedContext(controlContent))
 	if decision.Action != ConversationRouteClarify {
 		t.Fatalf("explicit Task control was bypassed by the long-message fallback: %+v", decision)
+	}
+}
+
+func TestTruncatedLongArticleWithExistingTasksKeepsIndependentAndRecoveryRequestsSeparate(t *testing.T) {
+	body := "\n# 长文章\n" + strings.Repeat("文章内容。", 1000)
+	content := "感动你终于不报错了.好现在你帮我看下这篇文章说了什么：" + body
+	preview, _ := ConversationRouteTextPreview(content, 2048)
+	digest := sha256.Sum256([]byte(content))
+	value := ConversationRouteContext{ActorID: "u1234567", Content: preview, ContentTruncated: true,
+		CurrentMessageID: "m2345678", ContentBytes: int64(len(content)), ContentSHA256: digest[:],
+		Candidates: []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusWaitingUser, Revision: 1}}}
+	for _, output := range []string{
+		`{"action":"reply","reply":"这是文章摘要。"}`,
+		`{"action":"clarify","question":"请补充全文。"}`,
+		`{"action":"new"}`,
+	} {
+		decision := ParseConversationRouteDecisionForContext(output, value)
+		if decision.Action != ConversationRouteNew {
+			t.Fatalf("independent article was blocked by another task: output=%s decision=%+v", output, decision)
+		}
+	}
+	for _, prefix := range []string{"继续根据这篇文章修改任务", "请看这篇文章并继续现有分析", "请总结这篇文章并更新上一个任务", "不要总结这篇文章，改做别的", "请总结这篇文章并发邮件"} {
+		ambiguous := value
+		ambiguous.Content, _ = ConversationRouteTextPreview(prefix+body, 2048)
+		decision := ParseConversationRouteDecisionForContext(`{"action":"reply","reply":"处理中。"}`, ambiguous)
+		if decision.Action != ConversationRouteClarify {
+			t.Fatalf("task-related or negated request %q was treated as independent: %+v", prefix, decision)
+		}
+	}
+	value.RequestCandidates = []ConversationRouteRequestCandidate{{MessageID: "m1234567", Sequence: 1,
+		ContentTruncated: true, ContentSHA256: digest[:], TaskID: "q1234567", TaskStatus: task.StatusWaitingUser,
+		RoutingStatus: conversation.RoutingRouted, SameExecutionScope: true, SameAuthorization: true}}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"new"}`, value)
+	if decision.Action != ConversationRouteClarify || !strings.Contains(decision.Question, "相同") ||
+		!strings.Contains(decision.Question, "重新开始") {
+		t.Fatalf("unresolved duplicate did not receive actionable recovery guidance: %+v", decision)
+	}
+	newContent := "重新开始新任务，请总结这篇文章：" + body
+	value.Content, _ = ConversationRouteTextPreview(newContent, 2048)
+	newDigest := sha256.Sum256([]byte(newContent))
+	value.ContentSHA256, value.ContentBytes = newDigest[:], int64(len(newContent))
+	value.RequestCandidates[0].ContentSHA256 = newDigest[:]
+	decision = ParseConversationRouteDecisionForContext(`{"action":"new"}`, value)
+	if decision.Action != ConversationRouteNew || !decision.ExplicitNew {
+		t.Fatalf("explicit restart did not bypass duplicate linking: %+v", decision)
+	}
+	value.Content, _ = ConversationRouteTextPreview("请总结这篇文章：\n"+strings.Repeat("正文", 500)+"从头重新做", 2048)
+	decision = ParseConversationRouteDecisionForContext(`{"action":"new"}`, value)
+	if decision.ExplicitNew {
+		t.Fatalf("text in the article was interpreted as a restart request: %+v", decision)
+	}
+	value.RequestCandidates = nil
+	value.Content, _ = ConversationRouteTextPreview("请总结这篇文章：\n正文里写着重新开始新任务。"+strings.Repeat("正文", 500), 2048)
+	decision = ParseConversationRouteDecisionForContext(`{"action":"new","explicit_new":true}`, value)
+	if decision.ExplicitNew {
+		t.Fatalf("model used restart text in the article as user intent: %+v", decision)
 	}
 }
 

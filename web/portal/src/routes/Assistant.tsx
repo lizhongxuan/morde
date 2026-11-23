@@ -610,61 +610,8 @@ function taskActivityIsExecuting(status: string): boolean {
   return status === 'running' || status === 'cancelling';
 }
 
-function taskStatusText(task: Task, cloudTasksAvailable: boolean | undefined): string {
-  if (task.status === 'queued') return cloudTasksAvailable === false
-    ? '任务已保存并排队；当前服务未启用云端执行，启用后才会开始运行。'
-    : '任务已保存，正在等待开始。关闭页面不会取消任务。';
-  if (task.status === 'running') {
-    if (task.current_revision !== undefined && task.desired_revision !== undefined && task.current_revision !== task.desired_revision) return '正在调整任务，等待开始新要求。';
-    if (task.current_revision_started === true && task.current_revision !== undefined && task.current_revision === task.desired_revision) return '开始处理你的请求。';
-    if (task.current_revision_started !== undefined) return '任务已保存，正在等待开始。';
-    return 'AI 正在处理…';
-  }
-  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_missing') return '尚未配置默认云端电脑，本次操作未执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_target_changed') return '任务已绑定其他云端电脑，无法安全切换；请为新目标另发起任务。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'computer_unavailable') return '目标云端电脑当前不可用或无法确认访问权限，本次操作未执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_unavailable') return '目标电脑的 Workspace 当前不可用、版本未就绪或无法确认访问权限，本次操作未执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_target_changed') return '任务已绑定其他云端电脑的文件，无法安全切换；请为新目标另发起任务。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'target_result_unknown') return '上次电脑操作的结果需要核对，暂不能重复执行。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'workspace_host_sync') return '任务等待目标云端电脑重新就绪并同步文件；确认版本已应用后才会完成。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'model_context_limit') return '消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。';
-  if (task.status === 'waiting_user' && task.waiting_reason === 'dsh_recovery_unresolved') return 'AI 运行中断，无法确认本次执行结果。请核对任务状态后再继续。';
-  if (task.status === 'waiting_user') return '任务正在等待你的确认或补充信息。';
-  if (task.status === 'paused') return '任务已暂停。';
-  if (task.status === 'pausing') return '正在安全暂停任务。';
-  if (task.status === 'cancelling') {
-    const unsettled = task.stop_request?.unsettled_operation_ids.length ?? 0;
-    if (unsettled > 0) return `停止请求已受理，仍有 ${unsettled} 个操作结果待确认。`;
-    if (task.stop_request?.status === 'pending') return '正在等待服务端确认停止结果。';
-    if (task.stop_request?.status === 'completed') return '服务端已处理停止请求，正在等待最终任务状态。';
-    return '停止状态待确认，正在重新读取服务端任务。';
-  }
-  if (task.status === 'failed') return task.result || '任务执行失败。';
-  if (task.status === 'cancelled') return '服务端已确认任务停止。';
-  if (task.result_message_pending) return '任务已完成，正在整理回复。';
-  if (task.result_message_published) return '任务已完成，最终回复已发布。';
-  return task.result || '任务已完成。';
-}
-
 function taskQueuePriorityText(priority: TaskSummary['queue_priority']): string {
   return priority === 'pinned' ? '置顶' : priority === 'background' ? '后台' : priority === 'normal' ? '普通' : '未知';
-}
-
-function taskActivityProgressText(task: Task, cloudTasksAvailable: boolean | undefined): string {
-  if (task.status === 'queued' && cloudTasksAvailable !== false) return '等待执行';
-  if (task.status === 'waiting_user') {
-    if (task.pending_request) return `等待审批：${task.pending_request.title}`;
-    if (task.clarification_request) return `等待补充：${task.clarification_request.question}`;
-  }
-  const currentStep = task.steps.find((step) => step.id === task.current_step);
-  const progressStep = currentStep?.status === 'running' && currentStep.kind !== 'model' ? currentStep
-    : [...task.steps].reverse().find((step) => step.status === 'running' && ['tool', 'subagent', 'verification', 'verify', 'progress'].includes(step.kind));
-  if (progressStep && task.status === 'running') return stepTitle(progressStep);
-  if (task.status === 'failed') return '任务执行失败，请查看当前状态和处理提示。';
-  if (task.status === 'completed' && (task.result_message_pending || ['pending', 'processing'].includes(task.result_review?.state ?? '')))
-    return '任务已完成，回复整理中。';
-  if (task.status === 'completed') return '任务已完成，打开详情查看结果。';
-  return taskStatusText(task, cloudTasksAvailable);
 }
 
 function recoveryHint(step: TaskStep | undefined): string | null {
@@ -938,7 +885,6 @@ export function Assistant() {
   const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
   const [taskDetailTaskID, setTaskDetailTaskID] = useState<string | null>(null);
   const [taskDetailStepID, setTaskDetailStepID] = useState<string | null>(null);
-  const [referenceTaskSelection, setReferenceTaskSelection] = useState<{ conversationID: string; taskID: string } | null>(null);
   const [visibleTaskPanelCount, setVisibleTaskPanelCount] = useState(5);
   const [openingTaskID, setOpeningTaskID] = useState('');
   const [taskObservationRequest, setTaskObservationRequest] = useState(false);
@@ -1531,15 +1477,6 @@ export function Assistant() {
   const allTasks = taskQueries.flatMap((query) => query.data && !isResourceNoLongerAccessible(query.error) ? [query.data] : []);
   const tasks = allTasks.filter((task) => task.conversation_id === conversationID);
   const allTasksByID = new Map(allTasks.map((task) => [task.id, task]));
-  const selectedReferenceTask = referenceTaskSelection?.conversationID === conversationID
-    ? allTasksByID.get(referenceTaskSelection.taskID) : undefined;
-  useEffect(() => {
-    if (referenceTaskSelection && referenceTaskSelection.conversationID !== conversationID) {
-      // A Task reference is a one-message intent and must not follow the user to another conversation.
-      // eslint-disable-next-line react-hooks/set-state-in-effect
-      setReferenceTaskSelection(null);
-    }
-  }, [conversationID, referenceTaskSelection]);
   useEffect(() => {
     const serviceInstanceID = capabilities.data?.service_instance_id;
     const actorID = user?.id;
@@ -2563,7 +2500,6 @@ export function Assistant() {
     if (savingMessageRef.current || preparingAttachmentCountRef.current > 0 || composerAttachments.some((item) => item.needsPreparation)) return;
     const text = content;
     if (!text.trim() && !composerAttachments.length) return;
-    const referenceTaskForMessage = referenceTaskSelection?.conversationID === conversationID ? referenceTaskSelection : null;
     const effectiveText = text.trim() ? text : '请阅读并处理我附加的文件。';
     const timeZone = browserIanaTimeZone();
     if (new TextEncoder().encode(effectiveText).length > maxMessageBytes) {
@@ -2588,7 +2524,6 @@ export function Assistant() {
         actorID: user?.id ?? '',
         request: {
           client_message_id: id, content: effectiveText,
-          ...(referenceTaskForMessage ? { reference_task_id: referenceTaskForMessage.taskID } : {}),
           ...(timeZone ? { time_zone: timeZone } : {}),
           ...(submissionModelID ? { model_id: submissionModelID } : {}),
           ...(preferredHostID ? { host_id: preferredHostID } : {}),
@@ -2601,10 +2536,6 @@ export function Assistant() {
       };
       const serverPredecessor = latestConversationClientMessageID(conversationMessageItems);
       const entry = await outbox.enqueue(message, serverPredecessor);
-      if (referenceTaskForMessage) {
-        setReferenceTaskSelection((current) => current?.conversationID === referenceTaskForMessage.conversationID &&
-          current.taskID === referenceTaskForMessage.taskID ? null : current);
-      }
       if (activeOutboxScope.current === entry.scope) {
         setContent((current) => current === text ? '' : current);
         setComposerAttachments((current) => current.filter((item) => !attachments.some((attachment) => attachment.id === item.id)));
@@ -3090,12 +3021,7 @@ export function Assistant() {
     const hasTaskRevisionFence = Number.isSafeInteger(task.current_revision) && (task.current_revision ?? -1) >= 0 &&
       Number.isSafeInteger(task.desired_revision) && (task.desired_revision ?? -1) >= 0;
     const taskActionPending = taskControl.isPending && taskControl.variables?.taskID === task.id;
-    const selectedForNextMessage = referenceTaskSelection?.conversationID === task.conversation_id &&
-      referenceTaskSelection.taskID === task.id;
-    const currentStep = task.steps.find((step) => step.id === task.current_step);
-    const recoveryMessage = task.waiting_reason === 'dsh_recovery_unresolved' ? recoveryHint(currentStep) : null;
-    const progressText = taskActivityProgressText(task, cloudTasksAvailable);
-    const showProgress = !terminalTaskStatuses.has(task.status) ||
+    const showFeedStatus = !terminalTaskStatuses.has(task.status) ||
       (task.status === 'completed' && (task.result_message_pending || ['pending', 'processing'].includes(task.result_review?.state ?? '')));
     const projectionRead = readK2TaskProjection(task);
     const projection = projectionRead.kind === 'available' ? projectionRead.projection : null;
@@ -3118,12 +3044,6 @@ export function Assistant() {
           {isRunning ? '执行中' : task.status === 'failed' ? '失败' : '停止'}
         </span>
       </header>
-      {task.conversation_id === conversationID && task.initiator_id === user?.id && <div className="inline-actions task-activity-actions">
-        <button type="button" className="button button-small button-secondary" aria-pressed={selectedForNextMessage}
-          onClick={() => setReferenceTaskSelection({ conversationID: task.conversation_id, taskID: task.id })}>
-          {selectedForNextMessage ? '下一条消息已绑定此任务' : '将下一条消息绑定到此任务'}
-        </button>
-      </div>}
       {task.status === 'queued' && task.queue_priority && <section className="task-activity-k2 task-queue-priority" aria-label="任务优先级">
         <h3>排队优先级</h3>
         <p>当前：{taskQueuePriorityText(task.queue_priority)}</p>
@@ -3176,13 +3096,9 @@ export function Assistant() {
           {answerClarification.isPending ? '正在提交…' : '提交并继续'}
         </button>
       </form>}
-      {showProgress && <section className="task-current-progress" aria-label="当前进展">
-        <h3>当前进展</h3>
-        <p role="status">{progressText}</p>
-        {recoveryMessage && <p role="status">{recoveryMessage}</p>}
-        {['disconnected', 'resyncing'].includes(taskEventFeeds[task.id] ?? '') && !showConsolidatedNetworkError && <p role="status">连接中断，正在重连…</p>}
-      </section>}
-      {task.status === 'failed' && <p className="task-current-progress-message" role="alert">{progressText}</p>}
+      {showFeedStatus && ['disconnected', 'resyncing'].includes(taskEventFeeds[task.id] ?? '') && !showConsolidatedNetworkError &&
+        <p role="status">连接中断，正在重连…</p>}
+      {task.status === 'failed' && <p role="alert">任务执行失败，请查看当前状态和处理提示。</p>}
       {canCancelTask && <div className="inline-actions task-activity-actions">
         <button type="button" className="button button-small button-secondary" aria-busy={taskActionPending && taskControl.variables?.action === 'cancel'}
           disabled={taskActionPending || !hasTaskRevisionFence} onClick={() => submitTaskControl('cancel', task)}>
@@ -3623,12 +3539,6 @@ export function Assistant() {
         <section className="assistant-composer" aria-label="发送对话消息">
           <form onSubmit={submit}>
             {!composerDraftReady && <p className="muted" role="status">正在恢复此会话草稿…</p>}
-            {referenceTaskSelection?.conversationID === conversationID && <div className="task-supplement-status" role="status">
-              <span>下一条消息将绑定到任务：{selectedReferenceTask ? taskActivityTitle(selectedReferenceTask.objective) : '目标任务'} · {referenceTaskSelection.taskID}</span>
-              <button type="button" className="button button-small button-secondary" aria-label="取消任务绑定"
-                onClick={() => setReferenceTaskSelection((current) => current?.conversationID === conversationID &&
-                  current.taskID === referenceTaskSelection.taskID ? null : current)}>取消绑定</button>
-            </div>}
             {composerDraftError && <FloatingError className="error-inline" role="alert">草稿尚未可靠保存：{composerDraftError}。当前输入仍保留在页面中。</FloatingError>}
             <label className="sr-only" htmlFor="assistant-content">消息内容</label>
             <textarea ref={composerTextarea} id="assistant-content" value={visibleComposerContent} style={{ resize: 'none' }} onChange={(event) => {

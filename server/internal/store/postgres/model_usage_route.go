@@ -977,7 +977,7 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 	}
 	switch value.Action {
 	case app.ConversationRouteNew:
-		return value.TaskID == "" && value.TargetMessageID == "" && (!value.ExplicitNew || app.ConversationRouteHasExplicitNewIntent(context.Content)) &&
+		return value.TaskID == "" && value.TargetMessageID == "" && (!value.ExplicitNew || app.ConversationRouteHasExplicitNewIntentForContext(context)) &&
 			value.ExpectedRevision == 0 && value.Question == "" && value.Reply == "" &&
 			(!value.ExplicitNew || len(value.AggregateMessageIDs) == 0) &&
 			app.ValidConversationRouteDependencyIDs(value.DependencyTaskIDs, context.Candidates) &&

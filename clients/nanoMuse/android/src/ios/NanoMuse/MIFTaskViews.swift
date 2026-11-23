@@ -40,6 +40,10 @@ enum MIFTaskDynamicsPresentation {
 
     static func isExecuting(_ status: String) -> Bool { status == "running" || status == "cancelling" }
 
+    static func isUnresolvedRecovery(_ task: MordeTask) -> Bool {
+        task.status == "waiting_user" && task.waiting_reason == "dsh_recovery_unresolved"
+    }
+
     static func statusLabel(_ status: String) -> String {
         AppLocalized(isExecuting(status) ? "Task executing" : "Task stopped")
     }
@@ -77,6 +81,26 @@ enum MIFTaskDynamicsPresentation {
         let value = readableSummary ?? readableTitle
             ?? (task.status == "running" ? AppLocalized("Processing your request.") : AppLocalized("No recorded steps"))
         return MIFTaskDynamicsSafeText.make(value, maximumCharacters: 56).value
+    }
+
+    static func lastConfirmedWorkSummary(_ task: MordeTask) -> String? {
+        guard let step = task.steps?.filter({
+            $0.status == "succeeded" && !["model", "plan", "budget"].contains($0.kind)
+        }).max(by: { $0.sequence < $1.sequence }) else { return nil }
+        let summary = MIFTaskDynamicsSafeText.make(step.summary.trimmingCharacters(in: .whitespacesAndNewlines),
+                                                   maximumCharacters: 56).value
+        let diagnostic = #"^(the model request could not be verified|the cloud dsh session completed|the task (failed|was interrupted)|(?:internal|runtime) error\b|traceback\b)"#
+        if !summary.isEmpty,
+           summary.range(of: diagnostic, options: [.regularExpression, .caseInsensitive]) == nil,
+           !summary.lowercased().hasPrefix("the cloud dsh tool completed") {
+            return summary
+        }
+        let title = MIFTaskDynamicsSafeText.make(MordeTaskStepPresentation.title(step.title),
+                                                 maximumCharacters: 56).value
+        guard title.range(of: diagnostic, options: [.regularExpression, .caseInsensitive]) == nil,
+              title.range(of: #"^(?:run cloud dsh (?:tool|mcp tool):|review cloud task recovery)"#,
+                          options: [.regularExpression, .caseInsensitive]) == nil else { return nil }
+        return title.isEmpty ? nil : title
     }
 
     static func workItemTitle(_ title: String) -> String {

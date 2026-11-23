@@ -248,6 +248,31 @@ final class MIFTaskViewsTests: XCTestCase {
             "The model request could not be verified (category: upstream_error).", title: "Review cloud task recovery"))
     }
 
+    func testUnresolvedRecoverySummaryShowsOnlyLastConfirmedWork() {
+        let confirmed = makeStep(id: "s1234567", sequence: 2, kind: "tool", status: "succeeded",
+            title: "Read project notes", summary: "Found the current release requirements.",
+            createdAt: "2026-11-04T00:00:01Z")
+        let modelFailure = makeStep(id: "s2345678", sequence: 3, kind: "model", status: "failed",
+            title: "The model request could not be verified", summary: "provider failure details",
+            createdAt: "2026-11-04T00:00:02Z")
+        let task = makeTask(id: "q5555555", status: "waiting_user", currentStep: "Review cloud task recovery",
+                            waitingReason: "dsh_recovery_unresolved", steps: [confirmed, modelFailure])
+
+        XCTAssertTrue(MIFTaskDynamicsPresentation.isUnresolvedRecovery(task))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.lastConfirmedWorkSummary(task), "Found the current release requirements.")
+        XCTAssertFalse(MIFTaskDynamicsPresentation.isUnresolvedRecovery(
+            makeTask(id: "q5555555", status: "failed", waitingReason: "dsh_recovery_unresolved")))
+        XCTAssertFalse(MIFTaskDynamicsPresentation.isUnresolvedRecovery(
+            makeTask(id: "q5555555", status: "waiting_user", waitingReason: "approval_required")))
+
+        let secret = makeStep(id: "s3456789", sequence: 4, kind: "tool", status: "succeeded",
+            title: "Read project notes", summary: "Loaded token=secret-value from the environment.",
+            createdAt: "2026-11-04T00:00:03Z")
+        XCTAssertEqual(MIFTaskDynamicsPresentation.lastConfirmedWorkSummary(
+            makeTask(id: "q5555555", status: "waiting_user", waitingReason: "dsh_recovery_unresolved",
+                     steps: [confirmed, secret])), "Loaded token=[REDACTED] from the environment.")
+    }
+
     func testPaginationRequiresAnAdvancingNonemptyCursorAndSingleRequest() {
         XCTAssertTrue(MIFTaskPageRules.canLoadMore(cursor: "next", isLoading: false))
         XCTAssertFalse(MIFTaskPageRules.canLoadMore(cursor: nil, isLoading: false))
@@ -558,7 +583,7 @@ final class MIFTaskViewsTests: XCTestCase {
     private func makeTask(id: String, status: String, objective: String = "Synthetic task", batchItems: [MordeBatchItem]? = nil,
                           currentStep: String? = nil, result: String? = nil,
                           stepCount: Int64 = 0, completedStepCount: Int64 = 0,
-                          steps: [MordeTask.Step]? = nil) -> MordeTask {
+                          waitingReason: String? = nil, steps: [MordeTask.Step]? = nil) -> MordeTask {
         // nanoMuse: model_id has no memberwise default, so fixture tasks provide nil explicitly.
         MordeTask(owner_id: nil, initiator_id: nil, id: id, conversation_id: "c1234567", host_id: nil,
                   execution_location: "server", model_id: nil, queue_priority: nil,
@@ -567,7 +592,7 @@ final class MIFTaskViewsTests: XCTestCase {
                   current_revision: nil, desired_revision: nil, current_revision_started: nil,
                   result: result, result_message_pending: nil,
                   result_message_published: nil,
-                  current_step: currentStep, waiting_reason: nil, stop_request: nil,
+                  current_step: currentStep, waiting_reason: waitingReason, stop_request: nil,
                   step_count: stepCount, completed_step_count: completedStepCount,
                   budget: nil, usage: nil, billing: nil, pending_request: nil,
                   clarification_request: nil, batch_items: batchItems, dependencies: nil,

@@ -1627,19 +1627,19 @@ type browserActivityCommand struct {
 }
 
 type browserActivityRun struct {
-	name, objective, stage, failure string
-	retryHostID                     string
-	current                         task.Task
-	agentLease                      app.AgentInstanceLease
-	supervisorNonce                 []byte
-	userMessageID, progressStepID   string
-	streamMessageID, streamTurnID   string
-	streamSequence                  int64
-	resultEventSequence             int64
-	busy                            bool
-	commands                        chan browserActivityCommand
-	dropIndex                       int
-	dropCursors                     map[string]int64
+	name, objective, stage, failure                     string
+	retryHostID                                         string
+	current                                             task.Task
+	agentLease                                          app.AgentInstanceLease
+	supervisorNonce                                     []byte
+	userMessageID, progressStepID, mcpRetrySourceStepID string
+	streamMessageID, streamTurnID                       string
+	streamSequence                                      int64
+	resultEventSequence                                 int64
+	busy                                                bool
+	commands                                            chan browserActivityCommand
+	dropIndex                                           int
+	dropCursors                                         map[string]int64
 }
 
 type browserActivityEventRequest struct {
@@ -2119,6 +2119,9 @@ VALUES ($1,$2,$3,$4,NULL,1,0,1,$5,$6,'',0,$7,$8,$9,'mcp_call',$10,'failed',$11,c
 		Title: "调用本地合成连接器", Summary: "本地合成连接器返回明确限流结果。", AgentSessionID: lease.Fence.AgentSessionID,
 		TaskRevision: &revision, ToolCallKey: callID, ToolName: "mcp_call", RequestDigest: requestDigest[:],
 		Phase: "execute", DetailState: "not_recorded", Attempt: 1, FailureReason: "connector_rate_limited", Retryable: true}
+	a.mu.Lock()
+	run.mcpRetrySourceStepID = step.ID
+	a.mu.Unlock()
 	toolCall := &app.TaskToolCallProgress{AgentSessionID: lease.Fence.AgentSessionID, AgentInstanceID: lease.Fence.AgentInstanceID,
 		AgentGeneration: lease.Fence.AgentGeneration, AuthorizationVersion: lease.Fence.AuthorizationVersion,
 		TaskRevision: revision, CallKey: callID, ToolName: step.ToolName, RequestDigest: requestDigest[:],
@@ -2858,7 +2861,7 @@ func (a *browserAcceptanceActivity) verifyMCPRetryAccepted(ctx context.Context) 
 		a.mu.Unlock()
 		return errors.New("MCP retry scenario is missing")
 	}
-	current, sourceStepID := run.current, run.progressStepID
+	current, sourceStepID := run.current, run.mcpRetrySourceStepID
 	a.mu.Unlock()
 	details, err := a.store.GetTask(ctx, current.ID, current.OwnerID)
 	if err != nil {

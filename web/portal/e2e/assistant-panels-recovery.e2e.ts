@@ -101,7 +101,8 @@ test.describe("Assistant panel recovery", () => {
     await page.evaluate(() => sessionStorage.setItem("e2e-task-detail-recovered", "1"));
     await detailError.getByRole("button", { name: "重试" }).click();
     await expect(page.getByRole("region", { name: `任务详情：${task.objective}` })).toBeVisible();
-    await expect(page.getByRole("region", { name: "当前进展" }).getByText("读取验收状态")).toBeVisible();
+    await expect(page.getByRole("button", { name: "查看工作项：读取验收状态" })).toBeVisible();
+    await expect(page.getByRole("region", { name: "当前进展" })).toHaveCount(0);
     await expect(page.getByRole("textbox", { name: "消息内容" })).toBeVisible();
   });
 });

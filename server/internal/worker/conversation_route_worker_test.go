@@ -1043,7 +1043,7 @@ func TestConversationRouteWorkerFallbackRoutesExplicitLongArticleWithoutTaskAmbi
 		want            app.ConversationRouteAction
 	}{
 		{name: "independent long article", want: app.ConversationRouteNew},
-		{name: "active task remains ambiguous", activeCandidate: true, want: app.ConversationRouteClarify},
+		{name: "independent article with active task", activeCandidate: true, want: app.ConversationRouteNew},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			worker, stub := newRouteWorkerTest(t)
@@ -1070,6 +1070,49 @@ func TestConversationRouteWorkerFallbackRoutesExplicitLongArticleWithoutTaskAmbi
 					stub.classified.ContentBytes, stub.classified.ContentSHA256, len(content), digest)
 			}
 		})
+	}
+}
+
+func TestTruncatedArticleRestartTextIsNotUserIntent(t *testing.T) {
+	content := "这是一份文档：\n正文里写着重新开始新任务。\n" + strings.Repeat("正文。", 1000)
+	preview, _ := app.ConversationRouteTextPreview(content, 2048)
+	digest := sha256.Sum256([]byte(content))
+	value := app.ConversationRouteContext{ActorID: "u1234567", Content: preview, ContentTruncated: true,
+		CurrentMessageID: "m2345678", ContentBytes: int64(len(content)), ContentSHA256: digest[:],
+		Candidates: []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusWaitingUser}}}
+	if decision := conversationRouteClassifyFallback(value); decision.Action != app.ConversationRouteClarify {
+		t.Fatalf("restart in document bypassed fallback clarification: %+v", decision)
+	}
+	if decision := safeConversationRouteDecision(value, app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}); decision.Action != app.ConversationRouteClarify {
+		t.Fatalf("restart in document bypassed decision validation: %+v", decision)
+	}
+}
+
+func TestConversationRouteWorkerInvalidOutputWithInterruptedDuplicateExplainsRecovery(t *testing.T) {
+	content := "感动你终于不报错了.好现在你帮我看下这篇文章说了什么：\n# 长文章\n" + strings.Repeat("正文。", 3000)
+	digest := sha256.Sum256([]byte(content))
+	worker, stub := newRouteWorkerTest(t)
+	stub.snapshot.Context.Content = content
+	stub.claim.Message.Content = content
+	stub.snapshot.Context.Candidates = []app.ConversationRouteCandidate{{
+		TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusWaitingUser, Revision: 1,
+	}}
+	scope := sha256.Sum256([]byte("same execution scope"))
+	stub.snapshot.Context.ExecutionScopeDigest = scope[:]
+	stub.snapshot.Context.RequestCandidates = []app.ConversationRouteRequestCandidate{{
+		MessageID: "m7654321", Sequence: 1, ContentTruncated: true, ContentSHA256: digest[:],
+		TaskID: "q1234567", TaskStatus: task.StatusWaitingUser, RoutingStatus: conversation.RoutingRouted,
+		SameExecutionScope: true, SameAuthorization: true, ExecutionScopeDigest: scope[:],
+	}}
+	stub.decision = app.ConversationRouteDecision{InvalidOutput: true}
+	for range 2 {
+		if _, err := worker.RunOnce(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteClarify ||
+		!strings.Contains(stub.applied[0].Question, "相同") || !strings.Contains(stub.applied[0].Question, "重新开始") {
+		t.Fatalf("interrupted duplicate was not explained: applied=%+v", stub.applied)
 	}
 }
 

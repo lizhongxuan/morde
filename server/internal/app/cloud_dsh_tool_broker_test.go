@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"image/png"
@@ -266,6 +267,24 @@ func TestCloudDSHToolBrokerAllowsTaskProgressAfterClaim(t *testing.T) {
 	store.mu.Unlock()
 	if _, err := broker.currentTaskDetails(context.Background(), claimed); err != nil {
 		t.Fatalf("currentTaskDetails() rejected legitimate task progress: %v", err)
+	}
+}
+
+func TestSelectedMCPDefinitionsDoNotDisplaceCurrentMessageSearch(t *testing.T) {
+	definitions := []AgentToolDefinition{{ModelTool: ModelTool{Name: cloudDSHCurrentMessageSearchToolName}}}
+	for index := 1; index < maxCloudDSHToolDefinitions-1; index++ {
+		definitions = append(definitions, AgentToolDefinition{ModelTool: ModelTool{Name: fmt.Sprintf("optional_%02d", index)}})
+	}
+	selectedMCP := []AgentToolDefinition{
+		{ModelTool: ModelTool{Name: cloudDSHMCPDiscoverToolName}},
+		{ModelTool: ModelTool{Name: cloudDSHMCPCallToolName}},
+	}
+	got := appendSelectedMCPDefinitionsWithinLimit(definitions, selectedMCP)
+	if len(got) != len(definitions) || !containsAgentTool(got, cloudDSHCurrentMessageSearchToolName) ||
+		containsAgentTool(got, cloudDSHMCPDiscoverToolName) || containsAgentTool(got, cloudDSHMCPCallToolName) {
+		t.Fatalf("optional MCP definitions displaced current-message search at capacity: got=%d search=%t MCP=%t/%t",
+			len(got), containsAgentTool(got, cloudDSHCurrentMessageSearchToolName),
+			containsAgentTool(got, cloudDSHMCPDiscoverToolName), containsAgentTool(got, cloudDSHMCPCallToolName))
 	}
 }
 

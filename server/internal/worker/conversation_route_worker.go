@@ -696,7 +696,7 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 	}
 	switch decision.Action {
 	case app.ConversationRouteNew:
-		if decision.TaskID == "" && decision.TargetMessageID == "" && (!decision.ExplicitNew || app.ConversationRouteHasExplicitNewIntent(value.Content)) &&
+		if decision.TaskID == "" && decision.TargetMessageID == "" && (!decision.ExplicitNew || app.ConversationRouteHasExplicitNewIntentForContext(value)) &&
 			decision.ExpectedRevision == 0 && decision.Question == "" &&
 			(!decision.ExplicitNew || len(decision.AggregateMessageIDs) == 0) &&
 			app.ValidConversationRouteDependencyIDs(decision.DependencyTaskIDs, value.Candidates) &&
@@ -784,11 +784,11 @@ func conversationRouteClassifyFallback(value app.ConversationRouteContext) app.C
 		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
 			Question: "分类暂时不可用，请说明要操作哪个任务。"}
 	}
-	if app.ConversationRouteHasExplicitLongMessageTaskIntent(value) {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteNew}
+	if decision, ok := app.ConversationRouteLongMessageFallback(value); ok {
+		return decision
 	}
 	if !value.PreviousMissing && !value.PreviousUnresolved && !value.ReferenceUnavailable &&
-		app.ConversationRouteHasExplicitNewIntent(value.Content) {
+		app.ConversationRouteHasExplicitNewIntentForContext(value) {
 		return app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}
 	}
 	target := value.ReferenceTaskID

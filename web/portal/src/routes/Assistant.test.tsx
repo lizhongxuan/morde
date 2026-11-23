@@ -898,7 +898,7 @@ describe('Assistant durable tasks', () => {
 
     const activity = await findTaskActivity(task.id);
     expect(within(activity).getByRole('region', { name: '需要批准的操作' })).toHaveTextContent('创建报告.md');
-    expect(within(activity).getByText('等待审批：写入文件')).toBeInTheDocument();
+    expect(within(activity).queryByRole('region', { name: '当前进展' })).not.toBeInTheDocument();
     expect(within(activity).getByText('工具：等待结果')).toBeInTheDocument();
     expect(activity).not.toHaveTextContent('工具：等待审批');
   });
@@ -2370,7 +2370,7 @@ describe('Assistant durable tasks', () => {
     expect(accept.mock.calls[0]![1]).not.toHaveProperty('reference_task_id');
   });
 
-  it('binds the next message and stop action only to the explicitly selected similar Task', async () => {
+  it('sends messages without a manual Task binding and stops only the selected similar Task', async () => {
     const first: Task = { ...task, id: 'qtask001', objective: '整理同一份报告摘要', status: 'running', result: null,
       current_revision: 2, desired_revision: 2, finished_at: null };
     const second: Task = { ...first, id: 'qtask002', current_revision: 3, desired_revision: 4 };
@@ -2390,17 +2390,14 @@ describe('Assistant durable tasks', () => {
     const view = renderPage();
 
     const firstDetail = await findTaskActivity(first.id);
-    await user.click(within(firstDetail).getByRole('button', { name: '将下一条消息绑定到此任务' }));
+    expect(within(firstDetail).queryByRole('button', { name: /绑定.*任务/ })).not.toBeInTheDocument();
+    expect(within(firstDetail).queryByRole('region', { name: '当前进展' })).not.toBeInTheDocument();
     const composerRegion = screen.getByRole('region', { name: '发送对话消息' });
-    expect(within(composerRegion).getByRole('status')).toHaveTextContent(`下一条消息将绑定到任务：整理同一份报告摘要 · ${first.id}`);
-    await user.click(within(composerRegion).getByRole('button', { name: '取消任务绑定' }));
-    expect(within(composerRegion).queryByText(/下一条消息将绑定到任务/)).not.toBeInTheDocument();
-
-    await user.click(within(firstDetail).getByRole('button', { name: '将下一条消息绑定到此任务' }));
     await user.type(await findReadyComposer(), '补充报告摘要的来源');
     await user.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(accept).toHaveBeenCalledOnce());
-    expect(accept.mock.calls[0]![1]).toMatchObject({ content: '补充报告摘要的来源', reference_task_id: first.id });
+    expect(accept.mock.calls[0]![1]).toMatchObject({ content: '补充报告摘要的来源' });
+    expect(accept.mock.calls[0]![1]).not.toHaveProperty('reference_task_id');
     expect(within(composerRegion).queryByText(/下一条消息将绑定到任务/)).not.toBeInTheDocument();
 
     const secondDetail = await findTaskActivity(second.id);
@@ -3292,7 +3289,7 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, result_message_pending: true });
     renderPage();
     const activity = await findTaskActivity(task.id);
-    expect(activity).toHaveTextContent('任务已完成，回复整理中。');
+    expect(within(activity).queryByRole('region', { name: '当前进展' })).not.toBeInTheDocument();
     expect(within(activity).queryByText('更多信息')).not.toBeInTheDocument();
     expect(activity).not.toHaveTextContent(reply.content);
     expect(Array.from(document.querySelectorAll('.chat-message-assistant')).map((element) => element.textContent))
@@ -3354,7 +3351,7 @@ describe('Assistant durable tasks', () => {
       .toHaveTextContent('主助手正在整理原始结果。');
     expect(within(secondPanel).queryByRole('button', { name: '重试结果整理' })).not.toBeInTheDocument();
     const thirdPanel = await findTaskActivity(thirdTask.id);
-    expect(thirdPanel).toHaveTextContent('等待执行');
+    expect(within(thirdPanel).getByRole('region', { name: '任务依赖与子任务' })).toHaveTextContent('依赖任务未就绪');
     expect(firstPanel).not.toHaveTextContent('更多信息');
     expect(firstPanel).not.toHaveTextContent('Task A 原始结果');
     expect(Array.from(document.querySelectorAll('.chat-message-assistant')).map((element) => element.textContent))
@@ -4166,11 +4163,11 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const firstPanel = await findTaskActivity(firstTask.id);
-    expect(within(firstPanel).getByText('等待审批：写入文件')).toBeInTheDocument();
+    expect(within(firstPanel).getByText('写入文件')).toBeInTheDocument();
     expect(firstPanel).toHaveTextContent('报告.md');
     const secondPanel = await findTaskActivity(secondTask.id);
     expect(within(secondPanel).queryByText('AI 正在处理…')).not.toBeInTheDocument();
-    expect(within(secondPanel).getByRole('status')).toHaveTextContent('读取网页');
+    expect(within(secondPanel).getByRole('button', { name: '查看工作项：读取网页' })).toBeInTheDocument();
     expect(screen.getByText(firstOutput.content)).toBeInTheDocument();
     expect(screen.getByText(secondOutput.content)).toBeInTheDocument();
     expect(screen.getByText(firstOutput.content).closest('.message-list')?.querySelector('.task-activity')).toBeNull();
@@ -4201,8 +4198,7 @@ describe('Assistant durable tasks', () => {
     }
     vi.stubGlobal('EventSource', TestEventSource);
     renderPage();
-    const activity = await findTaskActivity(task.id);
-    expect(await within(activity).findByText('任务已保存，正在等待开始。')).toBeInTheDocument();
+    await findTaskActivity(task.id);
     await waitFor(() => expect(sources).toHaveLength(1));
 
     history = [message, interrupted];
@@ -4218,13 +4214,14 @@ describe('Assistant durable tasks', () => {
     expect(sources[1]!.url).toBe(`/api/tasks/${task.id}/events?after=11`);
   });
 
-  it('keeps task progress in the task panel beside the conversation composer', async () => {
+  it('keeps task work items beside the composer without the removed progress section', async () => {
     mockCommon({ conversations: [conversation], messages: [message, reply] });
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'running', result: null, finished_at: null });
     renderPage();
 
     const activity = await findTaskActivity(task.id);
-    expect(within(activity).getByText('AI 正在处理…')).toBeInTheDocument();
+    expect(within(activity).queryByRole('region', { name: '当前进展' })).not.toBeInTheDocument();
+    expect(within(activity).queryByRole('button', { name: /绑定.*任务/ })).not.toBeInTheDocument();
     const messageList = screen.getByText(reply.content).closest('.message-list');
     expect(messageList?.querySelector('.task-activity')).toBeNull();
     const composer = screen.getByRole('region', { name: '发送对话消息' });
@@ -4241,8 +4238,7 @@ describe('Assistant durable tasks', () => {
     const running = { ...task, status: 'running' as const, result: null, finished_at: null };
     vi.spyOn(portalApi, 'task').mockResolvedValue(running);
     const { container, client } = renderPage();
-    const activity = await findTaskActivity(task.id);
-    expect(within(activity).getByText('AI 正在处理…')).toBeInTheDocument();
+    await findTaskActivity(task.id);
 
     const viewport = container.querySelector('.conversation-view');
     if (!(viewport instanceof HTMLElement)) throw new Error('conversation viewport not found');
@@ -4261,21 +4257,9 @@ describe('Assistant durable tasks', () => {
       });
     });
 
-    expect(await within(activity).findByText('开始处理你的请求。')).toBeInTheDocument();
+    expect(client.getQueryData<Task>(['task', task.id])?.current_revision_started).toBe(true);
     expect(writeScrollTop).not.toHaveBeenCalled();
     expect(scrollTop).toBe(160);
-  });
-
-  it.each([
-    { current_revision: 1, desired_revision: 1, current_revision_started: false, text: '任务已保存，正在等待开始。' },
-    { current_revision: 1, desired_revision: 1, current_revision_started: true, text: '开始处理你的请求。' },
-    { current_revision: 1, desired_revision: 2, current_revision_started: true, text: '正在调整任务，等待开始新要求。' },
-  ])('shows the confirmed state of the current revision', async ({ text, ...evidence }) => {
-    mockCommon({ conversations: [conversation], messages: [message] });
-    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, ...evidence, status: 'running', result: null, finished_at: null });
-    renderPage();
-    const activity = await findTaskActivity(task.id);
-    expect(await within(activity).findByText(text)).toBeInTheDocument();
   });
 
   it('shows a recovery interruption without task action buttons', async () => {
@@ -4295,7 +4279,8 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const activity = await findTaskActivity(task.id);
-    expect(await within(activity).findByText('AI 运行中断，无法确认本次执行结果。请核对任务状态后再继续。')).toBeInTheDocument();
+    expect(within(activity).queryByRole('region', { name: '当前进展' })).not.toBeInTheDocument();
+    expect(within(activity).queryByText('AI 运行中断，无法确认本次执行结果。请核对任务状态后再继续。')).not.toBeInTheDocument();
     const chatStatus = document.querySelector('.chat-message-row-user .chat-message-task-recovery');
     expect(chatStatus).toHaveTextContent('任务已中断，Agent 尚未返回最终答复，执行结果未确认。');
     expect(chatStatus).toHaveTextContent('最后完成：已校验并检索原文全部 32 页，返回 3 个相关片段。');
@@ -4321,17 +4306,17 @@ describe('Assistant durable tasks', () => {
       }] });
     renderPage();
     const panel = await findTaskActivity(task.id);
-    expect(within(panel).getByRole('status')).toHaveTextContent('原文已保留；请缩短后重新发送');
+    expect(within(panel).getByRole('button', { name: '查看工作项：消息超过模型输入上限' })).toHaveTextContent('消息及上下文超过当前模型输入上限');
     expect(screen.queryByText(/AI 运行中断，无法确认本次执行结果/)).not.toBeInTheDocument();
   });
 
-  it('shows a computer problem only on the Task that attempted to use it', async () => {
+  it('keeps the composer usable when a task waits for an unavailable computer', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, finished_at: null,
       waiting_reason: 'computer_unavailable', current_step: null, steps: [] });
     renderPage();
     const activity = await findTaskActivity(task.id);
-    expect(await within(activity).findByText(/目标云端电脑当前不可用或无法确认访问权限/)).toBeInTheDocument();
+    expect(within(activity).queryByRole('region', { name: '当前进展' })).not.toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: '消息内容' })).toBeEnabled();
   });
 

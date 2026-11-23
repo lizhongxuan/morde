@@ -18148,8 +18148,14 @@ private struct MordeRoot: View {
                         ForEach(client.displayedConversationMessages) { message in
                             let isLatestMessage = message.id == client.displayedConversationMessages.last?.id
                             let pending = client.pendingMessages.first { $0.id == message.client_message_id }
+                            let recoveryTask = message.task_id.flatMap { taskID in
+                                client.conversationTasks.first {
+                                    $0.id == taskID && $0.conversation_id == message.conversation_id
+                                }
+                            }
                             MIFMordeMessageBubble(message: message,
                                 sourceMessages: client.displayedConversationMessages.filter { $0.role == "user" },
+                                recoveryTask: recoveryTask,
                                 pending: pending,
                                 waitingForEarlier: pending.flatMap {
                                     MordeOutboxScheduling.waitingForEarlierMessage($0, in: client.pendingMessages)
@@ -19468,6 +19474,7 @@ private struct MIFMordeMessageBubble: View {
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     let message: MordeClientMessage
     let sourceMessages: [MordeClientMessage]
+    let recoveryTask: MordeTask?
     let pending: MordeOutboxMessage?
     let waitingForEarlier: String?
     let serviceNeedsUpdate: Bool
@@ -19489,6 +19496,12 @@ private struct MIFMordeMessageBubble: View {
     }
     private var sourceContentMatchesMessage: Bool {
         !sourceLines.isEmpty && sourceLines.map(\.source.content).joined(separator: "\n\n") == message.content
+    }
+    private var unresolvedRecoveryTask: MordeTask? {
+        guard isUser, let task = recoveryTask,
+              task.id == message.task_id, task.conversation_id == message.conversation_id,
+              MIFTaskDynamicsPresentation.isUnresolvedRecovery(task) else { return nil }
+        return task
     }
 
     var body: some View {
@@ -19602,6 +19615,33 @@ private struct MIFMordeMessageBubble: View {
                        let key = MordeRoutingPresentation.localizationKey(message.routing_status) {
                         Text(verbatim: NSLocalizedString(key, comment: "Message routing status"))
                             .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
+                    }
+                    if let task = unresolvedRecoveryTask {
+                        VStack(alignment: .leading, spacing: 5) {
+                            Text(AppLocalized("Task interrupted. No final answer was returned; the result is unconfirmed."))
+                                .font(.caption)
+                                .foregroundStyle(NanoMuseTones.warning)
+                                .fixedSize(horizontal: false, vertical: true)
+                                .accessibilityIdentifier("morde.chat.message.taskRecovery.status.\(task.id)")
+                            if let work = MIFTaskDynamicsPresentation.lastConfirmedWorkSummary(task) {
+                                Text("\(AppLocalized("Last confirmed work")): \(work)")
+                                    .font(.caption)
+                                    .foregroundStyle(NanoMuseTones.secondaryText)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                    .accessibilityIdentifier("morde.chat.message.taskRecovery.lastWork.\(task.id)")
+                            }
+                            NavigationLink {
+                                MIFTaskDetailView(taskID: task.id)
+                            } label: {
+                                Label(AppLocalized("Open task details and activity"), systemImage: "point.3.connected.trianglepath.dotted")
+                                    .font(.caption.weight(.medium))
+                            }
+                            .accessibilityIdentifier("morde.chat.message.taskRecovery.open.\(task.id)")
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.top, 4)
+                        .accessibilityElement(children: .contain)
+                        .accessibilityIdentifier("morde.chat.message.taskRecovery.\(task.id)")
                     }
                     if message.displayStatus == "streaming" {
                         Text("正在生成…")

@@ -377,17 +377,7 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 	if goalFollowupReadOnly {
 		definitions = filterGoalFollowupReadOnlyTools(definitions)
 	}
-	if !goalFollowupReadOnly && len(definitions)+len(selectedMCP)+1 > maxCloudDSHToolDefinitions {
-		for index, definition := range definitions {
-			if definition.Name == cloudDSHCurrentMessageSearchToolName {
-				definitions = append(definitions[:index], definitions[index+1:]...)
-				break
-			}
-		}
-	}
-	if len(definitions)+len(selectedMCP)+1 <= maxCloudDSHToolDefinitions {
-		definitions = append(definitions, selectedMCP...)
-	}
+	definitions = appendSelectedMCPDefinitionsWithinLimit(definitions, selectedMCP)
 	if !goalFollowupReadOnly && len(definitions)+1 > maxCloudDSHToolDefinitions {
 		return nil, domain.NewError(domain.CodeResultTooLarge, "the task has more tools than the model can accept")
 	}
@@ -431,6 +421,13 @@ func filterGoalFollowupReadOnlyTools(definitions []AgentToolDefinition) []AgentT
 		}
 	}
 	return filtered
+}
+
+func appendSelectedMCPDefinitionsWithinLimit(definitions, selectedMCP []AgentToolDefinition) []AgentToolDefinition {
+	if len(definitions)+len(selectedMCP)+1 > maxCloudDSHToolDefinitions {
+		return definitions
+	}
+	return append(definitions, selectedMCP...)
 }
 
 // Complete only commits a dsh result after the worker has confirmed its

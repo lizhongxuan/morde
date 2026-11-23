@@ -20,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/execution"
@@ -2055,9 +2057,12 @@ func TestCloudDSHExecutorRunsAuthorizedToolAndReturnsDurableResultToNextModelCal
 
 func TestCloudDSHExecutorStopsAfterDurableTerminalToolAttempt(t *testing.T) {
 	executor, _, store, _, models, value := cloudDSHFixture(t)
+	logCore, logs := observer.New(zap.WarnLevel)
+	executor.options.Logger = zap.New(logCore)
 	tool := cloudDSHReadTool()
 	tools := &cloudDSHTerminalTestTools{cloudDSHTestTools: &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}, result: app.AgentToolResult{
-		Status: app.AgentToolFailed, TerminalForAttempt: true, Output: "safe terminal status",
+		Status: app.AgentToolFailed, TerminalForAttempt: true,
+		Output: `{"is_error":true,"structured_content":{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":300}}`,
 	}}}
 	executor.options.Tools = tools
 	models.responses = []app.ModelResponse{{ToolCalls: []app.ModelToolCall{{CallID: "call_terminal_1", Name: tool.Name,
@@ -2070,6 +2075,20 @@ func TestCloudDSHExecutorStopsAfterDurableTerminalToolAttempt(t *testing.T) {
 	if len(tools.calls) != 1 || len(models.calls) != 1 || len(tools.admissionCalls) != 2 || tools.finisherCalls != 1 || store.stopped != 1 {
 		t.Fatalf("tool calls=%d model calls=%d admissions=%d finisher=%d stopped=%d; want one dispatched tool, no follow-up model turn, and a stopped runtime",
 			len(tools.calls), len(models.calls), len(tools.admissionCalls), tools.finisherCalls, store.stopped)
+	}
+	entries := logs.FilterMessage("DSH connector returned a terminal failure result").All()
+	if len(entries) != 1 {
+		t.Fatalf("terminal connector log entries=%d, want 1", len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["task_id"] != value.ID || fields["failure_stage"] != "tool_execution" ||
+		fields["failure_reason"] != "connector_rate_limited" || fields["tool_name"] != tool.Name ||
+		fields["tool_call_id"] != "call_terminal_1" || fields["tool_dispatch_status"] != "result_received" ||
+		fields["retry_after_seconds"] != int64(300) {
+		t.Fatalf("terminal connector diagnostic fields = %+v", fields)
+	}
+	if strings.Contains(fmt.Sprint(fields), "structured_content") {
+		t.Fatalf("terminal connector diagnostic log included raw output: %+v", fields)
 	}
 }
 

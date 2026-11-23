@@ -711,16 +711,28 @@ func ParseConversationRouteDecision(text string, candidates []ConversationRouteC
 // ParseConversationRouteDecisionForContext retains the distinction between an
 // unknown Task and an explicitly referenced Task that cannot be recovered.
 func ParseConversationRouteDecisionForContext(text string, value ConversationRouteContext) ConversationRouteDecision {
-	decision := parseConversationRouteDecision(text, value.Content, value.Candidates, value.RequestCandidates,
+	content := value.Content
+	if value.ContentTruncated {
+		content = conversationRouteLongMessageRequestPrefix(content)
+	}
+	decision := parseConversationRouteDecision(text, content, value.Candidates, value.RequestCandidates,
 		value.AggregationCandidates, value.ReferenceUnavailable)
 	if decision.InvalidOutput {
 		return decision
 	}
-	if value.ContentTruncated && decision.Action != ConversationRouteNew {
-		if (decision.Action == ConversationRouteReply || decision.Action == ConversationRouteTool || decision.Action == ConversationRouteClarify) &&
-			ConversationRouteHasExplicitLongMessageTaskIntent(value) {
-			return ConversationRouteDecision{Action: ConversationRouteNew, ModelOutput: decision.ModelOutput}
+	if value.ContentTruncated && (decision.Action == ConversationRouteNew || decision.Action == ConversationRouteReply ||
+		decision.Action == ConversationRouteTool || decision.Action == ConversationRouteClarify) {
+		if fallback, ok := ConversationRouteLongMessageFallback(value); ok {
+			if decision.Action != ConversationRouteNew || fallback.Action == ConversationRouteClarify {
+				fallback.ModelOutput = decision.ModelOutput
+				return fallback
+			}
+			if fallback.ExplicitNew && len(decision.AggregateMessageIDs) == 0 {
+				decision.ExplicitNew = true
+			}
 		}
+	}
+	if value.ContentTruncated && decision.Action != ConversationRouteNew {
 		if decision.Action != ConversationRouteClarify && !conversationRouteHasValidatedTaskAssociation(decision.Action) {
 			question := "当前请求内容只显示了有界预览。请重新说明要执行的任务，或先补充完整内容。"
 			if len(value.ContentSources) != 0 {
@@ -773,10 +785,49 @@ func ParseConversationRouteDecisionForContext(text string, value ConversationRou
 // independent content-processing request in the bounded preview of a saved
 // long message. It never derives a Task control action from the pasted source.
 func ConversationRouteHasExplicitLongMessageTaskIntent(value ConversationRouteContext) bool {
-	return value.ContentTruncated && len(value.ContentSources) == 0 && value.ResultReview == nil &&
-		value.ReferenceTaskID == "" && !value.ReferenceUnavailable && !value.PreviousMissing &&
-		!value.PreviousUnresolved && !value.CandidateSetIncomplete && len(value.Candidates) == 0 &&
-		conversationRouteHasExplicitLongMessageTaskIntent(value.Content)
+	if !value.ContentTruncated || !domain.ValidMessageID(value.CurrentMessageID) || len(value.ContentSHA256) != sha256.Size ||
+		value.ContentBytes <= 0 || value.ContentBytes < int64(len(value.Content)) || len(value.ContentSources) != 0 || value.ResultReview != nil ||
+		value.ReferenceTaskID != "" || value.ReferenceUnavailable || value.PreviousMissing ||
+		value.PreviousUnresolved || value.CandidateSetIncomplete || !conversationRouteHasExplicitLongMessageTaskIntent(value.Content) {
+		return false
+	}
+	if len(value.Candidates) == 0 {
+		return true
+	}
+	prefix := conversationRouteLongMessageRequestPrefix(value.Content)
+	if ConversationRouteHasExplicitNewIntent(prefix) {
+		return true
+	}
+	normalized := normalizeConversationRouteIntent(prefix)
+	return containsAnyRouteIntent(normalized, []string{"总结", "概括", "分析", "梳理", "解释", "说了什么", "讲了什么", "主要内容", "summarize", "analyze", "explain", "whatdoes"}) &&
+		!containsAnyRouteIntent(normalized, []string{"任务", "task", "继续", "接着", "补充", "追加", "修改", "调整", "更新", "更改", "重试", "重跑", "恢复", "停止", "取消", "上个", "上次", "之前", "现有", "不要", "不用", "无需", "禁止", "发送", "发给", "发邮件", "上传", "发布", "写入", "保存", "删除", "执行", "创建", "部署", "安装", "推送", "continue", "resume", "retry", "previous", "existing", "update", "change", "send", "email", "upload", "publish", "write", "save", "create", "deploy", "install", "delete", "execute", "donot", "dont", "without"})
+}
+
+// ConversationRouteLongMessageFallback keeps an unresolved duplicate visible
+// without starting the same work again unless the user explicitly requests it.
+func ConversationRouteLongMessageFallback(value ConversationRouteContext) (ConversationRouteDecision, bool) {
+	if !ConversationRouteHasExplicitLongMessageTaskIntent(value) {
+		return ConversationRouteDecision{}, false
+	}
+	explicitNew := ConversationRouteHasExplicitNewIntent(conversationRouteLongMessageRequestPrefix(value.Content))
+	if !explicitNew && len(value.ContentSHA256) == sha256.Size {
+		for _, candidate := range value.RequestCandidates {
+			if candidate.TaskID == "" || !candidate.SameExecutionScope || !candidate.SameAuthorization ||
+				candidate.TaskStatus == task.StatusQueued || candidate.TaskStatus == task.StatusRunning || !activeConversationRouteTask(candidate.TaskStatus) {
+				continue
+			}
+			digest := candidate.ContentSHA256
+			if !candidate.ContentTruncated {
+				sum := sha256.Sum256([]byte(candidate.Content))
+				digest = sum[:]
+			}
+			if bytes.Equal(digest, value.ContentSHA256) {
+				return ConversationRouteDecision{Action: ConversationRouteClarify,
+					Question: "之前相同请求的任务尚未结束，可能正在等待处理或恢复。请先查看任务详情；如确认要重新执行，请重新发送并在开头写“重新开始新任务”。"}, true
+			}
+		}
+	}
+	return ConversationRouteDecision{Action: ConversationRouteNew, ExplicitNew: explicitNew}, true
 }
 
 func conversationRouteHasValidatedTaskAssociation(action ConversationRouteAction) bool {
@@ -793,15 +844,7 @@ func conversationRouteHasValidatedTaskAssociation(action ConversationRouteAction
 // treats the rest of the pasted source as an instruction to control a Task.
 func conversationRouteHasExplicitLongMessageTaskIntent(content string) bool {
 	prefix := conversationRouteLongMessageRequestPrefix(content)
-
-	var normalized strings.Builder
-	for _, char := range strings.ToLower(prefix) {
-		if unicode.IsSpace(char) || unicode.IsPunct(char) || unicode.IsSymbol(char) {
-			continue
-		}
-		normalized.WriteRune(char)
-	}
-	value := normalized.String()
+	value := normalizeConversationRouteIntent(prefix)
 	if value == "" || ConversationRouteHasExplicitControlIntent(prefix) {
 		return false
 	}
@@ -813,6 +856,17 @@ func conversationRouteHasExplicitLongMessageTaskIntent(content string) bool {
 	}
 	return containsAnyRouteIntent(value, []string{"帮我", "帮忙", "请", "please", "couldyou", "说了什么", "讲了什么", "whatdoes"}) ||
 		containsAnyRouteIntent(strings.TrimLeft(value, "现在好那先然后你"), []string{"看下", "看一下", "看看", "总结", "概括", "分析", "梳理", "解释", "review", "summarize", "analyze", "explain"})
+}
+
+func normalizeConversationRouteIntent(prefix string) string {
+	var normalized strings.Builder
+	for _, char := range strings.ToLower(prefix) {
+		if unicode.IsSpace(char) || unicode.IsPunct(char) || unicode.IsSymbol(char) {
+			continue
+		}
+		normalized.WriteRune(char)
+	}
+	return normalized.String()
 }
 
 func conversationRouteLongMessageRequestPrefix(content string) string {
@@ -839,6 +893,16 @@ func ConversationRouteHasExplicitControlIntentForContext(value ConversationRoute
 		content = conversationRouteLongMessageRequestPrefix(content)
 	}
 	return ConversationRouteHasExplicitControlIntent(content)
+}
+
+// ConversationRouteHasExplicitNewIntentForContext treats a pasted long
+// message body as source text, not permission to rerun an earlier Task.
+func ConversationRouteHasExplicitNewIntentForContext(value ConversationRouteContext) bool {
+	content := value.Content
+	if value.ContentTruncated {
+		content = conversationRouteLongMessageRequestPrefix(content)
+	}
+	return ConversationRouteHasExplicitNewIntent(content)
 }
 
 // ConversationRouteHasExplicitControlIntent recognizes control clauses even
