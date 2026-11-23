@@ -9554,6 +9554,10 @@ export interface components {
             status: "running" | "idle" | "unknown";
             /** Format: date-time */
             observed_at: string | null;
+            /** @description Current activity phase, omitted when the observation is not current or trusted. */
+            activity_phase?: "model" | "tool" | "subagent" | "checkpoint";
+            /** @description Current activity state paired with activity_phase; this is not an approval status. */
+            activity_state?: "started" | "waiting" | "completed" | "failed" | "cancelled";
         };
         TaskStepDetail: {
             task_id: components["schemas"]["TaskId"];

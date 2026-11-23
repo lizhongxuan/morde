@@ -677,6 +677,123 @@ func TestCloudDSHStreamStopsAndRetainsSnapshotWhileSameTaskSteerIsPending(t *tes
 	}
 }
 
+func TestCloudDSHStreamRejectsOldCheckpointAfterSteerClaimAndRetainsInterruptedSnapshot(t *testing.T) {
+	f := newCloudDSHStreamFixture(t)
+	ctx := context.Background()
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, f.delta); err != nil || !appended {
+		t.Fatalf("initial stream: appended=%t err=%v", appended, err)
+	}
+
+	steer := f.route.receive(t, "stream-claimed-steer", "Also include a brief introduction", app.ConversationRoutingInput{
+		ReferenceTaskID: f.task.ID,
+	})
+	route, err := f.route.store.LoadConversationRouteSnapshot(ctx, steer)
+	if err != nil || !app.ValidConversationRouteSteerTarget(f.task.ID, route.Context) {
+		t.Fatalf("steer target: context=%+v err=%v", route.Context, err)
+	}
+	route.Context.ModelID = "p1234567"
+	decision := app.ConversationRouteDecision{Action: app.ConversationRouteSteer, TaskID: f.task.ID,
+		ExpectedRevision: route.Context.Candidates[0].Revision,
+		ModelOutput:      `{"action":"steer","task_id":"` + f.task.ID + `","acknowledge":false}`}
+	if !validStoredRouteDecision(decision, route.Context) {
+		t.Fatal("same-Task steer was rejected as a stored route decision")
+	}
+	if err := f.route.store.ApplyConversationRoute(ctx, steer, route, decision); err != nil {
+		t.Fatalf("persist same-Task steer: %v", err)
+	}
+
+	fence := app.AgentCheckpointFence{TaskID: f.delta.Fence.TaskID, OwnerID: f.delta.Fence.OwnerID,
+		InitiatorID: f.delta.Fence.InitiatorID, AgentInstanceID: f.delta.Fence.AgentInstanceID,
+		AgentGeneration: f.delta.Fence.AgentGeneration, AgentSessionID: f.delta.Fence.AgentSessionID,
+		AgentRootSessionID: f.delta.Fence.AgentRootSessionID, AuthorizationVersion: f.delta.Fence.AuthorizationVersion,
+		LeaseOwner: f.delta.Fence.LeaseOwner, LeaseVersion: f.delta.Fence.LeaseVersion,
+		EngineVersion: f.delta.Fence.EngineVersion, ProfileVersion: f.delta.Fence.ProfileVersion}
+	sealer, err := app.NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoints, err := app.NewAgentCheckpointService(f.route.store, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	saveCheckpoint := func(from, through int64, payload []byte) {
+		t.Helper()
+		digest := sha256.Sum256(payload)
+		if _, err := checkpoints.Save(ctx, app.AgentCheckpointCommand{Fence: fence, From: from, Through: through,
+			Digest: digest[:], Payload: payload}); err != nil {
+			t.Fatalf("save root checkpoint [%d,%d]: %v", from, through, err)
+		}
+	}
+	checkpointPayload := func(from int64, events ...any) []byte {
+		t.Helper()
+		payload, err := json.Marshal(map[string]any{
+			"header": map[string]string{"id": fence.AgentSessionID}, "from_seq": from, "events": events,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return payload
+	}
+	spliced := map[string]any{"seq": 2, "type": "agent/inbox/spliced", "data": map[string]any{
+		"target": "next-step", "start": 0, "inserted": []any{map[string]any{
+			"id": steer.Message.ID, "role": "user", "content": steer.Message.Content,
+			"source": map[string]string{"kind": "user"},
+		}},
+	}}
+	saveCheckpoint(2, 2, checkpointPayload(2, spliced))
+	claimed := map[string]any{"seq": 3, "type": "user/message", "data": map[string]any{
+		"id": steer.Message.ID, "role": "user", "content": steer.Message.Content,
+	}}
+	saveCheckpoint(3, 3, checkpointPayload(3, claimed))
+	var deliveryStatus string
+	var checkpointThrough, claimedCheckpointThrough int64
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT message.delivery_status,t.checkpoint_through_seq,delivery.claimed_checkpoint_through_seq
+FROM conversation_messages message
+JOIN tasks t ON t.id=message.task_id
+JOIN task_agent_message_deliveries delivery ON delivery.message_id=message.id
+WHERE message.id=$1`, steer.Message.ID).Scan(&deliveryStatus, &checkpointThrough, &claimedCheckpointThrough); err != nil ||
+		deliveryStatus != string(conversation.DeliveryApplied) || checkpointThrough != 3 || claimedCheckpointThrough != 3 {
+		t.Fatalf("steer claim checkpoint = status %q task through %d claimed through %d err=%v; want applied at sequence 3",
+			deliveryStatus, checkpointThrough, claimedCheckpointThrough, err)
+	}
+
+	stale := f.delta
+	stale.Text = "stale provider delta after claimed steer"
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, stale); err != nil || appended {
+		t.Fatalf("old stream fence appended after the steer claim: appended=%t err=%v", appended, err)
+	}
+
+	var snapshotID, snapshotStatus, snapshotContent string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT message_id,status,content FROM task_assistant_message_snapshots WHERE task_id=$1`, f.task.ID).
+		Scan(&snapshotID, &snapshotStatus, &snapshotContent); err != nil || snapshotID != f.delta.MessageID ||
+		snapshotStatus != "interrupted" || snapshotContent != f.delta.Text {
+		t.Fatalf("claimed steer did not retain interrupted stream snapshot: id=%s status=%s content=%q err=%v",
+			snapshotID, snapshotStatus, snapshotContent, err)
+	}
+	var messageStatus, messageContent string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT output_status,content FROM conversation_messages WHERE id=$1`, f.delta.MessageID).
+		Scan(&messageStatus, &messageContent); err != nil || messageStatus != "interrupted" || messageContent != f.delta.Text {
+		t.Fatalf("claimed steer did not retain interrupted conversation stream: status=%s content=%q err=%v",
+			messageStatus, messageContent, err)
+	}
+
+	otherTurn := mustID(t, domain.NewStepID)
+	if _, err := f.route.store.pool.Exec(ctx, `UPDATE task_assistant_message_snapshots
+SET turn_id=$2,status='streaming' WHERE task_id=$1`, f.task.ID, otherTurn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.route.store.pool.Exec(ctx, `UPDATE conversation_messages SET output_status='streaming' WHERE id=$1`, f.delta.MessageID); err != nil {
+		t.Fatal(err)
+	}
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, stale); err != nil || appended {
+		t.Fatalf("repeated stale stream delta was not rejected: appended=%t err=%v", appended, err)
+	}
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT status FROM task_assistant_message_snapshots WHERE task_id=$1`, f.task.ID).
+		Scan(&snapshotStatus); err != nil || snapshotStatus != "streaming" {
+		t.Fatalf("stale stream for a different turn interrupted the current snapshot: status=%s err=%v", snapshotStatus, err)
+	}
+}
+
 func TestCloudDSHStreamArchivesInterruptedPriorRevision(t *testing.T) {
 	f := newCloudDSHStreamFixture(t)
 	ctx := context.Background()

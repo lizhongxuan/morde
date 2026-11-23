@@ -176,7 +176,7 @@ final class MordeTaskEventIsolationTests: XCTestCase {
     }
 
     func testAgentActivityGroupsStepsBySessionAndDelegationOrder() throws {
-        let json = #"[{"id":"main-session","parent_id":null,"step_id":null,"task_revision":3,"role":"main","status":"running","observed_at":null},{"id":"subagent-b","parent_id":"main-session","step_id":"s0000002","task_revision":3,"role":"subagent","status":"idle","observed_at":null},{"id":"subagent-a","parent_id":"main-session","step_id":"s0000001","task_revision":3,"role":"subagent","status":"new_status","observed_at":null},{"id":"nested-agent","parent_id":"subagent-a","step_id":"s0000003","task_revision":3,"role":"subagent","status":"running","observed_at":null}]"#
+        let json = #"[{"id":"main-session","parent_id":null,"step_id":null,"task_revision":3,"role":"main","status":"running","observed_at":null,"activity_phase":"model","activity_state":"started"},{"id":"subagent-b","parent_id":"main-session","step_id":"s0000002","task_revision":3,"role":"subagent","status":"idle","observed_at":null,"activity_phase":"tool","activity_state":"waiting"},{"id":"subagent-a","parent_id":"main-session","step_id":"s0000001","task_revision":3,"role":"subagent","status":"new_status","observed_at":null,"activity_phase":"future_phase","activity_state":"future_state"},{"id":"nested-agent","parent_id":"subagent-a","step_id":"s0000003","task_revision":3,"role":"subagent","status":"running","observed_at":null}]"#
         let agents = try JSONDecoder().decode([MordeTaskAgentExecution].self, from: Data(json.utf8))
         let steps = [
             MordeTaskAgentActivityStep(id: "s0000004", sequence: 4, agentID: "unresolved-session"),
@@ -191,6 +191,13 @@ final class MordeTaskEventIsolationTests: XCTestCase {
         XCTAssertEqual(groups.map(\.stepIDs), [["s0000001"], [], ["s0000003"], ["s0000002"], ["s0000004"]])
         XCTAssertEqual(groups.map(\.taskRevision), [3, 3, 3, 3, nil])
         XCTAssertEqual(groups[2].status, "running")
+        XCTAssertEqual(groups[0].activityPhase, "model")
+        XCTAssertEqual(groups[0].activityState, "started")
+        XCTAssertEqual(groups[3].activityPhase, "tool")
+        XCTAssertEqual(groups[3].activityState, "waiting")
+        XCTAssertEqual(groups[1].activityPhase, "future_phase",
+                       "Unknown activity enum values remain available for the UI fallback.")
+        XCTAssertNil(groups[2].activityPhase, "Legacy or absent activity remains absent.")
         XCTAssertEqual(agents[2].status, "new_status", "Unknown agent status values remain available for the UI fallback.")
     }
 
@@ -201,6 +208,7 @@ final class MordeTaskEventIsolationTests: XCTestCase {
 
         XCTAssertEqual(MordeTaskAgentActivityPolicy.groups(agents: agents, steps: steps), [
             MordeTaskAgentActivityGroup(id: "unassigned", title: "Attribution unconfirmed", status: nil,
+                                        activityPhase: nil, activityState: nil,
                                         taskRevision: nil, depth: 0, stepIDs: ["s1234567"]),
         ])
     }

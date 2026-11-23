@@ -336,10 +336,19 @@ func StepCounts(steps []Step) (total, completed int64) {
 }
 
 type Operation struct {
-	ID                          string
-	TaskID                      string
-	Key                         string
-	RequestHash                 []byte
+	ID          string
+	TaskID      string
+	Key         string
+	RequestHash []byte
+	// TaskRevision, CallID, and ToolName bind an operation to one Task
+	// revision and exact Agent tool call. They remain nil/empty on legacy and
+	// non-Agent operations that do not carry this binding.
+	TaskRevision                *int64
+	CallID                      string
+	ToolName                    string
+	ApprovalID                  string
+	ApprovalVersion             *int64
+	ApprovalRequestHash         []byte
 	HostID                      string
 	WorkspaceID                 string
 	BindingVersion              int64
@@ -444,9 +453,12 @@ type ClarificationRequest struct {
 // Agent tool call and Host control fence. RequestHash is internal and omitted
 // from API responses.
 type PendingRequest struct {
-	ID                      string
-	TaskID                  string
-	Version                 int64
+	ID      string
+	TaskID  string
+	Version int64
+	// TaskRevision is the Task revision whose exact tool call this approval
+	// covers. A nil value is retained only for legacy rows or non-bound paths.
+	TaskRevision            *int64
 	Kind                    string
 	Title                   string
 	Object                  string

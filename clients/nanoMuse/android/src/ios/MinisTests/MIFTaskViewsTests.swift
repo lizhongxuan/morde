@@ -403,6 +403,28 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertEqual(event.status, "failed")
     }
 
+    func testAgentActivitySeparatesToolWaitFromApprovalAndPreservesUnknownEnums() throws {
+        XCTAssertEqual(MIFTaskPresentation.agentActivityLabel(phase: "tool", state: "waiting"),
+                       "\(AppLocalized("Tool")) · \(AppLocalized("Waiting for response"))")
+        XCTAssertEqual(MIFTaskPresentation.agentActivityLabel(phase: "future_phase", state: "waiting"),
+                       "\(AppLocalized("Status unknown")) · \(AppLocalized("Waiting for response"))")
+        XCTAssertEqual(MIFTaskPresentation.agentActivityLabel(phase: "model", state: "future_state"),
+                       "\(AppLocalized("Model")) · \(AppLocalized("Status unknown"))")
+        XCTAssertNil(MIFTaskPresentation.agentActivityLabel(phase: nil, state: nil))
+
+        let activity = try makeEvent(sequence: 1, type: "task.step",
+            payload: #"{"kind":"agent_activity","phase":"tool","status":"waiting","activity_id":"internal-activity-123"}"#)
+        XCTAssertEqual(activity.display?.title, AppLocalized("Activity"))
+        XCTAssertEqual(activity.display?.summary,
+                       "\(AppLocalized("Tool")) · \(AppLocalized("Waiting for response"))")
+        XCTAssertFalse(activity.display?.summary?.contains("internal-activity-123") == true)
+
+        let approval = try makeEvent(sequence: 2, type: "task.waiting_user",
+            payload: #"{"status":"waiting_user"}"#)
+        XCTAssertEqual(approval.display?.title, AppLocalized("Waiting for your action"))
+        XCTAssertNotEqual(activity.display?.summary, approval.display?.title)
+    }
+
     func testStartedProgressIsVisibleWithoutClaimingTheTaskFinished() throws {
         let step = makeStep(id: "s1234567", sequence: 1, kind: "progress", status: "succeeded",
             title: "开始处理", summary: "正在处理你的请求。", createdAt: "2026-11-04T00:00:01Z")

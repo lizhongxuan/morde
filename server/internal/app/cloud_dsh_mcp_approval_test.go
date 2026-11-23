@@ -42,6 +42,12 @@ func TestCloudDSHMCPExternalCallWaitsForExactApproval(t *testing.T) {
 		t.Fatalf("approved exact external call = %#v err=%v calls=%d tool=%q request=%s usage=%d",
 			approved, err, client.callCalls, client.lastTool, client.lastRequest, store.details.Task.Usage.ToolCalls)
 	}
+	operation, ok := store.operations[agentOperationKey(call.CallID)]
+	if !ok || operation.TaskRevision == nil || claimed.CurrentRevision == nil || *operation.TaskRevision != *claimed.CurrentRevision ||
+		operation.CallID != call.CallID || operation.ApprovalID != pending.ID || operation.ApprovalVersion != pending.Version ||
+		!bytes.Equal(operation.ApprovalRequestHash, fingerprint) {
+		t.Fatalf("external operation did not retain the exact approved identity: %#v pending=%#v", operation, pending)
+	}
 	replayed, err := broker.Reconcile(context.Background(), claimed, call, nil)
 	if err != nil || replayed.Status != AgentToolSucceeded || client.callCalls != 1 {
 		t.Fatalf("exact approved replay = %#v err=%v remote calls=%d", replayed, err, client.callCalls)
@@ -265,6 +271,9 @@ func newCloudDSHMCPApprovalFixture(t *testing.T) (*runtimeToolExecutorFixture, *
 			TaskID: fixture.store.details.Task.ID, OwnerID: ownerID, ConnectorOwnerID: ownerID,
 			ConnectorID: connectorID, ConnectorRevision: 1, CredentialVersion: 1, GrantVersion: 1,
 		}},
+	}
+	if fixture.store.details.Task.CurrentRevision == nil || fixture.store.details.Task.DesiredRevision == nil {
+		t.Fatal("approval fixture is missing a current Task revision")
 	}
 	fixture.executor.store = store
 	client := &cloudDSHMCPClientStub{

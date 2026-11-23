@@ -493,7 +493,24 @@ function stepDetailObject(step: TaskStep, object: string | null): string | null 
 }
 
 type TaskAgent = NonNullable<Task['agents']>[number];
-type TaskAgentActivityGroup = { id: string; title: string; steps: TaskStep[] };
+type TaskAgentActivityGroup = { id: string; title: string; currentActivity: string | null; steps: TaskStep[] };
+
+function taskAgentCurrentActivity(agent: TaskAgent): string | null {
+  if (!agent.activity_phase || !agent.activity_state) return null;
+  const phaseLabels = { model: '模型', tool: '工具', subagent: '子 Agent', checkpoint: '检查点' } as const;
+  const phaseLabel = phaseLabels[agent.activity_phase as keyof typeof phaseLabels];
+  if (!phaseLabel) return null;
+  const phaseActivity = {
+    model: { started: '模型：正在响应', waiting: '模型：等待响应' },
+    tool: { started: '工具：正在执行', waiting: '工具：等待结果' },
+    subagent: { started: '子 Agent：正在运行', waiting: '子 Agent：等待响应' },
+    checkpoint: { started: '检查点：正在保存', waiting: '检查点：等待服务端确认' },
+  } as const;
+  const terminal = { completed: '已完成', failed: '执行失败', cancelled: '已取消' } as const;
+  const terminalLabel = terminal[agent.activity_state as keyof typeof terminal];
+  if (terminalLabel) return `${phaseLabel}：${terminalLabel}`;
+  return phaseActivity[agent.activity_phase as keyof typeof phaseActivity]?.[agent.activity_state as 'started' | 'waiting'] ?? null;
+}
 
 function latestTaskSnapshot(previous: unknown, next: unknown): unknown {
   const oldTask = previous as Task | undefined;
@@ -726,12 +743,11 @@ function taskAgentActivityGroups(task: Task): TaskAgentActivityGroup[] {
   const steps = task.steps.filter((step) => !['model', 'plan', 'budget'].includes(step.kind) &&
     step.title !== '开始处理')
     .sort((left, right) => left.sequence - right.sequence);
-  if (!steps.length) return [];
   const unassigned = (items: TaskStep[]): TaskAgentActivityGroup[] => items.length
-    ? [{ id: 'unassigned', title: '归属未确认', steps: items }] : [];
+    ? [{ id: 'unassigned', title: '归属未确认', currentActivity: null, steps: items }] : [];
   const agents = task.agents ?? [];
-  if (!agents.length) return steps.some((step) => step.agent_id)
-    ? unassigned(steps) : [{ id: 'main', title: 'MAIN', steps }];
+  if (!agents.length) return !steps.length ? [] : steps.some((step) => step.agent_id)
+    ? unassigned(steps) : [{ id: 'main', title: 'MAIN', currentActivity: null, steps }];
 
   const byID = new Map(agents.map((agent) => [agent.id, agent]));
   const roots = agents.filter((agent) => agent.parent_id === null && agent.role === 'main');
@@ -752,8 +768,10 @@ function taskAgentActivityGroups(task: Task): TaskAgentActivityGroup[] {
     if (visited.has(agent.id)) { invalidTree = true; return; }
     visited.add(agent.id);
     const ownSteps = steps.filter((step) => step.agent_id === agent.id);
-    if (ownSteps.length) groups.push({ id: agent.id,
-      title: path.length ? `SUBAGENT ${path.map((part) => String(part).padStart(2, '0')).join('.')}` : 'MAIN', steps: ownSteps });
+    const currentActivity = taskAgentCurrentActivity(agent);
+    if (ownSteps.length || currentActivity) groups.push({ id: agent.id,
+      title: path.length ? `SUBAGENT ${path.map((part) => String(part).padStart(2, '0')).join('.')}` : 'MAIN',
+      currentActivity, steps: ownSteps });
     children.filter((item) => item.parent_id === agent.id).forEach((child, index) => append(child, [...path, index + 1]));
   };
   append(roots[0]!, []);
@@ -3185,6 +3203,7 @@ export function Assistant() {
         <div className="task-detail-work-heading"><h3>Agent 工作过程</h3></div>
         {groups.length ? groups.map((group) => <section className="task-agent-group" key={group.id}>
           <h4><strong>{group.title}</strong><span aria-hidden="true" /></h4>
+          {group.currentActivity && <p className="muted task-agent-current-activity" role="status">{group.currentActivity}</p>}
           {group.steps.map((step) => {
             const stepTitleText = safeTaskActivityText(conversationTitleFromText(taskActivityStepTitle(step)) ?? 'Agent 工作项', 120).value;
             const stepSummaryText = taskActivitySnippet(taskActivityStepSummary(step), 120) ?? '';

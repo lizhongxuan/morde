@@ -9,8 +9,8 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { AccountRuntime, workspaceWorkingDirectory } from '../src/account-runtime.mjs'
 import {
-  coordinatorCompactionModelCallID, coordinatorModelCallID, ENGINE_VERSION, modelCallID,
-  TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, taskValidationReviewModelCallID, validMessageDelivery, validStart,
+  coordinatorCompactionModelCallID, coordinatorModelCallID, DurableSession, ENGINE_VERSION, modelCallID,
+  TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, runAgent, taskValidationReviewModelCallID, validMessageDelivery, validStart,
 } from '../src/engine.mjs'
 import { WorkerIPC } from '../src/ipc.mjs'
 
@@ -195,7 +195,7 @@ function taskFence(frame) {
 
 function assertMonotonicAgentObservations(frames) {
   const sequences = new Map()
-  for (const frame of frames.filter(value => ['agent_status', 'agent_activity', 'agent_heartbeat'].includes(value.type))) {
+  for (const frame of frames.filter(value => ['agent_status', 'agent_activity', 'agent_heartbeat', 'agent_request_timeout'].includes(value.type))) {
     const previous = sequences.get(frame.session_id) ?? 0
     assert.equal(frame.observation_sequence, previous + 1, `observation sequence for ${frame.session_id}`)
     sequences.set(frame.session_id, frame.observation_sequence)
@@ -596,6 +596,195 @@ test('coordinator checkpoint acknowledgements require the complete actor fence',
   output.destroy()
 })
 
+test('WorkerIPC reports waiting only after a request write completes and only while its response is pending', async t => {
+  const taskIdentity = taskFence(start)
+  const childIdentity = { ...taskIdentity, session_id: 'child_789' }
+  const digest = createHash('sha256').update('{}').digest('hex')
+  const cases = [
+    {
+      name: 'checkpoint page read',
+      call: (ipc, onWaiting) => ipc.readCheckpoint(taskIdentity, 0, { onWaiting }),
+      response: request => ({ type: 'checkpoint_page', ...taskIdentity, id: request.id, ok: true,
+        from_seq: 0, through_seq: 0, payload: '{}', sha256: digest }),
+    },
+    {
+      name: 'checkpoint write',
+      call: (ipc, onWaiting) => ipc.checkpoint(taskIdentity, 0, 0, '{}', digest, { onWaiting }),
+      response: request => ({ type: 'checkpoint_ack', ...taskIdentity, id: request.id, ok: true,
+        through_seq: 0, sha256: digest }),
+    },
+    {
+      name: 'tool broker call',
+      call: (ipc, onWaiting) => ipc.toolCall(taskIdentity, 0, 'call_waiting_tool', 'test.tool', {}, undefined, { onWaiting }),
+      response: request => ({ type: 'tool_result', ...taskIdentity, id: request.id, call_id: 'call_waiting_tool',
+        status: 'succeeded', output: 'ok' }),
+    },
+    {
+      name: 'child creation',
+      call: (ipc, onWaiting) => ipc.createChild(taskIdentity, 0, 'call_waiting_child',
+        { objective: 'Do work', title: 'Work', tool_names: [] }, undefined, { onWaiting }),
+      response: request => ({ type: 'child_session', ...childIdentity, call_id: request.call_id,
+        parent_session_id: taskIdentity.session_id, objective: 'Do work', tools: [], checkpoint_through_seq: -1,
+        checkpoint_sha256: '', step_status: 'running', summary: '' }),
+    },
+    {
+      name: 'child settlement',
+      call: (ipc, onWaiting) => ipc.settleChild(childIdentity, 'call_waiting_settle', 'succeeded', 0, digest, 'Done', undefined, { onWaiting }),
+      response: request => ({ type: 'child_settle_ack', ...childIdentity, call_id: request.call_id, ok: true,
+        status: 'succeeded', summary: 'Done' }),
+    },
+  ]
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const input = new PassThrough()
+      const output = new PassThrough()
+      const events = []
+      let requestWritten
+      const wroteRequest = new Promise(resolve => { requestWritten = resolve })
+      output.write = bytes => {
+        const request = JSON.parse(bytes.toString().trim())
+        events.push(`write:${request.type}`)
+        requestWritten(request)
+        return false
+      }
+      const ipc = new WorkerIPC(input, output)
+      input.write(`${JSON.stringify(start)}\n`)
+      await ipc.start.promise
+      const pending = scenario.call(ipc, () => { events.push('waiting') })
+      const request = await wroteRequest
+      assert.deepEqual(events, [`write:${request.type}`], 'waiting must follow the completed IPC send')
+      output.emit('drain')
+      await new Promise(resolve => setImmediate(resolve))
+      assert.deepEqual(events, [`write:${request.type}`, 'waiting'])
+      ipc.dispatch(scenario.response(request))
+      await pending
+      input.destroy()
+      output.destroy()
+    })
+
+    await t.test(`${scenario.name} keeps its pending response when waiting telemetry rejects`, async () => {
+      const input = new PassThrough()
+      const output = new PassThrough()
+      const ipc = new WorkerIPC(input, output)
+      input.write(`${JSON.stringify(start)}\n`)
+      await ipc.start.promise
+      const requestWritten = once(output, 'data').then(([bytes]) => JSON.parse(bytes.toString().trim()))
+      let waitingAttempted = false
+      const pending = scenario.call(ipc, () => {
+        waitingAttempted = true
+        return Promise.reject(new Error('activity observation unavailable'))
+      })
+      const request = await requestWritten
+      await new Promise(resolve => setImmediate(resolve))
+      const requests = request.type.startsWith('child_') ? ipc.childPending : ipc.pending
+      const requestKey = request.id ?? request.call_id
+      assert.equal(waitingAttempted, true)
+      assert.equal(requests.get(requestKey)?.abandoned, undefined, 'telemetry failure must not abandon a dispatched request')
+      ipc.dispatch(scenario.response(request))
+      await pending
+      assert.equal(requests.has(requestKey), false, 'the matching response must still consume the pending request')
+      input.destroy()
+      output.destroy()
+    })
+
+    await t.test(`${scenario.name} does not wait for pending telemetry before consuming its response`, async () => {
+      const input = new PassThrough()
+      const output = new PassThrough()
+      const ipc = new WorkerIPC(input, output)
+      input.write(`${JSON.stringify(start)}\n`)
+      await ipc.start.promise
+      const requestWritten = once(output, 'data').then(([bytes]) => JSON.parse(bytes.toString().trim()))
+      let releaseWaiting
+      const waitingTelemetry = new Promise(resolve => { releaseWaiting = resolve })
+      const pending = scenario.call(ipc, () => waitingTelemetry)
+      const request = await requestWritten
+      await new Promise(resolve => setImmediate(resolve))
+      ipc.dispatch(scenario.response(request))
+      const settledBeforeTelemetry = await Promise.race([
+        pending.then(() => true), new Promise(resolve => setTimeout(() => resolve(false), 25)),
+      ])
+      releaseWaiting()
+      await pending
+      assert.equal(settledBeforeTelemetry, true, 'a matched response must not wait for waiting telemetry')
+      input.destroy()
+      output.destroy()
+    })
+  }
+
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const events = []
+  let requestWritten
+  const wroteRequest = new Promise(resolve => { requestWritten = resolve })
+  output.write = bytes => {
+    const request = JSON.parse(bytes.toString().trim())
+    requestWritten(request)
+    return false
+  }
+  const ipc = new WorkerIPC(input, output)
+  input.write(`${JSON.stringify(start)}\n`)
+  await ipc.start.promise
+  const pending = ipc.toolCall(taskIdentity, 0, 'call_response_race', 'test.tool', {}, undefined,
+    { onWaiting: () => { events.push('waiting') } })
+  const request = await wroteRequest
+  ipc.dispatch({ type: 'tool_result', ...taskIdentity, id: request.id, call_id: request.call_id, status: 'succeeded', output: 'ok' })
+  output.emit('drain')
+  await pending
+  assert.deepEqual(events, [], 'a matching response received before send completion needs no waiting frame')
+  input.destroy()
+  output.destroy()
+})
+
+test('DurableSession returns matched operation results without waiting for terminal activity telemetry', async t => {
+  for (const mode of ['blocked', 'failed']) {
+    await t.test(mode, async () => {
+      const frames = []
+      const failures = []
+      const ipc = {
+        failed: false,
+        send(frame) {
+          frames.push(frame)
+          if (frame.type === 'agent_activity' && frame.state === 'completed') {
+            return mode === 'blocked' ? new Promise(() => {}) : Promise.reject(new Error('terminal telemetry failed'))
+          }
+          return Promise.resolve()
+        },
+        fail(message) {
+          failures.push(message)
+          this.failed = true
+        },
+      }
+      const durable = new DurableSession(ipc, taskFence(start), start)
+      const result = await Promise.race([
+        durable.runActivity('tool', 'call_terminal_telemetry', undefined, onWaiting => {
+          onWaiting()
+          return 'matched operation result'
+        }),
+        new Promise(resolve => setTimeout(() => resolve('timed out'), 25)),
+      ])
+      assert.equal(result, 'matched operation result')
+      await new Promise(resolve => setImmediate(resolve))
+      assert.deepEqual(frames.map(frame => [frame.state, frame.observation_sequence]), [
+        ['started', 1], ['waiting', 2], ['completed', 3],
+      ])
+      assert.equal(failures.length, mode === 'failed' ? 1 : 0, 'a rejected terminal write must still fail IPC')
+      let nextOperationDispatched = false
+      const next = durable.runActivity('model', 'call_after_terminal', undefined, async () => {
+        nextOperationDispatched = true
+      })
+      if (mode === 'failed') {
+        await assert.rejects(next)
+      } else {
+        const result = await Promise.race([next.then(() => 'settled', () => 'settled'),
+          new Promise(resolve => setTimeout(() => resolve('blocked'), 25))])
+        assert.equal(result, 'blocked', 'a blocked terminal write must keep later activity behind the same queue')
+      }
+      assert.equal(nextOperationDispatched, false, 'a later operation must not dispatch after terminal activity failure')
+    })
+  }
+})
+
 test('a late tool result after timeout is ignored only for its exact abandoned call', async () => {
   const input = new PassThrough()
   const output = new PassThrough()
@@ -632,6 +821,117 @@ test('a late tool result after timeout is ignored only for its exact abandoned c
   assert.equal(ipc.failed, true, 'unknown tool responses must still fail closed')
   input.destroy()
   output.destroy()
+})
+
+test('WorkerIPC reports each request timeout digest and consumes exact late replies', async t => {
+  const taskIdentity = taskFence(start)
+  const childIdentity = { ...taskIdentity, session_id: 'child_789' }
+  const hash = value => createHash('sha256').update(value, 'utf8').digest('hex')
+  const payload = '{}'
+  const payloadDigest = hash(payload)
+  const checkpointDigest = 'a'.repeat(64)
+  const toolArgs = { path: 'notes.txt', content: 'saved' }
+  const childArgs = { title: 'Inspect notes', objective: 'Read the notes.', tool_names: [] }
+  const settleSummary = '\u0085 Child completed.\u0085 '
+  const cases = [
+    {
+      name: 'tool call', delay: 6 * 60_000,
+      call: (ipc, onTimeout) => ipc.toolCall(taskIdentity, 2, 'call_timeout_tool', 'file_write', toolArgs, undefined, { onTimeout }),
+      kind: 'tool_call', digest: hash(`tool_call\nfile_write\n${JSON.stringify(toolArgs)}`),
+      response: request => ({ type: 'tool_result', ...taskIdentity, id: request.id, call_id: request.call_id,
+        status: 'succeeded', output: 'late result', images: [] }),
+      timedOut: /tool result timed out/,
+    },
+    {
+      name: 'child creation', delay: 6 * 60_000,
+      call: (ipc, onTimeout) => ipc.createChild(taskIdentity, 2, 'call_timeout_child', childArgs, undefined, { onTimeout }),
+      kind: 'child_create', digest: hash(`child_create\n${JSON.stringify(childArgs)}`),
+      response: request => ({ type: 'child_session', ...childIdentity, call_id: request.call_id,
+        parent_session_id: taskIdentity.session_id, objective: childArgs.objective, tools: [],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' }),
+      timedOut: /child session response timed out/,
+    },
+    {
+      name: 'child settlement', delay: 6 * 60_000,
+      call: (ipc, onTimeout) => ipc.settleChild(childIdentity, 'call_timeout_settle', 'succeeded', 2, checkpointDigest,
+        settleSummary, undefined, { onTimeout }),
+      kind: 'child_settle', digest: hash(`child_settle\nsucceeded\n2\n${checkpointDigest}\n${hash('Child completed.')}`),
+      response: request => ({ type: 'child_settle_ack', ...childIdentity, call_id: request.call_id, ok: true,
+        status: 'succeeded', summary: 'Child completed.' }),
+      timedOut: /child settlement response timed out/,
+    },
+    {
+      name: 'checkpoint write', delay: 30_000,
+      call: (ipc, onTimeout) => ipc.checkpoint(taskIdentity, 0, 2, payload, payloadDigest, { onTimeout }),
+      kind: 'checkpoint_write', digest: hash(`checkpoint_write\n2\n${payloadDigest}`),
+      response: request => ({ type: 'checkpoint_ack', ...taskIdentity, id: request.id, ok: true, through_seq: 2, sha256: payloadDigest }),
+      timedOut: /checkpoint confirmation timed out/,
+    },
+    {
+      name: 'checkpoint read', delay: 30_000,
+      call: (ipc, onTimeout) => ipc.readCheckpoint(taskIdentity, 3,
+        { checkpointThrough: 8, checkpointDigest, onTimeout }),
+      kind: 'checkpoint_read', digest: hash(`checkpoint_read\n3\n8\n${checkpointDigest}`),
+      response: request => ({ type: 'checkpoint_page', ...taskIdentity, id: request.id, ok: true,
+        from_seq: 3, through_seq: 3, payload, sha256: payloadDigest }),
+      timedOut: /checkpoint read timed out/,
+    },
+  ]
+
+  for (const scenario of cases) {
+    await t.test(scenario.name, async () => {
+      const originalSetTimeout = globalThis.setTimeout
+      const originalClearTimeout = globalThis.clearTimeout
+      const forcedTimer = { requestTimeout: scenario.name }
+      let fireTimeout
+      globalThis.setTimeout = (callback, delay, ...args) => {
+        if (delay === scenario.delay && !fireTimeout) {
+          fireTimeout = () => callback(...args)
+          return forcedTimer
+        }
+        return originalSetTimeout(callback, delay, ...args)
+      }
+      globalThis.clearTimeout = timer => timer === forcedTimer ? undefined : originalClearTimeout(timer)
+      const input = new PassThrough()
+      const output = new PassThrough()
+      const ipc = new WorkerIPC(input, output)
+      const events = []
+      try {
+        input.write(`${JSON.stringify(start)}\n`)
+        await ipc.start.promise
+        const requestFrame = once(output, 'data').then(([bytes]) => JSON.parse(bytes.toString().trim()))
+        const pending = scenario.call(ipc, details => {
+          events.push({ type: 'timeout', ...details })
+          return Promise.reject(new Error('timeout observation unavailable'))
+        })
+        const completion = pending.then(() => ({ ok: true }), error => {
+          events.push({ type: 'rejected' })
+          return { error }
+        })
+        const request = await requestFrame
+        await new Promise(resolve => setImmediate(resolve))
+        assert.equal(typeof fireTimeout, 'function', 'the existing IPC timer is installed')
+        fireTimeout()
+        const result = await completion
+        assert.ok(result.error)
+        assert.match(result.error.message, scenario.timedOut)
+        assert.deepEqual(events, [
+          { type: 'timeout', request_kind: scenario.kind, request_digest: scenario.digest },
+          { type: 'rejected' },
+        ], 'timeout telemetry precedes the unchanged timeout error')
+
+        ipc.dispatch(scenario.response(request))
+        assert.equal(ipc.failed, false, 'the exact late reply stays inert after timeout')
+        input.destroy()
+        output.destroy()
+      } finally {
+        globalThis.setTimeout = originalSetTimeout
+        globalThis.clearTimeout = originalClearTimeout
+        input.destroy()
+        output.destroy()
+      }
+    })
+  }
 })
 
 test('late checkpoint and child responses after IPC cancellation are consumed only for their exact pending request', async t => {
@@ -1335,6 +1635,7 @@ test('late model frames after cancellation still require the original session fe
 test('real dsh runs only after worker confirms its events', async () => {
   let through = -1
   let calls = 0
+  let pendingCheckpoint
   const { child, frames } = launch((frame, proc) => {
     if (frame.type === 'ready') send(proc, start)
     if (frame.type === 'checkpoint') {
@@ -1345,7 +1646,12 @@ test('real dsh runs only after worker confirms its events', async () => {
       assert.equal(createHash('sha256').update(frame.payload).digest('hex'), frame.sha256)
       assert.equal(payload.events.at(-1).seq, frame.through_seq)
       through = frame.through_seq
-      send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: through, sha256: frame.sha256 })
+      pendingCheckpoint = frame
+    }
+    if (frame.type === 'agent_activity' && frame.phase === 'checkpoint' && frame.state === 'waiting') {
+      assert.ok(pendingCheckpoint, 'checkpoint wait must follow its written request')
+      acknowledgeCheckpoint(proc, pendingCheckpoint)
+      pendingCheckpoint = undefined
     }
     if (frame.type === 'model') {
       calls += 1
@@ -1378,7 +1684,17 @@ test('real dsh runs only after worker confirms its events', async () => {
   assertMonotonicAgentObservations(frames)
   assert.ok(observations.every(frame => frame.session_id === start.session_id && frame.task_revision === start.task_revision))
   assert.ok(observations.some(frame => frame.type === 'agent_activity' && frame.phase === 'model' && frame.state === 'started'))
-  assert.ok(observations.some(frame => frame.type === 'agent_activity' && frame.phase === 'checkpoint' && frame.state === 'completed'))
+  const checkpointWaiting = observations.find(frame => frame.type === 'agent_activity' && frame.phase === 'checkpoint' && frame.state === 'waiting')
+  const checkpointActivityID = checkpointWaiting?.activity_id
+  const checkpointActivities = observations.filter(frame => frame.type === 'agent_activity' && frame.phase === 'checkpoint' &&
+    frame.activity_id === checkpointActivityID)
+  assert.deepEqual(checkpointActivities.map(frame => frame.state), ['started', 'waiting', 'completed'])
+  const checkpointRequestIndex = frames.findIndex(frame => frame.type === 'checkpoint' && `checkpoint_${frame.through_seq}` === checkpointActivityID)
+  const checkpointWaitingIndex = frames.findIndex(frame => frame.type === 'agent_activity' && frame.phase === 'checkpoint' &&
+    frame.state === 'waiting' && frame.activity_id === checkpointActivityID)
+  const checkpointCompletedIndex = frames.findIndex(frame => frame.type === 'agent_activity' && frame.phase === 'checkpoint' &&
+    frame.state === 'completed' && frame.activity_id === checkpointActivityID)
+  assert.ok(checkpointRequestIndex < checkpointWaitingIndex && checkpointWaitingIndex < checkpointCompletedIndex)
   assert.ok(observations.some(frame => frame.type === 'agent_heartbeat' && frame.phase === '' && frame.activity_id === ''))
   for (const frame of observations) {
     const keys = ['type', 'task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id',
@@ -2128,7 +2444,193 @@ test('emits heartbeats while an IPC tool call is pending', { timeout: 30_000 }, 
   assert.equal(modelCalls, 2)
   assert.equal(heartbeatDuringTool, true, 'periodic heartbeat arrives before the tool result')
   assertMonotonicAgentObservations(frames)
+  const toolActivities = frames.filter(frame => frame.type === 'agent_activity' && frame.phase === 'tool' && frame.activity_id === 'call_long_1')
+  assert.deepEqual(toolActivities.map(frame => frame.state), ['started', 'waiting', 'completed'])
+  const toolRequestIndex = frames.findIndex(frame => frame.type === 'tool_call' && frame.call_id === 'call_long_1')
+  const toolWaitingIndex = frames.findIndex(frame => frame.type === 'agent_activity' && frame.phase === 'tool' && frame.state === 'waiting' && frame.activity_id === 'call_long_1')
+  const toolHeartbeatIndex = frames.findIndex(frame => frame.type === 'agent_heartbeat' && frame.phase === 'tool' && frame.activity_id === 'call_long_1')
+  assert.ok(toolRequestIndex < toolWaitingIndex && toolWaitingIndex < toolHeartbeatIndex)
   assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
+test('waiting activity telemetry failure does not replace a matched tool result', async t => {
+  const tool = {
+    name: 'write_once', description: 'Complete one test operation.',
+    parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
+  }
+  const startFrame = { ...start, tools: [tool] }
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  const sendIPCFrame = ipc.send.bind(ipc)
+  const frames = []
+  let waitingAttempts = 0
+  let modelCalls = 0
+  let toolCalls = 0
+  let returnedToolResult
+  let pendingToolFrame
+  ipc.send = frame => {
+    if (frame.type === 'agent_activity' && frame.phase === 'tool' && frame.state === 'waiting') {
+      waitingAttempts++
+      if (pendingToolFrame) {
+        writeInput({ type: 'tool_result', ...taskFence(pendingToolFrame), id: pendingToolFrame.id,
+          call_id: pendingToolFrame.call_id, status: 'succeeded', output: 'side effect result' })
+        pendingToolFrame = undefined
+      }
+      return Promise.reject(new Error('simulated waiting observation write failure'))
+    }
+    return sendIPCFrame(frame)
+  }
+  const lines = createInterface({ input: output })
+  const writeInput = frame => input.write(`${JSON.stringify(frame)}\n`)
+  const reply = (request, chunks) => {
+    chunks.forEach((chunk, index) => writeInput({ type: 'model_chunk', ...taskFence(request), id: request.id, index, chunk }))
+    writeInput({ type: 'model_end', ...taskFence(request), id: request.id, ok: true })
+  }
+  lines.on('line', raw => {
+    const frame = JSON.parse(raw)
+    frames.push(frame)
+    if (frame.type === 'checkpoint') {
+      writeInput({ type: 'checkpoint_ack', ...taskFence(frame), id: frame.id, ok: true,
+        through_seq: frame.through_seq, sha256: frame.sha256 })
+    } else if (frame.type === 'model') {
+      modelCalls++
+      if (modelCalls === 1) {
+        reply(frame, [
+          { type: 'tool-call-delta', index: 0, id: 'call_waiting_observation', name: tool.name,
+            argumentsDelta: '{"value":"committed"}' },
+          { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+          { type: 'finish', reason: { kind: 'tool-calls' } },
+        ])
+      } else {
+        returnedToolResult = frame.request.messages.find(message => message.role === 'tool' &&
+          message.toolCallId === 'call_waiting_observation')?.content?.[0]?.text
+        reply(frame, [
+          { type: 'block-start', index: 0, blockType: 'text' },
+          { type: 'text-delta', index: 0, text: 'The recorded result was used.' },
+          { type: 'block-end', index: 0, block: { type: 'text', text: 'The recorded result was used.' } },
+          { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+          { type: 'finish', reason: { kind: 'stop' } },
+        ])
+      }
+    } else if (frame.type === 'tool_call') {
+      toolCalls++
+      pendingToolFrame = frame
+    }
+  })
+  input.write(`${JSON.stringify(startFrame)}\n`)
+  await ipc.start.promise
+  const result = await runAgent(ipc, startFrame)
+  lines.close()
+  input.destroy()
+  output.destroy()
+
+  assert.equal(waitingAttempts, 1)
+  assert.equal(ipc.failed, false)
+  assert.equal(toolCalls, 1, 'the dispatched tool must not be repeated after observation failure')
+  assert.equal(modelCalls, 2)
+  assert.equal(returnedToolResult, 'side effect result', 'the matched IPC result must reach the next model request')
+  assert.equal(result.state, 'completed_candidate')
+  const toolActivities = frames.filter(frame => frame.type === 'agent_activity' && frame.phase === 'tool' &&
+    frame.activity_id === 'call_waiting_observation')
+  assert.deepEqual(toolActivities.map(frame => frame.state), ['started', 'completed'])
+  assert.ok(toolActivities[1].observation_sequence > toolActivities[0].observation_sequence + 1,
+    'the failed telemetry sequence remains a gap and is never replayed')
+  const observations = frames.filter(frame => ['agent_status', 'agent_activity', 'agent_heartbeat'].includes(frame.type))
+  for (let index = 1; index < observations.length; index++) {
+    assert.ok(observations[index].observation_sequence > observations[index - 1].observation_sequence,
+      `observation sequence for ${observations[index].session_id} remains strictly increasing`)
+  }
+})
+
+test('emits a best-effort tool timeout before its failed activity and ignores a late result', { timeout: 10_000 }, async () => {
+  const tool = {
+    name: 'slow_tool', description: 'Wait for a controlled timeout.',
+    parameters: { type: 'object', properties: { value: { type: 'string' } }, required: ['value'], additionalProperties: false },
+  }
+  const argumentsValue = { value: 'delayed' }
+  const startFrame = { ...start, tools: [tool] }
+  const originalSetTimeout = globalThis.setTimeout
+  const originalClearTimeout = globalThis.clearTimeout
+  const timeoutCallbacks = new Map()
+  globalThis.setTimeout = (callback, delay, ...args) => {
+    if (delay === 6 * 60_000) {
+      const timer = { toolRequestTimeout: timeoutCallbacks.size }
+      timeoutCallbacks.set(timer, () => callback(...args))
+      return timer
+    }
+    return originalSetTimeout(callback, delay, ...args)
+  }
+  globalThis.clearTimeout = timer => timeoutCallbacks.has(timer) ? undefined : originalClearTimeout(timer)
+
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  const lines = createInterface({ input: output })
+  const frames = []
+  lines.on('line', raw => {
+      const frame = JSON.parse(raw)
+      frames.push(frame)
+      if (frame.type === 'checkpoint') {
+        input.write(`${JSON.stringify({ type: 'checkpoint_ack', ...taskFence(frame), id: frame.id, ok: true,
+          through_seq: frame.through_seq, sha256: frame.sha256 })}\n`)
+      } else if (frame.type === 'model') {
+        const chunks = [
+          { type: 'tool-call-delta', index: 0, id: 'call_timeout_activity', name: tool.name,
+            argumentsDelta: JSON.stringify(argumentsValue) },
+          { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+          { type: 'finish', reason: { kind: 'tool-calls' } },
+        ]
+        chunks.forEach((chunk, index) => input.write(`${JSON.stringify({ type: 'model_chunk', ...taskFence(frame), id: frame.id, index, chunk })}\n`))
+        input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(frame), id: frame.id, ok: true })}\n`)
+      } else if (frame.type === 'agent_activity' && frame.state === 'waiting' && frame.activity_id === 'call_timeout_activity') {
+        const request = frames.find(item => item.type === 'tool_call' && item.call_id === frame.activity_id)
+        const timer = ipc.pending.get(request?.id)?.timer
+        assert.equal(typeof timeoutCallbacks.get(timer), 'function')
+        timeoutCallbacks.get(timer)()
+      } else if (frame.type === 'agent_request_timeout') {
+        const request = frames.find(item => item.type === 'tool_call' && item.call_id === frame.activity_id)
+        assert.ok(request)
+        input.write(`${JSON.stringify({ type: 'tool_result', ...taskFence(frame), id: request.id,
+          call_id: frame.activity_id, status: 'succeeded', output: 'late result', images: [] })}\n`)
+      }
+  })
+
+  try {
+    input.write(`${JSON.stringify(startFrame)}\n`)
+    await ipc.start.promise
+    const result = await runAgent(ipc, startFrame)
+    assert.equal(result.state, 'failed')
+    assert.equal(ipc.failed, false, 'the exact late tool reply is consumed after timeout')
+    assert.equal(frames.filter(frame => frame.type === 'tool_call' && frame.call_id === 'call_timeout_activity').length, 1)
+    const timeout = frames.find(frame => frame.type === 'agent_request_timeout')
+    assert.deepEqual({
+      task_id: timeout.task_id, owner_id: timeout.owner_id, agent_id: timeout.agent_id,
+      generation: timeout.generation, authorization_version: timeout.authorization_version,
+      session_id: timeout.session_id, task_revision: timeout.task_revision,
+      phase: timeout.phase, request_kind: timeout.request_kind, activity_id: timeout.activity_id,
+    }, {
+      task_id: start.task_id, owner_id: start.owner_id, agent_id: start.agent_id,
+      generation: start.generation, authorization_version: start.authorization_version,
+      session_id: start.session_id, task_revision: start.task_revision,
+      phase: 'tool', request_kind: 'tool_call', activity_id: 'call_timeout_activity',
+    })
+    assert.equal(timeout.request_digest, createHash('sha256').update(`tool_call\n${tool.name}\n${JSON.stringify(argumentsValue)}`, 'utf8').digest('hex'))
+    assert.equal(Object.hasOwn(timeout, 'arguments'), false)
+    assert.equal(Object.hasOwn(timeout, 'name'), false)
+    const timeoutIndex = frames.indexOf(timeout)
+    const failedIndex = frames.findIndex(frame => frame.type === 'agent_activity' && frame.activity_id === timeout.activity_id && frame.state === 'failed')
+    const requestIndex = frames.findIndex(frame => frame.type === 'tool_call' && frame.call_id === timeout.activity_id)
+    assert.ok(requestIndex < timeoutIndex)
+    assert.ok(timeoutIndex < failedIndex, 'request timeout observation precedes terminal activity failure')
+    assertMonotonicAgentObservations(frames)
+  } finally {
+    globalThis.setTimeout = originalSetTimeout
+    globalThis.clearTimeout = originalClearTimeout
+    lines.close()
+    input.destroy()
+    output.destroy()
+  }
 })
 
 test('replays an enqueued steer after its checkpoint acknowledgement is lost', { timeout: 15_000 }, async t => {
@@ -2417,6 +2919,7 @@ test('retries one exact checkpointed tool call through the server IPC and then r
   const retryFrames = []
   const resumed = await resumeSession(pages, {
     tools: [tool],
+    holdResponsesUntilWaiting: true,
     alterStart: value => ({ ...value, step_retry: stepRetry }),
     onToolCall(frame) {
       retryFrames.push(frame)
@@ -2438,6 +2941,9 @@ test('retries one exact checkpointed tool call through the server IPC and then r
   assert.equal(resumed.frames.filter(frame => frame.type === 'tool_call' && frame.call_id === retryCallID).length, 1)
   assert.equal(resumed.modelCalls, 1)
   assert.equal(resumed.frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+  const retryActivities = resumed.frames.filter(frame => frame.type === 'agent_activity' && frame.phase === 'tool' &&
+    frame.activity_id === retryCallID)
+  assert.deepEqual(retryActivities.map(frame => frame.state), ['started', 'waiting', 'completed'])
   const emitted = resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)
   assert.equal(emitted.some(event => event.type === 'assistant/message' && event.data.message.content
     .some(block => block.type === 'tool-call' && block.id === retryCallID)), false)
@@ -2741,6 +3247,16 @@ test('runs dsh_delegate in an isolated child session and waits for settlement be
   assert.ok(statusFrames.every(frame => frame.session_id === start.session_id))
   const observations = frames.filter(frame => ['agent_status', 'agent_activity', 'agent_heartbeat'].includes(frame.type))
   assertMonotonicAgentObservations(frames)
+  const subagentActivities = observations.filter(frame => frame.type === 'agent_activity' &&
+    frame.session_id === start.session_id && frame.phase === 'subagent' && frame.activity_id === 'call_delegate_1')
+  assert.deepEqual(subagentActivities.map(frame => frame.state), ['started', 'waiting', 'completed'])
+  const childCreateIndex = frames.findIndex(frame => frame.type === 'child_create' && frame.call_id === 'call_delegate_1')
+  const subagentWaitingIndex = frames.findIndex(frame => frame.type === 'agent_activity' && frame.session_id === start.session_id &&
+    frame.phase === 'subagent' && frame.state === 'waiting' && frame.activity_id === 'call_delegate_1')
+  const childSettleIndex = frames.findIndex(frame => frame.type === 'child_settle' && frame.call_id === 'call_delegate_1')
+  const subagentCompletedIndex = frames.findIndex(frame => frame.type === 'agent_activity' && frame.session_id === start.session_id &&
+    frame.phase === 'subagent' && frame.state === 'completed' && frame.activity_id === 'call_delegate_1')
+  assert.ok(childCreateIndex < subagentWaitingIndex && subagentWaitingIndex < childSettleIndex && childSettleIndex < subagentCompletedIndex)
   assert.ok(pagesBySession.get(start.session_id)?.length > 0)
   assert.ok(pagesBySession.get(childIdentity.session_id)?.length > 0)
 })
@@ -3517,6 +4033,7 @@ test('resumes an interrupted child from its own checkpoint before settling the p
   assert.ok(childPages?.length)
   const resumed = await resumeSession(parentPages, {
     tools: [delegateTool, fileReadTool],
+    holdResponsesUntilWaiting: true,
     checkpointPagesBySession: new Map([['child_789', childPages]]),
     onChildCreate(frame) {
       const tail = childPages.at(-1)
@@ -3536,6 +4053,16 @@ test('resumes an interrupted child from its own checkpoint before settling the p
   assert.ok(resumed.frames.some(frame => frame.type === 'model' && frame.session_id === 'child_789'))
   assert.equal(resumed.frames.filter(frame => frame.type === 'child_create').length, 1)
   assert.equal(resumed.frames.filter(frame => frame.type === 'child_settle').length, 1)
+  const checkpointReadActivities = resumed.frames.filter(frame => frame.type === 'agent_activity' &&
+    frame.session_id === 'child_789' && frame.phase === 'checkpoint' && frame.activity_id.startsWith('checkpoint_read_'))
+  assert.ok(checkpointReadActivities.length > 0)
+  assert.deepEqual(checkpointReadActivities.slice(0, 3).map(frame => frame.state), ['started', 'waiting', 'completed'])
+  const parentCreateActivities = resumed.frames.filter(frame => frame.type === 'agent_activity' &&
+    frame.session_id === start.session_id && frame.phase === 'subagent' && frame.activity_id === 'call_delegate_1')
+  assert.deepEqual(parentCreateActivities.map(frame => frame.state), ['started', 'waiting', 'completed'])
+  const childSettleActivities = resumed.frames.filter(frame => frame.type === 'agent_activity' &&
+    frame.session_id === 'child_789' && frame.phase === 'subagent' && frame.activity_id === 'call_delegate_1')
+  assert.deepEqual(childSettleActivities.map(frame => frame.state), ['started', 'waiting', 'completed'])
   const settlement = resumed.frames.find(frame => frame.type === 'child_settle')
   assert.equal(settlement.call_id, 'call_delegate_1')
   assert.equal(settlement.status, 'succeeded')
@@ -4028,7 +4555,7 @@ test('reconciles an interrupted tool call before resuming the dsh model', async 
     },
   }
   const pages = await captureInterruptedToolSession(tool)
-  const resumed = await resumeSession(pages, { tools: [tool], onToolCall: frame => {
+  const resumed = await resumeSession(pages, { tools: [tool], holdResponsesUntilWaiting: true, onToolCall: frame => {
     assert.equal(frame.call_id, 'call_interrupted_1')
     assert.equal(frame.name, 'file_write')
     assert.deepEqual(frame.arguments, { workspace_id: 'w1234567', path: 'notes.txt', content: 'saved' })
@@ -4036,6 +4563,9 @@ test('reconciles an interrupted tool call before resuming the dsh model', async 
   } })
   assert.equal(resumed.code, 0, `frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
   assert.equal(resumed.frames.filter(frame => frame.type === 'tool_call').length, 1)
+  const recoveryActivities = resumed.frames.filter(frame => frame.type === 'agent_activity' && frame.phase === 'tool' &&
+    frame.activity_id === 'call_interrupted_1')
+  assert.deepEqual(recoveryActivities.map(frame => frame.state), ['started', 'waiting', 'completed'])
   assert.equal(resumed.modelCalls, 1)
   assert.ok(resumed.frames.findIndex(frame => frame.type === 'tool_call') < resumed.frames.findIndex(frame => frame.type === 'model'))
   const recoveryResults = resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)
@@ -4438,12 +4968,23 @@ function checkpointPage(request, page) {
     from_seq: page.from_seq, through_seq: page.through_seq, payload: page.payload, sha256: page.sha256 }
 }
 
-async function resumeSession(pages, { alterStart = value => value, alterPage = value => value, stopRead = false, refuseCheckpoint = false, withholdToolResult = false, onToolCall, onChildCreate, onModel, checkpointPagesBySession, tools = [], deliveries = [] } = {}) {
+async function resumeSession(pages, { alterStart = value => value, alterPage = value => value, stopRead = false, refuseCheckpoint = false,
+  withholdToolResult = false, holdResponsesUntilWaiting = false, onToolCall, onChildCreate, onModel, checkpointPagesBySession,
+  tools = [], deliveries = [] } = {}) {
   const emitted = []
   const offsets = []
   const modelRequests = []
   const sentToolResults = []
   const sentChildSessions = []
+  const waitingResponses = new Map()
+  const activityKey = (sessionID, phase, activityID) => `${sessionID}\0${phase}\0${activityID}`
+  const respondForActivity = (frame, phase, activityID, response) => {
+    if (!holdResponsesUntilWaiting) {
+      response()
+      return
+    }
+    waitingResponses.set(activityKey(frame.session_id, phase, activityID), response)
+  }
   let modelCalls = 0
   const { child, frames } = launch((frame, proc) => {
     if (frame.type === 'ready') {
@@ -4463,7 +5004,8 @@ async function resumeSession(pages, { alterStart = value => value, alterPage = v
         proc.stdin.end()
         return
       }
-      send(proc, alterPage(checkpointPage(frame, page)))
+      respondForActivity(frame, 'checkpoint', `checkpoint_read_${frame.from_seq}`,
+        () => send(proc, alterPage(checkpointPage(frame, page))))
     }
     if (frame.type === 'checkpoint') {
       emitted.push(frame)
@@ -4477,23 +5019,36 @@ async function resumeSession(pages, { alterStart = value => value, alterPage = v
       const result = onToolCall?.(frame, proc)
       if (result === null) return
       const resolved = result ?? { status: 'succeeded', output: 'reconciled output' }
-      sentToolResults.push({ call_id: frame.call_id, status: resolved.status, output: resolved.output })
-      send(proc, {
-        type: 'tool_result', id: frame.id, task_id: frame.task_id, owner_id: frame.owner_id,
-        agent_id: frame.agent_id, generation: frame.generation, authorization_version: frame.authorization_version,
-        session_id: frame.session_id, call_id: frame.call_id, status: resolved.status, output: resolved.output,
-        ...(resolved.images === undefined ? {} : { images: resolved.images }),
+      respondForActivity(frame, 'tool', frame.call_id, () => {
+        sentToolResults.push({ call_id: frame.call_id, status: resolved.status, output: resolved.output })
+        send(proc, {
+          type: 'tool_result', id: frame.id, task_id: frame.task_id, owner_id: frame.owner_id,
+          agent_id: frame.agent_id, generation: frame.generation, authorization_version: frame.authorization_version,
+          session_id: frame.session_id, call_id: frame.call_id, status: resolved.status, output: resolved.output,
+          ...(resolved.images === undefined ? {} : { images: resolved.images }),
+        })
       })
     }
     if (frame.type === 'child_create') {
       const result = onChildCreate?.(frame, proc)
       if (result) {
-        sentChildSessions.push(result)
-        send(proc, result)
+        respondForActivity(frame, 'subagent', frame.call_id, () => {
+          sentChildSessions.push(result)
+          send(proc, result)
+        })
       }
     }
     if (frame.type === 'child_settle') {
-      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+      respondForActivity(frame, 'subagent', frame.call_id,
+        () => send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true }))
+    }
+    if (frame.type === 'agent_activity' && frame.state === 'waiting') {
+      const key = activityKey(frame.session_id, frame.phase, frame.activity_id)
+      const respond = waitingResponses.get(key)
+      if (respond) {
+        waitingResponses.delete(key)
+        respond()
+      }
     }
     if (frame.type === 'model_cancel') {
       send(proc, { type: 'model_end', id: frame.id, ok: false })

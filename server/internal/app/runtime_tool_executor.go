@@ -352,6 +352,7 @@ func (e *RuntimeToolExecutor) hasCurrentRuntimeToolApproval(ctx context.Context,
 	pending := details.PendingRequest
 	if pending == nil || pending.TaskID != current.ID || pending.Kind != "approval" || pending.ID != decision.PendingID ||
 		pending.Version != decision.Version || pending.CallID != request.Call.CallID || pending.ToolName != request.Call.Name ||
+		pending.TaskRevision == nil || current.CurrentRevision == nil || *pending.TaskRevision != *current.CurrentRevision ||
 		!bytes.Equal(pending.RequestHash, hash[:]) || !bytes.Equal(decision.RequestHash, hash[:]) {
 		return false, domain.NewError(domain.CodeForbidden, "Host action approval does not match this exact tool call")
 	}

@@ -563,6 +563,39 @@ func TestTaskResponseIncludesBatchAttemptAndArtifactAssociation(t *testing.T) {
 	}
 }
 
+func TestTaskResponseProjectsOnlyValidAgentActivityPair(t *testing.T) {
+	value := app.TaskDetails{Task: apiTestTask(), Agents: []app.TaskAgentExecution{{
+		ID: "session01", TaskRevision: 1, Role: "main", Status: "running", ActivityPhase: "tool", ActivityState: "waiting",
+	}}}
+	view, err := toTaskResponse(value)
+	if err != nil || len(view.Agents) != 1 || view.Agents[0].ActivityPhase == nil || *view.Agents[0].ActivityPhase != "tool" ||
+		view.Agents[0].ActivityState == nil || *view.Agents[0].ActivityState != "waiting" {
+		t.Fatalf("current waiting agent activity response = %#v, err=%v", view.Agents, err)
+	}
+	encoded, err := json.Marshal(view)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"activity_phase":"tool"`) || !strings.Contains(string(encoded), `"activity_state":"waiting"`) ||
+		strings.Contains(string(encoded), "activity_id") {
+		t.Fatalf("agent activity JSON has unexpected fields: %s", encoded)
+	}
+
+	value.Agents[0].ActivityPhase, value.Agents[0].ActivityState = "", ""
+	view, err = toTaskResponse(value)
+	if err != nil || len(view.Agents) != 1 || view.Agents[0].ActivityPhase != nil || view.Agents[0].ActivityState != nil {
+		t.Fatalf("unknown agent activity should be omitted: %#v, err=%v", view.Agents, err)
+	}
+
+	for _, pair := range [][2]string{{"tool", ""}, {"", "waiting"}, {"unknown", "waiting"}, {"tool", "unknown"}} {
+		value.Agents[0].ActivityPhase, value.Agents[0].ActivityState = pair[0], pair[1]
+		invalidView, err := toTaskResponse(value)
+		if err != nil || len(invalidView.Agents) != 1 || invalidView.Agents[0].ActivityPhase != nil || invalidView.Agents[0].ActivityState != nil {
+			t.Errorf("invalid activity pair (%q,%q) was not omitted together: agents=%#v err=%v", pair[0], pair[1], invalidView.Agents, err)
+		}
+	}
+}
+
 func TestTaskResponseIncludesVerifiedArtifactWorkspaceProof(t *testing.T) {
 	now := time.Now().UTC()
 	current := apiTestTask()

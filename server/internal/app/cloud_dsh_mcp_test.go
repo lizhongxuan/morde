@@ -75,7 +75,10 @@ func (s *cloudDSHMCPStoreStub) PrepareMCPConnectorOperation(_ context.Context, v
 		s.operations = make(map[string]MCPConnectorOperation)
 	}
 	if stored, ok := s.operations[value.Key]; ok {
-		if stored.ConnectorID != value.ConnectorID || stored.ToolName != value.ToolName || !bytes.Equal(stored.RequestHash, value.RequestHash) {
+		if stored.ConnectorID != value.ConnectorID || stored.ToolName != value.ToolName || !bytes.Equal(stored.RequestHash, value.RequestHash) ||
+			!sameMCPTaskRevision(stored.TaskRevision, value.TaskRevision) || stored.CallID != value.CallID ||
+			stored.ApprovalID != value.ApprovalID || stored.ApprovalVersion != value.ApprovalVersion ||
+			!bytes.Equal(stored.ApprovalRequestHash, value.ApprovalRequestHash) {
 			return MCPConnectorOperation{}, false, domain.NewError(domain.CodeIdempotencyConflict, "request changed")
 		}
 		if stored.Status == task.OperationPrepared {

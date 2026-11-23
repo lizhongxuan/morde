@@ -14,6 +14,7 @@ import (
 	"morde/server/internal/store/postgres/sqlcgen"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func (s *Store) GetOperation(ctx context.Context, ownerID, taskID, key string) (task.Operation, error) {
@@ -551,17 +552,41 @@ func validateCompletedTaskArtifacts(ctx context.Context, tx pgx.Tx, ownerID, tas
 
 func loadOwnedOperationByKey(ctx context.Context, tx pgx.Tx, ownerID, taskID, key string) (task.Operation, error) {
 	var row sqlcgen.TaskOperation
-	err := tx.QueryRow(ctx, `SELECT o.id, o.task_id, o.operation_key, o.request_hash, o.host_id, o.workspace_id, o.binding_version, o.input_revision, o.workspace_checkpoint_revision,
+	var taskRevision, approvalVersion pgtype.Int8
+	var callID, toolName, approvalID pgtype.Text
+	var approvalRequestHash []byte
+	err := tx.QueryRow(ctx, `SELECT o.id, o.task_id, o.operation_key, o.request_hash, o.task_revision, o.call_id, o.tool_name, o.approval_id, o.approval_version, o.approval_request_hash,
+o.host_id, o.workspace_id, o.binding_version, o.input_revision, o.workspace_checkpoint_revision,
 o.runtime_generation, o.runtime_instance_id, o.control_version, o.lease_version, o.runtime_lease_version, o.status, o.external_id, o.result, o.created_at, o.updated_at
 FROM task_operations o JOIN tasks t ON t.id=o.task_id
 WHERE t.owner_id=$1 AND o.task_id=$2 AND o.operation_key=$3`, ownerID, taskID, key).Scan(
-		&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID, &row.WorkspaceID, &row.BindingVersion, &row.InputRevision, &row.WorkspaceCheckpointRevision, &row.RuntimeGeneration,
+		&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &taskRevision, &callID, &toolName, &approvalID, &approvalVersion, &approvalRequestHash,
+		&row.HostID, &row.WorkspaceID, &row.BindingVersion, &row.InputRevision, &row.WorkspaceCheckpointRevision, &row.RuntimeGeneration,
 		&row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion, &row.RuntimeLeaseVersion, &row.Status,
 		&row.ExternalID, &row.Result, &row.CreatedAt, &row.UpdatedAt)
 	if err != nil {
 		return task.Operation{}, err
 	}
-	return taskOperationDomain(row), nil
+	operation := taskOperationDomain(row)
+	if taskRevision.Valid {
+		value := taskRevision.Int64
+		operation.TaskRevision = &value
+	}
+	if callID.Valid {
+		operation.CallID = callID.String
+	}
+	if toolName.Valid {
+		operation.ToolName = toolName.String
+	}
+	if approvalID.Valid {
+		operation.ApprovalID = approvalID.String
+	}
+	if approvalVersion.Valid {
+		value := approvalVersion.Int64
+		operation.ApprovalVersion = &value
+	}
+	operation.ApprovalRequestHash = append([]byte(nil), approvalRequestHash...)
+	return operation, nil
 }
 
 func loadOwnedTaskForUpdate(ctx context.Context, tx pgx.Tx, ownerID, taskID string) (sqlcgen.Task, error) {

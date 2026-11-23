@@ -47,7 +47,7 @@ func (s *Store) RespondToPendingRequest(ctx context.Context, record app.Idempote
 			return err
 		}
 		if err := tx.QueryRow(ctx, `SELECT status, lease_version, execution_epoch, COALESCE(workspace_id,''), initiator_id
-FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).Scan(&status, &leaseVersion, &taskEpoch, &workspaceID, &initiatorID); errors.Is(err, pgx.ErrNoRows) {
+FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, taskOwnerID).Scan(&status, &leaseVersion, &taskEpoch, &workspaceID, &initiatorID); errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		} else if err != nil {
 			return fmt.Errorf("lock task for pending response: %w", err)
@@ -94,9 +94,9 @@ FROM task_pending_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, pendingID, ta
 		if decision == task.PendingDecisionReject {
 			requestStatus = string(task.PendingRequestRejected)
 		}
-		updated, err := tx.Exec(ctx, `UPDATE task_pending_requests SET status=$3, decision=$4, responded_at=clock_timestamp()
+		updated, err := tx.Exec(ctx, `UPDATE task_pending_requests SET status=$3, decision=$4, responded_at=clock_timestamp(), responded_by_user_id=$5
 WHERE id=$1 AND task_id=$2 AND status='pending' AND (expires_at IS NULL OR expires_at > clock_timestamp())`,
-			pendingID, taskID, requestStatus, string(decision))
+			pendingID, taskID, requestStatus, string(decision), record.OwnerID)
 		if err != nil {
 			return fmt.Errorf("persist pending request decision: %w", err)
 		}
@@ -182,7 +182,7 @@ func (s *Store) ExpirePendingRequest(ctx context.Context, actorID, taskID, pendi
 		var leaseVersion int64
 		var leaseExpiresAt pgtype.Timestamptz
 		if err := tx.QueryRow(ctx, `SELECT status, waiting_reason, lease_version, COALESCE(workspace_id,''), initiator_id,
-lease_owner, lease_expires_at FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).
+lease_owner, lease_expires_at FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, taskOwnerID).
 			Scan(&taskStatus, &waitingReason, &leaseVersion, &workspaceID, &initiatorID, &leaseOwner, &leaseExpiresAt); errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		} else if err != nil {

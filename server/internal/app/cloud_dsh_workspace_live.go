@@ -201,10 +201,13 @@ func (t *cloudDSHWorkspaceTools) searchLive(ctx context.Context, current task.Ta
 }
 
 func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Task, call ModelToolCall, rawArguments json.RawMessage,
-	arguments cloudDSHWorkspaceWriteArguments) (AgentToolResult, error) {
+	arguments cloudDSHWorkspaceWriteArguments, approval *task.PendingRequest) (AgentToolResult, error) {
 	requestHash, err := agentOperationHash(call.Name, rawArguments)
 	if err != nil {
 		return AgentToolResult{}, err
+	}
+	if !hostlessWorkspaceWriteApprovalMatches(current, call, requestHash[:], approval) {
+		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeForbidden, "Workspace write approval does not match the current Task revision and tool call")), nil
 	}
 	operationKey := agentOperationKey(call.CallID)
 	findReceipt := func() (TaskWorkspacePublishReceipt, bool, error) {
@@ -215,7 +218,8 @@ func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Tas
 		if err != nil {
 			return TaskWorkspacePublishReceipt{}, false, err
 		}
-		if receipt.WorkspaceID != current.WorkspaceID || !receipt.DirectDirectorySource || receipt.RequestHash != hex.EncodeToString(requestHash[:]) || receipt.BaseRevision != arguments.ExpectedRevision {
+		if receipt.WorkspaceID != current.WorkspaceID || !receipt.DirectDirectorySource || receipt.RequestHash != hex.EncodeToString(requestHash[:]) ||
+			receipt.BaseRevision != arguments.ExpectedRevision || !taskWorkspacePublishReceiptMatchesApproval(receipt, call, approval) {
 			return TaskWorkspacePublishReceipt{}, false, domain.NewError(domain.CodeConflict, "Workspace operation key was reused with a different request")
 		}
 		return receipt, true, nil
@@ -233,6 +237,8 @@ func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Tas
 		ProjectID: current.ProjectID, InitiatorID: current.InitiatorID, WorkspaceOwnerID: taskWorkspaceOwner(current),
 		LeaseVersion: current.Lease.Version, InputRevision: *current.InputRevision, BaseRevision: arguments.ExpectedRevision,
 		InputManifestSHA256: hex.EncodeToString(current.ContextDigest), OperationKey: operationKey, RequestHash: requestHash[:],
+		TaskRevision: *approval.TaskRevision, CallID: approval.CallID, ToolName: approval.ToolName,
+		ApprovalID: approval.ID, ApprovalVersion: approval.Version, ApprovalRequestHash: append([]byte(nil), approval.RequestHash...),
 		DirectDirectorySource: true,
 	}
 	rejectConflict := func(message string) (AgentToolResult, error) {
@@ -296,7 +302,13 @@ func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Tas
 		return cloudDSHWorkspaceFailure(err), nil
 	}
 	if receipt.State != TaskWorkspacePublishPending {
+		if !taskWorkspacePublishReceiptMatchesApproval(receipt, call, approval) {
+			return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeConflict, "Workspace publish receipt approval binding changed")), nil
+		}
 		return cloudDSHWorkspaceReceiptResult(receipt, operationKey), nil
+	}
+	if !taskWorkspacePublishReceiptMatchesApproval(receipt, call, approval) {
+		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeConflict, "Workspace publish receipt approval binding changed")), nil
 	}
 	pendingReceipt = true
 	if !liveExists || liveFile.SHA256 != desiredSHA {
@@ -329,6 +341,9 @@ func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Tas
 			return cloudDSHWorkspaceReceiptResult(found, operationKey), nil
 		}
 		return cloudDSHWorkspaceFailure(err), nil
+	}
+	if !taskWorkspacePublishReceiptMatchesApproval(receipt, call, approval) {
+		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeConflict, "Workspace publish receipt approval binding changed")), nil
 	}
 	return cloudDSHWorkspaceReceiptResult(receipt, operationKey), nil
 }

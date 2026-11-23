@@ -1108,7 +1108,10 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	approvalCall := pendingApproval != nil && pendingApproval.CallID == call.CallID
 	if approvalCall && (pendingApproval.TaskID != current.ID || pendingApproval.Kind != "approval" || pendingApproval.ToolName != call.Name ||
+		(pendingApproval.Status != task.PendingRequestPending && pendingApproval.Status != task.PendingRequestApproved &&
+			pendingApproval.Status != task.PendingRequestRejected && pendingApproval.Status != task.PendingRequestExpired) ||
 		!bytes.Equal(pendingApproval.RequestHash, hash[:]) ||
+		pendingApproval.TaskRevision == nil || current.CurrentRevision == nil || *pendingApproval.TaskRevision != *current.CurrentRevision ||
 		(pendingApproval.Status == task.PendingRequestApproved && pendingApproval.Decision != task.PendingDecisionApprove) ||
 		((pendingApproval.Status == task.PendingRequestRejected || pendingApproval.Status == task.PendingRequestExpired) && pendingApproval.Decision != task.PendingDecisionReject) ||
 		(pendingApproval.Status == task.PendingRequestExpired && (pendingApproval.ExpiresAt == nil || pendingApproval.RespondedAt == nil || pendingApproval.RespondedAt.Before(*pendingApproval.ExpiresAt)))) {
@@ -1197,6 +1200,14 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if preparation.Status != AgentToolReady || !sameAgentControlFence(preparation.Fence, fence) {
 		return b.failBeforeDispatch(ctx, current, step, usage, call.Name, domain.NewError(domain.CodeInvalidState, "Host control fence changed"))
 	}
+	if runtimeToolRisk(call.Name, arguments) == runtimeToolRiskSensitive && request.Approval == nil {
+		return b.failBeforeDispatch(ctx, current, step, usage, call.Name,
+			domain.NewError(domain.CodeForbidden, "sensitive Host action has no exact approval binding"))
+	}
+	if current.CurrentRevision == nil || *current.CurrentRevision < 0 {
+		return b.failBeforeDispatch(ctx, current, step, usage, call.Name,
+			domain.NewError(domain.CodeInvalidState, "Task revision is unavailable for Host operation binding"))
+	}
 	request.Fence, request.WorkspaceID = preparation.Fence, preparation.WorkspaceID
 	operationID, err := domain.NewOperationID()
 	if err != nil {
@@ -1206,14 +1217,22 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if preparation.WorkspaceID != "" {
 		inputRevision = current.InputRevision
 	}
-	operation, replayed, err := b.store.CreateOperation(ctx, task.Operation{
+	operationValue := task.Operation{
 		ID: operationID, TaskID: current.ID, Key: request.OperationKey, RequestHash: hash[:], HostID: current.HostID,
+		TaskRevision: current.CurrentRevision, CallID: call.CallID, ToolName: call.Name,
 		WorkspaceID: preparation.WorkspaceID, BindingVersion: preparation.BindingVersion,
 		InputRevision: inputRevision, WorkspaceCheckpointRevision: current.WorkspaceCheckpointRevision,
 		RuntimeGeneration: request.Fence.RuntimeGeneration, RuntimeInstanceID: request.Fence.RuntimeInstanceID,
 		ControlVersion: request.Fence.ControlVersion, LeaseVersion: current.Lease.Version,
 		RuntimeLeaseVersion: current.Lease.Version, Status: task.OperationPrepared,
-	}, current.Lease.Owner)
+	}
+	if request.Approval != nil {
+		approvalVersion := request.Approval.Version
+		operationValue.ApprovalID = request.Approval.PendingID
+		operationValue.ApprovalVersion = &approvalVersion
+		operationValue.ApprovalRequestHash = append([]byte(nil), request.Approval.RequestHash...)
+	}
+	operation, replayed, err := b.store.CreateOperation(ctx, operationValue, current.Lease.Owner)
 	if err != nil {
 		if recoveryOperation {
 			return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "The stored tool operation could not be matched safely.")
@@ -1229,7 +1248,10 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if operation.ID == "" || operation.HostID != current.HostID || operation.WorkspaceID != preparation.WorkspaceID ||
 		operation.BindingVersion != preparation.BindingVersion || !sameTaskInputRevision(operation.InputRevision, inputRevision) ||
 		!operationWorkspaceCheckpointMatches(operation, current) ||
-		!bytes.Equal(operation.RequestHash, hash[:]) {
+		!bytes.Equal(operation.RequestHash, hash[:]) || operation.TaskRevision == nil ||
+		*operation.TaskRevision != *current.CurrentRevision || operation.CallID != call.CallID || operation.ToolName != call.Name ||
+		operation.ApprovalID != operationValue.ApprovalID || !sameTaskInputRevision(operation.ApprovalVersion, operationValue.ApprovalVersion) ||
+		!bytes.Equal(operation.ApprovalRequestHash, operationValue.ApprovalRequestHash) {
 		return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "The stored tool operation does not match this exact request.")
 	}
 	request.OperationID = operation.ID
@@ -1933,6 +1955,9 @@ func (b *CloudDSHToolBroker) failBeforeDispatch(ctx context.Context, current tas
 }
 
 func (b *CloudDSHToolBroker) pauseForApproval(ctx context.Context, current task.Task, step task.Step, usage task.Usage, request AgentToolRequest, hash []byte, preparation AgentToolPreparation, previous *task.PendingRequest) (AgentToolResult, error) {
+	if current.CurrentRevision == nil || *current.CurrentRevision < 0 {
+		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "Task revision is unavailable for Host approval binding")
+	}
 	version := int64(1)
 	if previous != nil {
 		version = previous.Version + 1
@@ -1941,6 +1966,8 @@ func (b *CloudDSHToolBroker) pauseForApproval(ctx context.Context, current task.
 	if err != nil {
 		return AgentToolResult{}, err
 	}
+	revision := *current.CurrentRevision
+	pending.TaskRevision = &revision
 	step.Status, step.Summary = task.StepWaitingUser, preparation.Approval.Content
 	if !strings.HasPrefix(step.Title, "Run cloud dsh MCP tool: ") {
 		step.Title = "Approval required: " + request.Call.Name

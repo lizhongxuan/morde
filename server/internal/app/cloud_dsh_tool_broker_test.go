@@ -748,7 +748,8 @@ func TestCloudDSHToolBrokerSensitiveApprovalResumesExactCallOnce(t *testing.T) {
 			len(fixture.store.operations), fixture.handlers["shell.exec"].calls.Load())
 	}
 	pending := store.details.PendingRequest
-	if pending == nil || pending.Status != task.PendingRequestPending || pending.CallID != call.CallID || pending.ToolName != call.Name {
+	if pending == nil || pending.Status != task.PendingRequestPending || pending.CallID != call.CallID || pending.ToolName != call.Name ||
+		pending.TaskRevision == nil || store.details.Task.CurrentRevision == nil || *pending.TaskRevision != *store.details.Task.CurrentRevision {
 		t.Fatalf("sensitive call was not bound to a pending approval: %#v", pending)
 	}
 	if !strings.Contains(pending.Content, `"command":"echo approved"`) || strings.Contains(pending.Content, `"workspace_id"`) {
@@ -763,6 +764,13 @@ func TestCloudDSHToolBrokerSensitiveApprovalResumesExactCallOnce(t *testing.T) {
 	if store.details.Task.Usage.ToolCalls != 1 || fixture.handlers["shell.exec"].calls.Load() != 1 {
 		t.Fatalf("approved resume was not once-only: usage=%+v dispatches=%d", store.details.Task.Usage,
 			fixture.handlers["shell.exec"].calls.Load())
+	}
+	operation, ok := fixture.store.operations[agentOperationKey(call.CallID)]
+	if !ok || operation.TaskRevision == nil || *operation.TaskRevision != *store.details.Task.CurrentRevision ||
+		operation.CallID != call.CallID || operation.ToolName != call.Name || operation.ApprovalID != pending.ID ||
+		operation.ApprovalVersion == nil || *operation.ApprovalVersion != pending.Version ||
+		!bytes.Equal(operation.RequestHash, pending.RequestHash) || !bytes.Equal(operation.ApprovalRequestHash, pending.RequestHash) {
+		t.Fatalf("dispatched operation lost exact Task/approval identity: operation=%#v pending=%#v", operation, pending)
 	}
 }
 

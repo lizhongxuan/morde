@@ -34,6 +34,12 @@ func TestPostgresTaskAgentActivityIsOrderedAndFenced(t *testing.T) {
 	if accepted, err := record(3, "running"); err != nil || !accepted {
 		t.Fatalf("record running status: accepted=%t err=%v", accepted, err)
 	}
+	if accepted, err := f.store.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
+		Fence: lease.Fence, AgentSessionID: lease.Fence.AgentSessionID, TaskRevision: taskRevision,
+		Kind: app.TaskAgentActivityKindActivity, Phase: "tool", State: "waiting", ActivityID: "call_sensitive", ObservationSequence: 4,
+	}); err != nil || !accepted {
+		t.Fatalf("record waiting tool activity: accepted=%t err=%v", accepted, err)
+	}
 	if accepted, err := record(2, "idle"); err != nil || accepted {
 		t.Fatalf("out-of-order status was not ignored: accepted=%t err=%v", accepted, err)
 	}
@@ -43,8 +49,15 @@ func TestPostgresTaskAgentActivityIsOrderedAndFenced(t *testing.T) {
 WHERE task_id=$1 AND session_id=$2`, lease.Fence.TaskID, lease.Fence.AgentSessionID).Scan(&status, &sequence); err != nil {
 		t.Fatal(err)
 	}
-	if status != "running" || sequence != 3 {
-		t.Fatalf("stored activity=(%s,%d), want (running,3)", status, sequence)
+	if status != "running" || sequence != 4 {
+		t.Fatalf("stored activity=(%s,%d), want (running,4)", status, sequence)
+	}
+	details, err := f.store.GetTask(ctx, lease.Fence.TaskID, lease.Fence.OwnerID)
+	if err != nil {
+		t.Fatalf("load task with current waiting activity: %v", err)
+	}
+	if len(details.Agents) == 0 || details.Agents[0].ActivityPhase != "tool" || details.Agents[0].ActivityState != "waiting" {
+		t.Fatalf("current waiting activity was not projected: %+v", details.Agents)
 	}
 	var events int
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_events
@@ -63,7 +76,7 @@ WHERE task_id=$1 AND event_type='task.step' AND payload->>'phase'='agent_status'
 	} {
 		accepted, err := f.store.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
 			Fence: fence, AgentSessionID: lease.Fence.AgentSessionID, TaskRevision: taskRevision,
-			Kind: app.TaskAgentActivityKindStatus, Status: "idle", ObservationSequence: 4,
+			Kind: app.TaskAgentActivityKindStatus, Status: "idle", ObservationSequence: 5,
 		})
 		if err != nil || accepted {
 			t.Fatalf("accepted %s activity fence: accepted=%t err=%v", name, accepted, err)
@@ -73,15 +86,46 @@ WHERE task_id=$1 AND event_type='task.step' AND payload->>'phase'='agent_status'
 WHERE task_id=$1 AND agent_generation=$2`, lease.Fence.TaskID, lease.Fence.AgentGeneration, time.Now().UTC().Add(-time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if accepted, err := record(4, "idle"); err != nil || accepted {
+	if accepted, err := record(5, "idle"); err != nil || accepted {
 		t.Fatalf("expired agent lease accepted activity: accepted=%t err=%v", accepted, err)
 	}
-	details, err := f.store.GetTask(ctx, lease.Fence.TaskID, lease.Fence.OwnerID)
+	details, err = f.store.GetTask(ctx, lease.Fence.TaskID, lease.Fence.OwnerID)
 	if err != nil {
 		t.Fatalf("load task after agent lease expiry: %v", err)
 	}
-	if len(details.Agents) == 0 || details.Agents[0].Status != "unknown" || details.Agents[0].ObservedAt != nil {
+	if len(details.Agents) == 0 || details.Agents[0].Status != "unknown" || details.Agents[0].ObservedAt != nil ||
+		details.Agents[0].ActivityPhase != "" || details.Agents[0].ActivityState != "" {
 		t.Fatalf("expired agent activity was presented as live: %+v", details.Agents)
+	}
+}
+
+func TestPostgresTaskAgentActivityProjectionRequiresCurrentRevision(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	lease, _, err := f.service.Start(ctx, f.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var taskRevision int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, lease.Fence.TaskID).Scan(&taskRevision); err != nil {
+		t.Fatal(err)
+	}
+	if accepted, err := f.store.RecordTaskAgentActivity(ctx, app.TaskAgentActivityObservation{
+		Fence: lease.Fence, AgentSessionID: lease.Fence.AgentSessionID, TaskRevision: taskRevision,
+		Kind: app.TaskAgentActivityKindActivity, Phase: "tool", State: "waiting", ActivityID: "call_sensitive", ObservationSequence: 1,
+	}); err != nil || !accepted {
+		t.Fatalf("record current waiting tool activity: accepted=%t err=%v", accepted, err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE task_agent_sessions SET activity_revision=CASE WHEN activity_revision=0 THEN 1 ELSE activity_revision-1 END
+WHERE task_id=$1 AND session_id=$2`, lease.Fence.TaskID, lease.Fence.AgentSessionID); err != nil {
+		t.Fatal(err)
+	}
+	details, err := f.store.GetTask(ctx, lease.Fence.TaskID, lease.Fence.OwnerID)
+	if err != nil {
+		t.Fatalf("load task with stale activity revision: %v", err)
+	}
+	if len(details.Agents) == 0 || details.Agents[0].ActivityPhase != "" || details.Agents[0].ActivityState != "" {
+		t.Fatalf("untrusted activity revision was projected: %+v", details.Agents)
 	}
 }
 

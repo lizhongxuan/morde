@@ -199,7 +199,7 @@ func TestSelectedMCPActivityUsesResolvedToolAndReusesCallIdentity(t *testing.T) 
 	current := store.details.Task
 	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-mcp", 1, "session-root"
 	revision := int64(5)
-	current.CurrentRevision = &revision
+	current.CurrentRevision, current.DesiredRevision = &revision, &revision
 	current.Authorization.Version = 2
 	store.details.Task = current
 	claimed = current

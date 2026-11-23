@@ -24,7 +24,15 @@ func (s taskMediaApprovedSaveStoreStub) GetTaskMediaForApprovedSave(context.Cont
 
 type taskMediaPublishFailStore struct {
 	*syncServiceStore
-	failNext bool
+	failNext   bool
+	reserveErr error
+}
+
+func (s *taskMediaPublishFailStore) ReserveTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error) {
+	if s.reserveErr != nil {
+		return TaskWorkspacePublishReceipt{}, s.reserveErr
+	}
+	return s.syncServiceStore.ReserveTaskWorkspacePublish(ctx, value)
 }
 
 func (s *taskMediaPublishFailStore) CommitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File,
@@ -105,17 +113,60 @@ func TestTaskMediaApprovalBindingSeparatesLedgerIDAndBindsToolOperation(t *testi
 	}
 }
 
+func TestTaskMediaWorkspacePublishReceiptRequiresExactApprovalBinding(t *testing.T) {
+	taskRevision := int64(4)
+	requestHash := sha256.Sum256([]byte("approved media tool request"))
+	current := task.Task{ID: "q1234567", OwnerID: "u1234567", CurrentRevision: &taskRevision, DesiredRevision: &taskRevision}
+	pending := task.PendingRequest{ID: "r1234567", TaskID: current.ID, Version: 3, TaskRevision: &taskRevision,
+		CallID: "media-tool-call", ToolName: "morde_generate_video", RequestHash: requestHash[:]}
+	receipt := TaskWorkspacePublishReceipt{State: TaskWorkspacePublishSucceeded, TaskRevision: taskRevision,
+		CallID: pending.CallID, ToolName: pending.ToolName, ApprovalID: pending.ID, ApprovalVersion: pending.Version,
+		ApprovalRequestHash: hex.EncodeToString(requestHash[:])}
+	if !taskMediaWorkspacePublishReceiptMatches(current, pending, receipt) {
+		t.Fatal("exact approved Task media publish receipt did not match")
+	}
+	for _, mutate := range []func(*task.Task, *task.PendingRequest, *TaskWorkspacePublishReceipt){
+		func(_ *task.Task, _ *task.PendingRequest, value *TaskWorkspacePublishReceipt) { value.TaskRevision++ },
+		func(_ *task.Task, value *task.PendingRequest, _ *TaskWorkspacePublishReceipt) {
+			value.CallID = "different-call"
+		},
+		func(_ *task.Task, value *task.PendingRequest, _ *TaskWorkspacePublishReceipt) {
+			value.ToolName = "different_tool"
+		},
+		func(_ *task.Task, value *task.PendingRequest, _ *TaskWorkspacePublishReceipt) { value.ID = "r7654321" },
+		func(_ *task.Task, value *task.PendingRequest, _ *TaskWorkspacePublishReceipt) { value.Version++ },
+		func(_ *task.Task, value *task.PendingRequest, _ *TaskWorkspacePublishReceipt) {
+			different := sha256.Sum256([]byte("different request"))
+			value.RequestHash = different[:]
+		},
+		func(value *task.Task, _ *task.PendingRequest, _ *TaskWorkspacePublishReceipt) {
+			changed := *value.CurrentRevision + 1
+			value.CurrentRevision = &changed
+		},
+	} {
+		changedTask, changedPending, changedReceipt := current, pending, receipt
+		mutate(&changedTask, &changedPending, &changedReceipt)
+		if taskMediaWorkspacePublishReceiptMatches(changedTask, changedPending, changedReceipt) {
+			t.Errorf("receipt matched changed Task revision or approval identity: %#v %#v", changedPending, changedReceipt)
+		}
+	}
+}
+
 func TestApprovedTaskMediaWorkspaceConflictIsVisibleAndDiscardsPreview(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
 	fixture.executor.store = store
+	taskRevision := int64(0)
+	currentTask := store.details.Task
+	currentTask.CurrentRevision, currentTask.DesiredRevision = &taskRevision, &taskRevision
+	store.details.Task = currentTask
 
 	requestHash := sha256.Sum256([]byte("synthetic approved media request"))
 	mediaDigest := sha256.Sum256([]byte("png"))
 	pending := task.PendingRequest{
 		ID: "r1234567", TaskID: store.details.Task.ID, Version: 1, Kind: "approval",
 		CallID: "synthetic-media-call", MediaPreviewOperationID: "o1234567", ToolName: "morde_generate_image",
-		RequestHash: requestHash[:], Status: task.PendingRequestApproved, Decision: task.PendingDecisionApprove,
+		RequestHash: requestHash[:], TaskRevision: &taskRevision, Status: task.PendingRequestApproved, Decision: task.PendingDecisionApprove,
 	}
 	store.details.PendingRequest = &pending
 	inputTokens, outputTokens := int64(1), int64(0)
@@ -128,7 +179,10 @@ func TestApprovedTaskMediaWorkspaceConflictIsVisibleAndDiscardsPreview(t *testin
 		SHA256: mediaDigest[:], State: TaskMediaPreviewSaving, CleanupState: TaskMediaCleanupPending,
 	}
 	stagedStore := &taskMediaPublishStagedStoreStub{object: staged}
-	receiptStore := &taskMediaPublishReceiptStoreStub{receipt: TaskWorkspacePublishReceipt{State: TaskWorkspacePublishConflict}}
+	receiptStore := &taskMediaPublishReceiptStoreStub{receipt: TaskWorkspacePublishReceipt{
+		State: TaskWorkspacePublishConflict, TaskRevision: taskRevision, CallID: pending.CallID, ToolName: pending.ToolName,
+		ApprovalID: pending.ID, ApprovalVersion: pending.Version, ApprovalRequestHash: hex.EncodeToString(pending.RequestHash),
+	}}
 	fixture.executor.workspaces = &WorkspaceSyncService{store: receiptStore}
 	fixture.executor.mediaStore = stagedStore
 	fixture.executor.mediaSave = &TaskMediaSaveService{}
@@ -151,6 +205,9 @@ func TestApprovedTaskMediaWorkspaceConflictIsVisibleAndDiscardsPreview(t *testin
 func TestApprovedTaskMediaWritesLiveWorkspaceAndReplaysAfterCommitInterruption(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	current := fixture.store.details.Task
+	taskRevision := int64(0)
+	current.CurrentRevision, current.DesiredRevision = &taskRevision, &taskRevision
+	fixture.store.details.Task = current
 	stepID := "s1234567"
 	operationID := "o1234567"
 	requestHash := sha256.Sum256([]byte("approved media request"))
@@ -166,6 +223,7 @@ func TestApprovedTaskMediaWritesLiveWorkspaceAndReplaysAfterCommitInterruption(t
 	fixture.fence, fixture.fences.fence = runtimeFence, runtimeFence
 	pending := task.PendingRequest{ID: "r1234567", TaskID: current.ID, Version: 1, Kind: "approval",
 		CallID: "approved-media-call", MediaPreviewOperationID: operationID, ToolName: "morde_generate_image", RequestHash: requestHash[:],
+		TaskRevision:      &taskRevision,
 		RuntimeGeneration: runtimeFence.RuntimeGeneration, RuntimeInstanceID: runtimeFence.RuntimeInstanceID,
 		ControlVersion: runtimeFence.ControlVersion, Status: task.PendingRequestApproved, Decision: task.PendingDecisionApprove}
 	fixture.store.details.PendingRequest = &pending
@@ -181,7 +239,9 @@ func TestApprovedTaskMediaWritesLiveWorkspaceAndReplaysAfterCommitInterruption(t
 	if !ok {
 		t.Fatalf("Workspace sync test store has type %T", service.store)
 	}
-	service.store = &taskMediaPublishFailStore{syncServiceStore: baseStore, failNext: true}
+	workspaceStore := &taskMediaPublishFailStore{syncServiceStore: baseStore, failNext: true,
+		reserveErr: domain.NewError(domain.CodeConflict, "approved media request changed")}
+	service.store = workspaceStore
 	service.liveDirectorySource = true
 	liveDirectory := &countingLiveWorkspaceDirectory{cloudDSHLiveWorkspaceDirectory: cloudDSHLiveWorkspaceDirectory{root: t.TempDir()}}
 	if err := service.SetWorkspaceCurrentDirectory(liveDirectory); err != nil {
@@ -203,6 +263,13 @@ func TestApprovedTaskMediaWritesLiveWorkspaceAndReplaysAfterCommitInterruption(t
 		t.Fatal(err)
 	}
 
+	if _, err := fixture.executor.SaveApprovedTaskMedia(context.Background(), current, pending, stepID); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("save with rejected approval reservation error = %v; want conflict", err)
+	}
+	if liveDirectory.writes != 0 {
+		t.Fatalf("live Workspace writes before approved reservation = %d; want zero", liveDirectory.writes)
+	}
+	workspaceStore.reserveErr = nil
 	if _, err := fixture.executor.SaveApprovedTaskMedia(context.Background(), current, pending, stepID); err == nil || err.Error() != "simulated commit interruption" {
 		t.Fatalf("first save error = %v; want simulated commit interruption", err)
 	}

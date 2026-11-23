@@ -270,7 +270,8 @@ func (w *TaskValidationReviewWorker) reviewInput(ctx context.Context, claim app.
 				if step, ok := steps[artifact.StepID]; ok && taskValidationReviewStepMatches(step, claim.TaskID, claim.TaskRevision,
 					app.TaskValidationEvidenceResult, ref.Sequence) {
 					if ref.CallID != "" && app.SafeTaskValidationCallID(ref.CallID) == ref.CallID &&
-						validTaskValidationReviewArtifact(artifact, details.Task.WorkspaceID) {
+						validTaskValidationReviewArtifact(artifact, details.Task.WorkspaceID) &&
+						taskValidationReviewArtifactSourceMatches(details.Steps, claim.TaskID, claim.TaskRevision, ref.CallID) {
 						item.State = "artifact_metadata_only"
 						item.Artifact = &app.TaskValidationReviewArtifact{SourceCallID: ref.CallID, Label: artifact.Label, Path: artifact.Path,
 							MediaType: artifact.MediaType, SizeBytes: artifact.SizeBytes, Revision: artifact.Revision, SHA256: artifact.SHA256}
@@ -322,6 +323,25 @@ func taskValidationReviewStepMatches(step task.Step, taskID string, revision int
 		return *step.TaskRevision == revision
 	}
 	return kind == app.TaskValidationEvidenceResult && step.Kind == "result"
+}
+
+func taskValidationReviewArtifactSourceMatches(steps []task.Step, taskID string, revision int64, callID string) bool {
+	if callID == "" {
+		return false
+	}
+	var source task.Step
+	matches := 0
+	for _, step := range steps {
+		if step.TaskID != taskID || step.TaskRevision == nil || *step.TaskRevision != revision || step.ToolCallKey != callID {
+			continue
+		}
+		matches++
+		if matches > 1 {
+			return false
+		}
+		source = step
+	}
+	return matches == 1 && source.Sequence > 0 && source.Kind == "tool" && source.Status == task.StepSucceeded
 }
 
 func validTaskValidationReviewArtifact(artifact task.Artifact, taskWorkspaceID string) bool {

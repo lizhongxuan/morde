@@ -2188,6 +2188,20 @@
         "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "任務已綁定其他工作區，無法安全切換；請為新目標另行發起任務。" } }
       }
     },
+    "Checkpoint" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Prüfpunkt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Checkpoint" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Punto de control" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Point de contrôle" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "チェックポイント" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "체크포인트" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Контрольная точка" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "检查点" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "檢查點" } }
+      }
+    },
     "Choose a computer to continue this task" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -16105,6 +16119,20 @@
             "value" : "動態"
           }
         }
+      }
+    },
+    "Activity started" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Aktivität gestartet" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Activity started" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Actividad iniciada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Activité démarrée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "アクティビティを開始しました" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "활동 시작" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Активность началась" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "活动已开始" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "活動已開始" } }
       }
     },
     "Add" : {
@@ -179829,6 +179857,20 @@
             "value" : "正在等待其他任務完成..."
           }
         }
+      }
+    },
+    "Waiting for response" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Wartet auf eine Antwort" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Waiting for response" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Esperando una respuesta" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "En attente d’une réponse" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "応答を待っています" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "응답 대기 중" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Ожидание ответа" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "等待响应" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "等待回應" } }
       }
     },
     "Waiting for task quota" : {

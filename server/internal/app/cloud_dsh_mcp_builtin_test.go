@@ -27,7 +27,7 @@ func TestBuiltinSearchStepStoresEncryptedContentEvidenceForReview(t *testing.T) 
 	current := store.details.Task
 	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-review", 1, "session-review"
 	revision := int64(3)
-	current.CurrentRevision, current.Authorization.Version = &revision, 1
+	current.CurrentRevision, current.DesiredRevision, current.Authorization.Version = &revision, &revision, 1
 	store.details.Task = current
 	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
 	if err != nil {
@@ -242,7 +242,9 @@ func TestBuiltinSearchIsGrantedToHostlessTasksAndReplaysStoredResult(t *testing.
 		t.Fatalf("search recency filter was not forwarded exactly: got %s, want %s", client.lastRequest, call.Arguments)
 	}
 	stored := store.operations[agentOperationKey(call.CallID)]
-	if stored.ConnectorID != BuiltinSearchMCPConnectorID || stored.Status != task.OperationSucceeded || stored.GrantVersion != claimed.Authorization.Version {
+	if stored.ConnectorID != BuiltinSearchMCPConnectorID || stored.Status != task.OperationSucceeded || stored.GrantVersion != claimed.Authorization.Version ||
+		stored.TaskRevision == nil || claimed.CurrentRevision == nil || *stored.TaskRevision != *claimed.CurrentRevision ||
+		stored.CallID != call.CallID || stored.ApprovalID != "" || stored.ApprovalVersion != 0 || len(stored.ApprovalRequestHash) != 0 {
 		t.Fatalf("search operation was not bound to the task: %#v", stored)
 	}
 	checkpoint := dshToolResultText(result)

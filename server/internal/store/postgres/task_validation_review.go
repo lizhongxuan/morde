@@ -209,6 +209,12 @@ func loadTaskValidationVerdictFacts(ctx context.Context, tx pgx.Tx, taskID, resu
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1 FROM task_steps WHERE task_id=$1 AND (kind='tool' OR tool_name IS NOT NULL)
   UNION ALL SELECT 1 FROM task_operations WHERE task_id=$1
+  UNION ALL SELECT 1 FROM task_mcp_connector_operations WHERE task_id=$1
+  UNION ALL SELECT 1 FROM task_hub_operations WHERE task_id=$1
+  UNION ALL SELECT 1 FROM task_workspace_publish_receipts WHERE task_id=$1
+  UNION ALL SELECT 1 FROM task_sandbox_call_receipts WHERE task_id=$1
+  UNION ALL SELECT 1 FROM task_workspace_view_deletions WHERE task_id=$1
+  UNION ALL SELECT 1 FROM task_agent_request_reconciliations WHERE task_id=$1
   UNION ALL SELECT 1 FROM task_agent_sessions WHERE task_id=$1 AND parent_session_id IS NOT NULL
   UNION ALL SELECT 1 FROM task_artifacts WHERE task_id=$1
 ), EXISTS (SELECT 1 FROM task_clarification_requests WHERE task_id=$1)`, taskID).

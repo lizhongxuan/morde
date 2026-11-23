@@ -34,6 +34,32 @@ import (
 
 const taskWorkspacePublishRuntimeID = "ri_task_publish"
 
+func TestValidateTaskWorkspacePublishApprovalCommand(t *testing.T) {
+	unbound := app.TaskWorkspacePublishCommand{}
+	if err := validateTaskWorkspacePublishApprovalCommand(unbound); err != nil {
+		t.Fatalf("ordinary Workspace publish binding error = %v", err)
+	}
+	bound := app.TaskWorkspacePublishCommand{TaskRevision: 0, CallID: "media-call-1", ToolName: "morde_generate_image",
+		ApprovalID: "r1234567", ApprovalVersion: 1, ApprovalRequestHash: hashBytes("approval request")}
+	if err := validateTaskWorkspacePublishApprovalCommand(bound); err != nil {
+		t.Fatalf("complete media approval binding error = %v", err)
+	}
+	for _, mutate := range []func(*app.TaskWorkspacePublishCommand){
+		func(value *app.TaskWorkspacePublishCommand) { value.ApprovalID = "" },
+		func(value *app.TaskWorkspacePublishCommand) { value.TaskRevision = -1 },
+		func(value *app.TaskWorkspacePublishCommand) { value.ApprovalVersion = 0 },
+		func(value *app.TaskWorkspacePublishCommand) { value.CallID = "" },
+		func(value *app.TaskWorkspacePublishCommand) { value.ToolName = "" },
+		func(value *app.TaskWorkspacePublishCommand) { value.ApprovalRequestHash = nil },
+	} {
+		invalid := bound
+		mutate(&invalid)
+		if err := validateTaskWorkspacePublishApprovalCommand(invalid); domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Errorf("invalid media approval binding error = %v; want invalid argument", err)
+		}
+	}
+}
+
 func newTaskWorkspacePublishTask(t *testing.T, ctx context.Context, store *Store, name string) (host.Host, workspace.Workspace, workspace.Binding, task.Task, app.TaskWorkspacePublishCommand) {
 	t.Helper()
 	owner := createPreRetirementTestUser(t, store, 3, 10_000, 20_000)
@@ -87,6 +113,329 @@ func newTaskWorkspacePublishTask(t *testing.T, ctx context.Context, store *Store
 		OperationKey: "task-workspace-publish:s1234567:" + workspaceValue.ID, RequestHash: requestHash[:],
 	}
 	return hostValue, workspaceValue, binding, claimed, command
+}
+
+func bindTaskWorkspacePublishApproval(t *testing.T, ctx context.Context, store *Store, command app.TaskWorkspacePublishCommand) app.TaskWorkspacePublishCommand {
+	return bindTaskWorkspacePublishApprovalForTool(t, ctx, store, command, "morde_generate_image")
+}
+
+func bindTaskWorkspacePublishApprovalForTool(t *testing.T, ctx context.Context, store *Store, command app.TaskWorkspacePublishCommand,
+	toolName string) app.TaskWorkspacePublishCommand {
+	t.Helper()
+	var taskRevision int64
+	if err := store.pool.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, command.TaskID).Scan(&taskRevision); err != nil {
+		t.Fatal(err)
+	}
+	approvalID := mustID(t, domain.NewPendingRequestID)
+	callID := "media-call-" + approvalID[1:]
+	approvalHash := hashBytes("approved media request:" + command.TaskID)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_pending_requests
+(id,task_id,version,kind,title,object,content,impact,call_id,tool_name,request_hash,task_revision,
+ runtime_generation,runtime_instance_id,control_version,status,decision,responded_by_user_id,responded_at)
+VALUES ($1,$2,1,'approval','Save generated media','Generated image','Save the approved image to the Workspace',
+	'Creates one Task Workspace artifact',$3,$4,$5,$6,0,'workspace-publish-test',0,'approved','approve',$7,clock_timestamp())`,
+		approvalID, command.TaskID, callID, toolName, approvalHash, taskRevision, command.OwnerID); err != nil {
+		t.Fatalf("insert approved Task media request: %v", err)
+	}
+	command.TaskRevision, command.CallID, command.ToolName = taskRevision, callID, toolName
+	command.ApprovalID, command.ApprovalVersion = approvalID, 1
+	command.ApprovalRequestHash = append([]byte(nil), approvalHash...)
+	return command
+}
+
+func TestTaskWorkspacePublishMediaApprovalBindingIsExactAndRecheckedAtCommit(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	_, workspaceValue, _, claimed, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-media-approval")
+	command = bindTaskWorkspacePublishApproval(t, ctx, store, command)
+	service, _ := taskWorkspacePublishTestService(t, store)
+	content := []byte("approved media bytes")
+	file := syncTestFile("morde-media-approved.png", content)
+	files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
+
+	receipt, err := service.ReserveTaskWorkspacePublish(ctx, command)
+	if err != nil || receipt.State != app.TaskWorkspacePublishPending || receipt.TaskRevision != command.TaskRevision ||
+		receipt.CallID != command.CallID || receipt.ToolName != command.ToolName || receipt.ApprovalID != command.ApprovalID ||
+		receipt.ApprovalVersion != command.ApprovalVersion || receipt.ApprovalRequestHash != hex.EncodeToString(command.ApprovalRequestHash) {
+		t.Fatalf("reserve approved media publish = %#v, %v", receipt, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*app.TaskWorkspacePublishCommand)
+	}{
+		{name: "wrong approval id", mutate: func(value *app.TaskWorkspacePublishCommand) { value.ApprovalID = mustID(t, domain.NewPendingRequestID) }},
+		{name: "wrong approval version", mutate: func(value *app.TaskWorkspacePublishCommand) { value.ApprovalVersion++ }},
+		{name: "wrong approval hash", mutate: func(value *app.TaskWorkspacePublishCommand) {
+			value.ApprovalRequestHash = hashBytes("different approved request")
+		}},
+		{name: "wrong task revision", mutate: func(value *app.TaskWorkspacePublishCommand) { value.TaskRevision++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wrong := command
+			test.mutate(&wrong)
+			if _, err := store.ReserveTaskWorkspacePublish(ctx, wrong); domain.CodeOf(err) != domain.CodeConflict {
+				t.Fatalf("mismatched media approval reservation error = %v; want conflict", err)
+			}
+		})
+	}
+
+	committed, err := service.CommitTaskWorkspacePublish(ctx, command, files, nil, directories, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
+		if digest != file.SHA256 {
+			return nil, domain.NewError(domain.CodeNotFound, "unexpected media Workspace block")
+		}
+		return append([]byte(nil), content...), nil
+	})
+	if err != nil || committed.State != app.TaskWorkspacePublishSucceeded || committed.PublishedRevision != workspaceValue.Revision+1 ||
+		committed.ApprovalID != command.ApprovalID || committed.ApprovalRequestHash != hex.EncodeToString(command.ApprovalRequestHash) {
+		t.Fatalf("commit exact approved media publish = %#v, %v", committed, err)
+	}
+	replayed, err := store.ReserveTaskWorkspacePublish(ctx, command)
+	if err != nil || replayed.State != app.TaskWorkspacePublishSucceeded || replayed.ApprovalID != command.ApprovalID ||
+		replayed.ApprovalRequestHash != hex.EncodeToString(command.ApprovalRequestHash) {
+		t.Fatalf("exact approved media receipt replay = %#v, %v", replayed, err)
+	}
+
+	wrongReplay := command
+	wrongReplay.ApprovalRequestHash = hashBytes("replay with another approval hash")
+	if _, err := store.ReserveTaskWorkspacePublish(ctx, wrongReplay); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("mismatched media publish replay error = %v; want conflict", err)
+	}
+
+	if err := store.RespondToPendingRequest(ctx, app.IdempotencyRecord{
+		OwnerID: command.OwnerID, Operation: "task.pending.respond", Key: "media-approval-post-publish",
+		RequestHash: hashBytes("reject:" + command.ApprovalID), ResourceID: command.TaskID, RelatedID: command.ApprovalID,
+	}, command.TaskID, command.ApprovalID, command.ApprovalVersion, task.PendingDecisionReject); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("already approved media request was answered twice: %v", err)
+	}
+	if claimed.ID != command.TaskID {
+		t.Fatalf("publish command Task = %q; fixture Task = %q", command.TaskID, claimed.ID)
+	}
+}
+
+func TestTaskWorkspacePublishHostlessWriteApprovalBindingRejectsMissingOrChangedReplay(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	_, workspaceValue, _, claimed, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-hostless-write-approval")
+	command = bindTaskWorkspacePublishApprovalForTool(t, ctx, store, command, app.CloudDSHWorkspaceWriteToolName)
+	service, _ := taskWorkspacePublishTestService(t, store)
+	content := []byte("approved Hostless Workspace write")
+	file := syncTestFile("reports/hostless-approved.txt", content)
+	files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
+
+	receipt, err := service.ReserveTaskWorkspacePublish(ctx, command)
+	if err != nil || receipt.State != app.TaskWorkspacePublishPending || receipt.TaskRevision != command.TaskRevision ||
+		receipt.CallID != command.CallID || receipt.ToolName != app.CloudDSHWorkspaceWriteToolName || receipt.ApprovalID != command.ApprovalID ||
+		receipt.ApprovalVersion != command.ApprovalVersion || receipt.ApprovalRequestHash != hex.EncodeToString(command.ApprovalRequestHash) {
+		t.Fatalf("reserve approved Hostless Workspace write = %#v, %v", receipt, err)
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*app.TaskWorkspacePublishCommand)
+	}{
+		{name: "missing binding", mutate: func(value *app.TaskWorkspacePublishCommand) {
+			value.TaskRevision, value.CallID, value.ToolName, value.ApprovalID, value.ApprovalVersion = 0, "", "", "", 0
+			value.ApprovalRequestHash = nil
+		}},
+		{name: "changed CallID", mutate: func(value *app.TaskWorkspacePublishCommand) { value.CallID += "-changed" }},
+		{name: "changed tool", mutate: func(value *app.TaskWorkspacePublishCommand) { value.ToolName = "morde_workspace_read" }},
+		{name: "changed approval version", mutate: func(value *app.TaskWorkspacePublishCommand) { value.ApprovalVersion++ }},
+		{name: "changed approval hash", mutate: func(value *app.TaskWorkspacePublishCommand) {
+			value.ApprovalRequestHash = hashBytes("different Hostless approval")
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			wrong := command
+			test.mutate(&wrong)
+			if _, err := service.ReserveTaskWorkspacePublish(ctx, wrong); domain.CodeOf(err) != domain.CodeConflict && domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+				t.Fatalf("mismatched Hostless approval binding reserve error = %v; want conflict", err)
+			}
+		})
+	}
+
+	committed, err := service.CommitTaskWorkspacePublish(ctx, command, files, nil, directories, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
+		if digest != file.SHA256 {
+			return nil, domain.NewError(domain.CodeNotFound, "unexpected Hostless Workspace block")
+		}
+		return append([]byte(nil), content...), nil
+	})
+	if err != nil || committed.State != app.TaskWorkspacePublishSucceeded || committed.PublishedRevision != workspaceValue.Revision+1 ||
+		committed.TaskRevision != command.TaskRevision || committed.CallID != command.CallID ||
+		committed.ToolName != app.CloudDSHWorkspaceWriteToolName || committed.ApprovalID != command.ApprovalID ||
+		committed.ApprovalVersion != command.ApprovalVersion || committed.ApprovalRequestHash != hex.EncodeToString(command.ApprovalRequestHash) {
+		t.Fatalf("commit approved Hostless Workspace write = %#v, %v", committed, err)
+	}
+	replayed, err := service.ReserveTaskWorkspacePublish(ctx, command)
+	if err != nil || replayed.State != app.TaskWorkspacePublishSucceeded || replayed.ApprovalID != command.ApprovalID ||
+		replayed.ApprovalRequestHash != hex.EncodeToString(command.ApprovalRequestHash) {
+		t.Fatalf("exact Hostless Workspace approval replay = %#v, %v", replayed, err)
+	}
+
+	if _, err := store.pool.Exec(ctx, `UPDATE task_workspace_publish_receipts SET task_revision=NULL, call_id=NULL, tool_name=NULL,
+approval_id=NULL, approval_version=NULL, approval_request_hash=NULL WHERE task_id=$1 AND operation_key=$2`, command.TaskID, command.OperationKey); err != nil {
+		t.Fatalf("remove persisted approval binding: %v", err)
+	}
+	if _, err := service.ReserveTaskWorkspacePublish(ctx, command); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("replay after persisted Hostless approval binding was lost = %v; want conflict", err)
+	}
+	if claimed.ID != command.TaskID {
+		t.Fatalf("publish command Task = %q; fixture Task = %q", command.TaskID, claimed.ID)
+	}
+}
+
+func TestTaskWorkspacePublishRechecksMediaApprovalUnderCommitLock(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	_, workspaceValue, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-media-approval-recheck")
+	command = bindTaskWorkspacePublishApproval(t, ctx, store, command)
+	service, _ := taskWorkspacePublishTestService(t, store)
+	if receipt, err := service.ReserveTaskWorkspacePublish(ctx, command); err != nil || receipt.State != app.TaskWorkspacePublishPending {
+		t.Fatalf("reserve before approval change = %#v, %v", receipt, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET status='rejected',decision='reject',responded_at=clock_timestamp() WHERE id=$1`, command.ApprovalID); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("must not be published")
+	file := syncTestFile("morde-media-rejected.png", content)
+	files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
+	if _, err := service.CommitTaskWorkspacePublish(ctx, command, files, nil, directories, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
+		if digest != file.SHA256 {
+			return nil, domain.NewError(domain.CodeNotFound, "unexpected media Workspace block")
+		}
+		return append([]byte(nil), content...), nil
+	}); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("commit after approval changed error = %v; want conflict", err)
+	}
+	var revision int64
+	if err := store.pool.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1`, workspaceValue.ID).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	var receiptState string
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`, command.TaskID, command.OperationKey).Scan(&receiptState); err != nil {
+		t.Fatal(err)
+	}
+	if revision != workspaceValue.Revision || receiptState != string(app.TaskWorkspacePublishPending) {
+		t.Fatalf("changed approval applied publish: Workspace revision=%d want=%d receipt=%s", revision, workspaceValue.Revision, receiptState)
+	}
+}
+
+func TestTaskWorkspacePublishRequiresStableTaskRevisionAtReserveAndCommit(t *testing.T) {
+	for _, phase := range []string{"reserve", "commit"} {
+		t.Run(phase, func(t *testing.T) {
+			store, _ := newTemporaryStore(t)
+			ctx := context.Background()
+			_, workspaceValue, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-media-revision-"+phase)
+			command = bindTaskWorkspacePublishApproval(t, ctx, store, command)
+			service, _ := taskWorkspacePublishTestService(t, store)
+			if phase == "commit" {
+				if receipt, err := service.ReserveTaskWorkspacePublish(ctx, command); err != nil || receipt.State != app.TaskWorkspacePublishPending {
+					t.Fatalf("reserve before desired revision changed = %#v, %v", receipt, err)
+				}
+			}
+			if _, err := store.pool.Exec(ctx, `UPDATE tasks SET desired_revision=current_revision+1 WHERE id=$1`, command.TaskID); err != nil {
+				t.Fatal(err)
+			}
+			content := []byte("must not publish across Task revisions")
+			file := syncTestFile("morde-media-revision.png", content)
+			files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
+			if phase == "reserve" {
+				if _, err := service.ReserveTaskWorkspacePublish(ctx, command); domain.CodeOf(err) != domain.CodeConflict {
+					t.Fatalf("reserve while Task revision changes error = %v; want conflict", err)
+				}
+			} else if _, err := service.CommitTaskWorkspacePublish(ctx, command, files, nil, directories, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
+				if digest != file.SHA256 {
+					return nil, domain.NewError(domain.CodeNotFound, "unexpected media Workspace block")
+				}
+				return append([]byte(nil), content...), nil
+			}); domain.CodeOf(err) != domain.CodeConflict {
+				t.Fatalf("commit while Task revision changes error = %v; want conflict", err)
+			}
+			var revision int64
+			if err := store.pool.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1`, workspaceValue.ID).Scan(&revision); err != nil {
+				t.Fatal(err)
+			}
+			if revision != workspaceValue.Revision {
+				t.Fatalf("publish crossed Task revision transition: Workspace revision=%d want=%d", revision, workspaceValue.Revision)
+			}
+		})
+	}
+}
+
+func TestTaskWorkspacePublishRequiresApprovalResponderAtCommit(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	_, workspaceValue, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-media-responder-recheck")
+	command = bindTaskWorkspacePublishApproval(t, ctx, store, command)
+	service, _ := taskWorkspacePublishTestService(t, store)
+	if receipt, err := service.ReserveTaskWorkspacePublish(ctx, command); err != nil || receipt.State != app.TaskWorkspacePublishPending {
+		t.Fatalf("reserve before responder removed = %#v, %v", receipt, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET responded_by_user_id=NULL WHERE id=$1`, command.ApprovalID); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("must not publish without an approval responder")
+	file := syncTestFile("morde-media-no-responder.png", content)
+	files, directories, manifestSHA := taskWorkspacePublishSnapshot(t, []workspace.File{file}, nil)
+	if _, err := service.CommitTaskWorkspacePublish(ctx, command, files, nil, directories, manifestSHA, func(_ context.Context, digest string) ([]byte, error) {
+		if digest != file.SHA256 {
+			return nil, domain.NewError(domain.CodeNotFound, "unexpected media Workspace block")
+		}
+		return append([]byte(nil), content...), nil
+	}); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("commit without approval responder error = %v; want conflict", err)
+	}
+	var revision int64
+	if err := store.pool.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1`, workspaceValue.ID).Scan(&revision); err != nil {
+		t.Fatal(err)
+	}
+	if revision != workspaceValue.Revision {
+		t.Fatalf("publish without approval responder advanced Workspace revision to %d; want %d", revision, workspaceValue.Revision)
+	}
+}
+
+func TestTaskWorkspacePublishRejectsNonApprovedMediaBeforeReservationAndCommit(t *testing.T) {
+	for _, status := range []string{"rejected", "expired", "response-after-expiry", "missing-responder"} {
+		t.Run(status, func(t *testing.T) {
+			store, _ := newTemporaryStore(t)
+			ctx := context.Background()
+			_, workspaceValue, _, _, command := newTaskWorkspacePublishTask(t, ctx, store, "task-publish-media-"+status)
+			command = bindTaskWorkspacePublishApproval(t, ctx, store, command)
+			if status == "rejected" {
+				if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET status='rejected',decision='reject',responded_at=clock_timestamp() WHERE id=$1`, command.ApprovalID); err != nil {
+					t.Fatal(err)
+				}
+			} else if status == "expired" {
+				if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET status='expired',decision='reject',created_at=clock_timestamp()-interval '2 hours',
+expires_at=clock_timestamp()-interval '1 hour',responded_at=clock_timestamp() WHERE id=$1`, command.ApprovalID); err != nil {
+					t.Fatal(err)
+				}
+			} else if status == "response-after-expiry" {
+				if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET created_at=clock_timestamp()-interval '2 hours',
+expires_at=clock_timestamp()-interval '1 hour',responded_at=clock_timestamp() WHERE id=$1`, command.ApprovalID); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if _, err := store.pool.Exec(ctx, `UPDATE task_pending_requests SET responded_by_user_id=NULL WHERE id=$1`, command.ApprovalID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := store.ReserveTaskWorkspacePublish(ctx, command); domain.CodeOf(err) != domain.CodeConflict {
+				t.Fatalf("%s media approval reserve error = %v; want conflict", status, err)
+			}
+			var receiptCount int
+			if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_workspace_publish_receipts WHERE task_id=$1`, command.TaskID).Scan(&receiptCount); err != nil {
+				t.Fatal(err)
+			}
+			var revision int64
+			if err := store.pool.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1`, workspaceValue.ID).Scan(&revision); err != nil {
+				t.Fatal(err)
+			}
+			if receiptCount != 0 || revision != workspaceValue.Revision {
+				t.Fatalf("non-approved request created side effect: receipts=%d Workspace revision=%d want=%d", receiptCount, revision, workspaceValue.Revision)
+			}
+		})
+	}
 }
 
 func taskWorkspacePublishTestService(t *testing.T, store *Store) (*app.WorkspaceSyncService, *workspacefs.Store) {
@@ -535,26 +884,47 @@ VALUES ($1,$2,$3,1,0,1,$2)`, claimed.ID, claimed.OwnerID, connectorID); err != n
 	if _, err := store.ReserveTaskWorkspacePublish(ctx, command); err != nil {
 		t.Fatalf("reserve Task Workspace publish: %v", err)
 	}
-	operation := app.MCPConnectorOperation{
-		ID: mustID(t, domain.NewOperationID), TaskID: claimed.ID, OwnerID: claimed.OwnerID, ConnectorID: connectorID,
-		Key: "mcp-during-publish", ToolName: "search", ConnectorRevision: 1, GrantVersion: 1,
-		LeaseVersion: claimed.Lease.Version, HostID: hostValue.ID, WorkspaceID: workspaceValue.ID,
-		BindingVersion: binding.BindingVersion, InputRevision: claimed.InputRevision,
-		WorkspaceCheckpointRevision: claimed.WorkspaceCheckpointRevision, RequestHash: hashBytes("mcp-during-publish"),
+	var taskRevision int64
+	if err := store.pool.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1 AND current_revision=desired_revision`, claimed.ID).Scan(&taskRevision); err != nil {
+		t.Fatalf("read current Task revision for MCP publish barrier: %v", err)
 	}
+	newApprovedOperation := func(key string, approvalVersion int64) app.MCPConnectorOperation {
+		approvalID := mustID(t, domain.NewPendingRequestID)
+		callID := "mcp-call-" + approvalID[1:]
+		toolName := "search"
+		approvalHash := hashBytes("approved MCP barrier request:" + key)
+		if _, err := store.pool.Exec(ctx, `INSERT INTO task_pending_requests
+(id,task_id,version,kind,title,object,content,impact,call_id,tool_name,request_hash,task_revision,
+ runtime_generation,runtime_instance_id,control_version,status,decision,responded_by_user_id,responded_at,expires_at)
+VALUES ($1,$2,$3,'approval','Approve MCP action','Test connector','Synthetic MCP action',
+ 'External connector action',$4,$5,$6,$7,1,$8,1,'approved','approve',$9,clock_timestamp(),clock_timestamp()+interval '1 hour')`,
+			approvalID, claimed.ID, approvalVersion, callID, toolName, approvalHash, taskRevision,
+			"mcp-connector:"+connectorID, claimed.OwnerID); err != nil {
+			t.Fatalf("insert exact approved MCP barrier request: %v", err)
+		}
+		return app.MCPConnectorOperation{
+			ID: mustID(t, domain.NewOperationID), TaskID: claimed.ID, OwnerID: claimed.OwnerID, ConnectorID: connectorID,
+			Key: key, TaskRevision: &taskRevision, CallID: callID, ApprovalID: approvalID, ApprovalVersion: approvalVersion,
+			ApprovalRequestHash: approvalHash, ToolName: toolName, ConnectorRevision: 1, GrantVersion: 1,
+			LeaseVersion: claimed.Lease.Version, HostID: hostValue.ID, WorkspaceID: workspaceValue.ID,
+			BindingVersion: binding.BindingVersion, InputRevision: claimed.InputRevision,
+			WorkspaceCheckpointRevision: claimed.WorkspaceCheckpointRevision, RequestHash: hashBytes(key),
+		}
+	}
+	operation := newApprovedOperation("mcp-during-publish", 1)
 	if _, _, err := store.PrepareMCPConnectorOperation(ctx, operation, claimed.Lease.Owner); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
 		t.Fatalf("MCP prepare during Task Workspace publish = %v; want Workspace busy", err)
 	}
-	dispatch := operation
-	dispatch.ID, dispatch.Key = mustID(t, domain.NewOperationID), "mcp-dispatch-during-publish"
+	dispatch := newApprovedOperation("mcp-dispatch-during-publish", 2)
 	if _, err := store.pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
 (id,task_id,owner_id,connector_id,connector_revision,credential_version,grant_version,lease_version,
  host_id,workspace_id,binding_version,input_revision,workspace_checkpoint_revision,
- operation_key,tool_name,request_hash,status)
-VALUES ($1,$2,$3,$4,1,0,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,'prepared')`,
+	 task_revision,call_id,approval_id,approval_version,approval_request_hash,operation_key,tool_name,request_hash,status)
+VALUES ($1,$2,$3,$4,1,0,1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,'prepared')`,
 		dispatch.ID, dispatch.TaskID, dispatch.OwnerID, dispatch.ConnectorID, dispatch.LeaseVersion,
 		dispatch.HostID, dispatch.WorkspaceID, dispatch.BindingVersion, *dispatch.InputRevision,
-		*dispatch.WorkspaceCheckpointRevision, dispatch.Key, dispatch.ToolName, dispatch.RequestHash); err != nil {
+		*dispatch.WorkspaceCheckpointRevision, *dispatch.TaskRevision, dispatch.CallID, dispatch.ApprovalID,
+		dispatch.ApprovalVersion, dispatch.ApprovalRequestHash, dispatch.Key, dispatch.ToolName, dispatch.RequestHash); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.MarkMCPConnectorOperationDispatched(ctx, dispatch, claimed.Lease.Owner); domain.CodeOf(err) != domain.CodeWorkspaceBusy {

@@ -53,6 +53,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let taskMediaFixtureLaunchArgument = "-morde.localTaskMediaFixture"
     static let taskMediaCapabilityDisabledFixtureLaunchArgument = "-morde.localTaskMediaCapabilityDisabled"
     static let taskPagesFixtureLaunchArgument = "-morde.localTaskPagesFixture"
+    static let taskAgentActivityFixtureLaunchArgument = "-morde.localTaskAgentActivityFixture"
     static let taskK2FixtureLaunchArgument = "-morde.localTaskK2Fixture"
     static let approvalPollingFixtureLaunchArgument = "-morde.localApprovalPollingFixture"
     static let taskPagesStepCountsFixtureLaunchArgument = "-morde.localTaskPagesStepCountsFixture"
@@ -1498,6 +1499,37 @@ private final class MordeAuthURLProtocol: URLProtocol {
     }
 
     private static func taskPagesDetail(id: String) -> [String: Any]? {
+        if id == "q7654321",
+           ProcessInfo.processInfo.arguments.contains(Self.taskAgentActivityFixtureLaunchArgument) {
+            var task = taskPagesSummary(id: id, status: "running", objective: "Local agent activity fixture")
+            task["event_sequence"] = 2
+            task["result"] = NSNull()
+            task["current_step"] = "Agent activity is in progress"
+            task["waiting_reason"] = NSNull()
+            task["stop_request"] = NSNull()
+            task["pending_request"] = NSNull()
+            task["clarification_request"] = NSNull()
+            task["batch_items"] = []
+            task["agents"] = [
+                ["id": "main-session", "parent_id": NSNull(), "step_id": NSNull(),
+                 "task_revision": 1, "role": "main", "status": "running", "observed_at": NSNull(),
+                 "activity_phase": "model", "activity_state": "started"],
+                ["id": "subagent-session", "parent_id": "main-session", "step_id": "s7654322",
+                 "task_revision": 1, "role": "subagent", "status": "idle", "observed_at": NSNull(),
+                 "activity_phase": "tool", "activity_state": "waiting"],
+            ]
+            task["steps"] = [
+                ["id": "s7654321", "sequence": 1, "kind": "agent", "status": "running",
+                 "title": "Main agent response", "summary": "Local main agent is responding.",
+                 "created_at": "2026-11-23T00:00:01Z", "agent_id": "main-session", "task_revision": 1],
+                ["id": "s7654322", "sequence": 2, "kind": "tool", "status": "running",
+                 "title": "Wait for local tool result", "summary": "The subagent tool is waiting for its result.",
+                 "created_at": "2026-11-23T00:00:02Z", "agent_id": "subagent-session", "task_revision": 1,
+                 "phase": "tool"],
+            ]
+            task["artifacts"] = []
+            return task
+        }
         if ProcessInfo.processInfo.arguments.contains(Self.taskK2FixtureLaunchArgument),
            let task = taskPagesK2Tasks().first(where: { $0["id"] as? String == id }) {
             return task
@@ -4004,6 +4036,15 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 body = Data(#"{"items":[],"next_cursor":null}"#.utf8)
             }
         } else if isFixtureOrigin, request.url?.path == "/api/tasks", request.httpMethod == "GET",
+                  ProcessInfo.processInfo.arguments.contains(Self.taskAgentActivityFixtureLaunchArgument) {
+            let query = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?.queryItems ?? []
+            let status = query.first(where: { $0.name == "status" })?.value
+            let items = status == nil || status == "running"
+                ? [Self.taskPagesDetail(id: "q7654321")].compactMap { $0 }
+                : []
+            statusCode = 200
+            body = (try? JSONSerialization.data(withJSONObject: ["items": items, "next_cursor": NSNull()])) ?? Data()
+        } else if isFixtureOrigin, request.url?.path == "/api/tasks", request.httpMethod == "GET",
                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesFixtureLaunchArgument) {
             let query = request.url.flatMap { URLComponents(url: $0, resolvingAgainstBaseURL: false) }?.queryItems ?? []
             let status = query.first(where: { $0.name == "status" })?.value
@@ -5089,6 +5130,12 @@ struct MordeTaskTimelineEvent: Decodable, Identifiable, Equatable {
     var display: (title: String, summary: String?)? {
         guard let values = payload.objectValue else { return (eventTitle, nil) }
         if type == "task.step" {
+            if values["kind"]?.stringValue == "agent_activity" {
+                let activity = MIFTaskPresentation.agentActivityLabel(
+                    phase: values["phase"]?.stringValue,
+                    state: values["status"]?.stringValue) ?? AppLocalized("Status unknown")
+                return (AppLocalized("Activity"), activity)
+            }
             if values["kind"]?.stringValue == "budget" { return nil }
             let originalTitle = values["title"]?.stringValue ?? AppLocalized("Task step updated")
             let title = MordeTaskStepPresentation.title(originalTitle)

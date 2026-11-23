@@ -25,9 +25,14 @@ func TestPostgresBuiltinSearchOperationIsolationReplayAndStop(t *testing.T) {
 	if err != nil || !found || claimed.ID != submitted.Task.ID {
 		t.Fatalf("claim hostless task = %#v, found=%t, err=%v", claimed, found, err)
 	}
+	var taskRevision int64
+	if err := pool.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, claimed.ID).Scan(&taskRevision); err != nil {
+		t.Fatalf("read built-in MCP Task revision: %v", err)
+	}
 	operation := app.MCPConnectorOperation{
 		ID: mustID(t, domain.NewOperationID), TaskID: claimed.ID, OwnerID: owner.ID,
 		ConnectorID: app.BuiltinSearchMCPConnectorID, Key: "same-key", ToolName: "morde_web_search",
+		TaskRevision: &taskRevision, CallID: "builtin-search-call",
 		ConnectorRevision: 1, GrantVersion: claimed.Authorization.Version, LeaseVersion: claimed.Lease.Version,
 		RequestHash: hashBytes("synthetic search"),
 	}
@@ -65,6 +70,17 @@ VALUES ($1,$2,$2,$3,1,0,1)`, claimed.ID, owner.ID, connectorID); err != nil {
 	}
 	ordinary := operation
 	ordinary.ID, ordinary.ConnectorID = mustID(t, domain.NewOperationID), connectorID
+	ordinary.ApprovalID, ordinary.ApprovalVersion = mustID(t, domain.NewPendingRequestID), 1
+	ordinary.ApprovalRequestHash = hashBytes("ordinary connector approval")
+	if _, err := pool.Exec(ctx, `INSERT INTO task_pending_requests
+(id,task_id,version,kind,title,object,content,impact,call_id,tool_name,request_hash,task_revision,
+ runtime_generation,runtime_instance_id,control_version,status,decision,responded_by_user_id,responded_at)
+VALUES ($1,$2,1,'approval','Approve MCP action','Test connector','Synthetic MCP action','External connector action',$3,$4,$5,$6,
+ 1,$7,1,'approved','approve',$8,clock_timestamp())`,
+		ordinary.ApprovalID, ordinary.TaskID, ordinary.CallID, ordinary.ToolName, ordinary.ApprovalRequestHash,
+		*ordinary.TaskRevision, "mcp-connector:"+ordinary.ConnectorID, owner.ID); err != nil {
+		t.Fatalf("insert ordinary MCP connector approval: %v", err)
+	}
 	if _, replay, err := store.PrepareMCPConnectorOperation(ctx, ordinary, claimed.Lease.Owner); err != nil || replay {
 		t.Fatalf("ordinary connector shares no built-in source key: replay=%t err=%v", replay, err)
 	}

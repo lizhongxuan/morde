@@ -22,6 +22,9 @@ func (s *Store) ReserveTaskWorkspacePublish(ctx context.Context, value app.TaskW
 	if err := app.ValidateTaskWorkspacePublishCommand(value); err != nil {
 		return app.TaskWorkspacePublishReceipt{}, err
 	}
+	if err := validateTaskWorkspacePublishApprovalCommand(value); err != nil {
+		return app.TaskWorkspacePublishReceipt{}, err
+	}
 	var receipt app.TaskWorkspacePublishReceipt
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := lockWorkspaceMutationFence(ctx, tx, value.WorkspaceID, false); err != nil {
@@ -44,15 +47,15 @@ func (s *Store) ReserveTaskWorkspacePublish(ctx context.Context, value app.TaskW
 		}
 		var ownerID, status, leaseOwner string
 		var hostID pgtype.Text
-		var leaseVersion, executionEpoch int64
+		var leaseVersion, executionEpoch, currentTaskRevision, desiredTaskRevision int64
 		var leaseActive bool
 		var workspaceID pgtype.Text
 		var inputRevision, checkpointRevision pgtype.Int8
 		if err := tx.QueryRow(ctx, `SELECT owner_id, host_id, status, lease_owner, lease_version,
-COALESCE(lease_expires_at > clock_timestamp(), false), execution_epoch, workspace_id, input_revision, workspace_checkpoint_revision
+COALESCE(lease_expires_at > clock_timestamp(), false), execution_epoch, workspace_id, input_revision, workspace_checkpoint_revision, current_revision, desired_revision
 FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 			&ownerID, &hostID, &status, &leaseOwner, &leaseVersion, &leaseActive, &executionEpoch,
-			&workspaceID, &inputRevision, &checkpointRevision); err != nil {
+			&workspaceID, &inputRevision, &checkpointRevision, &currentTaskRevision, &desiredTaskRevision); err != nil {
 			return storeError("lock Task before Workspace publish reservation", "task", err)
 		}
 		if err := verifyProjectTaskWorkspaceFence(ctx, tx, value.TaskID, projectFence); err != nil {
@@ -67,6 +70,9 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		}
 		if !taskWorkspacePublishHostMatches(hostID, value.HostID) {
 			return missingTaskError()
+		}
+		if err := verifyTaskWorkspacePublishApproval(ctx, tx, value, currentTaskRevision, desiredTaskRevision); err != nil {
+			return err
 		}
 		existing, err := getTaskWorkspacePublishReceiptTx(ctx, tx, value, false)
 		if err == nil {
@@ -106,10 +112,13 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if err := ensureNoPendingTaskWorkspacePublishOperation(ctx, tx, value.TaskID); err != nil {
 			return err
 		}
+		taskRevision, callID, toolName, approvalID, approvalVersion, approvalRequestHash := taskWorkspacePublishApprovalSQLValues(value)
 		if _, err := tx.Exec(ctx, `INSERT INTO task_workspace_publish_receipts
-(task_id, owner_id, workspace_id, operation_key, request_hash, base_revision, state, direct_directory_source)
-VALUES ($1,$2,$3,$4,$5,$6,'pending',$7) ON CONFLICT (task_id, operation_key) DO NOTHING`,
-			value.TaskID, value.OwnerID, value.WorkspaceID, value.OperationKey, value.RequestHash, value.BaseRevision, value.DirectDirectorySource); err != nil {
+(task_id, owner_id, workspace_id, operation_key, request_hash, base_revision, state, direct_directory_source,
+ task_revision, call_id, tool_name, approval_id, approval_version, approval_request_hash)
+VALUES ($1,$2,$3,$4,$5,$6,'pending',$7,$8,$9,$10,$11,$12,$13) ON CONFLICT (task_id, operation_key) DO NOTHING`,
+			value.TaskID, value.OwnerID, value.WorkspaceID, value.OperationKey, value.RequestHash, value.BaseRevision,
+			value.DirectDirectorySource, taskRevision, callID, toolName, approvalID, approvalVersion, approvalRequestHash); err != nil {
 			return fmt.Errorf("reserve Task Workspace publish receipt: %w", err)
 		}
 		receipt, err = getTaskWorkspacePublishReceiptTx(ctx, tx, value, false)
@@ -125,8 +134,69 @@ func taskWorkspacePublishHostMatches(storedHostID pgtype.Text, commandHostID str
 	return storedHostID.Valid && storedHostID.String == commandHostID
 }
 
+func validateTaskWorkspacePublishApprovalCommand(value app.TaskWorkspacePublishCommand) error {
+	if value.TaskRevision < 0 {
+		return domain.InvalidArgument("task_workspace_publish", "Task Workspace publish Task revision is invalid")
+	}
+	if value.ApprovalID == "" {
+		if value.TaskRevision != 0 || value.CallID != "" || value.ToolName != "" || value.ApprovalVersion != 0 || len(value.ApprovalRequestHash) != 0 {
+			return domain.InvalidArgument("task_workspace_publish", "non-media Workspace publish must not include approval binding fields")
+		}
+		return nil
+	}
+	if !domain.ValidPendingRequestID(value.ApprovalID) || value.ApprovalVersion < 1 || value.CallID == "" || len(value.CallID) > 256 ||
+		value.ToolName == "" || len(value.ToolName) > 128 || len(value.ApprovalRequestHash) != 32 {
+		return domain.InvalidArgument("task_workspace_publish", "media Workspace publish approval binding is invalid")
+	}
+	return nil
+}
+
+func taskWorkspacePublishApprovalSQLValues(value app.TaskWorkspacePublishCommand) (any, any, any, any, any, any) {
+	if value.ApprovalID == "" {
+		return nil, nil, nil, nil, nil, nil
+	}
+	return value.TaskRevision, value.CallID, value.ToolName, value.ApprovalID, value.ApprovalVersion, value.ApprovalRequestHash
+}
+
+func verifyTaskWorkspacePublishApproval(ctx context.Context, tx pgx.Tx, value app.TaskWorkspacePublishCommand,
+	currentTaskRevision, desiredTaskRevision int64) error {
+	if value.ApprovalID == "" {
+		return nil
+	}
+	if currentTaskRevision != desiredTaskRevision || value.TaskRevision != currentTaskRevision {
+		return domain.NewError(domain.CodeConflict, "Task revision is changing before approved media Workspace publish")
+	}
+	var pendingRevision pgtype.Int8
+	var responderID pgtype.Text
+	var version int64
+	var callID, toolName, status, decision string
+	var requestHash []byte
+	var responseNotExpired bool
+	err := tx.QueryRow(ctx, `SELECT task_revision, version, call_id, tool_name, request_hash, status, decision,
+responded_by_user_id, (responded_at IS NOT NULL AND responded_at <= clock_timestamp() AND
+  (expires_at IS NULL OR responded_at < expires_at))
+FROM task_pending_requests WHERE task_id=$1 AND id=$2 FOR UPDATE`, value.TaskID, value.ApprovalID).
+		Scan(&pendingRevision, &version, &callID, &toolName, &requestHash, &status, &decision, &responderID, &responseNotExpired)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeConflict, "approved Task media request no longer exists")
+	}
+	if err != nil {
+		return fmt.Errorf("lock pending approval before Task media Workspace publish: %w", err)
+	}
+	if !pendingRevision.Valid || pendingRevision.Int64 != currentTaskRevision || version != value.ApprovalVersion ||
+		callID != value.CallID || toolName != value.ToolName || !equalOperationHash(requestHash, value.ApprovalRequestHash) ||
+		status != string(task.PendingRequestApproved) || decision != string(task.PendingDecisionApprove) ||
+		!responderID.Valid || !domain.ValidUserID(responderID.String) || !responseNotExpired {
+		return domain.NewError(domain.CodeConflict, "Task media approval no longer matches the Workspace publish")
+	}
+	return nil
+}
+
 func (s *Store) GetTaskWorkspacePublishReceipt(ctx context.Context, value app.TaskWorkspacePublishCommand) (app.TaskWorkspacePublishReceipt, error) {
 	if err := app.ValidateTaskWorkspacePublishCommand(value); err != nil {
+		return app.TaskWorkspacePublishReceipt{}, err
+	}
+	if err := validateTaskWorkspacePublishApprovalCommand(value); err != nil {
 		return app.TaskWorkspacePublishReceipt{}, err
 	}
 	var receipt app.TaskWorkspacePublishReceipt
@@ -140,6 +210,9 @@ func (s *Store) GetTaskWorkspacePublishReceipt(ctx context.Context, value app.Ta
 
 func (s *Store) RejectTaskWorkspacePublishQuota(ctx context.Context, value app.TaskWorkspacePublishCommand) error {
 	if err := app.ValidateTaskWorkspacePublishCommand(value); err != nil {
+		return err
+	}
+	if err := validateTaskWorkspacePublishApprovalCommand(value); err != nil {
 		return err
 	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
@@ -192,6 +265,9 @@ func (s *Store) RejectTaskWorkspacePublishConflict(ctx context.Context, value ap
 	if err := app.ValidateTaskWorkspacePublishCommand(value); err != nil {
 		return err
 	}
+	if err := validateTaskWorkspacePublishApprovalCommand(value); err != nil {
+		return err
+	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
 		receipt, err := getTaskWorkspacePublishReceiptTx(ctx, tx, value, true)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -234,9 +310,14 @@ func (s *Store) FindTaskWorkspacePublishReceipt(ctx context.Context, ownerID, ta
 		var directDirectorySource bool
 		var manifestSHA pgtype.Text
 		var publishedRevision pgtype.Int8
-		err := tx.QueryRow(ctx, `SELECT owner_id, workspace_id, request_hash, base_revision, state, manifest_sha256, published_revision, direct_directory_source
+		var taskRevision, approvalVersion pgtype.Int8
+		var callID, toolName, approvalID pgtype.Text
+		var approvalRequestHash []byte
+		err := tx.QueryRow(ctx, `SELECT owner_id, workspace_id, request_hash, base_revision, state, manifest_sha256, published_revision, direct_directory_source,
+task_revision, call_id, tool_name, approval_id, approval_version, approval_request_hash
 FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`, taskID, operationKey).
-			Scan(&storedOwner, &storedWorkspace, &requestHash, &baseRevision, &state, &manifestSHA, &publishedRevision, &directDirectorySource)
+			Scan(&storedOwner, &storedWorkspace, &requestHash, &baseRevision, &state, &manifestSHA, &publishedRevision, &directDirectorySource,
+				&taskRevision, &callID, &toolName, &approvalID, &approvalVersion, &approvalRequestHash)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return storeError("find Task Workspace publish receipt", "Task Workspace publish receipt", err)
 		}
@@ -248,6 +329,7 @@ FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`, tas
 		}
 		receipt = app.TaskWorkspacePublishReceipt{State: app.TaskWorkspacePublishState(state), WorkspaceID: storedWorkspace,
 			BaseRevision: baseRevision, RequestHash: hex.EncodeToString(requestHash), DirectDirectorySource: directDirectorySource}
+		populateTaskWorkspacePublishApprovalReceipt(&receipt, taskRevision, callID, toolName, approvalID, approvalVersion, approvalRequestHash)
 		if manifestSHA.Valid {
 			receipt.ManifestSHA256 = manifestSHA.String
 		}
@@ -274,6 +356,39 @@ FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`, tas
 	return receipt, err
 }
 
+func taskWorkspacePublishReceiptBindingMatches(value app.TaskWorkspacePublishCommand, taskRevision pgtype.Int8,
+	callID, toolName, approvalID pgtype.Text, approvalVersion pgtype.Int8, approvalRequestHash []byte) bool {
+	if value.ApprovalID == "" {
+		return !taskRevision.Valid && !callID.Valid && !toolName.Valid && !approvalID.Valid && !approvalVersion.Valid && len(approvalRequestHash) == 0
+	}
+	return taskRevision.Valid && taskRevision.Int64 == value.TaskRevision &&
+		callID.Valid && callID.String == value.CallID && toolName.Valid && toolName.String == value.ToolName &&
+		approvalID.Valid && approvalID.String == value.ApprovalID && approvalVersion.Valid && approvalVersion.Int64 == value.ApprovalVersion &&
+		equalOperationHash(approvalRequestHash, value.ApprovalRequestHash)
+}
+
+func populateTaskWorkspacePublishApprovalReceipt(receipt *app.TaskWorkspacePublishReceipt, taskRevision pgtype.Int8,
+	callID, toolName, approvalID pgtype.Text, approvalVersion pgtype.Int8, approvalRequestHash []byte) {
+	if taskRevision.Valid {
+		receipt.TaskRevision = taskRevision.Int64
+	}
+	if callID.Valid {
+		receipt.CallID = callID.String
+	}
+	if toolName.Valid {
+		receipt.ToolName = toolName.String
+	}
+	if approvalID.Valid {
+		receipt.ApprovalID = approvalID.String
+	}
+	if approvalVersion.Valid {
+		receipt.ApprovalVersion = approvalVersion.Int64
+	}
+	if len(approvalRequestHash) != 0 {
+		receipt.ApprovalRequestHash = hex.EncodeToString(approvalRequestHash)
+	}
+}
+
 func getTaskWorkspacePublishReceiptTx(ctx context.Context, tx pgx.Tx, value app.TaskWorkspacePublishCommand, forUpdate bool) (app.TaskWorkspacePublishReceipt, error) {
 	lock := ""
 	if forUpdate {
@@ -285,9 +400,14 @@ func getTaskWorkspacePublishReceiptTx(ctx context.Context, tx pgx.Tx, value app.
 	var directDirectorySource bool
 	var manifestSHA pgtype.Text
 	var publishedRevision pgtype.Int8
-	err := tx.QueryRow(ctx, `SELECT owner_id, workspace_id, request_hash, base_revision, state, manifest_sha256, published_revision, direct_directory_source
+	var taskRevision, approvalVersion pgtype.Int8
+	var callID, toolName, approvalID pgtype.Text
+	var approvalRequestHash []byte
+	err := tx.QueryRow(ctx, `SELECT owner_id, workspace_id, request_hash, base_revision, state, manifest_sha256, published_revision, direct_directory_source,
+task_revision, call_id, tool_name, approval_id, approval_version, approval_request_hash
 FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`+lock, value.TaskID, value.OperationKey).
-		Scan(&ownerID, &workspaceID, &requestHash, &baseRevision, &state, &manifestSHA, &publishedRevision, &directDirectorySource)
+		Scan(&ownerID, &workspaceID, &requestHash, &baseRevision, &state, &manifestSHA, &publishedRevision, &directDirectorySource,
+			&taskRevision, &callID, &toolName, &approvalID, &approvalVersion, &approvalRequestHash)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return app.TaskWorkspacePublishReceipt{}, pgx.ErrNoRows
 	}
@@ -295,11 +415,13 @@ FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`+lock
 		return app.TaskWorkspacePublishReceipt{}, fmt.Errorf("read Task Workspace publish receipt: %w", err)
 	}
 	if ownerID != value.OwnerID || workspaceID != value.WorkspaceID || baseRevision != value.BaseRevision ||
-		directDirectorySource != value.DirectDirectorySource || !equalOperationHash(requestHash, value.RequestHash) {
+		directDirectorySource != value.DirectDirectorySource || !equalOperationHash(requestHash, value.RequestHash) ||
+		!taskWorkspacePublishReceiptBindingMatches(value, taskRevision, callID, toolName, approvalID, approvalVersion, approvalRequestHash) {
 		return app.TaskWorkspacePublishReceipt{}, idempotencyConflict()
 	}
 	receipt := app.TaskWorkspacePublishReceipt{State: app.TaskWorkspacePublishState(state), WorkspaceID: workspaceID,
 		BaseRevision: baseRevision, RequestHash: hex.EncodeToString(requestHash), DirectDirectorySource: directDirectorySource}
+	populateTaskWorkspacePublishApprovalReceipt(&receipt, taskRevision, callID, toolName, approvalID, approvalVersion, approvalRequestHash)
 	if manifestSHA.Valid {
 		receipt.ManifestSHA256 = manifestSHA.String
 	}
@@ -323,6 +445,9 @@ FROM task_workspace_publish_receipts WHERE task_id=$1 AND operation_key=$2`+lock
 func (s *Store) CommitTaskWorkspacePublish(ctx context.Context, value app.TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string,
 	directories []workspace.Directory, manifestSHA string) (app.TaskWorkspacePublishReceipt, error) {
 	if err := app.ValidateTaskWorkspacePublishCommand(value); err != nil {
+		return app.TaskWorkspacePublishReceipt{}, err
+	}
+	if err := validateTaskWorkspacePublishApprovalCommand(value); err != nil {
 		return app.TaskWorkspacePublishReceipt{}, err
 	}
 	actualManifestSHA, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
@@ -355,15 +480,15 @@ func (s *Store) CommitTaskWorkspacePublish(ctx context.Context, value app.TaskWo
 		}
 		var ownerID, status, leaseOwner string
 		var hostID pgtype.Text
-		var leaseVersion, executionEpoch int64
+		var leaseVersion, executionEpoch, currentTaskRevision, desiredTaskRevision int64
 		var leaseActive bool
 		var workspaceID pgtype.Text
 		var inputRevision, checkpointRevision pgtype.Int8
 		if err := tx.QueryRow(ctx, `SELECT owner_id, host_id, status, lease_owner, lease_version,
-COALESCE(lease_expires_at > clock_timestamp(), false), execution_epoch, workspace_id, input_revision, workspace_checkpoint_revision
+COALESCE(lease_expires_at > clock_timestamp(), false), execution_epoch, workspace_id, input_revision, workspace_checkpoint_revision, current_revision, desired_revision
 FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 			&ownerID, &hostID, &status, &leaseOwner, &leaseVersion, &leaseActive, &executionEpoch,
-			&workspaceID, &inputRevision, &checkpointRevision); err != nil {
+			&workspaceID, &inputRevision, &checkpointRevision, &currentTaskRevision, &desiredTaskRevision); err != nil {
 			return storeError("lock Task before Workspace publish", "task", err)
 		}
 		if err := verifyProjectTaskWorkspaceFence(ctx, tx, value.TaskID, projectFence); err != nil {
@@ -374,6 +499,9 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		}
 		if ownerID != value.OwnerID || !taskWorkspacePublishHostMatches(hostID, value.HostID) || executionEpoch != gate.epoch {
 			return missingTaskError()
+		}
+		if err := verifyTaskWorkspacePublishApproval(ctx, tx, value, currentTaskRevision, desiredTaskRevision); err != nil {
+			return err
 		}
 		stored, err := getTaskWorkspacePublishReceiptTx(ctx, tx, value, true)
 		if err != nil {

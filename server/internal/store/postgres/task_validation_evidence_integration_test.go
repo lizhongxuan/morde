@@ -206,6 +206,86 @@ WHERE review.task_id=$1`, current.Task.ID).
 	}
 }
 
+func TestPostgresTaskValidationFactsTreatHubOperationAsExecution(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 3, 10_000, 20_000)
+	targetID := mustID(t, domain.NewClientInstallationID)
+	if _, err := store.pool.Exec(ctx, `INSERT INTO client_installations (id,owner_id,display_name,platform,expires_at)
+VALUES ($1,$2,'Task target','desktop',clock_timestamp()+interval '1 day')`, targetID, owner.ID); err != nil {
+		t.Fatalf("insert Task target: %v", err)
+	}
+	submission := newTestTaskSubmission(t, owner.ID, "", "validation-hub-ledger", "inspect the authorized target")
+	submission.Task.ExecutionLocation = "server"
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit Task: %v", err)
+	}
+	requestHash := sha256.Sum256([]byte("morde_hub_command:{}"))
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_hub_operations
+(task_id,owner_id,operation_key,tool_name,target_installation_id,action,task_authorization_version,
+ target_grant_version,lease_version,request_hash,status)
+VALUES ($1,$2,'call:hub-command','morde_hub_command',$3,'command',1,1,1,$4,'prepared')`,
+		created.Task.ID, owner.ID, targetID, requestHash[:]); err != nil {
+		t.Fatalf("insert Hub operation: %v", err)
+	}
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	facts, err := loadTaskValidationVerdictFacts(ctx, tx, created.Task.ID, "", nil, app.TaskValidationReviewReport{})
+	if err != nil {
+		t.Fatalf("load Task validation facts: %v", err)
+	}
+	if facts.TaskExecution != app.TaskValidationFactPresent || facts.IrreversibleAction != app.TaskValidationFactUnknown {
+		t.Fatalf("Hub operation facts = %+v; want execution present and action unknown", facts)
+	}
+}
+
+func TestPostgresTaskValidationFactsTreatPendingRequestReconciliationAsExecution(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	lease, _, err := f.service.Start(ctx, f.request)
+	if err != nil {
+		t.Fatalf("start Task Agent: %v", err)
+	}
+	details, err := f.store.GetTask(ctx, lease.Fence.TaskID, lease.Fence.OwnerID)
+	if err != nil || details.Task.CurrentRevision == nil {
+		t.Fatalf("load running Task: current=%+v err=%v", details.Task, err)
+	}
+	before, err := f.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeFacts, err := loadTaskValidationVerdictFacts(ctx, before, lease.Fence.TaskID, "", nil, app.TaskValidationReviewReport{})
+	_ = before.Rollback(ctx)
+	if err != nil {
+		t.Fatalf("load validation facts before request reconciliation: %v", err)
+	}
+	if beforeFacts.TaskExecution != app.TaskValidationFactAbsent {
+		t.Fatalf("initial Task execution facts = %+v; want no recorded execution", beforeFacts)
+	}
+	reconciliation := newTaskAgentRequestReconciliation(lease.Fence, lease.Fence.AgentSessionID,
+		*details.Task.CurrentRevision, app.TaskAgentRequestPhaseTool, app.TaskAgentRequestKindToolCall,
+		"call_timeout_validation", strings.Repeat("a", 64), 1)
+	if accepted, err := f.store.RecordTaskAgentRequestReconciliation(ctx, reconciliation); err != nil || !accepted {
+		t.Fatalf("record pending request reconciliation: accepted=%t err=%v", accepted, err)
+	}
+	tx, err := f.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	facts, err := loadTaskValidationVerdictFacts(ctx, tx, lease.Fence.TaskID, "", nil, app.TaskValidationReviewReport{})
+	if err != nil {
+		t.Fatalf("load Task validation facts: %v", err)
+	}
+	if facts.TaskExecution != app.TaskValidationFactPresent || facts.IrreversibleAction != app.TaskValidationFactUnknown {
+		t.Fatalf("pending request reconciliation facts = %+v; want execution present and action unknown", facts)
+	}
+}
+
 func TestPostgresTaskValidationReviewClaimsAreLeasedAndFenced(t *testing.T) {
 	f := newAgentLifecycleFixture(t)
 	ctx := context.Background()

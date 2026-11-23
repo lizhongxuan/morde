@@ -17,6 +17,11 @@ type MCPConnectorOperation struct {
 	OwnerID                     string
 	ConnectorID                 string
 	Key                         string
+	TaskRevision                *int64
+	CallID                      string
+	ApprovalID                  string
+	ApprovalVersion             int64
+	ApprovalRequestHash         []byte
 	ToolName                    string
 	ConnectorRevision           int64
 	CredentialVersion           int64

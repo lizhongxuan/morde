@@ -192,22 +192,28 @@ const (
 type TaskWorkspacePublishCommand struct {
 	OwnerID, TaskID, WorkspaceID, HostID, LeaseOwner, OperationKey string
 	ProjectID, InitiatorID, WorkspaceOwnerID                       string
+	CallID, ToolName, ApprovalID                                   string
 	BindingVersion, LeaseVersion, InputRevision, BaseRevision      int64
+	TaskRevision, ApprovalVersion                                  int64
 	HostFence                                                      AgentHostFence
 	ViewID, InputManifestSHA256                                    string
 	DirectDirectorySource                                          bool
 	RequestHash                                                    []byte
+	ApprovalRequestHash                                            []byte
 }
 
 type TaskWorkspacePublishReceipt struct {
-	State                 TaskWorkspacePublishState
-	WorkspaceID           string
-	BaseRevision          int64
-	PublishedRevision     int64
-	ManifestSHA256        string
-	RequestHash           string
-	DirectDirectorySource bool
-	SupersedingMessages   []AgentConversationMessage
+	State                         TaskWorkspacePublishState
+	WorkspaceID                   string
+	CallID, ToolName, ApprovalID  string
+	BaseRevision                  int64
+	TaskRevision, ApprovalVersion int64
+	PublishedRevision             int64
+	ManifestSHA256                string
+	RequestHash                   string
+	ApprovalRequestHash           string
+	DirectDirectorySource         bool
+	SupersedingMessages           []AgentConversationMessage
 }
 
 // WorkspaceSyncStore owns durable manifests, change cursors, and resumable

@@ -139,13 +139,13 @@ function mordeMCPToolDefinition(sessionDurable, tool, onError, { recovering = fa
         if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
           return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
         }
-        const result = await sessionDurable.runActivity('tool', execution.callId, execution.signal, async () => {
+        const result = await sessionDurable.runActivity('tool', execution.callId, execution.signal, async (onWaiting, onTimeout) => {
           if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
             return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
           }
           const response = await sessionDurable.ipc.toolCall(
             sessionDurable.identity, sessionDurable.through, execution.callId, tool.name, args, execution.signal,
-            { recovering },
+            { recovering, onWaiting, onTimeout },
           )
           if (response === RECOVERY_TOOL_SUPERSEDED) return response
           if (!validMordeMCPToolResult(response)) throw new Error('Morde MCP broker returned an invalid result')
@@ -830,7 +830,7 @@ function validCoordinatorMessage(message) {
       (index === 0 || ids[index - 1] < id))
 }
 
-class DurableSession {
+export class DurableSession {
   constructor(ipc, identity, start) {
     this.ipc = ipc
     this.identity = identity
@@ -913,7 +913,17 @@ class DurableSession {
     } else {
       this.activeActivities.delete(activityID)
     }
-    return this.sendObservation({ type: 'agent_activity', phase, state, activity_id: activityID })
+    return this.sendObservation({ type: 'agent_activity', phase, state, activity_id: activityID },
+      { failIPC: state !== 'waiting', recordFailure: state !== 'waiting' })
+  }
+
+  observeRequestTimeout({ phase, request_kind, activity_id: activityID, request_digest: requestDigest }) {
+    if (!this.observationsEnabled || !ACTIVITY_PHASES.has(phase) || !ID.test(activityID ?? '') ||
+        !DIGEST.test(requestDigest ?? '') || !['tool_call', 'child_create', 'child_settle', 'checkpoint_write', 'checkpoint_read'].includes(request_kind)) {
+      return Promise.resolve()
+    }
+    return this.sendObservation({ type: 'agent_request_timeout', phase, request_kind, activity_id: activityID,
+      request_digest: requestDigest }, { failIPC: false, recordFailure: false }).catch(() => {})
   }
 
   observeHeartbeat() {
@@ -936,20 +946,31 @@ class DurableSession {
 
   async runActivity(phase, activityID, signal, action) {
     await this.observeActivity(phase, 'started', activityID)
+    let waitingObserved = false
+    const observeWaiting = () => {
+      if (waitingObserved) return
+      waitingObserved = true
+      void this.observeActivity(phase, 'waiting', activityID)
+        .catch(() => {})
+    }
+    const observeRequestTimeout = detail => this.observeRequestTimeout({ ...detail, phase, activity_id: activityID })
     try {
-      const result = await action()
-      await this.observeActivity(phase, 'completed', activityID)
+      const result = await action(observeWaiting, observeRequestTimeout)
+      void this.observeActivity(phase, 'completed', activityID).catch(() => {})
       return result
     } catch (error) {
       const state = signal?.aborted || this.ipc.cancelled ? 'cancelled' : 'failed'
-      await this.observeActivity(phase, state, activityID)
+      void this.observeActivity(phase, state, activityID).catch(() => {})
       throw error
     }
   }
 
-  sendObservation(fields) {
+  sendObservation(fields, { failIPC = true, recordFailure = failIPC } = {}) {
     if (this.observationFailure) return Promise.reject(this.observationFailure)
-    if (this.observationSequence >= Number.MAX_SAFE_INTEGER) return this.failObservation('agent observation sequence exhausted')
+    if (this.observationSequence >= Number.MAX_SAFE_INTEGER) {
+      if (failIPC) return this.failObservation('agent observation sequence exhausted')
+      return Promise.reject(new Error('agent observation sequence exhausted'))
+    }
     const sequence = ++this.observationSequence
     const frame = { ...fields, ...this.identity, task_revision: this.taskRevision, observation_sequence: sequence }
     const pending = this.observationWrites.then(() => {
@@ -957,8 +978,8 @@ class DurableSession {
       return this.ipc.send(frame)
     })
     this.observationWrites = pending.catch(error => {
-      this.observationFailure = error
-      this.ipc.fail?.('agent observation dispatch failed')
+      if (recordFailure) this.observationFailure = error
+      if (failIPC) this.ipc.fail?.('agent observation dispatch failed')
     })
     return pending
   }
@@ -991,8 +1012,8 @@ class DurableSession {
       }
       const through = from + batch.length - 1
       const digest = createHash('sha256').update(payload, 'utf8').digest('hex')
-      await this.runActivity('checkpoint', `checkpoint_${through}`, undefined,
-        () => this.ipc.checkpoint(this.identity, from, through, payload, digest))
+      await this.runActivity('checkpoint', `checkpoint_${through}`, undefined, (onWaiting, onTimeout) =>
+        this.ipc.checkpoint(this.identity, from, through, payload, digest, { onWaiting, onTimeout }))
       this.through = through
       this.digest = digest
       this.firstCheckpoint.resolve()
@@ -1019,7 +1040,9 @@ class DurableSession {
     let totalBytes = 0
     const events = []
     while (from <= frame.checkpoint_through_seq) {
-      const page = await this.ipc.readCheckpoint(this.identity, from)
+      const page = await this.runActivity('checkpoint', `checkpoint_read_${from}`, undefined, (onWaiting, onTimeout) =>
+        this.ipc.readCheckpoint(this.identity, from, { checkpointThrough: frame.checkpoint_through_seq,
+          checkpointDigest: frame.checkpoint_sha256, onWaiting, onTimeout }))
       if (this.ipc.cancelled || page.from_seq !== from || !Number.isSafeInteger(page.through_seq) ||
           page.through_seq < from || page.through_seq > frame.checkpoint_through_seq ||
           typeof page.payload !== 'string' || Buffer.byteLength(page.payload) > MAX_CHECKPOINT_PAYLOAD_BYTES ||
@@ -1100,7 +1123,8 @@ class DurableSession {
       let resultImages
       let supersededDuringRecovery = false
       if (call.name === DELEGATE_TOOL) {
-        const result = await this.executeDelegate?.(this, call.id, call.args, signal, call.resultText, true)
+        const result = await this.runActivity('subagent', call.id, signal, (onWaiting, onTimeout) =>
+          this.executeDelegate?.(this, call.id, call.args, signal, call.resultText, true, onWaiting, onTimeout))
         if (!result) throw new Error('delegated child recovery is unavailable')
         if (result === RECOVERY_TOOL_SUPERSEDED) {
           supersededDuringRecovery = true
@@ -1125,7 +1149,9 @@ class DurableSession {
           resultImages = value.images
         }
       } else {
-        const result = await this.ipc.toolCall(this.identity, this.through, call.id, call.name, call.args, signal, { recovering: true })
+        const result = await this.runActivity('tool', call.id, signal, (onWaiting, onTimeout) =>
+          this.ipc.toolCall(this.identity, this.through, call.id, call.name, call.args, signal,
+            { recovering: true, onWaiting, onTimeout }))
         if (result === RECOVERY_TOOL_SUPERSEDED) {
           supersededDuringRecovery = true
         } else {
@@ -1176,7 +1202,9 @@ class DurableSession {
       throw new Error('step retry is not bound to the verified source call')
     }
     this.stepRetryDispatched = true
-    const result = await this.ipc.toolCall(this.identity, retry.checkpoint_through_seq, retry.retry_call_id, retry.tool_name, source.args, signal)
+    const result = await this.runActivity('tool', retry.retry_call_id, signal, (onWaiting, onTimeout) =>
+      this.ipc.toolCall(this.identity, retry.checkpoint_through_seq, retry.retry_call_id, retry.tool_name, source.args, signal,
+        { onWaiting, onTimeout }))
     if (!validMordeMCPToolResult(result)) throw new Error('step retry broker returned an invalid result')
     return result
   }
@@ -1563,17 +1591,18 @@ export async function runAgent(ipc, frame) {
             }
             try {
               if (tool.name === DELEGATE_TOOL) {
-                return await sessionDurable.runActivity('subagent', exec.callId, exec.signal,
-                  () => runDelegation(sessionDurable, agent, exec.callId, args, exec.signal))
+                return await sessionDurable.runActivity('subagent', exec.callId, exec.signal, (onWaiting, onTimeout) =>
+                  runDelegation(sessionDurable, agent, exec.callId, args, exec.signal, undefined, false, onWaiting, onTimeout))
               }
-              return await sessionDurable.runActivity('tool', exec.callId, exec.signal, () => {
+              return await sessionDurable.runActivity('tool', exec.callId, exec.signal, (onWaiting, onTimeout) => {
                 if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
                   return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
                 }
                 if (sessionDurable.superseded || sessionDurable.terminalFailureReason) {
                   return { status: 'failed', output: sessionDurable.terminalFailureReason ?? sessionDurable.supersedeReason ?? STALE_MODEL_TOOL_MESSAGE, images: [] }
                 }
-                return ipc.toolCall(sessionDurable.identity, sessionDurable.through, exec.callId, tool.name, args, exec.signal)
+                return ipc.toolCall(sessionDurable.identity, sessionDurable.through, exec.callId, tool.name, args, exec.signal,
+                  { onWaiting, onTimeout })
               })
             } catch (error) {
               onError(error, exec)
@@ -1587,9 +1616,9 @@ export async function runAgent(ipc, frame) {
     const pending = sessionDurable.start.resume === true
       ? ctx.agents.resume({ ...options, resumeSessionId: SessionId(sessionDurable.identity.session_id) })
       : ctx.agents.create({ ...options, sessionId: SessionId(sessionDurable.identity.session_id) })
+    sessionDurable.startHeartbeats()
     return pending.then(handle => {
       liveHandles.add(handle)
-      sessionDurable.startHeartbeats()
       if (sessionDurable.superseded || sessionDurable.terminalFailureReason) {
         handle.agent.cancel({ kind: 'hook', reason: sessionDurable.terminalFailureReason ?? sessionDurable.supersedeReason })
       }
@@ -1599,6 +1628,9 @@ export async function runAgent(ipc, frame) {
         return dispose(...args)
       }
       return handle
+    }, error => {
+      sessionDurable.stopHeartbeats()
+      throw error
     })
   }
 
@@ -1671,7 +1703,9 @@ export async function runAgent(ipc, frame) {
         await agent.whenIdle()
         if (!await ctx.sessions.flush(agent.session)) throw new Error('child terminal checkpoint listener unavailable')
         const reason = durableChild.terminalFailureReason ?? durableChild.supersedeReason
-        const output = await ipc.settleChild(durableChild.identity, callID, 'failed', durableChild.through, durableChild.digest, reason, signal)
+        const output = await durableChild.runActivity('subagent', callID, signal, (onWaiting, onTimeout) =>
+          ipc.settleChild(durableChild.identity, callID, 'failed', durableChild.through, durableChild.digest,
+            reason, signal, { onWaiting, onTimeout }))
         return { status: 'failed', output: output ?? reason, images: [] }
       }
       if (childStart.resume === true) {
@@ -1717,7 +1751,9 @@ export async function runAgent(ipc, frame) {
       if (job?.cancelRequested) summary = 'Background job cancelled.'
       else if (!summary) summary = status === 'succeeded' ? 'Child agent completed without a text summary.' : 'Child agent did not complete successfully.'
       if (Buffer.byteLength(summary) > MAX_CHILD_SUMMARY_BYTES) throw new Error('child summary exceeds limit')
-      const output = await ipc.settleChild(durableChild.identity, callID, status, durableChild.through, durableChild.digest, summary, signal)
+      const output = await durableChild.runActivity('subagent', callID, signal, (onWaiting, onTimeout) =>
+        ipc.settleChild(durableChild.identity, callID, status, durableChild.through, durableChild.digest,
+          summary, signal, { onWaiting, onTimeout }))
       return { status, output: output ?? summary, images: [] }
     } finally {
       if (handle) {
@@ -1769,7 +1805,7 @@ export async function runAgent(ipc, frame) {
     return job.status === 'cancelled' ? 'cancelled' : job.status
   }
 
-  async function runDelegation(parentDurable, parentAgent, callID, argumentsValue, signal, recordedOutput, recovering = false) {
+  async function runDelegation(parentDurable, parentAgent, callID, argumentsValue, signal, recordedOutput, recovering = false, onWaiting, onTimeout) {
     if (!validDelegateArguments(argumentsValue, appTools)) throw new Error('delegated task arguments are invalid')
     const ownerKey = `${parentDurable.identity.session_id}\0${callID}`
     const existing = delegatedCalls.get(ownerKey)
@@ -1781,7 +1817,7 @@ export async function runAgent(ipc, frame) {
         return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
       }
       const response = await ipc.createChild(parentDurable.identity, parentDurable.through, callID, argumentsValue, signal,
-        { recovering })
+        { recovering, onWaiting, onTimeout })
       if (response === RECOVERY_TOOL_SUPERSEDED) return response
       const child = validateChildSession(response, parentDurable.identity, callID, argumentsValue, appTools)
       if (argumentsValue.run_in_background === true) {
@@ -1826,8 +1862,8 @@ export async function runAgent(ipc, frame) {
     }
   }
 
-  durable.executeDelegate = (parentDurable, callID, args, signal, recordedOutput, recovering = false) =>
-    runDelegation(parentDurable, undefined, callID, args, signal, recordedOutput, recovering)
+  durable.executeDelegate = (parentDurable, callID, args, signal, recordedOutput, recovering = false, onWaiting, onTimeout) =>
+    runDelegation(parentDurable, undefined, callID, args, signal, recordedOutput, recovering, onWaiting, onTimeout)
   class WorkerModel extends LlmAdapter {
     async resolveModel(provider, model) {
       if (provider !== 'morde' || model !== frame.model) throw new Error('model route is not authorized')

@@ -117,7 +117,7 @@ FROM tasks t CROSS JOIN service_identity i WHERE t.id=$1 AND t.owner_id=$2 AND t
 		if current.InstanceID != fence.AgentInstanceID || current.Generation != fence.AgentGeneration || current.SessionID != root ||
 			current.EngineVersion != fence.EngineVersion || current.ProfileVersion != fence.ProfileVersion ||
 			current.ConversationID != conversationID || current.ProjectID != projectID ||
-			current.HostID != projectWorkspaceFence.hostID || current.CheckpointThrough != fence.ThroughSequence {
+			current.HostID != projectWorkspaceFence.hostID {
 			return domain.NewError(domain.CodeUnauthenticated, "stream agent fence changed")
 		}
 		if err := lockActiveAgentLease(ctx, tx, agentFence); err != nil {
@@ -133,6 +133,27 @@ FROM tasks t CROSS JOIN service_identity i WHERE t.id=$1 AND t.owner_id=$2 AND t
 		}
 		if currentRevision < 0 || currentRevision != desiredRevision || currentRevision != dispatchRevision || taskModelID != dispatchModelID {
 			return domain.NewError(domain.CodeInvalidState, "stream task revision changed")
+		}
+		if current.CheckpointThrough != fence.ThroughSequence {
+			var appliedSteer bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM task_agent_message_deliveries delivery
+JOIN conversation_messages message ON message.id=delivery.message_id
+WHERE delivery.task_id=$1 AND delivery.owner_id=$2 AND delivery.initiator_id=$3
+ AND delivery.agent_instance_id=$4 AND delivery.agent_generation=$5 AND delivery.authorization_version=$6
+ AND delivery.session_id=$7 AND delivery.mode='steer' AND delivery.claimed_checkpoint_through_seq>$8
+ AND message.conversation_id=$9 AND message.role='user' AND message.delivery_status='applied'
+)`, fence.TaskID, fence.OwnerID, fence.InitiatorID, fence.AgentInstanceID, fence.AgentGeneration,
+				fence.AuthorizationVersion, fence.AgentSessionID, fence.ThroughSequence, conversationID).Scan(&appliedSteer); err != nil {
+				return fmt.Errorf("check claimed Task steer before stopping stale stream: %w", err)
+			}
+			if appliedSteer {
+				if err := interruptAssistantMessageSnapshot(ctx, tx, fence.TaskID, delta.TurnID, false); err != nil {
+					return err
+				}
+				return nil
+			}
+			return domain.NewError(domain.CodeUnauthenticated, "stream agent checkpoint changed")
 		}
 		// Route acceptance and delta appends both hold the Task row, so this orders
 		// the stream fence against a steer persisted before its inbox checkpoint.

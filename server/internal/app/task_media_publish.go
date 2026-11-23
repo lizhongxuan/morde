@@ -66,14 +66,18 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 	if current.ID != claimed.ID || current.OwnerID != claimed.OwnerID || current.InitiatorID != claimed.InitiatorID ||
 		current.HostID != claimed.HostID || current.Status != task.StatusRunning || current.Lease.Owner != claimed.Lease.Owner ||
 		current.Lease.Version != claimed.Lease.Version || current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) ||
-		current.WorkspaceID == "" || current.InputRevision == nil || current.WorkspaceCheckpointRevision == nil || len(current.ContextDigest) != sha256.Size {
+		current.WorkspaceID == "" || current.InputRevision == nil || current.WorkspaceCheckpointRevision == nil ||
+		current.CurrentRevision == nil || current.DesiredRevision == nil || *current.CurrentRevision < 0 ||
+		*current.DesiredRevision != *current.CurrentRevision || len(current.ContextDigest) != sha256.Size {
 		return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeInvalidState, "Task lease or Workspace binding changed before media save")
 	}
 	storedPending := details.PendingRequest
 	if storedPending == nil || storedPending.TaskID != pending.TaskID || storedPending.ID != pending.ID || storedPending.Version != pending.Version ||
 		storedPending.CallID != pending.CallID || storedPending.ToolName != pending.ToolName ||
 		storedPending.MediaPreviewOperationID != pending.MediaPreviewOperationID || !bytes.Equal(storedPending.RequestHash, pending.RequestHash) ||
-		storedPending.Status != task.PendingRequestApproved || storedPending.Decision != task.PendingDecisionApprove {
+		storedPending.Status != task.PendingRequestApproved || storedPending.Decision != task.PendingDecisionApprove ||
+		storedPending.TaskRevision == nil || pending.TaskRevision == nil ||
+		*storedPending.TaskRevision != *current.CurrentRevision || *pending.TaskRevision != *current.CurrentRevision {
 		return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeConflict, "approved Task media request changed")
 	}
 	if err := e.authorize(ctx, current, identity.ScopeComputerOperate); err != nil {
@@ -132,12 +136,15 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 		return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeInvalidState, "Task media publish identity is invalid")
 	}
 	if receipt, receiptErr := e.workspaces.FindTaskWorkspacePublishReceipt(ctx, current.OwnerID, current.ID, current.WorkspaceID, operationKey); receiptErr == nil {
+		if !taskMediaWorkspacePublishReceiptMatches(current, pending, receipt) {
+			return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeConflict, "Task media Workspace receipt approval binding changed")
+		}
 		switch receipt.State {
 		case TaskWorkspacePublishSucceeded:
 			if staged.State != TaskMediaPreviewSaving && staged.State != TaskMediaPreviewSaved {
 				return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeInvalidState, "successful Task media publish has no matching staged state")
 			}
-			return e.recordTaskMediaArtifact(ctx, current, stepID, staged, artifactPath, receipt)
+			return e.recordTaskMediaArtifact(ctx, current, pending, stepID, staged, artifactPath, receipt)
 		case TaskWorkspacePublishConflict:
 			return TaskMediaSavedArtifact{}, e.discardTaskMediaAfterPublishFailure(ctx, current.ID, operationID,
 				domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this Task checkpoint was confirmed"))
@@ -252,12 +259,14 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 	}
 	inputManifestSHA := hex.EncodeToString(current.ContextDigest)
 	requestBody, err := json.Marshal(struct {
-		OwnerID, TaskID, WorkspaceID, StepID, OperationID, PendingRequestID, Path, MediaType, SHA256, ViewID, InputManifestSHA256 string
-		PendingRequestVersion, BindingVersion, InputRevision, BaseRevision, SizeBytes                                             int64
+		OwnerID, TaskID, WorkspaceID, StepID, OperationID, CallID, ToolName, ApprovalID, Path, MediaType, SHA256, ViewID, InputManifestSHA256 string
+		ApprovalRequestHash                                                                                                                   string
+		TaskRevision, ApprovalVersion, BindingVersion, InputRevision, BaseRevision, SizeBytes                                                 int64
 	}{
 		OwnerID: current.OwnerID, TaskID: current.ID, WorkspaceID: current.WorkspaceID, StepID: stepID, OperationID: operationID,
-		PendingRequestID: pending.ID, Path: artifactPath, MediaType: media.MediaType, SHA256: digest, ViewID: viewID,
-		InputManifestSHA256: inputManifestSHA, PendingRequestVersion: pending.Version, BindingVersion: bindingVersion,
+		CallID: pending.CallID, ToolName: pending.ToolName, ApprovalID: pending.ID, ApprovalRequestHash: hex.EncodeToString(pending.RequestHash),
+		Path: artifactPath, MediaType: media.MediaType, SHA256: digest, ViewID: viewID,
+		InputManifestSHA256: inputManifestSHA, TaskRevision: *pending.TaskRevision, ApprovalVersion: pending.Version, BindingVersion: bindingVersion,
 		InputRevision: *current.InputRevision, BaseRevision: baseRevision, SizeBytes: media.SizeBytes,
 	})
 	if err != nil {
@@ -270,14 +279,19 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 		LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, BindingVersion: bindingVersion,
 		InputRevision: *current.InputRevision, BaseRevision: baseRevision, HostFence: fence, ViewID: viewID,
 		InputManifestSHA256: inputManifestSHA, OperationKey: operationKey, RequestHash: requestHash[:], DirectDirectorySource: liveDirectory,
+		TaskRevision: *pending.TaskRevision, CallID: pending.CallID, ToolName: pending.ToolName,
+		ApprovalID: pending.ID, ApprovalVersion: pending.Version, ApprovalRequestHash: append([]byte(nil), pending.RequestHash...),
 	}
 	receipt, err := e.workspaces.ReserveTaskWorkspacePublish(ctx, command)
 	if err != nil {
 		return TaskMediaSavedArtifact{}, err
 	}
+	if !taskMediaWorkspacePublishReceiptMatches(current, pending, receipt) {
+		return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeConflict, "Task media Workspace receipt approval binding changed")
+	}
 	switch receipt.State {
 	case TaskWorkspacePublishSucceeded:
-		return e.recordTaskMediaArtifact(ctx, current, stepID, staged, artifactPath, receipt)
+		return e.recordTaskMediaArtifact(ctx, current, pending, stepID, staged, artifactPath, receipt)
 	case TaskWorkspacePublishConflict:
 		return TaskMediaSavedArtifact{}, e.discardTaskMediaAfterPublishFailure(ctx, current.ID, operationID,
 			domain.NewError(domain.CodeWorkspaceConflict, "Workspace changed after this Task checkpoint was confirmed"))
@@ -333,7 +347,7 @@ func (e *RuntimeToolExecutor) saveApprovedTaskMedia(ctx context.Context, claimed
 		}
 		return TaskMediaSavedArtifact{}, err
 	}
-	return e.recordTaskMediaArtifact(ctx, current, stepID, staged, artifactPath, receipt)
+	return e.recordTaskMediaArtifact(ctx, current, pending, stepID, staged, artifactPath, receipt)
 }
 
 func taskMediaApprovalBindingMatches(current task.Task, pending task.PendingRequest, staged TaskMediaStagedObject) bool {
@@ -343,9 +357,18 @@ func taskMediaApprovalBindingMatches(current task.Task, pending task.PendingRequ
 		bytes.Equal(staged.RequestHash, pending.RequestHash)
 }
 
-func (e *RuntimeToolExecutor) recordTaskMediaArtifact(ctx context.Context, current task.Task, stepID string, staged TaskMediaStagedObject,
+func taskMediaWorkspacePublishReceiptMatches(current task.Task, pending task.PendingRequest, receipt TaskWorkspacePublishReceipt) bool {
+	return current.CurrentRevision != nil && current.DesiredRevision != nil && *current.CurrentRevision >= 0 &&
+		*current.DesiredRevision == *current.CurrentRevision && pending.TaskRevision != nil &&
+		*pending.TaskRevision == *current.CurrentRevision && len(pending.RequestHash) == sha256.Size &&
+		receipt.TaskRevision == *pending.TaskRevision && receipt.CallID == pending.CallID && receipt.ToolName == pending.ToolName &&
+		receipt.ApprovalID == pending.ID && receipt.ApprovalVersion == pending.Version &&
+		receipt.ApprovalRequestHash == hex.EncodeToString(pending.RequestHash)
+}
+
+func (e *RuntimeToolExecutor) recordTaskMediaArtifact(ctx context.Context, current task.Task, pending task.PendingRequest, stepID string, staged TaskMediaStagedObject,
 	artifactPath string, receipt TaskWorkspacePublishReceipt) (TaskMediaSavedArtifact, error) {
-	if receipt.State != TaskWorkspacePublishSucceeded || receipt.WorkspaceID != current.WorkspaceID || receipt.PublishedRevision < 0 ||
+	if !taskMediaWorkspacePublishReceiptMatches(current, pending, receipt) || receipt.State != TaskWorkspacePublishSucceeded || receipt.WorkspaceID != current.WorkspaceID || receipt.PublishedRevision < 0 ||
 		!validSyncDigest(receipt.ManifestSHA256) {
 		return TaskMediaSavedArtifact{}, domain.NewError(domain.CodeInternal, "Task media Workspace publish receipt is invalid")
 	}

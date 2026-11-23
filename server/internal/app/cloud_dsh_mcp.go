@@ -177,18 +177,23 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 		activity.displayObject = source.connectorName
 		ctx = context.WithValue(ctx, cloudDSHToolActivityKey{}, activity)
 	}
-	if result, handled, err := b.authorizeMCPCall(ctx, details, call, arguments, source, recovering, checkpointOutput); handled || err != nil {
+	approval, result, handled, err := b.authorizeMCPCall(ctx, details, call, arguments, source, recovering, checkpointOutput)
+	if handled || err != nil {
 		return result, err
 	}
-	return b.executeMCPSource(ctx, details, call, arguments, source, recovering, checkpointOutput)
+	return b.executeMCPSourceWithApproval(ctx, details, call, arguments, source, approval, recovering, checkpointOutput)
 }
 
 func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskDetails, call ModelToolCall,
-	arguments json.RawMessage, source cloudDSHMCPExecutionSource, recovering bool, checkpointOutput *string) (AgentToolResult, bool, error) {
+	arguments json.RawMessage, source cloudDSHMCPExecutionSource, recovering bool, checkpointOutput *string) (*task.PendingRequest, AgentToolResult, bool, error) {
 	current := details.Task
-	hash, err := cloudDSHMCPApprovalHash(current, call, arguments, source)
+	taskRevision, err := currentMCPTaskRevision(current)
 	if err != nil {
-		return AgentToolResult{}, true, err
+		return nil, AgentToolResult{}, true, err
+	}
+	hash, err := cloudDSHMCPApprovalHash(current, *taskRevision, call, arguments, source)
+	if err != nil {
+		return nil, AgentToolResult{}, true, err
 	}
 	fence := cloudDSHMCPApprovalFence(source)
 	request := AgentToolRequest{
@@ -199,72 +204,72 @@ func (b *CloudDSHToolBroker) authorizeMCPCall(ctx context.Context, details TaskD
 	sameApproval := sameMCPConnectorApproval(pending, current, call, hash, fence)
 	if pending != nil && pending.Status == task.PendingRequestPending {
 		result, err := b.pauseForExistingMCPApproval(ctx, details, pending, source.remoteTool)
-		return result, true, err
+		return nil, result, true, err
 	}
 	if sameApproval {
 		switch pending.Status {
 		case task.PendingRequestApproved:
 			if pending.Decision != task.PendingDecisionApprove {
 				result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
-				return result, true, err
+				return nil, result, true, err
 			}
-			return AgentToolResult{}, false, nil
+			return pending, AgentToolResult{}, false, nil
 		case task.PendingRequestRejected:
 			if pending.Decision != task.PendingDecisionReject {
 				result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
-				return result, true, err
+				return nil, result, true, err
 			}
 			step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
 				"Run cloud dsh MCP tool: "+source.remoteTool, "The connected service was not called.")
 			if err != nil {
-				return AgentToolResult{}, true, err
+				return nil, AgentToolResult{}, true, err
 			}
 			result, err := b.rejectApprovedToolCall(ctx, current, step, cloneTaskUsage(current.Usage), request)
-			return result, true, err
+			return nil, result, true, err
 		case task.PendingRequestExpired:
 			if pending.Decision != task.PendingDecisionReject || pending.ExpiresAt == nil || pending.RespondedAt == nil ||
 				pending.RespondedAt.Before(*pending.ExpiresAt) {
 				result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
-				return result, true, err
+				return nil, result, true, err
 			}
 			operationKey := agentOperationKey(call.CallID)
 			operationStore, ok := b.store.(MCPConnectorOperationStore)
 			if !ok {
-				return AgentToolResult{}, true, domain.NewError(domain.CodeUnsupported, "MCP connector operation storage is unavailable")
+				return nil, AgentToolResult{}, true, domain.NewError(domain.CodeUnsupported, "MCP connector operation storage is unavailable")
 			}
 			_, lookupErr := operationStore.GetMCPConnectorOperation(ctx, current.OwnerID, current.ID, source.connectorID, operationKey)
 			if lookupErr == nil || (domain.CodeOf(lookupErr) != domain.CodeNotFound) || checkpointOutput != nil {
 				step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepUnknown,
 					"Review expired MCP approval", "The expired action has a prior result that must be reconciled safely.")
 				if err != nil {
-					return AgentToolResult{}, true, err
+					return nil, AgentToolResult{}, true, err
 				}
 				result, err := b.pauseMCPUnknown(ctx, current, step, cloneTaskUsage(current.Usage), operationKey,
 					"The expired MCP approval has a prior or checkpointed result that cannot be replayed safely.")
-				return result, true, err
+				return nil, result, true, err
 			}
 			step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
 				"Run cloud dsh MCP tool: "+source.remoteTool, "The approval expired before the connected service was called.")
 			if err != nil {
-				return AgentToolResult{}, true, err
+				return nil, AgentToolResult{}, true, err
 			}
 			result, err := b.expireApprovedToolCall(ctx, current, step, cloneTaskUsage(current.Usage), request)
-			return result, true, err
+			return nil, result, true, err
 		default:
 			result, err := b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
-			return result, true, err
+			return nil, result, true, err
 		}
 	}
 	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
 		"Run cloud dsh MCP tool: "+source.remoteTool, "Waiting for approval before calling the connected service.")
 	if err != nil {
-		return AgentToolResult{}, true, err
+		return nil, AgentToolResult{}, true, err
 	}
 	preparation := AgentToolPreparation{
 		Status: AgentToolApprovalRequired, Approval: cloudDSHMCPApprovalRequest(source, arguments, hash), Fence: fence,
 	}
 	result, err := b.pauseForApproval(ctx, current, step, cloneTaskUsage(current.Usage), request, hash, preparation, pending)
-	return result, true, err
+	return nil, result, true, err
 }
 
 func (b *CloudDSHToolBroker) pauseForExistingMCPApproval(ctx context.Context, details TaskDetails, pending *task.PendingRequest, remoteTool string) (AgentToolResult, error) {
@@ -281,10 +286,20 @@ func (b *CloudDSHToolBroker) pauseForExistingMCPApproval(ctx context.Context, de
 	return AgentToolResult{Status: AgentToolNeedsUser}, nil
 }
 
-func cloudDSHMCPApprovalHash(current task.Task, call ModelToolCall, arguments json.RawMessage, source cloudDSHMCPExecutionSource) ([]byte, error) {
+func currentMCPTaskRevision(current task.Task) (*int64, error) {
+	if current.CurrentRevision == nil || current.DesiredRevision == nil || *current.CurrentRevision < 0 ||
+		*current.CurrentRevision != *current.DesiredRevision {
+		return nil, domain.NewError(domain.CodeConflict, "MCP Task revision is unavailable or changing")
+	}
+	revision := *current.CurrentRevision
+	return &revision, nil
+}
+
+func cloudDSHMCPApprovalHash(current task.Task, taskRevision int64, call ModelToolCall, arguments json.RawMessage, source cloudDSHMCPExecutionSource) ([]byte, error) {
 	encoded, err := json.Marshal(struct {
 		TaskID              string          `json:"task_id"`
 		OwnerID             string          `json:"owner_id"`
+		TaskRevision        int64           `json:"task_revision"`
 		CallID              string          `json:"call_id"`
 		ToolAlias           string          `json:"tool_alias"`
 		ConnectorOwnerID    string          `json:"connector_owner_id"`
@@ -297,7 +312,7 @@ func cloudDSHMCPApprovalHash(current task.Task, call ModelToolCall, arguments js
 		RemoteTool          string          `json:"remote_tool"`
 		Arguments           json.RawMessage `json:"arguments"`
 	}{
-		TaskID: current.ID, OwnerID: current.OwnerID, CallID: call.CallID, ToolAlias: call.Name,
+		TaskID: current.ID, OwnerID: current.OwnerID, TaskRevision: taskRevision, CallID: call.CallID, ToolAlias: call.Name,
 		ConnectorOwnerID: source.connectorOwnerID, ConnectorID: source.connectorID,
 		ConnectorRevision: source.connectorRevision, CredentialVersion: source.credentialVersion,
 		GrantVersion: source.grantVersion, ProjectID: source.projectID, ProjectGrantVersion: source.projectGrantVersion,
@@ -517,7 +532,8 @@ func sensitiveMCPApprovalKey(key string) bool {
 }
 
 func sameMCPConnectorApproval(pending *task.PendingRequest, current task.Task, call ModelToolCall, requestHash []byte, fence AgentHostFence) bool {
-	return pending != nil && pending.TaskID == current.ID && pending.Kind == "approval" && pending.CallID == call.CallID &&
+	return pending != nil && domain.ValidPendingRequestID(pending.ID) && pending.Version > 0 &&
+		pending.TaskID == current.ID && pending.Kind == "approval" && pending.CallID == call.CallID &&
 		pending.ToolName == call.Name && bytes.Equal(pending.RequestHash, requestHash) && samePendingApprovalFence(pending, fence)
 }
 
@@ -538,6 +554,11 @@ func (b *CloudDSHToolBroker) failMCPApprovalMismatch(ctx context.Context, curren
 
 func (b *CloudDSHToolBroker) executeMCPSource(ctx context.Context, details TaskDetails, call ModelToolCall, arguments json.RawMessage,
 	source cloudDSHMCPExecutionSource, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
+	return b.executeMCPSourceWithApproval(ctx, details, call, arguments, source, nil, recovering, checkpointOutput)
+}
+
+func (b *CloudDSHToolBroker) executeMCPSourceWithApproval(ctx context.Context, details TaskDetails, call ModelToolCall, arguments json.RawMessage,
+	source cloudDSHMCPExecutionSource, approval *task.PendingRequest, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
 	current := details.Task
 	actorID := taskActorID(current)
 	operationStore, ok := b.store.(MCPConnectorOperationStore)
@@ -548,6 +569,27 @@ func (b *CloudDSHToolBroker) executeMCPSource(ctx context.Context, details TaskD
 	arguments, err = validateAgentToolArguments(string(arguments))
 	if err != nil {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
+	}
+	taskRevision, err := currentMCPTaskRevision(current)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	approvalID, approvalVersion := "", int64(0)
+	var approvalRequestHash []byte
+	if source.connectorID == BuiltinSearchMCPConnectorID {
+		if approval != nil || (call.Name != cloudDSHWebSearchToolName && call.Name != cloudDSHWebReadToolName) {
+			return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "built-in MCP source is not an approved read-only search tool")
+		}
+	} else {
+		approvalRequestHash, err = cloudDSHMCPApprovalHash(current, *taskRevision, call, arguments, source)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
+		if !sameMCPConnectorApproval(approval, current, call, approvalRequestHash, cloudDSHMCPApprovalFence(source)) ||
+			approval.Status != task.PendingRequestApproved || approval.Decision != task.PendingDecisionApprove {
+			return b.failMCPApprovalMismatch(ctx, current, call, details.Steps)
+		}
+		approvalID, approvalVersion = approval.ID, approval.Version
 	}
 	hash, err := agentOperationHash(call.Name, arguments)
 	if err != nil {
@@ -562,6 +604,9 @@ func (b *CloudDSHToolBroker) executeMCPSource(ctx context.Context, details TaskD
 	if hasOperation && (operation.TaskID != current.ID || operation.OwnerID != current.OwnerID || operation.ConnectorID != source.connectorID ||
 		operation.Key != key || operation.ToolName != call.Name || !bytes.Equal(operation.RequestHash, hash[:]) ||
 		operation.ConnectorRevision != source.connectorRevision || operation.CredentialVersion != source.credentialVersion || operation.GrantVersion != source.grantVersion ||
+		!sameMCPTaskRevision(operation.TaskRevision, taskRevision) || operation.CallID != call.CallID ||
+		operation.ApprovalID != approvalID || operation.ApprovalVersion != approvalVersion ||
+		!bytes.Equal(operation.ApprovalRequestHash, approvalRequestHash) ||
 		!sameMCPConnectorOperationTaskSnapshot(operation, current)) {
 		step, stepErr := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepUnknown,
 			"Review MCP connector recovery", "The prior MCP connector operation does not match this exact request.")
@@ -612,7 +657,9 @@ func (b *CloudDSHToolBroker) executeMCPSource(ctx context.Context, details TaskD
 	}
 	preparedFence := MCPConnectorOperation{
 		ID: operationID, TaskID: current.ID, OwnerID: current.OwnerID, ConnectorID: source.connectorID, Key: key,
-		ToolName: call.Name, ConnectorRevision: source.connectorRevision, CredentialVersion: source.credentialVersion,
+		TaskRevision: taskRevision, CallID: call.CallID, ApprovalID: approvalID, ApprovalVersion: approvalVersion,
+		ApprovalRequestHash: approvalRequestHash,
+		ToolName:            call.Name, ConnectorRevision: source.connectorRevision, CredentialVersion: source.credentialVersion,
 		GrantVersion: source.grantVersion, LeaseVersion: current.Lease.Version, HostID: current.HostID,
 		WorkspaceID: current.WorkspaceID, InputRevision: current.InputRevision,
 		WorkspaceCheckpointRevision: current.WorkspaceCheckpointRevision,
@@ -863,6 +910,10 @@ func sameMCPConnectorOperationTaskSnapshot(operation MCPConnectorOperation, curr
 	return operation.HostID == current.HostID && operation.WorkspaceID == current.WorkspaceID &&
 		sameTaskInputRevision(operation.InputRevision, current.InputRevision) &&
 		sameTaskInputRevision(operation.WorkspaceCheckpointRevision, current.WorkspaceCheckpointRevision)
+}
+
+func sameMCPTaskRevision(left, right *int64) bool {
+	return left == nil && right == nil || left != nil && right != nil && *left == *right
 }
 
 func definitionForPinnedMCPTool(raw []byte, connectorID, alias, remoteName string) (MCPConnectorToolDefinition, error) {

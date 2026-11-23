@@ -2504,9 +2504,11 @@ func newRuntimeToolExecutorFixture(t *testing.T, specs []runtimeToolHandlerSpec)
 
 	expires := time.Now().Add(time.Minute).UTC()
 	inputRevision := int64(0)
+	taskRevision := int64(0)
 	value := task.Task{
 		ID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", HostID: "h1234567", ModelID: "p1234567", WorkspaceID: "w1234567",
 		InputRevision: &inputRevision, WorkspaceCheckpointRevision: &inputRevision,
+		CurrentRevision: &taskRevision, DesiredRevision: &taskRevision,
 		Status: task.StatusRunning, Authorization: task.Authorization{Kind: string(identity.KindSession)},
 		Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
 		Lease:  task.Lease{Owner: "worker-1", Version: 1, ExpiresAt: &expires},
@@ -2734,6 +2736,10 @@ func (f *runtimeToolExecutorFixture) prepared(name, arguments string, scope iden
 		if pendingErr != nil {
 			panic(pendingErr)
 		}
+		if request.Task.CurrentRevision != nil {
+			revision := *request.Task.CurrentRevision
+			pending.TaskRevision = &revision
+		}
 		pending.Status, pending.Decision = task.PendingRequestApproved, task.PendingDecisionApprove
 		f.store.details.PendingRequest = pending
 		f.fences.fence = preparation.Fence
@@ -2767,6 +2773,10 @@ func TestRuntimeToolExecutorRejectsExpiredApprovalFromCurrentTaskSnapshot(t *tes
 	}, request.Fence, 1)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if request.Task.CurrentRevision != nil {
+		revision := *request.Task.CurrentRevision
+		pending.TaskRevision = &revision
 	}
 	expiresAt, respondedAt := time.Now().UTC().Add(-time.Minute), time.Now().UTC()
 	pending.Status, pending.Decision = task.PendingRequestExpired, task.PendingDecisionReject

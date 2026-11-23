@@ -473,13 +473,15 @@ type taskStepResponse struct {
 }
 
 type taskAgentResponse struct {
-	ID           string     `json:"id"`
-	ParentID     *string    `json:"parent_id"`
-	StepID       *string    `json:"step_id"`
-	TaskRevision int64      `json:"task_revision"`
-	Role         string     `json:"role"`
-	Status       string     `json:"status"`
-	ObservedAt   *time.Time `json:"observed_at"`
+	ID            string     `json:"id"`
+	ParentID      *string    `json:"parent_id"`
+	StepID        *string    `json:"step_id"`
+	TaskRevision  int64      `json:"task_revision"`
+	Role          string     `json:"role"`
+	Status        string     `json:"status"`
+	ObservedAt    *time.Time `json:"observed_at"`
+	ActivityPhase *string    `json:"activity_phase,omitempty"`
+	ActivityState *string    `json:"activity_state,omitempty"`
 }
 
 type taskBatchItemResponse struct {
@@ -1511,6 +1513,22 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		})
 	}
 	for _, agent := range value.Agents {
+		var activityPhase, activityState *string
+		if agent.ActivityPhase != "" || agent.ActivityState != "" {
+			validPhase := false
+			switch agent.ActivityPhase {
+			case "model", "tool", "subagent", "checkpoint":
+				validPhase = true
+			}
+			validState := false
+			switch agent.ActivityState {
+			case "started", "waiting", "completed", "failed", "cancelled":
+				validState = true
+			}
+			if validPhase && validState {
+				activityPhase, activityState = stringPointer(agent.ActivityPhase), stringPointer(agent.ActivityState)
+			}
+		}
 		if !validTaskAgentID(agent.ID) || (agent.ParentID != "" && !validTaskAgentID(agent.ParentID)) ||
 			(agent.StepID != "" && !domain.ValidStepID(agent.StepID)) || agent.TaskRevision < 0 ||
 			(agent.Role != "main" && agent.Role != "subagent") ||
@@ -1520,7 +1538,8 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 		response.Agents = append(response.Agents, taskAgentResponse{ID: agent.ID, ParentID: optionalTaskText(agent.ParentID),
-			StepID: optionalTaskText(agent.StepID), TaskRevision: agent.TaskRevision, Role: agent.Role, Status: agent.Status, ObservedAt: agent.ObservedAt})
+			StepID: optionalTaskText(agent.StepID), TaskRevision: agent.TaskRevision, Role: agent.Role, Status: agent.Status, ObservedAt: agent.ObservedAt,
+			ActivityPhase: activityPhase, ActivityState: activityState})
 	}
 	for _, item := range value.BatchItems {
 		if !domain.ValidBatchItemID(item.ID) || item.TaskID != value.Task.ID || !validBatchStatusResponse(item.Status) || item.Attempt < 1 {

@@ -307,6 +307,28 @@ enum MIFTaskPresentation {
         }
     }
 
+    static func agentActivityLabel(phase: String?, state: String?) -> String? {
+        guard phase != nil || state != nil else { return nil }
+        let phaseLabel: String
+        switch phase {
+        case "model": phaseLabel = AppLocalized("Model")
+        case "tool": phaseLabel = AppLocalized("Tool")
+        case "subagent": phaseLabel = AppLocalized("Subagent activity")
+        case "checkpoint": phaseLabel = AppLocalized("Checkpoint")
+        default: phaseLabel = AppLocalized("Status unknown")
+        }
+        let stateLabel: String
+        switch state {
+        case "started": stateLabel = AppLocalized("Activity started")
+        case "waiting": stateLabel = AppLocalized("Waiting for response")
+        case "completed": stateLabel = AppLocalized("Completed")
+        case "failed": stateLabel = AppLocalized("Failed")
+        case "cancelled": stateLabel = AppLocalized("Cancelled")
+        default: stateLabel = AppLocalized("Status unknown")
+        }
+        return phaseLabel + " · " + stateLabel
+    }
+
     static func stepDetailStateMessage(_ state: String?) -> String {
         switch state {
         case "not_recorded": return AppLocalized("Details were not recorded")
@@ -1251,10 +1273,19 @@ private struct MIFTaskAgentGroupHeader: View {
 
     @ViewBuilder
     private var statusView: some View {
-        if let status = group.status {
-            Text(verbatim: MIFTaskPresentation.agentStatusLabel(status))
-                .font(.caption.weight(.medium))
-                .foregroundColor(NanoMuseTones.secondaryText)
+        VStack(alignment: .trailing, spacing: 2) {
+            if let status = group.status {
+                Text(verbatim: MIFTaskPresentation.agentStatusLabel(status))
+                    .font(.caption.weight(.medium))
+                    .foregroundColor(NanoMuseTones.secondaryText)
+            }
+            if let activity = MIFTaskPresentation.agentActivityLabel(
+                phase: group.activityPhase, state: group.activityState) {
+                Text(verbatim: activity)
+                    .font(.caption2)
+                    .foregroundColor(NanoMuseTones.secondaryText)
+                    .multilineTextAlignment(.trailing)
+            }
         }
     }
 }
@@ -1270,10 +1301,19 @@ private struct MIFTaskDynamicsAgentHeader: View {
                 .font(.system(size: 13, weight: .bold, design: .monospaced))
                 .foregroundStyle(NanoMuseTones.ink)
             Rectangle().fill(NanoMuseTones.hairline).frame(height: 1)
-            if let status = group.status {
-                Text(verbatim: MIFTaskPresentation.agentStatusLabel(status))
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(NanoMuseTones.secondaryText)
+            VStack(alignment: .trailing, spacing: 2) {
+                if let status = group.status {
+                    Text(verbatim: MIFTaskPresentation.agentStatusLabel(status))
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(NanoMuseTones.secondaryText)
+                }
+                if let activity = MIFTaskPresentation.agentActivityLabel(
+                    phase: group.activityPhase, state: group.activityState) {
+                    Text(verbatim: activity)
+                        .font(.caption2)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
+                        .multilineTextAlignment(.trailing)
+                }
             }
         }
         .padding(.top, 12)
@@ -1766,30 +1806,35 @@ struct MIFTaskDetailView: View {
                     .padding(.vertical, 12)
             } else {
                 ForEach(groups) { group in
-                    MIFTaskDynamicsAgentHeader(group: group)
-                    if group.stepIDs.isEmpty {
-                        Text(AppLocalized("No recorded steps"))
-                            .font(.footnote)
-                            .foregroundStyle(NanoMuseTones.secondaryText)
-                            .padding(.leading, 34)
-                            .padding(.bottom, 12)
-                    } else {
-                        ForEach(Array(group.stepIDs.enumerated()), id: \.offset) { index, stepID in
-                            if let step = stepsByID[stepID]?.first {
-                                MIFTaskDynamicsWorkItemRow(taskID: task.id,
-                                    eventSequence: task.event_sequence ?? 0,
-                                    step: step,
-                                    marker: MIFTaskPresentation.stepMarker(step),
-                                    showsConnector: index < group.stepIDs.count - 1)
+                    VStack(alignment: .leading, spacing: 0) {
+                        MIFTaskDynamicsAgentHeader(group: group)
+                        if group.stepIDs.isEmpty {
+                            Text(AppLocalized("No recorded steps"))
+                                .font(.footnote)
+                                .foregroundStyle(NanoMuseTones.secondaryText)
+                                .padding(.leading, 34)
+                                .padding(.bottom, 12)
+                        } else {
+                            ForEach(Array(group.stepIDs.enumerated()), id: \.offset) { index, stepID in
+                                if let step = stepsByID[stepID]?.first {
+                                    MIFTaskDynamicsWorkItemRow(taskID: task.id,
+                                        eventSequence: task.event_sequence ?? 0,
+                                        step: step,
+                                        marker: MIFTaskPresentation.stepMarker(step),
+                                        showsConnector: index < group.stepIDs.count - 1)
+                                }
                             }
                         }
                     }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityIdentifier("morde.taskDynamics.agentGroup.\(group.id)")
                 }
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 22)
         .padding(.top, 8)
+        .accessibilityElement(children: .contain)
         .accessibilityIdentifier("morde.taskDynamics.process")
     }
 

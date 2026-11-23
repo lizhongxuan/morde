@@ -47,7 +47,81 @@ type cloudDSHSessionState struct {
 	lastObservationSequence int64
 	activeActivities        map[string]string
 	activeActivityOrder     []string
+	agentRequests           map[string]cloudDSHAgentRequest
+	timedOutAgentRequests   map[string]struct{}
+	verifiedAgentRequests   map[string]struct{}
 	settled                 bool
+}
+
+type cloudDSHAgentRequest struct {
+	phase      string
+	kind       string
+	activityID string
+	digest     string
+}
+
+type cloudDSHAgentRequestRunner func(*cloudDSHSessionState, cloudDSHAgentRequest, func() (any, error)) (any, error)
+
+func (request cloudDSHAgentRequest) key() string {
+	return request.phase + "\x00" + request.kind + "\x00" + request.activityID + "\x00" + request.digest
+}
+
+func (state *cloudDSHSessionState) beginAgentRequest(request cloudDSHAgentRequest) error {
+	if state == nil || request.phase == "" || request.kind == "" || request.activityID == "" ||
+		!cloudDSHID.MatchString(request.activityID) {
+		return errors.New("dsh agent request identity is invalid")
+	}
+	if _, ok := cloudDSHDigestBytes(request.digest); !ok {
+		return errors.New("dsh agent request digest is invalid")
+	}
+	key := request.key()
+	if _, exists := state.agentRequests[key]; exists {
+		return errors.New("dsh agent request identity is repeated")
+	}
+	state.agentRequests[key] = request
+	return nil
+}
+
+func cloudDSHAgentRequestDigest(parts ...string) string {
+	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
+	return hex.EncodeToString(sum[:])
+}
+
+func cloudDSHAgentRequestForFrame(frame cloudDSHFrame, state *cloudDSHSessionState) (cloudDSHAgentRequest, bool, error) {
+	request := cloudDSHAgentRequest{}
+	switch frame.Type {
+	case "tool_call":
+		request = cloudDSHAgentRequest{phase: "tool", kind: "tool_call", activityID: frame.CallID,
+			digest: cloudDSHAgentRequestDigest("tool_call", frame.Name, string(frame.Arguments))}
+	case "child_create":
+		request = cloudDSHAgentRequest{phase: "subagent", kind: "child_create", activityID: frame.CallID,
+			digest: cloudDSHAgentRequestDigest("child_create", string(frame.Arguments))}
+	case "child_settle":
+		if frame.Through == nil {
+			return request, false, errors.New("dsh child settlement sequence is missing")
+		}
+		summaryDigest := sha256.Sum256([]byte(strings.TrimSpace(frame.Summary)))
+		request = cloudDSHAgentRequest{phase: "subagent", kind: "child_settle", activityID: frame.CallID,
+			digest: cloudDSHAgentRequestDigest("child_settle", frame.Status, fmt.Sprint(*frame.Through), frame.SHA256, hex.EncodeToString(summaryDigest[:]))}
+	case "checkpoint":
+		if frame.Through == nil {
+			return request, false, errors.New("dsh checkpoint sequence is missing")
+		}
+		request = cloudDSHAgentRequest{phase: "checkpoint", kind: "checkpoint_write", activityID: fmt.Sprintf("checkpoint_%d", *frame.Through),
+			digest: cloudDSHAgentRequestDigest("checkpoint_write", fmt.Sprint(*frame.Through), frame.SHA256)}
+	case "checkpoint_read":
+		if frame.From == nil || state == nil {
+			return request, false, errors.New("dsh checkpoint read identity is missing")
+		}
+		request = cloudDSHAgentRequest{phase: "checkpoint", kind: "checkpoint_read", activityID: fmt.Sprintf("checkpoint_read_%d", *frame.From),
+			digest: cloudDSHAgentRequestDigest("checkpoint_read", fmt.Sprint(*frame.From), fmt.Sprint(state.restoreThrough), hex.EncodeToString(state.restoreDigest))}
+	default:
+		return request, false, nil
+	}
+	if !cloudDSHID.MatchString(request.activityID) {
+		return cloudDSHAgentRequest{}, false, errors.New("dsh agent request activity identity is invalid")
+	}
+	return request, true, nil
 }
 
 const cloudDSHMaxPendingModelCalls = 17
@@ -83,7 +157,8 @@ func newCloudDSHSessionState(fence app.AgentInstanceFence, identity cloudDSHIden
 		checkpointDigest: append([]byte(nil), digest...), restoreDigest: append([]byte(nil), digest...),
 		checkpointIDs: make(map[string]struct{}), pageReadIDs: make(map[string]struct{}),
 		history: history, images: newCloudDSHImageRegistry(cloudDSHModelFence(fence, identity.SessionID, through)),
-		activeActivities: make(map[string]string)}
+		activeActivities: make(map[string]string), agentRequests: make(map[string]cloudDSHAgentRequest),
+		timedOutAgentRequests: make(map[string]struct{}), verifiedAgentRequests: make(map[string]struct{})}
 }
 
 func (state *cloudDSHSessionState) noteActivity(phase, activityID, activityState string) {
@@ -1067,12 +1142,22 @@ func markCloudDSHRetrySourceReconciled(history *cloudDSHCheckpointHistory, inten
 
 func (e *CloudDSHExecutor) recordCloudDSHAgentObservation(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
 	rootIdentity cloudDSHIdentity, states map[string]*cloudDSHSessionState, frame cloudDSHFrame) (bool, error) {
-	if frame.Type != "agent_status" && frame.Type != "agent_activity" && frame.Type != "agent_heartbeat" {
+	if frame.Type != "agent_status" && frame.Type != "agent_activity" && frame.Type != "agent_heartbeat" && frame.Type != "agent_request_timeout" {
 		return false, nil
 	}
 	state := states[frame.SessionID]
-	if state == nil || frame.cloudDSHIdentity != state.identity || state.settled {
+	if state == nil || frame.cloudDSHIdentity != state.identity {
 		return true, errors.New("dsh frame identity is invalid")
+	}
+	settleActivity := frame.Type == "agent_activity" && frame.Phase == "subagent" && frame.ActivityID == state.spawnKey &&
+		(frame.State == "waiting" || frame.State == "completed" || frame.State == "failed" || frame.State == "cancelled")
+	verifiedLateTimeout := false
+	if frame.Type == "agent_request_timeout" {
+		_, verifiedLateTimeout = state.verifiedAgentRequests[(cloudDSHAgentRequest{phase: frame.Phase, kind: frame.RequestKind,
+			activityID: frame.ActivityID, digest: frame.RequestDigest}).key()]
+	}
+	if state.settled && !settleActivity && !verifiedLateTimeout {
+		return true, errors.New("dsh settled child emitted an unexpected agent observation")
 	}
 	switch frame.Type {
 	case "agent_status":
@@ -1136,8 +1221,109 @@ func (e *CloudDSHExecutor) recordCloudDSHAgentObservation(ctx context.Context, v
 				return true, fmt.Errorf("record dsh agent heartbeat observation: %w", err)
 			}
 		}
+	case "agent_request_timeout":
+		if frame.TaskRevision == nil || *frame.TaskRevision != cloudDSHTaskRevision(value) || frame.ObservationSequence == nil ||
+			*frame.ObservationSequence < 1 || *frame.ObservationSequence > 1<<53-1 ||
+			!validCloudDSHAgentRequestTimeout(frame.RequestKind, frame.Phase, frame.ActivityID, frame.RequestDigest) ||
+			*frame.ObservationSequence <= state.lastObservationSequence {
+			return true, errors.New("dsh agent request timeout observation is invalid")
+		}
+		request := cloudDSHAgentRequest{phase: frame.Phase, kind: frame.RequestKind, activityID: frame.ActivityID, digest: frame.RequestDigest}
+		key := request.key()
+		state.lastObservationSequence = *frame.ObservationSequence
+		if _, alreadyVerified := state.verifiedAgentRequests[key]; alreadyVerified {
+			return true, nil
+		}
+		activePhase, active := state.activeActivities[frame.ActivityID]
+		registered, exists := state.agentRequests[key]
+		if !active || activePhase != frame.Phase || !exists || registered != request {
+			return true, errors.New("dsh agent request timeout does not match an in-flight request")
+		}
+		if _, alreadyTimedOut := state.timedOutAgentRequests[key]; alreadyTimedOut {
+			return true, nil
+		}
+		state.timedOutAgentRequests[key] = struct{}{}
+		if recorder, ok := e.options.AgentActivity.(app.TaskAgentRequestReconciliationRecorder); ok {
+			accepted, err := recorder.RecordTaskAgentRequestReconciliation(ctx, app.TaskAgentRequestReconciliation{
+				Fence: fence, AgentSessionID: state.identity.SessionID, TaskRevision: *frame.TaskRevision,
+				Phase: frame.Phase, RequestKind: frame.RequestKind, ActivityID: frame.ActivityID,
+				RequestDigest: frame.RequestDigest, ObservationSequence: *frame.ObservationSequence,
+			})
+			if err != nil {
+				return true, fmt.Errorf("record dsh request reconciliation timeout: %w", err)
+			}
+			if !accepted {
+				return true, errors.New("dsh request reconciliation timeout was fenced")
+			}
+		} else if e.options.AgentActivity != nil {
+			return true, errors.New("dsh request reconciliation recorder is unavailable")
+		}
 	}
 	return true, nil
+}
+
+func validCloudDSHAgentRequestTimeout(kind, phase, activityID, digest string) bool {
+	if !cloudDSHID.MatchString(activityID) {
+		return false
+	}
+	if _, ok := cloudDSHDigestBytes(digest); !ok {
+		return false
+	}
+	switch kind {
+	case "tool_call":
+		return phase == "tool"
+	case "child_create", "child_settle":
+		return phase == "subagent"
+	case "checkpoint_write", "checkpoint_read":
+		return phase == "checkpoint"
+	default:
+		return false
+	}
+}
+
+func (e *CloudDSHExecutor) resolveCloudDSHAgentRequest(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
+	state *cloudDSHSessionState, request cloudDSHAgentRequest) error {
+	if state == nil {
+		return errors.New("dsh agent request session is unavailable")
+	}
+	key := request.key()
+	_, timedOut := state.timedOutAgentRequests[key]
+	shouldResolve := timedOut || state.resume
+	if err := e.resolveCloudDSHAgentRequestForSession(ctx, value, fence, state.identity.SessionID, request, shouldResolve); err != nil {
+		return err
+	}
+	if state.verifiedAgentRequests == nil {
+		state.verifiedAgentRequests = make(map[string]struct{})
+	}
+	state.verifiedAgentRequests[key] = struct{}{}
+	delete(state.timedOutAgentRequests, key)
+	delete(state.agentRequests, key)
+	return nil
+}
+
+func (e *CloudDSHExecutor) resolveCloudDSHAgentRequestForSession(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
+	sessionID string, request cloudDSHAgentRequest, shouldResolve bool) error {
+	if !shouldResolve {
+		return nil
+	}
+	recorder, ok := e.options.AgentActivity.(app.TaskAgentRequestReconciliationRecorder)
+	if !ok {
+		if e.options.AgentActivity == nil {
+			return nil
+		}
+		return errors.New("dsh request reconciliation recorder is unavailable")
+	}
+	resolved, err := recorder.ResolveTaskAgentRequestReconciliation(ctx, app.TaskAgentRequestReconciliation{
+		Fence: fence, AgentSessionID: sessionID, TaskRevision: cloudDSHTaskRevision(value),
+		Phase: request.phase, RequestKind: request.kind, ActivityID: request.activityID, RequestDigest: request.digest,
+	})
+	if err != nil {
+		return fmt.Errorf("resolve dsh request reconciliation: %w", err)
+	}
+	if !resolved {
+		return errors.New("dsh request reconciliation resolution was fenced")
+	}
+	return nil
 }
 
 func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
@@ -1446,45 +1632,48 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	}
 	deferredFrames := make([]cloudDSHRead, 0)
 	deferredFrameBytes := 0
-	type cloudDSHToolExecutionResult struct {
-		result app.AgentToolResult
-		err    error
+	type cloudDSHAgentOperationResult struct {
+		value any
+		err   error
 	}
 	const deferredFrameBytesLimit = 16 << 20
 	deferFrame := func(item cloudDSHRead) {
 		deferredFrames = append(deferredFrames, item)
 		deferredFrameBytes += len(item.frame)
 	}
-	executeToolAndRecordActivity := func(execute func() (app.AgentToolResult, error)) (app.AgentToolResult, error) {
-		results := make(chan cloudDSHToolExecutionResult, 1)
+	runAgentRequest := func(state *cloudDSHSessionState, request cloudDSHAgentRequest, execute func() (any, error)) (any, error) {
+		if state == nil || state.agentRequests[request.key()] != request {
+			return nil, errors.New("dsh agent request was not registered")
+		}
+		results := make(chan cloudDSHAgentOperationResult, 1)
 		go func() {
-			result, err := execute()
-			results <- cloudDSHToolExecutionResult{result: result, err: err}
+			value, err := execute()
+			results <- cloudDSHAgentOperationResult{value: value, err: err}
 		}()
 		for {
 			select {
 			case result := <-results:
-				return result.result, result.err
+				return result.value, result.err
 			default:
 			}
 			if deferredFrameBytes >= deferredFrameBytesLimit {
 				result := <-results
-				return result.result, result.err
+				return result.value, result.err
 			}
 			select {
 			case result := <-results:
-				return result.result, result.err
+				return result.value, result.err
 			case item := <-frames:
 				if item.err != nil {
 					deferFrame(item)
 					result := <-results
-					return result.result, result.err
+					return result.value, result.err
 				}
 				frame, err := decodeCloudDSHFrame(item.frame)
 				if err != nil {
 					deferFrame(item)
 					result := <-results
-					return result.result, result.err
+					return result.value, result.err
 				}
 				handled, err := e.recordCloudDSHAgentObservation(ctx, value, fence, rootIdentity, states, frame)
 				if !handled {
@@ -1494,10 +1683,22 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if err != nil {
 					deferFrame(item)
 					result := <-results
-					return result.result, result.err
+					return result.value, result.err
 				}
 			}
 		}
+	}
+	executeToolAndRecordActivity := func(state *cloudDSHSessionState, request cloudDSHAgentRequest,
+		execute func() (app.AgentToolResult, error)) (app.AgentToolResult, error) {
+		value, err := runAgentRequest(state, request, func() (any, error) { return execute() })
+		if err != nil {
+			return app.AgentToolResult{}, err
+		}
+		result, ok := value.(app.AgentToolResult)
+		if !ok {
+			return app.AgentToolResult{}, errors.New("dsh tool execution returned an invalid result")
+		}
+		return result, nil
 	}
 	for {
 		var item cloudDSHRead
@@ -1847,7 +2048,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			supersedeChildCreate := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
 				return supersedeToolCall(deliveryCtx, messages, frame.SessionID, frame.CallID)
 			}
-			superseded, err := e.createCloudDSHChildSession(ctx, value, fence, frame, states, baseDefinitions, input, supersedeChildCreate)
+			superseded, err := e.createCloudDSHChildSession(ctx, value, fence, frame, states, baseDefinitions, input, supersedeChildCreate, runAgentRequest)
 			if err != nil {
 				return err
 			}
@@ -1877,10 +2078,23 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return errors.New("dsh checkpoint read identity is repeated")
 			}
 			state.pageReadIDs[frame.ID] = struct{}{}
-			page, err := e.options.Checkpoints.ReadPage(ctx, app.AgentCheckpointPageRequest{
-				Fence: fence, SessionID: state.identity.SessionID,
-				From: *frame.From, Through: state.restoreThrough, ThroughDigest: append([]byte(nil), state.restoreDigest...),
+			request, _, err := cloudDSHAgentRequestForFrame(frame, state)
+			if err != nil || state.beginAgentRequest(request) != nil {
+				return errors.New("dsh checkpoint read request could not be tracked")
+			}
+			pageValue, err := runAgentRequest(state, request, func() (any, error) {
+				return e.options.Checkpoints.ReadPage(ctx, app.AgentCheckpointPageRequest{
+					Fence: fence, SessionID: state.identity.SessionID,
+					From: *frame.From, Through: state.restoreThrough, ThroughDigest: append([]byte(nil), state.restoreDigest...),
+				})
 			})
+			if err != nil {
+				return errors.New("dsh checkpoint page is unavailable")
+			}
+			page, ok := pageValue.(app.AgentCheckpointPage)
+			if !ok {
+				return errors.New("dsh checkpoint page result is invalid")
+			}
 			if err != nil || page.From != *frame.From || page.Through < page.From || page.Through > state.restoreThrough ||
 				len(page.Payload) == 0 || len(page.Payload) > 1<<20 || !utf8.Valid(page.Payload) || !uniqueCloudDSHJSON(page.Payload) {
 				return errors.New("dsh checkpoint page is unavailable")
@@ -1892,6 +2106,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if !cloudDSHDigest(page.Payload, digest) || (page.Through == state.restoreThrough && !cloudDSHDigest(page.Payload, hex.EncodeToString(state.restoreDigest))) {
 				return errors.New("dsh checkpoint page digest is invalid")
 			}
+			if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
+				return err
+			}
 			if err := writeCloudDSHFrame(ctx, input, map[string]any{"type": "checkpoint_page", "id": frame.ID, "ok": true,
 				"task_id": state.identity.TaskID, "owner_id": state.identity.OwnerID, "agent_id": state.identity.AgentID,
 				"generation": state.identity.Generation, "authorization_version": state.identity.AuthorizationVersion,
@@ -1902,6 +2119,16 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			state.readThrough = page.Through
 			if state.readThrough == state.restoreThrough {
 				state.history.finishRestore()
+				if state.restoreThrough >= 0 {
+					request := cloudDSHAgentRequest{phase: "checkpoint", kind: "checkpoint_write",
+						activityID: fmt.Sprintf("checkpoint_%d", state.restoreThrough),
+						digest: cloudDSHAgentRequestDigest("checkpoint_write", fmt.Sprint(state.restoreThrough),
+							hex.EncodeToString(state.restoreDigest))}
+					if err := e.resolveCloudDSHAgentRequestForSession(ctx, value, fence, state.identity.SessionID,
+						request, state.resume); err != nil {
+						return err
+					}
+				}
 				if value.StepRetry != nil && state.identity.SessionID == rootIdentity.SessionID {
 					if state.restoreThrough != value.StepRetry.CheckpointThroughSequence ||
 						!bytes.Equal(state.restoreDigest, value.StepRetry.CheckpointDigest) ||
@@ -1920,18 +2147,31 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if _, exists := state.checkpointIDs[frame.ID]; exists || len(state.checkpointIDs) >= 4096 {
 				return errors.New("dsh checkpoint identity is repeated or exceeds the limit")
 			}
+			request, _, err := cloudDSHAgentRequestForFrame(frame, state)
+			if err != nil || state.beginAgentRequest(request) != nil {
+				return errors.New("dsh checkpoint write request could not be tracked")
+			}
 			digest, _ := hex.DecodeString(frame.SHA256)
-			history, err := saveCloudDSHCheckpoint(ctx, e.options.Checkpoints, state.history, app.AgentCheckpointCommand{
-				Fence: checkpointFenceForSession(fence, state.identity.SessionID),
-				From:  *frame.From, Through: *frame.Through, Digest: digest, Payload: []byte(frame.Payload),
+			historyValue, err := runAgentRequest(state, request, func() (any, error) {
+				return saveCloudDSHCheckpoint(ctx, e.options.Checkpoints, state.history, app.AgentCheckpointCommand{
+					Fence: checkpointFenceForSession(fence, state.identity.SessionID),
+					From:  *frame.From, Through: *frame.Through, Digest: digest, Payload: []byte(frame.Payload),
+				})
 			})
 			if err != nil {
 				return err
+			}
+			history, ok := historyValue.(*cloudDSHCheckpointHistory)
+			if !ok || history == nil {
+				return errors.New("dsh checkpoint persistence result is invalid")
 			}
 			state.checkpointIDs[frame.ID] = struct{}{}
 			state.history = history
 			state.through = *frame.Through
 			state.checkpointDigest = append(state.checkpointDigest[:0], digest...)
+			if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
+				return err
+			}
 			if err := writeCloudDSHFrame(ctx, input, map[string]any{"type": "checkpoint_ack", "id": frame.ID, "ok": true,
 				"through_seq": state.through, "sha256": frame.SHA256,
 				"task_id": state.identity.TaskID, "owner_id": state.identity.OwnerID, "agent_id": state.identity.AgentID,
@@ -2080,6 +2320,13 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				pending.arguments, result.Status, result.Output, nil); err != nil {
 				return err
 			}
+			request, _, err := cloudDSHAgentRequestForFrame(pending.frame, pending.session)
+			if err != nil {
+				return errors.New("dsh job cancellation request identity is invalid")
+			}
+			if err := e.resolveCloudDSHAgentRequest(ctx, value, pending.fence, pending.session, request); err != nil {
+				return errors.New("dsh job cancellation request reconciliation could not be confirmed")
+			}
 			if err := writeCloudDSHFrame(ctx, input, map[string]any{"type": "tool_result", "id": pending.frame.ID,
 				"task_id": pending.identity.TaskID, "owner_id": pending.identity.OwnerID, "agent_id": pending.identity.AgentID,
 				"generation": pending.identity.Generation, "authorization_version": pending.identity.AuthorizationVersion,
@@ -2107,13 +2354,30 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if status == task.StepSucceeded && !validCloudDSHChildSuccess(state.history, state.through, summary) {
 				return errors.New("dsh child Agent success is not supported by its checkpoint")
 			}
-			settled, _, err := e.options.Children.Settle(ctx, app.AgentChildSessionSettleCommand{Fence: fence,
-				ActorSessionID: rootIdentity.SessionID, SessionID: state.identity.SessionID, Status: status,
-				CheckpointThrough: state.through, CheckpointDigest: append([]byte(nil), state.checkpointDigest...), Summary: summary})
+			request, _, err := cloudDSHAgentRequestForFrame(frame, state)
+			if err != nil || state.beginAgentRequest(request) != nil {
+				return errors.New("dsh child settlement request could not be tracked")
+			}
+			type cloudDSHChildSettleResult struct {
+				session  app.AgentChildSession
+				replayed bool
+			}
+			settledValue, err := runAgentRequest(state, request, func() (any, error) {
+				settled, replayed, err := e.options.Children.Settle(ctx, app.AgentChildSessionSettleCommand{Fence: fence,
+					ActorSessionID: rootIdentity.SessionID, SessionID: state.identity.SessionID, Status: status,
+					CheckpointThrough: state.through, CheckpointDigest: append([]byte(nil), state.checkpointDigest...), Summary: summary})
+				return cloudDSHChildSettleResult{session: settled, replayed: replayed}, err
+			})
+			settleResult, ok := settledValue.(cloudDSHChildSettleResult)
+			settled := settleResult.session
 			if err != nil || settled.TaskID != value.ID || settled.SessionID != state.identity.SessionID ||
 				settled.ParentSessionID != state.parentSessionID || settled.Step.Status != status || strings.TrimSpace(settled.Step.Summary) != summary ||
-				settled.CheckpointThrough != state.through || !bytes.Equal(settled.CheckpointDigest, state.checkpointDigest) {
+				settled.CheckpointThrough != state.through || !bytes.Equal(settled.CheckpointDigest, state.checkpointDigest) || !ok {
 				return errors.New("dsh child Agent settlement was not durably confirmed")
+			}
+			_ = settleResult.replayed
+			if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
+				return err
 			}
 			toolOutput := summary
 			if !state.background {
@@ -2152,6 +2416,10 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				(!retryCall && !recoveryCall && (!state.history.allHistoricalCallsReconciled() || state.history.validateToolCall(frame.CallID, frame.Name, arguments) != nil)) {
 				return errors.New("dsh tool arguments are invalid")
 			}
+			request, _, err := cloudDSHAgentRequestForFrame(frame, state)
+			if err != nil || state.beginAgentRequest(request) != nil {
+				return errors.New("dsh tool request could not be tracked")
+			}
 			toolCallID := frame.CallID
 			if state.identity.SessionID != rootIdentity.SessionID {
 				toolCallID = cloudDSHNamespacedToolCallID(value.ID, state.identity.SessionID, frame.CallID)
@@ -2187,12 +2455,18 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					if err := supersedeToolCall(ctx, admission.PendingMessages, state.identity.SessionID, frame.CallID); err != nil {
 						return err
 					}
+					if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
+						return err
+					}
 					continue
 				case app.AgentToolCallBaselineUnverifiable:
 					if state.identity.SessionID == rootIdentity.SessionID || admission.Reason == "" {
 						return errors.New("dsh baseline-unverifiable admission is not a child call")
 					}
 					if err := e.writeCloudDSHChildAbort(ctx, fence, input, state.identity.SessionID, frame.CallID, admission.Reason); err != nil {
+						return err
+					}
+					if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
 						return err
 					}
 					continue
@@ -2207,6 +2481,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if cancelRequested {
 				if retryCall {
 					return context.Canceled
+				}
+				if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
+					return err
 				}
 				continue
 			}
@@ -2280,12 +2557,12 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 						if !ok {
 							return errors.New("dsh recovery broker is unavailable")
 						}
-						result, err = executeToolAndRecordActivity(func() (app.AgentToolResult, error) {
+						result, err = executeToolAndRecordActivity(state, request, func() (app.AgentToolResult, error) {
 							return recoveryTools.Reconcile(ctx, value, call, state.history.recoveryOutput(frame.CallID))
 						})
 					}
 				} else {
-					result, err = executeToolAndRecordActivity(func() (app.AgentToolResult, error) {
+					result, err = executeToolAndRecordActivity(state, request, func() (app.AgentToolResult, error) {
 						return e.options.Tools.Execute(ctx, value, call)
 					})
 				}
@@ -2297,10 +2574,16 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if err := supersedeToolCall(ctx, result.SupersedingMessages, state.identity.SessionID, frame.CallID); err != nil {
 					return err
 				}
+				if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
+					return err
+				}
 				continue
 			}
 			if result.Status == app.AgentToolUnknown || result.Status == app.AgentToolNeedsUser {
 				if result.Status == app.AgentToolNeedsUser {
+					if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
+						return err
+					}
 					return ErrCloudDSHWaitingForUser
 				}
 				return errors.New("dsh tool execution requires user attention")
@@ -2344,6 +2627,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			} else if err := state.history.noteToolResult(frame.CallID, frame.Name, arguments, result.Status, result.Output, toolImages); err != nil {
 				return err
 			}
+			if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
+				return err
+			}
 			if err := writeCloudDSHFrame(ctx, input, map[string]any{"type": "tool_result", "id": frame.ID,
 				"task_id": state.identity.TaskID, "owner_id": state.identity.OwnerID, "agent_id": state.identity.AgentID,
 				"generation": state.identity.Generation, "authorization_version": state.identity.AuthorizationVersion,
@@ -2363,7 +2649,13 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 
 func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value task.Task, fence app.AgentInstanceFence,
 	frame cloudDSHFrame, states map[string]*cloudDSHSessionState, parentDefinitions []app.AgentToolDefinition,
-	input io.WriteCloser, supersede func(context.Context, []app.AgentConversationMessage) error) (bool, error) {
+	input io.WriteCloser, supersede func(context.Context, []app.AgentConversationMessage) error,
+	runAgentRequest cloudDSHAgentRequestRunner) (bool, error) {
+	if runAgentRequest == nil {
+		runAgentRequest = func(_ *cloudDSHSessionState, _ cloudDSHAgentRequest, execute func() (any, error)) (any, error) {
+			return execute()
+		}
+	}
 	parent := states[frame.SessionID]
 	if e.options.Children == nil || parent == nil || !parent.canDelegate || parent.identity.SessionID != fence.AgentSessionID ||
 		frame.cloudDSHIdentity != parent.identity || frame.Through == nil || *frame.Through != parent.through || !cloudDSHID.MatchString(frame.CallID) {
@@ -2377,6 +2669,10 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		(!recoveryCall && (!parent.history.allHistoricalCallsReconciled() ||
 			parent.history.validateToolCall(frame.CallID, cloudDSHDelegateToolName, canonical) != nil)) {
 		return false, errors.New("dsh child Agent request does not match the checkpointed tool call")
+	}
+	request, _, err := cloudDSHAgentRequestForFrame(frame, parent)
+	if err != nil || parent.beginAgentRequest(request) != nil {
+		return false, errors.New("dsh child Agent request could not be tracked")
 	}
 	callID := frame.CallID
 	call := app.ModelToolCall{Name: cloudDSHDelegateToolName, CallID: callID, Arguments: string(canonical),
@@ -2394,6 +2690,9 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		if err := supersede(ctx, admission.PendingMessages); err != nil {
 			return false, err
 		}
+		if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, parent, request); err != nil {
+			return false, err
+		}
 		return true, nil
 	default:
 		return false, errors.New("dsh child Agent call admission returned an unsupported result")
@@ -2404,8 +2703,11 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 	}
 	rootCheckpointThrough := rootCheckpointThroughSequence(parent, fence.AgentSessionID)
 	if recoveryCall && frame.SessionID == fence.AgentSessionID {
-		children, err := e.options.Children.List(ctx, fence, frame.SessionID)
-		if err != nil {
+		childrenValue, err := runAgentRequest(parent, request, func() (any, error) {
+			return e.options.Children.List(ctx, fence, frame.SessionID)
+		})
+		children, ok := childrenValue.([]app.AgentChildSession)
+		if err != nil || !ok {
 			return false, errors.New("dsh root child sessions could not be reconciled")
 		}
 		for _, existing := range children {
@@ -2415,9 +2717,13 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 			}
 		}
 	}
-	child, _, err := e.options.Children.Create(ctx, app.AgentChildSessionCommand{Fence: fence, ParentSessionID: fence.AgentSessionID,
-		SpawnKey: frame.CallID, Arguments: canonical, Title: strings.TrimSpace(arguments.Title), AllowedTools: allowedTools,
-		Background: arguments.RunInBackground, RootCheckpointThroughSequence: rootCheckpointThrough})
+	childValue, err := runAgentRequest(parent, request, func() (any, error) {
+		child, _, err := e.options.Children.Create(ctx, app.AgentChildSessionCommand{Fence: fence, ParentSessionID: fence.AgentSessionID,
+			SpawnKey: frame.CallID, Arguments: canonical, Title: strings.TrimSpace(arguments.Title), AllowedTools: allowedTools,
+			Background: arguments.RunInBackground, RootCheckpointThroughSequence: rootCheckpointThrough})
+		return child, err
+	})
+	child, ok := childValue.(app.AgentChildSession)
 	if messages, superseded := cloudDSHTaskInputPendingMessages(err); superseded {
 		if supersede == nil {
 			return false, errors.New("dsh child Agent superseding delivery is unavailable")
@@ -2425,11 +2731,33 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		if err := supersede(ctx, messages); err != nil {
 			return false, err
 		}
+		if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, parent, request); err != nil {
+			return false, err
+		}
 		return true, nil
 	}
-	if err != nil || child.TaskID != value.ID || child.ParentSessionID != fence.AgentSessionID || child.SessionID == "" ||
+	if err != nil || !ok || child.TaskID != value.ID || child.ParentSessionID != fence.AgentSessionID || child.SessionID == "" ||
+		child.SpawnKey != frame.CallID || child.Background != arguments.RunInBackground ||
 		!sameWorkerToolNames(child.AllowedTools, allowedTools) {
 		return false, errors.New("dsh child Agent could not be durably created")
+	}
+	if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, parent, request); err != nil {
+		return false, err
+	}
+	if child.Step.Status == task.StepSucceeded || child.Step.Status == task.StepFailed {
+		summaryDigest := sha256.Sum256([]byte(strings.TrimSpace(child.Step.Summary)))
+		settlement := cloudDSHAgentRequest{phase: "subagent", kind: "child_settle", activityID: frame.CallID,
+			digest: cloudDSHAgentRequestDigest("child_settle", string(child.Step.Status), fmt.Sprint(child.CheckpointThrough),
+				hex.EncodeToString(child.CheckpointDigest), hex.EncodeToString(summaryDigest[:]))}
+		if childState := states[child.SessionID]; childState != nil && childState.identity.SessionID == child.SessionID {
+			if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, childState, settlement); err != nil {
+				return false, err
+			}
+		} else if parent.resume {
+			if err := e.resolveCloudDSHAgentRequestForSession(ctx, value, fence, child.SessionID, settlement, true); err != nil {
+				return false, err
+			}
+		}
 	}
 	var settledOutput string
 	hasSettledOutput := false

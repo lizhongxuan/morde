@@ -1724,6 +1724,14 @@ type TaskAgentCheckpoint struct {
 	AgentRootSessionID string             `json:"agent_root_session_id"`
 }
 
+type TaskAgentChildCancelOperation struct {
+	TaskID       string             `json:"task_id"`
+	OwnerID      string             `json:"owner_id"`
+	OperationKey string             `json:"operation_key"`
+	SessionID    string             `json:"session_id"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+}
+
 type TaskAgentInstance struct {
 	TaskID                        string             `json:"task_id"`
 	OwnerID                       string             `json:"owner_id"`
@@ -1765,40 +1773,103 @@ type TaskAgentInstance struct {
 }
 
 type TaskAgentMessageDelivery struct {
-	MessageID            string             `json:"message_id"`
+	MessageID                   string             `json:"message_id"`
+	TaskID                      string             `json:"task_id"`
+	OwnerID                     string             `json:"owner_id"`
+	InitiatorID                 string             `json:"initiator_id"`
+	AgentInstanceID             string             `json:"agent_instance_id"`
+	AgentGeneration             int64              `json:"agent_generation"`
+	AuthorizationVersion        int64              `json:"authorization_version"`
+	SessionID                   string             `json:"session_id"`
+	Mode                        string             `json:"mode"`
+	EnqueuedThroughSeq          pgtype.Int8        `json:"enqueued_through_seq"`
+	ClaimedThroughSeq           pgtype.Int8        `json:"claimed_through_seq"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
+	ClaimedCheckpointThroughSeq pgtype.Int8        `json:"claimed_checkpoint_through_seq"`
+}
+
+type TaskAgentRequestReconciliation struct {
 	TaskID               string             `json:"task_id"`
 	OwnerID              string             `json:"owner_id"`
-	InitiatorID          string             `json:"initiator_id"`
+	SessionID            string             `json:"session_id"`
+	TaskRevision         int64              `json:"task_revision"`
 	AgentInstanceID      string             `json:"agent_instance_id"`
 	AgentGeneration      int64              `json:"agent_generation"`
 	AuthorizationVersion int64              `json:"authorization_version"`
-	SessionID            string             `json:"session_id"`
-	Mode                 string             `json:"mode"`
-	EnqueuedThroughSeq   pgtype.Int8        `json:"enqueued_through_seq"`
-	ClaimedThroughSeq    pgtype.Int8        `json:"claimed_through_seq"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	Phase                string             `json:"phase"`
+	RequestKind          string             `json:"request_kind"`
+	ActivityID           string             `json:"activity_id"`
+	RequestDigest        string             `json:"request_digest"`
+	ObservationSequence  int64              `json:"observation_sequence"`
+	State                string             `json:"state"`
+	RecordedAt           pgtype.Timestamptz `json:"recorded_at"`
+	ResolvedAt           pgtype.Timestamptz `json:"resolved_at"`
 }
 
 type TaskAgentSession struct {
-	TaskID               string             `json:"task_id"`
-	OwnerID              string             `json:"owner_id"`
-	SessionID            string             `json:"session_id"`
-	ParentSessionID      pgtype.Text        `json:"parent_session_id"`
-	StepID               pgtype.Text        `json:"step_id"`
-	SpawnKey             pgtype.Text        `json:"spawn_key"`
-	RequestHash          []byte             `json:"request_hash"`
-	CheckpointThroughSeq int64              `json:"checkpoint_through_seq"`
-	CheckpointDigest     []byte             `json:"checkpoint_digest"`
-	CreatedAt            pgtype.Timestamptz `json:"created_at"`
-	AllowedTools         []byte             `json:"allowed_tools"`
-	IsBackground         bool               `json:"is_background"`
-	CancelRequestedAt    pgtype.Timestamptz `json:"cancel_requested_at"`
-	TaskRevision         int64              `json:"task_revision"`
-	ActivityStatus       pgtype.Text        `json:"activity_status"`
-	ActivityGeneration   pgtype.Int8        `json:"activity_generation"`
-	ActivitySequence     pgtype.Int8        `json:"activity_sequence"`
-	ActivityObservedAt   pgtype.Timestamptz `json:"activity_observed_at"`
+	TaskID                      string             `json:"task_id"`
+	OwnerID                     string             `json:"owner_id"`
+	SessionID                   string             `json:"session_id"`
+	ParentSessionID             pgtype.Text        `json:"parent_session_id"`
+	StepID                      pgtype.Text        `json:"step_id"`
+	SpawnKey                    pgtype.Text        `json:"spawn_key"`
+	RequestHash                 []byte             `json:"request_hash"`
+	CheckpointThroughSeq        int64              `json:"checkpoint_through_seq"`
+	CheckpointDigest            []byte             `json:"checkpoint_digest"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	AllowedTools                []byte             `json:"allowed_tools"`
+	IsBackground                bool               `json:"is_background"`
+	CancelRequestedAt           pgtype.Timestamptz `json:"cancel_requested_at"`
+	TaskRevision                int64              `json:"task_revision"`
+	ActivityStatus              pgtype.Text        `json:"activity_status"`
+	ActivityGeneration          pgtype.Int8        `json:"activity_generation"`
+	ActivitySequence            pgtype.Int8        `json:"activity_sequence"`
+	ActivityObservedAt          pgtype.Timestamptz `json:"activity_observed_at"`
+	ActivityRevision            pgtype.Int8        `json:"activity_revision"`
+	ActivityPhase               pgtype.Text        `json:"activity_phase"`
+	ActivityState               pgtype.Text        `json:"activity_state"`
+	ActivityID                  pgtype.Text        `json:"activity_id"`
+	ActivityProgressedAt        pgtype.Timestamptz `json:"activity_progressed_at"`
+	ActivityHeartbeatAt         pgtype.Timestamptz `json:"activity_heartbeat_at"`
+	RootCheckpointThroughSeq    int64              `json:"root_checkpoint_through_seq"`
+	RootCheckpointBaselineKnown bool               `json:"root_checkpoint_baseline_known"`
+}
+
+type TaskAgentStallNotice struct {
+	TaskID          string             `json:"task_id"`
+	OwnerID         string             `json:"owner_id"`
+	MessageID       string             `json:"message_id"`
+	StepID          string             `json:"step_id"`
+	TaskRevision    int64              `json:"task_revision"`
+	AgentGeneration int64              `json:"agent_generation"`
+	State           string             `json:"state"`
+	PromptedAt      pgtype.Timestamptz `json:"prompted_at"`
+	ClearedAt       pgtype.Timestamptz `json:"cleared_at"`
+	NoticeKind      string             `json:"notice_kind"`
+}
+
+type TaskAgentToolCallAdmission struct {
+	TaskID              string             `json:"task_id"`
+	OwnerID             string             `json:"owner_id"`
+	OperationKey        string             `json:"operation_key"`
+	AgentInstanceID     string             `json:"agent_instance_id"`
+	AgentGeneration     int64              `json:"agent_generation"`
+	RootSessionID       string             `json:"root_session_id"`
+	CallSessionID       string             `json:"call_session_id"`
+	ThroughSequence     int64              `json:"through_sequence"`
+	RootThroughSequence int64              `json:"root_through_sequence"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+}
+
+type TaskAgentToolSupersession struct {
+	TaskID       string             `json:"task_id"`
+	OwnerID      string             `json:"owner_id"`
+	OperationKey string             `json:"operation_key"`
+	MessageID    string             `json:"message_id"`
+	Position     int32              `json:"position"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
 }
 
 type TaskArtifact struct {
@@ -1985,6 +2056,11 @@ type TaskMcpConnectorOperation struct {
 	InputRevision               pgtype.Int8        `json:"input_revision"`
 	WorkspaceCheckpointRevision pgtype.Int8        `json:"workspace_checkpoint_revision"`
 	BuiltinService              pgtype.Text        `json:"builtin_service"`
+	TaskRevision                pgtype.Int8        `json:"task_revision"`
+	CallID                      pgtype.Text        `json:"call_id"`
+	ApprovalID                  pgtype.Text        `json:"approval_id"`
+	ApprovalVersion             pgtype.Int8        `json:"approval_version"`
+	ApprovalRequestHash         []byte             `json:"approval_request_hash"`
 }
 
 type TaskMcpSelectionSource struct {
@@ -2087,6 +2163,12 @@ type TaskOperation struct {
 	BindingVersion              int64              `json:"binding_version"`
 	InputRevision               pgtype.Int8        `json:"input_revision"`
 	WorkspaceCheckpointRevision pgtype.Int8        `json:"workspace_checkpoint_revision"`
+	TaskRevision                pgtype.Int8        `json:"task_revision"`
+	CallID                      pgtype.Text        `json:"call_id"`
+	ToolName                    pgtype.Text        `json:"tool_name"`
+	ApprovalID                  pgtype.Text        `json:"approval_id"`
+	ApprovalVersion             pgtype.Int8        `json:"approval_version"`
+	ApprovalRequestHash         []byte             `json:"approval_request_hash"`
 }
 
 type TaskPendingRequest struct {
@@ -2110,6 +2192,8 @@ type TaskPendingRequest struct {
 	RespondedAt             pgtype.Timestamptz `json:"responded_at"`
 	MediaPreviewOperationID pgtype.Text        `json:"media_preview_operation_id"`
 	ExpiresAt               pgtype.Timestamptz `json:"expires_at"`
+	TaskRevision            pgtype.Int8        `json:"task_revision"`
+	RespondedByUserID       pgtype.Text        `json:"responded_by_user_id"`
 }
 
 type TaskRevisionIntent struct {
@@ -2377,6 +2461,12 @@ type TaskWorkspacePublishReceipt struct {
 	CreatedAt             pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
 	DirectDirectorySource bool               `json:"direct_directory_source"`
+	TaskRevision          pgtype.Int8        `json:"task_revision"`
+	CallID                pgtype.Text        `json:"call_id"`
+	ToolName              pgtype.Text        `json:"tool_name"`
+	ApprovalID            pgtype.Text        `json:"approval_id"`
+	ApprovalVersion       pgtype.Int8        `json:"approval_version"`
+	ApprovalRequestHash   []byte             `json:"approval_request_hash"`
 }
 
 type TaskWorkspaceViewDeletion struct {

@@ -155,12 +155,13 @@ func (s *Store) GetTask(ctx context.Context, id, ownerID string) (app.TaskDetail
 		}
 		var pending task.PendingRequest
 		var requestHash []byte
+		var pendingRevision pgtype.Int8
 		var expiresAt, respondedAt pgtype.Timestamptz
 		err = tx.QueryRow(ctx, `SELECT id, task_id, version, kind, title, object, content, impact, call_id, COALESCE(media_preview_operation_id,''), tool_name,
-request_hash, runtime_generation, runtime_instance_id, control_version, status, decision, created_at, expires_at, responded_at
+task_revision, request_hash, runtime_generation, runtime_instance_id, control_version, status, decision, created_at, expires_at, responded_at
 FROM task_pending_requests WHERE task_id=$1 ORDER BY version DESC LIMIT 1`, id).Scan(
 			&pending.ID, &pending.TaskID, &pending.Version, &pending.Kind, &pending.Title, &pending.Object, &pending.Content,
-			&pending.Impact, &pending.CallID, &pending.MediaPreviewOperationID, &pending.ToolName, &requestHash, &pending.RuntimeGeneration,
+			&pending.Impact, &pending.CallID, &pending.MediaPreviewOperationID, &pending.ToolName, &pendingRevision, &requestHash, &pending.RuntimeGeneration,
 			&pending.RuntimeInstanceID, &pending.ControlVersion, &pending.Status, &pending.Decision, &pending.CreatedAt, &expiresAt, &respondedAt)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read latest task pending request: %w", err)
@@ -168,6 +169,10 @@ FROM task_pending_requests WHERE task_id=$1 ORDER BY version DESC LIMIT 1`, id).
 		var pendingRequest *task.PendingRequest
 		if err == nil {
 			pending.RequestHash = append([]byte(nil), requestHash...)
+			if pendingRevision.Valid {
+				revision := pendingRevision.Int64
+				pending.TaskRevision = &revision
+			}
 			if expiresAt.Valid {
 				expires := expiresAt.Time
 				pending.ExpiresAt = &expires
@@ -297,7 +302,11 @@ CASE WHEN s.parent_session_id IS NULL THEN 'main' ELSE 'subagent' END,
 CASE WHEN live.valid AND s.activity_generation=t.agent_generation AND s.activity_revision=t.current_revision AND s.activity_sequence IS NOT NULL
   AND (s.parent_session_id IS NULL OR s.task_revision=t.current_revision) THEN s.activity_status ELSE 'unknown' END,
 CASE WHEN live.valid AND s.activity_generation=t.agent_generation AND s.activity_revision=t.current_revision AND s.activity_sequence IS NOT NULL
-  AND (s.parent_session_id IS NULL OR s.task_revision=t.current_revision) THEN s.activity_observed_at ELSE NULL END
+  AND (s.parent_session_id IS NULL OR s.task_revision=t.current_revision) THEN s.activity_observed_at ELSE NULL END,
+CASE WHEN live.valid AND s.activity_generation=t.agent_generation AND s.activity_revision=t.current_revision AND s.activity_sequence IS NOT NULL
+  AND (s.parent_session_id IS NULL OR s.task_revision=t.current_revision) THEN s.activity_phase ELSE NULL END,
+CASE WHEN live.valid AND s.activity_generation=t.agent_generation AND s.activity_revision=t.current_revision AND s.activity_sequence IS NOT NULL
+  AND (s.parent_session_id IS NULL OR s.task_revision=t.current_revision) THEN s.activity_state ELSE NULL END
 FROM task_agent_sessions s JOIN tasks t ON t.id=s.task_id AND t.owner_id=s.owner_id
 LEFT JOIN LATERAL (SELECT true AS valid FROM task_agent_instances ai
   WHERE ai.task_id=t.id AND ai.owner_id=t.owner_id AND ai.agent_generation=t.agent_generation
@@ -318,13 +327,17 @@ ORDER BY (s.parent_session_id IS NULL) DESC,s.created_at,s.session_id`, taskID, 
 		var agent app.TaskAgentExecution
 		var status string
 		var observedAt pgtype.Timestamptz
-		if err := rows.Scan(&agent.ID, &agent.ParentID, &agent.StepID, &agent.TaskRevision, &agent.Role, &status, &observedAt); err != nil {
+		var activityPhase, activityState pgtype.Text
+		if err := rows.Scan(&agent.ID, &agent.ParentID, &agent.StepID, &agent.TaskRevision, &agent.Role, &status, &observedAt, &activityPhase, &activityState); err != nil {
 			return nil, err
 		}
 		agent.Status = status
 		if observedAt.Valid {
 			value := observedAt.Time
 			agent.ObservedAt = &value
+		}
+		if activityPhase.Valid && activityState.Valid && validTaskAgentActivityPhase(activityPhase.String) && validTaskAgentActivityState(activityState.String) {
+			agent.ActivityPhase, agent.ActivityState = activityPhase.String, activityState.String
 		}
 		agents = append(agents, agent)
 	}
@@ -1543,6 +1556,7 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 		hostlessWorkspaceApproval := app.IsHostlessWorkspaceWriteApproval(*pending)
 		if !domain.ValidPendingRequestID(pending.ID) || pending.TaskID != progress.TaskID || pending.Version < 1 || pending.Kind != "approval" ||
 			pending.Status != task.PendingRequestPending || pending.Decision != "" || len(pending.RequestHash) != 32 ||
+			(pending.TaskRevision != nil && *pending.TaskRevision < 0) ||
 			pending.RuntimeGeneration < 0 || (!hostlessWorkspaceApproval && pending.RuntimeInstanceID == "") || pending.ControlVersion < 0 || pending.CallID == "" || len(pending.CallID) > 256 ||
 			pending.ToolName == "" || len(pending.ToolName) > 128 || !validPendingText(pending.Title) || !validPendingText(pending.Object) ||
 			!validPendingText(pending.Content) || !validPendingText(pending.Impact) || progress.Status != task.StatusWaitingUser || progress.WaitingReason != "approval_required" {
@@ -1718,6 +1732,12 @@ FROM tasks WHERE id=$1 FOR UPDATE`, progress.TaskID).Scan(
 		}
 		if current.LeaseOwner != progress.LeaseOwner || current.LeaseVersion != progress.LeaseVersion || !leaseValid || !revisionReady || current.Status != string(task.StatusRunning) {
 			return taskLeaseConflict()
+		}
+		if pending := progress.PendingRequest; pending != nil {
+			if pending.TaskRevision != nil && *pending.TaskRevision != currentRevision {
+				return domain.NewError(domain.CodeConflict, "Task revision changed while creating its approval")
+			}
+			pending.TaskRevision = &currentRevision
 		}
 		currentTask := rowTaskDomain(current)
 		if fence := progress.AgentCompletionFence; fence != nil {
@@ -2203,10 +2223,10 @@ RETURNING event_seq`,
 				mediaOperationID = pgtype.Text{String: pending.MediaPreviewOperationID, Valid: true}
 			}
 			_, err = tx.Exec(ctx, `INSERT INTO task_pending_requests
-(id, task_id, version, kind, title, object, content, impact, call_id, media_preview_operation_id, tool_name, request_hash,
+(id, task_id, version, task_revision, kind, title, object, content, impact, call_id, media_preview_operation_id, tool_name, request_hash,
  runtime_generation, runtime_instance_id, control_version, status, expires_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,'pending',$16)`,
-				pending.ID, pending.TaskID, pending.Version, pending.Kind, pending.Title, pending.Object, pending.Content, pending.Impact,
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17)`,
+				pending.ID, pending.TaskID, pending.Version, pending.TaskRevision, pending.Kind, pending.Title, pending.Object, pending.Content, pending.Impact,
 				pending.CallID, mediaOperationID, pending.ToolName, pending.RequestHash, pending.RuntimeGeneration, pending.RuntimeInstanceID, pending.ControlVersion, pending.ExpiresAt)
 			if err != nil {
 				return fmt.Errorf("persist task pending request: %w", err)
@@ -2968,6 +2988,7 @@ func (s *Store) CreateOperation(ctx context.Context, value task.Operation, lease
 	if !domain.ValidOperationID(value.ID) || !domain.ValidTaskID(value.TaskID) || value.Key == "" || len(value.Key) > 255 ||
 		len(value.RequestHash) != 32 || !domain.ValidHostID(value.HostID) || value.LeaseVersion < 1 ||
 		value.RuntimeLeaseVersion < 1 || value.RuntimeInstanceID == "" || leaseOwner == "" ||
+		!validTaskOperationIdentityBinding(value) ||
 		!validOperationWorkspaceBinding(value.WorkspaceID, value.BindingVersion) ||
 		(value.InputRevision != nil && (value.WorkspaceID == "" || *value.InputRevision < 0)) ||
 		(value.WorkspaceID == "") != (value.WorkspaceCheckpointRevision == nil) ||
@@ -3043,12 +3064,27 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if err := requireOperationHostFence(ctx, tx, ownerID, value); err != nil {
 			return err
 		}
+		if value.TaskRevision != nil {
+			currentRevision, err := requireCurrentTaskRevision(ctx, tx, value.TaskID)
+			if err != nil {
+				return err
+			}
+			if *value.TaskRevision != currentRevision {
+				return domain.NewError(domain.CodeConflict, "Task revision changed before operation registration")
+			}
+		}
+		if value.ApprovalID != "" {
+			if err := requireApprovedTaskOperationBinding(ctx, tx, value, *value.TaskRevision); err != nil {
+				return err
+			}
+		}
 		existing, err := loadOperationByKey(ctx, tx, value.TaskID, value.Key)
 		if err == nil {
 			if !equalOperationHash(existing.RequestHash, value.RequestHash) || existing.HostID != value.HostID ||
 				existing.WorkspaceID != value.WorkspaceID || existing.BindingVersion != value.BindingVersion ||
 				!sameTaskInputRevision(existing.InputRevision, value.InputRevision) ||
-				!sameTaskInputRevision(existing.WorkspaceCheckpointRevision, value.WorkspaceCheckpointRevision) {
+				!sameTaskInputRevision(existing.WorkspaceCheckpointRevision, value.WorkspaceCheckpointRevision) ||
+				!sameTaskOperationIdentityBinding(existing, value) {
 				return idempotencyConflict()
 			}
 			result, replayed = existing, true
@@ -3068,10 +3104,14 @@ FROM tasks WHERE id=$1 FOR UPDATE`, value.TaskID).Scan(
 		if err := requireRunningTaskApplication(ctx, tx, row); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO task_operations (id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, runtime_generation, runtime_instance_id, control_version, lease_version, runtime_lease_version, status, external_id, result)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,'prepared',$15,$16)`, value.ID, value.TaskID, value.Key, value.RequestHash,
-			value.HostID, value.WorkspaceID, value.BindingVersion, taskUsageTokens(value.InputRevision), taskUsageTokens(value.WorkspaceCheckpointRevision), value.RuntimeGeneration, value.RuntimeInstanceID,
-			value.ControlVersion, value.LeaseVersion, value.RuntimeLeaseVersion, value.ExternalID, value.Result)
+		_, err = tx.Exec(ctx, `INSERT INTO task_operations
+(id, task_id, operation_key, request_hash, task_revision, call_id, tool_name, approval_id, approval_version, approval_request_hash,
+ host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, runtime_generation, runtime_instance_id, control_version, lease_version, runtime_lease_version, status, external_id, result)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,'prepared',$21,$22)`,
+			value.ID, value.TaskID, value.Key, value.RequestHash, taskUsageTokens(value.TaskRevision), nullableText(value.CallID), nullableText(value.ToolName),
+			nullableText(value.ApprovalID), taskUsageTokens(value.ApprovalVersion), value.ApprovalRequestHash, value.HostID, value.WorkspaceID,
+			value.BindingVersion, taskUsageTokens(value.InputRevision), taskUsageTokens(value.WorkspaceCheckpointRevision), value.RuntimeGeneration,
+			value.RuntimeInstanceID, value.ControlVersion, value.LeaseVersion, value.RuntimeLeaseVersion, value.ExternalID, value.Result)
 		if err != nil {
 			return fmt.Errorf("create prepared task operation: %w", err)
 		}
@@ -3183,6 +3223,27 @@ FROM tasks WHERE id=$1 FOR UPDATE`, update.TaskID).Scan(
 		}
 		dispatching := operation.Status == task.OperationPrepared && update.Status == task.OperationDispatched
 		rearming := operation.Status == task.OperationUnknown && update.Status == task.OperationPrepared
+		if !validTaskOperationIdentityBinding(operation) {
+			return domain.NewError(domain.CodeInvalidState, "stored task operation binding is incomplete")
+		}
+		if dispatching && operation.TaskRevision != nil {
+			currentRevision, err := requireCurrentTaskRevision(ctx, tx, update.TaskID)
+			if err != nil {
+				return err
+			}
+			if *operation.TaskRevision != currentRevision {
+				return domain.NewError(domain.CodeConflict, "Task revision changed before operation dispatch")
+			}
+			if operation.ApprovalID != "" {
+				dispatchOperation := operation
+				dispatchOperation.RuntimeGeneration = update.RuntimeGeneration
+				dispatchOperation.RuntimeInstanceID = update.RuntimeInstanceID
+				dispatchOperation.ControlVersion = update.ControlVersion
+				if err := requireApprovedTaskOperationBinding(ctx, tx, dispatchOperation, currentRevision); err != nil {
+					return err
+				}
+			}
+		}
 		if update.RearmAfterNotFound != rearming || update.AdoptPrepared != adoptingPrepared {
 			return domain.NewError(domain.CodeInvalidState, "operation rearm requires an explicit confirmed not-found result")
 		}
@@ -3440,12 +3501,40 @@ func incrementTaskEventSequence(ctx context.Context, tx pgx.Tx, taskID string) (
 
 func loadOperationByKey(ctx context.Context, tx pgx.Tx, taskID, operationKey string) (task.Operation, error) {
 	var row sqlcgen.TaskOperation
-	err := tx.QueryRow(ctx, `SELECT id, task_id, operation_key, request_hash, host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, runtime_generation, runtime_instance_id, control_version, lease_version, runtime_lease_version, status, external_id, result, created_at, updated_at
+	var taskRevision, approvalVersion pgtype.Int8
+	var callID, toolName, approvalID pgtype.Text
+	var approvalRequestHash []byte
+	err := tx.QueryRow(ctx, `SELECT id, task_id, operation_key, request_hash, task_revision, call_id, tool_name, approval_id, approval_version, approval_request_hash,
+host_id, workspace_id, binding_version, input_revision, workspace_checkpoint_revision, runtime_generation, runtime_instance_id, control_version, lease_version, runtime_lease_version, status, external_id, result, created_at, updated_at
 FROM task_operations WHERE task_id=$1 AND operation_key=$2`, taskID, operationKey).Scan(
-		&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash, &row.HostID, &row.WorkspaceID, &row.BindingVersion,
-		&row.InputRevision, &row.WorkspaceCheckpointRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion, &row.LeaseVersion, &row.RuntimeLeaseVersion, &row.Status,
-		&row.ExternalID, &row.Result, &row.CreatedAt, &row.UpdatedAt)
-	return taskOperationDomain(row), err
+		&row.ID, &row.TaskID, &row.OperationKey, &row.RequestHash,
+		&taskRevision, &callID, &toolName, &approvalID, &approvalVersion, &approvalRequestHash,
+		&row.HostID, &row.WorkspaceID, &row.BindingVersion,
+		&row.InputRevision, &row.WorkspaceCheckpointRevision, &row.RuntimeGeneration, &row.RuntimeInstanceID, &row.ControlVersion,
+		&row.LeaseVersion, &row.RuntimeLeaseVersion, &row.Status, &row.ExternalID, &row.Result, &row.CreatedAt, &row.UpdatedAt)
+	if err != nil {
+		return task.Operation{}, err
+	}
+	operation := taskOperationDomain(row)
+	if taskRevision.Valid {
+		value := taskRevision.Int64
+		operation.TaskRevision = &value
+	}
+	if callID.Valid {
+		operation.CallID = callID.String
+	}
+	if toolName.Valid {
+		operation.ToolName = toolName.String
+	}
+	if approvalID.Valid {
+		operation.ApprovalID = approvalID.String
+	}
+	if approvalVersion.Valid {
+		value := approvalVersion.Int64
+		operation.ApprovalVersion = &value
+	}
+	operation.ApprovalRequestHash = append([]byte(nil), approvalRequestHash...)
+	return operation, nil
 }
 
 func validOperationWorkspaceBinding(workspaceID string, bindingVersion int64) bool {
@@ -3453,6 +3542,76 @@ func validOperationWorkspaceBinding(workspaceID string, bindingVersion int64) bo
 		return bindingVersion == 0
 	}
 	return domain.ValidWorkspaceID(workspaceID) && bindingVersion > 0
+}
+
+func validTaskOperationIdentityBinding(operation task.Operation) bool {
+	hasBinding := operation.TaskRevision != nil || operation.CallID != "" || operation.ToolName != "" ||
+		operation.ApprovalID != "" || operation.ApprovalVersion != nil || len(operation.ApprovalRequestHash) != 0
+	if !hasBinding {
+		return true
+	}
+	if operation.TaskRevision == nil || *operation.TaskRevision < 0 || operation.CallID == "" || len(operation.CallID) > 256 ||
+		!utf8.ValidString(operation.CallID) || strings.ContainsRune(operation.CallID, '\x00') ||
+		operation.ToolName == "" || len(operation.ToolName) > 128 || !utf8.ValidString(operation.ToolName) ||
+		strings.ContainsRune(operation.ToolName, '\x00') || operation.Key != app.AgentOperationKey(operation.CallID) {
+		return false
+	}
+	hasApproval := operation.ApprovalID != "" || operation.ApprovalVersion != nil || len(operation.ApprovalRequestHash) != 0
+	if !hasApproval {
+		return true
+	}
+	return domain.ValidPendingRequestID(operation.ApprovalID) && operation.ApprovalVersion != nil && *operation.ApprovalVersion > 0 &&
+		len(operation.ApprovalRequestHash) == sha256.Size && bytes.Equal(operation.ApprovalRequestHash, operation.RequestHash)
+}
+
+func sameTaskOperationIdentityBinding(a, b task.Operation) bool {
+	return sameTaskInputRevision(a.TaskRevision, b.TaskRevision) && a.CallID == b.CallID && a.ToolName == b.ToolName &&
+		a.ApprovalID == b.ApprovalID && sameTaskInputRevision(a.ApprovalVersion, b.ApprovalVersion) &&
+		bytes.Equal(a.ApprovalRequestHash, b.ApprovalRequestHash)
+}
+
+func requireCurrentTaskRevision(ctx context.Context, tx pgx.Tx, taskID string) (int64, error) {
+	var currentRevision, desiredRevision int64
+	if err := tx.QueryRow(ctx, `SELECT current_revision, desired_revision FROM tasks WHERE id=$1`, taskID).
+		Scan(&currentRevision, &desiredRevision); err != nil {
+		return 0, fmt.Errorf("read Task revision for operation binding: %w", err)
+	}
+	if currentRevision < 0 || desiredRevision != currentRevision {
+		return 0, taskLeaseConflict()
+	}
+	return currentRevision, nil
+}
+
+func requireApprovedTaskOperationBinding(ctx context.Context, tx pgx.Tx, operation task.Operation, currentRevision int64) error {
+	if !validTaskOperationIdentityBinding(operation) || operation.ApprovalID == "" || operation.TaskRevision == nil ||
+		*operation.TaskRevision != currentRevision {
+		return domain.NewError(domain.CodeForbidden, "task operation approval binding is incomplete or stale")
+	}
+	var pendingRevision pgtype.Int8
+	var pendingCallID, pendingToolName, pendingStatus, pendingDecision, runtimeInstanceID string
+	var requestHash []byte
+	var runtimeGeneration, controlVersion int64
+	var hasResponder, hasResponse, expired bool
+	err := tx.QueryRow(ctx, `SELECT task_revision, call_id, tool_name, request_hash, status, decision,
+runtime_generation, runtime_instance_id, control_version, responded_by_user_id IS NOT NULL, responded_at IS NOT NULL,
+(expires_at IS NOT NULL AND (responded_at IS NULL OR responded_at >= expires_at))
+FROM task_pending_requests WHERE task_id=$1 AND id=$2 AND version=$3 FOR UPDATE`,
+		operation.TaskID, operation.ApprovalID, *operation.ApprovalVersion).
+		Scan(&pendingRevision, &pendingCallID, &pendingToolName, &requestHash, &pendingStatus, &pendingDecision,
+			&runtimeGeneration, &runtimeInstanceID, &controlVersion, &hasResponder, &hasResponse, &expired)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeForbidden, "task operation approval is unavailable")
+	}
+	if err != nil {
+		return fmt.Errorf("lock task operation approval: %w", err)
+	}
+	if !pendingRevision.Valid || pendingRevision.Int64 != currentRevision || pendingCallID != operation.CallID || pendingToolName != operation.ToolName ||
+		!bytes.Equal(requestHash, operation.RequestHash) || !bytes.Equal(requestHash, operation.ApprovalRequestHash) ||
+		pendingStatus != string(task.PendingRequestApproved) || pendingDecision != string(task.PendingDecisionApprove) || !hasResponder || !hasResponse || expired ||
+		runtimeGeneration != operation.RuntimeGeneration || runtimeInstanceID != operation.RuntimeInstanceID || controlVersion != operation.ControlVersion {
+		return domain.NewError(domain.CodeForbidden, "task operation approval does not match the current Host action")
+	}
+	return nil
 }
 
 func validTaskStatus(value task.Status) bool {

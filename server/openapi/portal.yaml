@@ -12773,6 +12773,8 @@ components:
         role: { type: string, enum: [main, subagent] }
         status: { type: string, enum: [running, idle, unknown], description: Runtime observation only; unknown means the observation cannot be trusted as current. }
         observed_at: { type: [string, 'null'], format: date-time }
+        activity_phase: { type: string, enum: [model, tool, subagent, checkpoint], description: Current Activity phase, omitted when the observation is not current or trusted. }
+        activity_state: { type: string, enum: [started, waiting, completed, failed, cancelled], description: Current Activity state paired with activity_phase; never an approval status. }
     TaskStepDetail:
       type: object
       required: [task_id, step_id, event_sequence, tool_name, detail_state, object, input, result, truncated]

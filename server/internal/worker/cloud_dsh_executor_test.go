@@ -966,6 +966,25 @@ type cloudDSHTestActivityRecorder struct {
 	err          error
 }
 
+type cloudDSHTestRequestReconciliationRecorder struct {
+	cloudDSHTestActivityRecorder
+	recorded         []app.TaskAgentRequestReconciliation
+	resolved         []app.TaskAgentRequestReconciliation
+	rejectResolution bool
+}
+
+func (r *cloudDSHTestRequestReconciliationRecorder) RecordTaskAgentRequestReconciliation(_ context.Context,
+	request app.TaskAgentRequestReconciliation) (bool, error) {
+	r.recorded = append(r.recorded, request)
+	return true, nil
+}
+
+func (r *cloudDSHTestRequestReconciliationRecorder) ResolveTaskAgentRequestReconciliation(_ context.Context,
+	request app.TaskAgentRequestReconciliation) (bool, error) {
+	r.resolved = append(r.resolved, request)
+	return !r.rejectResolution, nil
+}
+
 func (r *cloudDSHTestActivityRecorder) RecordTaskAgentActivity(_ context.Context, observation app.TaskAgentActivityObservation) (bool, error) {
 	r.observations = append(r.observations, observation)
 	if r.observed != nil {
@@ -975,6 +994,107 @@ func (r *cloudDSHTestActivityRecorder) RecordTaskAgentActivity(_ context.Context
 		}
 	}
 	return r.applied, r.err
+}
+
+func (r *cloudDSHTestActivityRecorder) RecordTaskAgentRequestReconciliation(_ context.Context,
+	_ app.TaskAgentRequestReconciliation) (bool, error) {
+	return true, r.err
+}
+
+func (r *cloudDSHTestActivityRecorder) ResolveTaskAgentRequestReconciliation(_ context.Context,
+	_ app.TaskAgentRequestReconciliation) (bool, error) {
+	return true, r.err
+}
+
+func TestCloudDSHRequestTimeoutFrameRequiresExactFields(t *testing.T) {
+	identity := `"task_id":"q1234567","owner_id":"u1234567","agent_id":"agent_1","generation":2,"authorization_version":1,"session_id":"session_1"`
+	valid := `{"type":"agent_request_timeout",` + identity + `,"task_revision":4,"observation_sequence":9,"phase":"tool","request_kind":"tool_call","activity_id":"call_123","request_digest":"` + strings.Repeat("a", 64) + `"}`
+	frame, err := decodeCloudDSHFrame([]byte(valid))
+	if err != nil || frame.RequestKind != "tool_call" || frame.RequestDigest != strings.Repeat("a", 64) {
+		t.Fatalf("valid request timeout frame = %#v, %v", frame, err)
+	}
+	for _, raw := range []string{
+		`{"type":"agent_request_timeout",` + identity + `,"observation_sequence":9,"phase":"tool","request_kind":"tool_call","activity_id":"call_123","request_digest":"` + strings.Repeat("a", 64) + `"}`,
+		`{"type":"agent_request_timeout",` + identity + `,"task_revision":4,"observation_sequence":9,"phase":"subagent","request_kind":"tool_call","activity_id":"call_123","request_digest":"` + strings.Repeat("a", 64) + `"}`,
+		`{"type":"agent_request_timeout",` + identity + `,"task_revision":4,"observation_sequence":9,"phase":"tool","request_kind":"tool_call","activity_id":"call_123","request_digest":"short"}`,
+		`{"type":"agent_request_timeout",` + identity + `,"task_revision":4,"observation_sequence":9,"phase":"tool","request_kind":"tool_call","activity_id":"call_123","request_digest":"` + strings.Repeat("a", 64) + `","raw_args":"must not be sent"}`,
+	} {
+		if _, err := decodeCloudDSHFrame([]byte(raw)); err == nil {
+			t.Fatalf("invalid request timeout frame accepted: %s", raw)
+		}
+	}
+}
+
+func TestCloudDSHRequestTimeoutPersistsUntilExactResultIsResolved(t *testing.T) {
+	revision := int64(7)
+	value := task.Task{ID: "q1234567", OwnerID: "u1234567", CurrentRevision: &revision}
+	fence := app.AgentInstanceFence{TaskID: value.ID, OwnerID: value.OwnerID, InitiatorID: value.OwnerID,
+		AgentInstanceID: "agent_1", AgentGeneration: 2, AgentSessionID: "session_1", SupervisorID: "supervisor_test",
+		LeaseOwner: "worker_test", LeaseVersion: 3, AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion,
+		ProfileVersion: cloudDSHProfileVersion}
+	identity := cloudDSHIdentity{TaskID: value.ID, OwnerID: value.OwnerID, AgentID: fence.AgentInstanceID,
+		Generation: fence.AgentGeneration, AuthorizationVersion: fence.AuthorizationVersion, SessionID: fence.AgentSessionID}
+	state := newCloudDSHSessionState(fence, identity, "", "", nil, false, false, -1, nil)
+	request := cloudDSHAgentRequest{phase: "tool", kind: "tool_call", activityID: "call_123",
+		digest: cloudDSHAgentRequestDigest("tool_call", "file_read", `{"path":"README.md"}`)}
+	if err := state.beginAgentRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	state.noteActivity(request.phase, request.activityID, "started")
+	recorder := &cloudDSHTestRequestReconciliationRecorder{}
+	executor := &CloudDSHExecutor{options: CloudDSHExecutorOptions{AgentActivity: recorder}}
+	sequence := int64(1)
+	frame := cloudDSHFrame{Type: "agent_request_timeout", cloudDSHIdentity: identity, TaskRevision: &revision,
+		ObservationSequence: &sequence, Phase: request.phase, RequestKind: request.kind,
+		ActivityID: request.activityID, RequestDigest: request.digest}
+	handled, err := executor.recordCloudDSHAgentObservation(context.Background(), value, fence, identity,
+		map[string]*cloudDSHSessionState{identity.SessionID: state}, frame)
+	if err != nil || !handled || len(recorder.recorded) != 1 || recorder.recorded[0].RequestDigest != request.digest {
+		t.Fatalf("timeout observation handled=%t err=%v recorded=%+v", handled, err, recorder.recorded)
+	}
+	if len(state.timedOutAgentRequests) != 1 || len(state.agentRequests) != 1 {
+		t.Fatalf("timeout was not kept pending in the in-flight session: %#v", state)
+	}
+	if err := executor.resolveCloudDSHAgentRequest(context.Background(), value, fence, state, request); err != nil {
+		t.Fatal(err)
+	}
+	if len(recorder.resolved) != 1 || recorder.resolved[0].RequestDigest != request.digest ||
+		len(state.timedOutAgentRequests) != 0 || len(state.agentRequests) != 0 {
+		t.Fatalf("exact result did not resolve the timeout: resolved=%+v state=%#v", recorder.resolved, state)
+	}
+	sequence = 2
+	handled, err = executor.recordCloudDSHAgentObservation(context.Background(), value, fence, identity,
+		map[string]*cloudDSHSessionState{identity.SessionID: state}, frame)
+	if err != nil || !handled || len(recorder.recorded) != 1 {
+		t.Fatalf("late timeout after exact result handled=%t err=%v recorded=%+v", handled, err, recorder.recorded)
+	}
+}
+
+func TestCloudDSHRequestResolutionFenceDoesNotMarkLocalRequestVerified(t *testing.T) {
+	revision := int64(7)
+	value := task.Task{ID: "q1234567", OwnerID: "u1234567", CurrentRevision: &revision}
+	fence := app.AgentInstanceFence{TaskID: value.ID, OwnerID: value.OwnerID, InitiatorID: value.OwnerID,
+		AgentInstanceID: "agent_1", AgentGeneration: 2, AgentSessionID: "session_1", SupervisorID: "supervisor_test",
+		LeaseOwner: "worker_test", LeaseVersion: 3, AuthorizationVersion: 1, EngineVersion: cloudDSHEngineVersion,
+		ProfileVersion: cloudDSHProfileVersion}
+	identity := cloudDSHIdentity{TaskID: value.ID, OwnerID: value.OwnerID, AgentID: fence.AgentInstanceID,
+		Generation: fence.AgentGeneration, AuthorizationVersion: fence.AuthorizationVersion, SessionID: fence.AgentSessionID}
+	state := newCloudDSHSessionState(fence, identity, "", "", nil, false, false, -1, nil)
+	request := cloudDSHAgentRequest{phase: "tool", kind: "tool_call", activityID: "call_123",
+		digest: cloudDSHAgentRequestDigest("tool_call", "file_read", `{"path":"README.md"}`)}
+	if err := state.beginAgentRequest(request); err != nil {
+		t.Fatal(err)
+	}
+	state.timedOutAgentRequests[request.key()] = struct{}{}
+	recorder := &cloudDSHTestRequestReconciliationRecorder{rejectResolution: true}
+	executor := &CloudDSHExecutor{options: CloudDSHExecutorOptions{AgentActivity: recorder}}
+	if err := executor.resolveCloudDSHAgentRequest(context.Background(), value, fence, state, request); err == nil {
+		t.Fatal("fenced reconciliation resolution was treated as success")
+	}
+	if len(recorder.resolved) != 1 || len(state.agentRequests) != 1 || len(state.timedOutAgentRequests) != 1 ||
+		len(state.verifiedAgentRequests) != 0 {
+		t.Fatalf("fenced resolution advanced local request state: resolved=%+v state=%#v", recorder.resolved, state)
+	}
 }
 
 func TestCloudDSHExecutorRecordsRootAgentStatusObservations(t *testing.T) {
@@ -1917,6 +2037,8 @@ createInterface({ input: process.stdin }).on('line', raw => {
       observation_sequence: ++sequence, phase: 'tool', state: 'started', activity_id: callID })
     emit({ type: 'tool_call', id: 'tool_pending', ...identity(start), through_seq: 2, call_id: callID,
       name: toolName, arguments: args })
+    emit({ type: 'agent_activity', ...identity(start), task_revision: start.task_revision,
+      observation_sequence: ++sequence, phase: 'tool', state: 'waiting', activity_id: callID })
     emit({ type: 'failed', ...identity(start), code: 'queued_until_tool_result' })
     timer = setInterval(() => emit({ type: 'agent_heartbeat', ...identity(start), task_revision: start.task_revision,
       observation_sequence: ++sequence, phase: 'tool', activity_id: callID }), 20)
@@ -1943,10 +2065,17 @@ setInterval(() => {}, 1000)`, tool.Name, `{"workspace_id":"w1234567","path":"REA
 
 	deadline := time.NewTimer(3 * time.Second)
 	defer deadline.Stop()
-	heartbeats := 0
-	for heartbeats < 2 {
+	heartbeats, waitingObserved := 0, false
+	for heartbeats < 2 || !waitingObserved {
 		select {
 		case observation := <-observed:
+			if observation.Kind == app.TaskAgentActivityKindActivity && observation.State == "waiting" {
+				if observation.Fence != supervisor.launch.Fence || observation.AgentSessionID != supervisor.launch.Fence.AgentSessionID ||
+					observation.TaskRevision != cloudDSHTaskRevision(value) || observation.Phase != "tool" || observation.ActivityID != "call_pending_1" {
+					t.Fatalf("tool wait identity/activity = %#v", observation)
+				}
+				waitingObserved = true
+			}
 			if observation.Kind == app.TaskAgentActivityKindHeartbeat {
 				if observation.Fence != supervisor.launch.Fence || observation.AgentSessionID != supervisor.launch.Fence.AgentSessionID ||
 					observation.TaskRevision != cloudDSHTaskRevision(value) || observation.Phase != "tool" || observation.ActivityID != "call_pending_1" {
@@ -1955,9 +2084,9 @@ setInterval(() => {}, 1000)`, tool.Name, `{"workspace_id":"w1234567","path":"REA
 				heartbeats++
 			}
 		case err := <-executeDone:
-			t.Fatalf("task ended before two pending-tool heartbeats were recorded: %v", err)
+			t.Fatalf("task ended before waiting activity and two pending-tool heartbeats were recorded: %v", err)
 		case <-deadline.C:
-			t.Fatalf("recorded %d heartbeats while tool execution remained pending", heartbeats)
+			t.Fatalf("waiting=%t heartbeats=%d while tool execution remained pending", waitingObserved, heartbeats)
 		}
 	}
 	releaseOnce.Do(func() { close(releaseExecute) })
@@ -2562,6 +2691,8 @@ func TestCloudDSHExecutorRecoversChildSessionAfterRuntimeRestartWithoutReplaying
 
 func TestCloudDSHPersonalRecoveryAllowsSettledChildWithWriteReceipt(t *testing.T) {
 	executor, supervisor, instances, checkpoints, models, value := cloudDSHFixture(t)
+	reconciliationRecorder := &cloudDSHTestRequestReconciliationRecorder{cloudDSHTestActivityRecorder: cloudDSHTestActivityRecorder{applied: true}}
+	executor.options.AgentActivity = reconciliationRecorder
 	definition := app.AgentToolDefinition{ModelTool: app.ModelTool{Name: "morde_personal_object_update", Description: "Save an authorized memory",
 		Parameters: json.RawMessage(`{"type":"object","properties":{"object_type":{"type":"string"},"object_id":{"type":"string"},"base_revision":{"type":"integer"},"body":{"type":"string"}},"required":["object_type","object_id","base_revision","body"],"additionalProperties":false}`)}}
 	baseTools := &cloudDSHMemoryTestTools{cloudDSHTestTools: &cloudDSHTestTools{definitions: []app.AgentToolDefinition{definition},
@@ -2621,7 +2752,8 @@ func TestCloudDSHPersonalRecoveryAllowsSettledChildWithWriteReceipt(t *testing.T
 		_ = supervisor.cmd.Process.Kill()
 		return app.ModelResponse{}, errors.New("test Runtime stopped after the child settled")
 	}
-	if err := executor.ExecuteTask(context.Background(), value); err == nil || errors.Is(err, ErrCloudDSHCompletionPending) {
+	err := executor.ExecuteTask(context.Background(), value)
+	if err == nil || errors.Is(err, ErrCloudDSHCompletionPending) {
 		t.Fatalf("interrupted parent run = %v", err)
 	}
 	cloudDSHExpireTestRuntime(t, executor)
@@ -2671,6 +2803,14 @@ func TestCloudDSHPersonalRecoveryAllowsSettledChildWithWriteReceipt(t *testing.T
 		t.Fatalf("settled child recovery replayed a write or resumed the child: confirmations=%d writes=%d pauses=%d root=%d child=%d settles=%d",
 			tools.confirmations, len(baseTools.calls), baseTools.pauseCalls, rootCalls[rootFence.AgentGeneration+1],
 			childCalls[rootFence.AgentGeneration+1], children.settles)
+	}
+	resolvedChildSettlement := false
+	for _, request := range reconciliationRecorder.resolved {
+		resolvedChildSettlement = resolvedChildSettlement || request.AgentSessionID == children.child.SessionID &&
+			request.RequestKind == app.TaskAgentRequestKindChildSettle
+	}
+	if !resolvedChildSettlement {
+		t.Fatalf("recovery did not reconcile the exact persisted child settlement: %+v", reconciliationRecorder.resolved)
 	}
 }
 
@@ -3244,7 +3384,7 @@ func TestCloudDSHChildCreateSupersedesBeforeCreatingPendingSpawn(t *testing.T) {
 	}
 
 	superseded, err := executor.createCloudDSHChildSession(context.Background(), value, fence, frame,
-		map[string]*cloudDSHSessionState{parent.identity.SessionID: parent}, []app.AgentToolDefinition{cloudDSHReadTool()}, writer, supersede)
+		map[string]*cloudDSHSessionState{parent.identity.SessionID: parent}, []app.AgentToolDefinition{cloudDSHReadTool()}, writer, supersede, nil)
 	if err != nil || !superseded {
 		t.Fatalf("child create with pending steer = superseded %t, err %v", superseded, err)
 	}
@@ -3279,7 +3419,7 @@ func TestCloudDSHChildCreateReconcilesExistingSpawnAfterSteer(t *testing.T) {
 	}
 
 	superseded, err := executor.createCloudDSHChildSession(context.Background(), value, fence, frame,
-		map[string]*cloudDSHSessionState{parent.identity.SessionID: parent}, []app.AgentToolDefinition{cloudDSHReadTool()}, writer, supersede)
+		map[string]*cloudDSHSessionState{parent.identity.SessionID: parent}, []app.AgentToolDefinition{cloudDSHReadTool()}, writer, supersede, nil)
 	if err != nil || superseded {
 		t.Fatalf("existing child spawn recovery = superseded %t, err %v", superseded, err)
 	}
@@ -3288,6 +3428,46 @@ func TestCloudDSHChildCreateReconcilesExistingSpawnAfterSteer(t *testing.T) {
 		!tools.admissionRecovery[0] || !strings.Contains(writer.String(), `"type":"child_session"`) {
 		t.Fatalf("existing child spawn was not reconciled: creates=%d key=%q admissions=%+v recovery=%v response=%s",
 			children.creates, children.createCommand.SpawnKey, tools.admissionCalls, tools.admissionRecovery, writer.String())
+	}
+}
+
+func TestCloudDSHChildCreateRejectsMismatchedSpawnReceiptBeforeResolvingTimeout(t *testing.T) {
+	const callID = "delegate_call_1"
+	arguments := `{"title":"Inspect","objective":"Read the project","tool_names":["file_read"],"run_in_background":true}`
+	for _, test := range []struct {
+		name       string
+		spawnKey   string
+		background bool
+	}{
+		{name: "wrong spawn key", spawnKey: "delegate_other", background: true},
+		{name: "wrong background mode", spawnKey: callID, background: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			tools := &cloudDSHTestTools{admissionStatus: app.AgentToolCallAdmitted}
+			children := &cloudDSHTestChildSessions{child: app.AgentChildSession{TaskID: "q1234567", SessionID: "child_test",
+				ParentSessionID: "session_123", SpawnKey: test.spawnKey, Background: test.background,
+				Step:              task.Step{ID: "step_child", TaskID: "q1234567", Sequence: 1, Kind: "subagent", Status: task.StepRunning},
+				CheckpointThrough: -1, AllowedTools: []string{"file_read"}}}
+			recorder := &cloudDSHTestRequestReconciliationRecorder{}
+			executor := &CloudDSHExecutor{options: CloudDSHExecutorOptions{Tools: tools, Children: children, AgentActivity: recorder}}
+			fence, parent, frame, value := cloudDSHChildCreateFixture(t, arguments, false)
+			request, _, err := cloudDSHAgentRequestForFrame(frame, parent)
+			if err != nil {
+				t.Fatal(err)
+			}
+			parent.timedOutAgentRequests[request.key()] = struct{}{}
+			writer := &cloudDSHFrameBuffer{}
+			states := map[string]*cloudDSHSessionState{parent.identity.SessionID: parent}
+
+			if superseded, err := executor.createCloudDSHChildSession(context.Background(), value, fence, frame,
+				states, []app.AgentToolDefinition{cloudDSHReadTool()}, writer, nil, nil); err == nil || superseded {
+				t.Fatalf("mismatched child receipt was accepted: superseded=%t err=%v", superseded, err)
+			}
+			if len(recorder.resolved) != 0 || len(parent.timedOutAgentRequests) != 1 {
+				t.Fatalf("mismatched child receipt cleared reconciliation: resolved=%+v timed_out=%v",
+					recorder.resolved, parent.timedOutAgentRequests)
+			}
+		})
 	}
 }
 
@@ -3306,7 +3486,7 @@ func TestCloudDSHChildCreatePersistsTheRootCheckpointBaseline(t *testing.T) {
 	states := map[string]*cloudDSHSessionState{parent.identity.SessionID: parent}
 
 	superseded, err := executor.createCloudDSHChildSession(context.Background(), value, fence, frame,
-		states, []app.AgentToolDefinition{cloudDSHReadTool()}, writer, supersede)
+		states, []app.AgentToolDefinition{cloudDSHReadTool()}, writer, supersede, nil)
 	if err != nil || superseded {
 		t.Fatalf("child create = superseded %t, err %v", superseded, err)
 	}

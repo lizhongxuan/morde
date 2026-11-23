@@ -1455,6 +1455,8 @@ struct MordeTaskAgentExecution: Decodable, Equatable, Identifiable, Sendable {
     let role: String
     let status: String
     let observed_at: String?
+    let activity_phase: String?
+    let activity_state: String?
 }
 
 struct MordeTaskStepDetail: Decodable, Equatable, Sendable {
@@ -1489,6 +1491,8 @@ struct MordeTaskAgentActivityGroup: Equatable, Identifiable, Sendable {
     let id: String
     let title: String
     let status: String?
+    let activityPhase: String?
+    let activityState: String?
     let taskRevision: Int64?
     let depth: Int
     let stepIDs: [String]
@@ -1501,6 +1505,7 @@ enum MordeTaskAgentActivityPolicy {
         func unassigned(_ values: [MordeTaskAgentActivityStep]) -> [MordeTaskAgentActivityGroup] {
             values.isEmpty ? [] : [MordeTaskAgentActivityGroup(
                 id: "unassigned", title: "Attribution unconfirmed", status: nil,
+                activityPhase: nil, activityState: nil,
                 taskRevision: nil, depth: 0, stepIDs: values.map(\.id))]
         }
         guard !agents.isEmpty else { return unassigned(orderedSteps) }
@@ -1539,6 +1544,8 @@ enum MordeTaskAgentActivityPolicy {
             groups.append(MordeTaskAgentActivityGroup(id: agent.id,
                 title: depth == 0 ? "MAIN" : "SUBAGENT " + path.map { String(format: "%02d", $0) }.joined(separator: "."),
                 status: agent.status,
+                activityPhase: agent.activity_phase,
+                activityState: agent.activity_state,
                 taskRevision: agent.task_revision,
                 depth: depth, stepIDs: ownSteps.map(\.id)))
             let orderedChildren = (children[agent.id] ?? []).sorted { left, right in

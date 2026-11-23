@@ -157,6 +157,23 @@ func cloudDSHWorkspaceToolsEligible(value task.Task) bool {
 		len(value.ContextDigest) == sha256.Size
 }
 
+func hostlessWorkspaceWriteApprovalMatches(current task.Task, call ModelToolCall, requestHash []byte, pending *task.PendingRequest) bool {
+	return current.CurrentRevision != nil && current.DesiredRevision != nil && *current.CurrentRevision >= 0 &&
+		*current.CurrentRevision == *current.DesiredRevision && pending != nil && domain.ValidPendingRequestID(pending.ID) &&
+		pending.TaskID == current.ID && pending.Version > 0 && pending.TaskRevision != nil &&
+		*pending.TaskRevision == *current.CurrentRevision && pending.Kind == "approval" &&
+		pending.Status == task.PendingRequestApproved && pending.Decision == task.PendingDecisionApprove &&
+		pending.CallID == call.CallID && pending.ToolName == call.Name && len(requestHash) == sha256.Size &&
+		bytes.Equal(pending.RequestHash, requestHash) && pending.RespondedAt != nil &&
+		(pending.ExpiresAt == nil || pending.RespondedAt.Before(*pending.ExpiresAt))
+}
+
+func taskWorkspacePublishReceiptMatchesApproval(receipt TaskWorkspacePublishReceipt, call ModelToolCall, pending *task.PendingRequest) bool {
+	return pending != nil && pending.TaskRevision != nil && receipt.TaskRevision == *pending.TaskRevision &&
+		receipt.CallID == call.CallID && receipt.ToolName == call.Name && receipt.ApprovalID == pending.ID &&
+		receipt.ApprovalVersion == pending.Version && receipt.ApprovalRequestHash == hex.EncodeToString(pending.RequestHash)
+}
+
 type projectTaskWorkspaceGuard interface {
 	WithProjectTaskWorkspaceAccess(context.Context, task.Task, bool, func(context.Context) error) error
 }
@@ -210,7 +227,8 @@ func cloudDSHWorkspaceToolDefinitions(revision int64, liveDirectory bool) []Agen
 	return definitions
 }
 
-func (t *cloudDSHWorkspaceTools) execute(ctx context.Context, current task.Task, call ModelToolCall, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
+func (t *cloudDSHWorkspaceTools) execute(ctx context.Context, current task.Task, call ModelToolCall, approval *task.PendingRequest,
+	recovering bool, checkpointOutput *string) (AgentToolResult, error) {
 	if t == nil || t.workspaces == nil || ctx == nil || !cloudDSHWorkspaceToolsEligible(current) ||
 		call.CallID == "" || len(call.CallID) > 256 || !cloudDSHWorkspaceToolName(call.Name) {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Workspace tools are not available for this task")
@@ -248,7 +266,7 @@ func (t *cloudDSHWorkspaceTools) execute(ctx context.Context, current task.Task,
 			if decodeStrictRuntimeResult(arguments, &value) != nil || value.ExpectedRevision < 0 || !utf8.ValidString(value.Content) || len(value.Content) > cloudDSHWorkspaceWriteMaxBytes {
 				return domain.InvalidArgument("tool_call.arguments", "Workspace write arguments are invalid")
 			}
-			result, err = t.write(operationCtx, current, call, arguments, value)
+			result, err = t.write(operationCtx, current, call, arguments, value, approval)
 		default:
 			return domain.NewError(domain.CodeForbidden, "Workspace tool is not available")
 		}
@@ -480,23 +498,26 @@ func truncateWorkspaceSearchSnippet(value string, maxRunes int) string {
 }
 
 func (t *cloudDSHWorkspaceTools) write(ctx context.Context, current task.Task, call ModelToolCall, rawArguments json.RawMessage,
-	arguments cloudDSHWorkspaceWriteArguments) (AgentToolResult, error) {
+	arguments cloudDSHWorkspaceWriteArguments, approval *task.PendingRequest) (AgentToolResult, error) {
 	if err := validateCloudDSHWorkspacePath(arguments.Path); err != nil {
 		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeInvalidArgument, "Workspace path is invalid")), nil
 	}
 	if cloudDSHWorkspacePathIsSensitive(arguments.Path) {
 		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeForbidden, "sensitive Workspace paths are unavailable")), nil
 	}
+	requestHash, err := agentOperationHash(call.Name, rawArguments)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	if !hostlessWorkspaceWriteApprovalMatches(current, call, requestHash[:], approval) {
+		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeForbidden, "Workspace write approval does not match the current Task revision and tool call")), nil
+	}
 	liveDirectory, err := t.workspaces.UsesLiveDirectorySource(ctx, taskWorkspaceOwner(current), current.WorkspaceID)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
 	if liveDirectory {
-		return t.writeLive(ctx, current, call, rawArguments, arguments)
-	}
-	requestHash, err := agentOperationHash(call.Name, rawArguments)
-	if err != nil {
-		return AgentToolResult{}, err
+		return t.writeLive(ctx, current, call, rawArguments, arguments, approval)
 	}
 	operationKey := agentOperationKey(call.CallID)
 	findReceipt := func() (TaskWorkspacePublishReceipt, bool, error) {
@@ -507,7 +528,8 @@ func (t *cloudDSHWorkspaceTools) write(ctx context.Context, current task.Task, c
 		if err != nil {
 			return TaskWorkspacePublishReceipt{}, false, err
 		}
-		if receipt.WorkspaceID != current.WorkspaceID || receipt.RequestHash != hex.EncodeToString(requestHash[:]) {
+		if receipt.WorkspaceID != current.WorkspaceID || receipt.RequestHash != hex.EncodeToString(requestHash[:]) ||
+			!taskWorkspacePublishReceiptMatchesApproval(receipt, call, approval) {
 			return TaskWorkspacePublishReceipt{}, false, domain.NewError(domain.CodeConflict, "Workspace operation key was reused with a different request")
 		}
 		if receipt.BaseRevision != arguments.ExpectedRevision {
@@ -570,6 +592,8 @@ func (t *cloudDSHWorkspaceTools) write(ctx context.Context, current task.Task, c
 		ProjectID: current.ProjectID, InitiatorID: current.InitiatorID, WorkspaceOwnerID: taskWorkspaceOwner(current),
 		LeaseVersion: current.Lease.Version, InputRevision: *current.InputRevision, BaseRevision: arguments.ExpectedRevision,
 		InputManifestSHA256: hex.EncodeToString(current.ContextDigest), OperationKey: operationKey, RequestHash: requestHash[:],
+		TaskRevision: *approval.TaskRevision, CallID: approval.CallID, ToolName: approval.ToolName,
+		ApprovalID: approval.ID, ApprovalVersion: approval.Version, ApprovalRequestHash: append([]byte(nil), approval.RequestHash...),
 	}
 	receipt, err := t.workspaces.ReserveTaskWorkspacePublish(ctx, command)
 	if err != nil {
@@ -577,6 +601,9 @@ func (t *cloudDSHWorkspaceTools) write(ctx context.Context, current task.Task, c
 			return cloudDSHWorkspaceReceiptResult(found, operationKey), nil
 		}
 		return cloudDSHWorkspaceFailure(err), nil
+	}
+	if !taskWorkspacePublishReceiptMatchesApproval(receipt, call, approval) {
+		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeConflict, "Workspace publish receipt approval binding changed")), nil
 	}
 	if receipt.State != TaskWorkspacePublishPending {
 		return cloudDSHWorkspaceReceiptResult(receipt, operationKey), nil
@@ -598,6 +625,9 @@ func (t *cloudDSHWorkspaceTools) write(ctx context.Context, current task.Task, c
 			return cloudDSHWorkspaceReceiptResult(found, operationKey), nil
 		}
 		return cloudDSHWorkspaceFailure(err), nil
+	}
+	if !taskWorkspacePublishReceiptMatchesApproval(receipt, call, approval) {
+		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeConflict, "Workspace publish receipt approval binding changed")), nil
 	}
 	return cloudDSHWorkspaceReceiptResult(receipt, operationKey), nil
 }
@@ -930,13 +960,15 @@ func (b *CloudDSHToolBroker) executeWorkspaceTool(ctx context.Context, claimed t
 		}
 	}
 	current.Usage = usage
+	var approvedWrite *task.PendingRequest
 	if call.Name == cloudDSHWorkspaceWriteToolName {
 		approval, handled, err := b.authorizeWorkspaceWrite(ctx, details, current, step, usage, call, checkpointOutput)
 		if err != nil || handled {
 			return approval, err
 		}
+		approvedWrite = details.PendingRequest
 	}
-	result, err := b.workspaceTools.execute(ctx, current, call, recovering, checkpointOutput)
+	result, err := b.workspaceTools.execute(ctx, current, call, approvedWrite, recovering, checkpointOutput)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
@@ -984,12 +1016,14 @@ func (b *CloudDSHToolBroker) authorizeWorkspaceWrite(ctx context.Context, detail
 	if pending != nil && pending.Status == task.PendingRequestPending {
 		return b.pauseForExistingWorkspaceApproval(ctx, current, step, usage, pending)
 	}
-	sameApproval := pending != nil && pending.TaskID == current.ID && pending.Kind == "approval" &&
-		pending.CallID == call.CallID && pending.ToolName == call.Name && bytes.Equal(pending.RequestHash, requestHash[:])
+	sameApproval := pending != nil && domain.ValidPendingRequestID(pending.ID) && pending.TaskID == current.ID &&
+		pending.Version > 0 && pending.TaskRevision != nil && current.CurrentRevision != nil &&
+		*pending.TaskRevision == *current.CurrentRevision && pending.Kind == "approval" && pending.CallID == call.CallID &&
+		pending.ToolName == call.Name && bytes.Equal(pending.RequestHash, requestHash[:])
 	if sameApproval {
 		switch pending.Status {
 		case task.PendingRequestApproved:
-			if pending.Decision != task.PendingDecisionApprove {
+			if !hostlessWorkspaceWriteApprovalMatches(current, call, requestHash[:], pending) {
 				result, err := b.commitApprovalMismatch(ctx, current, call.Name, details.Steps)
 				return result, true, err
 			}
@@ -1060,6 +1094,7 @@ func (b *CloudDSHToolBroker) pauseForExistingWorkspaceApproval(ctx context.Conte
 
 func newHostlessWorkspaceApproval(current task.Task, call ModelToolCall, requestHash []byte, approval AgentApprovalRequest, version int64) (*task.PendingRequest, error) {
 	if current.HostID != "" || current.ExecutionLocation != "server" || !cloudDSHWorkspaceToolsEligible(current) ||
+		current.CurrentRevision == nil || *current.CurrentRevision < 0 ||
 		len(requestHash) != sha256.Size || call.CallID == "" || len(call.CallID) > 256 || call.Name != cloudDSHWorkspaceWriteToolName || version < 1 {
 		return nil, domain.NewError(domain.CodeInvalidState, "Workspace approval identity is invalid")
 	}
@@ -1070,7 +1105,8 @@ func newHostlessWorkspaceApproval(current task.Task, call ModelToolCall, request
 	if err != nil {
 		return nil, fmt.Errorf("generate Workspace approval ID: %w", err)
 	}
-	return &task.PendingRequest{ID: id, TaskID: current.ID, Version: version, Kind: "approval",
+	revision := *current.CurrentRevision
+	return &task.PendingRequest{ID: id, TaskID: current.ID, Version: version, TaskRevision: &revision, Kind: "approval",
 		Title: "Approve Workspace file save", Object: approval.Object, Content: approval.Content, Impact: approval.Impact,
 		CallID: call.CallID, ToolName: call.Name, RequestHash: append([]byte(nil), requestHash...), Status: task.PendingRequestPending}, nil
 }

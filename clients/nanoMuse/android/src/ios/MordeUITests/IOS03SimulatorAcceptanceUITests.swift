@@ -1953,6 +1953,46 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         attachScreen(app, named: "MDA-04 task detail with aligned title and summary spacing")
     }
 
+    func testMordeTaskDetailShowsMainAndSubagentActivitySeparateFromApproval() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskPagesFixture",
+            "-morde.localTaskAgentActivityFixture",
+        ])
+        app.buttons["morde.nav.tab.tasks"].tap()
+
+        let task = app.buttons["morde.tasks.row.q7654321"]
+        XCTAssertTrue(task.waitForExistence(timeout: 15))
+        task.tap()
+
+        let taskStatus = app.staticTexts["morde.taskDynamics.status"]
+        XCTAssertTrue(taskStatus.waitForExistence(timeout: 15))
+        XCTAssertTrue(taskStatus.label.contains("执行中"), "The synthetic Task remains active while both agents are visible.")
+
+        let mainAgent = app.descendants(matching: .any)["morde.taskDynamics.agent.main-session"]
+        XCTAssertTrue(mainAgent.waitForExistence(timeout: 15))
+        XCTAssertTrue(mainAgent.label.contains("MAIN"))
+        XCTAssertTrue(mainAgent.label.contains("模型 · 活动已开始"), mainAgent.label)
+
+        let subagent = app.descendants(matching: .any)["morde.taskDynamics.agent.subagent-session"]
+        XCTAssertTrue(subagent.waitForExistence(timeout: 15))
+        XCTAssertTrue(subagent.label.contains("SUBAGENT 01"))
+        XCTAssertTrue(subagent.label.contains("工具 · 等待响应"), subagent.label)
+
+        let mainGroup = app.descendants(matching: .any)["morde.taskDynamics.agentGroup.main-session"]
+        let subagentGroup = app.descendants(matching: .any)["morde.taskDynamics.agentGroup.subagent-session"]
+        XCTAssertTrue(mainGroup.descendants(matching: .any)["morde.taskDynamics.workItem.s7654321"].exists,
+                      "The main step should remain grouped under MAIN.")
+        XCTAssertTrue(subagentGroup.descendants(matching: .any)["morde.taskDynamics.workItem.s7654322"].exists,
+                      "The waiting tool step should remain grouped under SUBAGENT 01.")
+
+        XCTAssertFalse(app.staticTexts["morde.task.approval.object"].exists)
+        XCTAssertFalse(app.buttons["morde.task.approval.approve.r0000001"].exists)
+        XCTAssertFalse(app.buttons["morde.task.approval.reject.r0000001"].exists)
+        XCTAssertFalse(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "审批")).firstMatch.exists,
+                        "A tool waiting state must not create an approval card or label.")
+    }
+
     func testMordeTaskTerminalDetailsKeepStatusStepsAndApprovedActions() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         launchLocalChat(app, additionalArguments: ["-morde.localTaskPagesStatusFixture"])

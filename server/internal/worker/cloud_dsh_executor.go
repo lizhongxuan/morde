@@ -776,6 +776,8 @@ type cloudDSHFrame struct {
 	SHA256              string          `json:"sha256,omitempty"`
 	Request             json.RawMessage `json:"request,omitempty"`
 	CallID              string          `json:"call_id,omitempty"`
+	RequestKind         string          `json:"request_kind,omitempty"`
+	RequestDigest       string          `json:"request_digest,omitempty"`
 	Name                string          `json:"name,omitempty"`
 	Arguments           json.RawMessage `json:"arguments,omitempty"`
 	State               string          `json:"state,omitempty"`
@@ -848,20 +850,21 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 		return cloudDSHFrame{}, errors.New("invalid dsh frame fields")
 	}
 	fields := map[string][]string{
-		"ready":             {"type", "version", "engine", "engine_version"},
-		"agent_status":      {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "task_revision", "status", "observation_sequence"},
-		"agent_activity":    {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "task_revision", "observation_sequence", "phase", "state", "activity_id"},
-		"agent_heartbeat":   {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "task_revision", "observation_sequence", "phase", "activity_id"},
-		"checkpoint":        {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq", "through_seq", "payload", "sha256"},
-		"checkpoint_read":   {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq"},
-		"model":             {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "request", "sha256"},
-		"tool_call":         {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "name", "arguments"},
-		"child_create":      {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "arguments"},
-		"child_settle":      {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "status", "sha256", "summary"},
-		"job_cancel_result": {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "job_id", "status"},
-		"model_cancel":      {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id"},
-		"settled":           {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "state", "through_seq"},
-		"failed":            {"type", "code", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id"},
+		"ready":                 {"type", "version", "engine", "engine_version"},
+		"agent_status":          {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "task_revision", "status", "observation_sequence"},
+		"agent_activity":        {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "task_revision", "observation_sequence", "phase", "state", "activity_id"},
+		"agent_heartbeat":       {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "task_revision", "observation_sequence", "phase", "activity_id"},
+		"agent_request_timeout": {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "task_revision", "observation_sequence", "phase", "request_kind", "activity_id", "request_digest"},
+		"checkpoint":            {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq", "through_seq", "payload", "sha256"},
+		"checkpoint_read":       {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq"},
+		"model":                 {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "request", "sha256"},
+		"tool_call":             {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "name", "arguments"},
+		"child_create":          {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "arguments"},
+		"child_settle":          {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "status", "sha256", "summary"},
+		"job_cancel_result":     {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "job_id", "status"},
+		"model_cancel":          {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id"},
+		"settled":               {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "state", "through_seq"},
+		"failed":                {"type", "code", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id"},
 	}
 	required, ok := fields[frame.Type]
 	if !ok || len(keys) != len(required) {
@@ -884,7 +887,7 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 }
 
 func validCloudDSHObservationFrame(frame cloudDSHFrame, fields map[string]json.RawMessage) bool {
-	if frame.Type != "agent_status" && frame.Type != "agent_activity" && frame.Type != "agent_heartbeat" {
+	if frame.Type != "agent_status" && frame.Type != "agent_activity" && frame.Type != "agent_heartbeat" && frame.Type != "agent_request_timeout" {
 		return true
 	}
 	if frame.TaskRevision == nil || *frame.TaskRevision < 0 || *frame.TaskRevision > 1<<53-1 ||
@@ -904,6 +907,29 @@ func validCloudDSHObservationFrame(frame cloudDSHFrame, fields map[string]json.R
 		}
 		return frame.Phase == "" && frame.ActivityID == "" ||
 			validCloudDSHActivityPhase(frame.Phase) && cloudDSHID.MatchString(frame.ActivityID)
+	case "agent_request_timeout":
+		return validCloudDSHAgentRequestTimeoutFrame(frame, fields)
+	default:
+		return false
+	}
+}
+
+func validCloudDSHAgentRequestTimeoutFrame(frame cloudDSHFrame, fields map[string]json.RawMessage) bool {
+	if !validCloudDSHJSONStringField(fields, "phase") || !validCloudDSHJSONStringField(fields, "request_kind") ||
+		!validCloudDSHJSONStringField(fields, "activity_id") || !validCloudDSHJSONStringField(fields, "request_digest") ||
+		!cloudDSHID.MatchString(frame.ActivityID) {
+		return false
+	}
+	if _, ok := cloudDSHDigestBytes(frame.RequestDigest); !ok {
+		return false
+	}
+	switch frame.RequestKind {
+	case "tool_call":
+		return frame.Phase == "tool"
+	case "child_create", "child_settle":
+		return frame.Phase == "subagent"
+	case "checkpoint_write", "checkpoint_read":
+		return frame.Phase == "checkpoint"
 	default:
 		return false
 	}
@@ -978,12 +1004,17 @@ func uniqueCloudDSHJSON(raw []byte) bool {
 }
 
 func cloudDSHDigest(data []byte, encoded string) bool {
-	want, err := hex.DecodeString(encoded)
-	if err != nil || len(encoded) != 64 || encoded != strings.ToLower(encoded) {
+	want, ok := cloudDSHDigestBytes(encoded)
+	if !ok {
 		return false
 	}
 	sum := sha256.Sum256(data)
 	return subtle.ConstantTimeCompare(sum[:], want) == 1
+}
+
+func cloudDSHDigestBytes(encoded string) ([]byte, bool) {
+	want, err := hex.DecodeString(encoded)
+	return want, err == nil && len(encoded) == 64 && len(want) == sha256.Size && encoded == strings.ToLower(encoded)
 }
 
 func cloudDSHToolPayload(definitions []app.AgentToolDefinition) []map[string]any {

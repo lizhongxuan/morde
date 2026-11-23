@@ -169,17 +169,34 @@ func taskWorkspacePublishReceiptKey(taskID, operationKey string) string {
 	return taskID + "/" + operationKey
 }
 
+func taskWorkspacePublishApprovalBindingEqual(left, right TaskWorkspacePublishCommand) bool {
+	return left.TaskRevision == right.TaskRevision && left.CallID == right.CallID && left.ToolName == right.ToolName &&
+		left.ApprovalID == right.ApprovalID && left.ApprovalVersion == right.ApprovalVersion &&
+		bytes.Equal(left.ApprovalRequestHash, right.ApprovalRequestHash)
+}
+
+func taskWorkspacePublishTestReceipt(value TaskWorkspacePublishCommand, state TaskWorkspacePublishState) TaskWorkspacePublishReceipt {
+	receipt := TaskWorkspacePublishReceipt{State: state, WorkspaceID: value.WorkspaceID, BaseRevision: value.BaseRevision,
+		DirectDirectorySource: value.DirectDirectorySource}
+	if value.ApprovalID != "" {
+		receipt.TaskRevision, receipt.CallID, receipt.ToolName = value.TaskRevision, value.CallID, value.ToolName
+		receipt.ApprovalID, receipt.ApprovalVersion = value.ApprovalID, value.ApprovalVersion
+		receipt.ApprovalRequestHash = hex.EncodeToString(value.ApprovalRequestHash)
+	}
+	return receipt
+}
+
 func (s *syncServiceStore) ReserveTaskWorkspacePublish(_ context.Context, value TaskWorkspacePublishCommand) (TaskWorkspacePublishReceipt, error) {
 	key := taskWorkspacePublishReceiptKey(value.TaskID, value.OperationKey)
 	if receipt, exists := s.taskWorkspacePublishReceipts[key]; exists {
 		command := s.taskWorkspacePublishCommands[key]
-		if command.WorkspaceID != value.WorkspaceID || command.BaseRevision != value.BaseRevision || !bytes.Equal(command.RequestHash, value.RequestHash) {
+		if command.WorkspaceID != value.WorkspaceID || command.BaseRevision != value.BaseRevision || !bytes.Equal(command.RequestHash, value.RequestHash) ||
+			!taskWorkspacePublishApprovalBindingEqual(command, value) {
 			return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeIdempotencyConflict, "Task Workspace publish key was reused")
 		}
 		return receipt, nil
 	}
-	receipt := TaskWorkspacePublishReceipt{State: TaskWorkspacePublishPending, WorkspaceID: value.WorkspaceID, BaseRevision: value.BaseRevision,
-		DirectDirectorySource: value.DirectDirectorySource}
+	receipt := taskWorkspacePublishTestReceipt(value, TaskWorkspacePublishPending)
 	s.taskWorkspacePublishReceipts[key], s.taskWorkspacePublishCommands[key] = receipt, value
 	return receipt, nil
 }
@@ -220,7 +237,8 @@ func (s *syncServiceStore) GetTaskWorkspacePublishReceipt(_ context.Context, val
 		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeNotFound, "Task Workspace publish receipt not found")
 	}
 	command := s.taskWorkspacePublishCommands[key]
-	if command.WorkspaceID != value.WorkspaceID || command.BaseRevision != value.BaseRevision || !bytes.Equal(command.RequestHash, value.RequestHash) {
+	if command.WorkspaceID != value.WorkspaceID || command.BaseRevision != value.BaseRevision || !bytes.Equal(command.RequestHash, value.RequestHash) ||
+		!taskWorkspacePublishApprovalBindingEqual(command, value) {
 		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeIdempotencyConflict, "Task Workspace publish key was reused")
 	}
 	return receipt, nil
@@ -233,14 +251,24 @@ func (s *syncServiceStore) FindTaskWorkspacePublishReceipt(_ context.Context, ow
 	if !exists || command.OwnerID != ownerID || command.WorkspaceID != workspaceID {
 		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeNotFound, "Task Workspace publish receipt not found")
 	}
+	if receipt.TaskRevision != command.TaskRevision || receipt.CallID != command.CallID || receipt.ToolName != command.ToolName ||
+		receipt.ApprovalID != command.ApprovalID || receipt.ApprovalVersion != command.ApprovalVersion ||
+		receipt.ApprovalRequestHash != hex.EncodeToString(command.ApprovalRequestHash) {
+		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeInternal, "Task Workspace publish receipt binding is invalid")
+	}
 	return receipt, nil
 }
 
 func (s *syncServiceStore) CommitTaskWorkspacePublish(_ context.Context, value TaskWorkspacePublishCommand, files []workspace.File, emptyDirectories []string, directories []workspace.Directory, manifestSHA string) (TaskWorkspacePublishReceipt, error) {
 	key := taskWorkspacePublishReceiptKey(value.TaskID, value.OperationKey)
 	receipt, exists := s.taskWorkspacePublishReceipts[key]
+	command := s.taskWorkspacePublishCommands[key]
 	if !exists || receipt.State != TaskWorkspacePublishPending {
 		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeNotFound, "pending Task Workspace publish receipt not found")
+	}
+	if command.WorkspaceID != value.WorkspaceID || command.BaseRevision != value.BaseRevision || !bytes.Equal(command.RequestHash, value.RequestHash) ||
+		!taskWorkspacePublishApprovalBindingEqual(command, value) {
+		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeIdempotencyConflict, "Task Workspace publish key was reused")
 	}
 	if current := s.workspace.Revision; current != value.BaseRevision {
 		receipt.State = TaskWorkspacePublishConflict

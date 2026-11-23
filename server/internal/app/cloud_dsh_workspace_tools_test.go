@@ -249,6 +249,8 @@ func resumeCloudDSHT08WorkspaceApproval(store *cloudDSHBrokerTaskStore, status t
 	expires := time.Now().Add(time.Minute).UTC()
 	store.details.PendingRequest.Status = status
 	store.details.PendingRequest.Decision = decision
+	responded := time.Now().UTC()
+	store.details.PendingRequest.RespondedAt = &responded
 	store.details.Task.Status = task.StatusRunning
 	store.details.Task.WaitingReason = ""
 	store.details.Task.Lease = task.Lease{Owner: "worker-2", Version: store.details.Task.Lease.Version + 1, ExpiresAt: &expires}
@@ -363,6 +365,7 @@ func newCloudDSHT08WorkspaceTools(t *testing.T, files []workspace.File, emptyDir
 	expires := time.Now().Add(time.Minute).UTC()
 	current := task.Task{ID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", WorkspaceID: "w1234567",
 		ExecutionLocation: "server", Status: task.StatusRunning, InputRevision: &revision, WorkspaceCheckpointRevision: &revision,
+		CurrentRevision: &revision, DesiredRevision: &revision,
 		ContextDigest: contextDigest, Lease: task.Lease{Owner: "worker-1", Version: 1, ExpiresAt: &expires},
 		Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000}}
 	return newCloudDSHWorkspaceTools(service), store, blocks, current
@@ -383,6 +386,22 @@ func workspaceToolCall(t *testing.T, name, callID string, arguments any) ModelTo
 	return ModelToolCall{CallID: callID, Name: name, Arguments: string(encoded)}
 }
 
+func approvedWorkspaceWriteForTest(t *testing.T, current task.Task, call ModelToolCall) *task.PendingRequest {
+	t.Helper()
+	if current.CurrentRevision == nil {
+		t.Fatal("test Task revision is missing")
+	}
+	hash, err := agentOperationHash(call.Name, json.RawMessage(call.Arguments))
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := *current.CurrentRevision
+	responded := time.Now().UTC()
+	return &task.PendingRequest{ID: "r1234567", TaskID: current.ID, Version: 1, TaskRevision: &revision,
+		Kind: "approval", CallID: call.CallID, ToolName: call.Name, RequestHash: hash[:],
+		Status: task.PendingRequestApproved, Decision: task.PendingDecisionApprove, RespondedAt: &responded}
+}
+
 func TestCloudDSHWorkspaceToolsReadOwnerSnapshotAndRejectTraversal(t *testing.T) {
 	file := syncServiceFile("notes/readme.txt", []byte("untrusted note"))
 	tools, _, blocks, current := newCloudDSHT08WorkspaceTools(t, []workspace.File{file}, nil, nil)
@@ -393,7 +412,7 @@ func TestCloudDSHWorkspaceToolsReadOwnerSnapshotAndRejectTraversal(t *testing.T)
 	read := workspaceToolCall(t, cloudDSHWorkspaceReadToolName, "read-call", cloudDSHWorkspaceReadArguments{
 		ExpectedRevision: 0, Path: file.Path,
 	})
-	result, err := tools.execute(context.Background(), current, read, false, nil)
+	result, err := tools.execute(context.Background(), current, read, nil, false, nil)
 	var decoded cloudDSHWorkspaceReadOutput
 	if err != nil || result.Status != AgentToolSucceeded || decodeStrictRuntimeResult([]byte(result.Output), &decoded) != nil ||
 		decoded.WorkspaceID != current.WorkspaceID || decoded.Revision != 0 || decoded.Content != "untrusted note" || decoded.SHA256 != file.SHA256 {
@@ -401,13 +420,13 @@ func TestCloudDSHWorkspaceToolsReadOwnerSnapshotAndRejectTraversal(t *testing.T)
 	}
 	for _, path := range []string{"../outside", "/etc/passwd", "notes/../../outside", ".env", ".env.local/private.txt", "settings/.env.production/key", ".ssh/id_rsa"} {
 		call := workspaceToolCall(t, cloudDSHWorkspaceReadToolName, "bad-read-"+path, cloudDSHWorkspaceReadArguments{ExpectedRevision: 0, Path: path})
-		result, err := tools.execute(context.Background(), current, call, false, nil)
+		result, err := tools.execute(context.Background(), current, call, nil, false, nil)
 		if err != nil || result.Status != AgentToolFailed {
 			t.Errorf("read %q = %#v, %v; want rejected tool result", path, result, err)
 		}
 	}
 	unknownWorkspace := `{"expected_revision":0,"path":"notes/readme.txt","workspace_id":"w7654321"}`
-	if _, err := tools.execute(context.Background(), current, ModelToolCall{CallID: "cross-workspace", Name: cloudDSHWorkspaceReadToolName, Arguments: unknownWorkspace}, false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
+	if _, err := tools.execute(context.Background(), current, ModelToolCall{CallID: "cross-workspace", Name: cloudDSHWorkspaceReadToolName, Arguments: unknownWorkspace}, nil, false, nil); domain.CodeOf(err) != domain.CodeInvalidArgument {
 		t.Fatalf("caller supplied workspace ID error = %v; want invalid argument", err)
 	}
 }
@@ -497,7 +516,8 @@ func TestCloudDSHWorkspaceWriteUpdatesLiveDirectoryWithoutMaterializingRevision(
 	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "live-write", cloudDSHWorkspaceWriteArguments{
 		ExpectedRevision: 0, Path: "reports/summary.md", Content: "agent data",
 	})
-	result, err := tools.execute(context.Background(), current, call, false, nil)
+	approval := approvedWorkspaceWriteForTest(t, current, call)
+	result, err := tools.execute(context.Background(), current, call, approval, false, nil)
 	var receipt cloudDSHWorkspaceWriteReceiptOutput
 	if err != nil || result.Status != AgentToolSucceeded || json.Unmarshal([]byte(result.Output), &receipt) != nil ||
 		receipt.PublishedRevision != 1 || store.commits != 1 || store.workspace.Revision != 1 {
@@ -507,6 +527,23 @@ func TestCloudDSHWorkspaceWriteUpdatesLiveDirectoryWithoutMaterializingRevision(
 	digest, digestErr := workspace.ManifestTreeWithMetadataSHA256(store.snapshots[1], store.emptyDirectorySnapshots[1], store.directorySnapshots[1])
 	if digestErr != nil || digest != receipt.ManifestSHA256 {
 		t.Fatalf("direct receipt manifest digest = %q, err=%v; want %q", digest, digestErr, receipt.ManifestSHA256)
+	}
+	command := store.taskWorkspacePublishCommands[taskWorkspacePublishReceiptKey(current.ID, agentOperationKey(call.CallID))]
+	if command.TaskRevision != *approval.TaskRevision || command.CallID != call.CallID || command.ToolName != call.Name ||
+		command.ApprovalID != approval.ID || command.ApprovalVersion != approval.Version || !bytes.Equal(command.ApprovalRequestHash, approval.RequestHash) {
+		t.Fatalf("live Workspace publish command lost approval binding: %+v", command)
+	}
+	key := taskWorkspacePublishReceiptKey(current.ID, agentOperationKey(call.CallID))
+	replayed, err := tools.execute(context.Background(), current, call, approval, true, nil)
+	if err != nil || replayed.Status != AgentToolSucceeded || store.commits != 1 {
+		t.Fatalf("exact live Workspace approval replay = %#v, err=%v, commits=%d", replayed, err, store.commits)
+	}
+	missingBinding := store.taskWorkspacePublishReceipts[key]
+	missingBinding.ApprovalID = ""
+	store.taskWorkspacePublishReceipts[key] = missingBinding
+	replayed, err = tools.execute(context.Background(), current, call, approval, true, nil)
+	if err != nil || replayed.Status == AgentToolSucceeded || store.commits != 1 {
+		t.Fatalf("live Workspace replay without approval binding = %#v, err=%v, commits=%d", replayed, err, store.commits)
 	}
 	for filePath, want := range map[string]string{"host-file.txt": "host data", "reports/summary.md": "agent data"} {
 		content, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(filePath)))
@@ -529,7 +566,8 @@ func TestCloudDSHWorkspaceWritePreservesAHostChangeToTheSameFile(t *testing.T) {
 	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "live-conflict", cloudDSHWorkspaceWriteArguments{
 		ExpectedRevision: 0, Path: baselineFile.Path, Content: "agent version",
 	})
-	result, err := tools.execute(context.Background(), current, call, false, nil)
+	approval := approvedWorkspaceWriteForTest(t, current, call)
+	result, err := tools.execute(context.Background(), current, call, approval, false, nil)
 	content, readErr := os.ReadFile(filepath.Join(root, baselineFile.Path))
 	if err != nil || result.Status != AgentToolFailed || readErr != nil || string(content) != "host version" || store.commits != 0 || store.workspace.Revision != 0 {
 		t.Fatalf("conflicting live write = %#v, err=%v, file=%q, readErr=%v, commits=%d revision=%d",
@@ -549,7 +587,7 @@ func TestCloudDSHWorkspaceSearchIsBoundedRevisionScopedAndOmitsRestrictedFiles(t
 	call := workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "search-workspace", cloudDSHWorkspaceSearchArguments{
 		ExpectedRevision: 0, Query: "  aI NEWS ", Prefix: "notes", MaxResults: 10,
 	})
-	result, err := tools.execute(context.Background(), current, call, false, nil)
+	result, err := tools.execute(context.Background(), current, call, nil, false, nil)
 	var found cloudDSHWorkspaceSearchOutput
 	if err != nil || result.Status != AgentToolSucceeded || decodeStrictRuntimeResult([]byte(result.Output), &found) != nil ||
 		found.WorkspaceID != current.WorkspaceID || found.Revision != 0 || !found.Complete || found.FilesScanned != 1 ||
@@ -560,7 +598,7 @@ func TestCloudDSHWorkspaceSearchIsBoundedRevisionScopedAndOmitsRestrictedFiles(t
 	call = workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "search-workspace-bounded", cloudDSHWorkspaceSearchArguments{
 		ExpectedRevision: 0, Query: "AI",
 	})
-	result, err = tools.execute(context.Background(), current, call, false, nil)
+	result, err = tools.execute(context.Background(), current, call, nil, false, nil)
 	if err != nil || result.Status != AgentToolSucceeded || decodeStrictRuntimeResult([]byte(result.Output), &found) != nil ||
 		found.Complete || found.SkippedFiles != 1 || len(found.Matches) != 1 || found.Matches[0].Path != file.Path {
 		t.Fatalf("bounded Workspace search = %#v, %#v, %v", result, found, err)
@@ -572,7 +610,7 @@ func TestCloudDSHWorkspaceSearchIsBoundedRevisionScopedAndOmitsRestrictedFiles(t
 	symlinkPrefix := workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "search-symlink-prefix", cloudDSHWorkspaceSearchArguments{
 		ExpectedRevision: 0, Query: "AI", Prefix: "linked",
 	})
-	result, err = tools.execute(context.Background(), current, symlinkPrefix, false, nil)
+	result, err = tools.execute(context.Background(), current, symlinkPrefix, nil, false, nil)
 	if err != nil || result.Status != AgentToolFailed {
 		t.Fatalf("search through symlink prefix = %#v, %v; want rejected tool result", result, err)
 	}
@@ -580,7 +618,7 @@ func TestCloudDSHWorkspaceSearchIsBoundedRevisionScopedAndOmitsRestrictedFiles(t
 	stale := workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "search-stale-workspace", cloudDSHWorkspaceSearchArguments{
 		ExpectedRevision: 1, Query: "AI",
 	})
-	result, err = tools.execute(context.Background(), current, stale, false, nil)
+	result, err = tools.execute(context.Background(), current, stale, nil, false, nil)
 	if err != nil || result.Status != AgentToolFailed {
 		t.Fatalf("search stale revision = %#v, %v; want failed tool result", result, err)
 	}
@@ -640,10 +678,59 @@ func TestCloudDSHWorkspaceWriteRequiresApprovalAndCommitsOnlyTheApprovedCall(t *
 		t.Fatalf("approved Workspace write = %#v, err=%v; receipt=%#v commits=%d revision=%d",
 			result, err, receipt, workspaceStore.commits, workspaceStore.workspace.Revision)
 	}
+	storedApproval := store.details.PendingRequest
+	command := workspaceStore.taskWorkspacePublishCommands[taskWorkspacePublishReceiptKey(current.ID, agentOperationKey(call.CallID))]
+	persistedReceipt := workspaceStore.taskWorkspacePublishReceipts[taskWorkspacePublishReceiptKey(current.ID, agentOperationKey(call.CallID))]
+	if storedApproval == nil || storedApproval.TaskRevision == nil || command.TaskRevision != *storedApproval.TaskRevision ||
+		command.CallID != call.CallID || command.ToolName != call.Name || command.ApprovalID != storedApproval.ID ||
+		command.ApprovalVersion != storedApproval.Version || !bytes.Equal(command.ApprovalRequestHash, storedApproval.RequestHash) ||
+		!taskWorkspacePublishReceiptMatchesApproval(persistedReceipt, call, storedApproval) {
+		t.Fatalf("Workspace publish did not persist the exact approved binding: command=%+v receipt=%+v approval=%+v",
+			command, persistedReceipt, storedApproval)
+	}
 	checkpoint := dshToolResultText(result)
 	replayed, err := broker.Reconcile(context.Background(), resumed, call, &checkpoint)
 	if err != nil || replayed.Status != result.Status || replayed.Output != result.Output || workspaceStore.commits != 1 {
 		t.Fatalf("approved Workspace write replay = %#v, err=%v; commits=%d", replayed, err, workspaceStore.commits)
+	}
+}
+
+func TestCloudDSHWorkspaceWriteReplayRejectsMissingOrChangedApprovalBinding(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*TaskWorkspacePublishReceipt)
+	}{
+		{name: "missing approval id", mutate: func(value *TaskWorkspacePublishReceipt) { value.ApprovalID = "" }},
+		{name: "changed task revision", mutate: func(value *TaskWorkspacePublishReceipt) { value.TaskRevision++ }},
+		{name: "changed call id", mutate: func(value *TaskWorkspacePublishReceipt) { value.CallID += "-changed" }},
+		{name: "changed approval version", mutate: func(value *TaskWorkspacePublishReceipt) { value.ApprovalVersion++ }},
+		{name: "changed approval hash", mutate: func(value *TaskWorkspacePublishReceipt) {
+			digest := sha256.Sum256([]byte("changed"))
+			value.ApprovalRequestHash = hex.EncodeToString(digest[:])
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, store, broker, workspaceStore, current := newCloudDSHT08WorkspaceBroker(t)
+			call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-replay-binding-"+strings.ReplaceAll(test.name, " ", "-"),
+				cloudDSHWorkspaceWriteArguments{ExpectedRevision: 0, Path: "reports/replay.txt", Content: "approved replay"})
+			if result, err := broker.Execute(context.Background(), current, call); err != nil || result.Status != AgentToolNeedsUser {
+				t.Fatalf("initial Workspace write = %#v, err=%v; want approval", result, err)
+			}
+			resumed := resumeCloudDSHT08WorkspaceApproval(store, task.PendingRequestApproved, task.PendingDecisionApprove)
+			result, err := broker.Reconcile(context.Background(), resumed, call, nil)
+			if err != nil || result.Status != AgentToolSucceeded || workspaceStore.commits != 1 {
+				t.Fatalf("approved Workspace write = %#v, err=%v; commits=%d", result, err, workspaceStore.commits)
+			}
+			key := taskWorkspacePublishReceiptKey(current.ID, agentOperationKey(call.CallID))
+			receipt := workspaceStore.taskWorkspacePublishReceipts[key]
+			test.mutate(&receipt)
+			workspaceStore.taskWorkspacePublishReceipts[key] = receipt
+			replayed, err := broker.Reconcile(context.Background(), resumed, call, nil)
+			if err != nil || replayed.Status == AgentToolSucceeded || workspaceStore.commits != 1 || workspaceStore.workspace.Revision != 1 {
+				t.Fatalf("replay with %s = %#v, err=%v; commits=%d revision=%d", test.name, replayed, err,
+					workspaceStore.commits, workspaceStore.workspace.Revision)
+			}
+		})
 	}
 }
 
@@ -809,13 +896,13 @@ func TestCloudDSHWorkspaceToolsIsolateOwnerDataAcrossOwners(t *testing.T) {
 	}{{"owner A", taskA, ownerAFile, string(ownerAContent)}, {"owner B", taskB, ownerBFile, string(ownerBContent)}} {
 		call := workspaceToolCall(t, cloudDSHWorkspaceReadToolName, "read-"+current.name,
 			cloudDSHWorkspaceReadArguments{ExpectedRevision: 0, Path: current.file.Path})
-		result, err := tools.execute(context.Background(), current.task, call, false, nil)
+		result, err := tools.execute(context.Background(), current.task, call, nil, false, nil)
 		if err != nil || result.Status != AgentToolSucceeded || !strings.Contains(result.Output, current.want) {
 			t.Fatalf("%s could not read its own Workspace: result=%#v err=%v", current.name, result, err)
 		}
 		search := workspaceToolCall(t, cloudDSHWorkspaceSearchToolName, "search-"+current.name,
 			cloudDSHWorkspaceSearchArguments{ExpectedRevision: 0, Query: "workspace"})
-		result, err = tools.execute(context.Background(), current.task, search, false, nil)
+		result, err = tools.execute(context.Background(), current.task, search, nil, false, nil)
 		if err != nil || result.Status != AgentToolSucceeded || !strings.Contains(result.Output, current.file.Path) ||
 			!strings.Contains(result.Output, current.want) {
 			t.Fatalf("%s could not search its own Workspace: result=%#v err=%v", current.name, result, err)
@@ -832,7 +919,11 @@ func TestCloudDSHWorkspaceToolsIsolateOwnerDataAcrossOwners(t *testing.T) {
 		}),
 	}
 	for _, call := range attacks {
-		result, err := tools.execute(context.Background(), taskA, call, false, nil)
+		var approval *task.PendingRequest
+		if call.Name == cloudDSHWorkspaceWriteToolName {
+			approval = approvedWorkspaceWriteForTest(t, taskA, call)
+		}
+		result, err := tools.execute(context.Background(), taskA, call, approval, false, nil)
 		if err != nil || result.Status != AgentToolFailed || strings.Contains(result.Output, string(ownerBContent)) || strings.Contains(result.Output, ownerBFile.Path) {
 			t.Errorf("owner A tool %s exposed or accepted owner B data: result=%#v err=%v", call.Name, result, err)
 		}
@@ -861,7 +952,11 @@ func TestCloudDSHWorkspaceToolsRejectSymlinkTraversalAndWrites(t *testing.T) {
 		workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-through-casefold-link", cloudDSHWorkspaceWriteArguments{ExpectedRevision: 0, Path: "LINKED/new.txt", Content: "blocked"}),
 		workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "replace-link", cloudDSHWorkspaceWriteArguments{ExpectedRevision: 0, Path: "linked", Content: "blocked"}),
 	} {
-		result, err := tools.execute(context.Background(), current, call, false, nil)
+		var approval *task.PendingRequest
+		if call.Name == cloudDSHWorkspaceWriteToolName {
+			approval = approvedWorkspaceWriteForTest(t, current, call)
+		}
+		result, err := tools.execute(context.Background(), current, call, approval, false, nil)
 		if err != nil || result.Status != AgentToolFailed {
 			t.Errorf("symlink call %s = %#v, %v; want rejected", call.CallID, result, err)
 		}
@@ -876,7 +971,8 @@ func TestCloudDSHWorkspaceWriteCommitsCASReceiptAndReplaysAfterRestart(t *testin
 	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-call-1", cloudDSHWorkspaceWriteArguments{
 		ExpectedRevision: 0, Path: "reports/result.txt", Content: "receipt-backed result",
 	})
-	result, err := tools.execute(context.Background(), current, call, false, nil)
+	approval := approvedWorkspaceWriteForTest(t, current, call)
+	result, err := tools.execute(context.Background(), current, call, approval, false, nil)
 	var receipt cloudDSHWorkspaceWriteReceiptOutput
 	if err != nil || result.Status != AgentToolSucceeded || decodeStrictRuntimeResult([]byte(result.Output), &receipt) != nil ||
 		receipt.Status != "committed" || receipt.WorkspaceID != current.WorkspaceID || receipt.BaseRevision != 0 ||
@@ -887,14 +983,15 @@ func TestCloudDSHWorkspaceWriteCommitsCASReceiptAndReplaysAfterRestart(t *testin
 	current.WorkspaceCheckpointRevision = int64PointerForWorkspaceTools(1)
 	current.Lease.Version = 2
 	checkpoint := dshToolResultText(result)
-	replayed, err := tools.execute(context.Background(), current, call, true, &checkpoint)
+	replayed, err := tools.execute(context.Background(), current, call, approval, true, &checkpoint)
 	if err != nil || replayed.Status != result.Status || replayed.Output != result.Output || store.commits != 1 {
 		t.Fatalf("restarted write replay = %#v, %v; prior=%#v commits=%d", replayed, err, result, store.commits)
 	}
 	secondWrite := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-call-2", cloudDSHWorkspaceWriteArguments{
 		ExpectedRevision: 1, Path: "reports/second.txt", Content: "second receipt-backed result",
 	})
-	secondResult, err := tools.execute(context.Background(), current, secondWrite, false, nil)
+	secondApproval := approvedWorkspaceWriteForTest(t, current, secondWrite)
+	secondResult, err := tools.execute(context.Background(), current, secondWrite, secondApproval, false, nil)
 	var secondReceipt cloudDSHWorkspaceWriteReceiptOutput
 	if err != nil || secondResult.Status != AgentToolSucceeded || decodeStrictRuntimeResult([]byte(secondResult.Output), &secondReceipt) != nil ||
 		secondReceipt.BaseRevision != 1 || secondReceipt.PublishedRevision != 2 || store.commits != 2 || store.workspace.Revision != 2 {
@@ -908,14 +1005,16 @@ func TestCloudDSHWorkspaceWriteCommitsCASReceiptAndReplaysAfterRestart(t *testin
 	changed := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-call-1", cloudDSHWorkspaceWriteArguments{
 		ExpectedRevision: 1, Path: "reports/result.txt", Content: "different body",
 	})
-	changedResult, err := tools.execute(context.Background(), current, changed, false, nil)
+	changedApproval := approvedWorkspaceWriteForTest(t, current, changed)
+	changedResult, err := tools.execute(context.Background(), current, changed, changedApproval, false, nil)
 	if err != nil || changedResult.Status != AgentToolFailed || store.commits != 2 {
 		t.Fatalf("reused operation key with different body = %#v, %v; commits=%d", changedResult, err, store.commits)
 	}
 	stale := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-call-stale", cloudDSHWorkspaceWriteArguments{
 		ExpectedRevision: 0, Path: "reports/stale.txt", Content: "must not commit",
 	})
-	staleResult, err := tools.execute(context.Background(), current, stale, false, nil)
+	staleApproval := approvedWorkspaceWriteForTest(t, current, stale)
+	staleResult, err := tools.execute(context.Background(), current, stale, staleApproval, false, nil)
 	if err != nil || staleResult.Status != AgentToolFailed || store.commits != 2 || store.workspace.Revision != 2 {
 		t.Fatalf("stale Workspace write = %#v, %v; commits=%d revision=%d", staleResult, err, store.commits, store.workspace.Revision)
 	}
@@ -927,7 +1026,8 @@ func TestCloudDSHWorkspaceWriteRejectsWorkspaceAdvancedPastCheckpoint(t *testing
 	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "stale-external", cloudDSHWorkspaceWriteArguments{
 		ExpectedRevision: 0, Path: "stale.txt", Content: "no",
 	})
-	result, err := tools.execute(context.Background(), current, call, false, nil)
+	approval := approvedWorkspaceWriteForTest(t, current, call)
+	result, err := tools.execute(context.Background(), current, call, approval, false, nil)
 	if err != nil || result.Status != AgentToolFailed || store.commits != 0 || len(store.taskWorkspacePublishReceipts) != 0 {
 		t.Fatalf("externally stale write = %#v, %v; commits=%d receipts=%d", result, err, store.commits, len(store.taskWorkspacePublishReceipts))
 	}

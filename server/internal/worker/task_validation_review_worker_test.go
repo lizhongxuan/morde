@@ -258,11 +258,13 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(
 		contentEvidence := &app.TaskStepContentEvidence{SHA256: hex.EncodeToString(sourceDigest[:]), Preview: sourceText}
 		claim := app.TaskValidationReviewClaim{OwnerID: "u1234567", InitiatorID: "u1234567", ConversationID: "c1234567",
 			TaskID: "q1234567", TaskRevision: revision, ResultEventSequence: 9, ResultSHA256: digest[:], ClaimGeneration: 1, LeaseOwner: "worker"}
+		sourceStep := task.Step{ID: "s7654321", TaskID: claim.TaskID, Sequence: 1, Kind: "tool", Status: task.StepSucceeded,
+			AgentSessionID: "session_123", TaskRevision: &revision, ToolCallKey: artifactRef.CallID, ToolName: "file_write"}
 		snapshots := taskValidationReviewSnapshotStub{details: app.TaskDetails{
 			Task: task.Task{ID: claim.TaskID, OwnerID: claim.OwnerID, InitiatorID: claim.InitiatorID, ConversationID: claim.ConversationID,
 				Status: task.StatusCompleted, CurrentRevision: &revision, DesiredRevision: &desiredRevision, WorkspaceID: "w1234567",
 				Objective: "Verify search", Result: result},
-			Steps: []task.Step{{ID: stepRef.ID, TaskID: claim.TaskID, Sequence: stepRef.Sequence, Kind: "tool", Status: task.StepSucceeded,
+			Steps: []task.Step{sourceStep, {ID: stepRef.ID, TaskID: claim.TaskID, Sequence: stepRef.Sequence, Kind: "tool", Status: task.StepSucceeded,
 				Title: "Read source", Summary: "Read completed successfully.", TaskRevision: &revision, ToolName: toolName, DetailState: "available"}},
 			Artifacts: []task.Artifact{{ID: artifactRef.ID, TaskID: claim.TaskID, StepID: stepRef.ID, WorkspaceID: "w1234567", Revision: 11,
 				Label: "Report", Path: "reports/result.txt", MediaType: "text/plain", SizeBytes: int64(len(artifactContent)), SHA256: hex.EncodeToString(artifactDigest[:])}},
@@ -294,6 +296,52 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(
 		if !strings.Contains(taskValidationReviewSystemPrompt, "不含产物字节") ||
 			!strings.Contains(taskValidationReviewSystemPrompt, "不能证明该操作的运行环境或产物内容正确") {
 			t.Fatal("artifact hash/revision was not described as metadata-only evidence")
+		}
+		mismatchedCall := sourceStep
+		mismatchedCall.ToolCallKey = "write_other_1"
+		staleSource := sourceStep
+		staleRevision := revision - 1
+		staleSource.TaskRevision = &staleRevision
+		failedSource := sourceStep
+		failedSource.Status = task.StepFailed
+		duplicateSource := sourceStep
+		duplicateSource.ID, duplicateSource.Sequence = "s7654322", 3
+		failedDuplicateSource := duplicateSource
+		failedDuplicateSource.Status = task.StepFailed
+		invalidSources := []struct {
+			name            string
+			producer        task.Step
+			includeProducer bool
+			duplicate       bool
+			failedDuplicate bool
+		}{
+			{name: "missing producer step"},
+			{name: "different source call", producer: mismatchedCall, includeProducer: true},
+			{name: "stale producer revision", producer: staleSource, includeProducer: true},
+			{name: "unsuccessful producer", producer: failedSource, includeProducer: true},
+			{name: "ambiguous producer", producer: sourceStep, includeProducer: true, duplicate: true},
+			{name: "failed duplicate producer", producer: sourceStep, includeProducer: true, failedDuplicate: true},
+		}
+		for _, test := range invalidSources {
+			t.Run(test.name, func(t *testing.T) {
+				invalidSnapshot := snapshots
+				invalidSnapshot.details.Steps = []task.Step{snapshots.details.Steps[1]}
+				if test.includeProducer {
+					invalidSnapshot.details.Steps = append(invalidSnapshot.details.Steps, test.producer)
+					if test.duplicate {
+						invalidSnapshot.details.Steps = append(invalidSnapshot.details.Steps, duplicateSource)
+					}
+					if test.failedDuplicate {
+						invalidSnapshot.details.Steps = append(invalidSnapshot.details.Steps, failedDuplicateSource)
+					}
+				}
+				worker.options.Snapshots = invalidSnapshot
+				invalid, err := worker.reviewInput(context.Background(), claim)
+				if err != nil || len(invalid.EvidenceDetails) != 2 || invalid.EvidenceDetails[1].State != "unavailable" ||
+					invalid.EvidenceDetails[1].Artifact != nil {
+					t.Fatalf("unbound artifact evidence state=%+v err=%v; want unavailable", invalid.EvidenceDetails, err)
+				}
+			})
 		}
 		missingHash := snapshots.details.Artifacts[0]
 		missingHash.SHA256 = ""
@@ -342,7 +390,7 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(
 			t.Fatalf("artifact without operation CallID state=%+v err=%v; want unavailable", missingCall.EvidenceDetails, err)
 		}
 		worker.options.Snapshots = snapshots
-		snapshots.details.Steps[0].ToolName = "morde_workspace_read"
+		snapshots.details.Steps[1].ToolName = "morde_workspace_read"
 		worker.options.Snapshots = snapshots
 		if _, err := worker.reviewInput(context.Background(), claim); err == nil {
 			t.Fatal("Workspace file content entered the external review package")

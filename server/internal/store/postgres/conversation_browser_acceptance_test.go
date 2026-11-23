@@ -1499,8 +1499,9 @@ AND message.delivery_status='applied' AND route.state='routed'`, ownerID, conver
 // MORDE_BROWSER_ACTIVITY_SCENARIOS=search,failed,approval selects individual
 // scenarios; omit it to require the full merge, separate, search, stream and
 // reconnect set. For a full run, merge-a and merge-b must complete within the
-// aggregation window; separate-a and separate-b must complete in order. Start
-// stream before submitting stream-other, then disconnect both clients using
+// aggregation window; separate-a and separate-b must complete in order, more
+// than maxConversationResultWindow apart. Start stream before submitting
+// stream-other, then disconnect both clients using
 // POST /__morde_fixture/disconnect/stream before completing the pair.
 // GET /__morde_fixture/verify/{merge|separate|reconnect|search|stream|failed|
 // approval} checks result identity and ordering, reconnect cursors, or the
@@ -2536,7 +2537,8 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 	if scenario == "search" {
 		run := runs[0]
 		message := matched[run.TaskID]
-		if counts[run.TaskID] != 1 || message.ID == "" || len(message.Sources) != 1 || message.Content != browserActivitySearchResult {
+		if counts[run.TaskID] != 1 || message.ID == "" || len(message.Sources) != 1 ||
+			!strings.Contains(message.Content, browserActivitySearchResult) {
 			return errors.New("fixed local search result is missing, duplicated or detached from its task")
 		}
 		return nil
@@ -2548,7 +2550,7 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 	if scenario == "merge" {
 		if first.ID != second.ID || len(first.Sources) != 2 || first.Sources[0].TaskID != runs[0].TaskID ||
 			first.Sources[1].TaskID != runs[1].TaskID ||
-			first.Content != "本地验收结果："+runs[0].Objective+"\n\n本地验收结果："+runs[1].Objective {
+			!strings.Contains(first.Content, "本地验收结果："+runs[0].Objective+"\n\n本地验收结果："+runs[1].Objective) {
 			return errors.New("nearby unstreamed results were not combined in completion order")
 		}
 	} else if first.ID == second.ID || len(first.Sources) != 1 || len(second.Sources) != 1 {

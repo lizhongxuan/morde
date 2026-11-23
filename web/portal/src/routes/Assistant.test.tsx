@@ -864,6 +864,62 @@ describe('Assistant durable tasks', () => {
     expect(await within(activity).findByText('100ms')).toBeInTheDocument();
   });
 
+  it('shows current model and tool activity for agents that have no recorded work items yet', async () => {
+    const mainAgentID = 'dsh-main-session-private';
+    const currentTask: Task = { ...task, status: 'running', result: null, finished_at: null, steps: [], agents: [
+      { id: mainAgentID, parent_id: null, step_id: null, task_revision: 1, role: 'main', status: 'running', observed_at: timestamp,
+        activity_phase: 'model', activity_state: 'started' },
+      { id: 'dsh-subagent-session-private', parent_id: mainAgentID, step_id: null, task_revision: 1, role: 'subagent', status: 'running', observed_at: timestamp,
+        activity_phase: 'tool', activity_state: 'waiting' },
+    ] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(currentTask);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    expect(activity).toHaveTextContent('MAIN');
+    expect(activity).toHaveTextContent('模型：正在响应');
+    expect(activity).toHaveTextContent('SUBAGENT 01');
+    expect(activity).toHaveTextContent('工具：等待结果');
+    expect(activity).not.toHaveTextContent(/dsh-(?:main|subagent)-session-private/);
+    expect(activity).not.toHaveTextContent('暂无已记录的工作项。');
+  });
+
+  it('keeps a waiting tool activity separate from the task approval state', async () => {
+    const approval = { id: 'k1234567', version: 1, kind: 'approval' as const, status: 'pending' as const,
+      title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件',
+      disclosures: unknownApprovalDisclosures, expires_at: null };
+    const currentTask: Task = { ...task, status: 'waiting_user', result: null, finished_at: null, waiting_reason: 'approval',
+      pending_request: approval, steps: [], agents: [{ id: 'dsh-main-session-private', parent_id: null, step_id: null,
+        task_revision: 1, role: 'main', status: 'running', observed_at: timestamp, activity_phase: 'tool', activity_state: 'waiting' }] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(currentTask);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    expect(within(activity).getByRole('region', { name: '需要批准的操作' })).toHaveTextContent('创建报告.md');
+    expect(within(activity).getByText('等待审批：写入文件')).toBeInTheDocument();
+    expect(within(activity).getByText('工具：等待结果')).toBeInTheDocument();
+    expect(activity).not.toHaveTextContent('工具：等待审批');
+  });
+
+  it('keeps agent activity unassigned when the agent tree is invalid', async () => {
+    const currentTask: Task = { ...task, status: 'running', result: null, finished_at: null,
+      steps: [{ id: 's1111111', sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'running',
+        title: '运行工具', summary: '', created_at: timestamp, agent_id: 'unknown-agent' }],
+      agents: [{ id: 'dsh-subagent-session-private', parent_id: 'missing-parent', step_id: null, task_revision: 1,
+        role: 'subagent', status: 'running', observed_at: timestamp, activity_phase: 'tool', activity_state: 'waiting' }] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(currentTask);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    expect(activity).toHaveTextContent('归属未确认');
+    expect(activity).toHaveTextContent('运行工具');
+    expect(activity).not.toHaveTextContent('工具：等待结果');
+    expect(activity).not.toHaveTextContent('dsh-subagent-session-private');
+  });
+
   it.each([
     { name: '旧修订', taskRevision: 0, eventSequence: 4 },
     { name: '未来事件', taskRevision: 1, eventSequence: 5 },

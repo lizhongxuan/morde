@@ -32,6 +32,34 @@ function deferred() {
   return { promise, resolve, reject }
 }
 
+function notifyIPCWaiting(onWaiting) {
+  if (typeof onWaiting !== 'function') return
+  try {
+    void Promise.resolve(onWaiting()).catch(() => {})
+  } catch {
+    // Waiting telemetry cannot discard a request that has already been sent.
+  }
+}
+
+function notifyIPCTimeout(onTimeout, requestKind, requestDigest) {
+  if (typeof onTimeout !== 'function' || !/^[a-f0-9]{64}$/.test(requestDigest ?? '')) return
+  try {
+    const notification = onTimeout({ request_kind: requestKind, request_digest: requestDigest })
+    void Promise.resolve(notification).catch(() => {})
+  } catch {
+    // Timeout telemetry is best-effort and cannot change the timed-out request.
+  }
+}
+
+function sha256(value) {
+  return createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+function trimGoSpace(value) {
+  return value.replace(/^[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/, '')
+    .replace(/[\u0009-\u000d\u0020\u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/, '')
+}
+
 function abortError() {
   return new Error('request cancelled')
 }
@@ -637,18 +665,20 @@ export class WorkerIPC {
     this.onCancel?.()
   }
 
-  async checkpoint(identity, from, through, payload, digest) {
+  async checkpoint(identity, from, through, payload, digest, { onWaiting, onTimeout } = {}) {
     const id = randomUUID()
     const result = deferred()
     const pending = { ...result, timer: undefined, kind: 'checkpoint_ack', through, digest, identity: { ...identity } }
     const timer = setTimeout(() => {
       this.abandonPending(this.pending, id, pending)
+      notifyIPCTimeout(onTimeout, 'checkpoint_write', sha256(`checkpoint_write\n${through}\n${digest}`))
       result.reject(new Error('checkpoint confirmation timed out'))
     }, CHECKPOINT_TIMEOUT_MS)
     pending.timer = timer
     this.pending.set(id, pending)
     try {
       await this.send({ type: 'checkpoint', id, ...identity, from_seq: from, through_seq: through, payload, sha256: digest })
+      if (this.pending.get(id) === pending) notifyIPCWaiting(onWaiting)
       await result.promise
     } finally {
       clearTimeout(timer)
@@ -656,7 +686,7 @@ export class WorkerIPC {
     }
   }
 
-  async readCheckpoint(identity, from) {
+  async readCheckpoint(identity, from, { checkpointThrough, checkpointDigest, onWaiting, onTimeout } = {}) {
     if (this.cancelled) throw abortError()
     if (!Number.isSafeInteger(from) || from < 0) throw new Error('invalid checkpoint offset')
     const id = randomUUID()
@@ -665,12 +695,16 @@ export class WorkerIPC {
     const pending = { ...result, timer: undefined, kind: 'checkpoint_page', identity: { ...identity }, from }
     const timer = setTimeout(() => {
       this.abandonPending(this.pending, id, pending)
+      if (Number.isSafeInteger(checkpointThrough) && typeof checkpointDigest === 'string' && /^[a-f0-9]{64}$/.test(checkpointDigest)) {
+        notifyIPCTimeout(onTimeout, 'checkpoint_read', sha256(`checkpoint_read\n${from}\n${checkpointThrough}\n${checkpointDigest}`))
+      }
       result.reject(new Error('checkpoint read timed out'))
     }, CHECKPOINT_TIMEOUT_MS)
     pending.timer = timer
     this.pending.set(id, pending)
     try {
       await this.send({ type: 'checkpoint_read', id, ...identity, from_seq: from })
+      if (this.pending.get(id) === pending) notifyIPCWaiting(onWaiting)
       return await result.promise
     } finally {
       clearTimeout(timer)
@@ -682,7 +716,7 @@ export class WorkerIPC {
     this.abandonPending(this.pending, id, pending)
   }
 
-  async toolCall(identity, through, callID, name, args, signal, { recovering = false } = {}) {
+  async toolCall(identity, through, callID, name, args, signal, { recovering = false, onWaiting, onTimeout } = {}) {
     if (this.cancelled) throw abortError()
     if (!Number.isSafeInteger(through) || through < 0 || typeof callID !== 'string' || !callID ||
         Buffer.byteLength(callID) > 256 || typeof name !== 'string' || !name || !isObject(args)) {
@@ -695,6 +729,7 @@ export class WorkerIPC {
     const pending = { ...result, timer: undefined, kind: 'tool_result', identity, callID, name, recovering }
     const timer = setTimeout(() => {
       this.abandonToolResult(id, pending)
+      notifyIPCTimeout(onTimeout, 'tool_call', sha256(`tool_call\n${name}\n${JSON.stringify(args)}`))
       result.reject(new Error('tool result timed out'))
     }, TOOL_RESULT_TIMEOUT_MS)
     const abort = () => {
@@ -707,6 +742,7 @@ export class WorkerIPC {
     signal?.addEventListener('abort', abort, { once: true })
     try {
       await this.send({ type: 'tool_call', id, ...identity, through_seq: through, call_id: callID, name, arguments: args })
+      if (this.pending.get(id) === pending) notifyIPCWaiting(onWaiting)
       return await result.promise
     } catch (error) {
       if (this.pending.get(id) === pending) {
@@ -723,7 +759,7 @@ export class WorkerIPC {
     }
   }
 
-  async createChild(identity, through, callID, args, signal, { recovering = false } = {}) {
+  async createChild(identity, through, callID, args, signal, { recovering = false, onWaiting, onTimeout } = {}) {
     if (this.cancelled) throw abortError()
     if (!Number.isSafeInteger(through) || through < 0 || typeof callID !== 'string' || !callID ||
         Buffer.byteLength(callID) > 256 || !isObject(args) ||
@@ -742,6 +778,7 @@ export class WorkerIPC {
       arguments: { ...args }, recovering }
     const timer = setTimeout(() => {
       this.abandonPending(this.childPending, callID, pending)
+      notifyIPCTimeout(onTimeout, 'child_create', sha256(`child_create\n${JSON.stringify(args)}`))
       result.reject(new Error('child session response timed out'))
     }, CHILD_RESULT_TIMEOUT_MS)
     const abort = () => {
@@ -754,6 +791,7 @@ export class WorkerIPC {
     signal?.addEventListener('abort', abort, { once: true })
     try {
       await this.send({ type: 'child_create', ...identity, through_seq: through, call_id: callID, arguments: args })
+      if (this.childPending.get(callID) === pending) notifyIPCWaiting(onWaiting)
       return await result.promise
     } catch (error) {
       if (this.childPending.get(callID) === pending) {
@@ -770,7 +808,7 @@ export class WorkerIPC {
     }
   }
 
-  async settleChild(identity, callID, status, through, digest, summary, signal) {
+  async settleChild(identity, callID, status, through, digest, summary, signal, { onWaiting, onTimeout } = {}) {
     if (this.cancelled) throw abortError()
     if (typeof callID !== 'string' || !callID || Buffer.byteLength(callID) > 256 ||
         !['succeeded', 'failed'].includes(status) || !Number.isSafeInteger(through) || through < -1 ||
@@ -784,6 +822,8 @@ export class WorkerIPC {
     const pending = { ...result, timer: undefined, kind: 'child_settle_ack', identity: { ...identity }, callID, status, summary }
     const timer = setTimeout(() => {
       this.abandonPending(this.childPending, callID, pending)
+      const summaryDigest = sha256(trimGoSpace(summary))
+      notifyIPCTimeout(onTimeout, 'child_settle', sha256(`child_settle\n${status}\n${through}\n${digest}\n${summaryDigest}`))
       result.reject(new Error('child settlement response timed out'))
     }, CHILD_RESULT_TIMEOUT_MS)
     const abort = () => {
@@ -799,6 +839,7 @@ export class WorkerIPC {
         type: 'child_settle', ...identity, call_id: callID, status,
         through_seq: through, sha256: digest, summary,
       })
+      if (this.childPending.get(callID) === pending) notifyIPCWaiting(onWaiting)
       return await result.promise
     } catch (error) {
       if (this.childPending.get(callID) === pending) {

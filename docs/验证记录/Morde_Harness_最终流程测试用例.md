@@ -441,6 +441,8 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **清理：** 执行 `git worktree remove /Users/zhongxuan_li/.thinkrail/worktrees/morde/workspace-1`、`git branch -d workspace-1` 和 `git branch -d codex/client-login-ordering-20261105`。三项成功；清理后 `git worktree list` 只列 `/Users/zhongxuan_li/Desktop/morde`，`git branch -vv` 只列 `main`，远端仍只列 `main`。主工作区内 8 个本地未提交文件未触碰、未推送。
 - **远端核对：** `git fetch origin main` 后本地 `main` 与远端提交均为 `a23d7e7572f349211992bdea69c541a31a29de5c`；`git ls-remote --heads origin` 只返回 `main`，因此截图分支没有待推送的远端引用，当前不需要再次 push。合并历史本身不代表真实 Provider、PC/iOS、云端电脑或耐久验收通过。
 
+- **后续 `dev` 引用复核（2026-11-23）：** 再次只读检查时远端列出 `main` 与 `dev`（`900bd6bc`）。获取远端引用后，`git merge-base --is-ancestor origin/dev main` 成功，`git log --oneline main..origin/dev` 无输出；该 tip 已由历史 PR #1 合入 `main`。截图指定的 19 个 `harness-*` 引用均不在远端列表中，且此前逐个验证其 tip 为主线祖先，因此没有额外合并或推送。此项是上一条“仅 main”核验后的远端引用状态更新。
+
 ### S00 会话修订重启 E2E 退出诊断（2026-11-22；本机隔离 PostgreSQL）
 
 - **退出状态诊断实现：** S02 在 `task_terminated.reason` 中补充有界 child `exit_code` 或信号信息，显式终止原因保持原值、Task 状态仍为 `unknown`。Node 定向测试 `node --test --test-concurrency=1 --test-name-pattern='reports unexpected child signals' test/runtime.test.mjs` 通过（1/1）；两个改动文件的 `node --check` 通过。
@@ -459,6 +461,12 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **审计结论：** S04 的 `TaskValidationReviewSnapshotReader` 只提供 Task/revision/result 与 Artifact metadata，没有 claim-bound 内容读取方法。仓库已有 `TaskService.OpenTaskArtifactContent`，会复用 Task/Host 授权并从 `WorkspaceSyncService.OpenCommittedArtifact` 读取固定 revision、校验 manifest/block/整文件 SHA-256；但通用方法本身不绑定当前 review claim、Task evidence ref 与 step。metadata 和 hash 证明来源及字节完整性，不证明语义正确。
 - **边界与决策：** 把 Artifact bytes 填入远程模型请求会把文件内容发送出本机，违反仓库 `AGENTS.md` 的本地文件约束；本轮未增加 claim-bound 读取、未将内容放进 reviewer 请求，也未调用外部环境。未来若需语义核验，应提供符合本地文件约束的本地复核路径。当前 metadata-only 输入继续要求 reviewer 对无法读取的 Artifact 内容标 `insufficient`，服务端 verdict 保持 `pending`。
 - **仍待验收：** 持久 Host/操作记录提供的可信环境身份、工程与非工程真实场景、H06 客户端入口与环境验收。只读审计无代码改动、无测试执行；本地 H09 Token 规模测试另见同轮 TODO/验证记录。
+
+### S00 H05 Artifact claim-bound 内容复核边界 2026-11-23
+
+- **调用链核对：** `TaskValidationReviewWorker.reviewInput` 只校验 Artifact 与当前 Task/step/sequence、安全 `source_call_id` 和 Workspace/revision/path/size/SHA metadata，然后将 `artifact_metadata_only` 加入 reviewer packet；系统提示也明确 metadata/hash 不证明内容或运行环境。服务端 validation fact 对 web search/read 的完整性证据有专门路径，但 Artifact SideEffect ref 不进入该事实。没有发现仅凭 Artifact metadata 得到 PASS 的途径；当前缺失语义证据保持 `pending/insufficient`。
+- **本机读取边界：** 现有 `TaskService.OpenTaskArtifactContent` 复用 Task/Host 授权，底层 `WorkspaceSyncService.OpenCommittedArtifact` 校验 pinned immutable revision、manifest/path、regular-file、大小与 SHA，并清理临时 spool。但它不是 claim/evidence-bound 读取；仓库也没有同时核对 review claim、SideEffect ref、step/sequence、持久 `source_call_id` 和精确 Artifact bytes 的入口。不能直接按路径读取或把 bytes 放进当前远程模型 prompt，因为这会发送本地文件内容。
+- **结论：** 本轮未改代码、未运行测试、未读取 Artifact bytes。若后续要做内容验证，应先提供在本地运行、格式/断言范围明确的 verifier；必要时再以当前 review claim 和 evidence ref 精确绑定到现有授权/不可变读取路径。远程 reviewer 只能接收不含 bytes 的本地核验结论；格式不支持或证据不足继续 `pending/insufficient`。可信执行环境身份、真实工程/非工程报告及客户端展示仍待 H06，H05 不完成。
 
 ### S00 H02 确认 429 后的 Worker 取消恢复 2026-11-22（本机隔离 PostgreSQL）
 
@@ -523,6 +531,86 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 - **Account Runtime 握手复核：** 当前 Go 校验的 ready frame 需要与 Node `account-runtime.mjs` 的 producer 对照的字段一致；两端的 `runtime_start` / `runtime_ready` 字段和 `0.2.0-rc.2` engine version 匹配。旧快照 `fee63a35` 的 race 握手失败未在当前主线重现，但旧日志没有原始 stdout/stderr，不能据此证明旧失败的具体根因。
 - **验证：** `cd server && go test ./internal/app -run '^(TestRuntimeToolExecutorReconcilesActiveDispatchAfterTaskLeaseReclaim|TestRuntimeToolExecutorReturnsNotFoundOnlyAfterExactOriginalLeaseQuery|TestRuntimeToolExecutorRetriesSameIDOnlyAfterExplicitNotFound)$' -count=1` 通过（1.972 秒）；`cd server && go test -race -count=1 ./...` 全部 Go 包通过，`internal/app` 42.532 秒、`internal/worker` 65.795 秒；本轮前述工具执行/恢复 heartbeat 定向 race 用例、worker 全量与 Runtime 182/182 也通过。源码格式检查和 `git diff --check` 通过。
 - **仍待验范围：** 未操作远端测试站、真实 Host 工具进程或真实 Provider；真实 Provider 验证暂缓，因为项目会话约定要求聊天明文出现的凭据先按已暴露处理、撤销并轮换，新凭据只从本机环境变量/密钥存储读取。工具/子 Agent/checkpoint 的请求级停滞策略、PC/iOS 实际入口、60 分钟耐久及旧握手失败的原始现场仍未验证。H04、H00 保持进行中，当前工作区改动未提交/推送。
+
+### S00 H04 等待审批与活动帧边界审计 2026-11-23
+
+- **核对：** Runtime `runActivity` 只在调用前发 `started`，并在返回时发 `completed`、`failed` 或 `cancelled`；协议、Account Runtime、Worker 与 PostgreSQL 均接受 `waiting` 状态，但当前没有生产者。审批路径由 `CloudDSHToolBroker` 先持久化 Task `waiting_user` 和待审批请求，再返回 `AgentToolNeedsUser`；Worker 收到该结果后以 `ErrCloudDSHWaitingForUser` 结束当前执行。它不是 Runtime 继续运行且等待用户的活动，因此不能通过新增通用 `waiting` 帧来代表审批。
+- **超时边界：** WorkerIPC 的 checkpoint 30 秒及 tool/child 6 分钟 timeout 只界定 Runtime 等待 IPC 响应的时间，不代表底层操作已停止或可安全重放。服务端仍按未知副作用对账规则处理；本轮未增加自动取消、重试或非模型活动时长阈值。
+- **验证：** `cd server && go test ./internal/app -run '^TestCloudDSHToolBrokerSensitiveApprovalResumesExactCallOnce$' -count=1` 通过（1.774 秒）；`cd server && go test ./internal/worker -run '^TestCloudDSHExecutorStopsCleanlyAfterDurableUserWait$' -count=1` 通过（1.422 秒）。另静态核对 `runtime/morde-cloud-runtime/src/engine.mjs` 的 `runActivity`、`server/internal/app/cloud_dsh_tool_broker.go` 的待审批持久化，以及 `server/internal/worker/cloud_dsh_session_tree.go` 的 `AgentToolNeedsUser` 停止路径；未修改生产代码。
+- **限制：** 这次审计澄清了审批和运行活动的既有状态边界，不解决健康 heartbeat 下长时间工具/子 Agent 请求的服务端提示策略，也未运行真实工具、PC/iOS 入口、Provider 或耐久场景；H04 保持进行中。
+
+### S00 H04 Runtime 等待态与客户端投影 2026-11-23
+
+- **Runtime：** `WorkerIPC` 在 checkpoint 写入/读取、工具调用、child 创建和结算请求已写出且仍等待匹配响应时触发一次 `waiting`；Runtime 恢复路径也覆盖 checkpoint page、未完成工具 reconciliation、精确 step retry 与 child 创建/读取/结算。请求仍保持 pending；等待活动遥测写失败不会撤销 IPC，匹配到的工具回执仍交给下一轮模型，不重放副作用。Activity 终态和 `Task.waiting_user` 审批保持独立。模型流仍使用既有 `model/started` 与 45 秒停滞提示。
+- **可信投影与客户端：** Task Agent 快照仅在当前 Task revision、Agent generation 和有效租约 fence 下同时返回可选 `activity_phase`/`activity_state`；未知或不成对值省略，不返回 activity ID。PC Assistant 在 `MAIN`/`SUBAGENT` 组中显示当前 phase/state；iOS Task 详情及 `agent_activity` 时间线显示本地化状态，未知枚举回退为“状态未知”，审批仍由 `waiting_user` 独立呈现。
+- **验证：** `cd runtime/morde-cloud-runtime && npm test` 通过 205/205（74.938 秒，含 DSH compaction 构建）；focused Runtime 26/26；`cd server && go test ./internal/api -run '^TestTaskResponseProjectsOnlyValidAgentActivityPair$' -count=1` 通过；使用一次性 loopback PostgreSQL 16 执行 `CH_TEST_DATABASE_URL=<本机一次性 DSN> go test ./internal/store/postgres -run '^TestPostgresTaskAgentActivity' -count=1` 通过（5.199 秒）；`go test -race ./internal/worker -run '^TestCloudDSHExecutorPersistsHeartbeatsWhileToolExecutionIsPending$' -count=1` 通过（2.274 秒）。PC Assistant 213 项和 Portal typecheck 通过，`pnpm run build:pc` 通过（504 modules；既有大 chunk warning）。iOS `MordeTaskEventIsolationTests/testAgentActivityGroupsStepsBySessionAndDelegationOrder` 与 `MIFTaskViewsTests/testAgentActivitySeparatesToolWaitFromApprovalAndPreservesUnknownEnums` 各 1/1 通过，`.xcstrings` JSON 和 `git diff --check` 通过。OpenAPI generator 输出确认两个字段均是可选枚举；未覆写整个现有 `schema.d.ts`，因为同一生成结果还包含无关的 client-login 409 描述漂移。
+- **实际 PC 尝试与限制：** 首次尝试复制 Portal bundle 并使用隔离 bundle ID，被 macOS 拒绝启动（`sandbox_extension_issue_file_to_process ... Operation not permitted`）；未触碰当时已运行的默认 profile。随后改用仓库 Electron 的 `MORDE_TEST_USER_DATA` 隔离入口，在本地 loopback 合成服务下实际启动 `morde-pc`。`/api/tasks/{id}` 与 React Task 对象一致包含主 Agent `running/model/started`、子 Agent `running/tool/waiting`（ID 已省略）；实际 DOM 显示 `MAIN → 模型：正在响应` 与 `SUBAGENT 01 → 工具：等待结果`，任务仍显示“执行中”且无审批标签。AX 快照先于异步活动文字，只显示分组标题；随后 DOM 核对确认文本已出现。
+- **PC 夹具结果与清理：** `go test ./internal/store/postgres -run '^TestConversationBrowserAcceptance$' -count=1 -v -timeout=5m` 的本地夹具完成请求返回 HTTP 409，测试最终失败并报告 `browser messages=1 replies=0`。因此只证明当前仓库 Electron 对合成 Task 活动态的实际渲染，不证明浏览器任务响应、真实模型/Host 或端到端闭环。隔离 Electron 进程已退出，DevTools 端口 9230 关闭，临时 profile、夹具目录、Go 缓存和 Portal bundle 已删除，临时容器已自动移除；默认 Electron PID 63655 保持运行且未触碰。未访问远端、读取凭据或发送文件。
+- **范围结论：** 本轮没有增加工具/子 Agent/checkpoint 请求级超时、取消或重试。真实 Host、Provider、iOS Task 实际入口与断线恢复、以及同一 Task 60 分钟耐久仍未验证；真实 Provider 验收等用户完成密钥轮换并在本机配置后继续。H04 保持进行中。
+
+### S00 H04 IPC 请求超时的持久对账 2026-11-23
+
+- **Runtime 协议：** 复用 WorkerIPC 已有的 checkpoint 30 秒、tool/child 6 分钟 deadline。期限到达时先发送 `agent_request_timeout`，再发当前活动的终态失败；该 telemetry 为 best-effort，不改 IPC 原结果。五类请求分别是 `tool_call`、`child_create`、`child_settle`、`checkpoint_write`、`checkpoint_read`，只携带现有 Task/Session/Revision fence、单调 observation sequence、phase、kind、activity ID 和 SHA-256 request digest，不带工具名或原始参数。没有新增期限、自动取消或副作用重试。
+- **Worker 对账：** Worker 只接受匹配当前 session/revision、活动 phase、已登记请求 kind/activity ID/digest 的 timeout frame；执行/恢复等待期间仍继续消费 status/activity/heartbeat。已知结果须先完成既有 operation ledger / checkpoint / child durable 验证，再按完全相同的请求身份 Resolve。恢复时工具调用仍走既有 `Reconcile`；已提交 checkpoint 只有在完整 pinned history 恢复并验过页 digest 后才可解决对应 write；已经 terminal 的 child 只有在其持久 checkpoint/status/summary 与请求 digest 相同时才可解决。settlement 响应后的同一 child settlement `waiting` telemetry 允许晚到处理，其他已结算 Session 观测仍失败关闭。
+- **持久层：** 新迁移 `00228_task_agent_request_reconciliation.sql` 增加 request reconciliation 表和 notice kind。记录按 Task/session/revision/kind/activity ID/digest 幂等；写入与解除分别重新检查当前 lease/generation/authorization、Task revision 与 Session ancestry。未解决行跨 heartbeat、idle、普通终态和新 generation 保留；相同 revision 下每条 pending 用户消息最多一条请求对账 notice。普通进展不会清除此 notice；消息离开 pending 可清 notice，但不会伪造 request 已 resolved。多个请求时，必须全数精确解决才清除待对账通知。
+- **验证：** `cd runtime/morde-cloud-runtime && npm test` 全套通过，212/212（72.405 秒），包括五种 timeout digest、先 timeout telemetry 后失败活动、迟到回执和等待遥测失败仍保留 IPC 结果。最终 `cd server && go test ./internal/worker -count=1` 全包通过（56.674 秒）；新增严格 timeout frame 解码、timeout 持久化/精确 Resolve、settled child 恢复 Worker 回归通过；changed-path `go test -race ./internal/worker -run '^(TestCloudDSHRequestTimeout.*|TestCloudDSHExecutorPersistsHeartbeatsWhileToolExecutionIsPending|TestCloudDSHExecutorRecoversChildSessionAfterRuntimeRestartWithoutReplayingTool|TestCloudDSHPersonalRecoveryAllowsSettledChildWithWriteReceipt)$' -count=1 -timeout=3m` 通过（4.086 秒）。settled child 恢复压力用例 `go test ./internal/worker -run '^TestCloudDSHExecutorRecoversChildSessionAfterRuntimeRestartWithoutReplayingTool$' -count=8 -v` 8/8 通过；最终 worker timeout/settled-child、Task API projection 定向用例通过。存储切片 agent 执行 `go build ./internal/store/postgres`、`go test ./internal/app -run '^$'` 及 `go test ./internal/store/postgres -run '^TestPostgresTaskAgentRequestReconciliation' -count=1 -timeout=3m` 均通过；4 个 PostgreSQL 集成测试覆盖 notice 去重、heartbeat/idle/代次保留、部分/完整 Resolve、错误 digest/fence inert、timeout 先于用户消息时补建 notice 及消息离开 pending 不改变 unresolved row。`gofmt` 与最终 `git diff --check` 通过。
+- **验收边界：** 实际 `morde-pc` 已在隔离 profile 和 loopback 合成服务上显示 MAIN/child 活动；完整浏览器夹具仍因完成回执 HTTP 409 失败，消息没有收到回复。此处没有真实慢 Host 工具、真实 Provider、iOS 实际 Task 恢复或 60 分钟 endurance 证据。用户已要求轮换聊天中曾出现的 DeepSeek 凭据并仅在本机配置后再继续真实模型验收；本轮未使用该凭据、未访问远端测试站或传输项目文件。H04 保持进行中，当前工作区改动未提交或推送。
+
+### S00 H04 iOS Task 活动页面入口尝试 2026-11-23
+
+- **目的：** 在新建的一次性 iPhone 18 Pro / iOS 27.2 模拟器中，用独立本地 fixture 从 iOS Tasks 列表打开 Task 详情，观察 MAIN 模型活动与 SUBAGENT 工具等待是否显示，并确认工具等待不是审批。
+- **结果：** `xcodebuild test -project clients/nanoMuse/android/src/ios/Morde.xcodeproj -scheme Morde -destination platform=iOS Simulator,id=18EEDF0C-C8C9-404A-B6C2-6F1B204ADB7C -derivedDataPath /tmp/MordeH04AgentActivityDerived -resultBundlePath /tmp/MordeH04AgentActivity.xcresult -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeTaskDetailShowsCurrentMainAndSubagentActivitySeparateFromApproval -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO` 首次编译通过，UI case 在 `launchLocalChat` 登录阶段失败；XCTest 截图与层级显示登录页收到 `请求失败：未能完成操作。（NSURLErrorDomain 错误 -3003。）`，提交按钮 disabled，未进入 Tasks 页面，新增页面断言没有执行。失败结果包位于 `/tmp/MordeH04AgentActivity.xcresult`，失败附件位于 `/tmp/MordeH04AgentActivityAttachments`。
+- **代码与清理：** 曾临时增加专用 Task activity fixture 和 UI case；因测试被登录网络夹具阻断、未验证目标页面，随后只移除这两项临时改动，保留原有 iOS 视图和单元测试改动。一次性模拟器 `18EEDF0C-C8C9-404A-B6C2-6F1B204ADB7C` 已关机并删除；已启动的 `Morde H06 AuthDiag` 模拟器完全未触碰。没有使用凭据、访问远端或发送文件。
+- **限制：** 这不是目标 Task 页面的通过证据；iOS 实际 Task 入口与断线恢复仍待在可工作的本地认证夹具下验收。已有 `MordeTaskEventIsolationTests/testAgentActivityGroupsStepsBySessionAndDelegationOrder` 和 `MIFTaskViewsTests/testAgentActivitySeparatesToolWaitFromApprovalAndPreservesUnknownEnums` 各 1/1 通过，但只证明模型/展示逻辑，不替代实际页面验收。H04/H06 保持未完成。
+
+### S00 H04 iOS Task activity fixture 与认证控制用例 2026-11-23
+
+- **改动：** `MordeApp.swift` 增加隔离启动参数 `-morde.localTaskAgentActivityFixture`，只为 `q7654321` 返回 running Task，含 MAIN 与 SUBAGENT 及各自关联步骤；既有 Task fixture 不变。`IOS03SimulatorAcceptanceUITests.swift` 新增 `testMordeTaskDetailShowsMainAndSubagentActivitySeparateFromApproval`，断言 MAIN 模型活动、SUBAGENT 工具等待、步骤分组以及无审批卡。两文件可编译；没有改认证代码或 UI 文案。
+- **目标用例：** `xcodebuild test -quiet -project clients/nanoMuse/android/src/ios/Morde.xcodeproj -scheme Morde -destination 'platform=iOS Simulator,id=4C714F96-1D74-4339-B65E-9DE886C1FDB5' -derivedDataPath /tmp/MordeH06TaskActivityUITestDerived-20261123 -resultBundlePath /tmp/MordeH06TaskActivityUITest-20261123.xcresult -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeTaskDetailShowsMainAndSubagentActivitySeparateFromApproval -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=NO` 编译通过，但 UI case 0/1、exit 65：`launchLocalChat` 登录提示 `NSURLErrorDomain -3003`，submit disabled，没有进入 Tasks 页面。去掉 `-AppleLanguages` 参数后同一 selector 仍 0/1，结果包 `/tmp/MordeH06TaskActivityUITest-rerun-20261123.xcresult`。
+- **控制用例：** 在同型号和系统的另一 disposable simulator 上，只运行既有 `testMordeTaskDetailShowsRealStepsWithoutBudget`。结果同样 0/1、exit 65，停在同一登录入口；结果包 `/tmp/MordeH06TaskActivityControl-20261123.xcresult`。这说明新 Task fixture 参数不是复现该登录失败的必要条件；既有成功结果来自不同日期/工作区，不能作为本次运行通过证据。失败附件没有记录 URL/host，不能进一步判定是 URLProtocol、URLSession 还是模拟器网络原因。
+- **清理与边界：** 两台 disposable simulator、DerivedData 和导出附件目录已删除；只保留上述两个 xcresult。已启动的 `Morde H06 AuthDiag` UDID `E1C86EF7-3EB6-4348-9233-7C197A7E3490` 未触碰。`git diff --check` 通过。目标 Task 页面断言未执行，本节不算 UI 通过；H04/H06 仍待在可工作的本地认证入口下验收。
+
+### S00 H04 iOS Task activity 签名验收 2026-11-23
+
+- **诊断修正：** iOS SDK 将 `-3003` 定义为 `NSURLErrorCannotWriteToFile`；项目 `MordeKeychain.set` 在 `SecItemAdd` 失败时抛出 `URLError(.cannotWriteToFile)`。Debug app 使用 `Morde.entitlements` 的 Keychain access group，早期 UI 命令用了 `CODE_SIGNING_ALLOWED=NO`。启用签名后的运行成功通过本地认证并进入 Tasks；证据支持测试签名参数是早期登录失败的条件。早期日志未保留 `SecItemAdd` 原始状态，因此不对具体错误码作推断。
+- **首次签名运行发现：** 新测试最初以错误的 task status selector 及不存在于 Task dynamics 结构中的通用 group ID 查询；XCTest hierarchy 还显示外层 `.accessibilityIdentifier("morde.taskDynamics.process")` 被传播给后代，覆盖了状态、Agent header 与 step 自身 ID。修正视图为 `.accessibilityElement(children: .contain)`，并让每个 Agent 的 header/step 有显式分组；测试使用 `morde.taskDynamics.status`、Agent 与 work item IDs，任务状态按真实本地化文本断言。
+- **通过结果：** 以下带签名 UI 复验通过：
+
+  ```text
+  xcodebuild test -quiet -project clients/nanoMuse/android/src/ios/Morde.xcodeproj -scheme Morde \\
+    -destination 'platform=iOS Simulator,id=C3BC41BD-63D3-4BD6-9F8B-08035654B621' \\
+    -derivedDataPath /tmp/MordeH06TaskActivitySignedDerived-20261123 \\
+    -resultBundlePath /tmp/MordeH06TaskActivitySigned-rerun3-20261123.xcresult \\
+    -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeTaskDetailShowsMainAndSubagentActivitySeparateFromApproval \\
+    -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=YES
+  # 1/1 passed，22.424 秒；iPhone 18 Pro / iOS 27.2
+  ```
+
+- **验收范围：** 从 iOS Tasks 列表打开本地 fixture 的 running Task，确认 MAIN 的模型活动与 SUBAGENT 01 的工具等待分开展示、各自步骤保留在对应组内、Task 状态仍为执行中，且不存在审批卡或审批标签。该用例通过不代表真实服务端 Task、真实 Provider/Host 或 PC↔iOS 同会话已验收。结果包留在 `/tmp/MordeH06TaskActivitySigned-rerun3-20261123.xcresult`；DerivedData 与一次性 `C3BC41BD-63D3-4BD6-9F8B-08035654B621` simulator 已清理，AuthDiag simulator 未触碰。H04/H06 保持未完成。
+
+### S00 H10 applied-steer 后旧 stream fence 回归 2026-11-23
+
+- **时序：** PostgreSQL 集成回归先追加 streaming delta 并保存同 Task steer，再通过两次 `SaveAgentCheckpoint` 分别覆盖 enqueue 与精确 claim。断言 steer 为 `applied`，Task 与 delivery checkpoint 均到序号 3 后，向旧 stream fence 提交迟到 delta。agent 的首个 `go test` 未传 `CH_TEST_DATABASE_URL`；依 `server/AGENTS.md` 约定该命令会跳过数据库 fixture，因此不算验证。为避免误记，随后显式连接一次性 PostgreSQL 重跑。
+- **首次真实失败与根因：** 在显式 loopback PostgreSQL 下，旧 delta 被拒绝，但 `task_assistant_message_snapshots.status` 仍为 `streaming`，conversation message 也未转为 `interrupted`。根因是 `AppendCloudDSHTextDelta` 在比较 `CheckpointThrough` 时先返回，没执行 pending-steer 分支的快照中断逻辑。
+- **修复：** checkpoint 不一致时，仅查询与当前 Task/owner/initiator、Agent instance/generation、授权版本及 root session 精确绑定、已 `applied` 且 `claimed_checkpoint_through_seq` 大于旧 model fence 的 `steer`。命中后复用 `interruptAssistantMessageSnapshot`，按迟到 delta 的 `turn_id` 精确保留并中断对应 snapshot/message，再正常拒绝旧 delta；不是该 steer 的 checkpoint 不匹配仍返回未授权错误，不触碰其他 turn。
+- **通过结果：** `CH_TEST_DATABASE_URL='postgres://postgres@127.0.0.1:55436/postgres?sslmode=disable' go test ./internal/store/postgres -run '^TestCloudDSHStream' -count=1 -v -timeout=5m` 在 PostgreSQL 16.15 一次性容器上通过，11 个顶层用例全部通过，包用时 15.697 秒；新组合回归约 0.89 秒。用例另把当前 snapshot 换成不同 turn 后重放旧 delta，确认另一 turn 仍为 `streaming`。整组覆盖旧 checkpoint、pending steer、修订/取消、Host 权限与并发消息/结算/撤权相关 stream 保护。旧 delta 未追加，原 snapshot 和 conversation message 保留原 partial text 并为 `interrupted`。`gofmt` 与 `git diff --check` 通过。容器仅绑 loopback、无持久卷，测试后已停止并删除。本项不替代 H10 的真实模型、PC/iOS、多任务并行与耐久验收。
+
+### S00 H04 PC 回执断言修正与 IPC 遥测非阻塞回归 2026-11-23
+
+- **PC 409 根因与修正：** 隔离复现中 `POST /__morde_fixture/advance/search/complete` 返回 204，Task 已完成且有 `task.result` 事件；409 来自 `/verify/search` 把助手整条消息要求为裸搜索结果。生产结果发布有意添加“结果摘要”标题及执行/验收状态回执，Task source 的 Task ID、用户消息、修订、事件序号和原始来源内容均正确。已将 search 与 merge 的 fixture 断言改为在完整回执中查找精确摘要片段，同时保留来源身份、顺序和数量校验；没有更改生产结果发布逻辑。
+- **IPC 遥测阻塞修正：** `WorkerIPC` 不再等待 `onWaiting` 遥测 Promise 才消费匹配响应；`DurableSession.runActivity` 在操作已返回后将 `completed`/失败终态观察按原 observation sequence 队列写出，不等待终态帧写完。`started` 仍在动作派发前 await；终态帧实际写入错误仍触发 IPC fail-closed。增加永不完成的 waiting 遥测、阻塞/失败的终态遥测及匹配回执测试。
+- **自动化回归：** `cd runtime/morde-cloud-runtime && npm test` 通过，220/220（74.019 秒，含 compaction 构建）；focused IPC/活动遥测组 20/20。`git diff --check` 与修改文件 `gofmt -d` 通过。
+- **实际 PC search 验收：** `MORDE_BROWSER_ACCEPTANCE=1 MORDE_BROWSER_ACTIVITY=1 MORDE_BROWSER_ACTIVITY_SCENARIOS=search go test ./internal/store/postgres -run '^TestConversationBrowserAcceptance$' -count=1 -v -timeout=5m` 通过（测试 55.78 秒、包 57.494 秒）。隔离 Electron PC 的 start/progress/complete 均返回 204，verify 首次返回 200 `{"scenario":"search","status":"verified"}`；run 为 completed、无 failure、result event sequence 为 5。
+- **实际 PC merge 验收：** 同命令将 activity 场景设为 `merge` 后通过（测试 111.73 秒、包 113.427 秒）；两条固定 Task 的 start/progress/complete 均返回 204，两次 complete 间隔 21ms，verify 首次返回 200 `{"scenario":"merge","status":"verified"}`；两个 run 均 completed、无 failure、事件序号为 5。测试用户首次登录有一次因手输遗漏字符产生 401，使用日志中的正确 synthetic 用户名后登录 200 并通过。
+- **实际 PC separate 验收：** 结果批次聚合窗口为 2 秒；第一次 A/B complete 相隔 1001ms，仍在同一结果批次窗口内，verify 409 符合合并语义（不是产品缺陷）。修正等待间隔后，A complete 返回 204，2604ms 后 B complete 返回 204；等待 2.2 秒后单次 verify 返回 200 `{"scenario":"separate","status":"verified"}`。Go 测试 59.74 秒、包 61.486 秒通过；两个 run 均 completed、无 failure、事件序号为 5。
+- **隔离与限制：** 三次验收均使用 loopback 合成服务、独立 Electron profile 和临时 PostgreSQL；相关进程、DevTools 端口、profile 与数据库目录均清理。默认 Electron PID 63655/profile 和 `Morde H06 AuthDiag` simulator 未触碰。stream、reconnect、failed、approval 场景及完整默认 suite 尚未复验，本轮没有调用 Provider、远端测试站或 Host 工具。若 IPC 输出通道永久背压，后续 checkpoint/观察帧仍会按序等待；这次只保证匹配结果不被 waiting/terminal 遥测 await 丢住，不表示结果已在通道恢复前持久化，后续恢复仍依赖 durable 对账。真实模型验收等待用户完成密钥轮换后仅在本机配置；H04/H06 仍未完成，改动未提交/推送。
+
+- **stream/reconnect/failed/approval 补验尝试：** 两次 Go test 均显式连接各自新建的 loopback PostgreSQL，没有静默 skip，但都因本地验收驱动顺序错误而未触达目标场景。首轮仅完成 PC 登录，四个 Task 均为 `awaiting_message`，没有发送消息或写 stop file，夹具 180.75 秒超时；次轮驱动脚本早于 PC Assistant 页就绪写入 stop file，Go 以 `browser messages=0 replies=0` 失败（81.72 秒）。两次均未创建 iOS SSE watcher、未推进 Task，也没有产品行为结论。完整日志与 attempt JSON 分别在 `/tmp/morde-h04-streamfail-evidence.hs6lp8/`、`/tmp/morde-h04-streamfail2-evidence.o17c6y/`；临时 PostgreSQL、Electron、DevTools 与 profile 已清理，默认 PID 63655/profile 和 H06 simulator 未触碰。四个场景及完整默认 suite 继续标记未验证。
+
+- **第三次夹具准备尝试：** Go 命令配置 acceptance timeout 5 分钟（Go 外层 6 分钟）；临时 PostgreSQL 与当前工作树 Electron 均成功启动。PC 登录后实际 Portal target 为本地 `/assistant`，`textarea#assistant-content` 已启用、`.assistant-send` 存在且主会话 ID 与 Go fixture 一致，主会话任务 API 返回 200；页面仍显示“工具连接暂不可用”。但 300.76 秒时测试报 `browser fixture timed out`，四个 run 均为 `awaiting_message`、没有 objective/fixture POST、没有 SSE 或 stop-file。此轮证明页面 readiness 已达到，未证明任何 Task 行为；旧 5 分钟窗口主要耗在 app/build 启动前置。脱敏证据 `/tmp/morde-h04-controlled.QXwJ2Y/`（`preparation-status.json`、`pc-readiness.json`、`go-test.scrubbed.log`、`pg-stop.log`）。进程、数据库和独立 profile 已清理；默认 Electron PID 63655 与 H06 simulator 未触碰。下一轮先完成 Portal/Electron 构建并启动登录页，再启动 Go fixture，以扩大留给场景执行的有效时间。
+
+- **第四次受控 PC 验收（2026-11-23；通过）：** 计时外 `npm run build:portal` 与 `npm run build` 均退出 0；随后启动当前仓库 `morde-pc`、全新 profile 和 loopback 合成 PostgreSQL。`MORDE_BROWSER_ACCEPTANCE=1 MORDE_BROWSER_ACTIVITY=1 MORDE_BROWSER_ACTIVITY_SCENARIOS=failed,approval,stream MORDE_BROWSER_ACCEPTANCE_TIMEOUT=10m go test ./internal/store/postgres -run '^TestConversationBrowserAcceptance$' -count=1 -v -timeout=12m` 通过，测试体 607.06 秒，包 608.725 秒，exit 0。登录进入本地 `/assistant`，主会话 ID 与 fixture 一致；四条固定 objective 都先由实际 PC 输入后变为 `claimed` 且有 Task ID，再按 start/progress 和对应终态推进。failed、approval、stream、reconnect 四项 verify 均 HTTP 200；最终 Task 状态分别为 failed、waiting_user、completed、completed。stream Task 的 browser 与临时 iOS Bearer SSE 在 stream phase 前均 active；`/disconnect/stream` 返回 204 后，iOS 以 `after=4`/`Last-Event-ID=4`、browser 以 `after=5` 重连，断开前最低 cursor 为 4，reconnect verify 通过。fixture 数据库最终 `user=5, assistant=2`，满足门槛后才 touch stop-file。未设置 `MORDE_BROWSER_CROSS_CLIENT`，iOS SSE bearer 只在本地进程内存使用。
+- **清理与限制：** Go 测试停机等待 PC 长连接 SSE；关闭本轮隔离 Electron 后 teardown 完成并 PASS。临时 PostgreSQL 数据库、profile、DevTools listener 和 Go 测试数据均清理；PID 63655 与 H06 simulator 未触碰。脱敏证据保留在 `/tmp/morde-h04-run4.ybmeYO/`（`run-summary.json`、各场景状态/verify、DB 门槛、scrubbed Go log、cleanup status）。这是实际 PC UI 到本地合成 HTTP/API/数据库的 Task 状态验收，不是 DSH 真实模型、真实 Host、iOS 应用页面或 60 分钟耐久结果；H04/H06 仍未完成，改动未提交/推送。
 
 ### S00 H05 来源身份 SQL 静态审计 2026-11-22
 
@@ -648,6 +736,162 @@ Worker 全套中的 `TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 
 
   以上均为本机合成 HTTP/流响应；deadline 使用 10ms 夹具以验证分类，不表示实际 Provider 超过 45 秒、真实网络流中断或客户端 UI 已验收。轮换后的实时 Provider 凭据尚未配置到当前进程，因此没有调用真实 Provider、测试站或客户端；H02 保持进行中。
 - **已知缺口与未验范围：** 单次聚合仍受 32 KiB 限制；超限补充按已验证路径单独排队，但客户端如何呈现这些独立消息未实测，也没有聚合原文分页读取接口。工具、子 Agent 与 Task checkpoint 的请求级停滞期限仍未补齐。用户选择等轮换凭据配置到本机后继续真实模型验收；本轮未调用真实模型、测试站或客户端，旧聊天 key 未使用。真实 tokenizer/Provider 窗口、跨账号长历史、双端 Task 状态、真实 Host 工具和 60 分钟耐久验收均未执行，H01/H04/H09 保持未完成。
+
+### S00 H04 IPC 回执绑定与 fence 拒绝 2026-11-23
+
+- **审查发现：** 当前 PostgreSQL child-session 实现会按 `SpawnKey` 查找创建结果，但 Worker 之前没有独立验证返回 `AgentChildSession.SpawnKey` 与请求 `CallID` 一致，也未验证返回的 `Background` 模式。另一个恢复路径忽略 `ResolveTaskAgentRequestReconciliation` 返回的 `false`，可能把 fence 拒绝当作成功并继续；本地请求状态也在存储解除前就被标成已验证。
+- **修复：** Worker 现在只接受 Task、父 Session、SpawnKey、Background 和允许工具集均匹配的 child 回执。持久对账解除返回 `false` 时返回 fenced error；只有存储接受解除后才更新本地 verified/pending 状态。该改动保护 child-create 和所有复用同一解除 helper 的 tool/checkpoint/child-settle 恢复路径，不改变重试或超时策略。
+- **验证：** 新增 worker 回归覆盖错误 SpawnKey、错误 Background 和数据库 fence 拒绝时仍保留 pending 本地状态。以下检查全部通过：
+
+  ```text
+  cd server && go test ./internal/worker -run '^TestCloudDSH(RequestResolutionFenceDoesNotMarkLocalRequestVerified|ChildCreateRejectsMismatchedSpawnReceiptBeforeResolvingTimeout)$' -count=1 -v
+  # 通过，1.721 秒
+  cd server && go test ./internal/worker -count=1
+  # 全包通过，58.928 秒
+  CH_TEST_DATABASE_URL='<本机一次性 PostgreSQL DSN>' go test ./internal/store/postgres -run '^TestPostgresTaskAgentRequestReconciliation' -count=1 -v -timeout=5m
+  # 4/4 顶层集成用例通过，4.917 秒
+  gofmt -d server/internal/worker/cloud_dsh_session_tree.go server/internal/worker/cloud_dsh_executor_test.go
+  git diff --check
+  # 格式与 diff 检查通过
+  ```
+
+  PostgreSQL 测试使用一次性 loopback PostgreSQL 16.15；结束后已停止并移除无持久卷容器。
+- **边界：** 这是本地 Worker/存储合同回归，不证明真实 Host 的副作用回执、实际 PC/iOS Task 入口、真实 Provider 或 60 分钟耐久。H04/H06 继续未完成；代码和文档仍只留在本机工作树。
+
+### S00 H04 未决请求提示保留至精确对账 2026-11-23
+
+- **根因与修复：** 只读审查发现，`CheckTaskAgentStall`、普通 Agent 进展和某个请求的精确解除路径，都会在关联用户消息离开 `pending` 后清除 `request_reconciliation` 提示；若同一 Task 修订仍有未知操作结果，步骤会被错误标为 `succeeded`。现三条路径均先按修订检查所有 pending 对账记录；只要仍有一条，提示与 running 步骤继续保留。全部请求已精确解除后，完成摘要再根据消息是否仍 pending 分别说明，不把消息出队误报为操作成功。
+- **配对回归：** PostgreSQL 集成用例先把消息从 pending 改为 applied，再触发停滞检查及后续 Agent 活动；两条请求仍未决时提示保持 active，逐项解除第一条后仍 active，第二条精确解除后才变为 succeeded，并检查最终摘要同时说明精确对账和消息已出队。
+- **验证：** 使用一次性 PostgreSQL 16.15 容器，仅绑定 `127.0.0.1:55440`，无持久卷；测试后已删除。
+
+  ```text
+  CH_TEST_DATABASE_URL='<loopback 一次性 PostgreSQL DSN>' go test ./internal/store/postgres -run '^(TestPostgresTaskAgentRequestReconciliation|TestPostgresTaskAgentActivity|TestPostgresTaskAgentModelCallStall)' -count=1 -v -timeout=5m
+  # 9 个顶层用例通过，21.538 秒
+  CH_TEST_DATABASE_URL='<同一一次性 DSN>' go test ./internal/store/postgres -run '^TestPostgresTaskAgentRequestReconciliationNoticePersistsUntilExactResolution$' -count=1 -v -timeout=3m
+  # 最终扩展版通过，1.866 秒；另一次测试夹具误复用观测序号 2 被单调序号门禁拒绝，修正为序号 3 后通过
+  cd server && go test ./internal/app ./internal/api ./internal/worker -count=1
+  # app 21.305 秒、api 2.220 秒、worker 54.964 秒，全部通过
+  cd runtime/morde-cloud-runtime && npm test
+  # 220/220 通过，74.186 秒
+  cd runtime/morde-cloud-runtime && node --test --test-concurrency=1 --test-name-pattern='DurableSession returns matched operation results' test/runtime.test.mjs
+  # parent + blocked/failed 两子用例共 3/3 通过；验证终态遥测阻塞/失败后后续活动不派发
+  cd web/portal && npm test -- src/routes/Assistant.test.tsx && npm run typecheck
+  # Assistant 213/213 通过；Portal typecheck 通过
+  git diff --check
+  gofmt -d server/internal/store/postgres/task_agent_stall.go server/internal/store/postgres/task_agent_request_reconciliation_integration_test.go
+  # diff 与格式检查通过
+  ```
+
+- **边界：** Runtime/Worker/PostgreSQL/Portal 检查为本机合成回归；没有调用 Provider、测试站或 Host。该修复防止未知副作用被用户界面报告为成功，但不自动解决未知结果，也不证明 H04/H06 的真实工具、iOS Task 入口或 60 分钟耐久验收。
+
+### S00 H05 审批来源覆盖审计 2026-11-23
+
+- **现有事实：** `task_pending_requests` 可绑定单个审批的 Task ID/pending-request version、CallID、tool name、request hash、Runtime generation/instance/control version 与 approved/rejected 响应；response event 记录对应的 pending ID/version/decision。通用 `task_operations` 记录 request hash、Host/Runtime fence 与终态。MCP、Hub、Workspace、media 等路径还有各自执行/回执记录。
+- **覆盖缺口：** 通用 operation 未直接绑定审批 ID/version，审批记录也没有 Task revision/响应人；多个副作用路径并非都走 `task_operations`。因此 approved 但未执行、成功操作但未批准、以及多个操作中存在一个无匹配批准，都无法用当前统一查询完整区分。当前 `loadTaskValidationVerdictFacts` 将执行类 Task 的 `IrreversibleAction` 保持 `unknown`，不设置 `ApprovalHistoryVerified`，属于正确的 fail-closed 行为；本轮不只凭 approved row 改成 verified。
+- **最小后续合同：** 需要统一并持久化服务端 action-risk/approval identity；每条副作用账本原子绑定审批 ID/version、Task revision、动作/步骤和授权 fence，再对当前修订下完整副作用集合做覆盖验证。回归须覆盖 approved-but-not-executed、wrong call/hash/fence/revision、rejected/expired/unknown、精确批准且终态成功、多操作漏绑，以及 MCP/Hub/Workspace/media 路径。此次只读审计未改代码或运行测试；H05 保持未完成。
+
+### S00 H05 跨账本审批与副作用关联审计 2026-11-23
+
+- **Host 普通工具：** Broker 会按 Task、CallID、tool、参数哈希和 Host runtime/control fence 精确匹配批准；响应事务会锁定审批行，并原子写 decision/idempotency、Task queued 状态与 `task.response` event。但审批行没有 Task revision/直接响应人，`task_operations` 没有 CallID、审批 ID/version 或 Task revision；创建/dispatch 事务未核验这条批准。因此应用层校验不能证明操作账本的原子批准关联。
+- **MCP：** 外部 connector 在 `cloud_dsh_mcp.go` 先做绑定 connector revision、credential/grant version、tool/arguments/CallID 的审批门，通过后才准备并派发 MCP operation；拒绝/过期不调用远端。MCP operation 的 request hash 与审批 hash 不同，表中无审批 ID/version、Task revision，Prepare/Dispatch 事务也未锁/核验审批。固定内置 search/read 复用 operation ledger，但跳过逐次审批并依赖 TaskSubmit 授权与固定只读工具定义。
+- **Hub：** Hub operation 绑定 Task、目标、action request hash、target grant 和 lease/auth fence；状态切换有 PostgreSQL 事务保护，但没有 pending approval identity 或 Task revision，也没有按本次批准核验的路径。工具范围/目标授权不能当成本次操作的显式审批记录。
+- **Workspace/media：** media preview/staged object 与精确 pending approval、生成操作在提交时已有事务关联；后续 Workspace publish receipt 不保留 approval ID/version 或 Task revision，只存 request hash。直接 live save 先写文件，再提交 publish receipt，Artifact/staged-state 更新还在后续事务。Workspace owner-session file operations 不带 Task/approval 关联，且运行 Task 时会被 writer gate 拒绝。
+- **规则边界：** `runtimeToolRisk` 将 `file.write`、browser click 等部分可能产生持久/外部变化的操作列为 `moderate`，而非逐次审批；现有 H05 “irreversible action” 与逐次批准要求没有说明这些动作是否由 Task/connector 授权覆盖。不得在未明确这条范围前将它们计作已验证。另 `server/AGENTS.md` 指向的 `docs/实施/00-总览与公共约定.md` 在当前仓库不存在，Schema 合同没有该权威落点。
+- **审计结论：** 保持 `ApprovalHistoryVerified=false`、`IrreversibleAction=unknown`，不改 S04 verdict loader、不声称覆盖 PASS。审计阶段只读，没有运行测试；未访问远端服务、模型或凭据。完整风险口径与文件边界记在并发总控和 S03 问题记录。
+
+### S00 H05 审批绑定迁移与实现分工 2026-11-23
+
+- **口径：** 沿用当前 `runtimeToolRisk` 与各连接器既有审批要求，不把 moderate 动作自动升级为逐次审批。只有明确要求逐次审批的 Host/MCP/media 动作写入 approval binding；固定内置 search/read 继续依靠固定只读定义与 TaskSubmit 授权。未能枚举或证明的其他执行账本仍保持 `unknown/pending`。
+- **Schema：** S00 分配并本地新增 `server/migrations/00229_task_approval_operation_bindings.sql`。它为 pending approval 加 Task revision 和响应人；Host、外部 MCP 和 Workspace media publish receipt 保存 CallID、tool/action hash、Task revision、approval ID/version/hash，并用复合外键及唯一索引避免单条批准被多条操作重复占用。旧行允许 nullable，不能被当作当前 revision 的验证证明。尚未在 PostgreSQL 执行该迁移。
+- **文件分工：** S03 分三条无重叠边界实现 Host generic operation、MCP connector operation、media Workspace publish reservation/receipt；每条在 prepare/dispatch 或 reserve/commit 的数据库事务中重核 exact pending approval。S04 verdict loader 暂不改动；Hub 的既有 target-grant 授权不会伪装为逐次用户批准。
+- **当前状态：** app/PostgreSQL 配对实现与定向故障测试正在进行，尚未完成/验证；不设置 `ApprovalHistoryVerified`，H05 保持未完成。本条只记录合同、迁移与文件边界，不是功能通过结论。
+
+### S00 H05 Artifact source-call 绑定 2026-11-23
+
+- **缺口与修复：** Artifact 的 `source_call_id` 原先只作验证引用别名，没有与 review snapshot 中实际产生它的 tool step 比较。S04 在 review packet 构造处增加本地匹配：同 Task、同当前 revision 中必须恰有一个相同 `ToolCallKey`；其序号须为正、kind 为 `tool`、状态为 `succeeded`。缺来源、CallID 不同、旧 revision、失败或重复 step 都只输出 `unavailable`，不会把 Artifact metadata 交给 reviewer。Artifact 仍只传 metadata，不传字节，也未改 schema。
+- **验证：**
+
+  ```text
+  cd server && go test ./internal/worker -run '^TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly$' -count=1 -v
+  # 通过，0.813 秒；含 missing/mismatched/stale/failed/duplicate（含失败重复）子用例
+  cd server && go test ./internal/worker -count=1
+  # 全包通过，56.621 秒
+  gofmt -d server/internal/worker/task_validation_review_worker.go server/internal/worker/task_validation_review_worker_test.go
+  git diff --check
+  # 格式与 diff 检查通过
+  ```
+
+- **边界：** 这是 review packet 的来源身份门禁，不证明产物文件的语义内容，也不建立 Task 全部不可逆动作的完整审批覆盖；审批验证继续为 unknown/pending。此次未连数据库、Provider、测试站或 Host，H05 仍未完成。
+
+### S00 H00 本地基线与 Hermes 哈希复核 2026-11-23
+
+- **基线：** 当前本地分支 `main`，`HEAD` 与本地 `origin/main` tracking ref 均为 `3d35a03c`；本轮未 fetch，远端最新状态未验证。`git status --short` 共 32 条状态记录。Node `v26.13.0`、npm `11.20.0`；桌面 package `0.1.0` / Electron `44.7.0`；Runtime package `0.0.0`，有 15 个直接 `@deepseek-ai/*` 依赖，lockfile 中 27 个 DSH 条目为 `0.2.2-rc.1`。
+- **Hermes：** 本地重新计算既有记录所列 18 个重点文件的 SHA-256，18/18 匹配。另从公开的[固定上游提交 `0d49d6d9d20e461155d49ba9d188687079c811af`](https://github.com/NousResearch/hermes-agent/commit/0d49d6d9d20e461155d49ba9d188687079c811af) fetch 到 `/tmp/morde-hermes-tree-20261123` 临时 bare repo，按完整路径、Git mode 和 blob SHA-1 比较全部文件：上游 27,298 个 blob；本地快照 27,297 个文件；缺 28、额外 27（均为 `__pycache__/*.pyc`）、共有文件内容差异 83、mode 差异 0。临时 bare repo 已删除；未改 `project/hermes-agent/`。明细/旧关键文件记录见[关键文件哈希清单](#s00-h00-hermes-固定提交关键文件哈希核对-2026-11-22)。
+- **边界：** 完整树核对再次确认本地快照并非固定提交的逐文件副本；本轮未运行 PC build、未调用 Provider、测试站或 Host。H00 仍待实际客户端/模型/云电脑与耐久验收。
+
+### S00 H00 main 与远端分支核对 2026-11-23
+
+- **核对：** 本地在 `main`，HEAD=`3d35a03c1b9a3ef93371ccfdb63627ce1458a144`。只读 `git ls-remote --heads origin` 返回 `refs/heads/main` 同一 SHA 与 `refs/heads/dev=900bd6bc6f07a3c16bcae4a761325aaa18922fac`；`git merge-base --is-ancestor 900bd6bc6f07a3c16bcae4a761325aaa18922fac 3d35a03c1b9a3ef93371ccfdb63627ce1458a144` 返回 0。当前远端只有 `main` 与 `dev`，截图中的 19 个分支名均不再作为远端 refs 存在；其历史整合记录保留于[并发总控](../Morde_Harness_并发实施/00-并发实施总控.md)。
+- **结果：** 当前 `main` 已与远端一致；本轮没有创建空提交或重复 push。未提交的 H04/H05 本地工作未包含在远端，仍留在本机工作树。
+
+### S00 H05 审批绑定账本实现与Postgres回归 2026-11-23
+
+- **实现：** 迁移 00229 为 pending approval 添加 Task revision/响应用户；Host task_operations、外部 MCP operation、media Workspace publish receipt 持久化 CallID/tool/action hash、Task revision 与 approval ID/version/hash。Host operation create 和最终 dispatch、MCP Prepare 和 MarkDispatched、Workspace publish Reserve 和 Commit 都在事务中锁定 Task 与对应 pending approval，校验当前 Task revision、审批状态/决定、响应人、动作身份及 Host/connector/Workspace fence。审批有效期按响应时间判定：截止前作出的批准不会因后续排队而失效；截止后响应失败关闭。MCP 内置 search/read 仅记录 Task revision/CallID，沿用固定只读工具定义和 TaskSubmit 授权。Workspace media receipt replay 要求所有审批绑定字段一致；Reserve 被拒绝时 direct-live 路径不写文件。Hub target grant 语义未改，moderate 动作未升级为逐次审批，S04 verdict loader 未改。
+- **生成与应用验证：** `cd server && make generate` 通过；更新 sqlcgen/models.go 以匹配 00228 与 00229 Schema。`cd server && go test ./internal/app -count=1` 通过（21.108 秒）。`gofmt -d $(git diff --name-only -- '*.go') server/internal/store/postgres/task_approval_operation_bindings_integration_test.go` 无差异；`git diff --check` 通过。
+- **PostgreSQL 验证：** 使用 `postgres:16.15-bookworm` 一次性容器，仅绑定 `127.0.0.1:55443`、无数据卷。CH_TEST_DATABASE_URL 指向该 loopback 实例，测试 helper 为每条集成用例创建/删除随机数据库并运行全量迁移；00229 在多个隔离库中实际应用。最终命令及结果：
+
+  ```text
+  cd server && CH_TEST_DATABASE_URL=<loopback disposable PostgreSQL DSN> go test ./internal/store/postgres -run '^(TestPostgresApprovedTaskOperationBindingAllowsExactDispatchAndReplay|TestPostgresTaskOperationRequiresExactApprovedBinding|TestPostgresTaskOperationDispatchRejectsRevisionChangedAfterApproval|TestPostgresMCPConnector.*|TestPostgresBuiltinSearchOperationIsolationReplayAndStop|TestTaskWorkspacePublish.*|TestTaskWorkspacePublishedArtifactPersistsAcrossPostgresConnectionRestartForOwner)$' -count=1 -timeout=10m
+  # ok morde/server/internal/store/postgres 34.405s
+  ```
+
+- **失败修正与清理：** 首轮真实 DB 运行发现三组测试夹具遗漏合同字段：Host fixture 未启动 Task revision、MCP fixture 重复使用同一 pending version、Workspace barrier fixture 缺精确审批身份。夹具按各自 owner 修正后整组重跑通过；另补充迁移既有 expiry_after_created 约束下的创建/响应/过期时间序列。最初无 DSN 的 agent 编译命令明确跳过集成用例，不计为通过。PostgreSQL 容器无持久卷，测试完成后已 stop 并自动删除。
+- **范围与未验证：** 修改和验证仅在本地 main；没有访问共享测试站/Host、没有调用真实模型或使用聊天中出现的密钥、没有发送项目文件。moderate action 是否需要逐次审批沿用当前 runtimeToolRisk，未扩大范围。H05 仍未完成：尚无所有不可逆 action class 的覆盖证明；Hub/其它独立账本不在本次 per-call binding 内；可信执行环境身份、Artifact 内容语义、真实 PC/iOS/Provider 与耐久验收未完成。执行类 Task 的 ApprovalHistoryVerified 仍为 false、IrreversibleAction 仍为 unknown，S04 fail-closed。
+
+### S00 H05 验证事实覆盖 Hub 副作用账本 2026-11-23
+
+- **缺口与修复：** `loadTaskValidationVerdictFacts` 先前只以 `task_steps`、通用 `task_operations`、子会话及 Artifact 判断是否发生 Task execution；独立账本中单独存在的 Hub action 因此可能被误当作“没有执行”。现将外部 MCP、Hub、Workspace publish、sandbox call、Workspace view deletion 与 IPC reconciliation 记录一并纳入存在性检查。该检查只会把 Task 标记为存在执行并把不可逆动作保持 `unknown`，不会将审批推断为已验证。
+- **回归：** 新 PostgreSQL 集成测试创建一个没有 Task tool step 的 Hub `command` operation，直接调用 `loadTaskValidationVerdictFacts`，断言 `TaskExecution=present` 且 `IrreversibleAction=unknown`。使用无数据卷、只监听 `127.0.0.1:55447` 的一次性 PostgreSQL 16 容器运行全量 goose migrations；容器在测试结束后停止并移除。
+
+  ```text
+  cd server && CH_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55447/postgres?sslmode=disable go test ./internal/store/postgres -run '^TestPostgresTaskValidationFactsTreatHubOperationAsExecution$' -count=1 -timeout=5m
+  # ok morde/server/internal/store/postgres 2.652s
+  ```
+
+- **结论与边界：** `gofmt` 与 `git diff --check` 通过。改动仅在本地 `main`，未访问测试站/Host、未调用模型、未外发文件。本测试证明 Hub ledger 不会被误分类为无执行；并未证明 Hub 的 `command`/`file.put` 具备逐次审批。Hostless Workspace write receipt 的精确批准绑定仍在实施；Hub grant、审批覆盖、可信环境和 Artifact 内容语义未闭合，H05 保持未完成并 fail-closed。
+
+### S00 H05 Hostless Workspace 精确审批回执绑定 2026-11-23
+
+- **实现：** Hostless `morde_workspace_write` 的 Broker 已批准分支现把精确 pending approval 传给 Workspace 工具。live-directory 和普通 Workspace 写入在 Reserve、Commit 及回执 replay 时均核验 Task `current_revision=desired_revision`、批准 Task revision、CallID、tool、request hash、approval ID/version 和批准状态/响应时间；缺失、过期、变化或回执绑定不一致时失败关闭。没有新增 migration，复用 00229 的 Workspace receipt 字段和数据库事务验证。
+- **验证：** 应用层回归覆盖 write 需要批准、同一精确批准完成写入、字段变化/绑定丢失的重放拒绝，以及 live-directory 写入和 live receipt replay 拒绝。PostgreSQL 用例覆盖 Hostless exact Reserve/Commit/replay、字段变化拒绝、持久化回执绑定被清空后拒绝，并复跑 media approval 的 revision/responder/commit 栅栏。最终集成验证：
+
+  ```text
+  cd server && go test ./internal/app -count=1
+  # ok morde/server/internal/app 22.714s
+
+  cd server && CH_TEST_DATABASE_URL=postgres://postgres@127.0.0.1:55448/postgres?sslmode=disable go test ./internal/store/postgres -run '^(TestPostgresTaskValidationFactsTreatHubOperationAsExecution|TestTaskWorkspacePublishMediaApprovalBindingIsExactAndRecheckedAtCommit|TestTaskWorkspacePublishHostlessWriteApprovalBindingRejectsMissingOrChangedReplay|TestTaskWorkspacePublishRechecksMediaApprovalUnderCommitLock|TestTaskWorkspacePublishRequiresStableTaskRevisionAtReserveAndCommit|TestTaskWorkspacePublishRequiresApprovalResponderAtCommit|TestTaskWorkspacePublishRejectsNonApprovedMediaBeforeReservationAndCommit)$' -count=1 -timeout=10m
+  # ok morde/server/internal/store/postgres 13.296s
+
+  gofmt -d server/internal/app/cloud_dsh_tool_broker.go server/internal/app/cloud_dsh_workspace_tools.go server/internal/app/cloud_dsh_workspace_live.go server/internal/app/workspace_sync_test.go server/internal/store/postgres/task_workspace_publish_integration_test.go server/internal/store/postgres/task_validation_review.go server/internal/store/postgres/task_validation_evidence_integration_test.go
+  git diff --check
+  # formatting diff empty; whitespace check passed
+  ```
+
+- **环境和未验证：** PostgreSQL 16 是一次性、无数据卷、只监听 `127.0.0.1:55448` 的容器；测试结束已停止并移除。未访问共享测试站或 Host、未调用真实模型、未发送文件。Hub 的目标 grant 不等同于逐次 approval；Host/Hub 全动作类别的审批覆盖、可信环境身份和 Artifact 内容语义仍未证实，执行类 Task 继续保持 `ApprovalHistoryVerified=false` / `IrreversibleAction=unknown`，H05 不勾选。
+
+### S00 H05 IPC reconciliation 执行事实漏项修正 2026-11-23
+
+- **问题与修复：** 上轮验证说明称 `loadTaskValidationVerdictFacts` 已覆盖 IPC reconciliation，但源码查询实际缺少 `task_agent_request_reconciliations`。pending tool/child 请求可能已产生未知副作用；把它们判为无执行会低估结果事实。现将该表加入执行存在性查询，仍将 `IrreversibleAction` 与 `RepeatedError` 留为 `unknown`，不推导审批完整或 PASS。
+- **回归：** 新增 PostgreSQL 用例启动真实 Agent session、持久化精确 pending tool-call reconciliation，再直接读取 validation facts，断言 `TaskExecution=present` 且 `IrreversibleAction=unknown`。已有 Hub operation 回归也在同一目标命令中复跑。
+- **验证命令与结果：** 在只绑定 loopback 随机端口、无数据卷的一次性 PostgreSQL 16 容器中运行：
+
+  ```sh
+  CH_TEST_DATABASE_URL="postgres://postgres@127.0.0.1:<ephemeral-port>/postgres?sslmode=disable" \
+    go test ./internal/store/postgres -run '^TestPostgresTaskValidationFactsTreat(HubOperation|PendingRequestReconciliation)AsExecution$' -count=1
+  ```
+
+  结果 `ok morde/server/internal/store/postgres 3.640s`；`gofmt` 与 `git diff --check` 通过。测试容器已停止并删除。
+- **补充审计与边界：** 只读调用链审计发现 Hostless live Workspace write 和 media publish 在 receipt Reserve、实际文件写入、receipt Commit 之间可与 Task cancellation 交错；目前取消可使 Commit 失败而 live 文件已写入。此情形涉及数据库与文件系统的持久状态协调，本轮未做不完整的 recheck/回滚修补，需按 H04/H05 状态机继续解决。Hub/sandbox 仍缺逐次审批身份或可信执行环境证明；Artifact 内容语义、真实 PC/iOS/Provider 与耐久验收未完成。执行类 Task 继续 `ApprovalHistoryVerified=false` / `IrreversibleAction=unknown`，H05 不勾选。
 
 ### 单次执行信息模板
 

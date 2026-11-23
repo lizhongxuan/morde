@@ -139,13 +139,15 @@ type TaskCostSummary struct {
 }
 
 type TaskAgentExecution struct {
-	ID           string
-	ParentID     string
-	StepID       string
-	TaskRevision int64
-	Role         string
-	Status       string
-	ObservedAt   *time.Time
+	ID            string
+	ParentID      string
+	StepID        string
+	TaskRevision  int64
+	Role          string
+	Status        string
+	ObservedAt    *time.Time
+	ActivityPhase string
+	ActivityState string
 }
 
 const (
@@ -168,6 +170,37 @@ type TaskAgentActivityObservation struct {
 
 type TaskAgentActivityRecorder interface {
 	RecordTaskAgentActivity(context.Context, TaskAgentActivityObservation) (bool, error)
+}
+
+// TaskAgentRequestReconciliation records an IPC response deadline without
+// claiming that the underlying operation has stopped. The request remains
+// pending until the same operation is durably reconciled.
+type TaskAgentRequestReconciliation struct {
+	Fence               AgentInstanceFence
+	AgentSessionID      string
+	TaskRevision        int64
+	Phase               string
+	RequestKind         string
+	ActivityID          string
+	RequestDigest       string
+	ObservationSequence int64
+}
+
+const (
+	TaskAgentRequestPhaseTool       = "tool"
+	TaskAgentRequestPhaseSubagent   = "subagent"
+	TaskAgentRequestPhaseCheckpoint = "checkpoint"
+
+	TaskAgentRequestKindToolCall        = "tool_call"
+	TaskAgentRequestKindChildCreate     = "child_create"
+	TaskAgentRequestKindChildSettle     = "child_settle"
+	TaskAgentRequestKindCheckpointWrite = "checkpoint_write"
+	TaskAgentRequestKindCheckpointRead  = "checkpoint_read"
+)
+
+type TaskAgentRequestReconciliationRecorder interface {
+	RecordTaskAgentRequestReconciliation(context.Context, TaskAgentRequestReconciliation) (bool, error)
+	ResolveTaskAgentRequestReconciliation(context.Context, TaskAgentRequestReconciliation) (bool, error)
 }
 
 type TaskStepDetailRecord struct {

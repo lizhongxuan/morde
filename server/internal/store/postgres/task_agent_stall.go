@@ -53,6 +53,10 @@ FOR UPDATE OF t,ai`, value.ID, value.OwnerID, value.Lease.Owner, value.Lease.Ver
 		if err != nil {
 			return err
 		}
+		hasPendingReconciliation, err := taskAgentHasPendingRequestReconciliation(ctx, tx, value.ID, value.OwnerID, *value.CurrentRevision)
+		if err != nil {
+			return err
+		}
 		known, stalled, err := taskAgentActivityStalled(ctx, tx, value, staleAfter)
 		if err != nil {
 			return err
@@ -66,8 +70,10 @@ FOR UPDATE OF t,ai`, value.ID, value.OwnerID, value.Lease.Owner, value.Lease.Ver
 			messageID string
 			stepID    string
 			state     string
+			kind      string
+			revision  int64
 		}
-		rows, err := tx.Query(ctx, `SELECT message_id,step_id,state FROM task_agent_stall_notices
+		rows, err := tx.Query(ctx, `SELECT message_id,step_id,state,notice_kind,task_revision FROM task_agent_stall_notices
 WHERE task_id=$1 AND owner_id=$2 FOR UPDATE`, value.ID, value.OwnerID)
 		if err != nil {
 			return fmt.Errorf("lock Task agent stall notices: %w", err)
@@ -76,7 +82,7 @@ WHERE task_id=$1 AND owner_id=$2 FOR UPDATE`, value.ID, value.OwnerID)
 		existing := make(map[string]struct{})
 		for rows.Next() {
 			var item notice
-			if err := rows.Scan(&item.messageID, &item.stepID, &item.state); err != nil {
+			if err := rows.Scan(&item.messageID, &item.stepID, &item.state, &item.kind, &item.revision); err != nil {
 				rows.Close()
 				return fmt.Errorf("scan Task agent stall notice: %w", err)
 			}
@@ -93,6 +99,23 @@ WHERE task_id=$1 AND owner_id=$2 FOR UPDATE`, value.ID, value.OwnerID)
 
 		for _, item := range notices {
 			_, stillPending := pending[item.messageID]
+			if item.kind == taskAgentRequestReconciliationNoticeKind {
+				hasUnresolved, err := taskAgentHasPendingRequestReconciliation(ctx, tx, value.ID, value.OwnerID, item.revision)
+				if err != nil {
+					return err
+				}
+				if hasUnresolved {
+					continue
+				}
+				summary := taskAgentRequestReconciliationClearedSummary
+				if !stillPending {
+					summary = taskAgentReconciliationResolvedMessageSummary
+				}
+				if err := clearTaskAgentStallNoticeWithSummary(ctx, tx, value.ID, item.messageID, item.stepID, summary); err != nil {
+					return err
+				}
+				continue
+			}
 			if stillPending && (!known || stalled) {
 				continue
 			}
@@ -100,10 +123,17 @@ WHERE task_id=$1 AND owner_id=$2 FOR UPDATE`, value.ID, value.OwnerID)
 				return err
 			}
 		}
-		if !known || !stalled {
-			return nil
-		}
 		for _, messageID := range pendingMessages {
+			if hasPendingReconciliation {
+				if err := createOrPromoteTaskAgentRequestReconciliationNotice(ctx, tx, value.ID,
+					value.OwnerID, messageID, *value.CurrentRevision, value.AgentGeneration); err != nil {
+					return err
+				}
+				continue
+			}
+			if !known || !stalled {
+				continue
+			}
 			if _, exists := existing[messageID]; exists {
 				continue
 			}
@@ -241,8 +271,8 @@ VALUES ($1,$2,$3,$4,'running',$5,$6)`, stepID, value.ID, stepSequence, taskAgent
 		return fmt.Errorf("persist Task activity notice step: %w", err)
 	}
 	if _, err := tx.Exec(ctx, `INSERT INTO task_agent_stall_notices
-(task_id,owner_id,message_id,step_id,task_revision,agent_generation,state)
-VALUES ($1,$2,$3,$4,$5,$6,'active')`, value.ID, value.OwnerID, messageID, stepID, revision, generation); err != nil {
+(task_id,owner_id,message_id,step_id,task_revision,agent_generation,state,notice_kind)
+VALUES ($1,$2,$3,$4,$5,$6,'active','activity_stall')`, value.ID, value.OwnerID, messageID, stepID, revision, generation); err != nil {
 		return fmt.Errorf("persist Task activity notice identity: %w", err)
 	}
 	return insertTaskAgentStallStepEvent(ctx, tx, value.ID, stepID, stepSequence, taskAgentStallNoticeKind, "running", title, summary)
@@ -255,6 +285,10 @@ func clearTaskAgentStallNotice(ctx context.Context, tx pgx.Tx, taskID, messageID
 	if !stillPending {
 		summary = summaryResolved
 	}
+	return clearTaskAgentStallNoticeWithSummary(ctx, tx, taskID, messageID, stepID, summary)
+}
+
+func clearTaskAgentStallNoticeWithSummary(ctx context.Context, tx pgx.Tx, taskID, messageID, stepID, summary string) error {
 	result, err := tx.Exec(ctx, `UPDATE task_agent_stall_notices SET state='cleared',cleared_at=clock_timestamp()
 WHERE task_id=$1 AND message_id=$2 AND state='active'`, taskID, messageID)
 	if err != nil {
@@ -274,16 +308,23 @@ WHERE task_id=$1 AND id=$2 AND status='running' RETURNING sequence,kind,title`, 
 }
 
 func clearTaskAgentStallNoticesForProgress(ctx context.Context, tx pgx.Tx, taskID, ownerID string) error {
-	rows, err := tx.Query(ctx, `SELECT message_id,step_id FROM task_agent_stall_notices
-WHERE task_id=$1 AND owner_id=$2 AND state='active' FOR UPDATE`, taskID, ownerID)
+	rows, err := tx.Query(ctx, `SELECT n.message_id,n.step_id,n.notice_kind,n.task_revision,
+EXISTS (SELECT 1 FROM conversation_messages m WHERE m.id=n.message_id AND m.task_id=n.task_id AND m.owner_id=n.owner_id
+  AND m.role='user' AND m.delivery_status='pending')
+FROM task_agent_stall_notices n
+WHERE n.task_id=$1 AND n.owner_id=$2 AND n.state='active' FOR UPDATE OF n`, taskID, ownerID)
 	if err != nil {
 		return fmt.Errorf("lock Task activity notices before clearing on progress: %w", err)
 	}
-	type item struct{ messageID, stepID string }
+	type item struct {
+		messageID, stepID, kind string
+		revision                int64
+		stillPending            bool
+	}
 	items := make([]item, 0)
 	for rows.Next() {
 		var notice item
-		if err := rows.Scan(&notice.messageID, &notice.stepID); err != nil {
+		if err := rows.Scan(&notice.messageID, &notice.stepID, &notice.kind, &notice.revision, &notice.stillPending); err != nil {
 			rows.Close()
 			return fmt.Errorf("scan Task activity notice before clearing on progress: %w", err)
 		}
@@ -295,7 +336,156 @@ WHERE task_id=$1 AND owner_id=$2 AND state='active' FOR UPDATE`, taskID, ownerID
 	}
 	rows.Close()
 	for _, notice := range items {
-		if err := clearTaskAgentStallNotice(ctx, tx, taskID, notice.messageID, notice.stepID, true); err != nil {
+		if notice.kind == taskAgentRequestReconciliationNoticeKind {
+			hasUnresolved, err := taskAgentHasPendingRequestReconciliation(ctx, tx, taskID, ownerID, notice.revision)
+			if err != nil {
+				return err
+			}
+			if hasUnresolved {
+				continue
+			}
+			summary := taskAgentRequestReconciliationClearedSummary
+			if !notice.stillPending {
+				summary = taskAgentReconciliationResolvedMessageSummary
+			}
+			if err := clearTaskAgentStallNoticeWithSummary(ctx, tx, taskID, notice.messageID, notice.stepID,
+				summary); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := clearTaskAgentStallNotice(ctx, tx, taskID, notice.messageID, notice.stepID, notice.stillPending); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+const (
+	taskAgentRequestReconciliationNoticeKind      = "request_reconciliation"
+	taskAgentRequestReconciliationNoticeTitle     = "操作结果待核对"
+	taskAgentRequestReconciliationNoticeSummary   = "Agent 的请求响应期限已到，操作结果仍待对账；不会自动重试或视为完成。"
+	taskAgentRequestReconciliationClearedSummary  = "已取得该请求的精确对账结果；消息仍待处理，任务按原状态继续。"
+	taskAgentReconciliationResolvedMessageSummary = "已取得该请求的精确对账结果；该消息已不在待处理队列中，任务按原状态继续。"
+)
+
+func taskAgentHasPendingRequestReconciliation(ctx context.Context, tx pgx.Tx, taskID, ownerID string, revision int64) (bool, error) {
+	var exists bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM task_agent_request_reconciliations
+  WHERE task_id=$1 AND owner_id=$2 AND task_revision=$3 AND state='pending'
+)`, taskID, ownerID, revision).Scan(&exists); err != nil {
+		return false, fmt.Errorf("check unresolved Task agent request reconciliation: %w", err)
+	}
+	return exists, nil
+}
+
+func createOrPromoteTaskAgentRequestReconciliationNotice(ctx context.Context, tx pgx.Tx, taskID, ownerID,
+	messageID string, revision, generation int64) error {
+	var stepID, state, noticeKind string
+	err := tx.QueryRow(ctx, `SELECT step_id,state,notice_kind FROM task_agent_stall_notices
+WHERE task_id=$1 AND owner_id=$2 AND message_id=$3 FOR UPDATE`, taskID, ownerID, messageID).
+		Scan(&stepID, &state, &noticeKind)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return createTaskAgentRequestReconciliationNotice(ctx, tx, taskID, ownerID, messageID, revision, generation)
+	}
+	if err != nil {
+		return fmt.Errorf("lock Task agent request reconciliation notice: %w", err)
+	}
+	if state == "active" && noticeKind == taskAgentRequestReconciliationNoticeKind {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE task_agent_stall_notices SET state='active',cleared_at=NULL,
+task_revision=$4,agent_generation=$5,notice_kind=$6
+WHERE task_id=$1 AND owner_id=$2 AND message_id=$3`, taskID, ownerID, messageID, revision, generation,
+		taskAgentRequestReconciliationNoticeKind); err != nil {
+		return fmt.Errorf("promote Task agent request reconciliation notice: %w", err)
+	}
+	var stepSequence int64
+	var kind, title string
+	if err := tx.QueryRow(ctx, `UPDATE task_steps SET status='running',title=$3,summary=$4
+WHERE task_id=$1 AND id=$2 RETURNING sequence,kind,title`, taskID, stepID,
+		taskAgentRequestReconciliationNoticeTitle, taskAgentRequestReconciliationNoticeSummary).
+		Scan(&stepSequence, &kind, &title); err != nil {
+		return fmt.Errorf("reopen Task agent request reconciliation step: %w", err)
+	}
+	return insertTaskAgentStallStepEvent(ctx, tx, taskID, stepID, stepSequence, kind, "running", title,
+		taskAgentRequestReconciliationNoticeSummary)
+}
+
+func createTaskAgentRequestReconciliationNotice(ctx context.Context, tx pgx.Tx, taskID, ownerID, messageID string,
+	revision, generation int64) error {
+	stepID, err := domain.NewStepID()
+	if err != nil {
+		return fmt.Errorf("generate Task request reconciliation notice step ID: %w", err)
+	}
+	var stepSequence int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM task_steps WHERE task_id=$1`, taskID).Scan(&stepSequence); err != nil {
+		return fmt.Errorf("allocate Task request reconciliation step sequence: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO task_steps (id,task_id,sequence,kind,status,title,summary)
+VALUES ($1,$2,$3,$4,'running',$5,$6)`, stepID, taskID, stepSequence, taskAgentStallNoticeKind,
+		taskAgentRequestReconciliationNoticeTitle, taskAgentRequestReconciliationNoticeSummary); err != nil {
+		return fmt.Errorf("persist Task request reconciliation step: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO task_agent_stall_notices
+(task_id,owner_id,message_id,step_id,task_revision,agent_generation,state,notice_kind)
+VALUES ($1,$2,$3,$4,$5,$6,'active',$7)`, taskID, ownerID, messageID, stepID, revision, generation,
+		taskAgentRequestReconciliationNoticeKind); err != nil {
+		return fmt.Errorf("persist Task request reconciliation notice identity: %w", err)
+	}
+	return insertTaskAgentStallStepEvent(ctx, tx, taskID, stepID, stepSequence, taskAgentStallNoticeKind,
+		"running", taskAgentRequestReconciliationNoticeTitle, taskAgentRequestReconciliationNoticeSummary)
+}
+
+func clearTaskAgentRequestReconciliationNotices(ctx context.Context, tx pgx.Tx, taskID, ownerID, conversationID string) error {
+	rows, err := tx.Query(ctx, `SELECT n.message_id,n.step_id,n.task_revision
+FROM task_agent_stall_notices n
+WHERE n.task_id=$1 AND n.owner_id=$2 AND n.state='active' AND n.notice_kind='request_reconciliation'
+FOR UPDATE`, taskID, ownerID)
+	if err != nil {
+		return fmt.Errorf("lock Task request reconciliation notices for resolution: %w", err)
+	}
+	type notice struct {
+		messageID string
+		stepID    string
+		revision  int64
+	}
+	notices := make([]notice, 0)
+	for rows.Next() {
+		var item notice
+		if err := rows.Scan(&item.messageID, &item.stepID, &item.revision); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan Task request reconciliation notice: %w", err)
+		}
+		notices = append(notices, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("read Task request reconciliation notices: %w", err)
+	}
+	rows.Close()
+	for _, item := range notices {
+		var stillPending bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM conversation_messages
+  WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND conversation_id=$4
+    AND role='user' AND delivery_status='pending'
+)`, item.messageID, taskID, ownerID, conversationID).Scan(&stillPending); err != nil {
+			return fmt.Errorf("check Task input state for request reconciliation notice: %w", err)
+		}
+		hasUnresolved, err := taskAgentHasPendingRequestReconciliation(ctx, tx, taskID, ownerID, item.revision)
+		if err != nil {
+			return err
+		}
+		if hasUnresolved {
+			continue
+		}
+		summary := taskAgentRequestReconciliationClearedSummary
+		if !stillPending {
+			summary = taskAgentReconciliationResolvedMessageSummary
+		}
+		if err := clearTaskAgentStallNoticeWithSummary(ctx, tx, taskID, item.messageID, item.stepID, summary); err != nil {
 			return err
 		}
 	}
