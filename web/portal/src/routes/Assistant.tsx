@@ -669,9 +669,18 @@ function taskActivityProgressText(task: Task, cloudTasksAvailable: boolean | und
 
 function recoveryHint(step: TaskStep | undefined): string | null {
   if (step?.title !== 'Review cloud task recovery') return null;
-  const category = /^The model request could not be verified \(category: ([a-z_]+)\); retry after checking the model connection\.$/.exec(step.summary)?.[1];
-  if (category === 'invalid_response') return '模型返回内容未通过安全校验，本次没有发布最终答复。';
-  if (category === 'unauthorized_tool') return '模型请求了当前任务未授权的工具，该调用未执行。';
+  const category = /\(category: ([a-z_]+)\)/.exec(step.summary)?.[1];
+  const reason = /diagnostic_reason: ([a-z_]+)/.exec(step.summary)?.[1];
+  const toolName = /tool_name: ([A-Za-z0-9_-]{1,64})/.exec(step.summary)?.[1];
+  if (category === 'invalid_response' && reason === 'tool_arguments_not_object')
+    return `工具${toolName ? ` ${toolName}` : ''}的参数不是有效对象，该调用未执行。`;
+  if (category === 'invalid_response' && reason === 'tool_call_metadata_invalid')
+    return `工具${toolName ? ` ${toolName}` : '调用'}的元数据不符合 DSH 要求，该调用未执行。`;
+  if (category === 'invalid_response') return '模型响应格式未通过 DSH 校验，本次没有发布最终答复。';
+  if (category === 'unauthorized_tool' && reason === 'task_has_no_authorized_tools')
+    return `当前任务没有授权可用工具，但模型请求了${toolName ? `工具 ${toolName}` : '工具'}；该调用未执行。`;
+  if (category === 'unauthorized_tool')
+    return `模型请求了当前任务未授权的${toolName ? `工具 ${toolName}` : '工具'}；该调用未执行。`;
   if (category === 'provider_rate_limited' || category === 'rate_limited') return '模型服务正在限流，稍后再试。';
   if (category === 'provider_invalid_api_key' || category === 'authentication_rejected') return '模型密钥未通过服务商验证，请检查模型连接。';
   if (category === 'provider_quota_exhausted' || category === 'quota_exhausted' || category === 'task_budget_exhausted') return '模型额度已用尽，请检查额度后重试。';

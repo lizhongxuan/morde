@@ -80,12 +80,13 @@ func TestPostgresTaskStepRetryConcurrentSameKeyCreatesOneAttempt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	supervisorNonce := bytes.Repeat([]byte{0x27}, 32)
 	started, replayed, err := instances.Start(ctx, app.AgentInstanceStart{
 		Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: claimed.OwnerID, InitiatorID: claimed.InitiatorID,
 			AgentInstanceID: "agent-step-retry-race", AgentSessionID: "session-step-retry-race", SupervisorID: "step-retry-supervisor",
 			LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, AuthorizationVersion: claimed.Authorization.Version,
 			EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"},
-		SupervisorNonce: bytes.Repeat([]byte{0x27}, 32), LeaseDuration: 30 * time.Second,
+		SupervisorNonce: supervisorNonce, LeaseDuration: 30 * time.Second,
 	})
 	if err != nil || replayed || started.Fence.AgentGeneration < 1 {
 		t.Fatalf("start retry Task Agent: lease=%+v replayed=%t err=%v", started, replayed, err)
@@ -260,13 +261,14 @@ func TestPostgresMCPConnectorRateLimitStepRetryWaitsForExactLedgerEvidence(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
+	supervisorNonce := bytes.Repeat([]byte{0x27}, 32)
 	started, replayed, err := instances.Start(ctx, app.AgentInstanceStart{
 		Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: claimed.OwnerID, InitiatorID: claimed.InitiatorID,
 			AgentInstanceID: "agent-mcp-rate-limit-retry", AgentSessionID: "session-mcp-rate-limit-retry",
 			SupervisorID: "mcp-rate-limit-retry-supervisor", LeaseOwner: claimed.Lease.Owner,
 			LeaseVersion: claimed.Lease.Version, AuthorizationVersion: claimed.Authorization.Version,
 			EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"},
-		SupervisorNonce: bytes.Repeat([]byte{0x27}, 32), LeaseDuration: 30 * time.Second,
+		SupervisorNonce: supervisorNonce, LeaseDuration: 30 * time.Second,
 	})
 	if err != nil || replayed {
 		t.Fatalf("start MCP retry Agent: replayed=%t err=%v", replayed, err)
@@ -340,8 +342,8 @@ WHERE task_id=$1 AND call_id=$2`, f.task.ID, callID); err != nil {
 		t.Fatalf("read Task after Retry-After window: %v", err)
 	}
 	for _, step := range details.Steps {
-		if step.ID == sourceStepID && (!step.Retryable || step.RetryAfterAt == nil || step.RetryAfterAt.After(time.Now())) {
-			t.Fatalf("step retry projection after Retry-After window = %+v; want enabled with an elapsed retry time", step)
+		if step.ID == sourceStepID && (step.Retryable || step.RetryAfterAt == nil || step.RetryAfterAt.After(time.Now())) {
+			t.Fatalf("step retry projection while Agent stop is unconfirmed = %+v; want disabled with an elapsed retry time", step)
 		}
 	}
 
@@ -383,6 +385,30 @@ VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,'mcp_call',$13,'unknown
 	}
 	if _, err := pool.Exec(ctx, `DELETE FROM task_mcp_connector_operations WHERE task_id=$1 AND call_id=$2`, f.task.ID, unknownCallID); err != nil {
 		t.Fatalf("remove unrelated unknown operation: %v", err)
+	}
+	if _, err := f.route.store.RequestTaskStepRetry(ctx, record, request); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("retry before verified Agent stop err=%v; want conflict", err)
+	}
+	details, err = f.route.store.GetTask(ctx, f.task.ID, f.route.ownerID)
+	if err != nil {
+		t.Fatalf("read Task while Agent stop is unconfirmed: %v", err)
+	}
+	for _, step := range details.Steps {
+		if step.ID == sourceStepID && step.Retryable {
+			t.Fatalf("unconfirmed Agent stop exposed an enabled retry: %+v", step)
+		}
+	}
+	if _, err := instances.ConfirmStopped(ctx, signAgentLifecycleReceipt(t, supervisorKey, started.Fence, supervisorNonce)); err != nil {
+		t.Fatalf("confirm previous MCP Agent stopped: %v", err)
+	}
+	details, err = f.route.store.GetTask(ctx, f.task.ID, f.route.ownerID)
+	if err != nil {
+		t.Fatalf("read Task after verified Agent stop: %v", err)
+	}
+	for _, step := range details.Steps {
+		if step.ID == sourceStepID && !step.Retryable {
+			t.Fatalf("verified Agent stop did not enable retry: %+v", step)
+		}
 	}
 
 	created, err := f.route.store.RequestTaskStepRetry(ctx, record, request)

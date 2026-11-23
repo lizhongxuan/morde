@@ -277,6 +277,11 @@ func listTaskStepsWithActivity(ctx context.Context, tx pgx.Tx, taskID string) ([
 COALESCE(s.failure_reason,''),s.retryable,s.created_at,COALESCE(s.agent_session_id,''),s.task_revision,COALESCE(s.tool_call_key,''),
 COALESCE(s.tool_name,''),s.request_digest,COALESCE(s.phase,''),s.detail_state,
 COALESCE(mcp.status,''),COALESCE(mcp.call_id,''),COALESCE(mcp.tool_name,''),mcp.request_hash,mcp.task_revision,mcp.result,mcp.updated_at,mcp.evidence_count
+,
+EXISTS (SELECT 1 FROM task_agent_instances ai WHERE ai.task_id=t.id AND ai.owner_id=t.owner_id
+ AND ai.agent_generation=t.agent_generation AND ai.agent_instance_id=t.agent_instance_id AND ai.agent_session_id=t.agent_session_id
+ AND ai.state='stopped' AND ((ai.stop_receipt IS NOT NULL AND ai.stop_receipt_digest=sha256(ai.stop_receipt))
+   OR (ai.guardian_stop_attestation IS NOT NULL AND ai.guardian_stop_attestation_digest=sha256(ai.guardian_stop_attestation))))
 FROM task_steps s JOIN tasks t ON t.id=s.task_id
 LEFT JOIN LATERAL (
  SELECT status,call_id,tool_name,request_hash,task_revision,result,updated_at,count(*) OVER() AS evidence_count
@@ -297,10 +302,12 @@ WHERE s.task_id=$1 ORDER BY s.sequence`, taskID)
 		var mcpRequestHash []byte
 		var mcpResult pgtype.Text
 		var mcpUpdatedAt pgtype.Timestamptz
+		var agentStopConfirmed bool
 		if err := rows.Scan(&step.ID, &step.TaskID, &step.Sequence, &step.Attempt, &step.RetryOfStepID, &step.Kind, &step.Status,
 			&step.Title, &step.Summary, &step.FailureReason, &step.Retryable, &step.CreatedAt, &step.AgentSessionID, &revision,
 			&step.ToolCallKey, &step.ToolName, &step.RequestDigest, &step.Phase, &step.DetailState,
-			&mcpStatus, &mcpCallID, &mcpToolName, &mcpRequestHash, &mcpTaskRevision, &mcpResult, &mcpUpdatedAt, &mcpEvidenceCount); err != nil {
+			&mcpStatus, &mcpCallID, &mcpToolName, &mcpRequestHash, &mcpTaskRevision, &mcpResult, &mcpUpdatedAt, &mcpEvidenceCount,
+			&agentStopConfirmed); err != nil {
 			return nil, err
 		}
 		if revision.Valid {
@@ -309,7 +316,7 @@ WHERE s.task_id=$1 ORDER BY s.sequence`, taskID)
 		}
 		if step.FailureReason == "connector_rate_limited" {
 			step.Retryable = false
-			if step.Status == task.StepFailed && mcpEvidenceCount.Valid && mcpEvidenceCount.Int64 == 1 &&
+			if step.Status == task.StepFailed && agentStopConfirmed && mcpEvidenceCount.Valid && mcpEvidenceCount.Int64 == 1 &&
 				mcpStatus.Valid && mcpStatus.String == string(task.OperationFailed) &&
 				mcpCallID.Valid && mcpCallID.String == step.ToolCallKey && mcpToolName.Valid && mcpToolName.String == step.ToolName &&
 				mcpTaskRevision.Valid && revision.Valid && mcpTaskRevision.Int64 == revision.Int64 &&

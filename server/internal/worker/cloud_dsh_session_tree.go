@@ -1768,8 +1768,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					}
 					return cloudDSHModelResultErrorFor(result.err)
 				}
-				if category := cloudDSHModelResponseFailureCategory(result.response, pending.state.definitions); category != "" {
-					return cloudDSHModelResultError{category: category}
+				if failure := cloudDSHModelResponseFailureDiagnostic(result.response, pending.state.definitions); failure.Category != "" {
+					return cloudDSHModelResultError{category: failure.Category, reasonCode: failure.ReasonCode,
+						toolName: failure.ToolName, toolCallID: failure.ToolCallID, stage: failure.Stage}
 				}
 				if !steerPending && pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through {
 					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
@@ -2590,10 +2591,10 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				}
 			}
 			if err != nil {
-				return errors.New("dsh tool execution could not be confirmed")
+				return cloudDSHToolExecutionFailureFor(frame, "tool_executor_error", err)
 			}
 			if result.TerminalForAttempt && result.Status != app.AgentToolFailed {
-				return errors.New("dsh terminal tool result is not a failure")
+				return cloudDSHToolExecutionFailureFor(frame, "terminal_status_invalid", nil)
 			}
 			if result.Status == app.AgentToolSuperseded {
 				if err := supersedeToolCall(ctx, result.SupersedingMessages, state.identity.SessionID, frame.CallID); err != nil {
@@ -2611,13 +2612,13 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					}
 					return ErrCloudDSHWaitingForUser
 				}
-				return errors.New("dsh tool execution requires user attention")
+				return cloudDSHToolExecutionFailureFor(frame, "operation_outcome_unknown", nil)
 			}
 			terminalChildFailure := ""
 			if !recoveredPersonalResult {
 				resultAdmission, err := e.admitToolCall(ctx, value, call, fence, true)
 				if err != nil {
-					return errors.New("dsh tool result admission could not be confirmed")
+					return cloudDSHToolExecutionFailureFor(frame, "result_admission_error", err)
 				}
 				if resultAdmission.Status == app.AgentToolCallSuperseded {
 					if err := supersedeToolCall(ctx, resultAdmission.PendingMessages, state.identity.SessionID, frame.CallID); err != nil {
@@ -2629,17 +2630,17 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					terminalChildFailure = resultAdmission.Reason
 				}
 				if resultAdmission.Status != app.AgentToolCallAdmitted && terminalChildFailure == "" {
-					return errors.New("dsh tool result admission returned an unsupported result")
+					return cloudDSHToolExecutionFailureFor(frame, "result_admission_unsupported", nil)
 				}
 			}
 			if result.Status != app.AgentToolSucceeded && result.Status != app.AgentToolFailed {
-				return errors.New("dsh tool returned an unsupported result")
+				return cloudDSHToolExecutionFailureFor(frame, "result_status_unsupported", nil)
 			}
 			if !validCloudDSHToolImageResult(frame.Name, result) {
-				return errors.New("dsh tool returned an unauthorized image")
+				return cloudDSHToolExecutionFailureFor(frame, "result_image_invalid", nil)
 			}
 			if !utf8.ValidString(result.Output) || len(result.Output) > cloudDSHMaxText {
-				return errors.New("dsh tool result exceeds the IPC limit")
+				return cloudDSHToolExecutionFailureFor(frame, "result_output_invalid", nil)
 			}
 			if result.TerminalForAttempt {
 				if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
@@ -2647,16 +2648,16 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				}
 				finisher, ok := e.options.Tools.(app.AgentToolTerminalAttemptFinisher)
 				if !ok {
-					return errors.New("dsh terminal tool result finisher is unavailable")
+					return cloudDSHToolExecutionFailureFor(frame, "terminal_finisher_unavailable", nil)
 				}
 				if err := finisher.FailTerminalToolAttempt(ctx, value, call); err != nil {
-					return errors.New("dsh terminal tool result could not be persisted")
+					return cloudDSHToolExecutionFailureFor(frame, "terminal_result_persist_error", err)
 				}
 				return errCloudDSHTerminalToolAttempt
 			}
 			toolImages, err := state.images.add(result.Images)
 			if err != nil {
-				return errors.New("dsh tool image could not be validated")
+				return cloudDSHToolExecutionFailureFor(frame, "result_image_invalid", err)
 			}
 			if retryCall {
 				settled := result

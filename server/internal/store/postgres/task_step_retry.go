@@ -151,6 +151,20 @@ FROM task_steps WHERE task_id=$1 AND id=$2 FOR UPDATE`, request.TaskID, request.
 		if !connectorRateLimitRetry && !notDispatchedRetry {
 			return domain.NewError(domain.CodeConflict, "step failure is not safe to retry")
 		}
+		if connectorRateLimitRetry {
+			previous, err := lockAgentInstance(ctx, tx, current.ID, current.OwnerID, current.AgentGeneration)
+			if err != nil {
+				if domain.CodeOf(err) == domain.CodeInvalidState {
+					return domain.NewError(domain.CodeConflict, "task Agent stop is unconfirmed")
+				}
+				return err
+			}
+			if previous.State != "stopped" || !validAgentStopEvidence(previous) ||
+				previous.Fence.AgentInstanceID != current.AgentInstanceID || previous.Fence.AgentSessionID != current.AgentSessionID ||
+				previous.Fence.EngineVersion != current.AgentEngineVersion || previous.Fence.ProfileVersion != current.AgentProfileVersion {
+				return domain.NewError(domain.CodeConflict, "task Agent stop is unconfirmed")
+			}
+		}
 		if connectorRateLimitRetry && current.UsageToolCalls >= int64(current.BudgetToolCalls) {
 			return domain.NewError(domain.CodeQuotaExceeded, "task tool call budget is exhausted")
 		}

@@ -759,35 +759,48 @@ func cloudDSHWriteTool() app.AgentToolDefinition {
 	}}
 }
 
-func TestCloudDSHModelResponseFailureCategoryDistinguishesMalformedAndUnauthorizedResults(t *testing.T) {
+func TestCloudDSHModelResponseFailureDiagnosticDistinguishesMalformedAndUnauthorizedResults(t *testing.T) {
 	definitions := []app.AgentToolDefinition{cloudDSHReadTool()}
 	baseCall := app.ModelToolCall{CallID: "call_1", Name: "file_read", Arguments: `{"path":"notes.txt"}`}
 	validToolResponse := app.ModelResponse{
 		ToolCalls: []app.ModelToolCall{baseCall}, Usage: app.ModelUsage{Known: true}, StopReason: "tool_calls",
 	}
 	for _, test := range []struct {
-		name        string
-		response    app.ModelResponse
-		definitions []app.AgentToolDefinition
-		want        string
+		name         string
+		response     app.ModelResponse
+		definitions  []app.AgentToolDefinition
+		wantCategory string
+		wantReason   string
+		wantTool     string
+		wantCallID   string
 	}{
-		{name: "valid response", response: validToolResponse, definitions: definitions, want: ""},
+		{name: "valid response", response: validToolResponse, definitions: definitions},
 		{name: "unauthorized tool", response: func() app.ModelResponse {
 			value := validToolResponse
-			value.ToolCalls = []app.ModelToolCall{{CallID: "call_1", Name: "delete_everything", Arguments: `{}`}}
+			value.ToolCalls = []app.ModelToolCall{{CallID: "call_1", Name: "morde_mcp_unsafe", Arguments: `{}`}}
 			return value
-		}(), definitions: definitions, want: "unauthorized_tool"},
-		{name: "no tools authorized", response: validToolResponse, want: "unauthorized_tool"},
+		}(), definitions: definitions, wantCategory: "unauthorized_tool", wantReason: "tool_not_in_task_allowlist", wantTool: "morde_mcp_unsafe", wantCallID: "call_1"},
+		{name: "no tools authorized", response: validToolResponse, wantCategory: "unauthorized_tool", wantReason: "task_has_no_authorized_tools", wantTool: "file_read", wantCallID: "call_1"},
 		{name: "invalid tool arguments", response: func() app.ModelResponse {
 			value := validToolResponse
 			value.ToolCalls = []app.ModelToolCall{{CallID: "call_1", Name: "file_read", Arguments: `[]`}}
 			return value
-		}(), definitions: definitions, want: "invalid_response"},
-		{name: "invalid base response", response: app.ModelResponse{Text: "", Usage: app.ModelUsage{Known: true}, StopReason: "stop"}, want: "invalid_response"},
+		}(), definitions: definitions, wantCategory: "invalid_response", wantReason: "tool_arguments_not_object", wantTool: "file_read", wantCallID: "call_1"},
+		{name: "invalid tool call metadata", response: func() app.ModelResponse {
+			value := validToolResponse
+			value.ToolCalls = []app.ModelToolCall{{CallID: "bad call id", Name: "file_read", Arguments: `{}`}}
+			return value
+		}(), definitions: definitions, wantCategory: "invalid_response", wantReason: "tool_call_metadata_invalid", wantTool: "file_read"},
+		{name: "invalid base response", response: app.ModelResponse{Text: "", Usage: app.ModelUsage{Known: true}, StopReason: "stop"}, wantCategory: "invalid_response", wantReason: "response_shape_invalid"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			if got := cloudDSHModelResponseFailureCategory(test.response, test.definitions); got != test.want {
-				t.Fatalf("cloudDSHModelResponseFailureCategory() = %q, want %q", got, test.want)
+			got := cloudDSHModelResponseFailureDiagnostic(test.response, test.definitions)
+			if got.Category != test.wantCategory || got.ReasonCode != test.wantReason || got.ToolName != test.wantTool || got.ToolCallID != test.wantCallID {
+				t.Fatalf("cloudDSHModelResponseFailureDiagnostic() = %#v, want category=%q reason=%q tool=%q call_id=%q",
+					got, test.wantCategory, test.wantReason, test.wantTool, test.wantCallID)
+			}
+			if test.wantCategory != "" && got.Stage != "model_response_validation" {
+				t.Fatalf("failure stage = %q, want model_response_validation", got.Stage)
 			}
 		})
 	}

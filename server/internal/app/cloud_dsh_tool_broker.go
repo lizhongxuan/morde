@@ -1811,25 +1811,50 @@ func dshToolResultText(result AgentToolResult) string {
 // PauseRecovery moves an unresolved restored session out of the worker claim
 // queue. It records no checkpoint contents or tool arguments in the task event.
 func (b *CloudDSHToolBroker) PauseRecovery(ctx context.Context, claimed task.Task) error {
-	return b.pauseRecovery(ctx, claimed, "")
+	return b.pauseRecovery(ctx, claimed, AgentModelFailureDiagnostic{})
 }
 
 // PauseModelRecovery records an allowlisted model failure category without
 // persisting provider response content, request data, or credentials.
 func (b *CloudDSHToolBroker) PauseModelRecovery(ctx context.Context, claimed task.Task, category string) error {
-	switch category {
+	return b.PauseModelRecoveryDiagnostic(ctx, claimed, AgentModelFailureDiagnostic{Category: category})
+}
+
+// PauseModelRecoveryDiagnostic persists only allowlisted response-validation
+// details. It excludes model text, tool arguments, and provider credentials.
+func (b *CloudDSHToolBroker) PauseModelRecoveryDiagnostic(ctx context.Context, claimed task.Task, diagnostic AgentModelFailureDiagnostic) error {
+	diagnostic = safeAgentModelFailureDiagnostic(diagnostic)
+	return b.pauseRecovery(ctx, claimed, diagnostic)
+}
+
+func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentModelFailureDiagnostic {
+	if value.Stage != "model_response_validation" {
+		value.Stage = ""
+	}
+	switch value.Category {
 	case "authentication_rejected", "access_rejected", "rate_limited", "quota_exhausted", "invalid_request",
 		"unavailable", "timeout", "transport", "invalid_response", "empty_response", "truncated_response", "upstream_error", "usage_unknown", "unsupported",
 		"client_request_invalid", "context_length_exceeded", "provider_invalid_request", "provider_unsupported_parameter", "provider_context_length_exceeded",
 		"provider_model_not_found", "provider_permission_denied", "provider_invalid_api_key", "provider_rate_limited",
 		"provider_quota_exhausted", "provider_server_error", "provider_request_rejected", "attachment_reader_unavailable", "stream_result_mismatch", "unauthorized_tool":
 	default:
-		category = "unknown"
+		value.Category = "unknown"
 	}
-	return b.pauseRecovery(ctx, claimed, category)
+	switch value.ReasonCode {
+	case "response_shape_invalid", "tool_call_metadata_invalid", "task_has_no_authorized_tools", "tool_not_in_task_allowlist", "tool_arguments_not_object":
+	default:
+		value.ReasonCode = ""
+	}
+	if !agentToolNamePattern.MatchString(value.ToolName) {
+		value.ToolName = ""
+	}
+	if !ValidDSHModelToolCallID(value.ToolCallID) {
+		value.ToolCallID = ""
+	}
+	return value
 }
 
-func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Task, modelFailureCategory string) error {
+func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Task, diagnostic AgentModelFailureDiagnostic) error {
 	if ctx == nil {
 		return domain.InvalidArgument("context", "recovery context is required")
 	}
@@ -1847,20 +1872,35 @@ func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Tas
 	title := "Review cloud task recovery"
 	summary := "The previous cloud task checkpoint could not be reconciled safely."
 	waitingReason := "dsh_recovery_unresolved"
-	if modelFailureCategory != "" {
-		summary = "The model request could not be verified (category: " + modelFailureCategory + "); retry after checking the model connection."
+	if diagnostic.Category != "" {
+		summary = "The model request could not be verified (category: " + diagnostic.Category + "); retry after checking the model connection."
+		if diagnostic.Stage != "" {
+			summary += " failure_stage: " + diagnostic.Stage + "."
+		}
+		if diagnostic.ReasonCode != "" {
+			summary += " diagnostic_reason: " + diagnostic.ReasonCode + "."
+		}
+		if diagnostic.ToolName != "" {
+			summary += " tool_name: " + diagnostic.ToolName + "."
+		}
+		if diagnostic.ToolCallID != "" {
+			summary += " tool_call_id: " + diagnostic.ToolCallID + "."
+		}
+		if modelFailureToolNotDispatched(diagnostic) {
+			summary += " tool_dispatched: false."
+		}
 	}
-	if modelFailureCategory == "context_length_exceeded" || modelFailureCategory == "provider_context_length_exceeded" {
+	if diagnostic.Category == "context_length_exceeded" || diagnostic.Category == "provider_context_length_exceeded" {
 		title = "消息超过模型输入上限"
 		summary = "消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。"
 		waitingReason = "model_context_limit"
 	}
-	if modelFailureCategory == "attachment_reader_unavailable" {
+	if diagnostic.Category == "attachment_reader_unavailable" {
 		title = "当前模型无法读取附件"
 		summary = "当前模型无法读取附件，请切换到支持工具的模型，或将附件内容粘贴到对话中。"
 		waitingReason = "model_attachment_unavailable"
 	}
-	if modelFailureCategory == "stream_result_mismatch" {
+	if diagnostic.Category == "stream_result_mismatch" {
 		title = "回复已中断"
 		summary = "已显示的部分回复与模型最终结果不一致，回复已中断；请重新发送消息。"
 		waitingReason = "model_stream_interrupted"
@@ -1870,9 +1910,32 @@ func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Tas
 	if err != nil {
 		return err
 	}
-	return b.commitProgress(persistCtx, current, step, current.Usage, task.StatusWaitingUser, waitingReason, "task.waiting_user", map[string]any{
-		"phase": "recovery", "source": "cloud_dsh",
-	})
+	step.ToolName = diagnostic.ToolName
+	metadata := map[string]any{"phase": "recovery", "source": "cloud_dsh"}
+	if diagnostic.Stage != "" {
+		metadata["failure_stage"] = diagnostic.Stage
+	}
+	if diagnostic.Category != "" {
+		metadata["failure_category"] = diagnostic.Category
+	}
+	if diagnostic.ReasonCode != "" {
+		metadata["failure_reason"] = diagnostic.ReasonCode
+	}
+	if diagnostic.ToolName != "" {
+		metadata["tool_name"] = diagnostic.ToolName
+	}
+	if diagnostic.ToolCallID != "" {
+		metadata["tool_call_id"] = diagnostic.ToolCallID
+	}
+	if modelFailureToolNotDispatched(diagnostic) {
+		metadata["tool_dispatched"] = false
+	}
+	return b.commitProgress(persistCtx, current, step, current.Usage, task.StatusWaitingUser, waitingReason, "task.waiting_user", metadata)
+}
+
+func modelFailureToolNotDispatched(diagnostic AgentModelFailureDiagnostic) bool {
+	return diagnostic.Category == "unauthorized_tool" || diagnostic.ReasonCode == "tool_call_metadata_invalid" ||
+		diagnostic.ReasonCode == "tool_arguments_not_object"
 }
 
 func (b *CloudDSHToolBroker) commitResult(ctx context.Context, current task.Task, step task.Step, usage task.Usage, name string, result AgentToolResult) (AgentToolResult, error) {

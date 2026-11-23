@@ -132,6 +132,16 @@ type AgentToolResult struct {
 	SupersedingMessages []AgentConversationMessage
 }
 
+// AgentModelFailureDiagnostic contains only safe, allowlisted details about a
+// rejected model response. It never carries model text or tool arguments.
+type AgentModelFailureDiagnostic struct {
+	Stage      string
+	Category   string
+	ReasonCode string
+	ToolName   string
+	ToolCallID string
+}
+
 // AgentToolTerminalAttemptFinisher durably closes a Task after the worker has
 // resolved the DSH request that produced a terminal tool result.
 type AgentToolTerminalAttemptFinisher interface {

@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
@@ -544,7 +545,7 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 				if activity != nil {
 					minimumReplies = 0
 					for _, scenario := range activity.required {
-						if scenario != "failed" && scenario != "approval" && scenario != "target-control" {
+						if scenario != "failed" && scenario != "approval" && scenario != "mcp-retry" && scenario != "target-control" {
 							minimumReplies = 1
 							break
 						}
@@ -1519,6 +1520,7 @@ var browserActivityObjectives = map[string]string{
 	"stream-other":     "跨端活动验收：流式后的独立任务",
 	"failed":           "跨端活动验收：已接单后任务失败",
 	"approval":         "跨端活动验收：等待用户授权",
+	"mcp-retry":        "跨端活动验收：连接器限流后手动重试",
 	"target-control-a": "跨端活动验收：整理项目总结 A",
 	"target-control-b": "跨端活动验收：整理项目总结 B",
 }
@@ -1562,6 +1564,8 @@ type browserActivityCommand struct {
 type browserActivityRun struct {
 	name, objective, stage, failure string
 	current                         task.Task
+	agentLease                      app.AgentInstanceLease
+	supervisorNonce                 []byte
 	userMessageID, progressStepID   string
 	streamMessageID, streamTurnID   string
 	streamSequence                  int64
@@ -1604,6 +1608,7 @@ type browserAcceptanceActivity struct {
 	checkpoints      *app.AgentCheckpointService
 	conversationID   string
 	controlToken     string
+	supervisorKey    []byte
 	required         []string
 	mu               sync.Mutex
 	runs             map[string]*browserActivityRun
@@ -1639,7 +1644,7 @@ func newBrowserAcceptanceActivity(store *Store, sealer *app.Sealer, conversation
 		return nil, err
 	}
 	a := &browserAcceptanceActivity{store: store, instances: instances, checkpoints: checkpoints,
-		conversationID: conversationID, controlToken: hex.EncodeToString(token),
+		conversationID: conversationID, controlToken: hex.EncodeToString(token), supervisorKey: key,
 		required: required, runs: make(map[string]*browserActivityRun), verified: make(map[string]bool),
 		watches: make(map[uint64]browserActivityWatch)}
 	for _, name := range selected {
@@ -1663,6 +1668,7 @@ func browserActivitySelection(raw string) ([]string, []string, error) {
 		"stream":         {"stream", "stream-other"},
 		"failed":         {"failed"},
 		"approval":       {"approval"},
+		"mcp-retry":      {"mcp-retry"},
 		"target-control": {"target-control-a", "target-control-b"},
 	}
 	var selected, required []string
@@ -1697,6 +1703,7 @@ func TestBrowserActivitySelection(t *testing.T) {
 		{name: "stream includes reconnect", input: "stream", selected: "stream,stream-other", required: "stream,reconnect"},
 		{name: "failed only", input: "failed", selected: "failed", required: "failed"},
 		{name: "approval only", input: "approval", selected: "approval", required: "approval"},
+		{name: "MCP rate-limit retry only", input: "mcp-retry", selected: "mcp-retry", required: "mcp-retry"},
 		{name: "failed and approval", input: "failed,approval", selected: "failed,approval", required: "failed,approval"},
 		{name: "target control starts two running tasks", input: "target-control",
 			selected: "target-control-a,target-control-b", required: "target-control"},
@@ -1752,6 +1759,12 @@ func (a *browserAcceptanceActivity) ExecuteTask(ctx context.Context, current tas
 	if run == nil {
 		a.mu.Unlock()
 		return (browserAcceptanceExecutor{store: a.store}).ExecuteTask(ctx, current)
+	}
+	if run.stage == "failed" && current.StepRetry != nil {
+		run.current, run.stage = current, "retry_claimed"
+		a.mu.Unlock()
+		<-ctx.Done()
+		return ctx.Err()
 	}
 	if run.stage != "awaiting_message" || current.ConversationID != a.conversationID {
 		a.mu.Unlock()
@@ -1825,6 +1838,11 @@ func (a *browserAcceptanceActivity) ExecuteTask(ctx context.Context, current tas
 	if run.name == "approval" {
 		return a.waitPhase(ctx, run, "approval", "waiting_user", renewErr, func() error {
 			return a.commitApprovalOutcome(ctx, run, lease)
+		})
+	}
+	if run.name == "mcp-retry" {
+		return a.waitPhase(ctx, run, "fail", "failed", renewErr, func() error {
+			return a.commitMCPRetryFailureOutcome(ctx, run, lease)
 		})
 	}
 	var delta app.CloudDSHTextDelta
@@ -1905,6 +1923,10 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.ID).Scan(&u
 	if replayed {
 		return app.AgentInstanceLease{}, errors.New("synthetic agent start unexpectedly replayed")
 	}
+	a.mu.Lock()
+	run.agentLease = lease
+	run.supervisorNonce = append([]byte(nil), nonce...)
+	a.mu.Unlock()
 	fence := app.AgentCheckpointFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
 		AgentInstanceID: lease.Fence.AgentInstanceID, AgentGeneration: lease.Fence.AgentGeneration,
 		AgentSessionID: lease.Fence.AgentSessionID, AuthorizationVersion: lease.Fence.AuthorizationVersion,
@@ -1969,6 +1991,68 @@ func (a *browserAcceptanceActivity) commitFailedOutcome(ctx context.Context, run
 	if err != nil {
 		return fmt.Errorf("commit synthetic task failure: %w", err)
 	}
+	return a.verifyActivityEvents(ctx, run, false)
+}
+
+func (a *browserAcceptanceActivity) commitMCPRetryFailureOutcome(ctx context.Context, run *browserActivityRun,
+	lease app.AgentInstanceLease) error {
+	current := run.current
+	var revision int64
+	if err := a.store.pool.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, current.ID).Scan(&revision); err != nil {
+		return fmt.Errorf("read MCP retry Task revision: %w", err)
+	}
+	stepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	operationID, err := domain.NewOperationID()
+	if err != nil {
+		return err
+	}
+	callID := "browser-rate-limit-call-" + current.ID
+	connectorID := "k1234567"
+	requestDigest := sha256.Sum256([]byte(`{"connector_id":"k1234567","operation":"lookup","arguments":{"query":"synthetic"}}`))
+	operationResult := `{"is_error":true,"structured_content":{"code":"connector_rate_limited","terminal_for_attempt":true,"retry_after_seconds":1}}`
+	if _, err := a.store.pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
+(id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
+host_id,workspace_id,binding_version,task_revision,call_id,operation_key,tool_name,request_hash,status,result,updated_at)
+VALUES ($1,$2,$3,$4,NULL,1,0,1,$5,$6,'',0,$7,$8,$9,'mcp_call',$10,'failed',$11,clock_timestamp()-interval '2 seconds')`,
+		operationID, current.ID, current.OwnerID, connectorID, current.Lease.Version, current.HostID, revision,
+		callID, "browser-rate-limit-source-"+current.ID, requestDigest[:], operationResult); err != nil {
+		return fmt.Errorf("seed local MCP rate-limit ledger: %w", err)
+	}
+	step := task.Step{ID: stepID, TaskID: current.ID, Sequence: 3, Kind: "tool", Status: task.StepFailed,
+		Title: "调用本地合成连接器", Summary: "本地合成连接器返回明确限流结果。", AgentSessionID: lease.Fence.AgentSessionID,
+		TaskRevision: &revision, ToolCallKey: callID, ToolName: "mcp_call", RequestDigest: requestDigest[:],
+		Phase: "execute", DetailState: "not_recorded", Attempt: 1, FailureReason: "connector_rate_limited", Retryable: true}
+	toolCall := &app.TaskToolCallProgress{AgentSessionID: lease.Fence.AgentSessionID, AgentInstanceID: lease.Fence.AgentInstanceID,
+		AgentGeneration: lease.Fence.AgentGeneration, AuthorizationVersion: lease.Fence.AuthorizationVersion,
+		TaskRevision: revision, CallKey: callID, ToolName: step.ToolName, RequestDigest: requestDigest[:],
+		Phase: step.Phase, DetailState: step.DetailState, FailureReason: step.FailureReason, Retryable: true}
+	payload, err := json.Marshal(map[string]any{"status": task.StatusFailed, "reason": "connector_rate_limited"})
+	if err != nil {
+		return err
+	}
+	if _, err := a.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: current.ID, LeaseOwner: current.Lease.Owner,
+		LeaseVersion: current.Lease.Version, Status: task.StatusFailed, CurrentStep: step.ID,
+		Result: "The selected connector rate limited this attempt.", Usage: current.Usage, Steps: []task.Step{step}, ToolCall: toolCall,
+		Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: payload}}); err != nil {
+		return fmt.Errorf("commit local MCP rate-limit failure: %w", err)
+	}
+	receipt := app.AgentStopReceipt{Fence: lease.Fence, SupervisorNonce: append([]byte(nil), run.supervisorNonce...), TreeStopped: true}
+	signingPayload, err := app.AgentStopReceiptSigningPayload(receipt)
+	if err != nil {
+		return err
+	}
+	signer := hmac.New(sha256.New, a.supervisorKey)
+	_, _ = signer.Write(signingPayload)
+	receipt.Signature = signer.Sum(nil)
+	if _, err := a.instances.ConfirmStopped(ctx, receipt); err != nil {
+		return fmt.Errorf("confirm local synthetic Agent stop: %w", err)
+	}
+	a.mu.Lock()
+	run.progressStepID = step.ID
+	a.mu.Unlock()
 	return a.verifyActivityEvents(ctx, run, false)
 }
 
@@ -2261,10 +2345,12 @@ func (a *browserAcceptanceActivity) serveControl(w http.ResponseWriter, r *http.
 		case "approval":
 			result["agent_acknowledged"], result["task_status"] = true, string(task.StatusWaitingUser)
 			result["waiting_reason"], result["pending_request_status"] = "approval_required", string(task.PendingRequestPending)
+		case "mcp-retry":
+			result["agent_acknowledged"], result["task_status"] = true, "running"
 		case "target-control":
 			result["target_task_id"] = a.runs["target-control-b"].current.ID
 			result["sibling_task_id"] = a.runs["target-control-a"].current.ID
-			result["target_status"], result["sibling_status"] = string(task.StatusCancelled), string(task.StatusRunning)
+			result["target_status"], result["sibling_status"] = string(task.StatusCancelling), string(task.StatusRunning)
 		}
 		_ = json.NewEncoder(w).Encode(result)
 		return
@@ -2296,7 +2382,7 @@ func (a *browserAcceptanceActivity) advance(ctx context.Context, name, phase str
 		expected = "streaming"
 	}
 	if expected == "" || phase == "stream" && name != "stream" ||
-		phase == "fail" && name != "failed" || phase == "approval" && name != "approval" ||
+		phase == "fail" && name != "failed" && name != "mcp-retry" || phase == "approval" && name != "approval" ||
 		(name == "failed" || name == "approval") && phase == "complete" || run.stage != expected || run.busy {
 		stage := run.stage
 		a.mu.Unlock()
@@ -2461,6 +2547,9 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 	if scenario == "failed" || scenario == "approval" {
 		return a.verifyAcceptedOutcome(ctx, scenario)
 	}
+	if scenario == "mcp-retry" {
+		return a.verifyMCPRetryAccepted(ctx)
+	}
 	var names []string
 	switch scenario {
 	case "merge":
@@ -2590,12 +2679,15 @@ func (a *browserAcceptanceActivity) verifyTargetControl(ctx context.Context) err
 	}
 	secondDetails, err := a.store.GetTask(ctx, secondCurrent.ID, secondCurrent.InitiatorID)
 	if err != nil {
-		return fmt.Errorf("read stopped Task: %w", err)
+		return fmt.Errorf("read target Task: %w", err)
 	}
-	if firstDetails.Task.Status != task.StatusRunning || secondDetails.Task.Status != task.StatusCancelled {
-		return fmt.Errorf("Task isolation mismatch: sibling=%s target=%s, want running/cancelled",
+	if firstDetails.Task.Status != task.StatusRunning || secondDetails.Task.Status != task.StatusCancelling {
+		return fmt.Errorf("Task isolation mismatch: sibling=%s target=%s, want running/cancelling",
 			firstDetails.Task.Status, secondDetails.Task.Status)
 	}
+	a.mu.Lock()
+	second.stage, second.failure = string(secondDetails.Task.Status), ""
+	a.mu.Unlock()
 	for _, details := range []struct {
 		id              string
 		currentRevision *int64
@@ -2666,6 +2758,56 @@ func (a *browserAcceptanceActivity) verifyAcceptedOutcome(ctx context.Context, s
 		}
 	}
 	return errors.New("synthetic route was not persisted with agent_acknowledged=true")
+}
+
+func (a *browserAcceptanceActivity) verifyMCPRetryAccepted(ctx context.Context) error {
+	a.mu.Lock()
+	run := a.runs["mcp-retry"]
+	if run == nil || run.stage != "retry_claimed" {
+		stage := "missing"
+		if run != nil {
+			stage = run.stage
+		}
+		a.mu.Unlock()
+		return fmt.Errorf("MCP retry has not been claimed by the local Task worker (stage %s)", stage)
+	}
+	current, sourceStepID := run.current, run.progressStepID
+	a.mu.Unlock()
+	details, err := a.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return fmt.Errorf("read retried MCP Task: %w", err)
+	}
+	if details.Task.Status != task.StatusRunning || details.Task.CurrentStep != current.CurrentStep ||
+		!domain.ValidStepID(sourceStepID) || !domain.ValidStepID(details.Task.CurrentStep) {
+		return fmt.Errorf("retried Task state/current step=%s/%s, want running at the reserved retry step", details.Task.Status, details.Task.CurrentStep)
+	}
+	var source, attempt *task.Step
+	for i := range details.Steps {
+		step := &details.Steps[i]
+		if step.ID == sourceStepID {
+			source = step
+		}
+		if step.ID == details.Task.CurrentStep {
+			attempt = step
+		}
+	}
+	if source == nil || attempt == nil || source.Status != task.StepFailed || source.FailureReason != "connector_rate_limited" ||
+		!source.Retryable || attempt.RetryOfStepID != source.ID || attempt.Attempt != 2 ||
+		(attempt.Status != task.StepQueued && attempt.Status != task.StepRunning) {
+		return fmt.Errorf("source/retry Task steps are not preserved and linked: source=%+v retry=%+v", source, attempt)
+	}
+	var attemptCount, operationCount int
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_steps WHERE task_id=$1 AND retry_of_step_id=$2`, current.ID, source.ID).Scan(&attemptCount); err != nil {
+		return fmt.Errorf("count reserved MCP retry attempts: %w", err)
+	}
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_mcp_connector_operations WHERE task_id=$1 AND call_id=$2`,
+		current.ID, source.ToolCallKey).Scan(&operationCount); err != nil {
+		return fmt.Errorf("count source MCP operation attempts: %w", err)
+	}
+	if attemptCount != 1 || operationCount != 1 {
+		return fmt.Errorf("MCP retry created duplicate attempts or connector calls: retry steps=%d source ledger rows=%d", attemptCount, operationCount)
+	}
+	return nil
 }
 
 func (a *browserAcceptanceActivity) verifyReconnect(name string) error {

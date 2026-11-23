@@ -60,8 +60,51 @@ type cloudDSHModelFailureCategory interface {
 	ModelFailureCategory() string
 }
 
+type cloudDSHToolExecutionDiagnostic struct {
+	Stage      string
+	ReasonCode string
+	ToolName   string
+	CallID     string
+	Dispatch   string
+	ErrorType  string
+}
+
+type cloudDSHToolExecutionFailure struct {
+	diagnostic cloudDSHToolExecutionDiagnostic
+	cause      error
+}
+
+func (e cloudDSHToolExecutionFailure) Error() string {
+	return "dsh tool execution could not be confirmed"
+}
+
+func (e cloudDSHToolExecutionFailure) Unwrap() error { return e.cause }
+
+func (e cloudDSHToolExecutionFailure) ToolExecutionDiagnostic() cloudDSHToolExecutionDiagnostic {
+	return e.diagnostic
+}
+
+func cloudDSHToolExecutionFailureFor(frame cloudDSHFrame, reasonCode string, cause error) error {
+	errorType := ""
+	if cause != nil {
+		errorType = fmt.Sprintf("%T", cause)
+	}
+	dispatch := "result_received"
+	if reasonCode == "tool_executor_error" || reasonCode == "operation_outcome_unknown" {
+		dispatch = "unknown"
+	}
+	return cloudDSHToolExecutionFailure{diagnostic: cloudDSHToolExecutionDiagnostic{
+		Stage: "tool_execution", ReasonCode: reasonCode, ToolName: cloudDSHSafeDiagnosticToolName(frame.Name),
+		CallID: safeCloudDSHDiagnosticCallID(frame.CallID), Dispatch: dispatch, ErrorType: errorType,
+	}, cause: cause}
+}
+
 type cloudDSHModelResultError struct {
-	category string
+	stage      string
+	category   string
+	reasonCode string
+	toolName   string
+	toolCallID string
 }
 
 func (e cloudDSHModelResultError) Error() string { return errCloudDSHModelResultUnavailable.Error() }
@@ -71,6 +114,11 @@ func (e cloudDSHModelResultError) Is(target error) bool {
 }
 
 func (e cloudDSHModelResultError) ModelFailureCategory() string { return e.category }
+
+func (e cloudDSHModelResultError) ModelFailureDiagnostic() app.AgentModelFailureDiagnostic {
+	return app.AgentModelFailureDiagnostic{Stage: e.stage, Category: e.category, ReasonCode: e.reasonCode,
+		ToolName: e.toolName, ToolCallID: e.toolCallID}
+}
 
 func cloudDSHModelErrorCategory(err error) string {
 	if err == nil {
@@ -215,7 +263,21 @@ type cloudDSHModelRecoveryTools interface {
 	PauseModelRecovery(context.Context, task.Task, string) error
 }
 
+type cloudDSHDetailedModelRecoveryTools interface {
+	PauseModelRecoveryDiagnostic(context.Context, task.Task, app.AgentModelFailureDiagnostic) error
+}
+
+type cloudDSHModelFailureDiagnosticSource interface {
+	ModelFailureDiagnostic() app.AgentModelFailureDiagnostic
+}
+
 func pauseCloudDSHModelRecovery(ctx context.Context, tools CloudDSHRecoveryTools, value task.Task, cause error) error {
+	var source cloudDSHModelFailureDiagnosticSource
+	if errors.As(cause, &source) {
+		if detailed, ok := tools.(cloudDSHDetailedModelRecoveryTools); ok {
+			return detailed.PauseModelRecoveryDiagnostic(ctx, value, source.ModelFailureDiagnostic())
+		}
+	}
 	var failure cloudDSHModelFailureCategory
 	if errors.As(cause, &failure) {
 		if detailed, ok := tools.(cloudDSHModelRecoveryTools); ok {
@@ -1272,23 +1334,49 @@ func validCloudDSHJSONObject(raw []byte) bool {
 	return json.Unmarshal(raw, &value) == nil && value != nil
 }
 
-func cloudDSHModelResponseFailureCategory(response app.ModelResponse, definitions []app.AgentToolDefinition) string {
+func cloudDSHModelResponseFailureDiagnostic(response app.ModelResponse, definitions []app.AgentToolDefinition) app.AgentModelFailureDiagnostic {
 	if !app.ValidDSHModelResponse(response) {
-		return "invalid_response"
+		reasonCode := "response_shape_invalid"
+		toolName := ""
+		toolCallID := ""
+		if len(response.ToolCalls) > 0 {
+			reasonCode = "tool_call_metadata_invalid"
+			toolName = cloudDSHSafeDiagnosticToolName(response.ToolCalls[0].Name)
+			toolCallID = safeCloudDSHDiagnosticCallID(response.ToolCalls[0].CallID)
+		}
+		return app.AgentModelFailureDiagnostic{Stage: "model_response_validation", Category: "invalid_response", ReasonCode: reasonCode,
+			ToolName: toolName, ToolCallID: toolCallID}
 	}
 	if len(response.ToolCalls) == 0 {
-		return ""
+		return app.AgentModelFailureDiagnostic{}
 	}
 	if len(definitions) == 0 {
-		return "unauthorized_tool"
+		return app.AgentModelFailureDiagnostic{Stage: "model_response_validation", Category: "unauthorized_tool", ReasonCode: "task_has_no_authorized_tools",
+			ToolName: cloudDSHSafeDiagnosticToolName(response.ToolCalls[0].Name), ToolCallID: safeCloudDSHDiagnosticCallID(response.ToolCalls[0].CallID)}
 	}
 	for _, call := range response.ToolCalls {
 		if !cloudDSHToolAllowed(definitions, call.Name) {
-			return "unauthorized_tool"
+			return app.AgentModelFailureDiagnostic{Stage: "model_response_validation", Category: "unauthorized_tool", ReasonCode: "tool_not_in_task_allowlist",
+				ToolName: cloudDSHSafeDiagnosticToolName(call.Name), ToolCallID: safeCloudDSHDiagnosticCallID(call.CallID)}
 		}
 		if !validCloudDSHJSONObject([]byte(call.Arguments)) {
-			return "invalid_response"
+			return app.AgentModelFailureDiagnostic{Stage: "model_response_validation", Category: "invalid_response", ReasonCode: "tool_arguments_not_object",
+				ToolName: cloudDSHSafeDiagnosticToolName(call.Name), ToolCallID: safeCloudDSHDiagnosticCallID(call.CallID)}
 		}
+	}
+	return app.AgentModelFailureDiagnostic{}
+}
+
+func cloudDSHSafeDiagnosticToolName(value string) string {
+	if len(value) <= 64 && cloudDSHID.MatchString(value) {
+		return value
+	}
+	return ""
+}
+
+func safeCloudDSHDiagnosticCallID(value string) string {
+	if app.ValidDSHModelToolCallID(value) {
+		return value
 	}
 	return ""
 }

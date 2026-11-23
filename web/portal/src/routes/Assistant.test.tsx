@@ -4288,7 +4288,7 @@ describe('Assistant durable tasks', () => {
       }, {
         id: 's2345678', sequence: 2, attempt: 1, retryable: false, kind: 'verification' as const, status: 'unknown' as const,
         title: 'Review cloud task recovery',
-        summary: 'The model request could not be verified (category: invalid_response); retry after checking the model connection.',
+        summary: 'The model request could not be verified (category: unauthorized_tool); retry after checking the model connection. failure_stage: model_response_validation. diagnostic_reason: tool_not_in_task_allowlist. tool_name: morde_mcp_unsafe. tool_dispatched: false.',
         created_at: timestamp,
       }] };
     vi.spyOn(portalApi, 'task').mockResolvedValue(interrupted);
@@ -4299,7 +4299,7 @@ describe('Assistant durable tasks', () => {
     const chatStatus = document.querySelector('.chat-message-row-user .chat-message-task-recovery');
     expect(chatStatus).toHaveTextContent('任务已中断，Agent 尚未返回最终答复，执行结果未确认。');
     expect(chatStatus).toHaveTextContent('最后完成：已校验并检索原文全部 32 页，返回 3 个相关片段。');
-    expect(chatStatus).toHaveTextContent('模型返回内容未通过安全校验，本次没有发布最终答复。');
+    expect(chatStatus).toHaveTextContent('模型请求了当前任务未授权的工具 morde_mcp_unsafe；该调用未执行。');
     const user = userEvent.setup();
     await user.click(within(chatStatus as HTMLElement).getByRole('button', { name: '查看任务详情' }));
     expect(document.querySelector('#assistant-task-panel .task-activity[data-task-id="q1234567"]')).toBeInTheDocument();
