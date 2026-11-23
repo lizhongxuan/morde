@@ -1459,6 +1459,32 @@ struct MordeTaskAgentExecution: Decodable, Equatable, Identifiable, Sendable {
     let activity_state: String?
 }
 
+struct MordeTaskStepExecution: Decodable, Equatable, Sendable {
+    let location: String?
+    let command: String?
+    let parameters: String?
+    let working_directory: String?
+    let duration_ms: Int64?
+    let exit_code: Int?
+    let timed_out: Bool?
+    let stdout: String?
+    let stderr: String?
+    let stdout_total_bytes: Int64?
+    let stderr_total_bytes: Int64?
+    let stdout_omitted_bytes: Int64?
+    let stderr_omitted_bytes: Int64?
+    let stdout_truncated: Bool?
+    let stderr_truncated: Bool?
+
+    var isValid: Bool {
+        [location, command, parameters, working_directory, stdout, stderr].allSatisfy {
+            ($0?.utf8.count ?? 0) <= 8192 && !($0?.contains("\0") ?? false)
+        } && [duration_ms, stdout_total_bytes, stderr_total_bytes, stdout_omitted_bytes, stderr_omitted_bytes]
+            .allSatisfy { $0.map { $0 >= 0 } ?? true } &&
+            (exit_code.map { (0...255).contains($0) } ?? true)
+    }
+}
+
 struct MordeTaskStepDetail: Decodable, Equatable, Sendable {
     let task_id: String
     let step_id: String
@@ -1469,6 +1495,7 @@ struct MordeTaskStepDetail: Decodable, Equatable, Sendable {
     let input: String?
     let result: String?
     let truncated: Bool
+    let execution: MordeTaskStepExecution?
 
     func isValid(taskID: String, stepID: String, atLeast sequence: Int64) -> Bool {
         task_id == taskID && step_id == stepID && event_sequence >= sequence &&
@@ -1477,6 +1504,7 @@ struct MordeTaskStepDetail: Decodable, Equatable, Sendable {
             MordeTaskResponsePolicy.hasValidStepID(step_id) &&
             tool_name.utf8.count <= 128 &&
             [object, input, result].allSatisfy { ($0?.utf8.count ?? 0) <= 8192 } &&
+            (execution?.isValid ?? true) && (detail_state == "available" || execution == nil) &&
             !detail_state.isEmpty && detail_state.utf8.count <= 64
     }
 }
@@ -1587,6 +1615,29 @@ struct MordeClientMessageSource: Decodable, Equatable {
     let content: String
 }
 
+struct MordeMessageToolActivity: Decodable, Equatable {
+    let tool: String
+    let status: String
+
+    private enum CodingKeys: String, CodingKey { case tool, status }
+
+    init(tool: String, status: String) {
+        self.tool = tool
+        self.status = status
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try? decoder.container(keyedBy: CodingKeys.self)
+        tool = (try? values?.decode(String.self, forKey: .tool)) ?? ""
+        status = (try? values?.decode(String.self, forKey: .status)) ?? ""
+    }
+
+    var isSupported: Bool {
+        ["web_search", "web_read"].contains(tool) &&
+            ["queued", "running", "waiting_user", "succeeded", "failed", "unknown", "cancelled"].contains(status)
+    }
+}
+
 struct MordeClientMessage: Decodable, Equatable, Identifiable {
     let id: String
     let conversation_id: String?
@@ -1616,10 +1667,15 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
     let variant_version: Int64?
     let variant_action: String?
     let agent_acknowledged: Bool?
+    let tool_activity: MordeMessageToolActivity?
 
     var displayStatus: String? { output_status ?? status }
     var displayTaskRevision: Int64? { output_task_revision ?? task_revision }
     var displayResultEventSequence: Int64? { output_result_event_sequence ?? result_event_sequence }
+    var visibleToolActivity: MordeMessageToolActivity? {
+        guard role == "user", let tool_activity, tool_activity.isSupported else { return nil }
+        return tool_activity
+    }
 
     init(id: String, conversation_id: String? = nil, sequence: Int64? = nil, task_id: String? = nil,
          role: String, content: String, attachment_ids: [String]? = nil, status: String? = nil, delivery_status: String? = nil,
@@ -1630,7 +1686,7 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
          sources: [MordeClientMessageSource]? = nil, output_status: String? = nil,
          output_task_revision: Int64? = nil, output_result_event_sequence: Int64? = nil,
          variant_group_id: String? = nil, variant_version: Int64? = nil, variant_action: String? = nil,
-         agent_acknowledged: Bool? = nil) {
+         agent_acknowledged: Bool? = nil, tool_activity: MordeMessageToolActivity? = nil) {
         self.id = id
         self.conversation_id = conversation_id
         self.sequence = sequence
@@ -1659,6 +1715,7 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
         self.variant_version = variant_version
         self.variant_action = variant_action
         self.agent_acknowledged = agent_acknowledged
+        self.tool_activity = tool_activity
     }
 }
 
@@ -2339,6 +2396,12 @@ enum MordeRoutingPresentation {
     }
 
     static func canRetryProcessing(_ reason: String?) -> Bool { reason != "message_too_long" }
+
+    static func canRetryProcessing(taskID: String?, relatedTaskID: String?, duplicateOfMessageID: String?,
+                                   routingStatus: String?, failureReason: String?) -> Bool {
+        taskID == nil && relatedTaskID == nil && duplicateOfMessageID == nil && routingStatus == "failed" &&
+            canRetryProcessing(failureReason)
+    }
 }
 
 enum MordeRoutingRetryAttempt {

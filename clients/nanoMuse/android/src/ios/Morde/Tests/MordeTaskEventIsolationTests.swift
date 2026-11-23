@@ -2,6 +2,27 @@ import XCTest
 @testable import MordeTaskPolicies
 
 final class MordeTaskEventIsolationTests: XCTestCase {
+    func testConversationWebToolActivityIsValidatedAndLimitedToUserMessages() throws {
+        func message(role: String = "user", activity: Any? = nil) throws -> MordeClientMessage {
+            var payload: [String: Any] = ["id": "m1234567", "role": role, "content": "Search"]
+            if let activity { payload["tool_activity"] = activity }
+            return try JSONDecoder().decode(MordeClientMessage.self,
+                from: JSONSerialization.data(withJSONObject: payload))
+        }
+
+        for status in ["running", "succeeded", "failed", "unknown", "cancelled"] {
+            let activity = try message(activity: ["tool": "web_search", "status": status]).visibleToolActivity
+            XCTAssertEqual(activity, MordeMessageToolActivity(tool: "web_search", status: status))
+        }
+        XCTAssertEqual(try message(activity: ["tool": "web_read", "status": "running"]).visibleToolActivity?.tool, "web_read")
+        XCTAssertNil(try message().visibleToolActivity)
+        XCTAssertNil(try message(role: "assistant", activity: ["tool": "web_search", "status": "running"]).visibleToolActivity)
+        XCTAssertNil(try message(activity: ["tool": "shell_exec", "status": "running"]).visibleToolActivity)
+        XCTAssertNil(try message(activity: ["tool": "web_search", "status": "future"]).visibleToolActivity)
+        XCTAssertNil(try message(activity: "malformed").visibleToolActivity)
+        XCTAssertNil(try message(activity: ["tool": NSNull(), "status": 3]).visibleToolActivity)
+    }
+
     func testEventsOlderThanConversationSnapshotAreNotPresented() {
         XCTAssertFalse(MordeTaskEventCursor.shouldPresent(sequence: 7, initialSequence: 8))
         XCTAssertTrue(MordeTaskEventCursor.shouldPresent(sequence: 8, initialSequence: 8))
@@ -173,6 +194,31 @@ final class MordeTaskEventIsolationTests: XCTestCase {
         let oversizedJSON = #"{"task_id":"q1234567","step_id":"s1234567","event_sequence":12,"tool_name":"read_file","detail_state":"available","object":null,"input":""# + oversized + #"","result":null,"truncated":false}"#
         let oversizedDetail = try JSONDecoder().decode(MordeTaskStepDetail.self, from: Data(oversizedJSON.utf8))
         XCTAssertFalse(oversizedDetail.isValid(taskID: "q1234567", stepID: "s1234567", atLeast: 12))
+    }
+
+    func testStepExecutionPreservesAuthorizedEvidenceAndRejectsInvalidOrRestrictedDetails() throws {
+        let prefix = #"{"task_id":"q1234567","step_id":"s1234567","event_sequence":12,"tool_name":"shell_exec","detail_state":"available","object":null,"input":null,"result":null,"truncated":false,"execution": "#
+        let execution = #"{"location":"test host","command":"printf ok","parameters":"safe params","working_directory":"/work","duration_ms":12,"exit_code":0,"timed_out":false,"stdout":"first\nsecond","stderr":"","stdout_total_bytes":25,"stdout_omitted_bytes":4,"stdout_truncated":true}"#
+        func read(_ value: String) throws -> MordeTaskStepDetail {
+            try JSONDecoder().decode(MordeTaskStepDetail.self, from: Data(value.utf8))
+        }
+        let detail = try read(prefix + execution + "}")
+        XCTAssertTrue(detail.isValid(taskID: "q1234567", stepID: "s1234567", atLeast: 12))
+        XCTAssertEqual(detail.execution?.command, "printf ok")
+        XCTAssertEqual(detail.execution?.parameters, "safe params")
+        XCTAssertEqual(detail.execution?.stdout, "first\nsecond")
+        XCTAssertEqual(detail.execution?.exit_code, 0)
+        XCTAssertEqual(detail.execution?.stdout_omitted_bytes, 4)
+        XCTAssertNil(detail.execution?.stderr_omitted_bytes)
+
+        for invalid in [#"{"exit_code":256}"#, #"{"duration_ms":-1}"#,
+                        #"{"stdout_omitted_bytes":-1}"#,
+                        #"{"command":""# + String(repeating: "x", count: 8193) + #""}"#] {
+            XCTAssertFalse(try read(prefix + invalid + "}").isValid(taskID: "q1234567", stepID: "s1234567", atLeast: 12))
+        }
+        let restricted = (prefix + execution + "}").replacingOccurrences(of: #""detail_state":"available""#,
+                                                                           with: #""detail_state":"restricted""#)
+        XCTAssertFalse(try read(restricted).isValid(taskID: "q1234567", stepID: "s1234567", atLeast: 12))
     }
 
     func testAgentActivityGroupsStepsBySessionAndDelegationOrder() throws {

@@ -102,8 +102,8 @@ func TestPostgresBackgroundAgentJobsListAndCancelFence(t *testing.T) {
 		jobs[1].SessionID != ordinary.SessionID || jobs[1].Background {
 		t.Fatalf("list child sessions: jobs=%#v err=%v", jobs, err)
 	}
-	if _, err := service.List(ctx, lease.Fence, ordinary.SessionID); err == nil {
-		t.Fatal("non-root session listed child sessions")
+	if children, err := service.List(ctx, lease.Fence, ordinary.SessionID); err != nil || len(children) != 0 {
+		t.Fatalf("child session listed other actors' sessions: children=%#v err=%v", children, err)
 	}
 	stale := lease.Fence
 	stale.AgentGeneration++
@@ -120,7 +120,7 @@ func TestPostgresBackgroundAgentJobsListAndCancelFence(t *testing.T) {
 	if _, err := service.List(ctx, wrongTask, wrongTask.AgentSessionID); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("other Task listed child sessions: %v", err)
 	}
-	persistedChildren, err := store.ListAgentChildSessions(ctx, lease.Fence)
+	persistedChildren, err := store.ListAgentChildSessions(ctx, lease.Fence, lease.Fence.AgentSessionID)
 	if err != nil || len(persistedChildren) != 2 || persistedChildren[0].SessionID != job.SessionID ||
 		persistedChildren[0].ParentSessionID != lease.Fence.AgentSessionID || persistedChildren[0].SpawnKey != job.SpawnKey ||
 		!persistedChildren[0].Background || persistedChildren[0].Step.Status != task.StepRunning ||
@@ -129,13 +129,13 @@ func TestPostgresBackgroundAgentJobsListAndCancelFence(t *testing.T) {
 		persistedChildren[1].Step.Status != task.StepRunning {
 		t.Fatalf("list persisted direct child sessions: children=%#v err=%v", persistedChildren, err)
 	}
-	if _, err := store.ListAgentChildSessions(ctx, stale); domain.CodeOf(err) != domain.CodeUnauthenticated {
+	if _, err := store.ListAgentChildSessions(ctx, stale, stale.AgentSessionID); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("stale generation listed persisted child sessions: %v", err)
 	}
-	if _, err := store.ListAgentChildSessions(ctx, wrongOwner); err == nil {
+	if _, err := store.ListAgentChildSessions(ctx, wrongOwner, wrongOwner.AgentSessionID); err == nil {
 		t.Fatal("other owner listed persisted child sessions")
 	}
-	if _, err := store.ListAgentChildSessions(ctx, wrongTask); domain.CodeOf(err) != domain.CodeUnauthenticated {
+	if _, err := store.ListAgentChildSessions(ctx, wrongTask, wrongTask.AgentSessionID); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("other Task listed persisted child sessions: %v", err)
 	}
 

@@ -135,6 +135,7 @@ type ProjectMapping = {
   dev: string;
   ino: string;
   folderId?: string;
+  confirmedFingerprint?: string;
   registrationKey: string;
 };
 type ProjectTarget = {
@@ -223,7 +224,9 @@ const codex = new MordeCodexRuntime(api, {
     savePrivate(profileFile("codex"), safeStorage.encryptString(JSON.stringify(value)));
   },
 }, () => notifyState());
-const syncBinary = () => app.isPackaged ? join(process.resourcesPath, "bin", process.platform === "win32" ? "morde-sync.exe" : "morde-sync") : process.env.MORDE_SYNC_BINARY || "";
+const syncBinary = () => app.isPackaged
+  ? join(process.resourcesPath, "bin", process.platform === "win32" ? "morde-sync.exe" : "morde-sync")
+  : process.env.MORDE_SYNC_BINARY || join(__dirname, "../bin", process.platform === "win32" ? "morde-sync.exe" : "morde-sync");
 const workspaceNode = new MordeSyncthingNode(() => app.isPackaged
   ? join(process.resourcesPath, "bin", process.platform === "win32" ? "morde-syncthing.exe" : "morde-syncthing")
   : process.env.MORDE_SYNCTHING_BINARY || join(__dirname, "../bin", process.platform === "win32" ? "morde-syncthing.exe" : "morde-syncthing"));
@@ -252,6 +255,7 @@ const sync = new MordeSync(syncBinary, (state, progress) => {
     throw new Error("Could not save the sync recovery point; sync startup was interrupted");
   }
 });
+const projectFingerprintScanner = new MordeSync(syncBinary, () => undefined);
 
 export function isSystemDirectory(candidate: string, root: string): boolean {
   const path = root.includes("\\") || /^[A-Za-z]:/.test(root) ? win32 : posix;
@@ -741,6 +745,7 @@ function validProjectMappingFields(value: unknown, requireSourceBinding: boolean
     typeof mapping.dev === "string" && /^\d+$/.test(mapping.dev) && typeof mapping.ino === "string" && /^\d+$/.test(mapping.ino) &&
     (mapping.sourceBindingID === undefined ? !requireSourceBinding : typeof mapping.sourceBindingID === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(mapping.sourceBindingID)) &&
     (mapping.folderId === undefined || typeof mapping.folderId === "string" && /^morde-[a-f0-9]{32}$/.test(mapping.folderId)) &&
+    (mapping.confirmedFingerprint === undefined || typeof mapping.confirmedFingerprint === "string" && /^[a-f0-9]{64}$/.test(mapping.confirmedFingerprint) && Boolean(mapping.folderId)) &&
     typeof mapping.registrationKey === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(mapping.registrationKey);
 }
 
@@ -992,6 +997,7 @@ function loadProfile(auth: Credentials): void {
       if (!saved || saved.serviceInstanceID !== auth.serviceInstanceID || saved.installationId !== auth.installationId || !/^w[a-z0-9]{7}$/.test(saved.workspaceId) || typeof saved.directory !== "string" || typeof saved.dev !== "string" || typeof saved.ino !== "string" || !/^[A-Za-z0-9._~-]{1,128}$/.test(saved.idempotencyKey) || !["upload", "download", "bidirectional", "live_sync", "handoff_checkpoint", "project_upload"].includes(saved.mode) || (saved.sessionId && !/^p[a-z0-9]{7}$/.test(saved.sessionId)) || (saved.childPid !== undefined && (!Number.isSafeInteger(saved.childPid) || saved.childPid <= 0)) || (saved.handoffTarget !== undefined && (saved.mode !== "handoff_checkpoint" || !["desktop", "cloud_workspace"].includes(saved.handoffTarget))) ||
         (saved.sessionState !== undefined && (saved.mode !== "project_upload" || !["running", "completed", "conflict", "cancelled", "failed", "expired"].includes(saved.sessionState))) ||
         (saved.hostApplicationStatus !== undefined && (saved.mode !== "project_upload" || !["pending_apply", "applied", "conflict", "unknown"].includes(saved.hostApplicationStatus))) ||
+        (saved.snapshotFingerprint !== undefined && (saved.mode !== "project_upload" || typeof saved.snapshotFingerprint !== "string" || !/^[a-f0-9]{64}$/.test(saved.snapshotFingerprint))) ||
         (saved.syncOutcome !== undefined && (saved.mode !== "project_upload" || !["failed", "unknown"].includes(saved.syncOutcome))) ||
         (saved.syncMessage !== undefined && (saved.mode !== "project_upload" || typeof saved.syncMessage !== "string" || saved.syncMessage.length > 512 || /[\u0000-\u001f\u007f]/.test(saved.syncMessage))) ||
         (saved.mode === "project_upload" && saved.sessionState === "completed" && !saved.sessionId) ||
@@ -1594,6 +1600,7 @@ async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown
     throw new Error("请选择自己拥有且文件目录已就绪的云端电脑");
   }
   if (requireRunning && hostValue.state !== "running") throw new Error("默认云端电脑未运行，项目同步已暂停；启动后可重试。");
+  if (requireRunning && hostValue.workspace_runtime_online !== true) throw new Error("默认云端电脑的文件服务未确认在线，项目同步已暂停。");
   const binding = workspaces[0] as Record<string, unknown> | null;
   const workspace = binding?.workspace as Record<string, unknown> | null;
   if (!binding || binding.state !== "active" || !workspace || workspace.id !== workspaceID || workspace.state !== "ready") {
@@ -1637,6 +1644,7 @@ async function listProjectUploadTargets(): Promise<ProjectTarget[]> {
     }));
     const blockedMessages = [
       ...(host.state === "running" ? [] : ["默认云端电脑未运行，当前已暂停项目同步。启动后可重试；不会切换到其他电脑。"]),
+      ...(host.state !== "running" || host.workspace_runtime_online === true ? [] : ["默认云端电脑的文件服务未确认在线，当前已暂停项目同步。"]),
       ...(rootFolder ? ["此电脑仍有旧版整目录同步，不能同时启用项目同步。"] : []),
     ];
     targets.push({
@@ -1683,6 +1691,7 @@ async function selectProjectDirectory(hostIDInput: unknown, workspaceIDInput: un
       hostId: hostID, workspaceId: workspaceID, projectName,
       directory: candidate.directory, dev: candidate.dev, ino: candidate.ino,
       ...(previous?.folderId ? { folderId: previous.folderId } : {}),
+      ...(sameSource && previous?.confirmedFingerprint ? { confirmedFingerprint: previous.confirmedFingerprint } : {}),
       registrationKey: previous?.registrationKey ?? randomUUID(),
     };
     const next = [...projectMappings.filter((item) => item.hostId !== hostID || item.workspaceId !== workspaceID || item.projectName !== projectName), mapping];
@@ -1691,6 +1700,25 @@ async function selectProjectDirectory(hostIDInput: unknown, workspaceIDInput: un
     notifyState();
     return publicProjectMapping(mapping);
   } finally { projectDirectorySelectionInProgress = false; }
+}
+
+async function projectLocalStatus(selectionID: unknown): Promise<{ state: "current" | "pending" | "unknown" }> {
+  const auth = credentials;
+  const mapping = projectMappings.find((item) => item.selectionID === selectionID);
+  if (!auth || !activeProfile || activeProfile !== profileID(auth) || !mapping || profileError || projectUploadInProgress || syncCheckpoint || sync.snapshot() !== "idle") {
+    return { state: "unknown" };
+  }
+  try {
+    await confirmProjectMapping(mapping);
+    if (!mapping.confirmedFingerprint && mapping.folderId) return { state: "unknown" };
+    const fingerprint = await projectFingerprintScanner.projectFingerprint(projectAsMapping(mapping));
+    await confirmProjectMapping(mapping);
+    if (credentials !== auth || activeProfile !== profileID(auth) || projectUploadInProgress || syncCheckpoint || sync.snapshot() !== "idle" ||
+      projectMappings.find((item) => item.selectionID === mapping.selectionID) !== mapping) return { state: "unknown" };
+    return { state: mapping.confirmedFingerprint && fingerprint === mapping.confirmedFingerprint ? "current" : "pending" };
+  } catch {
+    return { state: "unknown" };
+  }
 }
 
 async function ensureProjectFolder(auth: Credentials, mapping: ProjectMapping, projectName: string): Promise<ProjectSyncFolder> {
@@ -1855,19 +1883,31 @@ async function resolveCompletedProjectUpload(auth: Credentials, mapping: Project
   catch {
     syncRecoveryWarning = { state: "unknown", workspaceId: checkpoint.workspaceId, mode: "project_upload", message: "应用状态已读取，但本机恢复点保存状态未知；请保留并检查恢复点。" };
   }
+  let localSnapshotConfirmed = false;
   if (application.status === "applied") {
     try {
+      const current = projectMappings.find((item) => item.selectionID === mapping.selectionID);
+      if (!current || current.sourceBindingID !== checkpoint.sourceBindingID || current.folderId !== checkpoint.folderId || current.projectName !== checkpoint.projectName) {
+        throw new Error("Project mapping changed before confirming the local snapshot");
+      }
+      const { confirmedFingerprint: _oldFingerprint, ...withoutFingerprint } = current;
+      const updated = checkpoint.snapshotFingerprint ? { ...withoutFingerprint, confirmedFingerprint: checkpoint.snapshotFingerprint } : withoutFingerprint;
+      const next = projectMappings.map((item) => item.selectionID === current.selectionID ? updated : item);
+      savePrivate(profileFile("project-mappings"), JSON.stringify(next));
+      projectMappings = next;
+      localSnapshotConfirmed = Boolean(checkpoint.snapshotFingerprint);
       removeSyncCheckpointFile();
       syncCheckpoint = null;
       syncRecoveryWarning = null;
     } catch {
-      // The receipt is authoritative even if clearing this local recovery file fails.
+      localSnapshotConfirmed = false;
+      syncRecoveryWarning = { state: "unknown", workspaceId: checkpoint.workspaceId, mode: "project_upload", message: "云端已应用，但本机状态基线未确认；恢复点已保留。" };
     }
   }
   notifyState();
   return {
     session: { id: checkpoint.sessionId, workspace_id: mapping.workspaceId, folder_id: checkpoint.folderId, state: "completed" },
-    conflicts: [], cloudStatus: "confirmed", hostStatus: application.status,
+    conflicts: [], cloudStatus: "confirmed", hostStatus: application.status, localSnapshotConfirmed,
     hostApplication: {
       status: application.status,
       ...(application.targetRevision !== undefined ? { targetRevision: application.targetRevision } : {}),
@@ -1967,7 +2007,7 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
     markProjectUploadRecovery(failureState, error instanceof Error ? error.message : "Project upload failed");
     throw error;
   } finally { if (sync.snapshot() === "idle" && !childMayStillRun(syncCheckpoint)) clearConfirmedChild(); }
-  const outcome = result && typeof result === "object" ? result as { session?: { id?: unknown; workspace_id?: unknown; folder_id?: unknown; state?: unknown }; conflicts?: unknown } : null;
+  const outcome = result && typeof result === "object" ? result as { session?: { id?: unknown; workspace_id?: unknown; folder_id?: unknown; state?: unknown }; conflicts?: unknown; snapshot_fingerprint?: unknown } : null;
   const session = outcome?.session;
   const conflicts = publicSyncConflicts(outcome?.conflicts);
   if (!session || typeof session.id !== "string" || !/^p[a-z0-9]{7}$/.test(session.id) || session.workspace_id !== currentMapping.workspaceId ||
@@ -1984,6 +2024,8 @@ async function performProjectUpload(selectionIDInput: unknown, projectNameInput:
     syncCheckpoint.sessionId = session.id;
     syncCheckpoint.sessionState = "completed";
     syncCheckpoint.hostApplicationStatus = "pending_apply";
+    if (typeof outcome?.snapshot_fingerprint === "string" && /^[a-f0-9]{64}$/.test(outcome.snapshot_fingerprint)) syncCheckpoint.snapshotFingerprint = outcome.snapshot_fingerprint;
+    else delete syncCheckpoint.snapshotFingerprint;
     delete syncCheckpoint.childPid;
     try { savePrivate(profileFile("sync-checkpoint"), JSON.stringify(syncCheckpoint)); }
     catch {
@@ -3140,10 +3182,12 @@ function register(): void {
   handler("morde:project-upload-targets", listProjectUploadTargets);
   handler("morde:project-select-directory", selectProjectDirectory);
   handler("morde:project-upload", uploadProject);
+  handler("morde:project-local-status", projectLocalStatus);
   portalBridgeHandler("morde:portal-state", () => publicPortalProjectState(), true);
   portalBridgeHandler("morde:portal-project-upload-targets", listProjectUploadTargets, true);
   portalBridgeHandler("morde:portal-project-select-directory", selectProjectDirectory, true);
   portalBridgeHandler("morde:portal-project-upload", uploadProject, true);
+  portalBridgeHandler("morde:portal-project-local-status", projectLocalStatus, true);
   portalBridgeHandler("morde:portal-legacy-state", () => ({
     mappings: mappings.map((mapping) => ({ ...publicMapping(mapping),
       syncEnabled: Boolean(workspaceSyncProfile?.bindings[mapping.workspaceId]?.enabled),

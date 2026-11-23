@@ -71,6 +71,7 @@ type messageResponse struct {
 	RoutingStatus             conversation.RoutingStatus        `json:"routing_status,omitempty"`
 	RoutingFailureReason      conversation.RoutingFailureReason `json:"routing_failure_reason,omitempty"`
 	AgentAcknowledged         bool                              `json:"agent_acknowledged"`
+	ToolActivity              *conversation.ToolActivity        `json:"tool_activity,omitempty"`
 	Sources                   []conversation.MessageSource      `json:"sources,omitempty"`
 	DeliveryStatus            conversation.DeliveryStatus       `json:"delivery_status"`
 	OutputStatus              conversation.OutputStatus         `json:"output_status,omitempty"`
@@ -592,6 +593,9 @@ func toScopedMessageResponse(value conversation.Message, projectScope bool) (mes
 		(value.RoutingFailureReason != "" && !value.RoutingFailureReason.Valid()) {
 		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
+	if value.ToolActivity != nil && (value.Role != conversation.RoleUser || !value.ToolActivity.Valid()) {
+		return messageResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+	}
 	if value.OutputStatus != "" {
 		if !value.OutputStatus.Valid() || value.Role != conversation.RoleAssistant || value.TaskID == "" ||
 			value.OutputTaskRevision == nil || *value.OutputTaskRevision < 0 ||
@@ -623,9 +627,9 @@ func toScopedMessageResponse(value conversation.Message, projectScope bool) (mes
 		TaskID: value.TaskID, DuplicateOfMessageID: value.DuplicateOfMessageID, RelatedTaskID: value.RelatedTaskID,
 		AttachmentIDs:   append([]string(nil), value.AttachmentIDs...),
 		ClientMessageID: value.ClientMessageID, RoutingStatus: value.RoutingStatus, RoutingFailureReason: value.RoutingFailureReason,
-		AgentAcknowledged: value.AgentAcknowledged,
-		Sources:           append([]conversation.MessageSource(nil), value.Sources...),
-		DeliveryStatus:    deliveryStatus, OutputStatus: value.OutputStatus, OutputTaskRevision: value.OutputTaskRevision,
+		AgentAcknowledged: value.AgentAcknowledged, ToolActivity: value.ToolActivity,
+		Sources:        append([]conversation.MessageSource(nil), value.Sources...),
+		DeliveryStatus: deliveryStatus, OutputStatus: value.OutputStatus, OutputTaskRevision: value.OutputTaskRevision,
 		OutputResultEventSequence: value.OutputResultEventSequence, VariantGroupID: value.VariantGroupID,
 		VariantVersion: value.VariantVersion, VariantAction: value.VariantAction, CreatedAt: value.CreatedAt,
 	}, nil

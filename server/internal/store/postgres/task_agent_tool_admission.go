@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -56,6 +57,19 @@ func (s *Store) AdmitAgentToolCall(ctx context.Context, call app.ModelToolCall, 
 			if err := lockAgentChildSessionActor(ctx, tx, fence, value.AgentSessionID); err != nil {
 				return err
 			}
+			cancelling, err := agentSessionCancellationPending(ctx, tx, value.TaskID, value.OwnerID, value.AgentSessionID)
+			if err != nil {
+				return err
+			}
+			if cancelling {
+				_, durable, err := agentToolCallDurableState(ctx, tx, value, rootSessionID, operationKey, call)
+				if err != nil {
+					return err
+				}
+				if !recovering || !durable {
+					return domain.NewError(domain.CodeInvalidState, "Agent Session or ancestor cancellation is pending")
+				}
+			}
 		}
 		rootThroughSequence, rootBaselineKnown, err := toolCallRootCheckpointThroughSequence(ctx, tx, value, rootSessionID)
 		if err != nil {
@@ -90,37 +104,9 @@ func (s *Store) AdmitAgentToolCall(ctx context.Context, call app.ModelToolCall, 
 			return nil
 		}
 
-		prepared, dispatchedOrTerminal, err := agentToolOperationLedgerState(ctx, tx, value.TaskID, value.OwnerID, operationKey)
+		prepared, dispatchedOrTerminal, err := agentToolCallDurableState(ctx, tx, value, rootSessionID, operationKey, call)
 		if err != nil {
 			return err
-		}
-		if call.Name == "dsh_delegate" {
-			var childExists bool
-			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_sessions
-WHERE task_id=$1 AND owner_id=$2 AND spawn_key=$3 AND parent_session_id=$4)`, value.TaskID, value.OwnerID,
-				call.CallID, rootSessionID).Scan(&childExists); err != nil {
-				return fmt.Errorf("read durable delegated Agent session: %w", err)
-			}
-			dispatchedOrTerminal = dispatchedOrTerminal || childExists
-		}
-		if call.Name == "dsh_job_cancel" {
-			var arguments struct {
-				JobID string `json:"job_id"`
-			}
-			if json.Unmarshal([]byte(call.Arguments), &arguments) == nil && arguments.JobID != "" {
-				var durableSessionID string
-				lookupErr := tx.QueryRow(ctx, `SELECT session_id FROM task_agent_child_cancel_operations
-WHERE task_id=$1 AND owner_id=$2 AND operation_key=$3`, value.TaskID, value.OwnerID, operationKey).Scan(&durableSessionID)
-				if lookupErr != nil && !errors.Is(lookupErr, pgx.ErrNoRows) {
-					return fmt.Errorf("read durable delegated Agent cancellation: %w", lookupErr)
-				}
-				if lookupErr == nil {
-					if durableSessionID != arguments.JobID {
-						return domain.NewError(domain.CodeIdempotencyConflict, "background job cancel call was reused for a different job")
-					}
-					dispatchedOrTerminal = true
-				}
-			}
 		}
 		if dispatchedOrTerminal {
 			if err := persistTaskAgentToolCallAdmission(ctx, tx, value, operationKey, rootSessionID, rootThroughSequence); err != nil {
@@ -154,6 +140,84 @@ WHERE task_id=$1 AND owner_id=$2 AND operation_key=$3`, value.TaskID, value.Owne
 		return nil
 	})
 	return admission, err
+}
+
+func agentSessionCancellationPending(ctx context.Context, tx pgx.Tx, taskID, ownerID, sessionID string) (bool, error) {
+	var cancelling bool
+	err := tx.QueryRow(ctx, `WITH RECURSIVE lineage(session_id,parent_session_id,cancel_requested_at,path) AS (
+ SELECT session_id,parent_session_id,cancel_requested_at,ARRAY[session_id] FROM task_agent_sessions
+ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3
+ UNION ALL
+ SELECT p.session_id,p.parent_session_id,p.cancel_requested_at,l.path || p.session_id
+ FROM task_agent_sessions p JOIN lineage l ON p.session_id=l.parent_session_id
+ WHERE p.task_id=$1 AND p.owner_id=$2 AND NOT p.session_id=ANY(l.path)
+)
+SELECT EXISTS(SELECT 1 FROM lineage WHERE cancel_requested_at IS NOT NULL)`, taskID, ownerID, sessionID).Scan(&cancelling)
+	if err != nil {
+		return false, fmt.Errorf("read Agent Session cancellation ancestry: %w", err)
+	}
+	return cancelling, nil
+}
+
+func agentToolCallDurableState(ctx context.Context, tx pgx.Tx, value app.ModelTaskFence, rootSessionID, operationKey string,
+	call app.ModelToolCall) (bool, bool, error) {
+	prepared, durable, err := agentToolOperationLedgerState(ctx, tx, value.TaskID, value.OwnerID, operationKey)
+	if err != nil {
+		return false, false, err
+	}
+	if call.Name == "dsh_delegate" {
+		rows, err := tx.Query(ctx, `SELECT spawn_key,request_hash FROM task_agent_sessions
+WHERE task_id=$1 AND owner_id=$2 AND parent_session_id=$3`, value.TaskID, value.OwnerID, value.AgentSessionID)
+		if err != nil {
+			return false, false, fmt.Errorf("read durable delegated Agent session: %w", err)
+		}
+		for rows.Next() {
+			var spawnKey string
+			var requestHash []byte
+			if err := rows.Scan(&spawnKey, &requestHash); err != nil {
+				rows.Close()
+				return false, false, fmt.Errorf("scan durable delegated Agent session: %w", err)
+			}
+			if value.AgentSessionID != rootSessionID {
+				spawnKey = app.AgentSessionToolCallID(value.TaskID, value.AgentSessionID, spawnKey)
+			}
+			if spawnKey != call.CallID {
+				continue
+			}
+			digest := sha256.Sum256([]byte(call.Arguments))
+			if !bytes.Equal(digest[:], requestHash) {
+				rows.Close()
+				return false, false, domain.NewError(domain.CodeIdempotencyConflict, "delegated Agent call changed its arguments")
+			}
+			durable = true
+			break
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return false, false, fmt.Errorf("iterate durable delegated Agent sessions: %w", err)
+		}
+		rows.Close()
+	}
+	if call.Name == "dsh_job_cancel" {
+		var arguments struct {
+			JobID string `json:"job_id"`
+		}
+		if json.Unmarshal([]byte(call.Arguments), &arguments) == nil && arguments.JobID != "" {
+			var durableSessionID string
+			lookupErr := tx.QueryRow(ctx, `SELECT session_id FROM task_agent_child_cancel_operations
+WHERE task_id=$1 AND owner_id=$2 AND operation_key=$3`, value.TaskID, value.OwnerID, operationKey).Scan(&durableSessionID)
+			if lookupErr != nil && !errors.Is(lookupErr, pgx.ErrNoRows) {
+				return false, false, fmt.Errorf("read durable delegated Agent cancellation: %w", lookupErr)
+			}
+			if lookupErr == nil {
+				if durableSessionID != arguments.JobID {
+					return false, false, domain.NewError(domain.CodeIdempotencyConflict, "background job cancel call was reused for a different job")
+				}
+				durable = true
+			}
+		}
+	}
+	return prepared, durable, nil
 }
 
 func agentToolAdmissionIdentifier(value string) bool {
@@ -269,6 +333,13 @@ WHERE admission.task_id=$1 AND admission.owner_id=$2 AND admission.operation_key
 		return nil, domain.NewError(domain.CodeUnauthenticated, "tool-call admission root fence changed")
 	}
 	if callSessionID != admissionRootSessionID {
+		cancelling, err := agentSessionCancellationPending(ctx, tx, taskID, ownerID, callSessionID)
+		if err != nil {
+			return nil, err
+		}
+		if cancelling {
+			return nil, domain.NewError(domain.CodeInvalidState, "Agent Session or ancestor cancellation is pending")
+		}
 		var persistedRootThrough int64
 		if err := tx.QueryRow(ctx, `SELECT root_checkpoint_through_seq FROM task_agent_sessions
 WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 AND parent_session_id IS NOT NULL`, taskID, ownerID, callSessionID).

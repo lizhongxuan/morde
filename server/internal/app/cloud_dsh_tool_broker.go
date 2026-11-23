@@ -977,6 +977,27 @@ func (b *CloudDSHToolBroker) toolActivityContext(ctx context.Context, claimed ta
 	return withCloudDSHToolActivity(ctx, current, call, b.stepDetailSealer)
 }
 
+func withBoundTaskToolActivity(ctx context.Context, bound task.Task) context.Context {
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok {
+		return ctx
+	}
+	before := activity.current
+	if bound.ID != before.ID || bound.OwnerID != before.OwnerID || bound.InitiatorID != before.InitiatorID ||
+		bound.ProjectID != before.ProjectID || bound.ConversationID != before.ConversationID || bound.ModelID != before.ModelID ||
+		bound.ExecutionLocation != before.ExecutionLocation || bound.AgentInstanceID != before.AgentInstanceID ||
+		bound.AgentGeneration != before.AgentGeneration || bound.AgentSessionID != before.AgentSessionID ||
+		bound.Lease.Owner != before.Lease.Owner || bound.Lease.Version != before.Lease.Version ||
+		!sameTaskInputRevision(bound.CurrentRevision, before.CurrentRevision) ||
+		!sameCloudDSHAuthorization(bound.Authorization, before.Authorization) ||
+		(before.HostID != "" && bound.HostID != before.HostID) ||
+		(before.WorkspaceID != "" && bound.WorkspaceID != before.WorkspaceID) {
+		return ctx
+	}
+	activity.current = bound
+	return context.WithValue(ctx, cloudDSHToolActivityKey{}, activity)
+}
+
 func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, call ModelToolCall, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
 	if ctx == nil || call.CallID == "" || len(call.CallID) > 256 || len(call.Name) == 0 || len(call.Name) > 128 {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call", "dsh tool call identity is invalid")
@@ -1007,6 +1028,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		if reason != "" {
 			return b.pauseDeferredTarget(ctx, claimed, reason)
 		}
+		ctx = withBoundTaskToolActivity(ctx, bound)
 		claimed, call = bound, resolvedCall
 	}
 	if call.Name == agentAskUserToolName {
@@ -1021,6 +1043,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 			if reason != "" {
 				return b.pauseDeferredTarget(ctx, claimed, reason)
 			}
+			ctx = withBoundTaskToolActivity(ctx, bound)
 			claimed, call = bound, resolvedCall
 		}
 		return b.executeWorkspaceTool(ctx, claimed, call, recovering, checkpointOutput)
@@ -1315,12 +1338,16 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 			write := mapping.capability != "file.read" && mapping.capability != "file.list" && mapping.capability != "file.find"
 			executeErr = guard.WithProjectTaskWorkspaceAccess(ctx, current, write, func(operationCtx context.Context) error {
 				var err error
+				ctx = withTaskToolExecutionStart(ctx)
 				result, err = b.runtime.Execute(operationCtx, request, preparation)
+				ctx = withTaskToolExecutionEnd(ctx)
 				return err
 			})
 		}
 	} else {
+		ctx = withTaskToolExecutionStart(ctx)
 		result, executeErr = b.runtime.Execute(ctx, request, preparation)
+		ctx = withTaskToolExecutionEnd(ctx)
 	}
 	if executeErr != nil || result.Status == AgentToolUnknown || len(result.Output) > maxAgentToolOutputBytes ||
 		!validCloudDSHToolImages(call.Name, result) {

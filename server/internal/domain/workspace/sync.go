@@ -1202,6 +1202,9 @@ func sameFile(a, b File) bool {
 		a.MetadataKnown == b.MetadataKnown && SameNativeMetadata(a.Xattrs, b.Xattrs, a.ACL, b.ACL)
 }
 
+// SameSyncFile compares the observable file state used for sync conflicts.
+func SameSyncFile(a, b File) bool { return sameFile(a, b) }
+
 func sameOptionalInt64(a, b *int64) bool {
 	return a == nil && b == nil || a != nil && b != nil && *a == *b
 }
@@ -1410,6 +1413,14 @@ func ValidateCreateSyncSession(value CreateSyncSession, maxBytes int64) error {
 		seenMetadataDirectories[folded] = directory.Path
 	}
 	if len(value.Directories) > 0 {
+		// A scoped root can itself be an empty directory, with no file or
+		// empty-child paths from which to infer its metadata entry.
+		for _, scopePath := range value.Scope {
+			folded := strings.ToLower(scopePath)
+			if _, exists := seenMetadataDirectories[folded]; exists {
+				expectedDirectories[folded] = scopePath
+			}
+		}
 		metadataDirectoryCount := 0
 		for _, directory := range seenMetadataDirectories {
 			if directory != "." && inDirectorySubtree(directory, value.Scope) {
@@ -1467,7 +1478,7 @@ func ValidateCreateSyncSession(value CreateSyncSession, maxBytes int64) error {
 		if err := ValidateRelativePath(directory); err != nil {
 			return fmt.Errorf("deleted directory %q: %w", directory, err)
 		}
-		if err := deletedTree.AddEmptyDirectory(directory); err != nil {
+		if err := deletedTree.AddDirectory(directory); err != nil {
 			return err
 		}
 		folded := strings.ToLower(directory)

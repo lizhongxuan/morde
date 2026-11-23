@@ -12344,6 +12344,7 @@ components:
         routing_status: { type: string, enum: [pending, processing, routed, waiting_user, waiting_adjustment, failed] }
         routing_failure_reason: { type: string, enum: [model_unavailable, routing_context_unavailable, routing_action_unavailable, message_too_long] }
         agent_acknowledged: { type: boolean, description: True only after the Main Agent chose to acknowledge this message and its associated background Task actually started. Clients cannot set this field. }
+        tool_activity: { $ref: '#/components/schemas/ConversationToolActivity' }
         output_status: { type: string, enum: [streaming, interrupted, completed], description: Status of a persisted streamed assistant message. }
         output_task_revision: { type: integer, format: int64, minimum: 0, description: Task revision that produced this streamed message. }
         output_result_event_sequence: { type: integer, format: int64, minimum: 1, description: Present only after completion and identifies the corresponding Task result event. }
@@ -12356,6 +12357,14 @@ components:
           items: { $ref: '#/components/schemas/ConversationMessageSource' }
         delivery_status: { type: string, enum: [pending, applied, unknown] }
         created_at: { type: string, format: date-time }
+    ConversationToolActivity:
+      type: object
+      additionalProperties: false
+      description: Status of this user's short-lived read-only web call; no internal Task identity is exposed.
+      required: [tool, status]
+      properties:
+        tool: { type: string, enum: [web_search, web_read] }
+        status: { $ref: '#/components/schemas/TaskStepStatus' }
     ConversationMessage:
       allOf:
         - { $ref: '#/components/schemas/ConversationMessageBase' }
@@ -12555,7 +12564,7 @@ components:
       enum: [pinned, normal, background]
     TaskStepStatus:
       type: string
-      enum: [queued, running, waiting_user, succeeded, failed, unknown]
+      enum: [queued, running, waiting_user, succeeded, failed, cancelled, unknown]
     TaskBudgetRequest:
       type: object
       additionalProperties: false
@@ -12789,6 +12798,30 @@ components:
         input: { type: [string, 'null'], maxLength: 8192 }
         result: { type: [string, 'null'], maxLength: 8192 }
         truncated: { type: boolean }
+        execution: { $ref: '#/components/schemas/TaskStepExecution' }
+    TaskStepExecution:
+      type: object
+      description: Bounded, redacted execution details for an authorized Task reader; absent fields are unavailable or not applicable.
+      properties:
+        location: { type: string, maxLength: 8192 }
+        parameters: { type: string, maxLength: 8192 }
+        command: { type: string, maxLength: 8192 }
+        working_directory: { type: string, maxLength: 8192 }
+        duration_ms: { type: integer, format: int64, minimum: 0 }
+        exit_code: { type: integer, minimum: 0, maximum: 255 }
+        timed_out: { type: boolean }
+        stdout: { type: string, maxLength: 196608, description: Redacted captured output within the encrypted detail budget. }
+        stderr: { type: string, maxLength: 196608, description: Redacted captured output within the encrypted detail budget. }
+        stdout_total_bytes: { type: integer, minimum: 0, maximum: 65536, description: Original byte count only when the Host returned the complete output without redaction. }
+        stderr_total_bytes: { type: integer, minimum: 0, maximum: 65536, description: Original byte count only when the Host returned the complete output without redaction. }
+        stdout_omitted_bytes: { type: integer, minimum: 0, maximum: 65536, description: Bytes omitted from the complete, unredacted Host output when known. }
+        stderr_omitted_bytes: { type: integer, minimum: 0, maximum: 65536, description: Bytes omitted from the complete, unredacted Host output when known. }
+        stdout_truncated: { type: boolean, description: True when either the Host/Runtime truncated captured output or the server detail-size limit omitted redacted output. }
+        stderr_truncated: { type: boolean, description: True when either the Host/Runtime truncated captured output or the server detail-size limit omitted redacted output. }
+        stdout_runtime_truncated: { type: boolean, description: True only when the Host/Runtime reported that stdout was truncated before the server received it. }
+        stderr_runtime_truncated: { type: boolean, description: True only when the Host/Runtime reported that stderr was truncated before the server received it. }
+        stdout_detail_truncated: { type: boolean, description: True only when the server omitted captured stdout to stay within the encrypted step-detail size limit. }
+        stderr_detail_truncated: { type: boolean, description: True only when the server omitted captured stderr to stay within the encrypted step-detail size limit. }
     TaskBatchItem:
       type: object
       required: [id, key, status, attempt, result, error]

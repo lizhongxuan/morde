@@ -69,6 +69,76 @@ func TestWorkspaceCurrentPathMutationsAreScopedAndConditional(t *testing.T) {
 	}
 }
 
+func TestRemoveWorkspaceCurrentFileRestoresChangedEntry(t *testing.T) {
+	directory := t.TempDir()
+	const currentContent = "changed by another writer"
+	if err := os.WriteFile(filepath.Join(directory, "target.txt"), []byte(currentContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+
+	err = removeWorkspaceCurrentRegularFileAt(int(parent.Fd()), "target.txt", workspaceCurrentTestSHA("old expected content"))
+	if !errors.Is(err, ErrWriteConflict) {
+		t.Fatalf("remove with stale expected digest = %v; want ErrWriteConflict", err)
+	}
+	got, err := os.ReadFile(filepath.Join(directory, "target.txt"))
+	if err != nil || string(got) != currentContent {
+		t.Fatalf("target after rejected remove = %q, %v; want changed content restored", got, err)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "target.txt" {
+		t.Fatalf("entries after rejected remove = %v; want only target.txt", entries)
+	}
+}
+
+func TestMoveWorkspaceCurrentFileRestoresChangedSource(t *testing.T) {
+	directory := t.TempDir()
+	const originalContent = "baseline"
+	const changedContent = "changed!"
+	sourcePath := filepath.Join(directory, "source.txt")
+	if err := os.WriteFile(sourcePath, []byte(originalContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+
+	expectedSHA := workspaceCurrentTestSHA(originalContent)
+	expectedStat, err := verifyWorkspaceCurrentRegularFileAt(int(parent.Fd()), "source.txt", expectedSHA, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sourcePath, []byte(changedContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := moveWorkspaceCurrentRegularFileAt(int(parent.Fd()), "source.txt", int(parent.Fd()), "target.txt", expectedSHA, 0600, expectedStat); !errors.Is(err, ErrWriteConflict) {
+		t.Fatalf("move after source changed = %v; want ErrWriteConflict", err)
+	}
+	got, err := os.ReadFile(sourcePath)
+	if err != nil || string(got) != changedContent {
+		t.Fatalf("source after rejected move = %q, %v; want changed content restored", got, err)
+	}
+	if _, err := os.Lstat(filepath.Join(directory, "target.txt")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("target after rejected move = %v; want absent", err)
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "source.txt" {
+		t.Fatalf("entries after rejected move = %v; want only source.txt", entries)
+	}
+}
+
 func TestWorkspaceCurrentMoveRegularFileIsNoReplaceAndIdempotent(t *testing.T) {
 	store := newMutationTestWorkspace(t)
 	ctx := context.Background()

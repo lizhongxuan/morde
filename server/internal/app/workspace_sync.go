@@ -76,10 +76,19 @@ type WorkspaceCurrentMaterializationLockStore interface {
 }
 
 type WorkspaceSyncDirectCommitPlan struct {
-	Session                 workspace.SyncSession
-	PinnedFiles             []workspace.File
-	PinnedEmptyDirectories  []string
-	PinnedDirectoryMetadata []workspace.Directory
+	Session                   workspace.SyncSession
+	PinnedFiles               []workspace.File
+	PinnedEmptyDirectories    []string
+	PinnedDirectoryMetadata   []workspace.Directory
+	ProjectLiveBaseline       *WorkspaceSyncProjectLiveBaseline
+	RecordProjectLiveBaseline func(WorkspaceSyncProjectLiveBaseline) error
+}
+
+// WorkspaceSyncProjectLiveBaseline describes only PC-owned paths as actually
+// observed on the cloud target after a completed direct upload.
+type WorkspaceSyncProjectLiveBaseline struct {
+	Files       []workspace.File
+	Directories []workspace.Directory
 }
 
 type WorkspaceSyncDirectCommitCallback func(context.Context, WorkspaceSyncDirectCommitPlan) ([]workspace.Conflict, error)

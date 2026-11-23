@@ -424,7 +424,8 @@ WHERE id=$1 AND task_id=$2 AND status=$5`, operation.ID, taskID, string(status),
 		if command.RowsAffected() != 1 {
 			return domain.NewError(domain.CodeConflict, "task operation changed while settling")
 		}
-		payload, err := json.Marshal(map[string]any{"operation_id": operation.ID, "operation_key": operation.Key, "status": string(status), "stop_request_id": stopID})
+		payload, err := json.Marshal(map[string]any{"operation_id": operation.ID, "operation_key": operation.Key,
+			"previous_status": string(operation.Status), "status": string(status), "stop_request_id": stopID})
 		if err != nil {
 			return fmt.Errorf("encode stopped operation event: %w", err)
 		}
@@ -539,6 +540,11 @@ WHERE task_id=$1 AND (state<>'stopped' OR (guardian_task_stop_ack_required AND g
 		if status != string(expected) {
 			return domain.NewError(domain.CodeConflict, "task status changed before stop finalization")
 		}
+		if action == task.ActionCancel {
+			if err := settleCancelledTaskToolSteps(ctx, tx, taskID); err != nil {
+				return err
+			}
+		}
 		var sequence int64
 		err := tx.QueryRow(ctx, `UPDATE tasks SET status=$2, lease_owner='', lease_expires_at=NULL,
 waiting_reason=CASE WHEN $4 THEN 'workspace_input_changed' ELSE waiting_reason END,
@@ -595,6 +601,93 @@ WHERE id=$1 AND task_id=$2 AND status='pending'`, stopID, taskID)
 		return task.Task{}, deferredConflict
 	}
 	return result, nil
+}
+
+// Stop completion can report cancellation only when durable evidence proves
+// that the exact call did not cross its dispatch boundary. Other interrupted
+// tool calls retain an unknown outcome, including legacy unbound activities.
+func settleCancelledTaskToolSteps(ctx context.Context, tx pgx.Tx, taskID string) error {
+	rows, err := tx.Query(ctx, `SELECT id,sequence,status,title,COALESCE(tool_call_key,''),COALESCE(tool_name,''),task_revision,request_digest
+FROM task_steps WHERE task_id=$1 AND kind='tool' AND status IN ('queued','running','waiting_user')
+ORDER BY sequence FOR UPDATE`, taskID)
+	if err != nil {
+		return fmt.Errorf("lock interrupted task tool steps: %w", err)
+	}
+	type interruptedStep struct {
+		id, status, title, callID, toolName string
+		sequence                            int64
+		revision                            *int64
+		digest                              []byte
+	}
+	var steps []interruptedStep
+	for rows.Next() {
+		var step interruptedStep
+		if err := rows.Scan(&step.id, &step.sequence, &step.status, &step.title, &step.callID, &step.toolName, &step.revision, &step.digest); err != nil {
+			rows.Close()
+			return fmt.Errorf("read interrupted task tool step: %w", err)
+		}
+		steps = append(steps, step)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return fmt.Errorf("iterate interrupted task tool steps: %w", err)
+	}
+	rows.Close()
+
+	for _, step := range steps {
+		status, summary := task.StepUnknown, "The task stopped before this tool result could be confirmed."
+		if step.callID != "" && step.toolName != "" && step.revision != nil && len(step.digest) == 32 {
+			key := app.AgentOperationKey(step.callID)
+			var matchingSteps, operations int64
+			var cancelledMCP, cancelledHost, cancelledApproval, unconsumedRetry bool
+			err := tx.QueryRow(ctx, `SELECT
+  (SELECT count(*) FROM task_steps WHERE task_id=$1 AND tool_call_key=$3),
+  (SELECT count(*) FROM task_operations WHERE task_id=$1 AND (operation_key=$2 OR call_id=$3)) +
+  (SELECT count(*) FROM task_mcp_connector_operations WHERE task_id=$1 AND (operation_key=$2 OR call_id=$3)) +
+  (SELECT count(*) FROM task_hub_operations WHERE task_id=$1 AND operation_key=$2) +
+  (SELECT count(*) FROM task_workspace_publish_receipts WHERE task_id=$1 AND (operation_key=$2 OR call_id=$3)),
+  EXISTS (SELECT 1 FROM task_mcp_connector_operations WHERE task_id=$1 AND operation_key=$2 AND call_id=$3
+    AND task_revision=$4 AND tool_name=$5 AND request_hash=$6 AND status='cancelled'),
+  EXISTS (SELECT 1 FROM task_operations op WHERE op.task_id=$1 AND op.operation_key=$2 AND op.call_id=$3
+    AND op.task_revision=$4 AND op.tool_name=$5 AND op.request_hash=$6 AND op.status='cancelled'
+    AND EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=$1 AND e.event_type='task.operation'
+      AND e.payload->>'operation_id'=op.id AND e.payload->>'status'='cancelled' AND e.payload->>'previous_status'='prepared')),
+  EXISTS (SELECT 1 FROM task_pending_requests p JOIN tasks t ON t.id=p.task_id
+    WHERE p.task_id=$1 AND p.call_id=$3 AND p.task_revision=$4 AND p.tool_name=$5
+      AND p.status='cancelled' AND p.decision='' AND COALESCE(p.media_preview_operation_id,'')=''
+      AND t.current_step=$7 AND $8='waiting_user'),
+  EXISTS (SELECT 1 FROM task_step_retry_intents r WHERE r.task_id=$1 AND r.attempt_step_id=$7
+    AND r.retry_call_id=$3 AND r.task_revision=$4 AND r.tool_name=$5 AND r.request_digest=$6
+    AND r.agent_session_id=(SELECT agent_session_id FROM task_steps WHERE task_id=$1 AND id=$7)
+    AND r.state='pending' AND $8='queued')`, taskID, key, step.callID, *step.revision, step.toolName,
+				step.digest, step.id, step.status).Scan(&matchingSteps, &operations, &cancelledMCP, &cancelledHost,
+				&cancelledApproval, &unconsumedRetry)
+			if err != nil {
+				return fmt.Errorf("check interrupted task tool evidence: %w", err)
+			}
+			if matchingSteps == 1 && ((operations == 1 && (cancelledMCP || cancelledHost)) ||
+				(operations == 0 && (cancelledApproval || unconsumedRetry))) {
+				status, summary = task.StepCancelled, "The task was stopped before this tool call was dispatched."
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE task_steps SET status=$3,phase=$3,summary=$4,failure_reason=NULL,retryable=false
+WHERE task_id=$1 AND id=$2`, taskID, step.id, string(status), summary); err != nil {
+			return fmt.Errorf("settle interrupted task tool step: %w", err)
+		}
+		payload, err := json.Marshal(map[string]any{"step_id": step.id, "sequence": step.sequence, "kind": "tool",
+			"status": string(status), "phase": string(status), "title": step.title, "summary": summary})
+		if err != nil {
+			return fmt.Errorf("encode interrupted task tool step event: %w", err)
+		}
+		sequence, err := incrementTaskEventSequence(ctx, tx, taskID)
+		if err != nil {
+			return err
+		}
+		if err := insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: sequence, Type: "task.step", Payload: payload}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ReconcileStaleWorkspaceTasks fences tasks that were submitted against an

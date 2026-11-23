@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
-import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmError, textOnlyImageText } from '@deepseek-ai/dsh-llm'
+import { LlmError, textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import {
-  coordinatorCompactionModelCallID, coordinatorModelCallID, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS,
-  taskValidationReviewModelCallID, validMessageDelivery,
+  coordinatorCompactionModelCallID, coordinatorModelCallID, MODEL_FAILURE_SUMMARIES, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS,
+  taskValidationReviewModelCallID, validLateChildTools, validMessageDelivery,
 } from './engine.mjs'
 
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024
@@ -76,11 +76,8 @@ function digestNames(names) {
   return createHash('sha256').update(JSON.stringify([...names].sort())).digest('hex')
 }
 
-function returnedChildToolsDigest(tools) {
-  if (!Array.isArray(tools) || tools.length > 64) return undefined
-  const names = tools.map(tool => isObject(tool) ? tool.name : undefined)
-  if (names.some(name => typeof name !== 'string' || !TOOL_NAME.test(name)) || new Set(names).size !== names.length) return undefined
-  return digestNames(names)
+function childPendingKey(kind, sessionID, callID) {
+  return JSON.stringify([kind, sessionID, callID])
 }
 
 function validModelEndFrame(frame, identity) {
@@ -93,7 +90,7 @@ function validModelEndFrame(frame, identity) {
   if (frame.ok === true || !Object.hasOwn(frame, 'failure_code')) {
     return exactKeys(frame, ['type', ...fence, 'id', 'ok'])
   }
-  return frame.ok === false && frame.failure_code === CONTEXT_WINDOW_EXCEEDED_CODE &&
+  return frame.ok === false && typeof frame.failure_code === 'string' && Object.hasOwn(MODEL_FAILURE_SUMMARIES, frame.failure_code) &&
     exactKeys(frame, ['type', ...fence, 'id', 'ok', 'failure_code'])
 }
 
@@ -136,7 +133,7 @@ function validAbandonedChildSession(frame, callID, pending) {
     typeof frame.session_id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(frame.session_id) &&
     frame.session_id !== parent.session_id && frame.parent_session_id === parent.session_id &&
     typeof frame.objective === 'string' && createHash('sha256').update(frame.objective).digest('hex') === pending.objectiveDigest &&
-    returnedChildToolsDigest(frame.tools) === pending.toolNamesDigest &&
+    validLateChildTools(frame.tools, pending.toolNamesDigest, pending.allowControls) &&
     Number.isSafeInteger(frame.checkpoint_through_seq) && frame.checkpoint_through_seq >= -1 &&
     (frame.checkpoint_through_seq === -1 ? frame.checkpoint_sha256 === '' :
       typeof frame.checkpoint_sha256 === 'string' && /^[a-f0-9]{64}$/.test(frame.checkpoint_sha256)) &&
@@ -314,6 +311,8 @@ export class WorkerIPC {
       objectiveDigest: createHash('sha256').update(pending.arguments.objective).digest('hex'),
       toolNamesDigest: digestNames(pending.arguments.tool_names),
       runInBackground: pending.arguments.run_in_background,
+      allowControls: pending.identity.session_id === this.startFrame?.session_id &&
+        this.startFrame.tools?.some(tool => tool.name === 'dsh_delegate') === true,
     })
     if (pending.kind === 'child_settle_ack') Object.assign(value, { callID: pending.callID, status: pending.status })
     map.set(id, value)
@@ -438,14 +437,15 @@ export class WorkerIPC {
     if (frame.type === 'job_cancel') {
       const keys = ['agent_id', 'authorization_version', 'generation', 'id', 'job_id', 'owner_id', 'session_id', 'task_id', 'type']
       if (Object.keys(frame).sort().join(',') !== keys.sort().join(',') ||
-          !Object.entries(Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'session_id', 'generation', 'authorization_version'].map(key => [key, this.startFrame[key]])))
+          !Object.entries(Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version'].map(key => [key, this.startFrame[key]])))
             .every(([key, value]) => frame[key] === value) || typeof frame.id !== 'string' || !frame.id ||
-          typeof frame.job_id !== 'string' || !frame.job_id) throw new Error('invalid job cancellation request')
+          typeof frame.session_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(frame.session_id) ||
+          typeof frame.job_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(frame.job_id)) throw new Error('invalid job cancellation request')
       if (!this.onJobCancel) throw new Error('job cancellation is unavailable')
-      Promise.resolve(this.onJobCancel(frame.job_id)).then(status => {
+      Promise.resolve(this.onJobCancel(frame.job_id, frame.session_id)).then(status => {
         if (!['cancelled', 'succeeded', 'failed', 'unknown'].includes(status)) throw new Error('invalid job cancellation status')
         return this.send({ type: 'job_cancel_result', ...Object.fromEntries(keys.filter(key => key !== 'type' && key !== 'id' && key !== 'job_id').map(key => [key, this.startFrame[key]])),
-          id: frame.id, job_id: frame.job_id, status })
+          session_id: frame.session_id, id: frame.id, job_id: frame.job_id, status })
       }).catch(() => this.fail('job cancellation failed'))
       return
     }
@@ -528,27 +528,29 @@ export class WorkerIPC {
       return
     }
     if (frame.type === 'child_session') {
-      const pending = this.childPending.get(frame.call_id)
+      const key = childPendingKey('child_session', frame.parent_session_id, frame.call_id)
+      const pending = this.childPending.get(key)
       if (!pending || pending.kind !== 'child_session') throw new Error('unknown child session response')
       if (pending.abandoned) {
-        this.childPending.delete(frame.call_id)
+        this.childPending.delete(key)
         if (!validAbandonedChildSession(frame, frame.call_id, pending)) throw new Error('invalid late child session response')
         return
       }
-      this.childPending.delete(frame.call_id)
+      this.childPending.delete(key)
       clearTimeout(pending.timer)
       pending.resolve(frame)
       return
     }
     if (frame.type === 'child_settle_ack') {
-      const pending = this.childPending.get(frame.call_id)
+      const key = childPendingKey('child_settle_ack', frame.session_id, frame.call_id)
+      const pending = this.childPending.get(key)
       if (!pending || pending.kind !== 'child_settle_ack') throw new Error('unknown child settlement response')
       if (pending.abandoned) {
-        this.childPending.delete(frame.call_id)
+        this.childPending.delete(key)
         if (!validAbandonedChildSettleAck(frame, frame.call_id, pending)) throw new Error('invalid late child settlement response')
         return
       }
-      this.childPending.delete(frame.call_id)
+      this.childPending.delete(key)
       clearTimeout(pending.timer)
       const hasOutput = Object.hasOwn(frame, 'output')
       if (frame.ok !== true || hasOutput && (typeof frame.output !== 'string' || Buffer.byteLength(frame.output) > MAX_TOOL_OUTPUT_BYTES) ||
@@ -618,11 +620,11 @@ export class WorkerIPC {
       })
       return
     }
-    for (const [callID, pending] of this.childPending) {
+    for (const [key, pending] of this.childPending) {
       if (pending.kind !== 'child_session' || pending.recovering !== true || !matchesRoot(pending.identity) ||
-          pending.identity.session_id !== frame.supersede_session_id || callID !== frame.supersede_call_id) continue
+          pending.identity.session_id !== frame.supersede_session_id || pending.callID !== frame.supersede_call_id) continue
       queueMicrotask(() => {
-        if (this.childPending.get(callID) === pending) pending.resolve(RECOVERY_TOOL_SUPERSEDED)
+        if (this.childPending.get(key) === pending) pending.resolve(RECOVERY_TOOL_SUPERSEDED)
       })
       return
     }
@@ -761,6 +763,7 @@ export class WorkerIPC {
 
   async createChild(identity, through, callID, args, signal, { recovering = false, onWaiting, onTimeout } = {}) {
     if (this.cancelled) throw abortError()
+    const key = childPendingKey('child_session', identity?.session_id, callID)
     if (!Number.isSafeInteger(through) || through < 0 || typeof callID !== 'string' || !callID ||
         Buffer.byteLength(callID) > 256 || !isObject(args) ||
         !['objective,title,tool_names', 'objective,run_in_background,title,tool_names'].includes(Object.keys(args).sort().join(',')) ||
@@ -768,7 +771,7 @@ export class WorkerIPC {
         typeof args.objective !== 'string' || !args.objective.trim() || Buffer.byteLength(args.objective) > MAX_DELEGATE_OBJECTIVE_BYTES ||
         !Array.isArray(args.tool_names) || args.tool_names.length > 64 ||
         args.tool_names.some(name => typeof name !== 'string' || !TOOL_NAME.test(name)) ||
-        new Set(args.tool_names).size !== args.tool_names.length || this.childPending.has(callID)) {
+        new Set(args.tool_names).size !== args.tool_names.length || this.childPending.has(key)) {
       throw new Error('invalid child session request')
     }
     signal?.throwIfAborted()
@@ -777,32 +780,32 @@ export class WorkerIPC {
     const pending = { ...result, timer: undefined, kind: 'child_session', identity: { ...identity }, callID,
       arguments: { ...args }, recovering }
     const timer = setTimeout(() => {
-      this.abandonPending(this.childPending, callID, pending)
+      this.abandonPending(this.childPending, key, pending)
       notifyIPCTimeout(onTimeout, 'child_create', sha256(`child_create\n${JSON.stringify(args)}`))
       result.reject(new Error('child session response timed out'))
     }, CHILD_RESULT_TIMEOUT_MS)
     const abort = () => {
-      this.abandonPending(this.childPending, callID, pending)
+      this.abandonPending(this.childPending, key, pending)
       clearTimeout(timer)
       result.reject(abortError())
     }
     pending.timer = timer
-    this.childPending.set(callID, pending)
+    this.childPending.set(key, pending)
     signal?.addEventListener('abort', abort, { once: true })
     try {
       await this.send({ type: 'child_create', ...identity, through_seq: through, call_id: callID, arguments: args })
-      if (this.childPending.get(callID) === pending) notifyIPCWaiting(onWaiting)
+      if (this.childPending.get(key) === pending) notifyIPCWaiting(onWaiting)
       return await result.promise
     } catch (error) {
-      if (this.childPending.get(callID) === pending) {
-        this.childPending.delete(callID)
+      if (this.childPending.get(key) === pending) {
+        this.childPending.delete(key)
         clearTimeout(timer)
       }
       throw error
     } finally {
       signal?.removeEventListener('abort', abort)
-      if (this.childPending.get(callID) === pending) {
-        this.childPending.delete(callID)
+      if (this.childPending.get(key) === pending) {
+        this.childPending.delete(key)
         clearTimeout(timer)
       }
     }
@@ -810,10 +813,11 @@ export class WorkerIPC {
 
   async settleChild(identity, callID, status, through, digest, summary, signal, { onWaiting, onTimeout } = {}) {
     if (this.cancelled) throw abortError()
+    const key = childPendingKey('child_settle_ack', identity?.session_id, callID)
     if (typeof callID !== 'string' || !callID || Buffer.byteLength(callID) > 256 ||
         !['succeeded', 'failed'].includes(status) || !Number.isSafeInteger(through) || through < -1 ||
         (through === -1 ? digest !== '' : typeof digest !== 'string' || !/^[a-f0-9]{64}$/.test(digest)) ||
-        typeof summary !== 'string' || Buffer.byteLength(summary) > MAX_TOOL_OUTPUT_BYTES || this.childPending.has(callID)) {
+        typeof summary !== 'string' || Buffer.byteLength(summary) > MAX_TOOL_OUTPUT_BYTES || this.childPending.has(key)) {
       throw new Error('invalid child settlement')
     }
     signal?.throwIfAborted()
@@ -821,36 +825,36 @@ export class WorkerIPC {
     void result.promise.catch(() => {})
     const pending = { ...result, timer: undefined, kind: 'child_settle_ack', identity: { ...identity }, callID, status, summary }
     const timer = setTimeout(() => {
-      this.abandonPending(this.childPending, callID, pending)
+      this.abandonPending(this.childPending, key, pending)
       const summaryDigest = sha256(trimGoSpace(summary))
       notifyIPCTimeout(onTimeout, 'child_settle', sha256(`child_settle\n${status}\n${through}\n${digest}\n${summaryDigest}`))
       result.reject(new Error('child settlement response timed out'))
     }, CHILD_RESULT_TIMEOUT_MS)
     const abort = () => {
-      this.abandonPending(this.childPending, callID, pending)
+      this.abandonPending(this.childPending, key, pending)
       clearTimeout(timer)
       result.reject(abortError())
     }
     pending.timer = timer
-    this.childPending.set(callID, pending)
+    this.childPending.set(key, pending)
     signal?.addEventListener('abort', abort, { once: true })
     try {
       await this.send({
         type: 'child_settle', ...identity, call_id: callID, status,
         through_seq: through, sha256: digest, summary,
       })
-      if (this.childPending.get(callID) === pending) notifyIPCWaiting(onWaiting)
+      if (this.childPending.get(key) === pending) notifyIPCWaiting(onWaiting)
       return await result.promise
     } catch (error) {
-      if (this.childPending.get(callID) === pending) {
-        this.childPending.delete(callID)
+      if (this.childPending.get(key) === pending) {
+        this.childPending.delete(key)
         clearTimeout(timer)
       }
       throw error
     } finally {
       signal?.removeEventListener('abort', abort)
-      if (this.childPending.get(callID) === pending) {
-        this.childPending.delete(callID)
+      if (this.childPending.get(key) === pending) {
+        this.childPending.delete(key)
         clearTimeout(timer)
       }
     }
@@ -896,8 +900,8 @@ export class WorkerIPC {
       if (frame.type === 'model_end') {
         ended = true
         if (frame.ok !== true) {
-          failure = frame.failure_code === CONTEXT_WINDOW_EXCEEDED_CODE
-            ? new LlmError('provider confirmed the model context window was exceeded', CONTEXT_WINDOW_EXCEEDED_CODE)
+          failure = Object.hasOwn(MODEL_FAILURE_SUMMARIES, frame.failure_code)
+            ? new LlmError(MODEL_FAILURE_SUMMARIES[frame.failure_code], frame.failure_code)
             : new Error('model request failed')
         } else if (!finished) failure = new Error('model request failed')
         notify()

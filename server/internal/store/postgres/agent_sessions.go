@@ -44,10 +44,11 @@ func (s *Store) CreateAgentChildSession(ctx context.Context, request app.AgentCh
 			return domain.InvalidArgument("child_session", "child root checkpoint baseline is invalid")
 		}
 		var parentRootThroughSequence int64
-		var parentRootBaselineKnown bool
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(parent_session_id,''),COALESCE(step_id,''),root_checkpoint_through_seq,root_checkpoint_baseline_known FROM task_agent_sessions
+		var parentRootBaselineKnown, parentCancelRequested bool
+		var parentAllowedTools []byte
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(parent_session_id,''),COALESCE(step_id,''),root_checkpoint_through_seq,root_checkpoint_baseline_known,allowed_tools,cancel_requested_at IS NOT NULL FROM task_agent_sessions
 WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR UPDATE`, fence.TaskID, fence.OwnerID, request.ParentSessionID).
-			Scan(&parentOfParent, &parentStepID, &parentRootThroughSequence, &parentRootBaselineKnown); errors.Is(err, pgx.ErrNoRows) {
+			Scan(&parentOfParent, &parentStepID, &parentRootThroughSequence, &parentRootBaselineKnown, &parentAllowedTools, &parentCancelRequested); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeUnauthenticated, "parent Agent Session is unavailable")
 		} else if err != nil {
 			return fmt.Errorf("lock parent Agent Session: %w", err)
@@ -63,6 +64,22 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR UPDATE`, fence.TaskID, fe
 			}
 			if parentOfParent == "" || !underRoot {
 				return domain.NewError(domain.CodeUnauthenticated, "parent Agent Session is outside the active agent tree")
+			}
+			if parentOfParent != fence.AgentSessionID {
+				return domain.NewError(domain.CodeInvalidState, "Agent Session delegation depth is exceeded")
+			}
+			var parentTools []string
+			if err := json.Unmarshal(parentAllowedTools, &parentTools); err != nil || !validStoredAgentToolNames(parentTools) {
+				return errors.New("stored parent Agent tool allowlist is invalid")
+			}
+			allowedByParent := make(map[string]struct{}, len(parentTools))
+			for _, name := range parentTools {
+				allowedByParent[name] = struct{}{}
+			}
+			for _, name := range toolNames {
+				if _, ok := allowedByParent[name]; !ok {
+					return domain.NewError(domain.CodeForbidden, "child Agent tool exceeds the parent allowlist")
+				}
 			}
 			var parentStepStatus string
 			if err := tx.QueryRow(ctx, `SELECT status FROM task_steps WHERE task_id=$1 AND id=$2 FOR UPDATE`,
@@ -110,10 +127,17 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3 AND s.spawn_key=
 		} else if !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read existing child Agent Session: %w", err)
 		}
+		if parentCancelRequested {
+			return domain.NewError(domain.CodeInvalidState, "parent Agent Session cancellation is pending")
+		}
 		if request.RootCheckpointThroughSequence != parentRootThroughSequence {
 			return domain.NewError(domain.CodeConflict, "child root checkpoint baseline changed before spawn")
 		}
-		operationKey := app.AgentOperationKey(request.SpawnKey)
+		operationCallID := request.SpawnKey
+		if request.ParentSessionID != fence.AgentSessionID {
+			operationCallID = app.AgentSessionToolCallID(fence.TaskID, request.ParentSessionID, request.SpawnKey)
+		}
+		operationKey := app.AgentOperationKey(operationCallID)
 		storedMessages, hasStoredSupersession, err := readTaskAgentToolSupersession(ctx, tx,
 			app.ModelTaskFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID}, operationKey)
 		if err != nil {
@@ -209,8 +233,8 @@ func (s *Store) GetAgentChildSession(ctx context.Context, fence app.AgentInstanc
 s.is_background,s.cancel_requested_at IS NOT NULL,
 st.id,st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
-WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3 AND s.parent_session_id=$4
-FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, actorSessionID).Scan(
+WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3
+FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID).Scan(
 			&result.TaskID, &result.SessionID, &parentSessionID, &result.SpawnKey, &result.CheckpointThrough, &result.RootCheckpointThroughSequence, &result.CheckpointDigest, &allowedTools,
 			&result.Background, &result.CancelRequested,
 			&result.Step.ID, &result.Step.Sequence, &result.Step.Kind, &stepStatus, &result.Step.Title, &result.Step.Summary,
@@ -219,12 +243,12 @@ FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, actorSessionID).Sca
 		} else if err != nil {
 			return fmt.Errorf("read child Agent Session: %w", err)
 		}
-		underRoot, err := agentSessionDescendsFrom(ctx, tx, fence.TaskID, fence.OwnerID, sessionID, fence.AgentSessionID)
+		underActor, err := agentSessionStrictlyDescendsFrom(ctx, tx, fence.TaskID, fence.OwnerID, sessionID, actorSessionID)
 		if err != nil {
 			return fmt.Errorf("verify child Agent Session ancestry: %w", err)
 		}
-		if !underRoot {
-			return domain.NewError(domain.CodeUnauthenticated, "child Agent Session is outside the active agent tree")
+		if !underActor {
+			return domain.NewError(domain.CodeUnauthenticated, "child Agent Session is outside the actor's subtree")
 		}
 		result.ParentSessionID, result.Step.TaskID = parentSessionID, result.TaskID
 		result.Step.Status = task.StepStatus(stepStatus)
@@ -236,8 +260,8 @@ FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, actorSessionID).Sca
 	return result, err
 }
 
-func (s *Store) ListAgentChildSessions(ctx context.Context, fence app.AgentInstanceFence) ([]app.AgentChildSession, error) {
-	if err := fence.Validate(); err != nil {
+func (s *Store) ListAgentChildSessions(ctx context.Context, fence app.AgentInstanceFence, actorSessionID string) ([]app.AgentChildSession, error) {
+	if err := fence.Validate(); err != nil || actorSessionID == "" {
 		return nil, domain.InvalidArgument("child_session", "child session fence is invalid")
 	}
 	result := make([]app.AgentChildSession, 0)
@@ -245,12 +269,15 @@ func (s *Store) ListAgentChildSessions(ctx context.Context, fence app.AgentInsta
 		if err := lockCurrentAgentChildSessionTask(ctx, tx, fence); err != nil {
 			return err
 		}
+		if err := lockAgentChildSessionActor(ctx, tx, fence, actorSessionID); err != nil {
+			return err
+		}
 		rows, err := tx.Query(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.root_checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
 s.is_background,s.cancel_requested_at IS NOT NULL,
 st.id,st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
 WHERE s.task_id=$1 AND s.owner_id=$2 AND s.parent_session_id=$3
-ORDER BY st.sequence FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, fence.AgentSessionID)
+ORDER BY st.sequence FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, actorSessionID)
 		if err != nil {
 			return fmt.Errorf("list child Agent Sessions: %w", err)
 		}
@@ -278,8 +305,9 @@ ORDER BY st.sequence FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, fence.Age
 	return result, err
 }
 
-func (s *Store) RequestAgentChildSessionCancel(ctx context.Context, fence app.AgentInstanceFence, sessionID, operationKey string) (app.AgentChildSession, bool, error) {
-	if err := fence.Validate(); err != nil || sessionID == "" || sessionID == fence.AgentSessionID || !validAgentToolOperationKey(operationKey) {
+func (s *Store) RequestAgentChildSessionCancel(ctx context.Context, fence app.AgentInstanceFence, actorSessionID, sessionID, operationKey string) (app.AgentChildSession, bool, error) {
+	if err := fence.Validate(); err != nil || actorSessionID == "" || sessionID == "" || sessionID == fence.AgentSessionID ||
+		actorSessionID == sessionID || !validAgentToolOperationKey(operationKey) {
 		return app.AgentChildSession{}, false, domain.InvalidArgument("child_session", "background job cancellation is invalid")
 	}
 	var result app.AgentChildSession
@@ -290,20 +318,30 @@ func (s *Store) RequestAgentChildSessionCancel(ctx context.Context, fence app.Ag
 		if err := lockCurrentAgentChildSessionTask(ctx, tx, fence); err != nil {
 			return err
 		}
+		if err := lockAgentChildSessionActor(ctx, tx, fence, actorSessionID); err != nil {
+			return err
+		}
 		var parentSessionID, stepStatus string
 		var allowedTools []byte
 		if err := tx.QueryRow(ctx, `SELECT s.task_id,s.session_id,s.parent_session_id,s.spawn_key,s.checkpoint_through_seq,s.root_checkpoint_through_seq,s.checkpoint_digest,s.allowed_tools,
 s.is_background,s.cancel_requested_at IS NOT NULL,
 st.id,st.sequence,st.kind,st.status,st.title,st.summary,st.created_at
 FROM task_agent_sessions s JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
-WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3 AND s.parent_session_id=$4
-FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, fence.AgentSessionID).Scan(
+WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3
+FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID).Scan(
 			&result.TaskID, &result.SessionID, &parentSessionID, &result.SpawnKey, &result.CheckpointThrough, &result.RootCheckpointThroughSequence, &result.CheckpointDigest, &allowedTools,
 			&result.Background, &result.CancelRequested, &result.Step.ID, &result.Step.Sequence, &result.Step.Kind, &stepStatus,
 			&result.Step.Title, &result.Step.Summary, &result.Step.CreatedAt); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeUnauthenticated, "background Agent Session is unavailable")
 		} else if err != nil {
 			return fmt.Errorf("lock background Agent Session for cancellation: %w", err)
+		}
+		underActor, err := agentSessionStrictlyDescendsFrom(ctx, tx, fence.TaskID, fence.OwnerID, sessionID, actorSessionID)
+		if err != nil {
+			return fmt.Errorf("verify background Agent Session ancestry: %w", err)
+		}
+		if !underActor {
+			return domain.NewError(domain.CodeUnauthenticated, "background Agent Session is outside the actor's subtree")
 		}
 		result.ParentSessionID, result.Step.TaskID, result.Step.Status = parentSessionID, result.TaskID, task.StepStatus(stepStatus)
 		if err := json.Unmarshal(allowedTools, &result.AllowedTools); err != nil || !validStoredAgentToolNames(result.AllowedTools) {
@@ -332,6 +370,15 @@ FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, fence.AgentSessionI
 			inputPending = true
 			supersedingMessages = storedMessages
 			return nil
+		}
+		if actorSessionID != fence.AgentSessionID {
+			cancelling, err := agentSessionCancellationPending(ctx, tx, fence.TaskID, fence.OwnerID, actorSessionID)
+			if err != nil {
+				return err
+			}
+			if cancelling {
+				return domain.NewError(domain.CodeInvalidState, "Agent Session or ancestor cancellation is pending")
+			}
 		}
 		if result.CancelRequested {
 			if err := persistTaskAgentChildCancelOperation(ctx, tx, fence.TaskID, fence.OwnerID, operationKey, sessionID); err != nil {
@@ -375,7 +422,7 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 AND cancel_requested_at IS NU
 			Type: "task.step", Payload: payload}); err != nil {
 			return err
 		}
-		return nil
+		return requestActiveAgentDescendantCancellations(ctx, tx, fence.TaskID, fence.OwnerID, sessionID)
 	})
 	if err == nil && inputPending {
 		return app.AgentChildSession{}, false, app.NewTaskInputPendingError(supersedingMessages)
@@ -422,6 +469,11 @@ func requestActiveTaskAgentChildCancellations(ctx context.Context, tx pgx.Tx, ta
 	if rootSessionID == "" {
 		return nil
 	}
+	return requestActiveAgentDescendantCancellations(ctx, tx, taskID, ownerID, rootSessionID)
+}
+
+// The caller holds the Task lock, so a cancelled parent cannot race a new spawn.
+func requestActiveAgentDescendantCancellations(ctx context.Context, tx pgx.Tx, taskID, ownerID, parentSessionID string) error {
 	rows, err := tx.Query(ctx, `WITH RECURSIVE descendants(session_id) AS (
   SELECT session_id FROM task_agent_sessions
   WHERE task_id=$1 AND owner_id=$2 AND parent_session_id=$3
@@ -437,7 +489,7 @@ JOIN task_steps st ON st.task_id=s.task_id AND st.id=s.step_id
 WHERE s.cancel_requested_at IS NULL AND st.status IN ('queued','running','waiting_user')
   AND s.is_background
 ORDER BY st.sequence
-FOR UPDATE OF s,st`, taskID, ownerID, rootSessionID)
+FOR UPDATE OF s,st`, taskID, ownerID, parentSessionID)
 	if err != nil {
 		return fmt.Errorf("lock active child Agent Sessions for Task cancellation: %w", err)
 	}
@@ -564,9 +616,6 @@ FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, actorSessionID).Sca
 		if result.CheckpointThrough != checkpointThrough || !bytes.Equal(result.CheckpointDigest, checkpointDigest) {
 			return domain.NewError(domain.CodeInvalidState, "child Agent Session checkpoint head changed before settlement")
 		}
-		if result.Background && result.CancelRequested && status == task.StepSucceeded {
-			return domain.NewError(domain.CodeInvalidState, "cancelled background Agent Session cannot settle as succeeded")
-		}
 		if result.Step.Status == status {
 			if result.Step.Summary != summary {
 				return domain.NewError(domain.CodeIdempotencyConflict, "child Agent Session settlement changed")
@@ -576,6 +625,15 @@ FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, actorSessionID).Sca
 		}
 		if result.Step.Status != task.StepRunning {
 			return domain.NewError(domain.CodeInvalidState, "child Agent Session is not running")
+		}
+		if status == task.StepSucceeded {
+			cancelling, err := agentSessionCancellationPending(ctx, tx, fence.TaskID, fence.OwnerID, sessionID)
+			if err != nil {
+				return err
+			}
+			if cancelling {
+				return domain.NewError(domain.CodeInvalidState, "cancelled Agent Session or descendant cannot settle as succeeded")
+			}
 		}
 		updated, err := tx.Exec(ctx, `UPDATE task_steps SET status=$3,summary=$4 WHERE task_id=$1 AND id=$2 AND status='running'`,
 			fence.TaskID, result.Step.ID, string(status), summary)
@@ -602,6 +660,23 @@ FOR UPDATE OF s,st`, fence.TaskID, fence.OwnerID, sessionID, actorSessionID).Sca
 		return nil
 	})
 	return result, replayed, err
+}
+
+func agentSessionStrictlyDescendsFrom(ctx context.Context, tx pgx.Tx, taskID, ownerID, sessionID, ancestorSessionID string) (bool, error) {
+	var belongs bool
+	err := tx.QueryRow(ctx, `WITH RECURSIVE lineage(session_id,parent_session_id,path) AS (
+ SELECT session_id,parent_session_id,ARRAY[session_id] FROM task_agent_sessions
+ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3
+ UNION ALL
+ SELECT p.session_id,p.parent_session_id,l.path || p.session_id
+ FROM task_agent_sessions p JOIN lineage l ON p.session_id=l.parent_session_id
+ WHERE p.task_id=$1 AND p.owner_id=$2 AND NOT p.session_id=ANY(l.path)
+)
+SELECT EXISTS(SELECT 1 FROM lineage WHERE session_id=$4 AND session_id<>$3)`, taskID, ownerID, sessionID, ancestorSessionID).Scan(&belongs)
+	if err != nil {
+		return false, fmt.Errorf("read Agent Session subtree ancestry: %w", err)
+	}
+	return belongs, nil
 }
 
 func lockAgentChildSessionActor(ctx context.Context, tx pgx.Tx, fence app.AgentInstanceFence, actorSessionID string) error {

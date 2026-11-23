@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path"
 	"sort"
 	"strings"
 
@@ -67,6 +68,14 @@ func (s *WorkspaceSyncService) applyLiveProjectUpload(ctx context.Context, plan 
 	live, err := readWorkspaceLiveSnapshot(ctx, s.currentDirectory, ownerID, session.WorkspaceID, s.maxOwnerBytes)
 	if err != nil {
 		return nil, err
+	}
+	if session.SourceBaselineSessionID != "" {
+		if plan.ProjectLiveBaseline == nil {
+			return []workspace.Conflict{{Path: session.Scope[0], Reason: "cloud_baseline_unavailable"}}, nil
+		}
+		if conflicts := projectLiveBaselineConflicts(*plan.ProjectLiveBaseline, live.files, live.directories); len(conflicts) > 0 {
+			return conflicts, nil
+		}
 	}
 	files := make(map[string]workspace.File, len(live.files))
 	directories := make(map[string]workspace.Directory, len(live.directories))
@@ -218,7 +227,7 @@ func (s *WorkspaceSyncService) applyLiveProjectUpload(ctx context.Context, plan 
 	}
 	if err := s.applyLiveProjectDirectories(ctx, ownerID, session, directories); err != nil {
 		if errors.Is(err, workspacecurrent.ErrWriteConflict) || errors.Is(err, workspacecurrent.ErrUnsafePath) || errors.Is(err, os.ErrExist) {
-			return []workspace.Conflict{{Path: ".", Reason: "content_changed"}}, nil
+			return []workspace.Conflict{{Path: session.Scope[0], Reason: "content_changed"}}, nil
 		}
 		return nil, err
 	}
@@ -333,12 +342,25 @@ func (s *WorkspaceSyncService) applyLiveProjectUpload(ctx context.Context, plan 
 			return nil, err
 		}
 	}
+	if plan.RecordProjectLiveBaseline != nil {
+		files, _, directories, err := s.readLiveProjectManifest(ctx, ownerID, session.WorkspaceID, session.Scope[0])
+		if err != nil {
+			return nil, err
+		}
+		baseline, ok := projectLiveBaselineForSource(session, files, directories)
+		if !ok {
+			return []workspace.Conflict{{Path: session.Scope[0], Reason: "cloud_changed_during_apply"}}, nil
+		}
+		if err := plan.RecordProjectLiveBaseline(baseline); err != nil {
+			return nil, err
+		}
+	}
 	return nil, nil
 }
 
 func (s *WorkspaceSyncService) applyLiveProjectDirectories(ctx context.Context, ownerID string, session workspace.SyncSession,
 	existing map[string]workspace.Directory) error {
-	directories := append([]workspace.Directory(nil), session.UploadDirectories...)
+	directories := append([]workspace.Directory{{Path: session.Scope[0]}}, session.UploadDirectories...)
 	for _, directory := range session.UploadEmptyDirectories {
 		directories = append(directories, workspace.Directory{Path: directory})
 	}
@@ -362,6 +384,97 @@ func (s *WorkspaceSyncService) applyLiveProjectDirectories(ctx context.Context, 
 		}
 	}
 	return nil
+}
+
+func projectLiveBaselineForSource(source workspace.SyncSession, files []workspace.File, directories []workspace.Directory) (WorkspaceSyncProjectLiveBaseline, bool) {
+	result := WorkspaceSyncProjectLiveBaseline{Files: []workspace.File{}, Directories: []workspace.Directory{}}
+	if len(source.Scope) != 1 {
+		return result, false
+	}
+	fileMap := make(map[string]workspace.File, len(files))
+	for _, file := range files {
+		fileMap[strings.ToLower(file.Path)] = file
+	}
+	for _, expected := range source.Files {
+		actual, ok := fileMap[strings.ToLower(expected.Path)]
+		if !ok || actual.Path != expected.Path || !directProjectFilesMatch(actual, expected, true) {
+			return result, false
+		}
+		result.Files = append(result.Files, actual)
+	}
+	directoryMap := make(map[string]workspace.Directory, len(directories))
+	for _, directory := range directories {
+		directoryMap[strings.ToLower(directory.Path)] = directory
+	}
+	expectedDirectories := make(map[string]workspace.Directory)
+	addDirectory := func(directory string) {
+		for directory != "." && !strings.EqualFold(directory, source.Scope[0]) {
+			key := strings.ToLower(directory)
+			if _, exists := expectedDirectories[key]; !exists {
+				expectedDirectories[key] = workspace.Directory{Path: directory}
+			}
+			directory = path.Dir(directory)
+		}
+	}
+	for _, file := range source.Files {
+		addDirectory(path.Dir(file.Path))
+	}
+	for _, directory := range source.EmptyDirectories {
+		addDirectory(directory)
+	}
+	for _, directory := range source.Directories {
+		if !strings.EqualFold(directory.Path, source.Scope[0]) {
+			addDirectory(directory.Path)
+			expectedDirectories[strings.ToLower(directory.Path)] = directory
+		}
+	}
+	keys := make([]string, 0, len(expectedDirectories))
+	for key := range expectedDirectories {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		expected := expectedDirectories[key]
+		actual, ok := directoryMap[key]
+		if !ok || actual.Path != expected.Path || actual.Mode == nil || expected.Mode != nil && *actual.Mode != *expected.Mode {
+			return result, false
+		}
+		result.Directories = append(result.Directories, actual)
+	}
+	return result, true
+}
+
+func projectLiveBaselineMatchesSource(live WorkspaceSyncProjectLiveBaseline, source workspace.SyncSession) bool {
+	if len(source.Scope) != 1 {
+		return false
+	}
+	expected, ok := projectLiveBaselineForSource(source, live.Files, live.Directories)
+	return ok && len(live.Files) == len(expected.Files) && len(live.Directories) == len(expected.Directories)
+}
+
+func projectLiveBaselineConflicts(baseline WorkspaceSyncProjectLiveBaseline, files []workspace.File, directories []workspace.Directory) []workspace.Conflict {
+	fileMap := make(map[string]workspace.File, len(files))
+	for _, file := range files {
+		fileMap[strings.ToLower(file.Path)] = file
+	}
+	directoryMap := make(map[string]workspace.Directory, len(directories))
+	for _, directory := range directories {
+		directoryMap[strings.ToLower(directory.Path)] = directory
+	}
+	var conflicts []workspace.Conflict
+	for _, previous := range baseline.Files {
+		current, ok := fileMap[strings.ToLower(previous.Path)]
+		if !ok || !workspace.SameSyncFile(previous, current) {
+			conflicts = append(conflicts, workspace.Conflict{Path: previous.Path, Reason: "cloud_changed"})
+		}
+	}
+	for _, previous := range baseline.Directories {
+		current, ok := directoryMap[strings.ToLower(previous.Path)]
+		if !ok || !workspace.SameDirectoryMetadata(previous, current) {
+			conflicts = append(conflicts, workspace.Conflict{Path: previous.Path, Reason: "cloud_changed"})
+		}
+	}
+	return conflicts
 }
 
 func directProjectEmptyDirectoryRecords(paths []string) []workspace.Directory {

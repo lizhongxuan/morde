@@ -22,6 +22,10 @@ type workspaceSyncProjectSourceStore interface {
 	GetWorkspaceSyncProjectUploadBaseline(context.Context, identity.Principal, string, string, string) (*workspace.SyncSession, error)
 }
 
+type workspaceSyncProjectLiveBaselineStore interface {
+	GetWorkspaceSyncProjectLiveBaseline(context.Context, identity.Principal, string, string, string, string) (*WorkspaceSyncProjectLiveBaseline, error)
+}
+
 func (s *WorkspaceSyncService) authorizeSyncSession(ctx context.Context, principal identity.Principal, workspaceID, sessionID string) (workspace.Workspace, workspace.SyncSession, error) {
 	if !workspace.ValidSessionID(sessionID) {
 		return workspace.Workspace{}, workspace.SyncSession{}, domain.NewError(domain.CodeNotFound, "workspace sync session not found")
@@ -130,6 +134,7 @@ func (s *WorkspaceSyncService) createProjectUploadSession(ctx context.Context, p
 	}
 	baseFiles, baseEmptyDirectories, baseDirectories := []workspace.File{}, []string{}, []workspace.Directory{}
 	baselineSessionID := ""
+	var liveConflicts []workspace.Conflict
 	if baseline != nil {
 		if baseline.SourceBindingID != request.SourceBindingID || baseline.FolderID != folder.FolderID ||
 			baseline.State != workspace.SyncCompleted || baseline.Direction != workspace.SyncUpload || baseline.Policy != workspace.SyncCompareMerge ||
@@ -140,10 +145,28 @@ func (s *WorkspaceSyncService) createProjectUploadSession(ctx context.Context, p
 		baseEmptyDirectories = append(baseEmptyDirectories, baseline.EmptyDirectories...)
 		baseDirectories = append(baseDirectories, baseline.Directories...)
 		baselineSessionID = baseline.ID
+		if liveDirectory {
+			liveStore, ok := s.store.(workspaceSyncProjectLiveBaselineStore)
+			if !ok {
+				return workspace.SyncSession{}, domain.NewError(domain.CodeWorkspaceUnavailable, "project cloud baseline reader is unavailable")
+			}
+			liveBaseline, err := liveStore.GetWorkspaceSyncProjectLiveBaseline(ctx, principal, workspaceID, folder.FolderID, request.SourceBindingID, baseline.ID)
+			if err != nil {
+				return workspace.SyncSession{}, err
+			}
+			if liveBaseline == nil || !projectLiveBaselineMatchesSource(*liveBaseline, *baseline) {
+				liveConflicts = []workspace.Conflict{{Path: folder.RelativePath, Reason: "cloud_baseline_unavailable"}}
+			} else {
+				liveConflicts = projectLiveBaselineConflicts(*liveBaseline, currentFiles, currentDirectories)
+			}
+		}
 	}
 	command.BaseRevision = value.Revision
 	plan := workspace.SyncPlan{}
-	if baseline == nil && hasProjectDestinationContents(folder.RelativePath, currentFiles, currentEmptyDirectories, currentDirectories) {
+	if len(liveConflicts) > 0 {
+		plan = emptyWorkspaceSyncPlan()
+		plan.Conflicts = liveConflicts
+	} else if baseline == nil && hasProjectDestinationContents(folder.RelativePath, currentFiles, currentEmptyDirectories, currentDirectories) {
 		plan = projectDestinationConflictPlan(command, currentFiles, currentEmptyDirectories, currentDirectories)
 	} else {
 		if baseline != nil {
@@ -160,8 +183,26 @@ func (s *WorkspaceSyncService) createProjectUploadSession(ctx context.Context, p
 			}
 			return workspace.SyncSession{}, domain.InvalidArgument("sync_session", message)
 		}
+		planningCommand := command
+		if liveDirectory {
+			// The registered project root belongs to the cloud workspace. Its mode
+			// and timestamps need not match the selected local root; preserve them
+			// while still comparing every file and subdirectory inside the project.
+			// Live writes assign new mtimes. The separately recorded cloud baseline
+			// was checked above, so planning can compare PC content and permissions
+			// without mistaking the server's own timestamps for a cloud edit.
+			planningCommand.Files = projectLiveComparisonFiles(command.Files)
+			baseFiles = projectLiveComparisonFiles(baseFiles)
+			currentFiles = projectLiveComparisonFiles(currentFiles)
+			planningCommand.Directories = projectLiveComparisonDirectories(command.Directories, folder.RelativePath)
+			baseDirectories = projectLiveComparisonDirectories(baseDirectories, folder.RelativePath)
+			currentDirectories = projectLiveComparisonDirectories(currentDirectories, folder.RelativePath)
+		}
 		plan = workspace.PlanSyncTreeWithDirectories(baseFiles, currentFiles, baseEmptyDirectories, currentEmptyDirectories,
-			baseDirectories, currentDirectories, command)
+			baseDirectories, currentDirectories, planningCommand)
+		if liveDirectory {
+			restoreProjectUploadPlanMetadata(&plan, command)
+		}
 	}
 	for _, file := range plan.UploadFiles {
 		if file.SizeBytes > workspace.MaxSyncFileBytes {
@@ -212,6 +253,46 @@ func (s *WorkspaceSyncService) createProjectUploadSession(ctx context.Context, p
 		return workspace.SyncSession{}, err
 	}
 	return created, nil
+}
+
+func projectLiveComparisonFiles(files []workspace.File) []workspace.File {
+	result := append([]workspace.File(nil), files...)
+	for index := range result {
+		result[index].ModTimeNS = nil
+	}
+	return result
+}
+
+func projectLiveComparisonDirectories(directories []workspace.Directory, root string) []workspace.Directory {
+	result := make([]workspace.Directory, 0, len(directories))
+	for _, directory := range directories {
+		if !strings.EqualFold(directory.Path, root) {
+			directory.ModTimeNS = nil
+			result = append(result, directory)
+		}
+	}
+	return result
+}
+
+func restoreProjectUploadPlanMetadata(plan *workspace.SyncPlan, command workspace.CreateSyncSession) {
+	files := make(map[string]workspace.File, len(command.Files))
+	for _, file := range command.Files {
+		files[file.Path] = file
+	}
+	for index, file := range plan.UploadFiles {
+		if original, ok := files[file.Path]; ok {
+			plan.UploadFiles[index] = original
+		}
+	}
+	directories := make(map[string]workspace.Directory, len(command.Directories))
+	for _, directory := range command.Directories {
+		directories[directory.Path] = directory
+	}
+	for index, directory := range plan.UploadDirectories {
+		if original, ok := directories[directory.Path]; ok {
+			plan.UploadDirectories[index] = original
+		}
+	}
 }
 
 func (s *WorkspaceSyncService) authorizeProjectUpload(ctx context.Context, principal identity.Principal, workspaceID, folderID string,

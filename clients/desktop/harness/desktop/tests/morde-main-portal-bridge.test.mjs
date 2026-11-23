@@ -21,7 +21,7 @@ const capabilities = {
   default_max_request_bytes: 1048576,
 };
 const host = {
-  id: 'h1234567', owner_id: 'u1234567', name: 'Local test computer', url: 'https://host.example/', state: 'running',
+  id: 'h1234567', owner_id: 'u1234567', name: 'Local test computer', url: 'https://host.example/', state: 'running', workspace_runtime_online: true,
   workspaces: [{ state: 'active', workspace: { id: 'w1234567', name: 'Default Workspace', state: 'ready' } }],
 };
 const json = (value, status = 200) => new Response(JSON.stringify(value && typeof value === 'object' && 'web_session_credential' in value && !('web_session_host_frame_source' in value) ? { ...value, web_session_host_frame_source: 'https://*.hosts.example.test' } : value), { status, headers: { 'content-type': 'application/json' } });
@@ -294,6 +294,9 @@ test('Codex dialogs use the correct overload with or without a parent window', a
 
 test('Portal bridge requires the current trusted top-level route and returns only empty-folder metadata', async () => {
   const originalFetch = globalThis.fetch;
+  const Sync = require('../out/morde-sync.js').MordeSync;
+  const originalFingerprint = Sync.prototype.projectFingerprint;
+  Sync.prototype.projectFingerprint = async () => 'a'.repeat(64);
   const calls = [];
   mockFetch(calls);
   const h = harness();
@@ -313,6 +316,7 @@ test('Portal bridge requires the current trusted top-level route and returns onl
     await assert.rejects(h.invoke('morde:portal-state', portal.webContents), /Invalid Portal window or route/);
     portal.webContents.url = appURL(h, '/hosts');
     await assert.rejects(h.invoke('morde:portal-project-upload-targets', portal.webContents), /Invalid Portal window or route/);
+    await assert.rejects(h.invoke('morde:portal-project-local-status', portal.webContents, ['invalid']), /Invalid Portal window or route/);
     portal.webContents.url = `${new URL(h.views[0].webContents.url).origin}/hosts?sync=1&next=/assistant`;
     await assert.rejects(h.invoke('morde:portal-state', portal.webContents), /Invalid Portal window or route/);
     portal.webContents.url = appURL(h, '/hosts/sync?host=h1234567');
@@ -353,6 +357,7 @@ test('Portal bridge requires the current trusted top-level route and returns onl
       projectName: 'empty-project', directoryName: 'empty-project',
     });
     assert.equal(JSON.stringify(selection).includes(selectedDirectory), false);
+    assert.deepEqual(await h.invoke('morde:portal-project-local-status', portal.webContents, [selection.selectionID]), { state: 'pending' });
     const pushedState = portal.webContents.messages.filter(([channel]) => channel === 'morde:portal-state').at(-1)?.[1];
     assertPortalProjectState(pushedState);
     assert.equal(pushedState.projectMappings.length, 1);
@@ -370,6 +375,7 @@ test('Portal bridge requires the current trusted top-level route and returns onl
     await assert.rejects(h.invoke('morde:portal-project-stop', portal.webContents, [selection.selectionID]), /Invalid Portal window or route/);
     assert.equal(calls.some((call) => call.method === 'POST' && new URL(call.url).pathname.includes('/sync/')), false);
   } finally {
+    Sync.prototype.projectFingerprint = originalFingerprint;
     globalThis.fetch = originalFetch;
     h.cleanup();
     rmSync(selectedRoot, { recursive: true, force: true });

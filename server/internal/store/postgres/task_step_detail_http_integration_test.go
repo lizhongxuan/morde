@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,5 +106,84 @@ func TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord(t *testing.T) 
 		got.DetailState != "available" || got.Object == nil || *got.Object != document.Object ||
 		got.Input == nil || *got.Input != document.Input || got.Result == nil || *got.Result != document.Result || got.EventSequence < 1 {
 		t.Fatalf("authorized HTTP task detail=%+v err=%v body=%s", got, err, response.Body.String())
+	}
+}
+
+func TestPostgresTaskStepDetailStoresFullCapturedOutputAboveLegacyLimit(t *testing.T) {
+	fixture := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	lease, _, err := fixture.service.Start(ctx, fixture.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := fixture.store.GetTask(ctx, lease.Fence.TaskID, lease.Fence.OwnerID)
+	if err != nil || current.Task.CurrentRevision == nil {
+		t.Fatalf("load task revision: task=%+v err=%v", current.Task, err)
+	}
+	stepID, err := domain.NewStepID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	capturedOutput := strings.Repeat("captured-output-", 4<<10)
+	document := app.TaskStepDetailDocument{Object: "shell_exec", Input: "Run an authorized command.", Result: "Shell completed.",
+		ShellExecution: &app.TaskStepShellExecutionEvidence{StdoutBytes: len(capturedOutput)},
+		Execution:      &app.TaskStepExecution{Stdout: &capturedOutput}, ExecutionWorkspaceID: "w1234567"}
+	plain, err := json.Marshal(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealer, err := app.NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ciphertext, err := sealer.SealWithAAD(plain, aadForTaskStepDetail(current.Task.OwnerID, current.Task.ID, stepID,
+		*current.Task.CurrentRevision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	detailDigest := sha256.Sum256(plain)
+	size := int32(len(plain))
+	if len(ciphertext) <= 65564 || size <= 65536 {
+		t.Fatalf("test detail did not exceed legacy storage bounds: ciphertext=%d plaintext=%d", len(ciphertext), size)
+	}
+	step := task.Step{ID: stepID, TaskID: current.Task.ID, Sequence: 1, Kind: "tool", Status: task.StepSucceeded,
+		Title: "Run command", Summary: "Shell completed.", CreatedAt: time.Now().UTC()}
+	requestDigest := sha256.Sum256([]byte("shell.exec:{\"command\":\"printf captured\"}"))
+	usage := current.Task.Usage
+	usage.ToolCalls++
+	payload, err := json.Marshal(map[string]any{"step_id": step.ID, "sequence": step.Sequence, "kind": step.Kind,
+		"status": step.Status, "title": step.Title, "summary": step.Summary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: current.Task.ID, LeaseOwner: lease.Fence.LeaseOwner, LeaseVersion: lease.Fence.LeaseVersion,
+		Status: task.StatusRunning, CurrentStep: step.ID, Usage: usage, Steps: []task.Step{step},
+		Event: task.Event{TaskID: current.Task.ID, Type: "task.step", Payload: payload},
+		ToolCall: &app.TaskToolCallProgress{AgentSessionID: lease.Fence.AgentSessionID, AgentInstanceID: lease.Fence.AgentInstanceID,
+			AgentGeneration: lease.Fence.AgentGeneration, AuthorizationVersion: lease.Fence.AuthorizationVersion,
+			TaskRevision: *current.Task.CurrentRevision, CallKey: "http-shell-large-output", ToolName: "shell_exec",
+			RequestDigest: requestDigest[:], Phase: string(task.StepSucceeded), DetailState: "available",
+			DetailCiphertext: ciphertext, DetailSHA256: detailDigest[:], DetailSizeBytes: size},
+	}); err != nil {
+		t.Fatalf("persist large encrypted Task step detail: %v", err)
+	}
+	record, err := fixture.store.GetTaskStepDetail(ctx, current.Task.OwnerID, current.Task.ID, stepID)
+	if err != nil || record.SizeBytes != size || len(record.Ciphertext) != len(ciphertext) || len(record.Ciphertext) <= 65564 {
+		t.Fatalf("read large encrypted Task step detail: record bytes=%d size=%d err=%v", len(record.Ciphertext), record.SizeBytes, err)
+	}
+	opened, err := sealer.OpenWithAAD(record.Ciphertext, aadForTaskStepDetail(current.Task.OwnerID, current.Task.ID, stepID,
+		*current.Task.CurrentRevision))
+	if err != nil {
+		t.Fatalf("open persisted large detail: %v", err)
+	}
+	var got app.TaskStepDetailDocument
+	if err := json.Unmarshal(opened, &got); err != nil || got.Execution == nil || got.Execution.Stdout == nil || *got.Execution.Stdout != capturedOutput {
+		t.Fatalf("persisted captured output length=%d err=%v", func() int {
+			if got.Execution == nil || got.Execution.Stdout == nil {
+				return 0
+			}
+			return len(*got.Execution.Stdout)
+		}(), err)
 	}
 }

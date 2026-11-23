@@ -2279,9 +2279,13 @@ func TestCloudDSHExecutorRunsAndSettlesPersistedChildSession(t *testing.T) {
 		len(children.settleCommand.CheckpointDigest) != sha256.Size || children.settleCommand.Summary != "Child result" {
 		t.Fatalf("child lifecycle create=%#v settle=%#v counts=%d/%d", children.createCommand, children.settleCommand, children.creates, children.settles)
 	}
+	expectedChildDefinitions, err := cloudDSHChildDelegationTools([]app.AgentToolDefinition{tool}, true)
+	if err != nil {
+		t.Fatalf("child coordinator tool definitions: %v", err)
+	}
 	if len(models.calls) != 4 || models.calls[1].Task == nil || models.calls[1].Task.AgentSessionID != "child_test" ||
 		models.calls[1].Task.AgentRootSessionID != rootSessionID || models.calls[1].Task.TaskID != value.ID ||
-		!validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, []app.AgentToolDefinition{tool}) {
+		!validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, expectedChildDefinitions) {
 		t.Fatalf("child model call was not scoped to its persisted Session: %#v", models.calls)
 	}
 	if len(tools.calls) != 1 || !strings.HasPrefix(tools.calls[0].CallID, "dsh_") {

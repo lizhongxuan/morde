@@ -1,6 +1,10 @@
 package conversation
 
-import "time"
+import (
+	"time"
+
+	"morde/server/internal/domain/task"
+)
 
 type Role string
 
@@ -103,6 +107,7 @@ type Message struct {
 	RoutingStatus             RoutingStatus
 	RoutingFailureReason      RoutingFailureReason
 	AgentAcknowledged         bool
+	ToolActivity              *ToolActivity
 	Sources                   []MessageSource
 	ModelID                   string
 	Sequence                  int64
@@ -118,6 +123,25 @@ type Message struct {
 	VariantAction             string
 	VariantOperationID        string
 	CreatedAt                 time.Time
+}
+
+// ToolActivity exposes only the short-lived web operation associated with a
+// user message. The internal Task identity remains private.
+type ToolActivity struct {
+	Tool   string          `json:"tool"`
+	Status task.StepStatus `json:"status"`
+}
+
+func (value ToolActivity) Valid() bool {
+	if value.Tool != "web_search" && value.Tool != "web_read" {
+		return false
+	}
+	switch value.Status {
+	case task.StepQueued, task.StepRunning, task.StepWaitingUser, task.StepSucceeded, task.StepFailed, task.StepCancelled, task.StepUnknown:
+		return true
+	default:
+		return false
+	}
 }
 
 // MessageSource identifies the exact Task result included in a combined reply.

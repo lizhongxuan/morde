@@ -132,7 +132,10 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 			return domain.NewError(domain.CodeInvalidState, "model usage is unknown and requires reconciliation")
 		}
 		if running >= maxConcurrent {
-			return domain.NewError(domain.CodeRateLimited, "model concurrency limit reached")
+			limited := domain.NewError(domain.CodeRateLimited, "model concurrency limit reached")
+			limited.Details["reason"] = "model_concurrency_limit"
+			limited.Details["stage"] = "reservation"
+			return limited
 		}
 		if used > limit || request.ReservedTokens > limit-used {
 			return domain.NewError(domain.CodeQuotaExceeded, "model token budget exceeded")

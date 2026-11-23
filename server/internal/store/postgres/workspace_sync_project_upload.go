@@ -100,6 +100,52 @@ FROM workspace_sync_project_sources WHERE source_binding_id=$1`, sourceBindingID
 	return baseline, nil
 }
 
+func readWorkspaceSyncProjectLiveBaseline(ctx context.Context, tx pgx.Tx, workspaceID, sessionID string) (*app.WorkspaceSyncProjectLiveBaseline, error) {
+	var filesJSON, directoriesJSON []byte
+	err := tx.QueryRow(ctx, `SELECT files, directories FROM workspace_sync_project_live_baselines
+WHERE workspace_id=$1 AND session_id=$2`, workspaceID, sessionID).Scan(&filesJSON, &directoriesJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read project live baseline: %w", err)
+	}
+	var baseline app.WorkspaceSyncProjectLiveBaseline
+	if err := json.Unmarshal(filesJSON, &baseline.Files); err != nil {
+		return nil, fmt.Errorf("decode project live baseline files: %w", err)
+	}
+	if err := json.Unmarshal(directoriesJSON, &baseline.Directories); err != nil {
+		return nil, fmt.Errorf("decode project live baseline directories: %w", err)
+	}
+	return &baseline, nil
+}
+
+func (s *Store) GetWorkspaceSyncProjectLiveBaseline(ctx context.Context, principal identity.Principal,
+	workspaceID, folderID, sourceBindingID, sessionID string) (*app.WorkspaceSyncProjectLiveBaseline, error) {
+	if principal.Kind != identity.KindDevice || !domain.ValidClientInstallationID(principal.ClientInstallationID) ||
+		!domain.ValidUserID(principal.UserID) || !domain.ValidWorkspaceID(workspaceID) ||
+		!workspace.ValidSyncFolderID(folderID) || !workspace.ValidProjectSourceBindingID(sourceBindingID) || !workspace.ValidSessionID(sessionID) {
+		return nil, domain.NewError(domain.CodeForbidden, "project live baseline identity is invalid")
+	}
+	var result *app.WorkspaceSyncProjectLiveBaseline
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		var allowed bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM workspace_sync_project_sources
+WHERE source_binding_id=$1 AND owner_id=$2 AND client_installation_id=$3 AND workspace_id=$4 AND folder_id=$5
+  AND state='active' AND last_applied_session_id=$6)`, sourceBindingID, principal.UserID, principal.ClientInstallationID,
+			workspaceID, folderID, sessionID).Scan(&allowed); err != nil {
+			return fmt.Errorf("authorize project live baseline: %w", err)
+		}
+		if !allowed {
+			return nil
+		}
+		var err error
+		result, err = readWorkspaceSyncProjectLiveBaseline(ctx, tx, workspaceID, sessionID)
+		return err
+	})
+	return result, err
+}
+
 func (s *Store) ListPendingWorkspaceSyncProjectUploadApplications(ctx context.Context, hostID, workspaceID string,
 	bindingVersion int64) ([]workspace.PendingProjectUploadApplication, error) {
 	if !domain.ValidHostID(hostID) || !domain.ValidWorkspaceID(workspaceID) || bindingVersion < 1 {

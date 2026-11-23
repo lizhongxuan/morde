@@ -50,6 +50,39 @@ func (v *ManifestPathValidator) Add(value string) error {
 	return nil
 }
 
+// AddDirectory records a directory that may contain other recorded paths.
+// Unlike an empty manifest directory, a deleted directory may have deleted
+// descendants, which must be validated together before removing the tree.
+func (v *ManifestPathValidator) AddDirectory(value string) error {
+	if err := validRelativePath(value); err != nil {
+		return fmt.Errorf("manifest directory %q: %w", value, ErrInvalidManifest)
+	}
+	if v.nodes == nil {
+		v.nodes = make(map[string]manifestPathNode)
+	}
+	parts := strings.Split(value, "/")
+	var prefix string
+	pending := make([]manifestPathNode, 0, len(parts))
+	for index, part := range parts {
+		if index > 0 {
+			prefix += "/"
+		}
+		prefix += part
+		key := strings.ToLower(prefix)
+		if previous, exists := v.nodes[key]; exists {
+			if previous.path != prefix || !previous.directory || previous.empty {
+				return fmt.Errorf("manifest directory %q conflicts with %q: %w", value, previous.path, ErrInvalidManifest)
+			}
+			continue
+		}
+		pending = append(pending, manifestPathNode{path: prefix, directory: true})
+	}
+	for _, node := range pending {
+		v.nodes[strings.ToLower(node.path)] = node
+	}
+	return nil
+}
+
 // AddEmptyDirectory records an explicit empty leaf directory in a manifest.
 func (v *ManifestPathValidator) AddEmptyDirectory(value string) error {
 	if err := validRelativePath(value); err != nil {

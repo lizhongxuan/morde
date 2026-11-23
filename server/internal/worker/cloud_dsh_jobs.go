@@ -53,6 +53,18 @@ func cloudDSHChildToolDefinitions(parent []app.AgentToolDefinition, names []stri
 	return definitions, nil
 }
 
+func cloudDSHChildDelegationTools(definitions []app.AgentToolDefinition, canDelegate bool) ([]app.AgentToolDefinition, error) {
+	tools := append([]app.AgentToolDefinition(nil), definitions...)
+	if canDelegate {
+		tools = append(tools, cloudDSHJobTools()...)
+		tools = append(tools, cloudDSHDelegateTool(definitions))
+	}
+	if !validCloudDSHToolDefinitions(tools) {
+		return nil, errors.New("dsh child delegation tools exceed the allowed limit")
+	}
+	return tools, nil
+}
+
 func validCloudDSHStoredToolNames(names []string) bool {
 	if len(names) > 64 {
 		return false
@@ -71,8 +83,8 @@ func (e *CloudDSHExecutor) cloudDSHJobCancelRequested(ctx context.Context, fence
 	if state == nil || !state.background {
 		return false, nil
 	}
-	child, err := e.options.Children.Get(ctx, fence, fence.AgentSessionID, state.identity.SessionID)
-	if err != nil || !child.Background || child.ParentSessionID != fence.AgentSessionID || child.SessionID != state.identity.SessionID {
+	child, err := e.options.Children.Get(ctx, fence, state.parentSessionID, state.identity.SessionID)
+	if err != nil || !child.Background || child.ParentSessionID != state.parentSessionID || child.SessionID != state.identity.SessionID {
 		return false, errors.New("background job authorization changed")
 	}
 	return child.CancelRequested, nil
@@ -116,7 +128,7 @@ func (e *CloudDSHExecutor) executeCloudDSHJobRead(ctx context.Context, _ task.Ta
 		if err := decodeCloudDSHJobArguments(frame.Arguments, &arguments); err != nil {
 			return app.AgentToolResult{}, err
 		}
-		children, err := e.options.Children.List(ctx, fence, fence.AgentSessionID)
+		children, err := e.options.Children.List(ctx, fence, frame.SessionID)
 		if err != nil {
 			return app.AgentToolResult{}, err
 		}
@@ -140,7 +152,7 @@ func (e *CloudDSHExecutor) executeCloudDSHJobRead(ctx context.Context, _ task.Ta
 		if err := decodeCloudDSHJobArguments(frame.Arguments, &arguments); err != nil || !cloudDSHID.MatchString(arguments.JobID) {
 			return app.AgentToolResult{}, errors.New("background job identity is invalid")
 		}
-		child, err := e.options.Children.Get(ctx, fence, fence.AgentSessionID, arguments.JobID)
+		child, err := e.options.Children.Get(ctx, fence, frame.SessionID, arguments.JobID)
 		if err != nil || !child.Background {
 			return app.AgentToolResult{}, errors.New("background job is unavailable")
 		}
@@ -156,7 +168,7 @@ func (e *CloudDSHExecutor) executeCloudDSHJobRead(ctx context.Context, _ task.Ta
 	if err := decodeCloudDSHJobArguments(frame.Arguments, &arguments); err != nil || !cloudDSHID.MatchString(arguments.JobID) || arguments.AfterSeq < -1 {
 		return app.AgentToolResult{}, errors.New("background job output cursor is invalid")
 	}
-	child, err := e.options.Children.Get(ctx, fence, fence.AgentSessionID, arguments.JobID)
+	child, err := e.options.Children.Get(ctx, fence, frame.SessionID, arguments.JobID)
 	if err != nil || !child.Background || arguments.AfterSeq > child.CheckpointThrough {
 		return app.AgentToolResult{}, errors.New("background job is unavailable")
 	}

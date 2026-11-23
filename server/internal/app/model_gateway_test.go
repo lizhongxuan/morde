@@ -42,6 +42,37 @@ type modelGatewayStoreTest struct {
 	settledCtx      error
 }
 
+type concurrencyLimitedModelGatewayStore struct {
+	*modelGatewayStoreTest
+	mu         sync.Mutex
+	remaining  int
+	always     bool
+	attemptIDs []string
+}
+
+func (s *concurrencyLimitedModelGatewayStore) ReserveModelCall(ctx context.Context, value ModelCallReservation) error {
+	s.mu.Lock()
+	s.attemptIDs = append(s.attemptIDs, value.CallID)
+	limited := s.always || s.remaining > 0
+	if s.remaining > 0 {
+		s.remaining--
+	}
+	s.mu.Unlock()
+	if limited {
+		err := domain.NewError(domain.CodeRateLimited, "model concurrency limit reached")
+		err.Details["reason"] = "model_concurrency_limit"
+		err.Details["stage"] = "reservation"
+		return err
+	}
+	return s.modelGatewayStoreTest.ReserveModelCall(ctx, value)
+}
+
+func (s *concurrencyLimitedModelGatewayStore) reservationAttempts() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.attemptIDs...)
+}
+
 func setTestModelResponseSealer(t *testing.T, service *ModelGatewayService) {
 	t.Helper()
 	sealer, err := NewSealer(bytes.Repeat([]byte{0x5a}, 32))
@@ -121,6 +152,51 @@ func taskGatewayFixture(t *testing.T, rawRequest []byte, response ModelResponse)
 	setTestModelResponseSealer(t, service)
 	call := ModelCall{Source: ModelCallTask, Task: fence, ModelID: "p1234567", CallID: callID, RawRequest: rawRequest}
 	return service, store, client, call
+}
+
+func concurrencyTaskGatewayFixture(t *testing.T, store *concurrencyLimitedModelGatewayStore) (*ModelGatewayService, *modelGatewayClientTest, ModelCall) {
+	t.Helper()
+	callID, err := DSHModelCallID("q1234567", "session-1", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelCall{Source: ModelCallTask, Task: &ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567",
+		LeaseOwner: "worker-1", LeaseVersion: 1, AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1",
+		AuthorizationVersion: 1, EngineVersion: "dsh-1", ProfileVersion: "v1"}, ModelID: "p1234567", CallID: callID,
+		RawRequest: []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[],"max_tokens":16}`),
+		Request:    ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 16}}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "done", StopReason: "stop", ProviderReportedModel: "test-model",
+		Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}}}
+	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setTestModelResponseSealer(t, service)
+	return service, client, call
+}
+
+func TestTaskModelGatewayWaitsForTypedConcurrencyReservation(t *testing.T) {
+	store := &concurrencyLimitedModelGatewayStore{modelGatewayStoreTest: &modelGatewayStoreTest{}, remaining: 2}
+	service, client, call := concurrencyTaskGatewayFixture(t, store)
+	response, err := service.Complete(context.Background(), call)
+	attempts := store.reservationAttempts()
+	if err != nil || response.Text != "done" || len(attempts) != 3 || attempts[0] != call.CallID || attempts[1] != call.CallID ||
+		attempts[2] != call.CallID || store.dispatchN != 1 || client.calls != 1 || store.reserveN != 1 {
+		t.Fatalf("task call did not wait for a reservation slot with stable identity: response=%+v attempts=%v dispatch=%d provider=%d reserved=%d err=%v",
+			response, attempts, store.dispatchN, client.calls, store.reserveN, err)
+	}
+}
+
+func TestTaskModelGatewayStopsWaitingWhenCancelled(t *testing.T) {
+	store := &concurrencyLimitedModelGatewayStore{modelGatewayStoreTest: &modelGatewayStoreTest{}, always: true}
+	service, client, call := concurrencyTaskGatewayFixture(t, store)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	_, err := service.Complete(ctx, call)
+	if !errors.Is(err, context.DeadlineExceeded) || len(store.reservationAttempts()) == 0 || store.dispatchN != 0 || client.calls != 0 {
+		t.Fatalf("cancelled reservation wait reached dispatch/provider or lost cancellation: attempts=%v dispatch=%d provider=%d err=%v",
+			store.reservationAttempts(), store.dispatchN, client.calls, err)
+	}
 }
 
 type modelGatewayResolverTest struct {

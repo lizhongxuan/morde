@@ -20,6 +20,12 @@ const start = {
   session_id: 'session_456', task_revision: 1, model: 'test-model', prompt: 'Hello from a local test',
 }
 
+function pendingRequestKey(request) {
+  if (request.type === 'child_create') return JSON.stringify(['child_session', request.session_id, request.call_id])
+  if (request.type === 'child_settle') return JSON.stringify(['child_settle_ack', request.session_id, request.call_id])
+  return request.id
+}
+
 function launch(onFrame, extraEnv = {}, entrypoint = 'bin.mjs') {
   const child = spawn(process.execPath, [entrypoint], {
     cwd: new URL('..', import.meta.url),
@@ -678,7 +684,7 @@ test('WorkerIPC reports waiting only after a request write completes and only wh
       const request = await requestWritten
       await new Promise(resolve => setImmediate(resolve))
       const requests = request.type.startsWith('child_') ? ipc.childPending : ipc.pending
-      const requestKey = request.id ?? request.call_id
+      const requestKey = pendingRequestKey(request)
       assert.equal(waitingAttempted, true)
       assert.equal(requests.get(requestKey)?.abandoned, undefined, 'telemetry failure must not abandon a dispatched request')
       ipc.dispatch(scenario.response(request))
@@ -979,20 +985,53 @@ test('late checkpoint and child responses after IPC cancellation are consumed on
         await assert.rejects(pending, /request cancelled/)
       }
       if (scenario.name === 'child session') {
-        const abandoned = ipc.childPending.get(request.call_id)
+        const abandoned = ipc.childPending.get(pendingRequestKey(request))
         assert.equal(Object.hasOwn(abandoned, 'arguments'), false, 'abandoned metadata must not retain the full child request')
         assert.equal(typeof abandoned.objectiveDigest, 'string')
         assert.equal(typeof abandoned.toolNamesDigest, 'string')
       }
       input.write(`${JSON.stringify(scenario.response(request))}\n`)
       assert.equal(ipc.failed, false, 'an exact late backend response is safely consumed')
-      assert.equal(ipc[scenario.map].has(request.id ?? request.call_id), false, 'the tombstone is consumed once')
+      assert.equal(ipc[scenario.map].has(pendingRequestKey(request)), false, 'the tombstone is consumed once')
       input.write(`${JSON.stringify(scenario.response(request))}\n`)
       assert.equal(ipc.failed, true, 'a duplicate response is still rejected')
       input.destroy()
       output.destroy()
     })
   }
+})
+
+test('child IPC correlates identical call IDs by parent session and settles independently', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  input.write(`${JSON.stringify(start)}\n`)
+  await ipc.start.promise
+  const first = taskFence(start)
+  const second = { ...first, session_id: 'other_parent' }
+  const args = { objective: 'Local work', title: 'Work', tool_names: [] }
+  const createdFirst = ipc.createChild(first, 0, 'same_call', args)
+  const createdSecond = ipc.createChild(second, 0, 'same_call', args)
+  await new Promise(resolve => setImmediate(resolve))
+  const response = (parent, childID) => ({ type: 'child_session', ...parent, session_id: childID,
+    parent_session_id: parent.session_id, call_id: 'same_call', objective: args.objective, tools: [],
+    checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+  ipc.dispatch(response(second, 'other_worker'))
+  ipc.dispatch(response(first, 'first_worker'))
+  assert.equal((await createdFirst).session_id, 'first_worker')
+  assert.equal((await createdSecond).session_id, 'other_worker')
+  const digest = createHash('sha256').update('{}').digest('hex')
+  const firstWorker = { ...first, session_id: 'first_worker' }
+  const secondWorker = { ...first, session_id: 'other_worker' }
+  const firstSettlement = ipc.settleChild(firstWorker, 'same_call', 'succeeded', 0, digest, 'First')
+  const secondSettlement = ipc.settleChild(secondWorker, 'same_call', 'succeeded', 0, digest, 'Second')
+  await new Promise(resolve => setImmediate(resolve))
+  ipc.dispatch({ type: 'child_settle_ack', ...secondWorker, call_id: 'same_call', ok: true })
+  ipc.dispatch({ type: 'child_settle_ack', ...firstWorker, call_id: 'same_call', ok: true })
+  await Promise.all([firstSettlement, secondSettlement])
+  assert.equal(ipc.childPending.size, 0)
+  input.destroy()
+  output.destroy()
 })
 
 test('late child session with a tool outside its original allowlist remains a protocol error', async () => {
@@ -1565,6 +1604,30 @@ test('only the allowlisted provider context overflow reaches DSH recovery', asyn
   output.destroy()
 })
 
+test('classified model failures preserve only approved codes and safe text', async () => {
+  const codes = [
+    'MODEL_PROVIDER_RATE_LIMITED', 'MODEL_PROVIDER_QUOTA_EXHAUSTED', 'MODEL_PROVIDER_REJECTED', 'MODEL_UNAVAILABLE',
+    'MODEL_AUTHORIZATION_FAILED', 'MODEL_PROVIDER_UNAVAILABLE', 'MODEL_REQUEST_TIMEOUT', 'MODEL_TRANSPORT_FAILURE',
+    'MODEL_INVALID_RESPONSE', 'MODEL_USAGE_UNKNOWN', 'MODEL_PROVIDER_ERROR', 'MODEL_REQUEST_FAILED',
+    'MODEL_BUDGET_EXHAUSTED', 'MODEL_TASK_BUDGET_EXHAUSTED',
+  ]
+  for (const code of codes) {
+    const input = new PassThrough()
+    const output = new PassThrough()
+    const ipc = new WorkerIPC(input, output)
+    input.write(`${JSON.stringify(start)}\n`)
+    const sentFrame = once(output, 'data')
+    const response = ipc.streamModel(taskFence(start), 'model_classified', 0, { messages: [], tools: [] })
+    const rejected = assert.rejects(response.next(), error => error.code === code && !error.message.includes('private provider text'))
+    await sentFrame
+    input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id: 'model_classified', ok: false, failure_code: code })}\n`)
+    await rejected
+    assert.equal(ipc.failed, false)
+    input.destroy()
+    output.destroy()
+  }
+})
+
 test('model failure frames reject provider text and non-allowlisted failure codes', async () => {
   const input = new PassThrough()
   const output = new PassThrough()
@@ -1576,6 +1639,23 @@ test('model failure frames reject provider text and non-allowlisted failure code
   await sentFrame
   input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id: 'model_bad_failure', ok: false,
     failure_code: 'provider said the private key was rejected' })}\n`)
+  await rejected
+  assert.equal(ipc.failed, true)
+  input.destroy()
+  output.destroy()
+})
+
+test('classified model failure rejects an extra provider message', async () => {
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  input.write(`${JSON.stringify(start)}\n`)
+  const sentFrame = once(output, 'data')
+  const response = ipc.streamModel(taskFence(start), 'model_extra_failure', 0, { messages: [], tools: [] })
+  const rejected = assert.rejects(response.next(), /request cancelled/)
+  await sentFrame
+  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id: 'model_extra_failure', ok: false,
+    failure_code: 'MODEL_REQUEST_TIMEOUT', message: 'private provider text' })}\n`)
   await rejected
   assert.equal(ipc.failed, true)
   input.destroy()
@@ -3261,6 +3341,448 @@ test('runs dsh_delegate in an isolated child session and waits for settlement be
   assert.ok(pagesBySession.get(childIdentity.session_id)?.length > 0)
 })
 
+test('foreground delegation can nest two levels without deadlock and returns each actual result', { timeout: 15000 }, async t => {
+  const models = new Map()
+  const settled = []
+  const coordinatorID = 'nested_coordinator'
+  const workerID = 'nested_worker'
+  const respondWithDelegate = (proc, frame, title) => {
+    const chunks = [
+      { type: 'tool-call-delta', index: 0, id: 'same_call_id', name: delegateTool.name,
+        argumentsDelta: JSON.stringify({ title, objective: `Run ${title}`, tool_names: ['file_read'] }) },
+      { type: 'finish', reason: { kind: 'tool-calls' } },
+    ]
+    chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+    send(proc, { type: 'model_end', id: frame.id, ok: true })
+  }
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool, ...jobTools] })
+    if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
+    if (frame.type === 'model') {
+      const count = (models.get(frame.session_id) ?? 0) + 1
+      models.set(frame.session_id, count)
+      if (frame.session_id === start.session_id && count === 1) respondWithDelegate(proc, frame, 'coordinator')
+      else if (frame.session_id === coordinatorID && count === 1) {
+        assert.deepEqual(frame.request.tools.map(tool => tool.name).sort(),
+          [fileReadTool, delegateTool, ...jobTools].map(tool => tool.name).sort())
+        respondWithDelegate(proc, frame, 'worker')
+      } else if (frame.session_id === workerID) {
+        assert.deepEqual(frame.request.tools, [fileReadTool], 'worker cannot delegate or control sibling jobs')
+        replyWithText(proc, frame, 'Verified worker result.')
+      } else {
+        const result = frame.request.messages.find(message => message.role === 'tool' && message.toolCallId === 'same_call_id')
+        assert.ok(result?.content[0].text.includes(frame.session_id === coordinatorID ? 'Verified worker result.' : 'Coordinator reviewed worker.'),
+          `${frame.session_id}: ${JSON.stringify(result)}`)
+        replyWithText(proc, frame, frame.session_id === coordinatorID ? 'Coordinator reviewed worker.' : 'Root reviewed coordinator.')
+      }
+    }
+    if (frame.type === 'child_create') {
+      const root = frame.session_id === start.session_id
+      assert.equal(frame.session_id, root ? start.session_id : coordinatorID)
+      send(proc, { type: 'child_session', ...taskFence(frame), session_id: root ? coordinatorID : workerID,
+        parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+        tools: root ? [fileReadTool, delegateTool, ...jobTools] : [fileReadTool],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'child_settle') {
+      settled.push(frame.session_id)
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+    }
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.deepEqual(settled, [workerID, coordinatorID])
+  assert.equal(frames.filter(frame => frame.type === 'child_create').length, 2)
+  assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
+test('coordinator runs two background grandchildren concurrently and reviews actual outcomes', { timeout: 20000 }, async t => {
+  const coordinatorID = 'background_coordinator'
+  const models = new Map()
+  const workers = new Map()
+  const settled = []
+  const sendCalls = (proc, frame, calls) => {
+    const chunks = calls.map((call, index) => ({ type: 'tool-call-delta', index, id: call.id,
+      name: delegateTool.name, argumentsDelta: JSON.stringify(call.args) }))
+    chunks.push({ type: 'finish', reason: { kind: 'tool-calls' } })
+    chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+    send(proc, { type: 'model_end', id: frame.id, ok: true })
+  }
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool, ...jobTools] })
+    if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
+    if (frame.type === 'model') {
+      const count = (models.get(frame.session_id) ?? 0) + 1
+      models.set(frame.session_id, count)
+      if (frame.session_id === start.session_id && count === 1) {
+        sendCalls(proc, frame, [{ id: 'spawn_coordinator', args: { title: 'Coordinate', objective: 'Review both workers', tool_names: ['file_read'] } }])
+      } else if (frame.session_id === coordinatorID && count === 1) {
+        sendCalls(proc, frame, [1, 2].map(index => ({ id: `spawn_nested_${index}`, args: {
+          title: `Worker ${index}`, objective: `Inspect ${index}`, tool_names: ['file_read'], run_in_background: true,
+        } })))
+      } else if (frame.session_id.startsWith('background_worker_')) {
+        assert.equal(workers.has(frame.session_id), false)
+        workers.set(frame.session_id, frame)
+        if (workers.size === 2) {
+          for (const [id, pending] of workers) replyWithText(proc, pending, `Actual result ${id}`)
+        }
+      } else if (frame.session_id === coordinatorID && count === 2) {
+        replyWithText(proc, frame, 'Waiting for worker results.')
+      } else if (frame.session_id === coordinatorID) {
+        const handoff = JSON.stringify(frame.request.messages)
+        assert.match(handoff, /Actual result background_worker_1/)
+        assert.match(handoff, /Actual result background_worker_2/)
+        assert.match(handoff, /succeeded/)
+        replyWithText(proc, frame, 'Coordinator checked both actual results.')
+      } else {
+        assert.ok(frame.request.messages.some(message => message.role === 'tool' &&
+          message.content.some(block => block.text?.includes('Coordinator checked both actual results.'))), JSON.stringify(frame.request.messages))
+        replyWithText(proc, frame, 'Root delivered both results.')
+      }
+    }
+    if (frame.type === 'child_create') {
+      const root = frame.session_id === start.session_id
+      const sessionID = root ? coordinatorID : `background_worker_${frame.call_id.slice(-1)}`
+      send(proc, { type: 'child_session', ...taskFence(frame), session_id: sessionID,
+        parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+        tools: root ? [fileReadTool, delegateTool, ...jobTools] : [fileReadTool],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'child_settle') {
+      settled.push(frame.session_id)
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+    }
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(workers.size, 2, 'both worker model requests were in flight before either was answered')
+  assert.ok(settled.indexOf(coordinatorID) > settled.indexOf('background_worker_1'))
+  assert.ok(settled.indexOf(coordinatorID) > settled.indexOf('background_worker_2'))
+  assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
+test('child response rejects an escalated delegate tool allowlist', { timeout: 10000 }, async t => {
+  const badDelegate = structuredClone(delegateTool)
+  badDelegate.parameters.properties.tool_names.items.enum = ['file_read', 'file_write']
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool] })
+    if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
+    if (frame.type === 'model') {
+      const chunks = [
+        { type: 'tool-call-delta', index: 0, id: 'call_escalation', name: delegateTool.name,
+          argumentsDelta: JSON.stringify({ title: 'Check', objective: 'Read.', tool_names: ['file_read'] }) },
+        { type: 'finish', reason: { kind: 'tool-calls' } },
+      ]
+      chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+      send(proc, { type: 'model_end', id: frame.id, ok: true })
+    }
+    if (frame.type === 'child_create') send(proc, { type: 'child_session', ...taskFence(frame), session_id: 'child_escalation',
+      parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+      tools: [fileReadTool, badDelegate, ...jobTools], checkpoint_through_seq: -1, checkpoint_sha256: '',
+      step_status: 'running', summary: '' })
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const [code] = await once(child, 'close')
+  assert.ok(code !== 0 || frames.find(frame => frame.type === 'settled')?.state !== 'completed_candidate')
+  assert.equal(frames.some(frame => frame.type === 'model' && frame.session_id === 'child_escalation'), false)
+})
+
+test('a nested worker model failure is settled locally and its sibling continues', { timeout: 15000 }, async t => {
+  const coordinatorID = 'failure_coordinator'
+  const workers = new Map()
+  const models = new Map()
+  const settled = new Map()
+  let reviewed = false
+  const sendCalls = (proc, frame, calls) => {
+    const chunks = calls.map((call, index) => ({ type: 'tool-call-delta', index, id: call.id,
+      name: delegateTool.name, argumentsDelta: JSON.stringify(call.args) }))
+    chunks.push({ type: 'finish', reason: { kind: 'tool-calls' } })
+    chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+    send(proc, { type: 'model_end', id: frame.id, ok: true })
+  }
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool, ...jobTools] })
+    if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
+    if (frame.type === 'child_create') {
+      const root = frame.session_id === start.session_id
+      send(proc, { type: 'child_session', ...taskFence(frame), session_id: root ? coordinatorID : `failure_worker_${frame.call_id.slice(-1)}`,
+        parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+        tools: root ? [fileReadTool, delegateTool, ...jobTools] : [fileReadTool],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'model') {
+      const count = (models.get(frame.session_id) ?? 0) + 1
+      models.set(frame.session_id, count)
+      if (frame.session_id === start.session_id && count === 1) {
+        sendCalls(proc, frame, [{ id: 'spawn_coordinator', args: { title: 'Coordinate', objective: 'Review workers', tool_names: ['file_read'] } }])
+      } else if (frame.session_id === coordinatorID && count === 1) {
+        sendCalls(proc, frame, [1, 2].map(index => ({ id: `spawn_failure_${index}`, args: {
+          title: `Worker ${index}`, objective: `Inspect ${index}`, tool_names: ['file_read'], run_in_background: true,
+        } })))
+      } else if (frame.session_id.startsWith('failure_worker_')) {
+        workers.set(frame.session_id, frame)
+        if (workers.size === 2) {
+          const failed = workers.get('failure_worker_1')
+          send(proc, { type: 'model_end', ...taskFence(failed), id: failed.id, ok: false, failure_code: 'MODEL_REQUEST_TIMEOUT' })
+          replyWithText(proc, workers.get('failure_worker_2'), 'Successful sibling result.')
+        }
+      } else if (frame.session_id === coordinatorID && count === 2) {
+        replyWithText(proc, frame, 'Waiting for both workers.')
+      } else if (frame.session_id === coordinatorID) {
+        const handoff = JSON.stringify(frame.request.messages)
+        assert.match(handoff, /failure_worker_1/)
+        assert.match(handoff, /failed/)
+        assert.match(handoff, /MODEL_REQUEST_TIMEOUT/)
+        assert.match(handoff, /failure_worker_2/)
+        assert.match(handoff, /Successful sibling result/)
+        reviewed = true
+        replyWithText(proc, frame, 'One worker failed; the sibling completed.')
+      } else replyWithText(proc, frame, 'Reported both outcomes.')
+    }
+    if (frame.type === 'child_settle') {
+      if (frame.session_id === 'failure_worker_1') assert.match(frame.summary, /MODEL_REQUEST_TIMEOUT/)
+      settled.set(frame.session_id, frame.status)
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+    }
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `failed=${JSON.stringify(frames.find(frame => frame.type === 'failed'))}`)
+  assert.equal(workers.size, 2)
+  assert.equal(settled.get('failure_worker_1'), 'failed')
+  assert.equal(settled.get('failure_worker_2'), 'succeeded')
+  assert.equal(settled.get(coordinatorID), 'succeeded')
+  assert.equal(reviewed, true)
+  assert.equal(frames.some(frame => frame.type === 'model_cancel' && frame.session_id === 'failure_worker_2'), false)
+  assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
+test('a failed coordinator waits for its worker without starting another model turn', { timeout: 15000 }, async t => {
+  const coordinatorID = 'failed_parent_coordinator'
+  const workerID = 'failed_parent_worker'
+  const models = new Map()
+  const settled = []
+  let waitingWorker
+  let coordinatorFailed = false
+  const sendCall = (proc, frame, id, background) => {
+    send(proc, { type: 'model_chunk', id: frame.id, index: 0, chunk: { type: 'tool-call-delta', index: 0,
+      id, name: delegateTool.name, argumentsDelta: JSON.stringify({ title: id, objective: `Run ${id}`,
+        tool_names: ['file_read'], ...(background ? { run_in_background: true } : {}) }) } })
+    send(proc, { type: 'model_chunk', id: frame.id, index: 1, chunk: { type: 'finish', reason: { kind: 'tool-calls' } } })
+    send(proc, { type: 'model_end', id: frame.id, ok: true })
+  }
+  const maybeFinishWorker = proc => {
+    if (!coordinatorFailed || !waitingWorker) return
+    replyWithText(proc, waitingWorker, 'Worker completed independently.')
+    waitingWorker = undefined
+  }
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool, ...jobTools] })
+    if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
+    if (frame.type === 'child_create') {
+      const root = frame.session_id === start.session_id
+      send(proc, { type: 'child_session', ...taskFence(frame), session_id: root ? coordinatorID : workerID,
+        parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+        tools: root ? [fileReadTool, delegateTool, ...jobTools] : [fileReadTool],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'model') {
+      const count = (models.get(frame.session_id) ?? 0) + 1
+      models.set(frame.session_id, count)
+      if (frame.session_id === start.session_id && count === 1) sendCall(proc, frame, 'spawn_failed_coordinator', false)
+      else if (frame.session_id === coordinatorID && count === 1) sendCall(proc, frame, 'spawn_surviving_worker', true)
+      else if (frame.session_id === coordinatorID && count === 2) {
+        coordinatorFailed = true
+        send(proc, { type: 'model_end', ...taskFence(frame), id: frame.id, ok: false, failure_code: 'MODEL_REQUEST_TIMEOUT' })
+        maybeFinishWorker(proc)
+      } else if (frame.session_id === workerID) {
+        waitingWorker = frame
+        maybeFinishWorker(proc)
+      } else if (frame.session_id === coordinatorID) assert.fail('a failed coordinator must not start another turn')
+      else {
+        assert.match(JSON.stringify(frame.request.messages), /MODEL_REQUEST_TIMEOUT/)
+        replyWithText(proc, frame, 'The coordinator failed due to a model timeout.')
+      }
+    }
+    if (frame.type === 'child_settle') {
+      if (frame.session_id === coordinatorID) {
+        assert.equal(frame.status, 'failed')
+        assert.match(frame.summary, /MODEL_REQUEST_TIMEOUT/)
+        assert.ok(settled.includes(workerID), 'the failed parent waits for its worker to settle')
+      }
+      settled.push(frame.session_id)
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+    }
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `failed=${JSON.stringify(frames.find(frame => frame.type === 'failed'))}`)
+  assert.deepEqual(settled, [workerID, coordinatorID])
+  assert.equal(models.get(coordinatorID), 2)
+  assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
+test('cancelling a coordinator cancels its worker while an independent sibling continues', { timeout: 15000 }, async t => {
+  const coordinatorID = 'cancel_coordinator'
+  const workerID = 'cancel_nested_worker'
+  const siblingID = 'cancel_independent_sibling'
+  const models = new Map()
+  const waiting = new Map()
+  const settled = new Map()
+  let rootCancelModel
+  let coordinatorWaiting = false
+  let cancelCall
+  let requested = false
+  const sendCall = (proc, frame, id, name, args) => {
+    send(proc, { type: 'model_chunk', id: frame.id, index: 0, chunk: { type: 'tool-call-delta', index: 0,
+      id, name, argumentsDelta: JSON.stringify(args) } })
+    send(proc, { type: 'model_chunk', id: frame.id, index: 1, chunk: { type: 'finish', reason: { kind: 'tool-calls' } } })
+    send(proc, { type: 'model_end', id: frame.id, ok: true })
+  }
+  const requestWhenRunning = proc => {
+    if (requested || !rootCancelModel || !coordinatorWaiting || !waiting.has(workerID) || !waiting.has(siblingID)) return
+    requested = true
+    sendCall(proc, rootCancelModel, 'cancel_coordinator_call', jobCancelTool.name, { job_id: coordinatorID })
+  }
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool, ...jobTools] })
+    if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
+    if (frame.type === 'child_create') {
+      const root = frame.session_id === start.session_id
+      const sessionID = root ? frame.call_id === 'spawn_cancel_coordinator' ? coordinatorID : siblingID : workerID
+      send(proc, { type: 'child_session', ...taskFence(frame), session_id: sessionID,
+        parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+        tools: sessionID === coordinatorID ? [fileReadTool, delegateTool, ...jobTools] : [fileReadTool],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'model') {
+      const count = (models.get(frame.session_id) ?? 0) + 1
+      models.set(frame.session_id, count)
+      if (frame.session_id === start.session_id && count <= 2) {
+        sendCall(proc, frame, count === 1 ? 'spawn_cancel_coordinator' : 'spawn_cancel_sibling', delegateTool.name,
+          { title: 'Background', objective: `Work ${count}`, tool_names: ['file_read'], run_in_background: true })
+      } else if (frame.session_id === start.session_id && count === 3) {
+        rootCancelModel = frame
+        requestWhenRunning(proc)
+      } else if (frame.session_id === start.session_id) {
+        assert.ok(frame.request.messages.some(message => message.role === 'tool' && message.toolCallId === 'cancel_coordinator_call' &&
+          message.content.some(block => block.text?.includes('cancelled'))))
+        replyWithText(proc, frame, 'Coordinator cancelled, independent sibling continued.')
+      } else if (frame.session_id === coordinatorID && count === 1) {
+        sendCall(proc, frame, 'spawn_cancel_worker', delegateTool.name,
+          { title: 'Worker', objective: 'Wait for cancellation', tool_names: ['file_read'], run_in_background: true })
+      } else if (frame.session_id === coordinatorID) {
+        coordinatorWaiting = true
+        replyWithText(proc, frame, 'Waiting for the worker.')
+        requestWhenRunning(proc)
+      } else {
+        waiting.set(frame.session_id, frame)
+        requestWhenRunning(proc)
+      }
+    }
+    if (frame.type === 'tool_call' && frame.call_id === 'cancel_coordinator_call') {
+      cancelCall = frame
+      send(proc, { type: 'job_cancel', id: 'cancel_coordinator_request', ...taskFence(frame), job_id: coordinatorID })
+    }
+    if (frame.type === 'model_cancel') {
+      assert.equal(frame.session_id, workerID)
+      send(proc, { type: 'model_end', ...taskFence(frame), id: frame.id, ok: false })
+    }
+    if (frame.type === 'child_settle') {
+      settled.set(frame.session_id, frame.status)
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+    }
+    if (frame.type === 'job_cancel_result') {
+      assert.equal(frame.status, 'cancelled')
+      assert.equal(settled.get(workerID), 'failed')
+      assert.equal(settled.get(coordinatorID), 'failed')
+      assert.equal(settled.has(siblingID), false)
+      send(proc, { type: 'tool_result', id: cancelCall.id, ...taskFence(cancelCall), call_id: cancelCall.call_id,
+        status: 'succeeded', output: JSON.stringify({ job_id: coordinatorID, status: 'cancelled' }) })
+      replyWithText(proc, waiting.get(siblingID), 'Independent sibling completed.')
+    }
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `failed=${JSON.stringify(frames.find(frame => frame.type === 'failed'))}`)
+  assert.equal(settled.get(siblingID), 'succeeded')
+  assert.equal(frames.some(frame => frame.type === 'model_cancel' && frame.session_id === siblingID), false)
+  assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
+test('a coordinator can cancel only its own background worker', { timeout: 15000 }, async t => {
+  const coordinatorID = 'nested_cancel_owner'
+  const workerID = 'nested_cancel_child'
+  const models = new Map()
+  let coordinatorModel
+  let workerModel
+  let forgedSent = false
+  let cancelCall
+  const sendCall = (proc, frame, id, name, args) => {
+    send(proc, { type: 'model_chunk', id: frame.id, index: 0, chunk: { type: 'tool-call-delta', index: 0,
+      id, name, argumentsDelta: JSON.stringify(args) } })
+    send(proc, { type: 'model_chunk', id: frame.id, index: 1, chunk: { type: 'finish', reason: { kind: 'tool-calls' } } })
+    send(proc, { type: 'model_end', id: frame.id, ok: true })
+  }
+  const tryForged = proc => {
+    if (forgedSent || !coordinatorModel || !workerModel) return
+    forgedSent = true
+    send(proc, { type: 'job_cancel', id: 'wrong_parent_request', ...taskFence(start), job_id: workerID })
+  }
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool, ...jobTools] })
+    if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
+    if (frame.type === 'child_create') {
+      const root = frame.session_id === start.session_id
+      send(proc, { type: 'child_session', ...taskFence(frame), session_id: root ? coordinatorID : workerID,
+        parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+        tools: root ? [fileReadTool, delegateTool, ...jobTools] : [fileReadTool],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'model') {
+      const count = (models.get(frame.session_id) ?? 0) + 1
+      models.set(frame.session_id, count)
+      if (frame.session_id === start.session_id && count === 1) {
+        sendCall(proc, frame, 'spawn_owner', delegateTool.name, { title: 'Owner', objective: 'Manage worker', tool_names: ['file_read'] })
+      } else if (frame.session_id === coordinatorID && count === 1) {
+        sendCall(proc, frame, 'spawn_owned_worker', delegateTool.name,
+          { title: 'Worker', objective: 'Wait', tool_names: ['file_read'], run_in_background: true })
+      } else if (frame.session_id === coordinatorID && count === 2) {
+        coordinatorModel = frame
+        tryForged(proc)
+      } else if (frame.session_id === coordinatorID) {
+        replyWithText(proc, frame, 'Worker was cancelled.')
+      } else if (frame.session_id === workerID) {
+        workerModel = frame
+        tryForged(proc)
+      } else replyWithText(proc, frame, 'Cancellation was reported.')
+    }
+    if (frame.type === 'job_cancel_result' && frame.id === 'wrong_parent_request') {
+      assert.equal(frame.status, 'unknown')
+      assert.equal(frames.some(item => item.type === 'model_cancel' && item.session_id === workerID), false)
+      sendCall(proc, coordinatorModel, 'cancel_owned_worker', jobCancelTool.name, { job_id: workerID })
+    }
+    if (frame.type === 'tool_call' && frame.call_id === 'cancel_owned_worker') {
+      cancelCall = frame
+      send(proc, { type: 'job_cancel', id: 'owned_cancel_request', ...taskFence(frame), job_id: workerID })
+    }
+    if (frame.type === 'model_cancel') send(proc, { type: 'model_end', ...taskFence(frame), id: frame.id, ok: false })
+    if (frame.type === 'child_settle') send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+    if (frame.type === 'job_cancel_result' && frame.id === 'owned_cancel_request') {
+      assert.equal(frame.session_id, coordinatorID)
+      assert.equal(frame.status, 'cancelled')
+      send(proc, { type: 'tool_result', id: cancelCall.id, ...taskFence(cancelCall), call_id: cancelCall.call_id,
+        status: 'succeeded', output: JSON.stringify({ job_id: workerID, status: 'cancelled' }) })
+    }
+  })
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `failed=${JSON.stringify(frames.find(frame => frame.type === 'failed'))}`)
+  assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+})
+
 test('starts a dependent child only after the prerequisite result is settled', { timeout: 10000 }, async t => {
   const throughBySession = new Map()
   const settled = []
@@ -4464,6 +4986,101 @@ async function captureInterruptedDelegateChildSession() {
   return pagesBySession
 }
 
+async function captureNestedBackgroundInterruption(mode) {
+  const coordinatorID = 'recovered_coordinator'
+  const workerID = 'recovered_worker'
+  const pagesBySession = new Map()
+  const models = new Map()
+  let coordinatorWaiting = false
+  let workerWaiting = false
+  let workerSettled = false
+  let sideEffects = 0
+  const delegate = (proc, frame, callID, background) => {
+    send(proc, { type: 'model_chunk', id: frame.id, index: 0, chunk: { type: 'tool-call-delta', index: 0,
+      id: callID, name: delegateTool.name, argumentsDelta: JSON.stringify({ title: callID, objective: `Run ${callID}`,
+        tool_names: ['file_read'], ...(background ? { run_in_background: true } : {}) }) } })
+    send(proc, { type: 'model_chunk', id: frame.id, index: 1, chunk: { type: 'finish', reason: { kind: 'tool-calls' } } })
+    send(proc, { type: 'model_end', id: frame.id, ok: true })
+  }
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [delegateTool, fileReadTool, ...jobTools] })
+    if (frame.type === 'checkpoint') {
+      const pages = pagesBySession.get(frame.session_id) ?? []
+      assert.equal(frame.from_seq, (pages.at(-1)?.through_seq ?? -1) + 1)
+      pages.push({ from_seq: frame.from_seq, through_seq: frame.through_seq, payload: frame.payload, sha256: frame.sha256 })
+      pagesBySession.set(frame.session_id, pages)
+      acknowledgeCheckpoint(proc, frame)
+    }
+    if (frame.type === 'child_create') {
+      if (frame.session_id === coordinatorID && mode === 'before-handle') {
+        proc.kill('SIGKILL')
+        return
+      }
+      const root = frame.session_id === start.session_id
+      send(proc, { type: 'child_session', ...taskFence(frame), session_id: root ? coordinatorID : workerID,
+        parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+        tools: root ? [fileReadTool, delegateTool, ...jobTools] : [fileReadTool],
+        checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '' })
+    }
+    if (frame.type === 'model') {
+      const count = (models.get(frame.session_id) ?? 0) + 1
+      models.set(frame.session_id, count)
+      if (frame.session_id === start.session_id && count === 1) delegate(proc, frame, 'restore_coordinator', mode === 'cancel-recovery')
+      else if (frame.session_id === start.session_id) return
+      else if (frame.session_id === coordinatorID && count === 1) delegate(proc, frame, 'restore_worker', true)
+      else if (frame.session_id === coordinatorID && mode === 'reviewed') {
+        if (count === 2) replyWithText(proc, frame, 'Waiting for the worker.')
+        else {
+          assert.match(JSON.stringify(frame.request.messages), /Previously completed worker result/)
+          replyWithText(proc, frame, 'Previously reviewed worker.')
+        }
+      }
+      else if (frame.session_id === coordinatorID) {
+        coordinatorWaiting = true
+        if (mode === 'running' && workerWaiting || ['settled', 'failed'].includes(mode) && workerSettled) proc.kill('SIGKILL')
+      } else if (frame.session_id === workerID && count === 1) {
+        send(proc, { type: 'model_chunk', id: frame.id, index: 0, chunk: { type: 'tool-call-delta', index: 0,
+          id: 'worker_read_once', name: fileReadTool.name, argumentsDelta: JSON.stringify({ path: 'notes.txt' }) } })
+        send(proc, { type: 'model_chunk', id: frame.id, index: 1, chunk: { type: 'finish', reason: { kind: 'tool-calls' } } })
+        send(proc, { type: 'model_end', id: frame.id, ok: true })
+      } else if (frame.session_id === workerID) {
+        workerWaiting = true
+        if (mode === 'settled' || mode === 'reviewed') replyWithText(proc, frame, 'Previously completed worker result.')
+        else if (mode === 'failed') send(proc, { type: 'model_end', ...taskFence(frame), id: frame.id, ok: false,
+          failure_code: 'MODEL_REQUEST_TIMEOUT' })
+        else if (coordinatorWaiting) proc.kill('SIGKILL')
+      }
+    }
+    if (frame.type === 'tool_call') {
+      assert.equal(frame.call_id, 'worker_read_once')
+      sideEffects++
+      send(proc, { type: 'tool_result', id: frame.id, ...taskFence(frame), call_id: frame.call_id,
+        status: 'succeeded', output: 'Stored notes output.' })
+    }
+    if (frame.type === 'child_settle') {
+      if (frame.session_id === coordinatorID && mode === 'reviewed') {
+        proc.kill('SIGKILL')
+        return
+      }
+      assert.equal(frame.session_id, workerID)
+      workerSettled = true
+      send(proc, { type: 'child_settle_ack', ...taskFence(frame), call_id: frame.call_id, ok: true })
+      if (['settled', 'failed'].includes(mode) && coordinatorWaiting) proc.kill('SIGKILL')
+    }
+  })
+  const [code, signal] = await once(child, 'close')
+  assert.equal(signal, 'SIGKILL', `mode=${mode}, code=${code}, frames=${frames.map(frame => frame.type).join(', ')}`)
+  assert.ok(pagesBySession.get(start.session_id)?.length)
+  assert.ok(pagesBySession.get(coordinatorID)?.length)
+  if (mode !== 'before-handle') {
+    assert.equal(sideEffects, 1)
+    assert.ok(pagesBySession.get(workerID)?.length)
+    const events = pagesBySession.get(coordinatorID).flatMap(page => JSON.parse(page.payload).events)
+    assert.ok(events.some(event => event.type === 'tool/result' && event.data.message?.toolCallId === 'restore_worker'))
+  }
+  return { coordinatorID, workerID, pagesBySession, sideEffects }
+}
+
 async function captureToolResultInterrupted(tool, argumentsJSON, callID, result) {
   const pages = []
   let modelCalls = 0
@@ -5074,6 +5691,101 @@ async function resumeSession(pages, { alterStart = value => value, alterPage = v
   const [code] = await once(child, 'close')
   return { code, frames, emitted, offsets, modelCalls, modelRequests, sentToolResults, sentChildSessions }
 }
+
+for (const mode of ['before-handle', 'running', 'recover-fails', 'settled', 'failed', 'reviewed', 'unknown']) {
+  test(`restores nested background worker ${mode} without repeating completed actions`, { timeout: 25000 }, async () => {
+    const captured = await captureNestedBackgroundInterruption(['unknown', 'recover-fails'].includes(mode) ? 'running' : mode)
+    const { coordinatorID, workerID, pagesBySession } = captured
+    let reviewed = false
+    const result = await resumeSession(pagesBySession.get(start.session_id), {
+      tools: [delegateTool, fileReadTool, ...jobTools], checkpointPagesBySession: pagesBySession,
+      onChildCreate(frame) {
+        const root = frame.session_id === start.session_id
+        assert.equal(frame.call_id, root ? 'restore_coordinator' : 'restore_worker')
+        assert.equal(frame.session_id, root ? start.session_id : coordinatorID)
+        const sessionID = root ? coordinatorID : workerID
+        const tail = pagesBySession.get(sessionID)?.at(-1)
+        return { type: 'child_session', ...taskFence(frame), session_id: sessionID,
+          parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+          tools: root ? [fileReadTool, delegateTool, ...jobTools] : [fileReadTool],
+          checkpoint_through_seq: tail?.through_seq ?? -1, checkpoint_sha256: tail?.sha256 ?? '',
+          step_status: root ? 'running' : ['settled', 'reviewed'].includes(mode) ? 'succeeded' : mode === 'failed' ? 'failed' : mode === 'unknown' ? 'unknown' : 'running',
+          summary: !root && ['settled', 'reviewed'].includes(mode) ? 'Previously completed worker result.' :
+            !root && mode === 'failed' ? 'The model request timed out. (MODEL_REQUEST_TIMEOUT)' : '' }
+      },
+      onToolCall(frame) {
+        assert.ok(['running', 'recover-fails'].includes(mode))
+        assert.equal(frame.session_id, workerID)
+        assert.equal(frame.call_id, 'worker_read_once')
+        return { status: 'succeeded', output: 'Stored notes output.' }
+      },
+      onModel(frame, proc) {
+        if (frame.session_id === workerID) {
+          assert.ok(!['settled', 'failed', 'reviewed'].includes(mode), 'a settled worker must never execute again')
+          if (mode === 'recover-fails') send(proc, { type: 'model_end', ...taskFence(frame), id: frame.id, ok: false,
+            failure_code: 'MODEL_REQUEST_TIMEOUT' })
+          else replyWithText(proc, frame, 'Recovered worker result.')
+        } else if (frame.session_id === coordinatorID) {
+          const messages = JSON.stringify(frame.request.messages)
+          if (messages.includes('Review these actual delegated worker outcomes')) {
+            reviewed = true
+            assert.match(messages, mode === 'settled' ? /Previously completed worker result/ :
+              ['failed', 'recover-fails'].includes(mode) ? /MODEL_REQUEST_TIMEOUT/ : /Recovered worker result/)
+            replyWithText(proc, frame, 'Coordinator reviewed the worker.')
+          } else replyWithText(proc, frame, 'Waiting for the worker.')
+        } else replyWithText(proc, frame, 'Root reviewed the coordinator.')
+      },
+    })
+    if (mode === 'unknown') {
+      assert.notEqual(result.frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+      assert.equal(result.frames.some(frame => frame.type === 'model' && frame.session_id === workerID), false)
+      return
+    }
+    assert.equal(result.code, 0, `mode=${mode}, failed=${JSON.stringify(result.frames.find(frame => frame.type === 'failed'))}, frames=${result.frames.map(frame => `${frame.type}:${frame.session_id ?? ''}`).join(', ')}`)
+    assert.equal(result.frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+    assert.equal(reviewed, mode !== 'reviewed', 'a recorded completed review must not be replayed')
+    assert.equal(result.sentToolResults.length, ['running', 'recover-fails'].includes(mode) ? 1 : 0)
+    if (['settled', 'failed', 'reviewed'].includes(mode)) {
+      assert.equal(result.frames.some(frame => frame.type === 'child_settle' && frame.session_id === workerID), false)
+    }
+    if (mode === 'reviewed') assert.equal(result.frames.some(frame => frame.type === 'model' && frame.session_id === coordinatorID), false)
+  })
+}
+
+test('cancelling a recovering coordinator never starts an unmounted grandchild', { timeout: 25000 }, async () => {
+  const { coordinatorID, workerID, pagesBySession } = await captureNestedBackgroundInterruption('cancel-recovery')
+  const coordinatorTail = pagesBySession.get(coordinatorID).at(-1)
+  let cancellationSent = false
+  const result = await resumeSession(pagesBySession.get(start.session_id), {
+    tools: [delegateTool, fileReadTool, ...jobTools], checkpointPagesBySession: pagesBySession,
+    alterStart(value) {
+      return { ...value, background_jobs: [{ ...taskFence(value), session_id: coordinatorID, parent_session_id: value.session_id,
+        spawn_key: 'restore_coordinator', title: 'restore_coordinator', background: true, cancel_requested: false,
+        step_status: 'running', tools: [fileReadTool, delegateTool, ...jobTools],
+        checkpoint_through_seq: coordinatorTail.through_seq, checkpoint_sha256: coordinatorTail.sha256 }] }
+    },
+    onChildCreate(frame, proc) {
+      const root = frame.session_id === start.session_id
+      const sessionID = root ? coordinatorID : workerID
+      const tail = pagesBySession.get(sessionID).at(-1)
+      if (!root) {
+        cancellationSent = true
+        send(proc, { type: 'job_cancel', ...taskFence(frame), session_id: start.session_id,
+          id: 'cancel_during_restore', job_id: coordinatorID })
+      }
+      return { type: 'child_session', ...taskFence(frame), session_id: sessionID,
+        parent_session_id: frame.session_id, call_id: frame.call_id, objective: frame.arguments.objective,
+        tools: root ? [fileReadTool, delegateTool, ...jobTools] : [fileReadTool],
+        checkpoint_through_seq: tail.through_seq, checkpoint_sha256: tail.sha256, step_status: 'running', summary: '' }
+    },
+  })
+  assert.equal(cancellationSent, true)
+  assert.notEqual(result.frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
+  assert.equal(result.frames.some(frame => frame.type === 'checkpoint_read' && frame.session_id === workerID), false)
+  assert.equal(result.frames.some(frame => frame.type === 'model' && frame.session_id === workerID), false)
+  assert.equal(result.frames.some(frame => frame.type === 'job_cancel_result' && frame.status === 'cancelled'), false,
+    'the broker must reconcile the unmounted descendant before claiming cancellation')
+})
 
 test('restores a completed dsh session from verified pages without replaying the prompt', async () => {
   const pages = await captureSession()
@@ -6325,6 +7037,47 @@ test('account runtime drops exact late checkpoint and child replies during Task 
     'late_task_response_mismatch', 'late_task_response_mismatch', 'late_task_response_mismatch', 'unknown_task',
   ])
   assert.equal(runtime.lateTaskResponses.size, 0, 'each exact retired response consumes one tombstone')
+})
+
+test('account runtime isolates identical child call IDs by parent while active and after exit', async () => {
+  const runtime = new AccountRuntime(new PassThrough(), new PassThrough())
+  runtime.runtime = account
+  const sent = []
+  const writes = []
+  runtime.send = async frame => sent.push(frame)
+  const fence = taskFence(accountTask('task_nested_late', 'Nested replies', 8))
+  const key = JSON.stringify(['task_id', 'owner_id', 'agent_id', 'session_id', 'generation', 'authorization_version']
+    .map(field => fence[field]))
+  const task = { fence, key, runtimeSequence: 8, startFrame: { tools: [delegateTool, fileReadTool, ...jobTools] },
+    outputBuffer: Buffer.alloc(0), outputFrames: Promise.resolve(), readyReceived: true,
+    started: { promise: Promise.resolve() }, startDispatchFailed: false, terminal: false, terminated: false,
+    pendingToolCalls: new Map(), pendingResponses: new Map(),
+    child: { stdin: { destroyed: false, write(bytes, callback) { writes.push(JSON.parse(bytes.toString())); callback() } } } }
+  runtime.tasks.set(key, task)
+  const nestedParent = 'late_parent_coordinator'
+  for (const sessionID of [fence.session_id, nestedParent]) {
+    const frame = { type: 'child_create', ...fence, session_id: sessionID, call_id: 'shared_call_id',
+      arguments: { objective: 'Read notes', title: 'Read', tool_names: ['file_read'] } }
+    runtime.receiveTaskOutput(task, `${JSON.stringify(frame)}\n`)
+  }
+  await task.outputFrames
+  assert.equal(task.pendingResponses.size, 2)
+  const response = (parent, session, tools) => ({ type: 'child_session', ...fence, session_id: session,
+    parent_session_id: parent, call_id: 'shared_call_id', objective: 'Read notes', tools,
+    checkpoint_through_seq: -1, checkpoint_sha256: '', step_status: 'running', summary: '',
+    server_instance_id: account.server_instance_id, runtime_id: account.runtime_id,
+    runtime_generation: account.runtime_generation, runtime_sequence: 8 })
+  await runtime.routeTaskFrame(response(fence.session_id, 'late_parent_coordinator', [fileReadTool, delegateTool, ...jobTools]))
+  assert.equal(writes.length, 1)
+  assert.equal(task.pendingResponses.size, 1, 'a delivered active reply is removed before its account fence is stripped')
+  task.exit = { code: 0 }
+  runtime.finishTask(task, false)
+  assert.equal(runtime.lateTaskResponses.size, 1)
+  await runtime.routeTaskFrame(response(nestedParent, 'late_nested_child', [fileReadTool, delegateTool, ...jobTools]))
+  assert.equal(runtime.lateTaskResponses.size, 1, 'a late worker reply cannot add delegation controls')
+  await runtime.routeTaskFrame(response(nestedParent, 'late_nested_child', [fileReadTool]))
+  assert.equal(runtime.lateTaskResponses.size, 0)
+  assert.deepEqual(sent.filter(frame => frame.type === 'protocol_error').map(frame => frame.code), ['late_task_response_mismatch'])
 })
 
 test('account runtime consumes only exact late coordinator replies during exit and after retirement', async () => {

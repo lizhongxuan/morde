@@ -16,7 +16,7 @@ export type K2TaskProjectionRead =
 const taskStatuses = new Set<TaskStatus>([
   'queued', 'running', 'waiting_user', 'pausing', 'paused', 'cancelling', 'completed', 'failed', 'cancelled',
 ]);
-const taskStepStatuses = new Set<TaskStepStatus>(['queued', 'running', 'waiting_user', 'succeeded', 'failed', 'unknown']);
+const taskStepStatuses = new Set<TaskStepStatus>(['queued', 'running', 'waiting_user', 'succeeded', 'failed', 'cancelled', 'unknown']);
 const resultReviewStates = new Set<K2ResultReview['state']>(['pending', 'processing', 'published', 'failed']);
 const projectionFields = ['dependencies', 'child_jobs', 'result_review'] as const;
 

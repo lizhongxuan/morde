@@ -115,8 +115,9 @@ type Progress struct {
 // Result preserves the latest session known to the client even when a transfer
 // fails, so the caller can resume it by passing Session.ID in SyncOptions.
 type Result struct {
-	Session   SyncSession
-	Conflicts []Conflict
+	Session             SyncSession
+	Conflicts           []Conflict
+	SnapshotFingerprint string
 }
 
 // SyncSession is the transport representation of the Portal API session.
@@ -375,6 +376,13 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 		}
 	}
 	result := Result{Session: session, Conflicts: append([]Conflict(nil), session.Conflicts...)}
+	if options.FolderID != "" {
+		fingerprint, fingerprintErr := mordesync.ManifestFingerprint(local)
+		if fingerprintErr != nil {
+			return result, fingerprintErr
+		}
+		result.SnapshotFingerprint = fingerprint
+	}
 	if err != nil {
 		return result, err
 	}

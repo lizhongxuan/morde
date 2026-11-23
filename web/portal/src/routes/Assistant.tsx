@@ -46,6 +46,7 @@ type TaskSummary = Awaited<ReturnType<typeof portalApi.tasks>>['items'][number];
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
 type TaskStep = Task['steps'][number];
 type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
+type TaskStepDetailWithExecution = Omit<TaskStepDetail, 'execution'> & { execution?: TaskStepDetail['execution'] | null };
 type TaskArtifact = Task['artifacts'][number];
 type AssistantPanelTab = 'tasks' | 'files' | 'computer';
 type AssistantOutletContext = {
@@ -158,6 +159,15 @@ function conversationMessageStatus(message: AssistantDisplayMessage, task?: Task
   if (routingStatus) return routingStatus;
   if (message.delivery_status !== 'pending' || (task && terminalTaskStatuses.has(task.status))) return null;
   return deliveryStatusText('pending');
+}
+
+function conversationRoutingFailureText(message: AssistantDisplayMessage): string | null {
+  if (message.role !== 'user' || message.routing_status !== 'failed' || message.task_id ||
+    message.related_task_id || message.duplicate_of_message_id) return null;
+  if (message.routing_failure_reason === 'message_too_long') {
+    return '消息及上下文超过模型输入限制，原消息已保留；请缩短后重新发送。';
+  }
+  return '消息处理失败，原消息已保留。';
 }
 
 function hasCompleteVerifiedArtifactProof(artifact: TaskArtifact): boolean {
@@ -431,6 +441,79 @@ function stepTitle(step: Task['steps'][number]): string {
   return stepPresentationTitle(step.title);
 }
 
+function taskStepStatusText(status: string): string {
+  switch (status) {
+    case 'queued': return '等待执行';
+    case 'running': return '进行中';
+    case 'waiting_user': return '等待用户';
+    case 'succeeded': return '已完成';
+    case 'failed': return '失败';
+    case 'cancelled': return '已取消';
+    default: return '状态待确认';
+  }
+}
+
+const taskStepOutputMaxBytes = 64 * 1024;
+const taskStepOutputPreviewCharacters = 2_000;
+
+function safeTaskStepOutput(value: unknown): { value: string; truncated: boolean } | null {
+  if (typeof value !== 'string') return null;
+  const redacted = safeTaskActivityText(value, taskStepOutputMaxBytes);
+  let bytes = 0;
+  let bounded = '';
+  let byteTruncated = false;
+  for (const character of redacted.value) {
+    const point = character.codePointAt(0) ?? 0;
+    const characterBytes = point <= 0x7f ? 1 : point <= 0x7ff ? 2 : point <= 0xffff ? 3 : 4;
+    if (bytes + characterBytes > taskStepOutputMaxBytes) {
+      byteTruncated = true;
+      break;
+    }
+    bounded += character;
+    bytes += characterBytes;
+  }
+  return { value: bounded, truncated: redacted.truncated || byteTruncated };
+}
+
+function TaskStepOutput({ label, value, clientTruncated, truncated, omittedBytes }: {
+  label: string;
+  value: string;
+  clientTruncated: boolean;
+  truncated: boolean;
+  omittedBytes: number | null;
+}) {
+  let preview = '';
+  let previewCharacters = 0;
+  let hasMore = false;
+  for (const character of value) {
+    if (previewCharacters >= taskStepOutputPreviewCharacters) {
+      hasMore = true;
+      break;
+    }
+    preview += character;
+    previewCharacters += 1;
+  }
+  return <div className="task-step-output">
+    <p><strong>{label}</strong> {value ? preview : '（无输出）'}{hasMore ? '…' : ''}</p>
+    {clientTruncated && <p role="status">已记录的{label}超过客户端 64 KiB 显示上限，本页内容已截断。</p>}
+    {truncated && <p role="status">已记录的{label}有截断标记{omittedBytes === null ? '。' : `，省略 ${omittedBytes} 字节。`}</p>}
+    {hasMore && <details>
+      <summary>查看完整已记录输出</summary>
+      <pre>{value}</pre>
+    </details>}
+  </div>;
+}
+
+function conversationToolActivity(message: Pick<ConversationMessage, 'role' | 'tool_activity'>): { tool: 'web_search' | 'web_read'; status: string } | null {
+  if (message.role !== 'user') return null;
+  const activity: unknown = message.tool_activity;
+  if (!activity || typeof activity !== 'object' || Array.isArray(activity)) return null;
+  const { tool, status } = activity as Record<string, unknown>;
+  if ((tool !== 'web_search' && tool !== 'web_read') || typeof status !== 'string' ||
+      !['queued', 'running', 'waiting_user', 'succeeded', 'failed', 'unknown', 'cancelled'].includes(status)) return null;
+  return { tool, status };
+}
+
 function stepPresentationTitle(title: string): string {
   const mcpPrefix = 'Run cloud dsh MCP tool: ';
   const prefix = ['Run cloud dsh tool: ', mcpPrefix, 'Run Hostless Workspace tool: ']
@@ -500,16 +583,16 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
   const detail = useQuery({
     queryKey,
     queryFn: async () => {
-      const result = await portalApi.taskStepDetail(task.id, step.id);
+      const result = await portalApi.taskStepDetail(task.id, step.id) as TaskStepDetailWithExecution;
       if (result.task_id !== task.id || result.step_id !== step.id) throw new Error('详情身份不匹配');
-      return result.detail_state === 'available' ? result : { ...result, object: null, input: null, result: null };
+      return result.detail_state === 'available' ? result : { ...result, object: null, input: null, result: null, execution: null };
     },
     enabled: Boolean(actorID && serviceInstanceID && conversationID) && !accessRevoked,
     retry: false,
     gcTime: 0,
     structuralSharing: (previous: unknown, next: unknown) => {
-      const oldDetail = previous as TaskStepDetail | undefined;
-      const newDetail = next as TaskStepDetail;
+      const oldDetail = previous as TaskStepDetailWithExecution | undefined;
+      const newDetail = next as TaskStepDetailWithExecution;
       if (newDetail.detail_state !== 'available') return newDetail;
       return oldDetail && oldDetail.task_id === newDetail.task_id && oldDetail.step_id === newDetail.step_id &&
         oldDetail.event_sequence > newDetail.event_sequence ? oldDetail : newDetail;
@@ -559,6 +642,26 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
   const safeObject = object !== null ? safeTaskActivityText(object) : null;
   const safeInput = data.input !== null ? safeTaskActivityText(data.input) : null;
   const safeResult = data.result !== null ? safeTaskActivityText(data.result) : null;
+  const execution = data.detail_state === 'available' && data.execution && !Array.isArray(data.execution) &&
+    typeof data.execution === 'object' ? data.execution : null;
+  const isShell = data.tool_name === 'shell_exec';
+  const executionText = (value: unknown) => typeof value === 'string' ? safeTaskActivityText(value, 8_192) : null;
+  const executionNumber = (value: unknown) => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : null;
+  const location = executionText(execution?.location);
+  const command = executionText(execution?.command);
+  const parameters = executionText(execution?.parameters);
+  const cwd = executionText(execution?.working_directory);
+  const hasStdout = typeof execution?.stdout === 'string';
+  const hasStderr = typeof execution?.stderr === 'string';
+  const confirmedResult = data.detail_state === 'available' && ['succeeded', 'failed'].includes(step.status);
+  const safeStdout = confirmedResult ? safeTaskStepOutput(execution?.stdout) : null;
+  const safeStderr = confirmedResult ? safeTaskStepOutput(execution?.stderr) : null;
+  const duration = executionNumber(execution?.duration_ms);
+  const exitCode = executionNumber(execution?.exit_code);
+  const stdoutBytes = executionNumber(execution?.stdout_total_bytes);
+  const stderrBytes = executionNumber(execution?.stderr_total_bytes);
+  const stdoutOmitted = executionNumber(execution?.stdout_omitted_bytes);
+  const stderrOmitted = executionNumber(execution?.stderr_omitted_bytes);
   const canRetryStep = step.status === 'failed' && step.retryable && Number.isSafeInteger(step.task_revision) &&
     Number.isSafeInteger(step.attempt) && (task.current_revision === undefined || task.current_revision === step.task_revision);
   const retryStep = async () => {
@@ -594,7 +697,25 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
       {safeObject && <p><strong>对象</strong> {safeObject.value || '（空）'}</p>}
       {safeInput && <p><strong>输入</strong> {safeInput.value || '（空）'}</p>}
       {safeResult && <p><strong>结果</strong> {safeResult.value || '（空结果）'}</p>}
-      {data.object === null && data.input === null && data.result === null && <p>没有可展示的输入或结果。</p>}
+      {execution ? <>
+        {(location || isShell) && <p><strong>执行位置</strong> {location?.value || '未记录'}</p>}
+        {(command || isShell) && <p><strong>命令</strong> {command?.value || '未记录'}</p>}
+        {parameters && <p><strong>参数</strong> {parameters.value || '（空）'}</p>}
+        {(cwd || isShell) && <p><strong>工作目录</strong> {cwd?.value || '未记录'}</p>}
+        {(duration !== null || isShell) && <p><strong>耗时</strong> {duration === null ? '未记录' : `${duration} 毫秒`}</p>}
+        {(exitCode !== null || isShell) && <p><strong>退出码</strong> {exitCode ?? '未记录'}</p>}
+        {(typeof execution.timed_out === 'boolean' || isShell) && <p><strong>是否超时</strong> {typeof execution.timed_out === 'boolean' ? (execution.timed_out ? '是' : '否') : '未记录'}</p>}
+        {safeStdout && <TaskStepOutput label="标准输出" value={safeStdout.value} clientTruncated={safeStdout.truncated}
+          truncated={execution.stdout_truncated === true} omittedBytes={stdoutOmitted} />}
+        {!safeStdout && (hasStdout || isShell) && <p><strong>标准输出</strong> 未记录</p>}
+        {stdoutBytes !== null && <p><strong>标准输出字节数</strong> {stdoutBytes} 字节</p>}
+        {safeStderr && <TaskStepOutput label="错误输出" value={safeStderr.value} clientTruncated={safeStderr.truncated}
+          truncated={execution.stderr_truncated === true} omittedBytes={stderrOmitted} />}
+        {!safeStderr && (hasStderr || isShell) && <p><strong>错误输出</strong> 未记录</p>}
+        {stderrBytes !== null && <p><strong>错误输出字节数</strong> {stderrBytes} 字节</p>}
+        {[location, command, parameters, cwd].some((field) => field?.truncated) && <p>执行信息在界面显示时截断。</p>}
+      </> : isShell && <p>执行详情未记录或不可用。</p>}
+      {data.object === null && data.input === null && data.result === null && !execution && !isShell && <p>没有可展示的输入或结果。</p>}
       {(data.truncated || [safeToolName, safeObject, safeInput, safeResult].some((field) => field?.truncated)) && <p>详情已截断。</p>}
     </>}
     {step.failure_reason === 'connector_rate_limited' && step.retry_after_at && !step.retryable &&
@@ -1418,8 +1539,9 @@ export function Assistant() {
     queryFn: ({ pageParam }) => portalApi.conversationMessages(conversationID!, pageParam),
     getNextPageParam: (page) => page.next_cursor ?? undefined,
     enabled: Boolean(conversationID),
-    refetchInterval: (query) => query.state.data?.pages.some((page) => page.items.some((item) =>
-      item.routing_status === 'pending' || item.routing_status === 'processing' || item.routing_status === 'waiting_adjustment')) ? 2000 : false,
+    refetchInterval: (query) => !isResourceNoLongerAccessible(query.state.error) && query.state.data?.pages.some((page) => page.items.some((item) =>
+      item.routing_status === 'pending' || item.routing_status === 'processing' || item.routing_status === 'waiting_adjustment' ||
+      ['queued', 'running', 'waiting_user'].includes(conversationToolActivity(item)?.status ?? ''))) ? 2000 : false,
   });
   const conversationContentAccessRevoked = isResourceNoLongerAccessible(messages.error);
   const conversationMessageItems = conversationContentAccessRevoked ? [] : flattenConversationPages(messages.data);
@@ -3006,6 +3128,7 @@ export function Assistant() {
       if (!step) return <p className="muted" role="status">此工作项已不在当前任务记录中。</p>;
       const text = taskActivitySnippet(taskActivityStepSummary(step), 280) ?? '暂无可展示的步骤结果。';
       return <div className="task-work-step-detail" aria-label="工作项详情">
+        <p className="task-step-detail-message" role="status">状态：{taskStepStatusText(step.status)}</p>
         {step.kind === 'tool' || step.tool_name
           ? <TaskStepDetails task={task} step={step} conversationID={task.conversation_id} actorID={user?.id ?? ''}
             serviceInstanceID={capabilities.data?.service_instance_id ?? ''} />
@@ -3155,12 +3278,14 @@ export function Assistant() {
           {group.steps.map((step) => {
             const stepTitleText = safeTaskActivityText(conversationTitleFromText(taskActivityStepTitle(step)) ?? 'Agent 工作项', 120).value;
             const stepSummaryText = taskActivitySnippet(taskActivityStepSummary(step), 120) ?? '';
+            const statusID = `task-step-status-${task.id}-${step.id}`;
             return <button key={step.id} type="button" className="task-activity-step-button task-work-item"
-              aria-label={`查看工作项：${stepTitleText}`} onClick={() => setTaskDetailStepID(step.id)}>
+              aria-label={`查看工作项：${stepTitleText}`} aria-describedby={statusID} onClick={() => setTaskDetailStepID(step.id)}>
               <span className={`task-step-icon status-${step.status}`} aria-hidden="true" />
               <span className="task-work-copy"><strong>{stepTitleText}</strong>
                 {stepSummaryText && <small>{stepSummaryText}</small>}
               </span>
+              <span className="task-work-status" id={statusID}>{taskStepStatusText(step.status)}</span>
               <span className="task-work-arrow" aria-hidden="true">›</span>
             </button>;
           })}
@@ -3447,9 +3572,11 @@ export function Assistant() {
                   const acceptedRetryStatus = retryAcceptedMessageIDs.has(message.id) &&
                     ['failed', 'pending', 'processing'].includes(message.routing_status ?? '') ? '正在重新处理消息' : null;
                   const canRetryRouting = message.role === 'user' && message.routing_status === 'failed' && message.routing_failure_reason !== 'message_too_long'
-                    && !message.related_task_id && !acceptedRetryStatus;
+                    && !message.task_id && !message.related_task_id && !message.duplicate_of_message_id && !acceptedRetryStatus;
                   const routingStatus = message.role === 'user'
-                    ? acceptedRetryStatus ?? (message.routing_status === 'failed' ? null : conversationMessageStatus(message, messageTask)) : null;
+                    ? acceptedRetryStatus ?? conversationRoutingFailureText(message) ??
+                      (message.routing_status === 'failed' ? null : conversationMessageStatus(message, messageTask)) : null;
+                  const toolActivity = conversationToolActivity(message);
                   const previous = displayMessages[index - 1];
                   const messageDate = formatDate(message.created_at).split(' ')[0];
                   const showDate = !previous || formatDate(previous.created_at).split(' ')[0] !== messageDate;
@@ -3492,6 +3619,9 @@ export function Assistant() {
                           disabled={groupOperations.some((item) => item.operation.status === 'sending')} onClick={() => void sendVariantOperation(entry)}>核对并重试</button>}
                       </div>)}
                     </article>
+                    {toolActivity && <div className="chat-message-status" role="status">
+                      {toolActivity.tool === 'web_search' ? '网页搜索' : '网页读取'} · {taskStepStatusText(toolActivity.status)}
+                    </div>}
                     {message.role === 'user' && (routingStatus || message.delivery_status === 'unknown') && <div className="chat-message-status" role="status">
                         {routingStatus}
                         {message.delivery_status === 'unknown' && <button type="button" className="button button-small button-secondary"

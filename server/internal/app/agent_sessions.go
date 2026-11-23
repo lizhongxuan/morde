@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
@@ -44,8 +45,8 @@ type AgentChildSessionCreate struct {
 type AgentChildSessionStore interface {
 	CreateAgentChildSession(context.Context, AgentChildSessionCreate) (AgentChildSession, bool, error)
 	GetAgentChildSession(context.Context, AgentInstanceFence, string, string) (AgentChildSession, error)
-	ListAgentChildSessions(context.Context, AgentInstanceFence) ([]AgentChildSession, error)
-	RequestAgentChildSessionCancel(context.Context, AgentInstanceFence, string, string) (AgentChildSession, bool, error)
+	ListAgentChildSessions(context.Context, AgentInstanceFence, string) ([]AgentChildSession, error)
+	RequestAgentChildSessionCancel(context.Context, AgentInstanceFence, string, string, string) (AgentChildSession, bool, error)
 	SettleAgentChildSession(context.Context, AgentInstanceFence, string, string, task.StepStatus, int64, []byte, string) (AgentChildSession, bool, error)
 }
 
@@ -119,16 +120,15 @@ func (s *AgentChildSessionService) Create(ctx context.Context, command AgentChil
 }
 
 func (s *AgentChildSessionService) List(ctx context.Context, fence AgentInstanceFence, actorSessionID string) ([]AgentChildSession, error) {
-	if err := fence.Validate(); err != nil || actorSessionID != fence.AgentSessionID ||
-		!agentCheckpointIDPattern.MatchString(actorSessionID) {
+	if err := fence.Validate(); err != nil || !agentCheckpointIDPattern.MatchString(actorSessionID) {
 		return nil, domain.InvalidArgument("child_session", "child session actor is invalid")
 	}
-	return s.store.ListAgentChildSessions(ctx, fence)
+	return s.store.ListAgentChildSessions(ctx, fence, actorSessionID)
 }
 
 func (s *AgentChildSessionService) RequestCancel(ctx context.Context, command AgentChildSessionCancelCommand) (AgentChildSession, bool, error) {
-	if err := command.Fence.Validate(); err != nil || command.ActorSessionID != command.Fence.AgentSessionID ||
-		!agentCheckpointIDPattern.MatchString(command.ActorSessionID) || !agentCheckpointIDPattern.MatchString(command.SessionID) ||
+	if err := command.Fence.Validate(); err != nil || !agentCheckpointIDPattern.MatchString(command.ActorSessionID) ||
+		!agentCheckpointIDPattern.MatchString(command.SessionID) || command.SessionID == command.Fence.AgentSessionID ||
 		command.SessionID == command.ActorSessionID || command.CallID != "" && !agentCheckpointIDPattern.MatchString(command.CallID) {
 		return AgentChildSession{}, false, domain.InvalidArgument("child_session", "background job cancellation is invalid")
 	}
@@ -136,7 +136,16 @@ func (s *AgentChildSessionService) RequestCancel(ctx context.Context, command Ag
 	if callID == "" {
 		callID = "dsh_job_cancel:" + command.SessionID
 	}
-	return s.store.RequestAgentChildSessionCancel(ctx, command.Fence, command.SessionID, AgentOperationKey(callID))
+	if command.ActorSessionID != command.Fence.AgentSessionID {
+		callID = AgentSessionToolCallID(command.Fence.TaskID, command.ActorSessionID, callID)
+	}
+	return s.store.RequestAgentChildSessionCancel(ctx, command.Fence, command.ActorSessionID, command.SessionID, AgentOperationKey(callID))
+}
+
+// AgentSessionToolCallID binds a child session's tool call identity to its Task.
+func AgentSessionToolCallID(taskID, sessionID, callID string) string {
+	digest := sha256.Sum256([]byte("morde-dsh-tool-v1\n" + taskID + "\n" + sessionID + "\n" + callID))
+	return "dsh_" + hex.EncodeToString(digest[:])
 }
 
 func validAgentChildToolNames(names []string) bool {

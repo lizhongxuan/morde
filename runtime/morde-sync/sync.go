@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"hash"
@@ -188,6 +189,19 @@ func withBlockBuffer(ctx context.Context, use func([]byte) error) error {
 // special files, unsupported ACL/xattr metadata, invalid paths, or changing
 // entries fail closed.
 func Scan(ctx context.Context, directory string, report func(ScanProgress)) (Manifest, error) {
+	return scanWithIdentity(ctx, directory, "", "", report)
+}
+
+// ScanMatchingIdentity reads only the selected directory after confirming that
+// the opened root still has the device and inode recorded by the PC client.
+func ScanMatchingIdentity(ctx context.Context, directory, device, inode string) (Manifest, error) {
+	if device == "" || inode == "" {
+		return Manifest{}, errors.New("selected workspace identity is required")
+	}
+	return scanWithIdentity(ctx, directory, device, inode, nil)
+}
+
+func scanWithIdentity(ctx context.Context, directory, device, inode string, report func(ScanProgress)) (Manifest, error) {
 	if ctx == nil {
 		return Manifest{}, errors.New("context is required")
 	}
@@ -200,6 +214,9 @@ func Scan(ctx context.Context, directory string, report func(ScanProgress)) (Man
 		return Manifest{}, err
 	}
 	defer root.Close()
+	if device != "" && !matchesSelectedRootIdentity(root, device, inode) {
+		return Manifest{}, errors.New("selected workspace root identity changed")
+	}
 
 	var progressMu sync.Mutex
 	progress := ScanProgress{Phase: PhaseInventory}
@@ -309,6 +326,20 @@ sendJobs:
 		totalBytes += file.Size
 	}
 	return Manifest{FileCount: int64(len(results)), TotalBytes: totalBytes, Files: results, EmptyDirectories: emptyDirectories, Directories: directoryValues(directories)}, nil
+}
+
+// ManifestFingerprint identifies the exact scanned tree without retaining file
+// contents or paths in the PC's confirmed-upload status record.
+func ManifestFingerprint(manifest Manifest) (string, error) {
+	if err := ValidateManifest(manifest); err != nil {
+		return "", err
+	}
+	encoded, err := json.Marshal(manifest)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
 }
 
 func inventory(ctx context.Context, root *os.Root, prefix string, files *[]scannedFile, emptyDirectories *[]string, directories *[]scannedDirectory, progress *ScanProgress, report func()) error {

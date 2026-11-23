@@ -1,6 +1,26 @@
 import SwiftUI
 import UIKit
 
+enum MIFConversationToolActivityPresentation {
+    static func label(_ activity: MordeMessageToolActivity) -> String {
+        let action = activity.tool == "web_search" ? AppLocalized("Web search") : AppLocalized("Web read")
+        return "\(action) · \(MIFTaskPresentation.stepStatusLabel(activity.status))"
+    }
+}
+
+struct MIFConversationToolActivityView: View {
+    let activity: MordeMessageToolActivity
+
+    var body: some View {
+        if activity.isSupported {
+            Text(verbatim: MIFConversationToolActivityPresentation.label(activity))
+                .font(.caption)
+                .foregroundStyle(NanoMuseTones.secondaryText)
+                .accessibilityIdentifier("morde.chat.message.tool-activity")
+        }
+    }
+}
+
 private struct MIFTaskFileFetchPreview: Identifiable {
     let id = UUID()
     let url: URL
@@ -137,6 +157,38 @@ struct MIFTaskDynamicsSafeText: Equatable {
         guard safe.count > limit else { return Self(value: safe, truncated: false) }
         guard limit > 0 else { return Self(value: "…", truncated: true) }
         return Self(value: String(safe.prefix(limit - 1)) + "…", truncated: true)
+    }
+}
+
+struct MIFTaskExecutionOutputDisclosure: Equatable {
+    let fullText: String
+    let preview: String
+    let truncated: Bool
+
+    static let maximumBytes = 64 * 1024
+    static let previewCharacters = 2_000
+
+    static func make(_ source: String) -> Self {
+        let safe = MIFTaskDynamicsSafeText.make(source, maximumCharacters: maximumBytes)
+        var result = String.UnicodeScalarView()
+        var byteCount = 0
+        var byteTruncated = false
+        for scalar in safe.value.unicodeScalars {
+            let scalarBytes = scalar.utf8.count
+            guard byteCount + scalarBytes <= maximumBytes else {
+                byteTruncated = true
+                break
+            }
+            result.append(scalar)
+            byteCount += scalarBytes
+        }
+        let full = String(result)
+        let preview = MIFTaskDynamicsSafeText.make(full, maximumCharacters: previewCharacters)
+        return Self(fullText: full, preview: preview.value, truncated: safe.truncated || byteTruncated)
+    }
+
+    static func isAvailable(detailState: String, stepStatus: String, output: String?) -> Bool {
+        detailState == "available" && ["succeeded", "failed"].contains(stepStatus) && output != nil
     }
 }
 
@@ -365,7 +417,7 @@ enum MIFTaskPresentation {
     static func stepMarker(_ step: MordeTask.Step) -> MIFTaskTimelineMarker {
         switch step.status {
         case "succeeded": .completed
-        case "cancelled": .unconfirmed
+        case "cancelled": .cancelled
         case "running", "waiting_user": .current
         case "failed": .failed
         case "queued": .upcoming
@@ -466,6 +518,7 @@ enum MIFTaskPresentation {
         switch eventStatus {
         case "succeeded", "completed": return .completed
         case "failed": return .failed
+        case "cancelled": return .cancelled
         case "running", "waiting_user", "pausing", "cancelling": return .current
         case "queued", "pending": return .upcoming
         case .some(_): return .unconfirmed
@@ -478,7 +531,8 @@ enum MIFTaskPresentation {
         return switch taskStatus {
         case "queued", "running", "waiting_user", "pausing", "cancelling": .current
         case "failed": .failed
-        case "completed", "cancelled": .completed
+        case "completed": .completed
+        case "cancelled": .cancelled
         default: .unconfirmed
         }
     }
@@ -488,6 +542,7 @@ enum MIFTaskPresentation {
         case .completed: return AppLocalized("Completed")
         case .current: return AppLocalized("Current")
         case .failed: return AppLocalized("Failed")
+        case .cancelled: return AppLocalized("Cancelled")
         case .upcoming: return AppLocalized("Queued")
         case .unconfirmed: return AppLocalized("Status unknown")
         }
@@ -504,6 +559,7 @@ enum MIFTaskTimelineMarker: Equatable {
     case completed
     case current
     case failed
+    case cancelled
     case upcoming
     case unconfirmed
 }
@@ -546,6 +602,15 @@ private struct MIFTaskTimelineMarkerView: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 10, weight: .bold))
                         .foregroundStyle(NanoMuseTones.dangerInk)
+                }
+                .frame(width: 24, height: 24)
+        case .cancelled:
+            Circle()
+                .stroke(NanoMuseTones.secondaryText, lineWidth: 1.5)
+                .overlay {
+                    Image(systemName: "minus")
+                        .font(.system(size: 10, weight: .bold))
+                        .foregroundStyle(NanoMuseTones.secondaryText)
                 }
                 .frame(width: 24, height: 24)
         case .upcoming:
@@ -1050,6 +1115,135 @@ private final class MordeVerticalScrollBounceView: UIView {
     }
 }
 
+private struct MIFTaskExecutionEvidenceFields: View {
+    let detail: MordeTaskStepDetail
+    let stepStatus: String
+    @State private var expandedStdout = false
+    @State private var expandedStderr = false
+
+    private var isShell: Bool { detail.tool_name == "shell_exec" }
+
+    @ViewBuilder
+    var body: some View {
+        if detail.detail_state == "available" {
+            if let execution = detail.execution {
+                if let value = value(execution.location) { field(AppLocalized("Execution location"), value: value) }
+                if let value = value(execution.command) { field(AppLocalized("Command"), value: value) }
+                if let value = execution.parameters, !value.isEmpty { field(AppLocalized("Parameters"), value: value) }
+                if let value = value(execution.working_directory) { field(AppLocalized("Working directory"), value: value) }
+                if let value = number(execution.duration_ms) { field(AppLocalized("Duration (ms)"), value: value) }
+                if let value = number(execution.exit_code.map { Int64($0) }) { field(AppLocalized("Exit code"), value: value) }
+                if let timedOut = execution.timed_out {
+                    field(AppLocalized("Timed out"), value: timedOut ? AppLocalized("Yes") : AppLocalized("No"))
+                } else if isShell {
+                    field(AppLocalized("Timed out"), value: AppLocalized("Not recorded"))
+                }
+                if MIFTaskExecutionOutputDisclosure.isAvailable(detailState: detail.detail_state,
+                    stepStatus: stepStatus, output: execution.stdout), let stdout = execution.stdout {
+                    outputField(AppLocalized("Standard output"), value: stdout,
+                        serverTruncated: execution.stdout_truncated == true, omitted: execution.stdout_omitted_bytes,
+                        truncationLabel: AppLocalized("Standard output is truncated"), expanded: expandedStdout) { expandedStdout.toggle() }
+                } else if isShell {
+                    field(AppLocalized("Standard output"), value: AppLocalized("Not recorded"))
+                }
+                if let bytes = execution.stdout_total_bytes {
+                    field(AppLocalized("Standard output size (bytes)"), value: String(bytes))
+                }
+                if execution.stdout_truncated == true {
+                    truncation(AppLocalized("Standard output is truncated"), omitted: execution.stdout_omitted_bytes)
+                }
+                if MIFTaskExecutionOutputDisclosure.isAvailable(detailState: detail.detail_state,
+                    stepStatus: stepStatus, output: execution.stderr), let stderr = execution.stderr {
+                    outputField(AppLocalized("Standard error"), value: stderr,
+                        serverTruncated: execution.stderr_truncated == true, omitted: execution.stderr_omitted_bytes,
+                        truncationLabel: AppLocalized("Standard error is truncated"), expanded: expandedStderr) { expandedStderr.toggle() }
+                } else if isShell {
+                    field(AppLocalized("Standard error"), value: AppLocalized("Not recorded"))
+                }
+                if let bytes = execution.stderr_total_bytes {
+                    field(AppLocalized("Standard error size (bytes)"), value: String(bytes))
+                }
+                if execution.stderr_truncated == true {
+                    truncation(AppLocalized("Standard error is truncated"), omitted: execution.stderr_omitted_bytes)
+                }
+            } else if isShell {
+                Text(AppLocalized("Execution details not recorded or unavailable"))
+                    .font(.footnote)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
+            }
+        }
+    }
+
+    private func value(_ raw: String?) -> String? {
+        guard let raw, !raw.isEmpty else { return isShell ? AppLocalized("Not recorded") : nil }
+        return raw
+    }
+
+    private func number(_ raw: Int64?) -> String? {
+        guard let raw else { return isShell ? AppLocalized("Not recorded") : nil }
+        return String(raw)
+    }
+
+    private func outputField(_ label: String, value: String, serverTruncated: Bool, omitted: Int64?, truncationLabel: String,
+                             expanded: Bool, toggle: @escaping () -> Void) -> some View {
+        let disclosure = MIFTaskExecutionOutputDisclosure.make(value)
+        return VStack(alignment: .leading, spacing: 5) {
+            Text(verbatim: label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(NanoMuseTones.secondaryText)
+            Text(verbatim: disclosure.fullText.isEmpty ? AppLocalized("No output") :
+                (expanded ? disclosure.fullText : disclosure.preview))
+                .font(.footnote.monospaced())
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            if disclosure.truncated {
+                Text(AppLocalized("Recorded output exceeds the 64 KiB client display limit"))
+                    .font(.footnote)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
+            }
+            if serverTruncated {
+                truncation(truncationLabel, omitted: omitted)
+            }
+            if disclosure.fullText.count > MIFTaskExecutionOutputDisclosure.previewCharacters {
+                Button(AppLocalized(expanded ? "Collapse output" : "Show full recorded output"), action: toggle)
+                    .font(.footnote)
+                    .accessibilityIdentifier(expanded ? "morde.task.output.collapse" : "morde.task.output.expand")
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func field(_ label: String, value: String) -> some View {
+        let safe = MIFTaskDynamicsSafeText.make(value, maximumCharacters: 8_192)
+        return VStack(alignment: .leading, spacing: 3) {
+            Text(verbatim: label)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(NanoMuseTones.secondaryText)
+            Text(verbatim: safe.value)
+                .font(.footnote.monospaced())
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+            if safe.truncated {
+                Text(AppLocalized("Details are truncated"))
+                    .font(.footnote)
+                    .foregroundStyle(NanoMuseTones.secondaryText)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private func truncation(_ label: String, omitted: Int64?) -> some View {
+        HStack(spacing: 4) {
+            Text(verbatim: label)
+            if let omitted {
+                Text(verbatim: "\(omitted) \(AppLocalized("Bytes omitted"))")
+            }
+        }
+        .font(.footnote)
+        .foregroundStyle(NanoMuseTones.secondaryText)
+    }
+}
+
 @MainActor
 private struct MIFTaskStepActivityRow: View {
     let taskID: String
@@ -1196,6 +1390,7 @@ private struct MIFTaskStepActivityRow: View {
                     }
                     if let input = visibleDetail.input, !input.isEmpty { detailField("Input", value: input) }
                     if let result = visibleDetail.result, !result.isEmpty { detailField("Result", value: result) }
+                    MIFTaskExecutionEvidenceFields(detail: visibleDetail, stepStatus: step.status)
                     if visibleDetail.truncated || step.truncated == true {
                         Text(AppLocalized("Details are truncated"))
                             .font(.footnote)
@@ -1435,6 +1630,7 @@ private struct MIFTaskDynamicsStepDetailView: View {
     @State private var loadedKey: String?
     @State private var loadError: String?
     @State private var isLoading = false
+    @State private var isRetrying = false
 
     private var detailRequestKey: String {
         "\(store.scopeKey ?? ""):\(taskID):\(step.id):\(eventSequence)"
@@ -1480,12 +1676,43 @@ private struct MIFTaskDynamicsStepDetailView: View {
                         .foregroundStyle(NanoMuseTones.secondaryText)
                         .fixedSize(horizontal: false, vertical: true)
 
+                    if let explanation = MIFTaskPresentation.stepFailureExplanation(step) {
+                        Text(verbatim: explanation)
+                            .font(.footnote)
+                            .foregroundStyle(NanoMuseTones.secondaryText)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("morde.task.step.failureReason.\(step.id)")
+                    }
+
                     if canLoadToolDetail {
                         toolDetailContent
                     } else {
                         Text(AppLocalized("No tool was called"))
                             .font(.subheadline.weight(.medium))
                             .foregroundStyle(NanoMuseTones.secondaryText)
+                    }
+
+                    if MIFTaskPresentation.canRetryStep(step) {
+                        Button {
+                            guard !isRetrying, !store.actionInFlight else { return }
+                            isRetrying = true
+                            Task {
+                                let accepted = await store.retryTaskStep(taskID: taskID, stepID: step.id)
+                                isRetrying = false
+                                if accepted { dismiss() }
+                            }
+                        } label: {
+                            HStack(spacing: 8) {
+                                if isRetrying { ProgressView().controlSize(.small) }
+                                Text(AppLocalized("Retry step"))
+                            }
+                        }
+                        .disabled(isRetrying || store.actionInFlight)
+                        .accessibilityIdentifier("morde.task.step.retry.\(step.id)")
+                    }
+                    if let error = store.stepRetryError(taskID: taskID, stepID: step.id) {
+                        MIFTaskInlineError(message: error)
+                            .accessibilityIdentifier("morde.task.step.retry.error.\(step.id)")
                     }
                 }
                 .padding(22)
@@ -1521,6 +1748,7 @@ private struct MIFTaskDynamicsStepDetailView: View {
                     if let result = visibleDetail.result, !result.isEmpty {
                         detailField(AppLocalized("Result"), value: result)
                     }
+                    MIFTaskExecutionEvidenceFields(detail: visibleDetail, stepStatus: step.status)
                     if visibleDetail.truncated || step.truncated == true {
                         Text(AppLocalized("Details are truncated"))
                             .font(.footnote)

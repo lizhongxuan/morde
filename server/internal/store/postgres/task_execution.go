@@ -1584,8 +1584,8 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			return task.Event{}, domain.InvalidArgument("tool_call.failure", "task tool failure evidence is invalid")
 		}
 		if call.DetailState == "available" {
-			if len(call.DetailCiphertext) < 29 || len(call.DetailCiphertext) > 65564 || len(call.DetailSHA256) != 32 ||
-				call.DetailSizeBytes < 1 || call.DetailSizeBytes > 65536 || len(progress.Steps[0].ID) == 0 {
+			if len(call.DetailCiphertext) < 29 || len(call.DetailCiphertext) > app.MaxTaskStepDetailCiphertextBytes || len(call.DetailSHA256) != 32 ||
+				call.DetailSizeBytes < 1 || call.DetailSizeBytes > app.MaxTaskStepDetailPayloadBytes || len(progress.Steps[0].ID) == 0 {
 				return task.Event{}, domain.InvalidArgument("tool_call.detail", "task tool detail is invalid")
 			}
 		} else if len(call.DetailCiphertext) != 0 || len(call.DetailSHA256) != 0 || call.DetailSizeBytes != 0 {
@@ -3706,7 +3706,7 @@ func validTaskStatus(value task.Status) bool {
 
 func validStepStatus(value task.StepStatus) bool {
 	switch value {
-	case task.StepQueued, task.StepRunning, task.StepWaitingUser, task.StepSucceeded, task.StepFailed, task.StepUnknown:
+	case task.StepQueued, task.StepRunning, task.StepWaitingUser, task.StepSucceeded, task.StepFailed, task.StepCancelled, task.StepUnknown:
 		return true
 	default:
 		return false

@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -119,40 +120,33 @@ func removeWorkspaceCurrentRegularFile(root, relativePath, expectedSHA256 string
 		return err
 	}
 	defer parent.Close()
-	var before unix.Stat_t
-	if err := unix.Fstatat(int(parent.Fd()), name, &before, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-		return err
-	}
-	if before.Mode&unix.S_IFMT != unix.S_IFREG {
-		return ErrUnsafePath
-	}
-	fd, err := unix.Openat(int(parent.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	return removeWorkspaceCurrentRegularFileAt(int(parent.Fd()), name, expectedSHA256)
+}
+
+func removeWorkspaceCurrentRegularFileAt(parentFD int, name, expectedSHA256 string) error {
+	temporary, err := workspaceCurrentTemporaryName(".morde-delete-")
 	if err != nil {
 		return err
 	}
-	file := os.NewFile(uintptr(fd), name)
-	hasher := sha256.New()
-	_, readErr := io.Copy(hasher, file)
-	var opened unix.Stat_t
-	statErr := unix.Fstat(fd, &opened)
-	closeErr := file.Close()
-	if readErr != nil || statErr != nil || closeErr != nil {
-		return errors.Join(readErr, statErr, closeErr)
-	}
-	if hex.EncodeToString(hasher.Sum(nil)) != expectedSHA256 || before.Dev != opened.Dev || before.Ino != opened.Ino {
-		return ErrWriteConflict
-	}
-	var current unix.Stat_t
-	if err := unix.Fstatat(int(parent.Fd()), name, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if err := unix.Renameat2(parentFD, name, parentFD, temporary, unix.RENAME_NOREPLACE); err != nil {
 		return err
 	}
-	if current.Mode&unix.S_IFMT != unix.S_IFREG || current.Dev != opened.Dev || current.Ino != opened.Ino {
-		return ErrWriteConflict
+	verifyErr := verifyExpectedWorkspaceFile(parentFD, temporary, expectedSHA256)
+	if verifyErr != nil {
+		restoreErr := unix.Renameat2(parentFD, temporary, parentFD, name, unix.RENAME_NOREPLACE)
+		if restoreErr != nil {
+			return errors.Join(ErrWriteConflict, verifyErr,
+				fmt.Errorf("changed Workspace file is preserved at %q because restoration failed: %w", temporary, restoreErr))
+		}
+		if err := unix.Fsync(parentFD); err != nil {
+			return errors.Join(ErrWriteConflict, verifyErr, err)
+		}
+		return verifyErr
 	}
-	if err := unix.Unlinkat(int(parent.Fd()), name, 0); err != nil {
-		return err
+	if err := unix.Unlinkat(parentFD, temporary, 0); err != nil {
+		return fmt.Errorf("verified Workspace file is preserved at %q because deletion failed: %w", temporary, err)
 	}
-	return unix.Fsync(int(parent.Fd()))
+	return unix.Fsync(parentFD)
 }
 
 func moveWorkspaceCurrentRegularFile(root, sourcePath, targetPath, expectedSHA256 string, expectedMode uint32) error {
@@ -195,24 +189,117 @@ func moveWorkspaceCurrentRegularFile(root, sourcePath, targetPath, expectedSHA25
 	if err := unix.Fstatat(sourceFD, sourceName, &currentSource, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return err
 	}
-	if currentSource.Mode&unix.S_IFMT != unix.S_IFREG || currentSource.Dev != sourceStat.Dev || currentSource.Ino != sourceStat.Ino {
+	if !sameWorkspaceCurrentFileIdentity(currentSource, sourceStat) {
 		return ErrWriteConflict
 	}
-	// shortcut: Host writers do not take this lock, so same-inode writes can race the digest check; require Host-cooperative locking before promising cross-process CAS.
-	if err := unix.Renameat2(sourceFD, sourceName, targetFD, targetName, unix.RENAME_NOREPLACE); err != nil {
-		if errors.Is(err, unix.EEXIST) {
-			var targetStat unix.Stat_t
-			if statErr := unix.Fstatat(targetFD, targetName, &targetStat, unix.AT_SYMLINK_NOFOLLOW); statErr == nil && targetStat.Mode&unix.S_IFMT != unix.S_IFREG {
-				return ErrUnsafePath
-			}
+	return moveWorkspaceCurrentRegularFileAt(sourceFD, sourceName, targetFD, targetName, expectedSHA256, expectedMode, sourceStat)
+}
+
+func moveWorkspaceCurrentRegularFileAt(sourceFD int, sourceName string, targetFD int, targetName, expectedSHA256 string, expectedMode uint32, expectedStat unix.Stat_t) error {
+	temporary, err := workspaceCurrentTemporaryName(".morde-move-")
+	if err != nil {
+		return err
+	}
+	if err := unix.Renameat2(sourceFD, sourceName, targetFD, temporary, unix.RENAME_NOREPLACE); err != nil {
+		if errors.Is(err, unix.ENOENT) {
 			return ErrWriteConflict
 		}
 		return err
 	}
+
+	stagedStat, verifyErr := verifyWorkspaceCurrentRegularFileAt(targetFD, temporary, expectedSHA256, expectedMode)
+	if verifyErr == nil && !sameWorkspaceCurrentFileIdentity(stagedStat, expectedStat) {
+		verifyErr = ErrWriteConflict
+	}
+	if verifyErr != nil {
+		return errors.Join(ErrWriteConflict, verifyErr, restoreStagedWorkspaceCurrentFile(targetFD, temporary, sourceFD, sourceName))
+	}
+
+	backup, err := workspaceCurrentTemporaryName(".morde-move-recovery-")
+	if err != nil {
+		return errors.Join(err, restoreStagedWorkspaceCurrentFile(targetFD, temporary, sourceFD, sourceName))
+	}
+	if err := unix.Linkat(targetFD, temporary, targetFD, backup, 0); err != nil {
+		return errors.Join(fmt.Errorf("prepare move recovery link: %w", err), restoreStagedWorkspaceCurrentFile(targetFD, temporary, sourceFD, sourceName))
+	}
 	if err := unix.Fsync(sourceFD); err != nil {
-		return err
+		return errors.Join(err, restoreStagedWorkspaceCurrentFileWithBackup(targetFD, temporary, backup, sourceFD, sourceName))
+	}
+	if err := unix.Fsync(targetFD); err != nil {
+		return errors.Join(err, restoreStagedWorkspaceCurrentFileWithBackup(targetFD, temporary, backup, sourceFD, sourceName))
+	}
+
+	if err := unix.Renameat2(targetFD, temporary, targetFD, targetName, unix.RENAME_NOREPLACE); err != nil {
+		restoreErr := restoreStagedWorkspaceCurrentFileWithBackup(targetFD, temporary, backup, sourceFD, sourceName)
+		if errors.Is(err, unix.EEXIST) {
+			var current unix.Stat_t
+			if statErr := unix.Fstatat(targetFD, targetName, &current, unix.AT_SYMLINK_NOFOLLOW); statErr == nil && current.Mode&unix.S_IFMT != unix.S_IFREG {
+				return errors.Join(ErrUnsafePath, restoreErr)
+			}
+			return errors.Join(ErrWriteConflict, restoreErr)
+		}
+		return errors.Join(err, restoreErr)
+	}
+	if err := unix.Fsync(sourceFD); err != nil {
+		return fmt.Errorf("move committed with recovery copy at %q; source directory sync failed: %w", backup, err)
+	}
+	if err := unix.Fsync(targetFD); err != nil {
+		return fmt.Errorf("move committed with recovery copy at %q; target directory sync failed: %w", backup, err)
+	}
+
+	movedStat, verifyErr := verifyWorkspaceCurrentRegularFileAt(targetFD, targetName, expectedSHA256, expectedMode)
+	if verifyErr == nil && !sameWorkspaceCurrentFileIdentity(movedStat, expectedStat) {
+		verifyErr = ErrWriteConflict
+	}
+	if verifyErr != nil {
+		return errors.Join(ErrWriteConflict, verifyErr, restoreMovedWorkspaceCurrentFile(targetFD, targetName, backup, sourceFD, sourceName, expectedStat))
+	}
+	if err := unix.Unlinkat(targetFD, backup, 0); err != nil {
+		return fmt.Errorf("move completed; recovery copy is preserved at %q because cleanup failed: %w", backup, err)
 	}
 	return unix.Fsync(targetFD)
+}
+
+func restoreStagedWorkspaceCurrentFile(targetFD int, temporary string, sourceFD int, sourceName string) error {
+	return restoreStagedWorkspaceCurrentFileWithBackup(targetFD, temporary, "", sourceFD, sourceName)
+}
+
+func restoreStagedWorkspaceCurrentFileWithBackup(targetFD int, temporary, backup string, sourceFD int, sourceName string) error {
+	if err := unix.Renameat2(targetFD, temporary, sourceFD, sourceName, unix.RENAME_NOREPLACE); err != nil {
+		preserved := temporary
+		if backup != "" {
+			preserved = backup
+		}
+		return fmt.Errorf("staged Workspace file is preserved at %q because source restoration failed: %w", preserved, err)
+	}
+	if backup != "" {
+		if err := unix.Unlinkat(targetFD, backup, 0); err != nil {
+			return fmt.Errorf("restored Workspace source; recovery link is preserved at %q: %w", backup, err)
+		}
+	}
+	return errors.Join(unix.Fsync(targetFD), unix.Fsync(sourceFD))
+}
+
+func restoreMovedWorkspaceCurrentFile(targetFD int, targetName, backup string, sourceFD int, sourceName string, expectedStat unix.Stat_t) error {
+	var current unix.Stat_t
+	statErr := unix.Fstatat(targetFD, targetName, &current, unix.AT_SYMLINK_NOFOLLOW)
+	if statErr == nil && sameWorkspaceCurrentFileIdentity(current, expectedStat) {
+		if err := unix.Renameat2(targetFD, targetName, sourceFD, sourceName, unix.RENAME_NOREPLACE); err == nil {
+			if err := unix.Unlinkat(targetFD, backup, 0); err != nil {
+				return fmt.Errorf("restored moved file; recovery link is preserved at %q: %w", backup, err)
+			}
+			return errors.Join(unix.Fsync(targetFD), unix.Fsync(sourceFD))
+		} else if !errors.Is(err, unix.ENOENT) && !errors.Is(err, unix.EEXIST) {
+			return fmt.Errorf("could not restore moved file from target; recovery copy is preserved at %q: %w", backup, err)
+		}
+	}
+	if statErr != nil && !errors.Is(statErr, unix.ENOENT) {
+		return fmt.Errorf("could not inspect moved target; recovery copy is preserved at %q: %w", backup, statErr)
+	}
+	if err := unix.Renameat2(targetFD, backup, sourceFD, sourceName, unix.RENAME_NOREPLACE); err != nil {
+		return fmt.Errorf("moved file is preserved at recovery path %q because source restoration failed: %w", backup, err)
+	}
+	return errors.Join(unix.Fsync(targetFD), unix.Fsync(sourceFD))
 }
 
 func verifyMovedWorkspaceCurrentRegularFile(root, relativePath, expectedSHA256 string, expectedMode uint32) error {
@@ -248,26 +335,34 @@ func verifyWorkspaceCurrentRegularFileAt(parentFD int, name, expectedSHA256 stri
 		return unix.Stat_t{}, err
 	}
 	file := os.NewFile(uintptr(fd), name)
+	var openedBefore unix.Stat_t
+	if err := unix.Fstat(fd, &openedBefore); err != nil {
+		return unix.Stat_t{}, errors.Join(err, file.Close())
+	}
+	if !sameWorkspaceCurrentFileVersion(before, openedBefore) {
+		return unix.Stat_t{}, errors.Join(ErrWriteConflict, file.Close())
+	}
 	hasher := sha256.New()
 	_, readErr := io.Copy(hasher, file)
-	var opened unix.Stat_t
-	statErr := unix.Fstat(fd, &opened)
+	var openedAfter unix.Stat_t
+	statErr := unix.Fstat(fd, &openedAfter)
 	closeErr := file.Close()
 	if readErr != nil || statErr != nil || closeErr != nil {
 		return unix.Stat_t{}, errors.Join(readErr, statErr, closeErr)
 	}
-	if hex.EncodeToString(hasher.Sum(nil)) != expectedSHA256 || uint32(opened.Mode&0777) != expectedMode ||
-		before.Dev != opened.Dev || before.Ino != opened.Ino {
+	if hex.EncodeToString(hasher.Sum(nil)) != expectedSHA256 || uint32(openedAfter.Mode&0777) != expectedMode ||
+		!sameWorkspaceCurrentFileVersion(openedBefore, openedAfter) {
 		return unix.Stat_t{}, ErrWriteConflict
 	}
 	var current unix.Stat_t
 	if err := unix.Fstatat(parentFD, name, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return unix.Stat_t{}, err
 	}
-	if current.Mode&unix.S_IFMT != unix.S_IFREG || uint32(current.Mode&0777) != expectedMode || current.Dev != opened.Dev || current.Ino != opened.Ino {
+	if current.Mode&unix.S_IFMT != unix.S_IFREG || uint32(current.Mode&0777) != expectedMode ||
+		!sameWorkspaceCurrentFileVersion(openedAfter, current) {
 		return unix.Stat_t{}, ErrWriteConflict
 	}
-	return opened, nil
+	return openedAfter, nil
 }
 
 func writeWorkspaceCurrentSymbolicLink(root, relativePath, target, expectedTarget string) error {

@@ -46,6 +46,7 @@ type cloudDSHSessionState struct {
 	images                  *cloudDSHImageRegistry
 	lastStream              *cloudDSHTextStream
 	stepRetryResult         *app.AgentToolResult
+	modelFailureCode        string
 	lastObservationSequence int64
 	activeActivities        map[string]string
 	activeActivityOrder     []string
@@ -1356,14 +1357,16 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	canDelegate := false
 	if toolsAllowed && e.options.Children != nil {
 		rootDefinitions = append(rootDefinitions, cloudDSHJobTools()...)
+		hasDelegableTools := false
 		for _, definition := range baseDefinitions {
 			if definition.Name != cloudDSHDelegateToolName && definition.Name != "ask_user" {
-				canDelegate = true
+				hasDelegableTools = true
 				break
 			}
 		}
-		if canDelegate && len(rootDefinitions) < 64 {
+		if hasDelegableTools && len(rootDefinitions) < 64 {
 			rootDefinitions = append(rootDefinitions, cloudDSHDelegateTool(baseDefinitions))
+			canDelegate = true
 		}
 	}
 	if toolsAllowed && e.options.Tools != nil && len(baseDefinitions) > 0 && len(rootDefinitions) < 64 {
@@ -1450,10 +1453,14 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err != nil {
 				return errors.New("dsh background job authorization is unavailable")
 			}
+			definitions, err = cloudDSHChildDelegationTools(definitions, canDelegate)
+			if err != nil {
+				return err
+			}
 			identity := rootIdentity
 			identity.SessionID = child.SessionID
 			state := newCloudDSHSessionState(fence, identity, rootIdentity.SessionID, child.SpawnKey, definitions,
-				false, true, child.CheckpointThrough, child.CheckpointDigest)
+				canDelegate, true, child.CheckpointThrough, child.CheckpointDigest)
 			state.rootCheckpointThrough = child.RootCheckpointThroughSequence
 			state.background = true
 			states[child.SessionID] = state
@@ -1525,16 +1532,17 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	}
 	frames := make(chan cloudDSHRead, 1)
 	go readCloudDSHFrames(ctx, output, frames)
-	modelResults := make(chan cloudDSHModelResult, 1)
+	modelResults := make(chan cloudDSHModelResult, cloudDSHMaxPendingModelCalls)
 	pendingModels := make(map[string]*cloudDSHPendingModelCall)
 	queuedModelIDs := make([]string, 0, cloudDSHMaxPendingModelCalls)
-	activeModelID := ""
+	activeModelIDs := make(map[string]struct{})
 	startModel := func(id string) {
 		pending := pendingModels[id]
 		modelCtx, cancelModel := context.WithCancel(ctx)
 		explicitCtx, cancelExplicit := context.WithCancel(context.Background())
 		modelCtx = app.WithModelExplicitCancellation(modelCtx, explicitCtx)
-		pending.cancel, activeModelID = cancelModel, id
+		pending.cancel = cancelModel
+		activeModelIDs[id] = struct{}{}
 		pending.cancelExplicit = cancelExplicit
 		modelCall, modelIdentity := pending.modelCall, pending.identity
 		memoryVersions := append([]app.CloudDSHMemoryVersion(nil), pending.memoryVersions...)
@@ -1574,9 +1582,6 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 		}()
 	}
 	startNextModel := func() {
-		if activeModelID != "" {
-			return
-		}
 		for len(queuedModelIDs) > 0 {
 			id := queuedModelIDs[0]
 			queuedModelIDs = queuedModelIDs[1:]
@@ -1709,7 +1714,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			deferredFrames[0] = cloudDSHRead{}
 			deferredFrames = deferredFrames[1:]
 			deferredFrameBytes -= len(item.frame)
-		} else if activeModelID == "" && len(queuedModelIDs) > 0 {
+		} else if len(queuedModelIDs) > 0 {
 			select {
 			case <-ctx.Done():
 				return context.Cause(ctx)
@@ -1724,13 +1729,14 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return context.Cause(ctx)
 			case result := <-modelResults:
 				pending, exists := pendingModels[result.id]
-				if !exists || pending.identity != result.identity || activeModelID != result.id {
+				_, active := activeModelIDs[result.id]
+				if !exists || pending.identity != result.identity || !active {
 					return errors.New("dsh model result identity is invalid")
 				}
 				delete(pendingModels, result.id)
+				delete(activeModelIDs, result.id)
 				pending.cancelExplicit()
 				pending.cancel()
-				activeModelID = ""
 				if pending.cancelled {
 					continue
 				}
@@ -1763,10 +1769,22 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				}
 				if result.err != nil {
 					if cloudDSHModelErrorCategory(result.err) == "provider_context_length_exceeded" {
+						if pending.identity.SessionID != rootIdentity.SessionID {
+							pending.state.modelFailureCode = "CONTEXT_WINDOW_EXCEEDED"
+						}
 						if err := writeCloudDSHModelFailure(ctx, input, result.id, pending.identity); err != nil {
 							return err
 						}
 						continue
+					}
+					if pending.identity.SessionID != rootIdentity.SessionID {
+						if failureCode, safeFailure := cloudDSHChildModelFailureCode(result.err); safeFailure {
+							pending.state.modelFailureCode = failureCode
+							if err := writeCloudDSHModelRequestFailure(ctx, input, result.id, pending.identity, failureCode); err != nil {
+								return err
+							}
+							continue
+						}
 					}
 					return cloudDSHModelResultErrorFor(result.err)
 				}
@@ -2221,6 +2239,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if _, exists := pendingModels[frame.ID]; exists {
 				return errors.New("dsh model request identity is repeated")
 			}
+			for _, pending := range pendingModels {
+				if pending.identity.SessionID == state.identity.SessionID && !pending.cancelled {
+					return errors.New("dsh session already has a pending model request")
+				}
+			}
 			state.lastModel = state.through
 			cancelRequested, err := e.cloudDSHJobCancelRequested(ctx, fence, state)
 			if err != nil {
@@ -2324,7 +2347,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err != nil || child.Step.Status == task.StepRunning || cloudDSHJobStatus(child) != frame.Status {
 				return errors.New("dsh job cancellation was not durably confirmed")
 			}
-			call := app.ModelToolCall{Name: cloudDSHJobCancelToolName, CallID: pending.frame.CallID,
+			cancelCallID := pending.frame.CallID
+			if pending.identity.SessionID != rootIdentity.SessionID {
+				cancelCallID = cloudDSHNamespacedToolCallID(value.ID, pending.identity.SessionID, pending.frame.CallID)
+			}
+			call := app.ModelToolCall{Name: cloudDSHJobCancelToolName, CallID: cancelCallID,
 				Arguments: string(pending.arguments), TaskFence: cloudDSHModelFencePointer(pending.fence, pending.identity.SessionID,
 					*pending.frame.Through)}
 			admission, err := e.admitToolCall(ctx, value, call, pending.fence, true)
@@ -2360,9 +2387,24 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return err
 			}
 		case "child_settle":
-			if e.options.Children == nil || state.identity.SessionID == rootIdentity.SessionID || state.parentSessionID != rootIdentity.SessionID ||
+			parent := states[state.parentSessionID]
+			if e.options.Children == nil || state.identity.SessionID == rootIdentity.SessionID || parent == nil || parent.settled ||
 				state.spawnKey != frame.CallID || !cloudDSHID.MatchString(frame.CallID) {
 				return errors.New("dsh child Agent settlement is invalid")
+			}
+			if state.canDelegate {
+				children, err := e.options.Children.List(ctx, fence, state.identity.SessionID)
+				if err != nil {
+					return errors.New("dsh nested child settlement is unavailable")
+				}
+				continuations, waiting, err := cloudDSHBackgroundOutputContinuations(state.history, children,
+					value.ID, state.identity.SessionID, state.definitions)
+				if err != nil {
+					return err
+				}
+				if waiting || len(continuations) != 0 {
+					return errCloudDSHBackgroundOutputPending
+				}
 			}
 			if frame.Through == nil || *frame.Through != state.through {
 				return errors.New("dsh child Agent settlement sequence is invalid")
@@ -2376,6 +2418,18 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 			summary := strings.TrimSpace(frame.Summary)
 			status := task.StepStatus(frame.Status)
+			if status == task.StepFailed && state.modelFailureCode != "" {
+				failureSummary := cloudDSHModelFailureSummary(state.modelFailureCode)
+				if !strings.Contains(summary, state.modelFailureCode) && !strings.Contains(summary, failureSummary) {
+					if summary == "" {
+						summary = failureSummary
+					} else if len(summary)+len(failureSummary)+1 <= 2048 {
+						summary += "\n" + failureSummary
+					} else {
+						summary = failureSummary
+					}
+				}
+			}
 			if status == task.StepSucceeded && !validCloudDSHChildSuccess(state.history, state.through, summary) {
 				return errors.New("dsh child Agent success is not supported by its checkpoint")
 			}
@@ -2389,7 +2443,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 			settledValue, err := runAgentRequest(state, request, func() (any, error) {
 				settled, replayed, err := e.options.Children.Settle(ctx, app.AgentChildSessionSettleCommand{Fence: fence,
-					ActorSessionID: rootIdentity.SessionID, SessionID: state.identity.SessionID, Status: status,
+					ActorSessionID: state.parentSessionID, SessionID: state.identity.SessionID, Status: status,
 					CheckpointThrough: state.through, CheckpointDigest: append([]byte(nil), state.checkpointDigest...), Summary: summary})
 				return cloudDSHChildSettleResult{session: settled, replayed: replayed}, err
 			})
@@ -2531,7 +2585,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if frame.Name == cloudDSHResultEvidenceToolName {
 					result = app.AgentToolResult{Status: app.AgentToolSucceeded, Output: "Evidence map received as an untrusted claim. It is retained only if references resolve and the final answer exactly matches the text in the assistant message that submitted it."}
 				} else if cloudDSHJobTool(frame.Name) {
-					if state.identity.SessionID != rootIdentity.SessionID || e.options.Children == nil {
+					if (state.identity.SessionID != rootIdentity.SessionID && !state.canDelegate) || e.options.Children == nil {
 						return errors.New("dsh job tool is unavailable to this session")
 					}
 					if recoveryCall {
@@ -2541,7 +2595,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					}
 					if result.Status == "" {
 						if frame.Name == cloudDSHJobCancelToolName {
-							immediate, pending, jobID, cancelErr := e.cancelCloudDSHJob(ctx, fence, rootIdentity.SessionID, frame.CallID, frame.Arguments)
+							immediate, pending, jobID, cancelErr := e.cancelCloudDSHJob(ctx, fence, state.identity.SessionID, frame.CallID, frame.Arguments)
 							if cancelErr != nil {
 								if messages, superseded := cloudDSHTaskInputPendingMessages(cancelErr); superseded {
 									if err := supersedeToolCall(ctx, messages, state.identity.SessionID, frame.CallID); err != nil {
@@ -2553,8 +2607,8 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 							}
 							if pending {
 								pendingCancels[frame.ID] = cloudDSHJobCancelPending{session: state, fence: fence, frame: frame,
-									arguments: arguments, identity: rootIdentity, jobID: jobID}
-								if err := e.writeCloudDSHJobCancel(ctx, rootIdentity, frame.ID, jobID, input); err != nil {
+									arguments: arguments, identity: state.identity, jobID: jobID}
+								if err := e.writeCloudDSHJobCancel(ctx, state.identity, frame.ID, jobID, input); err != nil {
 									delete(pendingCancels, frame.ID)
 									return err
 								}
@@ -2723,9 +2777,13 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		}
 	}
 	parent := states[frame.SessionID]
-	if e.options.Children == nil || parent == nil || !parent.canDelegate || parent.identity.SessionID != fence.AgentSessionID ||
+	if e.options.Children == nil || parent == nil || parent.settled || !parent.canDelegate ||
+		(parent.identity.SessionID != fence.AgentSessionID && parent.parentSessionID != fence.AgentSessionID) ||
 		frame.cloudDSHIdentity != parent.identity || frame.Through == nil || *frame.Through != parent.through || !cloudDSHID.MatchString(frame.CallID) {
 		return false, errors.New("dsh child Agent request identity is invalid")
+	}
+	if parent.identity.SessionID != fence.AgentSessionID {
+		parentDefinitions = parent.definitions
 	}
 	arguments, definitions, err := validateCloudDSHDelegateArguments(frame.Arguments, parentDefinitions)
 	canonical, canonicalOK := canonicalCloudDSHJSON(frame.Arguments)
@@ -2741,6 +2799,9 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		return false, errors.New("dsh child Agent request could not be tracked")
 	}
 	callID := frame.CallID
+	if parent.identity.SessionID != fence.AgentSessionID {
+		callID = cloudDSHNamespacedToolCallID(value.ID, parent.identity.SessionID, frame.CallID)
+	}
 	call := app.ModelToolCall{Name: cloudDSHDelegateToolName, CallID: callID, Arguments: string(canonical),
 		TaskFence: cloudDSHModelFencePointer(fence, parent.identity.SessionID, parent.through)}
 	admission, err := e.admitToolCall(ctx, value, call, fence, recoveryCall)
@@ -2768,7 +2829,7 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		allowedTools = append(allowedTools, definition.Name)
 	}
 	rootCheckpointThrough := rootCheckpointThroughSequence(parent, fence.AgentSessionID)
-	if recoveryCall && frame.SessionID == fence.AgentSessionID {
+	if recoveryCall {
 		childrenValue, err := runAgentRequest(parent, request, func() (any, error) {
 			return e.options.Children.List(ctx, fence, frame.SessionID)
 		})
@@ -2783,10 +2844,12 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 			}
 		}
 	}
+	childReplayed := false
 	childValue, err := runAgentRequest(parent, request, func() (any, error) {
-		child, _, err := e.options.Children.Create(ctx, app.AgentChildSessionCommand{Fence: fence, ParentSessionID: fence.AgentSessionID,
+		child, replayed, err := e.options.Children.Create(ctx, app.AgentChildSessionCommand{Fence: fence, ParentSessionID: parent.identity.SessionID,
 			SpawnKey: frame.CallID, Arguments: canonical, Title: strings.TrimSpace(arguments.Title), AllowedTools: allowedTools,
 			Background: arguments.RunInBackground, RootCheckpointThroughSequence: rootCheckpointThrough})
+		childReplayed = replayed
 		return child, err
 	})
 	child, ok := childValue.(app.AgentChildSession)
@@ -2802,10 +2865,25 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		}
 		return true, nil
 	}
-	if err != nil || !ok || child.TaskID != value.ID || child.ParentSessionID != fence.AgentSessionID || child.SessionID == "" ||
+	if err != nil || !ok || child.TaskID != value.ID || child.ParentSessionID != parent.identity.SessionID || child.SessionID == "" ||
 		child.SpawnKey != frame.CallID || child.Background != arguments.RunInBackground ||
 		!sameWorkerToolNames(child.AllowedTools, allowedTools) {
 		return false, errors.New("dsh child Agent could not be durably created")
+	}
+	if childReplayed && parent.resume && child.CancelRequested && child.Step.Status == task.StepRunning {
+		const summary = "outcome unknown after cancellation and confirmed Agent restart"
+		settled, _, err := e.options.Children.Settle(ctx, app.AgentChildSessionSettleCommand{
+			Fence: fence, ActorSessionID: parent.identity.SessionID, SessionID: child.SessionID,
+			Status: task.StepUnknown, CheckpointThrough: child.CheckpointThrough,
+			CheckpointDigest: append([]byte(nil), child.CheckpointDigest...), Summary: summary,
+		})
+		if err != nil || settled.TaskID != value.ID || settled.SessionID != child.SessionID ||
+			settled.ParentSessionID != parent.identity.SessionID || settled.Step.Status != task.StepUnknown ||
+			settled.Step.Summary != summary || settled.CheckpointThrough != child.CheckpointThrough ||
+			!bytes.Equal(settled.CheckpointDigest, child.CheckpointDigest) {
+			return false, errors.New("cancelled nested child outcome could not be durably reconciled")
+		}
+		child = settled
 	}
 	if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, parent, request); err != nil {
 		return false, err
@@ -2871,6 +2949,11 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 	}
 	identity := parent.identity
 	identity.SessionID = child.SessionID
+	childCanDelegate := parent.identity.SessionID == fence.AgentSessionID
+	childDefinitions, err := cloudDSHChildDelegationTools(definitions, childCanDelegate)
+	if err != nil {
+		return false, err
+	}
 	if child.Step.Status == task.StepRunning {
 		if existing := states[child.SessionID]; existing != nil {
 			if existing.spawnKey != frame.CallID || existing.identity != identity || existing.background != arguments.RunInBackground {
@@ -2878,8 +2961,8 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 			}
 		} else {
 			resume := child.CheckpointThrough >= 0
-			states[child.SessionID] = newCloudDSHSessionState(fence, identity, fence.AgentSessionID, frame.CallID,
-				definitions, false, resume, child.CheckpointThrough, child.CheckpointDigest)
+			states[child.SessionID] = newCloudDSHSessionState(fence, identity, parent.identity.SessionID, frame.CallID,
+				childDefinitions, childCanDelegate, resume, child.CheckpointThrough, child.CheckpointDigest)
 			states[child.SessionID].rootCheckpointThrough = child.RootCheckpointThroughSequence
 			states[child.SessionID].background = arguments.RunInBackground
 		}
@@ -2888,7 +2971,7 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		"task_id": identity.TaskID, "owner_id": identity.OwnerID, "agent_id": identity.AgentID, "session_id": identity.SessionID,
 		"generation": identity.Generation, "authorization_version": identity.AuthorizationVersion,
 		"parent_session_id": child.ParentSessionID, "objective": arguments.Objective,
-		"tools": cloudDSHToolPayload(definitions), "checkpoint_through_seq": child.CheckpointThrough,
+		"tools": cloudDSHToolPayload(childDefinitions), "checkpoint_through_seq": child.CheckpointThrough,
 		"checkpoint_sha256": hex.EncodeToString(child.CheckpointDigest), "step_status": child.Step.Status, "summary": child.Step.Summary}
 	if hasSettledOutput {
 		response["settled_output"] = settledOutput

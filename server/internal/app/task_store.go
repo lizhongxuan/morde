@@ -13,6 +13,11 @@ import (
 const MaxAssistantMessageBytes = 32 << 10
 const maxEventPage = 100
 
+const (
+	MaxTaskStepDetailPayloadBytes    = 256 << 10
+	MaxTaskStepDetailCiphertextBytes = MaxTaskStepDetailPayloadBytes + 28
+)
+
 type PageRequest struct {
 	Limit  int32
 	Cursor string
@@ -231,12 +236,38 @@ type TaskStepContentEvidence struct {
 	Truncated bool   `json:"truncated"`
 }
 
+// TaskStepExecution contains only bounded, redacted details visible to the
+// authorized Task reader. Nil fields were not recorded or do not apply.
+type TaskStepExecution struct {
+	Location               *string `json:"location,omitempty"`
+	Parameters             *string `json:"parameters,omitempty"`
+	Command                *string `json:"command,omitempty"`
+	WorkingDirectory       *string `json:"working_directory,omitempty"`
+	DurationMS             *int64  `json:"duration_ms,omitempty"`
+	ExitCode               *int    `json:"exit_code,omitempty"`
+	TimedOut               *bool   `json:"timed_out,omitempty"`
+	Stdout                 *string `json:"stdout,omitempty"`
+	Stderr                 *string `json:"stderr,omitempty"`
+	StdoutTotalBytes       *int    `json:"stdout_total_bytes,omitempty"`
+	StderrTotalBytes       *int    `json:"stderr_total_bytes,omitempty"`
+	StdoutOmittedBytes     *int    `json:"stdout_omitted_bytes,omitempty"`
+	StderrOmittedBytes     *int    `json:"stderr_omitted_bytes,omitempty"`
+	StdoutTruncated        *bool   `json:"stdout_truncated,omitempty"`
+	StderrTruncated        *bool   `json:"stderr_truncated,omitempty"`
+	StdoutRuntimeTruncated *bool   `json:"stdout_runtime_truncated,omitempty"`
+	StderrRuntimeTruncated *bool   `json:"stderr_runtime_truncated,omitempty"`
+	StdoutDetailTruncated  *bool   `json:"stdout_detail_truncated,omitempty"`
+	StderrDetailTruncated  *bool   `json:"stderr_detail_truncated,omitempty"`
+}
+
 type TaskStepDetailDocument struct {
-	Object          string                          `json:"object"`
-	Input           string                          `json:"input"`
-	Result          string                          `json:"result"`
-	ShellExecution  *TaskStepShellExecutionEvidence `json:"shell_execution,omitempty"`
-	ContentEvidence *TaskStepContentEvidence        `json:"content_evidence,omitempty"`
+	Object               string                          `json:"object"`
+	Input                string                          `json:"input"`
+	Result               string                          `json:"result"`
+	ShellExecution       *TaskStepShellExecutionEvidence `json:"shell_execution,omitempty"`
+	ContentEvidence      *TaskStepContentEvidence        `json:"content_evidence,omitempty"`
+	Execution            *TaskStepExecution              `json:"execution,omitempty"`
+	ExecutionWorkspaceID string                          `json:"execution_workspace_id,omitempty"`
 }
 
 type TaskStepDetail struct {
@@ -249,6 +280,7 @@ type TaskStepDetail struct {
 	Input           *string                         `json:"input"`
 	Result          *string                         `json:"result"`
 	Truncated       bool                            `json:"truncated"`
+	Execution       *TaskStepExecution              `json:"execution,omitempty"`
 	ShellExecution  *TaskStepShellExecutionEvidence `json:"-"`
 	ContentEvidence *TaskStepContentEvidence        `json:"-"`
 }

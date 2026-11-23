@@ -81,6 +81,70 @@ func TestWriteRegularFileFromRejectsUnverifiedContentWithoutReplacingTarget(t *t
 	}
 }
 
+func TestCommitWorkspaceCurrentWritePreservesConcurrentReplacement(t *testing.T) {
+	directory := t.TempDir()
+	const targetContent = "concurrent replacement"
+	const stagedContent = "our staged candidate"
+	if err := os.WriteFile(filepath.Join(directory, "target.txt"), []byte(targetContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "staged.tmp"), []byte(stagedContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+
+	preserve, err := commitWorkspaceCurrentWriteAt(int(parent.Fd()), "staged.tmp", "target.txt",
+		workspaceCurrentTestSHA("baseline before concurrent replacement"), workspaceCurrentTestSHA(stagedContent))
+	if !errors.Is(err, ErrWriteConflict) {
+		t.Fatalf("commit with changed expected target = %v; want ErrWriteConflict", err)
+	}
+	if preserve {
+		t.Fatal("unchanged staged candidate should be safe for the caller to clean up after rollback")
+	}
+	gotTarget, err := os.ReadFile(filepath.Join(directory, "target.txt"))
+	if err != nil || string(gotTarget) != targetContent {
+		t.Fatalf("target after conflicted exchange = %q, %v; want concurrent replacement", gotTarget, err)
+	}
+	gotStaged, err := os.ReadFile(filepath.Join(directory, "staged.tmp"))
+	if err != nil || string(gotStaged) != stagedContent {
+		t.Fatalf("staged candidate after rollback = %q, %v; want candidate intact", gotStaged, err)
+	}
+}
+
+func TestCommitWorkspaceCurrentCreateDoesNotReplaceConcurrentTarget(t *testing.T) {
+	directory := t.TempDir()
+	const targetContent = "created by another writer"
+	const stagedContent = "our candidate"
+	if err := os.WriteFile(filepath.Join(directory, "target.txt"), []byte(targetContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "staged.tmp"), []byte(stagedContent), 0600); err != nil {
+		t.Fatal(err)
+	}
+	parent, err := os.Open(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parent.Close()
+
+	if preserve, err := commitWorkspaceCurrentWriteAt(int(parent.Fd()), "staged.tmp", "target.txt", "", workspaceCurrentTestSHA(stagedContent)); !errors.Is(err, ErrWriteConflict) || preserve {
+		t.Fatalf("create over concurrent target = preserve:%t err:%v; want conflict with staged candidate safe to clean", preserve, err)
+	}
+	got, err := os.ReadFile(filepath.Join(directory, "target.txt"))
+	if err != nil || string(got) != targetContent {
+		t.Fatalf("target after rejected create = %q, %v; want concurrent target", got, err)
+	}
+}
+
+func workspaceCurrentTestSHA(value string) string {
+	digest := sha256.Sum256([]byte(value))
+	return hex.EncodeToString(digest[:])
+}
+
 func TestWorkspaceCurrentWriteRejectsSymbolicLinkParents(t *testing.T) {
 	store := openSymlinkTestStore(t)
 	if err := store.Materialize(context.Background(), "u1234567", "w1234567", 0, nil, nil,

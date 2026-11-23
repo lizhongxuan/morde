@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"morde/server/internal/domain/task"
@@ -40,6 +41,18 @@ func validTaskStepDetailDocument(value TaskStepDetailDocument) bool {
 			!utf8.ValidString(evidence.Preview) || strings.ContainsRune(evidence.Preview, '\x00')) {
 		return false
 	}
+	if !validTaskStepExecution(value.Execution) {
+		return false
+	}
+	if value.Execution != nil && (value.Execution.Stdout != nil || value.Execution.Stderr != nil) && value.ShellExecution == nil {
+		return false
+	}
+	if value.ExecutionWorkspaceID != "" && !validRuntimeWorkspaceID(value.ExecutionWorkspaceID) {
+		return false
+	}
+	if taskStepExecutionRequiresWorkspace(value.Execution) && value.ExecutionWorkspaceID == "" {
+		return false
+	}
 	return true
 }
 
@@ -48,7 +61,7 @@ func sealTaskStepDetail(sealer *Sealer, ownerID, taskID, stepID string, revision
 		return nil, nil, 0, fmt.Errorf("task step detail identity or document is invalid")
 	}
 	plain, err := json.Marshal(value)
-	if err != nil || len(plain) == 0 || len(plain) > 64<<10 {
+	if err != nil || len(plain) == 0 || len(plain) > MaxTaskStepDetailPayloadBytes {
 		return nil, nil, 0, fmt.Errorf("task step detail exceeds its storage limit")
 	}
 	ciphertext, err := sealer.SealWithAAD(plain, taskStepDetailAAD(ownerID, taskID, stepID, revision))
@@ -68,6 +81,9 @@ type cloudDSHToolActivity struct {
 	sealer          *Sealer
 	displayObject   string
 	shellExecution  *TaskStepShellExecutionEvidence
+	shellOutput     *taskStepShellOutput
+	executionStart  time.Time
+	executionMS     *int64
 	contentEvidence *TaskStepContentEvidence
 	phaseOverride   string
 	failureReason   string
@@ -115,6 +131,12 @@ func withTaskToolShellExecutionEvidence(ctx context.Context, name string, result
 		return ctx
 	}
 	activity.shellExecution = taskToolShellExecutionEvidence(name, result)
+	if activity.shellExecution != nil {
+		var output taskStepShellOutput
+		if decodeStrictRuntimeResult([]byte(result.Output), &output) == nil {
+			activity.shellOutput = &output
+		}
+	}
 	return context.WithValue(ctx, cloudDSHToolActivityKey{}, activity)
 }
 
@@ -177,14 +199,7 @@ func taskToolShellExecutionEvidence(name string, result AgentToolResult) *TaskSt
 	if name != runtimeToolShellExec || (result.Status != AgentToolSucceeded && result.Status != AgentToolFailed) {
 		return nil
 	}
-	var shell struct {
-		ExitCode        int    `json:"exit_code"`
-		TimedOut        bool   `json:"timed_out"`
-		Stdout          string `json:"stdout"`
-		Stderr          string `json:"stderr"`
-		StdoutTruncated bool   `json:"stdout_truncated"`
-		StderrTruncated bool   `json:"stderr_truncated"`
-	}
+	var shell taskStepShellOutput
 	if decodeStrictRuntimeResult([]byte(result.Output), &shell) != nil || shell.ExitCode < 0 || shell.ExitCode > 255 ||
 		(result.Status == AgentToolSucceeded) == (shell.ExitCode != 0 || shell.TimedOut) {
 		return nil
@@ -207,9 +222,11 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 	if activity.displayObject != "" {
 		object = activity.displayObject
 	}
+	execution, executionTruncated := taskToolExecutionDetails(activity)
 	detail := TaskStepDetailDocument{Object: object, Input: taskToolInputSummary(activity.call.Name, activity.call.Arguments),
-		Result: taskToolResultSummary(step), ShellExecution: activity.shellExecution, ContentEvidence: activity.contentEvidence}
-	truncated := false
+		Result: taskToolResultSummary(step), ShellExecution: activity.shellExecution, ContentEvidence: activity.contentEvidence,
+		Execution: execution, ExecutionWorkspaceID: taskToolExecutionWorkspaceID(activity)}
+	truncated := executionTruncated
 	detail.Object, truncated = truncateTaskDetail(detail.Object, truncated)
 	detail.Input, truncated = truncateTaskDetail(detail.Input, truncated)
 	detail.Result, truncated = truncateTaskDetail(detail.Result, truncated)

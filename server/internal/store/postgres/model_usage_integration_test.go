@@ -680,8 +680,11 @@ func TestPostgresModelBudgetAndUnknownUsageFailClosed(t *testing.T) {
 	}
 	next := reservation
 	next.CallID = "test-call-0002"
-	if err := store.ReserveModelCall(ctx, next); domain.CodeOf(err) != domain.CodeRateLimited {
-		t.Fatalf("concurrent limit = %v", err)
+	err := store.ReserveModelCall(ctx, next)
+	var concurrencyLimit *domain.Error
+	if domain.CodeOf(err) != domain.CodeRateLimited || !errors.As(err, &concurrencyLimit) ||
+		concurrencyLimit.Details["reason"] != "model_concurrency_limit" || concurrencyLimit.Details["stage"] != "reservation" {
+		t.Fatalf("concurrent reservation limit lacks its safe pre-dispatch classification: %v", err)
 	}
 	if err := store.SettleModelCall(ctx, app.ModelCallSettlement{Source: reservation.Source, OwnerID: principal.UserID, CallID: reservation.CallID, Unknown: true}); err != nil {
 		t.Fatal(err)

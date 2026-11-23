@@ -174,6 +174,8 @@ func (s *ModelGatewayService) observeModelUsage(settlement ModelCallSettlement) 
 
 const modelRequestItemTokenReserve int64 = 32
 
+const modelConcurrencyReservationRetryMaxDelay = time.Second
+
 // MaxDSHModelResponseTextBytes is the maximum response text accepted by the cloud DSH worker.
 // MaxDSHModelResponseToolCalls is the maximum tool-call count accepted by the cloud DSH worker.
 const (
@@ -231,6 +233,53 @@ func (s *ModelGatewayService) SetModelResponseSealer(sealer *Sealer) error {
 
 func (s *ModelGatewayService) SetGPT6LunaMaxReasoning(enabled bool) {
 	s.gpt6LunaMaxReasoning = enabled
+}
+
+func modelConcurrencyReservationLimited(err error) bool {
+	var modelErr *domain.Error
+	return errors.As(err, &modelErr) && modelErr.Code == domain.CodeRateLimited &&
+		modelErr.Details["reason"] == "model_concurrency_limit" && modelErr.Details["stage"] == "reservation"
+}
+
+// reserveModelCall retries only a typed, pre-dispatch account concurrency limit.
+// Other rate limits, uncertain reservations, and provider errors remain terminal.
+func (s *ModelGatewayService) reserveModelCall(ctx context.Context, source ModelCallSource, projectCall bool, projectID string,
+	reservation ModelCallReservation, usage project.Usage) error {
+	delay := 100 * time.Millisecond
+	for {
+		var err error
+		if projectCall {
+			if source == ModelCallCompaction {
+				_, _, err = s.projectBudget.reserveConversationSummaryModelCall(ctx, projectID, reservation, usage)
+			} else if source == ModelCallReview {
+				_, _, err = s.projectBudget.reserveTaskValidationReviewModelCall(ctx, projectID, reservation, usage)
+			} else {
+				_, _, err = s.projectBudget.reserveTaskModelCall(ctx, projectID, reservation, usage)
+			}
+		} else {
+			err = s.store.ReserveModelCall(ctx, reservation)
+		}
+		if err == nil || source != ModelCallTask || !modelConcurrencyReservationLimited(err) {
+			return err
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return context.Cause(ctx)
+		case <-timer.C:
+		}
+		if delay < modelConcurrencyReservationRetryMaxDelay/2 {
+			delay *= 2
+		} else {
+			delay = modelConcurrencyReservationRetryMaxDelay
+		}
+	}
 }
 
 func (s *ModelGatewayService) applyGPT6LunaReasoning(endpoint ModelEndpoint, request *ModelRequest, disableByDefault bool) {
@@ -494,20 +543,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		}
 	}
 	projectCall := projectID != "" && !endpoint.Personal
-	if projectCall {
-		usage := projectUsageReservation(call.Request, reserve)
-		var reserveErr error
-		if call.Source == ModelCallCompaction {
-			_, _, reserveErr = s.projectBudget.reserveConversationSummaryModelCall(ctx, projectID, reservation, usage)
-		} else if call.Source == ModelCallReview {
-			_, _, reserveErr = s.projectBudget.reserveTaskValidationReviewModelCall(ctx, projectID, reservation, usage)
-		} else {
-			_, _, reserveErr = s.projectBudget.reserveTaskModelCall(ctx, projectID, reservation, usage)
-		}
-		if reserveErr != nil {
-			return ModelResponse{}, reserveErr
-		}
-	} else if err := s.store.ReserveModelCall(ctx, reservation); err != nil {
+	if err := s.reserveModelCall(ctx, call.Source, projectCall, projectID, reservation, projectUsageReservation(call.Request, reserve)); err != nil {
 		return ModelResponse{}, err
 	}
 	request := call.Request

@@ -106,6 +106,80 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
         app.terminate()
     }
 
+    func testLocalPortalRetriesConnectorRateLimitFromNativeTaskDetail() async throws {
+        guard let account = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_USER"],
+              let password = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_PASSWORD"],
+              let server = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_SERVER"],
+              let url = URL(string: server), url.scheme == "http",
+              ["localhost", "127.0.0.1"].contains(url.host ?? ""),
+              let port = url.port, (1...65535).contains(port),
+              let token = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_ACTIVITY_TOKEN"],
+              !token.isEmpty else {
+            throw XCTSkip("Set the generated local Portal credentials, loopback URL, and activity token.")
+        }
+
+        let objective = "跨端活动验收：连接器限流后手动重试"
+        let app = XCUIApplication()
+        app.launchArguments = ["-morde.server", server]
+        app.launch()
+
+        let accountField = app.textFields["morde.auth.username"]
+        if accountField.waitForExistence(timeout: 5) {
+            enterLocalPortalCredentials(app: app, account: account, password: password)
+            let loginFormDismissed = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "exists == false"), object: accountField)
+            await fulfillment(of: [loginFormDismissed], timeout: 30)
+        }
+
+        let chatTab = app.buttons["morde.shell.tab.chat"]
+        XCTAssertTrue(chatTab.waitForExistence(timeout: 30))
+        chatTab.tap()
+        let composer = app.descendants(matching: .any).matching(identifier: "morde.chat.composer").firstMatch
+        XCTAssertTrue(composer.waitForExistence(timeout: 15))
+        composer.tap()
+        composer.typeText(objective)
+        let send = app.buttons["morde.task.send"]
+        XCTAssertTrue(send.waitForExistence(timeout: 10))
+        XCTAssertTrue(send.isEnabled)
+        send.tap()
+
+        let claimed = try await waitForFixtureRun("mcp-retry", stage: "claimed", server: url, token: token)
+        let taskID = try XCTUnwrap(claimed.taskID)
+        try await advanceFixture("mcp-retry", phase: "start", server: url, token: token)
+        _ = try await waitForFixtureRun("mcp-retry", stage: "started", server: url, token: token)
+        try await advanceFixture("mcp-retry", phase: "progress", server: url, token: token)
+        _ = try await waitForFixtureRun("mcp-retry", stage: "progress", server: url, token: token)
+        try await advanceFixture("mcp-retry", phase: "fail", server: url, token: token)
+        _ = try await waitForFixtureRun("mcp-retry", stage: "failed", server: url, token: token)
+
+        let tasksTab = app.buttons["morde.shell.tab.tasks"]
+        XCTAssertTrue(tasksTab.waitForExistence(timeout: 15))
+        tasksTab.tap()
+        let taskRow = app.buttons["morde.tasks.row.\(taskID)"]
+        XCTAssertTrue(taskRow.waitForExistence(timeout: 30), "The server-failed Task should appear in the native task list.")
+        taskRow.tap()
+
+        let sourceStep = app.buttons.matching(
+            NSPredicate(format: "label CONTAINS %@", "调用本地合成连接器")).firstMatch
+        XCTAssertTrue(sourceStep.waitForExistence(timeout: 20), "The failed connector step should appear in native Task activity.")
+        let workItems = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "morde.taskDynamics.workItem."))
+        let sourceStepCount = workItems.count
+        sourceStep.tap()
+
+        let retry = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "morde.task.step.retry.")).firstMatch
+        XCTAssertTrue(retry.waitForExistence(timeout: 20), "The exact server-authorized rate-limit retry should be available.")
+        retry.tap()
+
+        let newAttempt = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "count > %d", sourceStepCount), object: workItems)
+        await fulfillment(of: [newAttempt], timeout: 30)
+        XCTAssertGreaterThan(workItems.count, sourceStepCount)
+        try await verifyFixture("mcp-retry", server: url, token: token)
+        app.terminate()
+    }
+
     func testLocalPortalLongMessageUploadResumesAfterAppRestart() async throws {
         guard let account = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_USER"],
               let password = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_PASSWORD"],

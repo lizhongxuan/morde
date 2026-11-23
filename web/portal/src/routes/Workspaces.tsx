@@ -38,6 +38,7 @@ type PortalProjectBridge = {
   projectUploadTargets?: () => Promise<unknown>;
   selectProjectDirectory?: (hostId: string, workspaceId: string) => Promise<unknown>;
   uploadProject?: (selectionID: string, projectName: string) => Promise<unknown>;
+  projectLocalStatus?: (selectionID: string) => Promise<unknown>;
   stopProjectSync?: (selectionID: string) => Promise<unknown>;
   legacyDiscardSync?: (workspaceID: string) => Promise<unknown>;
   state?: () => Promise<unknown>;
@@ -190,13 +191,19 @@ function projectUploadStatus(value: unknown): string {
     if (result.hostStatus === 'applied' && receipt.status === 'applied'
       && Number.isSafeInteger(receipt.targetRevision) && Number.isSafeInteger(receipt.appliedRevision)
       && Number(receipt.targetRevision) >= 0 && Number(receipt.appliedRevision) >= Number(receipt.targetRevision)
-      && Array.isArray(receipt.impacts) && receipt.impacts.length === 0) return '同步完成，目标电脑已应用本次项目。';
+      && Array.isArray(receipt.impacts) && receipt.impacts.length === 0) return result.localSnapshotConfirmed === true
+        ? '上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。'
+        : '目标电脑已应用本次项目，但本机状态基线未确认；请重新同步后核对。';
     if (receipt.status === 'conflict') return `云端已确认，目标电脑存在冲突；恢复点已保留。${projectConflictPaths(receipt.impacts)}`;
     if (receipt.status === 'unknown' || result.hostStatus === 'unknown') return '云端已确认，目标电脑应用状态未知；恢复点已保留。';
     return '云端已确认，等待目标电脑应用。';
   }
   const messages: Record<string, string> = { running: '同步仍在进行，恢复点已保留。', conflict: '发现冲突，本次同步未提交。',
     failed: '同步失败，云端未确认完成。', cancelled: '同步已取消，云端未确认完成。', expired: '同步会话已过期，云端未确认完成。' };
+  if (session.state === 'conflict' && Array.isArray(result.conflicts) && result.conflicts.some((conflict) => conflict && typeof conflict === 'object'
+    && (conflict as Record<string, unknown>).reason === 'cloud_baseline_unavailable')) {
+    return '无法核对上次同步后的云端文件状态，同步已暂停；请先核对云端项目内容。';
+  }
   return typeof session.state === 'string' ? `${messages[session.state] ?? '同步结果待确认。'}${session.state === 'conflict' ? projectConflictPaths(result.conflicts) : ''}` : '同步结果未知，请核对状态。';
 }
 
@@ -436,6 +443,19 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
     ? scopedProjectState?.projectMappings.find((item) => item.selectionID === projectCheckpoint.projectSelectionID
       && item.workspaceId === projectCheckpoint.workspaceId && item.projectName === projectCheckpoint.projectName) : undefined;
   const projectNameValidation = validateProjectName(projectNameDraft);
+  const projectLocalStatus = useQuery({
+    queryKey: ['project-local-status', user?.id, scopedProjectSelection?.selectionID],
+    queryFn: async () => {
+      if (!projectBridge?.projectLocalStatus || !scopedProjectSelection) return 'unknown';
+      const value = await projectBridge.projectLocalStatus(scopedProjectSelection.selectionID);
+      const state = value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>).state : undefined;
+      return state === 'current' || state === 'pending' ? state : 'unknown';
+    },
+    enabled: Boolean(projectBridge?.projectLocalStatus && scopedProjectSelection && user?.id && !projectUploadBusy && scopedProjectState?.syncState === 'idle'),
+    refetchInterval: 10000,
+    refetchOnWindowFocus: true,
+    retry: false,
+  });
   const query = useQuery({
     queryKey: ['workspaces'], queryFn: portalApi.workspaces,
     enabled: !projectSyncOnly || Boolean(computer),
@@ -679,6 +699,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
       setProjectNameDraft(selection.projectName);
       setConfirmedProjectName('');
       setProjectNameError('');
+      setProjectUploadMessage('待处理：确认项目名后，点击同步才会更新云端。');
       setProjectDirectoryNotice(`已选择本机目录“${selection.directoryName}”。`);
     } catch (error) {
       if (revision === projectSelectionRevision.current && ownerID === currentProjectOwner.current) setProjectDirectoryError(`选择本机目录失败：${errorDetails(error).message}`);
@@ -725,6 +746,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
       if (ownerID === currentProjectOwner.current) {
         await refreshLocalProjectState();
         setProjectUploadBusy(false);
+        void client.invalidateQueries({ queryKey: ['project-local-status', ownerID, selection.selectionID] });
       }
     }
   };
@@ -773,12 +795,12 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
       <Link className="button button-secondary button-small" to="/hosts">查看云端电脑</Link>
       <button type="button" className="button button-secondary button-small" onClick={abandonRecovery}>我已核对，清除本机记录</button>
     </FloatingNotice>}
-    {legacyCreateRecovery.invalid && <FloatingError role="alert">无法读取旧版云端文件创建恢复记录。请先检查云端文件列表，再清除本机记录。
+    {legacyCreateRecovery.invalid && <div className="error-inline" role="alert">无法读取旧版云端文件创建恢复记录。请先检查云端文件列表，再清除本机记录。
       <Link className="button button-secondary button-small" to="/hosts">查看云端电脑</Link>
       <button type="button" className="button button-secondary button-small" onClick={abandonRecovery}>我已核对，清除本机记录</button>
-    </FloatingError>}
+    </div>}
     {computerID && hosts.isSuccess && !computer && <FloatingNotice className="notice-warning">无法确认这台云端电脑的文件访问权限。</FloatingNotice>}
-    {restoreRecovery.invalid && <FloatingError>本机文件恢复记录无法读取。请先在云端电脑列表核对状态，不能直接开始另一项恢复。<button type="button" className="button button-secondary" disabled={restoreWorkflowBusy} onClick={abandonWorkspaceRestoreRecord}>我已核对服务端状态，清除损坏记录</button></FloatingError>}
+    {restoreRecovery.invalid && <div className="error-inline" role="alert">本机文件恢复记录无法读取。请先在云端电脑列表核对状态，不能直接开始另一项恢复。<button type="button" className="button button-secondary" disabled={restoreWorkflowBusy} onClick={abandonWorkspaceRestoreRecord}>我已核对服务端状态，清除损坏记录</button></div>}
     {restoreRecovery.pending && <FloatingNotice className="notice-warning">
       <p>{restoreRecovery.pending.hostID
         ? '旧版 Host 文件恢复流程在“' + restorePhaseLabel[restoreRecovery.pending.phase] + '”阶段待人工核对。Host 目录现在不能通过解绑式恢复；本机恢复记录已保留，未继续操作。'
@@ -796,7 +818,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
       <div className="design-panel-header"><div><h2 id="project-upload-title">文件同步</h2><p>将本机文件夹手动单向同步到默认云端电脑的项目目录。</p></div></div>
       {!projectBridgeAvailable && <p className="muted" role="status">本机文件同步需要 Morde 桌面客户端，请在桌面客户端继续。</p>}
       {projectBridgeAvailable && projectCapabilities.isPending && <FloatingNotice className="notice-info">正在确认服务端文件同步能力…</FloatingNotice>}
-      {projectBridgeAvailable && projectCapabilities.isError && <FloatingError>无法确认服务端项目同步能力。为保护云端数据，项目目录和同步操作已关闭。<button type="button" className="button button-secondary button-small" onClick={() => void projectCapabilities.refetch()}>重试</button></FloatingError>}
+      {projectBridgeAvailable && projectCapabilities.isError && <div className="error-inline" role="alert">无法确认服务端项目同步能力。为保护云端数据，项目目录和同步操作已关闭。<button type="button" className="button button-secondary button-small" onClick={() => void projectCapabilities.refetch()}>重试</button></div>}
       {projectBridgeAvailable && projectCapabilities.isSuccess && !projectUploadGateEnabled && <p className="muted" role="status">当前服务尚未开放本机文件同步。</p>}
       {projectBridgeAvailable && !projectBridge?.state && <p className="muted" role="status">当前桌面客户端不支持读取本机同步状态，请更新客户端。</p>}
       {localProjectError && <p className="muted" role="status">{localProjectError} <button type="button" className="button button-secondary button-small" onClick={() => void refreshLocalProjectState()}>重试</button></p>}
@@ -809,11 +831,11 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
         disabled={!projectBridge?.stopProjectSync || projectStopBusy} onClick={() => void stopProjectUpload()}>{projectStopBusy ? '正在停止…' : '停止同步'}</button>}
       {projectBridgeAvailable && projectUploadGateEnabled && <>
         {projectPreferences.isPending && <FloatingNotice className="notice-info">正在读取默认云端电脑设置…</FloatingNotice>}
-        {projectPreferences.isError && <FloatingError>无法读取默认电脑设置，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void projectPreferences.refetch()}>重试</button></FloatingError>}
+        {projectPreferences.isError && <div className="error-inline" role="alert">无法读取默认电脑设置，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void projectPreferences.refetch()}>重试</button></div>}
         {projectPreferences.isSuccess && !defaultHostID && <p className="notice notice-warning" role="status">尚未设置默认云端电脑。请先在<Link to="/hosts">云端电脑页面</Link>设置默认电脑；文件同步不会改用其他电脑。</p>}
         {projectTargetRouteMismatch && <p className="notice notice-warning" role="status">此链接指定的电脑已不是当前默认电脑，文件同步已暂停。请从<Link to="/hosts?sync=1">云端电脑页面</Link>重新打开默认电脑的同步入口。</p>}
         {defaultHostID && hosts.isPending && <FloatingNotice className="notice-info">正在核对默认云端电脑和文件目录…</FloatingNotice>}
-        {defaultHostID && hosts.isError && <FloatingError>无法核对默认云端电脑及其文件目录，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
+        {defaultHostID && hosts.isError && <div className="error-inline" role="alert">无法核对默认云端电脑及其文件目录，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void hosts.refetch()}>重试</button></div>}
         {defaultHostID && hosts.isSuccess && !configuredDefaultHost && <p className="notice notice-warning" role="status">默认云端电脑不可用或已失去访问权限。请先检查默认电脑设置；文件同步不会改用其他电脑。</p>}
         {configuredDefaultHost && configuredDefaultHost.state !== 'running' && <p className="notice notice-warning" role="status">默认云端电脑当前{hostStateLabel[configuredDefaultHost.state] || configuredDefaultHost.state}，同步已暂停。请先恢复默认电脑。</p>}
         {configuredDefaultHost?.state === 'running' && configuredDefaultHost.workspace_runtime_online !== true && <p className="notice notice-warning" role="status">默认云端电脑的文件服务未确认在线，文件同步已暂停。</p>}
@@ -821,7 +843,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
         {configuredDefaultWorkspace && !configuredDefaultWorkspaceReady && <p className="notice notice-warning" role="status">默认云端电脑的文件状态未确认完成或存在冲突，文件同步已暂停。</p>}
         {projectPreferences.isSuccess && Boolean(defaultHostID) && configuredDefaultHost && configuredDefaultWorkspace && projectTargets.isPending
           && <FloatingNotice className="notice-info">正在核对默认电脑的项目同步权限…</FloatingNotice>}
-        {projectPreferences.isSuccess && Boolean(defaultHostID) && projectTargets.isError && <FloatingError>无法核对默认电脑的项目同步权限，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void projectTargets.refetch()}>重试</button></FloatingError>}
+        {projectPreferences.isSuccess && Boolean(defaultHostID) && projectTargets.isError && <div className="error-inline" role="alert">无法核对默认电脑的项目同步权限，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void projectTargets.refetch()}>重试</button></div>}
         {projectTargets.isSuccess && defaultHostID && configuredDefaultHost && configuredDefaultWorkspace && !configuredDefaultProjectTarget
           && <p className="notice notice-warning" role="status">默认云端电脑当前不可用于项目同步（目录未就绪、授权变化或仍有旧版同步）。文件同步已暂停，不会切换到其他电脑。</p>}
         {configuredDefaultProjectTarget && <article className="schedule-card" role="group" aria-label="同步目标电脑" style={{ padding: '8px 10px' }}>
@@ -846,6 +868,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
                 setProjectNameDraft(event.target.value);
                 setConfirmedProjectName('');
                 setProjectNameError('');
+                setProjectUploadMessage('待处理：确认项目名后，点击同步才会更新云端。');
               }} />
               {projectNameError && <FloatingError>{projectNameError}</FloatingError>}
               <div className="inline-actions">
@@ -873,11 +896,17 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
           ? scopedProjectState.syncRecovery?.message || '同步状态未知，恢复点已保留。'
           : scopedProjectState?.syncRecovery?.state === 'failed' ? `上次同步失败：${scopedProjectState.syncRecovery.message || '恢复点已保留，可重试。'}`
             : projectCheckpoint ? '存在待处理的同步恢复点。' : '仅在点击同步后更新云端；云端变更不会下载到本机。')}</p>
+      {scopedProjectSelection && !projectUploadBusy && scopedProjectState?.syncState === 'idle' && <p role="status" aria-live="polite">
+        {projectLocalStatus.isFetching ? '正在核对本机项目变化…'
+          : projectLocalStatus.data === 'pending' ? '待处理：本机项目有变化，点击同步后才会更新云端。'
+            : projectLocalStatus.data === 'current' ? '本机项目与上次确认同步的内容一致。'
+              : '本机项目状态待核对；请检查目录或再次同步。'}
+      </p>}
       <LocalWorkspaceRecovery key={user?.id} bridge={projectBridge} workspaceNames={Object.fromEntries((query.data?.items ?? []).map((item) => [item.id, item.name]))} />
     </section>
     {showComputerFiles && <section className="design-panel" aria-labelledby="workspace-list-title">
       <div className="design-panel-header"><div><h2 id="workspace-list-title">{computer ? `${computer.name || '云端电脑'} · 文件与版本` : '云端文件与版本'}</h2><p>{computer ? '查看这台电脑已保存的文件和历史版本。' : '查看云端文件和历史版本。'}</p></div>{!computerID && !legacyCreateRecovery.pending && !legacyCreateRecovery.invalid && <Link className="button button-primary" to="/hosts/new">＋ 创建云端电脑</Link>}</div>
-    {query.isPending ? <div className="loading-card">正在加载云端文件…</div> : query.isError ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError> : !visibleWorkspaces.length ? <div className="empty-card"><h2>{computer ? '这台电脑暂无关联文件' : '还没有云端文件'}</h2><p>{computer ? '旧电脑的数据可以从电脑管理入口核对后再关联。' : '创建云端电脑后，文件会与电脑一同管理。'}</p></div> : <ScreenPagination
+    {query.isPending ? <div className="loading-card">正在加载云端文件…</div> : query.isError ? <div className="error-inline" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></div> : !visibleWorkspaces.length ? <div className="empty-card"><h2>{computer ? '这台电脑暂无关联文件' : '还没有云端文件'}</h2><p>{computer ? '旧电脑的数据可以从电脑管理入口核对后再关联。' : '创建云端电脑后，文件会与电脑一同管理。'}</p></div> : <ScreenPagination
       items={visibleWorkspaces}
       getKey={(item) => item.id}
       estimatedItemHeight={270}
@@ -1031,7 +1060,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
     </section>}
     {progressWorkspaceID && <section className="notice notice-info" aria-live="polite">
       <div className="host-card-heading"><h2>设备同步进度 · {visibleWorkspaces.find((item) => item.id === progressWorkspaceID)?.name || progressWorkspaceID}</h2><button type="button" className="button button-secondary button-small" aria-label="关闭设备同步进度" onClick={() => setProgressWorkspaceID('')}>关闭</button></div>
-      {deviceProgress.isPending ? <p>正在读取同步状态…</p> : deviceProgress.isError ? <FloatingError className="error-inline" role="alert">读取失败：{errorDetails(deviceProgress.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void deviceProgress.refetch()}>重试</button></FloatingError> : !deviceProgress.data.items.length ? <p>当前没有设备正在同步。设备连接后，仍可能有待同步的文件。</p> : <ScreenPagination
+      {deviceProgress.isPending ? <p>正在读取同步状态…</p> : deviceProgress.isError ? <div className="error-inline" role="alert">读取失败：{errorDetails(deviceProgress.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void deviceProgress.refetch()}>重试</button></div> : !deviceProgress.data.items.length ? <p>当前没有设备正在同步。设备连接后，仍可能有待同步的文件。</p> : <ScreenPagination
         items={deviceProgress.data.items}
         getKey={(item) => item.session_id}
         estimatedItemHeight={82}
@@ -1046,7 +1075,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
         </div>}
       />}
     </section>}
-    {hosts.isError && <FloatingError className="error-inline" role="alert">{projectSyncOnly ? '无法读取云端电脑状态，暂时无法确认文件目录。' : '无法读取云端电脑状态，不能确认文件与电脑的关系或删除权限。'}{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
+    {hosts.isError && <div className="error-inline" role="alert">{projectSyncOnly ? '无法读取云端电脑状态，暂时无法确认文件目录。' : '无法读取云端电脑状态，不能确认文件与电脑的关系或删除权限。'}{errorDetails(hosts.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void hosts.refetch()}>重试</button></div>}
     {selected && <ConfirmDialog title="删除工作区" description={`确定删除“${selected.name || selected.id}”吗？这会永久删除 Morde 云端工作区及其已同步数据。本地文件夹和未同步的文件会保留。`} confirmLabel="删除工作区" danger busy={remove.isPending} onClose={() => setSelected(null)} onConfirm={() => remove.mutate(selected.id)} />}
   </section>;
 }

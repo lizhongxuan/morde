@@ -378,3 +378,29 @@ func TestManifestAndChangeCursorsAreBoundedAndValidated(t *testing.T) {
 		t.Fatalf("root directory change cursor round trip = %#v, %v", decodedRootChange, err)
 	}
 }
+
+func TestValidateSyncDeletionTree(t *testing.T) {
+	request := CreateSyncSession{Direction: SyncUpload, Policy: SyncCompareMerge,
+		DeletedPaths: []string{"old/deep/file.txt"}, DeletedDirectories: []string{"old", "old/deep"}}
+	if err := ValidateCreateSyncSession(request, 0); err != nil {
+		t.Fatalf("a deleted tree containing its files and parent directories must be valid: %v", err)
+	}
+	for _, invalid := range []CreateSyncSession{
+		{Direction: SyncUpload, Policy: SyncCompareMerge, DeletedPaths: []string{"old/file"}, DeletedDirectories: []string{"old/file"}},
+		{Direction: SyncUpload, Policy: SyncCompareMerge, DeletedPaths: []string{"Old/deep/file"}, DeletedDirectories: []string{"old"}},
+		{Direction: SyncUpload, Policy: SyncCompareMerge, DeletedDirectories: []string{"old", "old"}},
+	} {
+		if err := ValidateCreateSyncSession(invalid, 0); err == nil {
+			t.Fatalf("accepted ambiguous deletion tree: %#v", invalid)
+		}
+	}
+}
+
+func TestValidateScopedEmptyRootMetadata(t *testing.T) {
+	mode, modified := uint32(0o700), int64(1)
+	request := CreateSyncSession{Direction: SyncUpload, Policy: SyncCompareMerge, Scope: []string{"project/empty"},
+		Directories: []Directory{{Path: "project/empty", Mode: &mode, ModTimeNS: &modified, MetadataKnown: true}}}
+	if err := ValidateCreateSyncSession(request, 0); err != nil {
+		t.Fatalf("empty scoped root metadata must be valid: %v", err)
+	}
+}

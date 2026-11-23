@@ -822,7 +822,8 @@ func (s *TaskService) taskStepDetailFromDetails(ctx context.Context, principal i
 		return TaskStepDetail{}, err
 	}
 	if record.TaskID != taskID || record.OwnerID != details.Task.OwnerID || record.StepID != stepID || record.TaskRevision != *step.TaskRevision ||
-		record.SizeBytes < 1 || record.SizeBytes > 64<<10 || len(record.SHA256) != 32 {
+		len(record.Ciphertext) < 29 || len(record.Ciphertext) > MaxTaskStepDetailCiphertextBytes ||
+		record.SizeBytes < 1 || record.SizeBytes > MaxTaskStepDetailPayloadBytes || len(record.SHA256) != 32 {
 		return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step detail identity is invalid")
 	}
 	plain, err := s.stepDetailSealer.OpenWithAAD(record.Ciphertext, taskStepDetailAAD(record.OwnerID, taskID, stepID, record.TaskRevision))
@@ -834,6 +835,20 @@ func (s *TaskService) taskStepDetailFromDetails(ctx context.Context, principal i
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&document) != nil || !validTaskStepDetailDocument(document) {
 		return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step detail document is invalid")
+	}
+	if taskStepExecutionRequiresWorkspace(document.Execution) {
+		if document.ExecutionWorkspaceID == "" || document.ExecutionWorkspaceID != details.Task.WorkspaceID {
+			result.DetailState = "restricted"
+			return result, nil
+		}
+		visible, err := s.taskWorkspaceDetailVisible(ctx, principal, details.Task)
+		if err != nil {
+			return TaskStepDetail{}, err
+		}
+		if !visible {
+			result.DetailState = "restricted"
+			return result, nil
+		}
 	}
 	if document.ContentEvidence == nil {
 		if len(record.ContentEvidenceSHA256) != 0 {
@@ -850,7 +865,30 @@ func (s *TaskService) taskStepDetailFromDetails(ctx context.Context, principal i
 	result.EventSequence = record.EventSequence
 	result.Object, result.Input, result.Result = &document.Object, &document.Input, &document.Result
 	result.ShellExecution, result.ContentEvidence = document.ShellExecution, document.ContentEvidence
+	result.Execution = document.Execution
+	if step.Status == task.StepUnknown || step.Status == task.StepCancelled {
+		message := "The tool result could not be confirmed and needs reconciliation."
+		if step.Status == task.StepCancelled {
+			message = "The tool call was cancelled before its result was committed."
+		}
+		result.Result = &message
+		result.Execution = taskStepExecutionWithoutResult(document.Execution)
+		result.ShellExecution = nil
+	}
 	return result, nil
+}
+
+func taskStepExecutionWithoutResult(value *TaskStepExecution) *TaskStepExecution {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	copy.ExitCode, copy.TimedOut, copy.Stdout, copy.Stderr = nil, nil, nil, nil
+	copy.StdoutTotalBytes, copy.StderrTotalBytes, copy.StdoutOmittedBytes, copy.StderrOmittedBytes = nil, nil, nil, nil
+	copy.StdoutTruncated, copy.StderrTruncated = nil, nil
+	copy.StdoutRuntimeTruncated, copy.StderrRuntimeTruncated = nil, nil
+	copy.StdoutDetailTruncated, copy.StderrDetailTruncated = nil, nil
+	return &copy
 }
 
 // RetryStep reserves an immutable retry of one confirmed, not-dispatched Host

@@ -1,6 +1,300 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Web search" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Websuche" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Web search" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Búsqueda web" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Recherche web" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ウェブ検索" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "웹 검색" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Поиск в интернете" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "网页搜索" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "網頁搜尋" } }
+      }
+    },
+    "Web read" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Webseite lesen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Web read" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Lectura web" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Lecture web" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "ウェブページの読み取り" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "웹 읽기" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Чтение веб-страницы" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "网页读取" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "網頁讀取" } }
+      }
+    },
+    "Execution location" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ausführungsort" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Execution location" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Lugar de ejecución" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Lieu d’exécution" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "実行場所" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "실행 위치" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Место выполнения" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "执行位置" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "執行位置" } }
+      }
+    },
+    "Parameters" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Parameter" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Parameters" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Parámetros" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Paramètres" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "パラメーター" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "매개변수" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Параметры" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "参数" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "參數" } }
+      }
+    },
+    "Working directory" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Arbeitsverzeichnis" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Working directory" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Directorio de trabajo" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Répertoire de travail" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "作業ディレクトリ" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "작업 디렉터리" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Рабочий каталог" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "工作目录" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "工作目錄" } }
+      }
+    },
+    "Duration (ms)" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Dauer (ms)" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Duration (ms)" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Duración (ms)" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Durée (ms)" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "所要時間（ミリ秒）" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "소요 시간(ms)" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Длительность (мс)" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "耗时（毫秒）" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "耗時（毫秒）" } }
+      }
+    },
+    "Exit code" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Exitcode" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Exit code" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Código de salida" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Code de sortie" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "終了コード" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "종료 코드" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Код выхода" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "退出码" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "結束代碼" } }
+      }
+    },
+    "Timed out" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Zeitüberschreitung" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Timed out" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Tiempo agotado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Délai dépassé" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "タイムアウト" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "시간 초과" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Превышено время ожидания" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "是否超时" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "是否逾時" } }
+      }
+    },
+    "Standard output" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Standardausgabe" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Standard output" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Salida estándar" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Sortie standard" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "標準出力" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "표준 출력" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Стандартный вывод" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "标准输出" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "標準輸出" } }
+      }
+    },
+    "Standard error" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Standardfehler" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Standard error" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Error estándar" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Erreur standard" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "標準エラー" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "표준 오류" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Стандартный поток ошибок" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "错误输出" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "錯誤輸出" } }
+      }
+    },
+    "Not recorded" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Nicht aufgezeichnet" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Not recorded" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "No registrado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Non enregistré" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "未記録" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "기록되지 않음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Не записано" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "未记录" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "未記錄" } }
+      }
+    },
+    "No output" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Keine Ausgabe" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "No output" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Sin salida" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Aucune sortie" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "出力なし" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "출력 없음" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Нет вывода" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "无输出" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "無輸出" } }
+      }
+    },
+    "Execution details not recorded or unavailable" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ausführungsdetails nicht aufgezeichnet oder nicht verfügbar" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Execution details not recorded or unavailable" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Detalles de ejecución no registrados o no disponibles" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Détails d’exécution non enregistrés ou indisponibles" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "実行詳細は未記録または利用できません" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "실행 세부 정보가 기록되지 않았거나 사용할 수 없습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Детали выполнения не записаны или недоступны" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "执行详情未记录或不可用" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "執行詳細資料未記錄或無法使用" } }
+      }
+    },
+    "Standard output is truncated" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Standardausgabe ist gekürzt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Standard output is truncated" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "La salida estándar está truncada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "La sortie standard est tronquée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "標準出力は省略されています" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "표준 출력이 일부 생략되었습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Стандартный вывод сокращён" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "标准输出已截断" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "標準輸出已截斷" } }
+      }
+    },
+    "Standard error is truncated" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Standardfehlerausgabe ist gekürzt" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Standard error is truncated" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "El error estándar está truncado" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "La sortie d’erreur est tronquée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "標準エラー出力は省略されています" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "표준 오류 출력이 일부 생략되었습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Вывод ошибок сокращён" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "错误输出已截断" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "錯誤輸出已截斷" } }
+      }
+    },
+    "Show full recorded output" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Vollständige aufgezeichnete Ausgabe anzeigen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Show full recorded output" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Mostrar toda la salida registrada" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Afficher toute la sortie enregistrée" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "記録済みの出力全体を表示" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "기록된 전체 출력 표시" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Показать полный записанный вывод" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "显示完整已记录输出" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "顯示完整已記錄輸出" } }
+      }
+    },
+    "Collapse output" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Ausgabe einklappen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Collapse output" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Contraer salida" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Réduire la sortie" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "出力を折りたたむ" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "출력 접기" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Свернуть вывод" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "收起输出" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "收合輸出" } }
+      }
+    },
+    "Recorded output exceeds the 64 KiB client display limit" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Die aufgezeichnete Ausgabe überschreitet das clientseitige Anzeigelimit von 64 KiB" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Recorded output exceeds the 64 KiB client display limit" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "La salida registrada supera el límite de visualización del cliente de 64 KiB" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "La sortie enregistrée dépasse la limite d’affichage client de 64 Kio" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "記録済み出力はクライアントの表示上限 64 KiB を超えています" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "기록된 출력이 클라이언트 표시 한도인 64 KiB를 초과했습니다" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Записанный вывод превышает клиентский лимит отображения 64 КиБ" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "已记录输出超过客户端 64 KiB 显示上限" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "已記錄輸出超過用戶端 64 KiB 顯示上限" } }
+      }
+    },
+    "Bytes omitted" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Bytes ausgelassen" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "bytes omitted" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "bytes omitidos" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "octets omis" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "バイト省略" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "바이트 생략" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "байт пропущено" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "字节已省略" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "位元組已省略" } }
+      }
+    },
+    "Standard output size (bytes)" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Größe der Standardausgabe (Byte)" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Standard output size (bytes)" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Tamaño de salida estándar (bytes)" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Taille de la sortie standard (octets)" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "標準出力のサイズ（バイト）" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "표준 출력 크기(바이트)" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Размер стандартного вывода (байт)" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "标准输出字节数" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "標準輸出位元組數" } }
+      }
+    },
+    "Standard error size (bytes)" : {
+      "extractionState" : "manual",
+      "localizations" : {
+        "de" : { "stringUnit" : { "state" : "translated", "value" : "Größe der Standardfehlerausgabe (Byte)" } },
+        "en" : { "stringUnit" : { "state" : "translated", "value" : "Standard error size (bytes)" } },
+        "es" : { "stringUnit" : { "state" : "translated", "value" : "Tamaño del error estándar (bytes)" } },
+        "fr" : { "stringUnit" : { "state" : "translated", "value" : "Taille de la sortie d’erreur (octets)" } },
+        "ja" : { "stringUnit" : { "state" : "translated", "value" : "標準エラー出力のサイズ（バイト）" } },
+        "ko" : { "stringUnit" : { "state" : "translated", "value" : "표준 오류 크기(바이트)" } },
+        "ru" : { "stringUnit" : { "state" : "translated", "value" : "Размер вывода ошибок (байт)" } },
+        "zh-Hans" : { "stringUnit" : { "state" : "translated", "value" : "错误输出字节数" } },
+        "zh-Hant" : { "stringUnit" : { "state" : "translated", "value" : "錯誤輸出位元組數" } }
+      }
+    },
     "Answer every question to continue." : {
       "extractionState" : "manual",
       "localizations" : {

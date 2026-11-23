@@ -1,9 +1,34 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { checkedDirectory, MordeSync, SyncRunError, verifyMapping } from '../out/morde-sync.js';
+
+const projectSyncBinary = process.env.MORDE_SYNC_TEST_BINARY || fileURLToPath(new URL(`../bin/${process.platform === 'win32' ? 'morde-sync.exe' : 'morde-sync'}`, import.meta.url));
+
+test('project status fingerprints local changes without an upload', { skip: !existsSync(projectSyncBinary) }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'morde-project-local-status-'));
+  try {
+    const directory = join(root, 'project');
+    await mkdir(directory);
+    const mapping = { ...await checkedDirectory(directory, []), workspaceId: 'w1234567' };
+    const inspector = new MordeSync(() => projectSyncBinary, () => {});
+    const initial = await inspector.projectFingerprint(mapping);
+    await writeFile(join(directory, 'synthetic.txt'), 'first');
+    const added = await inspector.projectFingerprint(mapping);
+    assert.notEqual(added, initial);
+    await writeFile(join(directory, 'synthetic.txt'), 'second');
+    const modified = await inspector.projectFingerprint(mapping);
+    assert.notEqual(modified, added);
+    await rm(join(directory, 'synthetic.txt'));
+    assert.notEqual(await inspector.projectFingerprint(mapping), modified);
+    await rm(directory, { recursive: true });
+    await assert.rejects(inspector.projectFingerprint(mapping));
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
 
 test('sync directory identity and overlap reject nested and aliased roots', async () => {
   const root = await mkdtemp(join(tmpdir(), 'morde-desktop-'));

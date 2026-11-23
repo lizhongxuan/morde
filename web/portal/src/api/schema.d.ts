@@ -9101,6 +9101,7 @@ export interface components {
             routing_failure_reason?: "model_unavailable" | "routing_context_unavailable" | "routing_action_unavailable" | "message_too_long";
             /** @description True only after the Main Agent chose to acknowledge this message and its associated background Task actually started. Clients cannot set this field. */
             agent_acknowledged?: boolean;
+            tool_activity?: components["schemas"]["ConversationToolActivity"];
             /**
              * @description Status of a persisted streamed assistant message.
              * @enum {string}
@@ -9131,6 +9132,12 @@ export interface components {
             delivery_status: "pending" | "applied" | "unknown";
             /** Format: date-time */
             created_at: string;
+        };
+        /** @description Status of this user's short-lived read-only web call; no internal Task identity is exposed. */
+        ConversationToolActivity: {
+            /** @enum {string} */
+            tool: "web_search" | "web_read";
+            status: components["schemas"]["TaskStepStatus"];
         };
         ConversationMessage: components["schemas"]["ConversationMessageBase"] & {
             attachment_ids?: components["schemas"]["PersonalAttachmentId"][];
@@ -9294,7 +9301,7 @@ export interface components {
         /** @enum {string} */
         TaskQueuePriority: "pinned" | "normal" | "background";
         /** @enum {string} */
-        TaskStepStatus: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "unknown";
+        TaskStepStatus: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "cancelled" | "unknown";
         TaskBudgetRequest: {
             active_seconds: number;
             tool_calls: number;
@@ -9582,6 +9589,42 @@ export interface components {
             input: string | null;
             result: string | null;
             truncated: boolean;
+            execution?: components["schemas"]["TaskStepExecution"];
+        };
+        /** @description Bounded, redacted execution details for an authorized Task reader; absent fields are unavailable or not applicable. */
+        TaskStepExecution: {
+            location?: string;
+            parameters?: string;
+            command?: string;
+            working_directory?: string;
+            /** Format: int64 */
+            duration_ms?: number;
+            exit_code?: number;
+            timed_out?: boolean;
+            /** @description Redacted captured output within the encrypted detail budget. */
+            stdout?: string;
+            /** @description Redacted captured output within the encrypted detail budget. */
+            stderr?: string;
+            /** @description Original byte count only when the Host returned the complete output without redaction. */
+            stdout_total_bytes?: number;
+            /** @description Original byte count only when the Host returned the complete output without redaction. */
+            stderr_total_bytes?: number;
+            /** @description Bytes omitted from the complete */
+            stdout_omitted_bytes?: number;
+            /** @description Bytes omitted from the complete */
+            stderr_omitted_bytes?: number;
+            /** @description True when either the Host/Runtime truncated captured output or the server detail-size limit omitted redacted output. */
+            stdout_truncated?: boolean;
+            /** @description True when either the Host/Runtime truncated captured output or the server detail-size limit omitted redacted output. */
+            stderr_truncated?: boolean;
+            /** @description True only when the Host/Runtime reported that stdout was truncated before the server received it. */
+            stdout_runtime_truncated?: boolean;
+            /** @description True only when the Host/Runtime reported that stderr was truncated before the server received it. */
+            stderr_runtime_truncated?: boolean;
+            /** @description True only when the server omitted captured stdout to stay within the encrypted step-detail size limit. */
+            stdout_detail_truncated?: boolean;
+            /** @description True only when the server omitted captured stderr to stay within the encrypted step-detail size limit. */
+            stderr_detail_truncated?: boolean;
         };
         TaskBatchItem: {
             id: components["schemas"]["BatchItemId"];

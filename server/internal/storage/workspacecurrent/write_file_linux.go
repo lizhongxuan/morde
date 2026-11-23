@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -109,14 +110,15 @@ func writeWorkspaceCurrentFileFrom(ctx context.Context, root, relativePath strin
 	if err := file.Close(); err != nil {
 		return err
 	}
-	if err := verifyExpectedWorkspaceFile(parentFD, name, expectedSHA256); err != nil {
-		return err
+	preserveTemporary, err := commitWorkspaceCurrentWriteAt(parentFD, temporary, name, expectedSHA256, digest)
+	if preserveTemporary {
+		removeTemporary = false
 	}
-	if err := unix.Renameat2(parentFD, temporary, parentFD, name, 0); err != nil {
+	if err != nil {
 		return err
 	}
 	removeTemporary = false
-	return unix.Fsync(parentFD)
+	return nil
 }
 
 type workspaceCurrentContextReader struct {
@@ -154,14 +156,103 @@ func verifyExpectedWorkspaceFile(parentFD int, name, expectedSHA256 string) erro
 		return err
 	}
 	file := os.NewFile(uintptr(fd), name)
+	var openedBefore unix.Stat_t
+	if err := unix.Fstat(fd, &openedBefore); err != nil {
+		return errors.Join(err, file.Close())
+	}
+	if !sameWorkspaceCurrentFileVersion(stat, openedBefore) {
+		return errors.Join(ErrWriteConflict, file.Close())
+	}
 	hasher := sha256.New()
 	_, readErr := io.Copy(hasher, file)
+	var openedAfter unix.Stat_t
+	statErr := unix.Fstat(fd, &openedAfter)
 	closeErr := file.Close()
-	if readErr != nil || closeErr != nil {
-		return errors.Join(readErr, closeErr)
+	if readErr != nil || statErr != nil || closeErr != nil {
+		return errors.Join(readErr, statErr, closeErr)
 	}
-	if hex.EncodeToString(hasher.Sum(nil)) != expectedSHA256 {
+	var current unix.Stat_t
+	if err := unix.Fstatat(parentFD, name, &current, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return ErrWriteConflict
+		}
+		return err
+	}
+	if hex.EncodeToString(hasher.Sum(nil)) != expectedSHA256 ||
+		!sameWorkspaceCurrentFileVersion(openedBefore, openedAfter) ||
+		!sameWorkspaceCurrentFileVersion(openedAfter, current) {
 		return ErrWriteConflict
 	}
 	return nil
+}
+
+// commitWorkspaceCurrentWriteAt closes the directory-entry replacement race
+// left by a separate digest check followed by rename. It is still not a CAS
+// against a writer that already holds an fd to the old inode; that requires
+// such writers to cooperate with the Workspace lock.
+func commitWorkspaceCurrentWriteAt(parentFD int, temporary, name, expectedSHA256, candidateSHA256 string) (preserveTemporary bool, retErr error) {
+	if expectedSHA256 == "" {
+		if err := unix.Renameat2(parentFD, temporary, parentFD, name, unix.RENAME_NOREPLACE); err != nil {
+			if errors.Is(err, unix.EEXIST) {
+				var current unix.Stat_t
+				if statErr := unix.Fstatat(parentFD, name, &current, unix.AT_SYMLINK_NOFOLLOW); statErr == nil && current.Mode&unix.S_IFMT != unix.S_IFREG {
+					return false, ErrUnsafePath
+				}
+				return false, ErrWriteConflict
+			}
+			if errors.Is(err, unix.ENOENT) {
+				return false, ErrWriteConflict
+			}
+			return false, err
+		}
+		return false, unix.Fsync(parentFD)
+	}
+
+	if err := unix.Renameat2(parentFD, temporary, parentFD, name, unix.RENAME_EXCHANGE); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return false, ErrWriteConflict
+		}
+		return false, err
+	}
+
+	priorErr := verifyExpectedWorkspaceFile(parentFD, temporary, expectedSHA256)
+	candidateErr := verifyExpectedWorkspaceFile(parentFD, name, candidateSHA256)
+	if priorErr == nil && candidateErr == nil {
+		if err := unix.Unlinkat(parentFD, temporary, 0); err != nil {
+			return true, fmt.Errorf("preserved prior Workspace file at %q after replacement cleanup failed: %w", temporary, err)
+		}
+		return false, unix.Fsync(parentFD)
+	}
+
+	if err := unix.Renameat2(parentFD, temporary, parentFD, name, unix.RENAME_EXCHANGE); err != nil {
+		return true, errors.Join(ErrWriteConflict, priorErr, candidateErr,
+			fmt.Errorf("could not restore exchanged Workspace file; conflicting entry is preserved at %q: %w", temporary, err))
+	}
+	if err := unix.Fsync(parentFD); err != nil {
+		return false, errors.Join(ErrWriteConflict, priorErr, candidateErr, err)
+	}
+	if candidateErr := verifyExpectedWorkspaceFile(parentFD, temporary, candidateSHA256); candidateErr != nil {
+		return true, errors.Join(ErrWriteConflict, priorErr, candidateErr,
+			fmt.Errorf("preserved changed write candidate at %q", temporary))
+	}
+	return false, errors.Join(ErrWriteConflict, priorErr, candidateErr)
+}
+
+func sameWorkspaceCurrentFileVersion(left, right unix.Stat_t) bool {
+	return left.Mode&unix.S_IFMT == unix.S_IFREG && right.Mode&unix.S_IFMT == unix.S_IFREG &&
+		left.Dev == right.Dev && left.Ino == right.Ino && left.Mode == right.Mode && left.Size == right.Size &&
+		left.Mtim == right.Mtim && left.Ctim == right.Ctim
+}
+
+func sameWorkspaceCurrentFileIdentity(left, right unix.Stat_t) bool {
+	return left.Mode&unix.S_IFMT == unix.S_IFREG && right.Mode&unix.S_IFMT == unix.S_IFREG &&
+		left.Dev == right.Dev && left.Ino == right.Ino
+}
+
+func workspaceCurrentTemporaryName(prefix string) (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", err
+	}
+	return prefix + hex.EncodeToString(nonce[:]), nil
 }

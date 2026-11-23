@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -10,6 +11,245 @@ import (
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
+
+func TestPostgresTaskStopSettlesToolActivitiesWithoutAssumingUnknownResults(t *testing.T) {
+	for _, action := range []task.Action{task.ActionCancel, task.ActionPause} {
+		t.Run(string(action), func(t *testing.T) {
+			f := newAgentLifecycleFixture(t)
+			ctx := context.Background()
+			lease, _, err := f.service.Start(ctx, f.request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current, err := f.store.GetTask(ctx, lease.Fence.TaskID, lease.Fence.OwnerID)
+			if err != nil || current.Task.CurrentRevision == nil {
+				t.Fatalf("read running task: err=%v", err)
+			}
+			revision := *current.Task.CurrentRevision
+			hostValue := createRunningControlHostWithoutWorkspace(t, ctx, f.store, current.Task.OwnerID, "ai", 0)
+			if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET host_id=$2 WHERE id=$1`, current.Task.ID, hostValue.ID); err != nil {
+				t.Fatal(err)
+			}
+			type stepCase struct {
+				name, callID, initial, wantCancel string
+				digest                            []byte
+				id                                string
+			}
+			steps := []stepCase{
+				{name: "prepared connector", callID: "stop-prepared", initial: "running", wantCancel: "cancelled"},
+				{name: "dispatched connector", callID: "stop-dispatched", initial: "running", wantCancel: "unknown"},
+				{name: "mismatched connector", callID: "stop-mismatch", initial: "running", wantCancel: "unknown"},
+				{name: "missing operation", callID: "stop-no-operation", initial: "running", wantCancel: "unknown"},
+				{name: "completed tool", callID: "stop-completed", initial: "succeeded", wantCancel: "succeeded"},
+				{name: "cancelled approval", callID: "stop-approval", initial: "waiting_user", wantCancel: "cancelled"},
+				{name: "queued retry", callID: "stop-retry", initial: "queued", wantCancel: "cancelled"},
+				{name: "retry source", callID: "stop-retry-source", initial: "failed", wantCancel: "failed"},
+				{name: "prepared Host", callID: "stop-host-prepared", initial: "running", wantCancel: "cancelled"},
+				{name: "dispatched Host", callID: "stop-host-dispatched", initial: "running", wantCancel: "unknown"},
+			}
+			for i := range steps {
+				step := &steps[i]
+				step.id = mustID(t, domain.NewStepID)
+				step.digest = hashBytes("stop-tool-" + step.callID)
+				if step.name == "retry source" {
+					step.digest = steps[6].digest
+				}
+				if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_steps
+(id,task_id,sequence,kind,status,title,summary,agent_session_id,task_revision,tool_call_key,tool_name,request_digest,phase)
+VALUES ($1,$2,$3,'tool',$4,$5,'original summary',$6,$7,$8,'morde_web_read',$9,'prepare')`,
+					step.id, current.Task.ID, i+1, step.initial, step.name, lease.Fence.AgentSessionID, revision, step.callID, step.digest); err != nil {
+					t.Fatalf("insert %s: %v", step.name, err)
+				}
+			}
+			if _, err := f.store.pool.Exec(ctx, `UPDATE task_steps SET attempt_no=2,retry_of_step_id=$3,phase='retry'
+WHERE task_id=$1 AND id=$2`, current.Task.ID, steps[6].id, steps[7].id); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_step_retry_intents
+(attempt_step_id,task_id,owner_id,source_step_id,attempt_no,task_revision,agent_session_id,source_call_id,retry_call_id,
+ tool_name,request_digest,authorization_version,host_id,host_runtime_generation,checkpoint_through_seq,checkpoint_digest,expires_at)
+VALUES ($1,$2,$3,$4,2,$5,$6,$7,$8,'morde_web_read',$9,1,'h1234567',1,0,$10,clock_timestamp()+interval '1 minute')`,
+				steps[6].id, current.Task.ID, current.Task.OwnerID, steps[7].id, revision, lease.Fence.AgentSessionID,
+				steps[7].callID, steps[6].callID, steps[6].digest, hashBytes("retry checkpoint")); err != nil {
+				t.Fatalf("insert queued retry intent: %v", err)
+			}
+			for i, status := range []string{"prepared", "dispatched", "prepared"} {
+				step := steps[i]
+				digest := step.digest
+				if i == 2 {
+					digest = hashBytes("a different request")
+				}
+				if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
+(id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
+ operation_key,tool_name,request_hash,status,task_revision,call_id)
+VALUES ($1,$2,$3,NULL,'searxng-v2.10.0',1,0,1,$4,$5,'morde_web_read',$6,$7,$8,$9)`,
+					mustID(t, domain.NewOperationID), current.Task.ID, current.Task.OwnerID, current.Task.Lease.Version,
+					app.AgentOperationKey(step.callID), digest, status, revision, step.callID); err != nil {
+					t.Fatalf("insert %s operation: %v", step.name, err)
+				}
+			}
+			for i, status := range []string{"prepared", "dispatched"} {
+				step := steps[8+i]
+				if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_operations
+(id,task_id,operation_key,request_hash,host_id,runtime_generation,control_version,lease_version,runtime_lease_version,
+ status,task_revision,call_id,tool_name)
+VALUES ($1,$2,$3,$4,$5,1,0,$6,$6,$7,$8,$9,'morde_web_read')`, mustID(t, domain.NewOperationID),
+					current.Task.ID, app.AgentOperationKey(step.callID), step.digest, hostValue.ID, current.Task.Lease.Version,
+					status, revision, step.callID); err != nil {
+					t.Fatalf("insert %s operation: %v", step.name, err)
+				}
+			}
+			approval := steps[5]
+			if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_pending_requests
+(id,task_id,version,kind,title,object,content,impact,call_id,tool_name,request_hash,runtime_generation,
+ runtime_instance_id,control_version,status,task_revision)
+VALUES ($1,$2,1,'approval','Approve','operation','Allow operation?','It changes state.',$3,'morde_web_read',$4,0,'',0,'pending',$5)`,
+				mustID(t, domain.NewPendingRequestID), current.Task.ID, approval.callID, approval.digest, revision); err != nil {
+				t.Fatal(err)
+			}
+			initialTaskStatus := task.StatusWaitingUser
+			if action == task.ActionPause {
+				initialTaskStatus = task.StatusRunning
+			}
+			if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET status=$3,current_step=$2 WHERE id=$1`, current.Task.ID, approval.id, string(initialTaskStatus)); err != nil {
+				t.Fatal(err)
+			}
+			stopID := mustID(t, domain.NewTaskActionID)
+			record := taskActionIdempotency(current.Task.OwnerID, action, "tool-stop-"+string(action), current.Task.ID, initialTaskStatus, stopID)
+			if _, err := f.store.RequestTaskAction(ctx, record, current.Task.ID, action, initialTaskStatus, nil, stopID); err != nil {
+				t.Fatalf("request %s: %v", action, err)
+			}
+			claim, found, err := f.store.ClaimNextTaskStop(ctx, "tool-stop-worker", time.Minute)
+			if err != nil || !found || claim.Request.ID != stopID {
+				t.Fatalf("claim stop: found=%t err=%v", found, err)
+			}
+			for _, operation := range claim.Operations {
+				if err := f.store.SettleTaskStopOperation(ctx, current.Task.ID, stopID, "tool-stop-worker", claim.Request.LeaseVersion,
+					operation.ID, task.OperationCancelled, "synthetic stop confirmation", false); err != nil {
+					t.Fatalf("settle Host operation: %v", err)
+				}
+			}
+			if _, err := f.store.pool.Exec(ctx, `UPDATE task_stop_requests SET safe_after=clock_timestamp()-interval '1 second' WHERE id=$1`, stopID); err != nil {
+				t.Fatal(err)
+			}
+			receipt := signAgentLifecycleReceipt(t, f.key, lease.Fence, f.request.SupervisorNonce)
+			if _, err := f.service.ConfirmStopped(ctx, receipt); err != nil {
+				t.Fatalf("confirm agent stop: %v", err)
+			}
+			var before int64
+			if err := f.store.pool.QueryRow(ctx, `SELECT event_seq FROM tasks WHERE id=$1`, current.Task.ID).Scan(&before); err != nil {
+				t.Fatal(err)
+			}
+			finished, err := f.store.CompleteTaskStop(ctx, current.Task.ID, stopID, "tool-stop-worker", claim.Request.LeaseVersion)
+			if err != nil {
+				t.Fatalf("finish %s: %v", action, err)
+			}
+			wantStatus := task.StatusCancelled
+			if action == task.ActionPause {
+				wantStatus = task.StatusPaused
+			}
+			if finished.Status != wantStatus {
+				t.Fatalf("task status = %s, want %s", finished.Status, wantStatus)
+			}
+			details, err := f.store.GetTask(ctx, current.Task.ID, current.Task.OwnerID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			byID := make(map[string]task.Step)
+			for _, step := range details.Steps {
+				byID[step.ID] = step
+			}
+			for _, expected := range steps {
+				want := expected.wantCancel
+				if action == task.ActionPause {
+					want = expected.initial
+				}
+				got, ok := byID[expected.id]
+				if !ok || string(got.Status) != want || got.ToolCallKey != expected.callID {
+					t.Errorf("%s step = %+v, want %s with original call id", expected.name, got, want)
+				}
+			}
+			var operationStatus string
+			if err := f.store.pool.QueryRow(ctx, `SELECT status FROM task_mcp_connector_operations WHERE task_id=$1 AND call_id=$2`,
+				current.Task.ID, steps[1].callID).Scan(&operationStatus); err != nil || operationStatus != "unknown" {
+				t.Errorf("dispatched operation status = %q, err=%v", operationStatus, err)
+			}
+			events, err := f.store.ListTaskEvents(ctx, current.Task.OwnerID, current.Task.ID, before, 100)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed := make(map[string]string)
+			var last int64 = before
+			for _, event := range events {
+				if event.Sequence != last+1 {
+					t.Fatalf("task event sequence jumped from %d to %d", last, event.Sequence)
+				}
+				last = event.Sequence
+				if event.Type == "task.step" {
+					var payload struct {
+						StepID string `json:"step_id"`
+						Status string `json:"status"`
+					}
+					if err := json.Unmarshal(event.Payload, &payload); err != nil {
+						t.Fatal(err)
+					}
+					if _, duplicate := changed[payload.StepID]; duplicate {
+						t.Fatalf("duplicate terminal step event for %s", payload.StepID)
+					}
+					changed[payload.StepID] = payload.Status
+				}
+			}
+			if action == task.ActionCancel {
+				if len(changed) != len(steps)-2 || changed[steps[0].id] != "cancelled" ||
+					changed[steps[1].id] != "unknown" || changed[approval.id] != "cancelled" || changed[steps[6].id] != "cancelled" ||
+					changed[steps[8].id] != "cancelled" || changed[steps[9].id] != "unknown" {
+					t.Errorf("cancelled step events = %+v", changed)
+				}
+			} else if len(changed) != 0 {
+				t.Errorf("pause settled tool steps: %+v", changed)
+			}
+			other := createPreRetirementTestUser(t, f.store, 8, 20_000, 40_000)
+			if _, err := f.store.GetTask(ctx, current.Task.ID, other.ID); err == nil {
+				t.Error("another user can read the stopped task")
+			}
+			if _, err := f.store.RequestTaskAction(ctx, record, current.Task.ID, action, initialTaskStatus, nil, stopID); err != nil {
+				t.Fatalf("replay stop request: %v", err)
+			}
+			var afterReplay int64
+			if err := f.store.pool.QueryRow(ctx, `SELECT event_seq FROM tasks WHERE id=$1`, current.Task.ID).Scan(&afterReplay); err != nil || afterReplay != last {
+				t.Fatalf("stop replay changed event sequence: got=%d want=%d err=%v", afterReplay, last, err)
+			}
+		})
+	}
+}
+
+func TestPostgresCancelledToolStepMigrationPreservesHistory(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	provider, closeProvider, err := newMigrationProvider(f.store.pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeProvider()
+	if _, err := provider.DownTo(ctx, 231); err != nil {
+		t.Fatalf("roll back without cancelled steps: %v", err)
+	}
+	if _, err := provider.Up(ctx); err != nil {
+		t.Fatalf("restore cancelled step migration: %v", err)
+	}
+	stepID := mustID(t, domain.NewStepID)
+	if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_steps(id,task_id,sequence,kind,status,title)
+VALUES ($1,$2,1,'tool','cancelled','Stopped before dispatch')`, stepID, f.request.Fence.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := provider.DownTo(ctx, 231); err == nil {
+		t.Fatal("migration discarded a recorded cancelled step")
+	}
+	var status string
+	if err := f.store.pool.QueryRow(ctx, `SELECT status FROM task_steps WHERE id=$1`, stepID).Scan(&status); err != nil || status != "cancelled" {
+		t.Fatalf("cancelled step after rejected rollback: status=%q err=%v", status, err)
+	}
+}
 
 func TestPostgresTaskPauseResumeStopLifecycle(t *testing.T) {
 	store, _ := newTemporaryStore(t)

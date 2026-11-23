@@ -12,7 +12,7 @@ type Progress = { state: string; stage?: string; confirmed_bytes?: number; plann
 export type HandoffTarget = "desktop" | "cloud_workspace";
 export type HandoffRecord = { id: string; workspaceId: string; scope: string[]; source: HandoffTarget; target: HandoffTarget; phase: "checking" | "needs_review" | "verified"; revision?: number };
 export type ProjectHostApplicationStatus = "pending_apply" | "applied" | "conflict" | "unknown";
-export type SyncCheckpoint = { serviceInstanceID: string; installationId: string; workspaceId: string; directory: string; dev: string; ino: string; mode: "upload" | "download" | "bidirectional" | "live_sync" | "handoff_checkpoint" | "project_upload"; scope: string[]; handoffTarget?: HandoffTarget; projectSelectionID?: string; sourceBindingID?: string; hostId?: string; folderId?: string; projectName?: string; idempotencyKey: string; sessionId?: string; sessionState?: "running" | "completed" | "conflict" | "cancelled" | "failed" | "expired"; hostApplicationStatus?: ProjectHostApplicationStatus; syncOutcome?: "failed" | "unknown"; syncMessage?: string; childPid?: number };
+export type SyncCheckpoint = { serviceInstanceID: string; installationId: string; workspaceId: string; directory: string; dev: string; ino: string; mode: "upload" | "download" | "bidirectional" | "live_sync" | "handoff_checkpoint" | "project_upload"; scope: string[]; handoffTarget?: HandoffTarget; projectSelectionID?: string; sourceBindingID?: string; hostId?: string; folderId?: string; projectName?: string; idempotencyKey: string; sessionId?: string; sessionState?: "running" | "completed" | "conflict" | "cancelled" | "failed" | "expired"; hostApplicationStatus?: ProjectHostApplicationStatus; snapshotFingerprint?: string; syncOutcome?: "failed" | "unknown"; syncMessage?: string; childPid?: number };
 
 export class SyncRunError extends Error {
   constructor(readonly outcome: "failed" | "unknown", message: string) {
@@ -137,6 +137,15 @@ export class MordeSync {
     return result;
   }
 
+  async projectFingerprint(mapping: Mapping): Promise<string> {
+    await verifyMapping(mapping);
+    const result = await this.localRequest("project_fingerprint", { directory: mapping.directory, device: mapping.dev, inode: mapping.ino });
+    await verifyMapping(mapping);
+    const fingerprint = result && typeof result === "object" ? (result as { fingerprint?: unknown }).fingerprint : undefined;
+    if (typeof fingerprint !== "string" || !/^[a-f0-9]{64}$/.test(fingerprint)) throw new Error("无法核对本机项目状态");
+    return fingerprint;
+  }
+
   async restorePreserved(mapping: Mapping, id: string, folderID?: string): Promise<void> {
     checkedId("workspace", mapping.workspaceId);
     if (!/^[a-f0-9]{32}$/.test(id)) throw new Error("Invalid safety-copy ID");
@@ -155,7 +164,7 @@ export class MordeSync {
     if (!result || typeof result !== "object" || (result as { deleted?: unknown }).deleted !== true) throw new Error("Invalid safety-copy delete response");
   }
 
-  private async localRequest(method: "list_preserved" | "restore_preserved" | "delete_preserved", params: Record<string, string>): Promise<unknown> {
+  private async localRequest(method: "list_preserved" | "restore_preserved" | "delete_preserved" | "project_fingerprint", params: Record<string, string>): Promise<unknown> {
     if (this.child || this.localOperation || this.state !== "idle") throw new Error("Finish or verify the prior sync before accessing safety copies");
     this.localOperation = true;
     const binary = this.binary();
@@ -197,7 +206,7 @@ export class MordeSync {
           catch { failure = new Error("Invalid safety-copy response"); child.kill(); return; }
           if (message.id !== id) continue;
           received = true;
-          if (message.error) failure = new Error(method === "list_preserved" ? "Could not read local safety copies" : method === "restore_preserved" ? "Could not restore the local safety copy; its archive remains in place" : "Could not delete the local safety copy");
+          if (message.error) failure = new Error(method === "project_fingerprint" ? "无法核对本机项目目录" : method === "list_preserved" ? "Could not read local safety copies" : method === "restore_preserved" ? "Could not restore the local safety copy; its archive remains in place" : "Could not delete the local safety copy");
           else result = message.result;
           try { child.stdin.end(); } catch { child.kill(); }
         }

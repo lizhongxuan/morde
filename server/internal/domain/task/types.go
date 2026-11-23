@@ -79,6 +79,7 @@ const (
 	StepWaitingUser StepStatus = "waiting_user"
 	StepSucceeded   StepStatus = "succeeded"
 	StepFailed      StepStatus = "failed"
+	StepCancelled   StepStatus = "cancelled"
 	StepUnknown     StepStatus = "unknown"
 )
 

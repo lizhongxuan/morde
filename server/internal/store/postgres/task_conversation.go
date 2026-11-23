@@ -563,11 +563,15 @@ func (s *Store) ListMessages(ctx context.Context, ownerID, conversationID string
 			return app.MessagePage{}, domain.InvalidArgument("cursor", "message cursor is invalid")
 		}
 	}
-	rows, err := s.pool.Query(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.role,m.content,m.task_id,m.created_at,m.model_id,m.source_kind,
+	rows, err := s.pool.Query(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.role,m.content,
+CASE WHEN EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls hidden WHERE hidden.task_id=m.task_id) THEN NULL ELSE m.task_id END,
+m.created_at,m.model_id,m.source_kind,
 m.source_exchange_id,m.requested_conversation_id,m.sequence,
 CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_status ELSE m.delivery_status END,m.actor_id,
 COALESCE(r.client_message_id,''),COALESCE(r.duplicate_of_message_id,''),
-CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN COALESCE(original_message.task_id,'') ELSE '' END,
+CASE WHEN r.duplicate_of_message_id IS NOT NULL AND NOT EXISTS (
+ SELECT 1 FROM conversation_route_internal_tool_calls hidden WHERE hidden.task_id=original_message.task_id
+) THEN COALESCE(original_message.task_id,'') ELSE '' END,
 COALESCE(original_route.state,r.state,''),COALESCE(original_route.failure_reason,r.failure_reason,''),
 COALESCE(r.agent_acknowledged,false),
 CASE WHEN m.output_status='streaming' AND NOT EXISTS (
@@ -576,12 +580,24 @@ CASE WHEN m.output_status='streaming' AND NOT EXISTS (
 ) THEN 'interrupted' ELSE COALESCE(m.output_status,'') END,m.output_task_revision,m.output_result_event_sequence,
 COALESCE(m.variant_group_id,CASE WHEN m.role='user' THEN m.id ELSE variant_input.group_id END,''),
 COALESCE(m.variant_version,CASE WHEN m.role='user' THEN 1 ELSE variant_input.variant_version END,1),
-COALESCE(m.variant_action,CASE WHEN m.role='user' THEN 'original' ELSE variant_input.variant_action END,'original')
-FROM conversation_messages m LEFT JOIN conversation_message_routes r ON r.message_id=m.id
+COALESCE(m.variant_action,CASE WHEN m.role='user' THEN 'original' ELSE variant_input.variant_action END,'original'),
+CASE WHEN internal_task.id IS NOT NULL THEN internal_tool.tool_name ELSE '' END,
+COALESCE(internal_task.status,''),COALESCE(internal_step.status,''),
+EXISTS (SELECT 1 FROM task_mcp_connector_operations op WHERE op.task_id=internal_task.id
+ AND op.status IN ('dispatched','unknown','succeeded','failed')),
+EXISTS (SELECT 1 FROM task_mcp_connector_operations op WHERE op.task_id=internal_task.id AND op.status='unknown')
+FROM conversation_messages m
+JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id AND c.project_id IS NULL AND c.archived_at IS NULL
+LEFT JOIN conversation_message_routes r ON r.message_id=m.id
 LEFT JOIN conversation_message_routes original_route ON original_route.service_instance_id=r.service_instance_id
  AND original_route.owner_id=r.owner_id AND original_route.actor_id=r.actor_id AND original_route.conversation_id=r.conversation_id
  AND original_route.message_id=r.duplicate_of_message_id
 LEFT JOIN conversation_messages original_message ON original_message.id=original_route.message_id
+LEFT JOIN conversation_route_internal_tool_calls internal_tool ON internal_tool.message_id=m.id
+ AND internal_tool.owner_id=m.owner_id AND m.actor_id=$1 AND m.role='user'
+LEFT JOIN tasks internal_task ON internal_task.id=internal_tool.task_id AND internal_task.owner_id=m.owner_id
+ AND internal_task.initiator_id=m.actor_id AND internal_task.conversation_id=m.conversation_id AND internal_task.project_id IS NULL
+LEFT JOIN task_steps internal_step ON internal_step.task_id=internal_task.id AND internal_step.id=internal_task.current_step AND internal_step.kind='tool'
 LEFT JOIN LATERAL (
  SELECT COALESCE(input.variant_group_id,input.id) AS group_id,COALESCE(input.variant_version,1) AS variant_version,
   COALESCE(input.variant_action,'original') AS variant_action
@@ -606,10 +622,13 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 		var outputRevision, outputEvent pgtype.Int8
 		var variantGroupID, variantAction string
 		var variantVersion int64
+		var internalToolName, internalTaskStatus, internalStepStatus string
+		var internalDispatched, internalUnknown bool
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
 			&row.Sequence, &deliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure,
-			&agentAcknowledged, &outputStatus, &outputRevision, &outputEvent, &variantGroupID, &variantVersion, &variantAction); err != nil {
+			&agentAcknowledged, &outputStatus, &outputRevision, &outputEvent, &variantGroupID, &variantVersion, &variantAction,
+			&internalToolName, &internalTaskStatus, &internalStepStatus, &internalDispatched, &internalUnknown); err != nil {
 			rows.Close()
 			return app.MessagePage{}, fmt.Errorf("scan conversation message: %w", err)
 		}
@@ -621,6 +640,7 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
 		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
 		message.AgentAcknowledged = agentAcknowledged
+		message.ToolActivity = conversationToolActivity(internalToolName, internalTaskStatus, internalStepStatus, internalDispatched, internalUnknown)
 		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)
 		message.VariantGroupID, message.VariantVersion, message.VariantAction = variantGroupID, variantVersion, variantAction
 		items = append(items, message)
@@ -663,12 +683,16 @@ func (s *Store) ListProjectConversationMessages(ctx context.Context, actorID, pr
 			return app.MessagePage{}, domain.InvalidArgument("cursor", "message cursor is invalid")
 		}
 	}
-	rows, err := s.pool.Query(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.role,m.content,m.task_id,m.created_at,m.model_id,m.source_kind,
+	rows, err := s.pool.Query(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.role,m.content,
+CASE WHEN EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls hidden WHERE hidden.task_id=m.task_id) THEN NULL ELSE m.task_id END,
+m.created_at,m.model_id,m.source_kind,
 m.source_exchange_id,m.requested_conversation_id,m.sequence,
 CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_status ELSE m.delivery_status END,m.actor_id,
 CASE WHEN r.actor_id=$2 THEN COALESCE(r.client_message_id,'') ELSE '' END,
 CASE WHEN r.actor_id=$2 THEN COALESCE(r.duplicate_of_message_id,'') ELSE '' END,
-CASE WHEN r.actor_id=$2 AND r.duplicate_of_message_id IS NOT NULL THEN COALESCE(original_message.task_id,'') ELSE '' END,
+CASE WHEN r.actor_id=$2 AND r.duplicate_of_message_id IS NOT NULL AND NOT EXISTS (
+ SELECT 1 FROM conversation_route_internal_tool_calls hidden WHERE hidden.task_id=original_message.task_id
+) THEN COALESCE(original_message.task_id,'') ELSE '' END,
 COALESCE(original_route.state,r.state,''),COALESCE(original_route.failure_reason,r.failure_reason,''),
 CASE WHEN r.actor_id=$2 THEN COALESCE(r.agent_acknowledged,false) ELSE false END,
 CASE WHEN m.output_status='streaming' AND NOT EXISTS (
@@ -677,9 +701,14 @@ CASE WHEN m.output_status='streaming' AND NOT EXISTS (
 ) THEN 'interrupted' ELSE COALESCE(m.output_status,'') END,m.output_task_revision,m.output_result_event_sequence,
 COALESCE(m.variant_group_id,CASE WHEN m.role='user' THEN m.id ELSE variant_input.group_id END,''),
 COALESCE(m.variant_version,CASE WHEN m.role='user' THEN 1 ELSE variant_input.variant_version END,1),
-COALESCE(m.variant_action,CASE WHEN m.role='user' THEN 'original' ELSE variant_input.variant_action END,'original')
+COALESCE(m.variant_action,CASE WHEN m.role='user' THEN 'original' ELSE variant_input.variant_action END,'original'),
+CASE WHEN internal_task.id IS NOT NULL THEN internal_tool.tool_name ELSE '' END,
+COALESCE(internal_task.status,''),COALESCE(internal_step.status,''),
+EXISTS (SELECT 1 FROM task_mcp_connector_operations op WHERE op.task_id=internal_task.id
+ AND op.status IN ('dispatched','unknown','succeeded','failed')),
+EXISTS (SELECT 1 FROM task_mcp_connector_operations op WHERE op.task_id=internal_task.id AND op.status='unknown')
 FROM conversation_messages m
-JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id AND c.project_id=$1
+JOIN conversations c ON c.id=m.conversation_id AND c.owner_id=m.owner_id AND c.project_id=$1 AND c.archived_at IS NULL
 JOIN project_members pm ON pm.project_id=c.project_id AND pm.user_id=$2
 JOIN users u ON u.id=pm.user_id AND u.status='approved'
 LEFT JOIN conversation_message_routes r ON r.message_id=m.id
@@ -687,6 +716,11 @@ LEFT JOIN conversation_message_routes original_route ON original_route.service_i
  AND original_route.owner_id=r.owner_id AND original_route.actor_id=r.actor_id AND original_route.conversation_id=r.conversation_id
  AND original_route.message_id=r.duplicate_of_message_id
 LEFT JOIN conversation_messages original_message ON original_message.id=original_route.message_id
+LEFT JOIN conversation_route_internal_tool_calls internal_tool ON internal_tool.message_id=m.id
+ AND internal_tool.owner_id=m.owner_id AND m.actor_id=$2 AND m.role='user'
+LEFT JOIN tasks internal_task ON internal_task.id=internal_tool.task_id AND internal_task.owner_id=m.owner_id
+ AND internal_task.initiator_id=m.actor_id AND internal_task.conversation_id=m.conversation_id AND internal_task.project_id=c.project_id
+LEFT JOIN task_steps internal_step ON internal_step.task_id=internal_task.id AND internal_step.id=internal_task.current_step AND internal_step.kind='tool'
 LEFT JOIN LATERAL (
  SELECT COALESCE(input.variant_group_id,input.id) AS group_id,COALESCE(input.variant_version,1) AS variant_version,
   COALESCE(input.variant_action,'original') AS variant_action
@@ -711,10 +745,13 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		var outputRevision, outputEvent pgtype.Int8
 		var variantGroupID, variantAction string
 		var variantVersion int64
+		var internalToolName, internalTaskStatus, internalStepStatus string
+		var internalDispatched, internalUnknown bool
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
 			&row.Sequence, &row.DeliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure,
-			&agentAcknowledged, &outputStatus, &outputRevision, &outputEvent, &variantGroupID, &variantVersion, &variantAction); err != nil {
+			&agentAcknowledged, &outputStatus, &outputRevision, &outputEvent, &variantGroupID, &variantVersion, &variantAction,
+			&internalToolName, &internalTaskStatus, &internalStepStatus, &internalDispatched, &internalUnknown); err != nil {
 			rows.Close()
 			return app.MessagePage{}, fmt.Errorf("scan project conversation message: %w", err)
 		}
@@ -726,6 +763,7 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
 		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
 		message.AgentAcknowledged = agentAcknowledged
+		message.ToolActivity = conversationToolActivity(internalToolName, internalTaskStatus, internalStepStatus, internalDispatched, internalUnknown)
 		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)
 		message.VariantGroupID, message.VariantVersion, message.VariantAction = variantGroupID, variantVersion, variantAction
 		items = append(items, message)
@@ -747,6 +785,49 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		result.Items = items[:limit]
 	}
 	return result, nil
+}
+
+func conversationToolActivity(toolName, taskStatus, stepStatus string, dispatched, unknown bool) *conversation.ToolActivity {
+	tool := ""
+	switch toolName {
+	case "morde_web_search":
+		tool = "web_search"
+	case "morde_web_read":
+		tool = "web_read"
+	default:
+		return nil
+	}
+	return &conversation.ToolActivity{Tool: tool, Status: conversationToolActivityStatus(task.Status(taskStatus), task.StepStatus(stepStatus), dispatched, unknown)}
+}
+
+func conversationToolActivityStatus(taskStatus task.Status, stepStatus task.StepStatus, dispatched, unknown bool) task.StepStatus {
+	if unknown {
+		return task.StepUnknown
+	}
+	switch stepStatus {
+	case task.StepSucceeded, task.StepFailed, task.StepCancelled, task.StepUnknown:
+		return stepStatus
+	}
+	switch taskStatus {
+	case task.StatusQueued:
+		if dispatched {
+			return task.StepUnknown
+		}
+		return task.StepQueued
+	case task.StatusRunning:
+		return task.StepRunning
+	case task.StatusWaitingUser:
+		return task.StepWaitingUser
+	case task.StatusFailed:
+		if stepStatus == "" && !dispatched {
+			return task.StepFailed
+		}
+	case task.StatusCancelled:
+		if stepStatus == "" && !dispatched {
+			return task.StepCancelled
+		}
+	}
+	return task.StepUnknown
 }
 
 func applyConversationOutputProjection(message *conversation.Message, status string, revision, event pgtype.Int8) {

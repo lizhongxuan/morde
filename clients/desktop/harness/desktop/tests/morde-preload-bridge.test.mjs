@@ -41,12 +41,13 @@ test('Portal preload exposes project and restricted local recovery operations', 
   assert.deepEqual(Object.keys(bridge.exposed.value).sort(), [
     'closeHostWorkbenchEmbed', 'codexAddProfile', 'codexAuthorizeProfile', 'codexAuthorizeThread', 'codexListThreads', 'codexRevoke', 'codexRevokeProfile', 'codexSelectProfile', 'codexState', 'codexUpdateScopes',
     'deletePreserved', 'legacyDiscardSync', 'legacyPauseSync', 'legacyResumeSync', 'legacyStopLiveSync', 'legacyStopSync', 'legacySyncState',
-    'onCodexState', 'onHostWorkbenchMessage', 'onState', 'onSync', 'openHostWorkbenchEmbed', 'preserved', 'projectUploadTargets',
+    'onCodexState', 'onHostWorkbenchMessage', 'onState', 'onSync', 'openHostWorkbenchEmbed', 'preserved', 'projectLocalStatus', 'projectUploadTargets',
     'restorePreserved', 'selectProjectDirectory', 'sendHostWorkbenchCommand', 'setHostWorkbenchBounds', 'state', 'stopProjectSync', 'uploadProject',
   ]);
   await bridge.exposed.value.projectUploadTargets();
   await bridge.exposed.value.selectProjectDirectory('h1234567', 'w1234567');
   await bridge.exposed.value.uploadProject('selection', 'project');
+  await bridge.exposed.value.projectLocalStatus('selection');
   await bridge.exposed.value.stopProjectSync('selection');
   await bridge.exposed.value.state();
   await bridge.exposed.value.legacySyncState();
@@ -68,6 +69,7 @@ test('Portal preload exposes project and restricted local recovery operations', 
     ['morde:portal-project-upload-targets'],
     ['morde:portal-project-select-directory', 'h1234567', 'w1234567'],
     ['morde:portal-project-upload', 'selection', 'project'],
+    ['morde:portal-project-local-status', 'selection'],
     ['morde:portal-project-stop', 'selection'],
     ['morde:portal-state'],
     ['morde:portal-legacy-state'],

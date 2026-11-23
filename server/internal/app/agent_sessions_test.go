@@ -15,6 +15,9 @@ type agentChildSessionStoreStub struct {
 	settleText    string
 	settleThrough int64
 	settleDigest  []byte
+	listActor     string
+	cancelActor   string
+	cancelKey     string
 	cancelCalls   int
 	listCalls     int
 	calls         int
@@ -36,17 +39,19 @@ func (s *agentChildSessionStoreStub) GetAgentChildSession(_ context.Context, fen
 	return AgentChildSession{TaskID: fence.TaskID, SessionID: sessionID, ParentSessionID: actorSessionID, SpawnKey: "call_1"}, nil
 }
 
-func (s *agentChildSessionStoreStub) ListAgentChildSessions(_ context.Context, fence AgentInstanceFence) ([]AgentChildSession, error) {
+func (s *agentChildSessionStoreStub) ListAgentChildSessions(_ context.Context, fence AgentInstanceFence, actorSessionID string) ([]AgentChildSession, error) {
 	s.listCalls++
+	s.listActor = actorSessionID
 	return []AgentChildSession{
-		{TaskID: fence.TaskID, SessionID: "child_1", ParentSessionID: fence.AgentSessionID, SpawnKey: "call_1", Background: true},
-		{TaskID: fence.TaskID, SessionID: "child_2", ParentSessionID: fence.AgentSessionID, SpawnKey: "call_2", Background: false},
+		{TaskID: fence.TaskID, SessionID: "child_1", ParentSessionID: actorSessionID, SpawnKey: "call_1", Background: true},
+		{TaskID: fence.TaskID, SessionID: "child_2", ParentSessionID: actorSessionID, SpawnKey: "call_2", Background: false},
 	}, nil
 }
 
-func (s *agentChildSessionStoreStub) RequestAgentChildSessionCancel(_ context.Context, fence AgentInstanceFence, sessionID, _ string) (AgentChildSession, bool, error) {
+func (s *agentChildSessionStoreStub) RequestAgentChildSessionCancel(_ context.Context, fence AgentInstanceFence, actorSessionID, sessionID, operationKey string) (AgentChildSession, bool, error) {
 	s.cancelCalls++
-	return AgentChildSession{TaskID: fence.TaskID, SessionID: sessionID, ParentSessionID: fence.AgentSessionID, SpawnKey: "call_1",
+	s.cancelActor, s.cancelKey = actorSessionID, operationKey
+	return AgentChildSession{TaskID: fence.TaskID, SessionID: sessionID, ParentSessionID: actorSessionID, SpawnKey: "call_1",
 		Background: true, CancelRequested: true, Step: task.Step{ID: "step_1", TaskID: fence.TaskID, Status: task.StepRunning}}, s.cancelCalls > 1, nil
 }
 
@@ -127,8 +132,8 @@ func TestAgentChildSessionListingAndCancelFenceRoot(t *testing.T) {
 	if err != nil || store.listCalls != 1 || len(jobs) != 2 || !jobs[0].Background || jobs[1].Background {
 		t.Fatalf("list child sessions = %#v calls=%d err=%v", jobs, store.listCalls, err)
 	}
-	if _, err := service.List(context.Background(), fence, "child_1"); err == nil || store.listCalls != 1 {
-		t.Fatalf("child session listed sessions outside root: calls=%d err=%v", store.listCalls, err)
+	if _, err := service.List(context.Background(), fence, "child_1"); err != nil || store.listCalls != 2 || store.listActor != "child_1" {
+		t.Fatalf("child actor was not forwarded to the authorization store: calls=%d actor=%q err=%v", store.listCalls, store.listActor, err)
 	}
 	job, replayed, err := service.RequestCancel(context.Background(), AgentChildSessionCancelCommand{
 		Fence: fence, ActorSessionID: fence.AgentSessionID, SessionID: "child_1", CallID: "call_cancel_1",
@@ -136,9 +141,28 @@ func TestAgentChildSessionListingAndCancelFenceRoot(t *testing.T) {
 	if err != nil || replayed || !job.Background || !job.CancelRequested || job.Step.Status != task.StepRunning || store.cancelCalls != 1 {
 		t.Fatalf("request cancel = %#v replayed=%t calls=%d err=%v", job, replayed, store.cancelCalls, err)
 	}
+	if store.cancelKey != AgentOperationKey("call_cancel_1") {
+		t.Fatalf("root cancellation identity changed: %q", store.cancelKey)
+	}
 	if _, _, err := service.RequestCancel(context.Background(), AgentChildSessionCancelCommand{
-		Fence: fence, ActorSessionID: "child_1", SessionID: "child_2",
-	}); err == nil || store.cancelCalls != 1 {
-		t.Fatalf("non-root cancel reached store: calls=%d err=%v", store.cancelCalls, err)
+		Fence: fence, ActorSessionID: "child_1", SessionID: "child_2", CallID: "call_cancel_1",
+	}); err != nil || store.cancelCalls != 2 || store.cancelActor != "child_1" ||
+		store.cancelKey != AgentOperationKey(AgentSessionToolCallID(fence.TaskID, "child_1", "call_cancel_1")) {
+		t.Fatalf("child cancellation did not retain the actor-scoped identity: calls=%d actor=%q key=%q err=%v",
+			store.cancelCalls, store.cancelActor, store.cancelKey, err)
+	}
+	if _, _, err := service.RequestCancel(context.Background(), AgentChildSessionCancelCommand{
+		Fence: fence, ActorSessionID: "child_1", SessionID: "child_1",
+	}); err == nil || store.cancelCalls != 2 {
+		t.Fatalf("actor could cancel its own session: calls=%d err=%v", store.cancelCalls, err)
+	}
+}
+
+func TestAgentSessionToolCallIDIsStableAndScoped(t *testing.T) {
+	got := AgentSessionToolCallID("q1234567", "child_1", "call_cancel_1")
+	const want = "dsh_03931f3fd4910bb90ae97567a36f5e8131ff763b4640d1017b95bead34ace01c"
+	if got != want || got == AgentSessionToolCallID("q1234567", "child_2", "call_cancel_1") ||
+		got == AgentSessionToolCallID("q7654321", "child_1", "call_cancel_1") {
+		t.Fatalf("child call namespace does not bind task and session: got=%q want=%q", got, want)
 	}
 }

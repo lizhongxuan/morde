@@ -1188,6 +1188,16 @@ enum MordeCredentialExpiryTests {
             "Message and context exceed the model input limit; the original is retained. Shorten and send again.")
         precondition(!MordeRoutingPresentation.canRetryProcessing("message_too_long"))
         precondition(MordeRoutingPresentation.canRetryProcessing("model_unavailable"))
+        precondition(MordeRoutingPresentation.canRetryProcessing(taskID: nil, relatedTaskID: nil,
+            duplicateOfMessageID: nil, routingStatus: "failed", failureReason: "model_unavailable"))
+        precondition(!MordeRoutingPresentation.canRetryProcessing(taskID: "q1234567", relatedTaskID: nil,
+            duplicateOfMessageID: nil, routingStatus: "failed", failureReason: "model_unavailable"))
+        precondition(!MordeRoutingPresentation.canRetryProcessing(taskID: nil, relatedTaskID: "q1234567",
+            duplicateOfMessageID: nil, routingStatus: "failed", failureReason: "model_unavailable"))
+        precondition(!MordeRoutingPresentation.canRetryProcessing(taskID: nil, relatedTaskID: nil,
+            duplicateOfMessageID: "m7654321", routingStatus: "failed", failureReason: "model_unavailable"))
+        precondition(!MordeRoutingPresentation.canRetryProcessing(taskID: nil, relatedTaskID: nil,
+            duplicateOfMessageID: nil, routingStatus: "routed", failureReason: "model_unavailable"))
         precondition(MordeTaskStatusPresentation.label(status: "waiting_user", waitingReason: "model_context_limit") ==
             "消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。")
         precondition(MordeTaskStatusPresentation.localizationKey(status: "waiting_user", waitingReason: "model_context_limit") ==

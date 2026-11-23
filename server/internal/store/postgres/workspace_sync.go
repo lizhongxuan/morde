@@ -1791,9 +1791,37 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 			if err != nil {
 				return err
 			}
+			var projectLiveBaseline *app.WorkspaceSyncProjectLiveBaseline
+			if row.SourceBaselineSessionID.Valid {
+				projectLiveBaseline, err = readWorkspaceSyncProjectLiveBaseline(ctx, tx, workspaceID, row.SourceBaselineSessionID.String)
+				if err != nil {
+					return err
+				}
+			}
+			baselineRecorded := false
 			directConflicts, err := directApply(ctx, app.WorkspaceSyncDirectCommitPlan{
 				Session: directSession, PinnedFiles: pinnedFiles,
 				PinnedEmptyDirectories: pinnedDirectories, PinnedDirectoryMetadata: pinnedMetadata,
+				ProjectLiveBaseline: projectLiveBaseline,
+				RecordProjectLiveBaseline: func(baseline app.WorkspaceSyncProjectLiveBaseline) error {
+					if baselineRecorded {
+						return errors.New("project live baseline was recorded more than once")
+					}
+					files, err := marshalNonNilJSON(baseline.Files)
+					if err != nil {
+						return err
+					}
+					directories, err := marshalNonNilJSON(baseline.Directories)
+					if err != nil {
+						return err
+					}
+					if _, err := tx.Exec(ctx, `INSERT INTO workspace_sync_project_live_baselines
+(workspace_id,session_id,files,directories) VALUES ($1,$2,$3::jsonb,$4::jsonb)`, workspaceID, sessionID, files, directories); err != nil {
+						return fmt.Errorf("record project live baseline: %w", err)
+					}
+					baselineRecorded = true
+					return nil
+				},
 			})
 			if err != nil {
 				return err
@@ -1822,6 +1850,9 @@ WHERE owner_id=$1 AND operation=$2 AND key=$3 AND state='pending'`, idempotency.
 					return err
 				}
 				return saveWorkspaceSyncCommitSuccess(ctx, tx, idempotency)
+			}
+			if !baselineRecorded {
+				return domain.NewError(domain.CodeWorkspaceUnavailable, "project live baseline was not recorded")
 			}
 		}
 		targetRevision := currentRevision

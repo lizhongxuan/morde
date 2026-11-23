@@ -2,6 +2,47 @@ import XCTest
 @testable import Minis
 
 final class MIFTaskViewsTests: XCTestCase {
+    func testRecordedOutputDisclosureBoundsAndRedactsBeforePreviewing() {
+        let raw = "token=synthetic-secret " + String(repeating: "界", count: 3_000)
+        let disclosure = MIFTaskExecutionOutputDisclosure.make(raw)
+
+        XCTAssertLessThanOrEqual(disclosure.fullText.utf8.count, MIFTaskExecutionOutputDisclosure.maximumBytes)
+        XCTAssertTrue(disclosure.fullText.contains("token=[REDACTED]"))
+        XCTAssertFalse(disclosure.fullText.contains("synthetic-secret"))
+        XCTAssertTrue(disclosure.preview.hasSuffix("…"))
+        XCTAssertGreaterThan(disclosure.fullText.count, disclosure.preview.count)
+        XCTAssertFalse(disclosure.truncated, "A collapsed preview is not a loss of recorded output.")
+
+        let overByteLimit = MIFTaskExecutionOutputDisclosure.make(String(repeating: "界", count: 22_000))
+        XCTAssertLessThanOrEqual(overByteLimit.fullText.utf8.count, MIFTaskExecutionOutputDisclosure.maximumBytes)
+        XCTAssertTrue(overByteLimit.truncated)
+    }
+
+    func testRecordedOutputRequiresAvailableDetailAndConfirmedTerminalStep() {
+        XCTAssertTrue(MIFTaskExecutionOutputDisclosure.isAvailable(detailState: "available", stepStatus: "succeeded", output: "ok"))
+        XCTAssertTrue(MIFTaskExecutionOutputDisclosure.isAvailable(detailState: "available", stepStatus: "failed", output: "partial"))
+        for status in ["queued", "running", "waiting_user", "unknown", "cancelled"] {
+            XCTAssertFalse(MIFTaskExecutionOutputDisclosure.isAvailable(detailState: "available", stepStatus: status, output: "private"))
+        }
+        XCTAssertFalse(MIFTaskExecutionOutputDisclosure.isAvailable(detailState: "restricted", stepStatus: "succeeded", output: "private"))
+        XCTAssertFalse(MIFTaskExecutionOutputDisclosure.isAvailable(detailState: "available", stepStatus: "succeeded", output: nil))
+    }
+
+    func testConversationToolActivityLabelsReflectToolAndState() {
+        let examples: [(String, String, String.LocalizationValue, String.LocalizationValue)] = [
+            ("web_search", "running", "Web search", "Running"),
+            ("web_read", "succeeded", "Web read", "Completed"),
+            ("web_search", "failed", "Web search", "Failed"),
+            ("web_read", "unknown", "Web read", "Status unknown"),
+            ("web_search", "cancelled", "Web search", "Cancelled"),
+        ]
+        for (tool, status, action, state) in examples {
+            let activity = MordeMessageToolActivity(tool: tool, status: status)
+            XCTAssertEqual(MIFConversationToolActivityPresentation.label(activity),
+                           "\(AppLocalized(action)) · \(AppLocalized(state))")
+        }
+    }
+
     func testTaskDecodesAggregationFlagsWithRequiredStepCounts() throws {
         let legacy = #"{"id":"q1234567","conversation_id":"c1234567","objective":"demo","status":"completed","step_count":0,"completed_step_count":0,"updated_at":"2026-11-04T00:00:00Z"}"#
         let pending = #"{"id":"q1234567","conversation_id":"c1234567","objective":"demo","status":"completed","step_count":0,"completed_step_count":0,"updated_at":"2026-11-04T00:00:00Z","result_message_pending":true,"result_message_published":false}"#
@@ -422,6 +463,10 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("failed"), AppLocalized("Failed"))
         XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("unknown"), AppLocalized("Status unknown"))
         XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("succeeded"), AppLocalized("Completed"))
+        XCTAssertEqual(MIFTaskPresentation.stepStatusLabel("cancelled"), AppLocalized("Cancelled"))
+        let cancelledStep = makeStep(id: "s1234567", sequence: 1, kind: "tool", status: "cancelled",
+                                     title: "Run command", summary: "", createdAt: "2026-11-04T00:00:01Z")
+        XCTAssertEqual(MIFTaskPresentation.stepMarker(cancelledStep), .cancelled)
         XCTAssertEqual(MIFTaskPresentation.agentStatusLabel("idle"), AppLocalized("Idle"))
         XCTAssertEqual(MIFTaskPresentation.agentStatusLabel("future_status"), AppLocalized("Status unknown"))
     }
@@ -564,7 +609,9 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertEqual(MIFTaskPresentation.eventChainMarker(eventStatus: "future_status", taskStatus: "completed",
                                                              index: 0, rowCount: 2), .unconfirmed)
         XCTAssertEqual(MIFTaskPresentation.eventChainMarker(eventStatus: "cancelled", taskStatus: "completed",
-                                                             index: 0, rowCount: 2), .unconfirmed)
+                                                             index: 0, rowCount: 2), .cancelled)
+        XCTAssertEqual(MIFTaskPresentation.timelineMarker(taskStatus: "cancelled", index: 0, rowCount: 1), .cancelled)
+        XCTAssertEqual(MIFTaskPresentation.timelineMarkerLabel(.cancelled), AppLocalized("Cancelled"))
         XCTAssertEqual(MIFTaskPresentation.eventChainMarker(eventStatus: "failed", taskStatus: "running",
                                                              index: 0, rowCount: 2), .failed)
         XCTAssertEqual(MIFTaskPresentation.eventChainMarker(eventStatus: "waiting_user", taskStatus: "running",

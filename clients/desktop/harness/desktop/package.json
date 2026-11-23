@@ -19,7 +19,7 @@
     "build:sync": "node scripts/build-morde-sync.mjs",
     "build:syncthing": "node scripts/build-morde-syncthing.mjs",
     "stage:portal": "node scripts/portal-downloads.mjs stage",
-    "start": "npm run build:portal && npm run build && electron .",
+    "start": "npm run build:portal && npm run build:sync && npm run build && electron .",
     "dist": "npm run build:portal && npm run build && npm run build:sync && npm run build:syncthing && electron-builder --config electron-builder.yml --publish never",
     "dist:dir": "npm run build:portal && npm run build && npm run build:sync && npm run build:syncthing && electron-builder --config electron-builder.yml --dir",
     "dist:macos:x64": "npm run build:portal && npm run build && node scripts/build-morde-sync.mjs macos x64 && node scripts/build-morde-syncthing.mjs macos x64 && electron-builder --config electron-builder.yml --mac dmg --x64 --publish never",

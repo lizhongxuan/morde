@@ -844,6 +844,202 @@ func TestCloudDSHToolBrokerReconcilesApprovedActionAfterLostRuntimeReceipt(t *te
 	}
 }
 
+func TestCloudDSHToolBrokerKeepsFencedActivityAcrossLostReceiptAndRecovery(t *testing.T) {
+	fixture, store, broker, call := newCloudDSHApprovalFixture(t)
+	sealer, err := NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.stepDetailSealer = sealer
+	current := &store.details.Task
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-activity", 1, "session-root"
+	revision := int64(4)
+	current.CurrentRevision, current.Authorization.Version = &revision, 2
+	call.TaskFence = &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+		LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+		AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+		AuthorizationVersion: current.Authorization.Version}
+	var dropped, operationPosts int
+	fixture.wrap = func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodPost && request.URL.Path == "/runtime/v1/operations" {
+				operationPosts++
+			}
+			if request.Method == http.MethodGet && strings.HasPrefix(request.URL.Path, "/runtime/v1/operations/") && dropped == 0 {
+				dropped++
+				recorded := httptest.NewRecorder()
+				next.ServeHTTP(recorded, request)
+				http.Error(writer, "simulated lost runtime receipt", http.StatusServiceUnavailable)
+				return
+			}
+			next.ServeHTTP(writer, request)
+		})
+	}
+
+	first, err := broker.Execute(context.Background(), *current, call)
+	if err != nil || first.Status != AgentToolNeedsUser || len(store.details.Steps) != 1 ||
+		store.details.Steps[0].Status != task.StepWaitingUser {
+		t.Fatalf("approval activity = %#v, err=%v, steps=%+v", first, err, store.details.Steps)
+	}
+	original := store.details.Steps[0]
+	if original.AgentSessionID != current.AgentSessionID || original.ToolCallKey != call.CallID ||
+		original.TaskRevision == nil || *original.TaskRevision != revision {
+		t.Fatalf("approval activity is not bound to the original call: %+v", original)
+	}
+	pendingDetail := store.toolCalls[len(store.toolCalls)-1]
+	plain, err := sealer.OpenWithAAD(pendingDetail.DetailCiphertext, taskStepDetailAAD(current.OwnerID, current.ID, original.ID, revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pendingDocument TaskStepDetailDocument
+	if err := json.Unmarshal(plain, &pendingDocument); err != nil ||
+		(pendingDocument.Execution != nil && pendingDocument.Execution.DurationMS != nil) {
+		t.Fatalf("pending approval unexpectedly recorded an execution duration: err=%v", err)
+	}
+	resumeCloudDSHApproval(fixture, store, task.PendingRequestApproved, task.PendingDecisionApprove)
+	call.TaskFence.LeaseOwner, call.TaskFence.LeaseVersion = store.details.Task.Lease.Owner, store.details.Task.Lease.Version
+	unknown, err := broker.Reconcile(context.Background(), store.details.Task, call, nil)
+	if err != nil || unknown.Status != AgentToolUnknown || len(store.details.Steps) != 1 ||
+		store.details.Steps[0].ID != original.ID || store.details.Steps[0].Status != task.StepUnknown ||
+		store.operation.Status != task.OperationUnknown || fixture.handlers["shell.exec"].calls.Load() != 1 || operationPosts != 1 {
+		t.Fatalf("lost receipt did not preserve the original unknown activity: result=%+v err=%v steps=%+v operation=%+v calls=%d posts=%d",
+			unknown, err, store.details.Steps, store.operation, fixture.handlers["shell.exec"].calls.Load(), operationPosts)
+	}
+
+	expires := time.Now().Add(time.Minute).UTC()
+	store.mu.Lock()
+	store.details.Task.Status, store.details.Task.WaitingReason = task.StatusRunning, ""
+	store.details.Task.Lease = task.Lease{Owner: "worker-3", Version: 3, ExpiresAt: &expires}
+	claimed := store.details.Task
+	operation := store.operations[agentOperationKey(call.CallID)]
+	operation.LeaseVersion = claimed.Lease.Version
+	store.operations[operation.Key], store.operation = operation, operation
+	store.mu.Unlock()
+	call.TaskFence.LeaseOwner, call.TaskFence.LeaseVersion = claimed.Lease.Owner, claimed.Lease.Version
+	recovered, err := broker.Reconcile(context.Background(), claimed, call, nil)
+	if err != nil || recovered.Status != AgentToolSucceeded || len(store.details.Steps) != 1 ||
+		store.details.Steps[0].ID != original.ID || store.details.Steps[0].Sequence != original.Sequence ||
+		store.details.Steps[0].Status != task.StepSucceeded || store.details.Steps[0].ToolCallKey != call.CallID ||
+		store.operation.Status != task.OperationSucceeded || fixture.handlers["shell.exec"].calls.Load() != 1 || operationPosts != 1 ||
+		store.details.Task.Usage.ToolCalls != 1 {
+		t.Fatalf("recovery did not settle the original activity exactly once: result=%+v err=%v steps=%+v operation=%+v calls=%d posts=%d usage=%d",
+			recovered, err, store.details.Steps, store.operation, fixture.handlers["shell.exec"].calls.Load(), operationPosts,
+			store.details.Task.Usage.ToolCalls)
+	}
+}
+
+func TestCloudDSHToolBrokerRecordsActualDeferredHostExecution(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "window.list", action: "list", result: `{"windows":[]}`,
+	}})
+	base := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	store := &deferredBrokerTestStore{cloudDSHBrokerTaskStore: base, target: DeferredTaskTarget{HostID: "h1234567"}}
+	fixture.executor.store = store
+	session, err := fixture.executor.connect(context.Background(), store.details.Task, fixture.fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.fences.fence = agentFenceFromRuntime(session.Fence)
+	session.Close()
+	current := &store.details.Task
+	current.HostID, current.WorkspaceID = "", ""
+	current.InputRevision, current.WorkspaceCheckpointRevision = nil, nil
+	current.ExecutionLocation, current.Authorization.Version = "server", 1
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-deferred", 1, "session-deferred"
+	claimed := *current
+	call := ModelToolCall{CallID: "deferred-activity", Name: runtimeToolWindowList, Arguments: `{}`,
+		TaskFence: &ModelTaskFence{TaskID: claimed.ID, OwnerID: claimed.OwnerID, InitiatorID: claimed.InitiatorID,
+			LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, AgentInstanceID: claimed.AgentInstanceID,
+			AgentGeneration: claimed.AgentGeneration, AgentSessionID: claimed.AgentSessionID,
+			AuthorizationVersion: claimed.Authorization.Version}}
+	sealer, err := NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.stepDetailSealer = sealer
+
+	activityCtx := withCloudDSHToolActivity(context.Background(), claimed, call, sealer)
+	for _, change := range []func(*task.Task){
+		func(value *task.Task) { value.OwnerID = "u7654321" },
+		func(value *task.Task) { value.Authorization.Version++ },
+		func(value *task.Task) { value.Lease.Version++ },
+		func(value *task.Task) { value.AgentSessionID = "different-session" },
+	} {
+		wrong := claimed
+		wrong.HostID = store.target.HostID
+		change(&wrong)
+		activity, ok := cloudDSHToolActivityFromContext(withBoundTaskToolActivity(activityCtx, wrong))
+		if !ok || activity.current.HostID != "" {
+			t.Fatal("mismatched deferred target changed the original activity identity")
+		}
+	}
+
+	result, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || result.Status != AgentToolSucceeded || fixture.handlers["window.list"].calls.Load() != 1 {
+		t.Fatalf("deferred Host execution failed: result=%+v err=%v", result, err)
+	}
+	progress := store.committedTaskProgress[len(store.committedTaskProgress)-1]
+	if progress.ToolCall == nil || len(progress.Steps) != 1 || progress.ToolCall.DetailState != "available" {
+		t.Fatalf("completed execution detail was not saved")
+	}
+	plain, err := sealer.OpenWithAAD(progress.ToolCall.DetailCiphertext,
+		taskStepDetailAAD(claimed.OwnerID, claimed.ID, progress.Steps[0].ID, *claimed.CurrentRevision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail TaskStepDetailDocument
+	if err := json.Unmarshal(plain, &detail); err != nil || detail.Execution == nil || detail.Execution.Location == nil ||
+		*detail.Execution.Location != "云端电脑" || detail.Execution.DurationMS == nil || *detail.Execution.DurationMS < 0 {
+		t.Fatalf("deferred Host execution lacks a measured duration or actual location: err=%v detail=%+v", err, detail.Execution)
+	}
+}
+
+func TestCloudDSHToolBrokerRecordsDeferredWorkspaceLocationWithoutHostDuration(t *testing.T) {
+	fixture, base, broker, workspaceStore, original := newCloudDSHT08WorkspaceBroker(t)
+	store := &deferredWorkspaceBrokerTestStore{deferredBrokerTestStore: &deferredBrokerTestStore{
+		cloudDSHBrokerTaskStore: base, target: DeferredTaskTarget{WorkspaceID: original.WorkspaceID},
+	}, workspaceStore: workspaceStore}
+	fixture.executor.store, broker.store = store, store
+	current := &base.details.Task
+	current.Authorization.Kind, current.Authorization.Version = string(identity.KindSession), 1
+	current.WorkspaceID = ""
+	current.InputRevision, current.WorkspaceCheckpointRevision, current.ContextDigest = nil, nil, nil
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-workspace", 1, "session-workspace"
+	claimed := *current
+	call := ModelToolCall{CallID: "deferred-workspace-activity", Name: cloudDSHWorkspaceListToolName,
+		Arguments: `{"expected_revision":-1}`, TaskFence: &ModelTaskFence{TaskID: claimed.ID, OwnerID: claimed.OwnerID,
+			InitiatorID: claimed.InitiatorID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+			AgentInstanceID: claimed.AgentInstanceID, AgentGeneration: claimed.AgentGeneration,
+			AgentSessionID: claimed.AgentSessionID, AuthorizationVersion: claimed.Authorization.Version}}
+	sealer, err := NewSealer(make([]byte, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.stepDetailSealer = sealer
+	result, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || result.Status != AgentToolSucceeded || store.workspaceBinds != 1 {
+		t.Fatalf("deferred Workspace execution failed: result=%+v err=%v", result, err)
+	}
+	progress := base.committedTaskProgress[len(base.committedTaskProgress)-1]
+	if progress.ToolCall == nil || len(progress.Steps) != 1 || progress.ToolCall.DetailState != "available" {
+		t.Fatal("completed Workspace detail was not saved")
+	}
+	plain, err := sealer.OpenWithAAD(progress.ToolCall.DetailCiphertext,
+		taskStepDetailAAD(claimed.OwnerID, claimed.ID, progress.Steps[0].ID, *claimed.CurrentRevision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail TaskStepDetailDocument
+	if err := json.Unmarshal(plain, &detail); err != nil || detail.Execution == nil || detail.Execution.Location == nil ||
+		*detail.Execution.Location != "云端工作区" || detail.ExecutionWorkspaceID != original.WorkspaceID || detail.Execution.DurationMS != nil {
+		t.Fatalf("deferred Workspace location or Host duration is incorrect: err=%v detail=%+v", err, detail.Execution)
+	}
+}
+
 func TestCloudDSHToolBrokerKeepsUnknownWhenRuntimeOperationQueriesStayUnavailable(t *testing.T) {
 	fixture, store, broker, call := newCloudDSHApprovalFixture(t)
 	var operationPosts, operationGets int

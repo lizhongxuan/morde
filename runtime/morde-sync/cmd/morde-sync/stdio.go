@@ -15,6 +15,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	mordesync "morde-sync"
 	"morde-sync/client"
 )
 
@@ -35,6 +36,7 @@ var (
 	idempotencyRE     = regexp.MustCompile(`^[A-Za-z0-9._~-]{1,128}$`)
 	preservedIDRE     = regexp.MustCompile(`^[a-f0-9]{32}$`)
 	folderIDRE        = regexp.MustCompile(`^morde-[a-f0-9]{32}$`)
+	rootIdentityRE    = regexp.MustCompile(`^[0-9]{1,32}$`)
 )
 
 type stdioServer struct {
@@ -164,6 +166,12 @@ type hubRootParams struct {
 	Directory string `json:"directory"`
 }
 
+type projectFingerprintParams struct {
+	Directory string `json:"directory"`
+	Device    string `json:"device"`
+	Inode     string `json:"inode"`
+}
+
 type hubFilesParams struct {
 	Directory string `json:"directory"`
 	Identity  string `json:"identity"`
@@ -224,8 +232,9 @@ type preservedDeleteResult struct {
 }
 
 type syncResult struct {
-	Session   client.SyncSession `json:"session"`
-	Conflicts []client.Conflict  `json:"conflicts"`
+	Session             client.SyncSession `json:"session"`
+	Conflicts           []client.Conflict  `json:"conflicts"`
+	SnapshotFingerprint string             `json:"snapshot_fingerprint,omitempty"`
 }
 
 type cancelResult struct {
@@ -328,6 +337,8 @@ func (s *stdioServer) handleLine(line []byte) {
 		s.deletePreserved(request.ID, request.Params)
 	case "hub_root":
 		s.hubRoot(request.ID, request.Params)
+	case "project_fingerprint":
+		s.projectFingerprint(request.ID, request.Params)
 	case "hub_files":
 		s.hubFiles(request.ID, request.Params)
 	case "hub_file_get":
@@ -345,6 +356,30 @@ func (s *stdioServer) handleLine(line []byte) {
 	default:
 		_ = s.writeError(request.ID, -32601, "method not found")
 	}
+}
+
+func (s *stdioServer) projectFingerprint(id json.RawMessage, rawParams json.RawMessage) {
+	var params projectFingerprintParams
+	if err := decodeStrict(rawParams, &params); err != nil || params.Directory == "" || len(params.Directory) > 4096 ||
+		!rootIdentityRE.MatchString(params.Device) || !rootIdentityRE.MatchString(params.Inode) {
+		_ = s.writeError(id, -32602, "invalid selected project parameters")
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), localRecoveryTimeout)
+	defer cancel()
+	manifest, err := mordesync.ScanMatchingIdentity(ctx, params.Directory, params.Device, params.Inode)
+	if err != nil {
+		_ = s.writeError(id, -32030, "selected project could not be verified")
+		return
+	}
+	fingerprint, err := mordesync.ManifestFingerprint(manifest)
+	if err != nil {
+		_ = s.writeError(id, -32030, "selected project could not be verified")
+		return
+	}
+	_ = s.writeResult(id, struct {
+		Fingerprint string `json:"fingerprint"`
+	}{Fingerprint: fingerprint})
 }
 
 func (s *stdioServer) hubRoot(id json.RawMessage, rawParams json.RawMessage) {
@@ -783,7 +818,7 @@ func (s *stdioServer) startSync(id json.RawMessage, idKey string, rawParams json
 			}
 			_ = s.writeError(id, -32010, message)
 		} else {
-			_ = s.writeResult(id, syncResult{Session: result.Session, Conflicts: nonNilConflicts(result.Conflicts)})
+			_ = s.writeResult(id, syncResult{Session: result.Session, Conflicts: nonNilConflicts(result.Conflicts), SnapshotFingerprint: result.SnapshotFingerprint})
 		}
 		s.clearActiveUnlessCancelling(operation)
 	}()

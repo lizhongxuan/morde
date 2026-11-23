@@ -1,5 +1,5 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { focusManager, QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -72,6 +72,7 @@ describe('Workspaces', () => {
     localStorage.clear();
     vi.restoreAllMocks();
     vi.useRealTimers();
+    focusManager.setFocused(undefined);
   });
 
   it('explains project directory selection is unavailable in the browser without calling service capabilities', async () => {
@@ -222,15 +223,21 @@ describe('Workspaces', () => {
     expect(screen.queryByRole('button', { name: /上传/ })).not.toBeInTheDocument();
   });
 
-  it('does not read target metadata when service capabilities cannot be confirmed', async () => {
+  it('pauses when service capabilities cannot be confirmed and allows retry', async () => {
     const projectUploadTargets = vi.fn().mockResolvedValue([projectTarget]);
     setProjectBridge({ projectUploadTargets, selectProjectDirectory: vi.fn() });
-    vi.spyOn(portalApi, 'capabilities').mockRejectedValue(new Error('capabilities unavailable'));
+    const capabilities = vi.spyOn(portalApi, 'capabilities').mockRejectedValueOnce(new Error('capabilities unavailable')).mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost();
+    const user = userEvent.setup();
     renderWorkspaces();
 
     expect(await screen.findByText(/无法确认服务端项目同步能力/)).toBeInTheDocument();
     expect(projectUploadTargets).not.toHaveBeenCalled();
     expect(screen.queryByRole('button', { name: /上传/ })).not.toBeInTheDocument();
+    await user.click(within(screen.getByRole('alert')).getByRole('button', { name: '重试' }));
+    expect(await screen.findByRole('button', { name: '选择本机目录' })).toBeInTheDocument();
+    expect(capabilities).toHaveBeenCalledTimes(2);
+    expect(projectUploadTargets).toHaveBeenCalledOnce();
   });
 
   it('starts project sync only after an explicit click and verifies the applied receipt', async () => {
@@ -239,7 +246,7 @@ describe('Workspaces', () => {
       selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
       projectName: 'demo', directoryName: 'demo',
     });
-    const uploadProject = vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied',
+    const uploadProject = vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied', localSnapshotConfirmed: true,
       hostApplication: { status: 'applied', targetRevision: 3, appliedRevision: 3, impacts: [] } });
     setProjectBridge({ projectUploadTargets, selectProjectDirectory, uploadProject });
     vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
@@ -263,7 +270,36 @@ describe('Workspaces', () => {
     await user.click(screen.getByRole('button', { name: '开始同步' }));
     expect(uploadProject).toHaveBeenCalledOnce();
     expect(uploadProject).toHaveBeenCalledWith('11111111-1111-4111-8111-111111111112', 'release-notes');
-    expect(await screen.findByText('同步完成，目标电脑已应用本次项目。')).toBeInTheDocument();
+    expect(await screen.findByText('上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。')).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '重新选择本机目录' }));
+    expect(await screen.findByText('待处理：确认项目名后，点击同步才会更新云端。')).toBeInTheDocument();
+    expect(screen.queryByText('上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。')).not.toBeInTheDocument();
+    await user.clear(screen.getByRole('textbox', { name: '项目名' }));
+    await user.type(screen.getByRole('textbox', { name: '项目名' }), 'second-project');
+    expect(screen.getByText('待处理：确认项目名后，点击同步才会更新云端。')).toBeInTheDocument();
+    expect(uploadProject).toHaveBeenCalledOnce();
+  });
+
+  it('shows local changes as pending without starting another upload', async () => {
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    const projectLocalStatus = vi.fn().mockResolvedValue({ state: 'current' });
+    const uploadProject = vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied',
+      localSnapshotConfirmed: true, hostApplication: { status: 'applied', targetRevision: 3, appliedRevision: 3, impacts: [] } });
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn().mockResolvedValue(selection),
+      projectLocalStatus, uploadProject });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost();
+    const user = userEvent.setup();
+    renderWorkspaces();
+    await user.click(await screen.findByRole('button', { name: '选择本机目录' }));
+    await user.click(screen.getByRole('button', { name: '确认项目名' }));
+    await user.click(screen.getByRole('button', { name: '开始同步' }));
+    expect(await screen.findByText('本机项目与上次确认同步的内容一致。')).toBeInTheDocument();
+    projectLocalStatus.mockResolvedValue({ state: 'pending' });
+    act(() => { focusManager.setFocused(false); focusManager.setFocused(true); });
+    expect(await screen.findByText('待处理：本机项目有变化，点击同步后才会更新云端。')).toBeInTheDocument();
+    expect(uploadProject).toHaveBeenCalledOnce();
   });
 
   it('does not claim success when the application receipt lacks revision evidence', async () => {
@@ -280,7 +316,25 @@ describe('Workspaces', () => {
     await user.click(screen.getByRole('button', { name: '确认项目名' }));
     await user.click(screen.getByRole('button', { name: '开始同步' }));
     expect(await screen.findByText('云端已确认，等待目标电脑应用。')).toBeInTheDocument();
-    expect(screen.queryByText('同步完成，目标电脑已应用本次项目。')).not.toBeInTheDocument();
+    expect(screen.queryByText('上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。')).not.toBeInTheDocument();
+  });
+
+  it('does not claim the local snapshot is confirmed when an old receipt lacks its fingerprint', async () => {
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn().mockResolvedValue(selection),
+      projectLocalStatus: vi.fn().mockResolvedValue({ state: 'unknown' }),
+      uploadProject: vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied',
+        localSnapshotConfirmed: false, hostApplication: { status: 'applied', targetRevision: 3, appliedRevision: 3, impacts: [] } }) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost();
+    const user = userEvent.setup();
+    renderWorkspaces();
+    await user.click(await screen.findByRole('button', { name: '选择本机目录' }));
+    await user.click(screen.getByRole('button', { name: '确认项目名' }));
+    await user.click(screen.getByRole('button', { name: '开始同步' }));
+    expect(await screen.findByText('目标电脑已应用本次项目，但本机状态基线未确认；请重新同步后核对。')).toBeInTheDocument();
+    expect(screen.queryByText('上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。')).not.toBeInTheDocument();
   });
 
   it('shows safe conflict paths and retains the unconfirmed result', async () => {
@@ -298,7 +352,23 @@ describe('Workspaces', () => {
     await user.click(screen.getByRole('button', { name: '开始同步' }));
     expect(await screen.findByText(/目标电脑存在冲突.*notes\/a\.txt/)).toBeInTheDocument();
     expect(screen.queryByText(/\.\.\/outside/)).not.toBeInTheDocument();
-    expect(screen.queryByText('同步完成，目标电脑已应用本次项目。')).not.toBeInTheDocument();
+    expect(screen.queryByText('上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。')).not.toBeInTheDocument();
+  });
+
+  it('explains when an older sync has no verified cloud baseline', async () => {
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn().mockResolvedValue(selection),
+      uploadProject: vi.fn().mockResolvedValue({ session: { state: 'conflict' },
+        conflicts: [{ path: 'project/demo', reason: 'cloud_baseline_unavailable' }] }) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost();
+    const user = userEvent.setup();
+    renderWorkspaces();
+    await user.click(await screen.findByRole('button', { name: '选择本机目录' }));
+    await user.click(screen.getByRole('button', { name: '确认项目名' }));
+    await user.click(screen.getByRole('button', { name: '开始同步' }));
+    expect(await screen.findByText('无法核对上次同步后的云端文件状态，同步已暂停；请先核对云端项目内容。')).toBeInTheDocument();
   });
 
   it('allows checking a completed recovery receipt even when new uploads are unavailable', async () => {

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
-  ENGINE_VERSION, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, validMessageDelivery, validStart,
+  ENGINE_VERSION, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, validLateChildTools, validMessageDelivery, validStart,
 } from './engine.mjs'
 import { decodeToolImages, MAX_FRAME_BYTES } from './ipc.mjs'
 
@@ -146,8 +146,8 @@ function matchesLateToolResult(frame, late) {
     Buffer.byteLength(frame.output) <= MAX_TOOL_OUTPUT_BYTES && Array.isArray(frame.images) && frame.images.length <= 4
 }
 
-function taskResponseKey(type, correlationID, runtimeSequence) {
-  return JSON.stringify([runtimeSequence, type, correlationID])
+function taskResponseKey(type, correlationID, runtimeSequence, sessionID) {
+  return JSON.stringify([runtimeSequence, type, sessionID, correlationID])
 }
 
 function taskResponseCorrelation(frame) {
@@ -158,13 +158,6 @@ function taskResponseCorrelation(frame) {
 
 function digestNames(names) {
   return createHash('sha256').update(JSON.stringify([...names].sort())).digest('hex')
-}
-
-function returnedChildToolsDigest(tools) {
-  if (!Array.isArray(tools) || tools.length > 64) return undefined
-  const names = tools.map(tool => tool && typeof tool === 'object' && !Array.isArray(tool) ? tool.name : undefined)
-  if (names.some(name => typeof name !== 'string' || !TOOL_NAME.test(name)) || new Set(names).size !== names.length) return undefined
-  return digestNames(names)
 }
 
 function pendingTaskResponse(frame, task) {
@@ -200,10 +193,12 @@ function pendingTaskResponse(frame, task) {
     pending.objectiveDigest = createHash('sha256').update(args.objective).digest('hex')
     pending.toolNamesDigest = digestNames(args.tool_names)
     pending.runInBackground = args.run_in_background
+    pending.allowControls = frame.session_id === task.fence.session_id &&
+      task.startFrame?.tools?.some(tool => tool.name === 'dsh_delegate') === true
   } else {
     pending.status = frame.status
   }
-  pending.key = taskResponseKey(responseType, correlationID, task.runtimeSequence)
+  pending.key = taskResponseKey(responseType, correlationID, task.runtimeSequence, frame.session_id)
   return pending
 }
 
@@ -236,7 +231,7 @@ function matchesLateTaskResponse(frame, pending, runtime) {
       frame.parent_session_id === pending.identity.session_id && typeof frame.objective === 'string' &&
       createHash('sha256').update(frame.objective).digest('hex') === pending.objectiveDigest &&
       typeof frame.session_id === 'string' && ID.test(frame.session_id) && frame.session_id !== pending.identity.session_id &&
-      returnedChildToolsDigest(frame.tools) === pending.toolNamesDigest && Number.isSafeInteger(frame.checkpoint_through_seq) && frame.checkpoint_through_seq >= -1 &&
+      validLateChildTools(frame.tools, pending.toolNamesDigest, pending.allowControls) && Number.isSafeInteger(frame.checkpoint_through_seq) && frame.checkpoint_through_seq >= -1 &&
       (frame.checkpoint_through_seq === -1 ? frame.checkpoint_sha256 === '' :
         typeof frame.checkpoint_sha256 === 'string' && /^[a-f0-9]{64}$/.test(frame.checkpoint_sha256)) &&
       ['running', 'succeeded', 'failed', 'unknown'].includes(frame.step_status) &&
@@ -1105,8 +1100,9 @@ export class AccountRuntime {
       return
     }
     const correlationID = taskResponseCorrelation(frame)
-    const responseKey = typeof correlationID === 'string' && Number.isSafeInteger(frame.runtime_sequence)
-      ? taskResponseKey(frame.type, correlationID, frame.runtime_sequence) : undefined
+    const responseSessionID = frame.type === 'child_session' ? frame.parent_session_id : frame.session_id
+    const responseKey = typeof correlationID === 'string' && Number.isSafeInteger(frame.runtime_sequence) && typeof responseSessionID === 'string'
+      ? taskResponseKey(frame.type, correlationID, frame.runtime_sequence, responseSessionID) : undefined
     if (responseKey && this.lateTaskResponses.has(responseKey)) {
       const late = this.lateTaskResponses.get(responseKey)
       if (!matchesLateTaskResponse(frame, late, this.runtime)) {
@@ -1164,6 +1160,8 @@ export class AccountRuntime {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'task_fence_mismatch' })
       return
     }
+    const pendingResponse = responseKey ? task.pendingResponses?.get(responseKey) : undefined
+    const matchesPendingResponse = pendingResponse && matchesLateTaskResponse(frame, pendingResponse, this.runtime)
     for (const key of [...accountScope, 'runtime_sequence']) delete frame[key]
     if (frame.type === 'message_delivery' && !validMessageDelivery(frame, fence)) {
       await this.send({ type: 'protocol_error', ...runtimeFields(this.runtime), ...fence, code: 'invalid_message_delivery' })
@@ -1178,10 +1176,7 @@ export class AccountRuntime {
       return
     }
     await this.writeTaskInput(task, frame)
-    if (responseKey) {
-      const pending = task.pendingResponses?.get(responseKey)
-      if (pending && matchesLateTaskResponse(frame, pending, this.runtime)) task.pendingResponses.delete(responseKey)
-    }
+    if (matchesPendingResponse && task.pendingResponses?.get(responseKey) === pendingResponse) task.pendingResponses.delete(responseKey)
     if (frame.type === 'tool_result') {
       const pending = task.pendingToolCalls?.get(frame.id)
       if (pending && pending.callID === frame.call_id && pending.sessionID === frame.session_id) task.pendingToolCalls.delete(frame.id)

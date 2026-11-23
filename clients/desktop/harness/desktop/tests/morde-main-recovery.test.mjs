@@ -1689,13 +1689,16 @@ test('project upload registers only folder metadata and waits for the Host appli
   const originalFetch = globalThis.fetch;
   const Sync = require('../out/morde-sync.js').MordeSync;
   const originalRun = Sync.prototype.run;
+  const originalFingerprint = Sync.prototype.projectFingerprint;
+  let fingerprint = 'a'.repeat(64);
+  Sync.prototype.projectFingerprint = async () => fingerprint;
   const projectRoot = mkdtempSync(join(homedir(), 'morde-project-upload-empty-'));
   const directory = join(projectRoot, 'demo');
   mkdirSync(directory);
   const info = statSync(directory, { bigint: true });
   const folderID = 'morde-0123456789abcdef0123456789abcdef';
   const host = {
-    id: 'h1234567', name: 'default computer', owner_id: 'u1234567', state: 'running',
+    id: 'h1234567', name: 'default computer', owner_id: 'u1234567', state: 'running', workspace_runtime_online: true,
     workspaces: [{ state: 'active', binding_version: 2, desired_revision: 9, applied_revision: 6,
       workspace: { id: 'w1234567', name: 'workspace', state: 'ready' } }],
   };
@@ -1738,6 +1741,8 @@ test('project upload registers only folder metadata and waits for the Host appli
   const syncRunGate = new Promise((resolve) => { releaseSyncRun = resolve; });
   Sync.prototype.run = async function (_auth, mapping, mode, scope, checkpoint, _authorized, confirmMapping) {
     await confirmMapping?.();
+    const expectedBinary = process.env.MORDE_SYNC_BINARY || fileURLToPath(new URL(`../bin/${process.platform === 'win32' ? 'morde-sync.exe' : 'morde-sync'}`, import.meta.url));
+    assert.equal(this.binary(), expectedBinary, 'unpackaged PC must resolve the built sync executable');
     syncCalls.push({ workspaceId: mapping.workspaceId, mode, scope, folderId: checkpoint.folderId, hostId: checkpoint.hostId, sourceBindingID: checkpoint.sourceBindingID,
       idempotencyKey: checkpoint.idempotencyKey, sessionId: checkpoint.sessionId });
     if (holdNextSyncRun) {
@@ -1751,7 +1756,7 @@ test('project upload registers only folder metadata and waits for the Host appli
       return { session: { id: 'p1234567', workspace_id: mapping.workspaceId, folder_id: checkpoint.folderId, state: 'conflict' },
         conflicts: [{ path: 'existing-folder', reason: 'destination_exists' }] };
     }
-    return { session: { id: 'p2345678', workspace_id: mapping.workspaceId, folder_id: checkpoint.folderId, state: 'completed' }, conflicts: [] };
+    return { session: { id: 'p2345678', workspace_id: mapping.workspaceId, folder_id: checkpoint.folderId, state: 'completed' }, conflicts: [], snapshot_fingerprint: 'a'.repeat(64) };
   };
   const h = harness(auth);
   h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] });
@@ -1792,6 +1797,7 @@ test('project upload registers only folder metadata and waits for the Host appli
     const result = await h.invoke('morde:project-upload', selection.selectionID, 'demo');
     assert.equal(result.cloudStatus, 'confirmed');
     assert.equal(result.hostStatus, 'pending_apply');
+    assert.deepEqual(await h.invoke('morde:project-local-status', selection.selectionID), { state: 'unknown' });
     assert.equal(syncCalls.length, 2);
     let checkpoint = (await h.invoke('morde:state')).syncCheckpoint;
     assert.equal(checkpoint.sessionId, 'p2345678');
@@ -1823,12 +1829,17 @@ test('project upload registers only folder metadata and waits for the Host appli
     assert.equal(checked.hostApplication.appliedRevision, 9);
     assert.equal(syncCalls.length, 2, 'checking a completed session reads its receipt without starting another scan/upload');
     assert.equal((await h.invoke('morde:state')).syncCheckpoint, null);
+    assert.deepEqual(await h.invoke('morde:project-local-status', selection.selectionID), { state: 'current' });
+    fingerprint = 'b'.repeat(64);
+    assert.deepEqual(await h.invoke('morde:project-local-status', selection.selectionID), { state: 'pending' });
+    assert.equal(syncCalls.length, 2, 'checking local changes must never start a transfer');
     assert.equal(calls.filter((call) => call.url.endsWith('/api/workspaces/w1234567/sync-sessions/p2345678')).length, 2);
     assert.equal(readFileSync(profileFile(h, auth, 'project-mappings'), 'utf8').includes(directory), true);
     assert.equal(JSON.stringify(targets).includes(directory), false);
     assert.equal(info.isDirectory(), true);
   } finally {
     Sync.prototype.run = originalRun;
+    Sync.prototype.projectFingerprint = originalFingerprint;
     globalThis.fetch = originalFetch;
     h.cleanup();
     rmSync(projectRoot, { recursive: true, force: true });
@@ -1865,6 +1876,13 @@ test('project sync exposes only the default computer and pauses selection when i
     assert.match(targets[0].blockedMessage, /默认云端电脑未运行/);
     await assert.rejects(h.invoke('morde:project-select-directory', 'h7654321', 'w7654321'), /默认云端电脑已更改/);
     await assert.rejects(h.invoke('morde:project-select-directory', 'h1234567', 'w1234567'), /默认云端电脑未运行/);
+    defaultHost.state = 'running';
+    defaultHost.workspace_runtime_online = false;
+    const offlineTargets = await h.invoke('morde:project-upload-targets');
+    assert.match(offlineTargets[0].blockedMessage, /文件服务未确认在线/);
+    await assert.rejects(h.invoke('morde:project-select-directory', 'h1234567', 'w1234567'), /文件服务未确认在线/);
+    delete defaultHost.workspace_runtime_online;
+    await assert.rejects(h.invoke('morde:project-select-directory', 'h1234567', 'w1234567'), /文件服务未确认在线/);
     assert.equal(pickerOpened, false);
   } finally {
     globalThis.fetch = originalFetch;
@@ -1873,16 +1891,16 @@ test('project sync exposes only the default computer and pauses selection when i
   }
 });
 
-test('project upload stops if the account default changes while confirmation is open', async () => {
+test('project upload stops if the default computer changes or goes offline while confirmation is open', async () => {
   const originalFetch = globalThis.fetch;
   const Sync = require('../out/morde-sync.js').MordeSync;
   const originalRun = Sync.prototype.run;
   const projectRoot = mkdtempSync(join(homedir(), 'morde-project-default-change-'));
   const directory = join(projectRoot, 'demo');
   mkdirSync(directory);
-  const host = { id: 'h1234567', name: 'default computer', owner_id: 'u1234567', state: 'running',
+  const host = { id: 'h1234567', name: 'default computer', owner_id: 'u1234567', state: 'running', workspace_runtime_online: true,
     workspaces: [{ state: 'active', workspace: { id: 'w1234567', state: 'ready' } }] };
-  let defaultHostID = 'h1234567', registered = false, syncStarted = false;
+  let defaultHostID = 'h1234567', registered = false, syncStarted = false, change = 'offline';
   globalThis.fetch = async (url, options = {}) => {
     const path = String(url);
     if (path.endsWith('/api/capabilities')) return json({ ...capabilitiesResponse,
@@ -1898,10 +1916,19 @@ test('project upload stops if the account default changes while confirmation is 
   Sync.prototype.run = async () => { syncStarted = true; throw new Error('sync must not start after the default target changes'); };
   const h = harness(auth);
   h.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] });
-  h.dialog.showMessageBox = async () => { defaultHostID = 'h7654321'; return { response: 0 }; };
+  h.dialog.showMessageBox = async () => {
+    if (change === 'offline') host.workspace_runtime_online = false;
+    else defaultHostID = 'h7654321';
+    return { response: 0 };
+  };
   try {
     await h.ready();
     const selection = await h.invoke('morde:project-select-directory', 'h1234567', 'w1234567');
+    await assert.rejects(h.invoke('morde:project-upload', selection.selectionID, 'demo'), /文件服务未确认在线/);
+    assert.equal(registered, false);
+    assert.equal(syncStarted, false);
+    host.workspace_runtime_online = true;
+    change = 'default';
     await assert.rejects(h.invoke('morde:project-upload', selection.selectionID, 'demo'), /默认云端电脑已更改/);
     assert.equal(registered, false);
     assert.equal(syncStarted, false);
@@ -1948,13 +1975,15 @@ test('project upload resumes the same confirmed session after desktop restart', 
   const originalFetch = globalThis.fetch;
   const { MordeSync: Sync, SyncRunError } = require('../out/morde-sync.js');
   const originalRun = Sync.prototype.run;
+  const originalFingerprint = Sync.prototype.projectFingerprint;
+  Sync.prototype.projectFingerprint = async () => 'c'.repeat(64);
   const appRoot = mkdtempSync(join(tmpdir(), 'morde-project-recovery-profile-'));
   const projectRoot = mkdtempSync(join(homedir(), 'morde-project-recovery-empty-'));
   const directory = join(projectRoot, 'demo');
   mkdirSync(directory);
   const folderID = 'morde-abcdef0123456789abcdef0123456789';
   const host = {
-    id: 'h1234567', name: 'default computer', owner_id: 'u1234567', state: 'running',
+    id: 'h1234567', name: 'default computer', owner_id: 'u1234567', state: 'running', workspace_runtime_online: true,
     workspaces: [{ state: 'active', binding_version: 4, desired_revision: 3, applied_revision: 2,
       workspace: { id: 'w1234567', name: 'workspace', state: 'ready' } }],
   };
@@ -1995,9 +2024,9 @@ test('project upload resumes the same confirmed session after desktop restart', 
       sessionId: checkpoint.sessionId, mode, scope });
     this.update('running', { session_id: 'p1234567', stage: 'transfer' });
     if (runs.length === 1) throw new SyncRunError('unknown', 'connection lost');
-    return { session: { id: 'p1234567', workspace_id: mapping.workspaceId, folder_id: checkpoint.folderId, state: 'completed' }, conflicts: [] };
+    return { session: { id: 'p1234567', workspace_id: mapping.workspaceId, folder_id: checkpoint.folderId, state: 'completed' }, conflicts: [], snapshot_fingerprint: 'c'.repeat(64) };
   };
-  let first, second;
+  let first, second, third;
   try {
     first = harness(auth, appRoot);
     first.dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [directory] });
@@ -2028,6 +2057,7 @@ test('project upload resumes the same confirmed session after desktop restart', 
     const result = await second.invoke('morde:project-upload', selection.selectionID, 'demo');
     assert.equal(result.cloudStatus, 'confirmed');
     assert.equal(result.hostStatus, 'pending_apply');
+    assert.equal(JSON.parse(readFileSync(profileFile(second, auth, 'sync-checkpoint'), 'utf8')).snapshotFingerprint, 'c'.repeat(64));
     assert.equal(result.session.id, 'p1234567');
     assert.equal(runs.length, 2);
     assert.equal(runs[1].sessionId, 'p1234567');
@@ -2044,11 +2074,18 @@ test('project upload resumes the same confirmed session after desktop restart', 
     assert.equal(checked.hostStatus, 'applied');
     assert.equal(runs.length, 2, 'restart receipt check must not repeat the completed project upload');
     assert.equal((await second.invoke('morde:state')).syncCheckpoint, null);
+    second.cleanup(false);
+    second = null;
+    third = harness(auth, appRoot);
+    await third.ready();
+    assert.deepEqual(await third.invoke('morde:project-local-status', selection.selectionID), { state: 'current' });
   } finally {
     Sync.prototype.run = originalRun;
+    Sync.prototype.projectFingerprint = originalFingerprint;
     globalThis.fetch = originalFetch;
     first?.cleanup(false);
     second?.cleanup(false);
+    third?.cleanup(false);
     rmSync(appRoot, { recursive: true, force: true });
     rmSync(projectRoot, { recursive: true, force: true });
   }
@@ -2110,7 +2147,7 @@ test('project upload rejects a replaced local directory before registration or t
   const directory = join(projectRoot, 'demo');
   const moved = join(projectRoot, 'demo-moved');
   mkdirSync(directory);
-  const host = { id: 'h1234567', name: 'computer', owner_id: 'u1234567', state: 'running',
+  const host = { id: 'h1234567', name: 'computer', owner_id: 'u1234567', state: 'running', workspace_runtime_online: true,
     workspaces: [{ state: 'active', workspace: { id: 'w1234567', state: 'ready' } }] };
   const calls = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -2152,7 +2189,7 @@ test('project upload keeps a missing local root from becoming an empty upload', 
   const projectRoot = mkdtempSync(join(homedir(), 'morde-project-missing-empty-'));
   const directory = join(projectRoot, 'demo');
   mkdirSync(directory);
-  const host = { id: 'h1234567', name: 'computer', owner_id: 'u1234567', state: 'running',
+  const host = { id: 'h1234567', name: 'computer', owner_id: 'u1234567', state: 'running', workspace_runtime_online: true,
     workspaces: [{ state: 'active', binding_version: 2, workspace: { id: 'w1234567', state: 'ready' } }] };
   const calls = [];
   globalThis.fetch = async (url, options = {}) => {
@@ -2176,6 +2213,7 @@ test('project upload keeps a missing local root from becoming an empty upload', 
     await h.ready();
     const selection = await h.invoke('morde:project-select-directory', 'h1234567', 'w1234567');
     rmSync(directory, { recursive: true, force: true });
+    assert.deepEqual(await h.invoke('morde:project-local-status', selection.selectionID), { state: 'unknown' });
     await assert.rejects(h.invoke('morde:project-upload', selection.selectionID, 'demo'), /项目根目录无法访问/);
     assert.equal(syncStarted, false);
     assert.equal(calls.some((call) => call.method === 'POST' && call.path.endsWith('/sync-folders')), false,

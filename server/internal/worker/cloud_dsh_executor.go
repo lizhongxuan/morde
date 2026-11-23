@@ -204,6 +204,76 @@ func cloudDSHModelResultErrorFor(err error) error {
 	return cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err)}
 }
 
+func cloudDSHChildModelFailureCode(err error) (string, bool) {
+	switch cloudDSHModelErrorCategory(err) {
+	case "provider_context_length_exceeded", "context_length_exceeded":
+		return "CONTEXT_WINDOW_EXCEEDED", true
+	case "provider_rate_limited", "rate_limited":
+		return "MODEL_PROVIDER_RATE_LIMITED", true
+	case "provider_quota_exhausted":
+		return "MODEL_PROVIDER_QUOTA_EXHAUSTED", true
+	case "quota_exhausted":
+		return "MODEL_BUDGET_EXHAUSTED", true
+	case "task_budget_exhausted":
+		return "MODEL_TASK_BUDGET_EXHAUSTED", true
+	case "provider_invalid_request", "provider_unsupported_parameter", "provider_request_rejected", "invalid_request", "client_request_invalid":
+		return "MODEL_PROVIDER_REJECTED", true
+	case "provider_model_not_found", "unsupported":
+		return "MODEL_UNAVAILABLE", true
+	case "provider_permission_denied", "provider_invalid_api_key", "authentication_rejected", "access_rejected":
+		return "MODEL_AUTHORIZATION_FAILED", true
+	case "provider_server_error", "upstream_error":
+		return "MODEL_PROVIDER_ERROR", true
+	case "unavailable":
+		return "MODEL_PROVIDER_UNAVAILABLE", true
+	case "timeout":
+		return "MODEL_REQUEST_TIMEOUT", true
+	case "transport":
+		return "MODEL_TRANSPORT_FAILURE", true
+	case "invalid_response", "empty_response", "truncated_response":
+		return "MODEL_INVALID_RESPONSE", true
+	case "usage_unknown":
+		return "MODEL_USAGE_UNKNOWN", true
+	default:
+		return "", false
+	}
+}
+
+func cloudDSHModelFailureSummary(code string) string {
+	switch code {
+	case "CONTEXT_WINDOW_EXCEEDED":
+		return "Worker model context limit was reached."
+	case "MODEL_PROVIDER_RATE_LIMITED":
+		return "Worker model provider rate limited the request."
+	case "MODEL_PROVIDER_QUOTA_EXHAUSTED":
+		return "Worker model provider reported its quota is exhausted."
+	case "MODEL_BUDGET_EXHAUSTED":
+		return "The account model budget is exhausted."
+	case "MODEL_TASK_BUDGET_EXHAUSTED":
+		return "The shared Task model budget is exhausted."
+	case "MODEL_PROVIDER_REJECTED":
+		return "Worker model provider rejected the request."
+	case "MODEL_UNAVAILABLE":
+		return "The selected worker model is unavailable."
+	case "MODEL_AUTHORIZATION_FAILED":
+		return "Worker model authorization failed."
+	case "MODEL_PROVIDER_ERROR":
+		return "Worker model provider returned an error."
+	case "MODEL_PROVIDER_UNAVAILABLE":
+		return "Worker model provider is unavailable."
+	case "MODEL_REQUEST_TIMEOUT":
+		return "Worker model request timed out."
+	case "MODEL_TRANSPORT_FAILURE":
+		return "Worker model connection failed."
+	case "MODEL_INVALID_RESPONSE":
+		return "Worker model response was invalid or incomplete."
+	case "MODEL_USAGE_UNKNOWN":
+		return "Worker model usage could not be reconciled."
+	default:
+		return "Worker model request failed."
+	}
+}
+
 var cloudDSHID = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 
 type CloudDSHInstances interface {
@@ -481,7 +551,8 @@ func validateCloudDSHDelegateArguments(raw []byte, parentDefinitions []app.Agent
 	}
 	selected := make(map[string]struct{}, len(arguments.ToolNames))
 	for _, name := range arguments.ToolNames {
-		if !cloudDSHID.MatchString(name) || name == cloudDSHDelegateToolName || name == "ask_user" {
+		if !cloudDSHID.MatchString(name) || name == cloudDSHDelegateToolName || cloudDSHJobTool(name) ||
+			name == cloudDSHResultEvidenceToolName || name == "ask_user" {
 			return cloudDSHDelegateArguments{}, nil, errors.New("child Agent tool selection is invalid")
 		}
 		if _, exists := selected[name]; exists {
@@ -1492,14 +1563,28 @@ func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, i
 }
 
 func writeCloudDSHModelFailure(ctx context.Context, target io.WriteCloser, id string, identity cloudDSHIdentity) error {
+	return writeCloudDSHModelRequestFailure(ctx, target, id, identity, "CONTEXT_WINDOW_EXCEEDED")
+}
+
+func writeCloudDSHModelRequestFailure(ctx context.Context, target io.WriteCloser, id string, identity cloudDSHIdentity, failureCode string) error {
 	if id == "" || !cloudDSHIdentityValid(identity) {
 		return errors.New("dsh model failure identity is invalid")
+	}
+	validFailureCode := failureCode == "CONTEXT_WINDOW_EXCEEDED"
+	for _, candidate := range []string{"MODEL_PROVIDER_RATE_LIMITED", "MODEL_PROVIDER_QUOTA_EXHAUSTED", "MODEL_BUDGET_EXHAUSTED",
+		"MODEL_TASK_BUDGET_EXHAUSTED", "MODEL_PROVIDER_REJECTED", "MODEL_UNAVAILABLE", "MODEL_AUTHORIZATION_FAILED",
+		"MODEL_PROVIDER_UNAVAILABLE", "MODEL_REQUEST_TIMEOUT", "MODEL_TRANSPORT_FAILURE", "MODEL_INVALID_RESPONSE",
+		"MODEL_USAGE_UNKNOWN", "MODEL_PROVIDER_ERROR", "MODEL_REQUEST_FAILED"} {
+		validFailureCode = validFailureCode || failureCode == candidate
+	}
+	if !validFailureCode {
+		return errors.New("dsh model failure code is invalid")
 	}
 	return writeCloudDSHFrame(ctx, target, map[string]any{
 		"type": "model_end", "task_id": identity.TaskID, "owner_id": identity.OwnerID,
 		"agent_id": identity.AgentID, "session_id": identity.SessionID, "generation": identity.Generation,
 		"authorization_version": identity.AuthorizationVersion, "id": id, "ok": false,
-		"failure_code": "CONTEXT_WINDOW_EXCEEDED",
+		"failure_code": failureCode,
 	})
 }
 

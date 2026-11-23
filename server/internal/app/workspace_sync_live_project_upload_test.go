@@ -189,3 +189,22 @@ func TestApplyLiveProjectUploadDeletesNestedTreeBottomUp(t *testing.T) {
 		t.Fatalf("deleted tree remains: stat err %v", err)
 	}
 }
+
+func TestProjectLiveBaselineIncludesImplicitAndEmptyDirectories(t *testing.T) {
+	mode, originalTime, changedTime := uint32(0o755), int64(10), int64(11)
+	file := workspace.File{Kind: workspace.FileKindRegular, Path: "project/demo/nested/file.txt",
+		SizeBytes: 0, SHA256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", Mode: 0o644}
+	source := workspace.SyncSession{Scope: []string{"project/demo"}, Files: []workspace.File{file},
+		EmptyDirectories: []string{"project/demo/empty"}}
+	directories := []workspace.Directory{{Path: "project/demo/nested", Mode: &mode, ModTimeNS: &originalTime, MetadataKnown: true},
+		{Path: "project/demo/empty", Mode: &mode, ModTimeNS: &originalTime, MetadataKnown: true}}
+	baseline, ok := projectLiveBaselineForSource(source, []workspace.File{file}, directories)
+	if !ok || len(baseline.Directories) != 2 || !projectLiveBaselineMatchesSource(baseline, source) {
+		t.Fatalf("incomplete live baseline: %#v, ok=%v", baseline, ok)
+	}
+	directories[1].ModTimeNS = &changedTime
+	conflicts := projectLiveBaselineConflicts(baseline, []workspace.File{file}, directories)
+	if len(conflicts) != 1 || conflicts[0].Path != "project/demo/empty" {
+		t.Fatalf("empty directory cloud timestamp change was not protected: %#v", conflicts)
+	}
+}
