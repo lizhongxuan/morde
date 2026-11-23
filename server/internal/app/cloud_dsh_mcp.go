@@ -1138,9 +1138,13 @@ func (b *CloudDSHToolBroker) commitMCPResult(ctx context.Context, current task.T
 	if result.TerminalForAttempt {
 		ctx = withTaskToolResultEvidence(ctx, "execute", "connector_rate_limited")
 		step.Status, step.Summary = task.StepFailed, "The connector rate limited this attempt; it was not retried."
-		if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+		metadata := map[string]any{
 			"tool": name, "operation_status": result.Status, "reason": "connector_rate_limited",
-		}); err != nil {
+		}
+		if retryAfterSeconds, ok := MCPConnectorTerminalRetryAfterSeconds(result.Output); ok {
+			metadata["retry_after_seconds"] = retryAfterSeconds
+		}
+		if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", metadata); err != nil {
 			return AgentToolResult{}, err
 		}
 		return result, nil

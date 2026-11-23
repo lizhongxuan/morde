@@ -18,6 +18,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.uber.org/zap"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
@@ -293,6 +295,7 @@ type CloudDSHCompleter interface {
 
 type CloudDSHExecutorOptions struct {
 	SupervisorID     string
+	Logger           *zap.Logger
 	SummarySealer    *app.Sealer
 	AccountRuntimes  *CloudDSHAccountRuntimeManager
 	Instances        CloudDSHInstances
@@ -321,6 +324,9 @@ func NewCloudDSHExecutor(options CloudDSHExecutorOptions) (*CloudDSHExecutor, er
 	}
 	if options.StreamCapability == nil {
 		options.StreamCapability, _ = options.Models.(CloudDSHTextStreamingCapability)
+	}
+	if options.Logger == nil {
+		options.Logger = zap.NewNop()
 	}
 	return &CloudDSHExecutor{options: options}, nil
 }

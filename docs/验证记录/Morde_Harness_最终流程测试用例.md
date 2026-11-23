@@ -948,7 +948,7 @@ Tokenizer 与 token 统计来源：
 - **普通回复：** 发送“只回复 M02 连通测试收到，不调用工具或创建执行任务”，PC 显示精确回复 `M02连通测试收到`，通过此项冒烟验证。
 - **显式只读搜索：** 发送只读请求，要求搜索 PostgreSQL 官方 `jsonb` 文档并只返回标题和官方 URL。PC 显示了用户可见的 Task 详情/工作项，而不是隐藏的短命内部 Task 直达 Broker；助手称当前没有可用网页搜索工具，并明确给出的 URL 未经实时抓取核实。没有证据表明搜索已执行，故此项失败，不能算来源验证通过。
 - **输入安全：** macOS 拼音输入把一次未提交的草稿转成错误字符；确认该草稿未发送，随后在独立测试旁聊清空，并核实输入框为空且发送按钮禁用。错误草稿未形成用户消息。
-- **结论与未覆盖：** 远端测试服务的简单工具行为不符合当前 M02-06 目标；由于远端服务版本未知，不能据此判定当前工作区代码失败，也不能据此验收本地实现。当前 M02-02 双运行 Task 和 M02-08 当前工作区后端 PC E2E 仍待验证；iOS 未验收。该测试旁聊和可见 Task 留在测试账号中，未做远端删除。
+- **结论与未覆盖：** 远端测试服务的简单工具行为不符合当前 M02-06 目标；由于远端服务版本未知，不能据此判定当前工作区代码失败，也不能据此验收本地实现。**截至该探针记录时**，M02-02 双运行 Task、M02-08 当前工作区后端 PC E2E 与 iOS 均待验证；M02-02 随后由下方本机 PostgreSQL、PC 和 iOS 记录完成，M02-08 仍待最终联调。该测试旁聊和可见 Task 留在测试账号中，未做远端删除。
 
 ### S09 M09-06 Task/MCP 限流后的安全重试实现（2026-11-23）
 
@@ -956,3 +956,31 @@ Tokenizer 与 token 统计来源：
 - **PostgreSQL：** 在 `initdb` 创建的一次性临时集群中，PostgreSQL 仅绑定 `127.0.0.1` 随机端口；Go 测试 helper 为用例创建独立随机数据库并运行全部迁移。更新 `TestPostgresMCPConnectorRateLimitStepRetryWaitsForExactLedgerEvidence`，覆盖等待期前拒绝、等待期结束但 Agent 停止未确认时详情/API 仍关闭、确认匹配停止收据后启用、重复 call ID 账本拒绝、无关 unknown MCP operation 拒绝、失败来源保留、同键 replay 只创建一项；`TestPostgresTaskStepRetryMigration` 验证 migration 00231 和 call ID 查找索引，`TestPostgresTaskStepRetryConcurrentSameKeyCreatesOneAttempt` 通过。新测试实际调用 GetTask 投影与 `RequestTaskStepRetry`，不是浏览器/纯 mock 数据。临时集群测试后停止，目录由临时目录作用域清理。
 - **其他定向回归：** `go test ./internal/app ./internal/api ./internal/worker -run 'Test(NewMCPToolTaskStepReusesExactQueuedRetryAttempt|CloudDSHMCPTerminalRateLimitFailsTaskAndReplaysLedgerResult|CloudDSHMCPTerminalForAttemptRequiresExactBoundedRateLimitSignal|MCPConnectorTerminalRetryAfterValidatesPersistedOutput|TaskToolCallProgressMarksOnlyExplicitConnectorRateLimitRetryable|CloudDSHStepRetryRequiresThePinnedFenceAndConfirmedFailure|CloudDSHExecutorStopsAfterDurableTerminalToolAttempt|TaskStepProjectionDisablesRetryAfterAttemptExists|TaskStepRetryRouteBindsRequestAndRejectsReplacementArguments)$' -count=1` 通过；Portal `Assistant.test.tsx` 209/209、`npm run typecheck`、`npm run build:pc` 通过。桌面 `make pc` 的 Portal/Workbench/desktop TypeScript build 阶段完成。
 - **客户端/外部边界：** `make pc` 使用独立 `MORDE_TEST_USER_DATA` 启动隔离 Electron 后，Arc 没有发现可交互窗口；仅停止本次隔离启动进程，既有 Electron 进程未触碰。因此没有验证 Task retry 按钮到真实状态变化；iOS 原生 Task retry 也未实测，不能把客户端验收记为通过。未连接远端服务、真实 Provider 或连接器，没有使用聊天中曾出现的密钥或发送文件；`git diff --check` 通过。M09-06 保持进行中，M09-02/M09-04 客户端故障链路保持待验收。
+
+### M02-02 双运行 Task 目标绑定与停止隔离验收（2026-11-23）
+
+- **实现：** PC 任务详情增加“将下一条消息绑定到此任务”及清除入口。发送 outbox 仅携带一次目标 `reference_task_id`。停止请求执行前按会话、Task ID、状态和修订重新读取，避免列表陈旧或并发变化时误操作兄弟任务。
+- **PostgreSQL：** 在一次性 PostgreSQL 16.15 容器（只绑定 `127.0.0.1:55449`、trust 仅用于本机测试、无持久卷）执行 `MORDE_BROWSER_ACCEPTANCE=1 MORDE_BROWSER_ACTIVITY=1 MORDE_BROWSER_ACTIVITY_SCENARIOS=target-control MORDE_BROWSER_ACCEPTANCE_TIMEOUT=7m go test ./internal/store/postgres -run '^TestConversationBrowserAcceptance$' -count=1 -v -timeout=9m`，通过（测试 303.12 秒，包 304.009 秒）。集成夹具创建两条同会话相似 Task，并只通过本机 PC 操作和控制端推进；目标 Task B 状态断言为 `cancelling`、Task A 仍为 `running`，两者修订未变化。另有授权及并发快照 PostgreSQL 回归 `TestConversationRouteUpdateOnlyAdjustsReferencedRunningTask`、`TestConversationRouteStopIsAuthorizedAndLeavesSiblingAlone` 通过。验收容器已移除。
+- **实际 PC：** 通过 `make pc` 启动隔离 profile 的真实 `morde-pc`，仅连接本机合成 Portal/模型。经客户端发送 A/B 两条请求，并把两 Task 推进到运行中；PC 任务列表绑定 B 时 composer 明确显示目标 Task ID，清除绑定后从 B 详情触发停止。UI 显示“正在等待服务端确认停止结果。”，兄弟 A 仍保持运行。未用浏览器或远程服务代测。
+- **iOS：** 参考本文件 S00 H04 签名验收，使用模拟器 ad-hoc 签名，并让此用例先重置本地账号以恢复 A/B 双运行 fixture。命令与结果如下：
+
+  ```text
+  xcodebuild test -quiet \
+    -project clients/nanoMuse/android/src/ios/Morde.xcodeproj -scheme Morde \
+    -destination 'platform=iOS Simulator,id=ED1D3DA1-5FCE-4B3B-9589-551F3A7DDE06' \
+    -derivedDataPath /tmp/M02-02-ios-stop-signed-derived-20261123 \
+    -resultBundlePath /tmp/M02-02-ios-stop-signed-final3-20261123.xcresult \
+    -only-testing:MordeUITests/IOS03SimulatorAcceptanceUITests/testMordeStoppingTaskBLeavesTaskARunning \
+    -parallel-testing-enabled NO CODE_SIGNING_ALLOWED=YES CODE_SIGN_IDENTITY=-
+  # Passed, 1/1；iPhone 18 Pro / iOS 27.2
+  ```
+
+  停止 B 后 Tasks 列表显示 B=`停止`、A=`执行中`；fixture 返回 B 的底层终态为 `cancelled`。之前使用 `CODE_SIGNING_ALLOWED=NO` 时 Keychain 无法写入，导致登录失败；该配置已纠正。
+- **其他验证与边界：** PC `Assistant.test.tsx` 的目标绑定/停止定向用例 3 项通过，Portal `npm run typecheck` 通过；夹具变更后 `go test ./internal/store/postgres -run '^TestBrowserActivitySelection$' -count=1` 通过，`git diff --check` 通过。本轮只使用合成数据、loopback 服务与本地模型夹具；没有调用外部模型、测试网站、远端数据库、上传文件或使用聊天中给出的凭据。M02-02 的服务端、PC 与 iOS 目标隔离路径通过；M02-08 的 M09/M10 三步 PC/iOS 端到端联调仍待可用本地 Cloud DSH/Guardian 环境。
+
+### M02/M10 长文章请求未建立 Task 诊断（2026-11-23）
+
+- **现象：**用户在实际 `morde-pc` 提交“帮我看下这篇文章说了什么”及长文章正文后，助手回复“当前请求内容只显示了有界预览。请重新说明要执行的任务，或先补充完整内容。”截图显示该回复，没有出现 Task 进度。
+- **原因：**路由模型请求已包含“实质工作选择 new Task、Task Agent 可按授权搜索原始长消息”的说明；模型仍把它判成普通回复。`ParseConversationRouteDecisionForContext` 随后按截断预览保护规则将其改为澄清。该消息在路由层只以首段预览分类，原始消息身份仍由消息 ID 与 SHA-256 绑定，Task Agent 的搜索/读取工具可按授权取回来源。只读查看 Portal 日志未发现 `conversation route failed`，因此没有证据表明是 Provider 或工具执行失败；此请求未进入 Task，也未调用原文搜索工具。
+- **本地修正：**新增有界首段意图判断；当截断消息明确要求总结、分析、解释文章/原文时，即使模型误选 `reply`、`tool` 或 `clarify`，将其路由为新 Task。模糊长消息、已有 Task 控制请求及多消息聚合仍遵守原澄清规则。另在 DSH Executor 记录 Broker 正常返回的连接器终止限流结果，并把安全解析后的等待秒数放入 Task 步骤事件。日志不记录消息/文章正文、工具参数、连接器原始错误或凭据。
+- **验证和边界：**本轮只检查源码与用户提供的 PC 截图；未运行测试，未部署或修改远端服务，也未通过普通用户 Web 代测。`morde-pc` 当前没有可供本轮控制的交互窗口，因此不能做实际 PC 复验。修复状态为本地已编辑、代码与 PC 验收待验证；明确长文章请求是否能由 Task 检索并给出带来源答案仍归 M10-03/M10-06 验收。

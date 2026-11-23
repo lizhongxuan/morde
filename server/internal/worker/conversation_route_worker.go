@@ -674,7 +674,7 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 			ModelOutput: decision.ModelOutput}
 	}
 	if (decision.Action == app.ConversationRouteNew || decision.Action == app.ConversationRouteReply) &&
-		app.ConversationRouteHasExplicitControlIntent(value.Content) {
+		app.ConversationRouteHasExplicitControlIntentForContext(value) {
 		if value.ReferenceUnavailable {
 			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage,
 				ModelOutput: decision.ModelOutput}
@@ -689,7 +689,7 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。",
 			ModelOutput: decision.ModelOutput}
 	}
-	if value.CandidateSetIncomplete && app.ConversationRouteHasExplicitControlIntent(value.Content) &&
+	if value.CandidateSetIncomplete && app.ConversationRouteHasExplicitControlIntentForContext(value) &&
 		(decision.Action == app.ConversationRouteNew || decision.Action == app.ConversationRouteReply) {
 		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
 			Question: "当前未能确认你要操作的任务。请指出任务，或重新描述一项独立工作。", ModelOutput: decision.ModelOutput}
@@ -780,9 +780,12 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 // continue the previous task or start a new one. An ambiguous message is
 // never silently dropped into a task.
 func conversationRouteClassifyFallback(value app.ConversationRouteContext) app.ConversationRouteDecision {
-	if app.ConversationRouteHasExplicitControlIntent(value.Content) {
+	if app.ConversationRouteHasExplicitControlIntentForContext(value) {
 		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
 			Question: "分类暂时不可用，请说明要操作哪个任务。"}
+	}
+	if app.ConversationRouteHasExplicitLongMessageTaskIntent(value) {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	}
 	if !value.PreviousMissing && !value.PreviousUnresolved && !value.ReferenceUnavailable &&
 		app.ConversationRouteHasExplicitNewIntent(value.Content) {

@@ -1071,7 +1071,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 		return nil, err
 	}
 	executor, err := worker.NewCloudDSHExecutor(worker.CloudDSHExecutorOptions{
-		SupervisorID: cfg.SupervisorID, SummarySealer: sealer, AccountRuntimes: accountRuntimes,
+		SupervisorID: cfg.SupervisorID, Logger: logger, SummarySealer: sealer, AccountRuntimes: accountRuntimes,
 		Instances: instances, Checkpoints: checkpoints, Models: models, Tools: tools, AgentActivity: store,
 		Children: childSessions, Completion: tools, RevisionStops: store, TextStreams: store, ProjectContexts: store,
 	})

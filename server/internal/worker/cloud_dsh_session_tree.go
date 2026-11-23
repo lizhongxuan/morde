@@ -15,6 +15,8 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"go.uber.org/zap"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
@@ -2642,7 +2644,32 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if !utf8.ValidString(result.Output) || len(result.Output) > cloudDSHMaxText {
 				return cloudDSHToolExecutionFailureFor(frame, "result_output_invalid", nil)
 			}
+			if result.Status == app.AgentToolFailed && !result.TerminalForAttempt {
+				e.options.Logger.Warn("DSH tool returned a definitive failure",
+					zap.String("task_id", state.identity.TaskID),
+					zap.String("failure_stage", "tool_execution"),
+					zap.String("failure_reason", "tool_returned_failed"),
+					zap.String("tool_name", cloudDSHSafeDiagnosticToolName(frame.Name)),
+					zap.String("tool_call_id", safeCloudDSHDiagnosticCallID(frame.CallID)),
+					zap.String("tool_status", string(result.Status)),
+					zap.String("tool_dispatch_status", "result_received"),
+				)
+			}
 			if result.TerminalForAttempt {
+				retryAfterSeconds, retryAfterKnown := app.MCPConnectorTerminalRetryAfterSeconds(result.Output)
+				fields := []zap.Field{
+					zap.String("task_id", state.identity.TaskID),
+					zap.String("failure_stage", "tool_execution"),
+					zap.String("failure_reason", "connector_rate_limited"),
+					zap.String("tool_name", cloudDSHSafeDiagnosticToolName(frame.Name)),
+					zap.String("tool_call_id", safeCloudDSHDiagnosticCallID(frame.CallID)),
+					zap.String("tool_status", string(result.Status)),
+					zap.String("tool_dispatch_status", "result_received"),
+				}
+				if retryAfterKnown {
+					fields = append(fields, zap.Int64("retry_after_seconds", retryAfterSeconds))
+				}
+				e.options.Logger.Warn("DSH connector returned a terminal failure result", fields...)
 				if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
 					return err
 				}

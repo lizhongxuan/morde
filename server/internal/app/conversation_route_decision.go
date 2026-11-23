@@ -716,13 +716,18 @@ func ParseConversationRouteDecisionForContext(text string, value ConversationRou
 	if decision.InvalidOutput {
 		return decision
 	}
-	if value.ContentTruncated && decision.Action != ConversationRouteNew && decision.Action != ConversationRouteClarify {
-		question := "当前请求内容只显示了有界预览。请重新说明要执行的任务，或先补充完整内容。"
-		if len(value.ContentSources) != 0 {
-			question = "同一项请求的完整消息已保存，但当前只显示有界预览。请确认是否按顺序作为一项任务处理。"
+	if value.ContentTruncated && decision.Action != ConversationRouteNew {
+		if ConversationRouteHasExplicitLongMessageTaskIntent(value) {
+			return ConversationRouteDecision{Action: ConversationRouteNew, ModelOutput: decision.ModelOutput}
 		}
-		return ConversationRouteDecision{Action: ConversationRouteClarify,
-			Question: question, ModelOutput: decision.ModelOutput}
+		if decision.Action != ConversationRouteClarify {
+			question := "当前请求内容只显示了有界预览。请重新说明要执行的任务，或先补充完整内容。"
+			if len(value.ContentSources) != 0 {
+				question = "同一项请求的完整消息已保存，但当前只显示有界预览。请确认是否按顺序作为一项任务处理。"
+			}
+			return ConversationRouteDecision{Action: ConversationRouteClarify,
+				Question: question, ModelOutput: decision.ModelOutput}
+		}
 	}
 	if decision.Action == ConversationRouteSteer && !ValidConversationRouteSteerTarget(decision.TaskID, value) {
 		return ConversationRouteDecision{Action: ConversationRouteClarify,
@@ -743,13 +748,13 @@ func ParseConversationRouteDecisionForContext(text string, value ConversationRou
 		return ConversationRouteDecision{Action: ConversationRouteNew, ModelOutput: decision.ModelOutput}
 	}
 	if value.ResultReview == nil && value.ReferenceTaskID == "" && !value.ReferenceUnavailable &&
-		!value.PreviousUnresolved && !value.PreviousMissing && !ConversationRouteHasExplicitControlIntent(value.Content) &&
+		!value.PreviousUnresolved && !value.PreviousMissing && !ConversationRouteHasExplicitControlIntentForContext(value) &&
 		(decision.Action == ConversationRouteClarify || decision.Action == ConversationRouteReply) {
 		if intent, explicit := RoutedFileDeliveryDirective(value.Content, false); explicit && intent == task.FileDeliveryRequired {
 			return ConversationRouteDecision{Action: ConversationRouteNew, ModelOutput: decision.ModelOutput}
 		}
 	}
-	if (decision.Action == ConversationRouteNew || decision.Action == ConversationRouteReply) && ConversationRouteHasExplicitControlIntent(value.Content) {
+	if (decision.Action == ConversationRouteNew || decision.Action == ConversationRouteReply) && ConversationRouteHasExplicitControlIntentForContext(value) {
 		if value.ReferenceUnavailable {
 			return ConversationRouteDecision{Action: ConversationRouteClarify, Question: UnavailableRouteReferenceMessage, ModelOutput: decision.ModelOutput}
 		}
@@ -761,6 +766,68 @@ func ParseConversationRouteDecisionForContext(text string, value ConversationRou
 		return ConversationRouteDecision{Action: ConversationRouteClarify, Question: "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。", ModelOutput: decision.ModelOutput}
 	}
 	return decision
+}
+
+// ConversationRouteHasExplicitLongMessageTaskIntent recognizes a clear,
+// independent content-processing request in the bounded preview of a saved
+// long message. It never derives a Task control action from the pasted source.
+func ConversationRouteHasExplicitLongMessageTaskIntent(value ConversationRouteContext) bool {
+	return value.ContentTruncated && len(value.ContentSources) == 0 && value.ResultReview == nil &&
+		value.ReferenceTaskID == "" && !value.ReferenceUnavailable &&
+		conversationRouteHasExplicitLongMessageTaskIntent(value.Content)
+}
+
+// conversationRouteHasExplicitLongMessageTaskIntent recognizes a substantive
+// request in the leading preview before routing a saved long message. It never
+// treats the rest of the pasted source as an instruction to control a Task.
+func conversationRouteHasExplicitLongMessageTaskIntent(content string) bool {
+	prefix := conversationRouteLongMessageRequestPrefix(content)
+
+	var normalized strings.Builder
+	for _, char := range strings.ToLower(prefix) {
+		if unicode.IsSpace(char) || unicode.IsPunct(char) || unicode.IsSymbol(char) {
+			continue
+		}
+		normalized.WriteRune(char)
+	}
+	value := normalized.String()
+	if value == "" || ConversationRouteHasExplicitControlIntent(prefix) {
+		return false
+	}
+	if !containsAnyRouteIntent(value, []string{"文章", "原文", "内容", "文档", "文件", "网页", "链接", "材料", "这篇", "这段", "article", "source", "document", "text", "file", "page", "link", "content"}) {
+		return false
+	}
+	if !containsAnyRouteIntent(value, []string{"帮我看", "帮忙看", "请看", "看下", "看一下", "看看", "总结", "概括", "分析", "梳理", "解释", "说明", "说了什么", "讲了什么", "主要内容", "summarize", "analyze", "review", "explain", "whatdoes"}) {
+		return false
+	}
+	return containsAnyRouteIntent(value, []string{"帮我", "帮忙", "请", "please", "couldyou", "说了什么", "讲了什么", "whatdoes"}) ||
+		containsAnyRouteIntent(strings.TrimLeft(value, "现在好那先然后你"), []string{"看下", "看一下", "看看", "总结", "概括", "分析", "梳理", "解释", "review", "summarize", "analyze", "explain"})
+}
+
+func conversationRouteLongMessageRequestPrefix(content string) string {
+	prefix := strings.TrimSpace(content)
+	if end := strings.IndexAny(prefix, "\r\n"); end >= 0 {
+		prefix = prefix[:end]
+	}
+	if len(prefix) > 512 {
+		for offset := range prefix {
+			if offset > 512 {
+				prefix = prefix[:offset]
+				break
+			}
+		}
+	}
+	return prefix
+}
+
+// ConversationRouteHasExplicitControlIntentForContext ignores pasted source
+// text after the request prefix when a long message has been truncated.
+func ConversationRouteHasExplicitControlIntentForContext(value ConversationRouteContext) bool {
+	content := value.Content
+	if value.ContentTruncated {
+		content = conversationRouteLongMessageRequestPrefix(content)
+	}
+	return ConversationRouteHasExplicitControlIntent(content)
 }
 
 // ConversationRouteHasExplicitControlIntent recognizes control clauses even
@@ -1018,7 +1085,7 @@ func ValidConversationRouteSteerTarget(taskID string, value ConversationRouteCon
 	if !domain.ValidTaskID(taskID) || !domain.ValidUserID(value.ActorID) || value.ResultReview != nil ||
 		value.CurrentMessageHasAttachments || value.ReferenceUnavailable || value.PreviousMissing ||
 		value.PreviousUnresolved ||
-		ConversationRouteHasExplicitControlIntent(value.Content) ||
+		ConversationRouteHasExplicitControlIntentForContext(value) ||
 		(value.ReferenceTaskID != "" && value.ReferenceTaskID != taskID) ||
 		(value.CandidateSetIncomplete && value.ReferenceTaskID == "") {
 		return false

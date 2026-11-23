@@ -1863,7 +1863,9 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
 
     func testMordeStoppingTaskBLeavesTaskARunning() {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
-        launchLocalChat(app, additionalArguments: ["-morde.localTaskK2Fixture"])
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskK2Fixture", "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN",
+        ], resetExistingAccount: true)
         XCTAssertTrue(app.staticTexts["Task A coordinator"].waitForExistence(timeout: 15))
         XCTAssertTrue(app.staticTexts["Task B research"].exists)
 
@@ -1878,10 +1880,12 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(taskAStatus.waitForExistence(timeout: 15))
         XCTAssertTrue(taskBStatus.waitForExistence(timeout: 15))
         let taskBStopped = XCTNSPredicateExpectation(
-            predicate: NSPredicate(format: "label != %@", taskAStatus.label), object: taskBStatus)
+            predicate: NSPredicate(format: "label == %@", "停止"), object: taskBStatus)
         XCTAssertEqual(XCTWaiter.wait(for: [taskBStopped], timeout: 15), .completed,
-                       "Stopping Task B should update only its task status while Task A remains running.")
-        XCTAssertNotEqual(taskBStatus.label, taskAStatus.label)
+                       "The task list presents terminal Task B as stopped.")
+        XCTAssertTrue(taskAStatus.label.contains("执行中"),
+                      "Stopping Task B must leave Task A running.")
+        XCTAssertEqual(taskBStatus.label, "停止")
     }
 
     func testMordeBusyConcurrentTasksAcceptIndependentMessage() {

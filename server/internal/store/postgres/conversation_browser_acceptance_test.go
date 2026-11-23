@@ -33,6 +33,8 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/execution"
+	domainhost "morde/server/internal/domain/host"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/storage"
 	"morde/server/internal/storage/workspacefs"
@@ -250,6 +252,17 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 		if err != nil {
 			t.Fatal(err)
 		}
+		if retryRun := activity.runs["mcp-retry"]; retryRun != nil {
+			retryHost := createRunningControlHost(t, ctx, store, owner.ID, domainhost.ControlAI, 0)
+			runtimeInstanceID := "browser-m09-retry-" + retryHost.ID
+			if _, err := store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id=$2 WHERE id=$1`, retryHost.ID, runtimeInstanceID); err != nil {
+				t.Fatalf("seed local MCP retry Host Runtime identity: %v", err)
+			}
+			if err := store.RecordHostReplicaHeartbeat(ctx, retryHost.ID, retryHost.RuntimeGeneration); err != nil {
+				t.Fatalf("seed local MCP retry Host Runtime heartbeat: %v", err)
+			}
+			retryRun.retryHostID = retryHost.ID
+		}
 		executor = activity
 	}
 	taskWorker, err := worker.NewTaskWorker(worker.TaskWorkerOptions{
@@ -295,12 +308,37 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 	}
 	go func() { workerDone <- resultWorker.Run(workerCtx) }()
 	workerCount++
+	var retryHostHeartbeatDone chan struct{}
+	if activity != nil {
+		if retryRun := activity.runs["mcp-retry"]; retryRun != nil && retryRun.retryHostID != "" {
+			retryHostID := retryRun.retryHostID
+			retryHostHeartbeatDone = make(chan struct{})
+			go func() {
+				defer close(retryHostHeartbeatDone)
+				ticker := time.NewTicker(5 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-workerCtx.Done():
+						return
+					case <-ticker.C:
+						if err := store.RecordHostReplicaHeartbeat(workerCtx, retryHostID, 1); err != nil {
+							return
+						}
+					}
+				}
+			}()
+		}
+	}
 	t.Cleanup(func() {
 		cancelWorkers()
 		for i := 0; i < workerCount; i++ {
 			if err := <-workerDone; !errors.Is(err, context.Canceled) {
 				t.Errorf("stop browser fixture worker: %v", err)
 			}
+		}
+		if retryHostHeartbeatDone != nil {
+			<-retryHostHeartbeatDone
 		}
 	})
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -312,7 +350,11 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 		t.Fatal(err)
 	}
 	portalRoot := filepath.Join("..", "..", "..", "..", "web", "portal", "dist")
-	apiDeps := api.Deps{Hosts: nativeAcceptanceHosts{}, TLSAuthorizer: nativeAcceptanceTLS{}, Verifier: credentials,
+	var hostService app.HostService = nativeAcceptanceHosts{}
+	if activity != nil && activity.runs["mcp-retry"] != nil {
+		hostService = browserAcceptanceHosts{nativeAcceptanceHosts: nativeAcceptanceHosts{}, store: store}
+	}
+	apiDeps := api.Deps{Hosts: hostService, TLSAuthorizer: nativeAcceptanceTLS{}, Verifier: credentials,
 		Auth: nativeAcceptanceAuth{credentials: credentials, users: users}, ClientLogin: clients, Tasks: tasks, Conversations: conversations,
 		WorkspaceOps: workspaceOps, Onboarding: onboarding,
 		PersonalData: personalData, PersonalSync: personalSync, PersonalDataQuotaUser: personalQuotaUser,
@@ -451,6 +493,29 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 		}
 		if activity != nil && strings.HasPrefix(r.URL.Path, "/api/tasks/") && strings.HasSuffix(r.URL.Path, "/events") {
 			activity.serveTaskEvents(w, r, router)
+			return
+		}
+		if activity != nil && activity.runs["mcp-retry"] != nil && r.Method == http.MethodPost &&
+			strings.HasPrefix(r.URL.Path, "/api/tasks/") && strings.HasSuffix(r.URL.Path, "/retries") {
+			recorder := httptest.NewRecorder()
+			router.ServeHTTP(recorder, r)
+			if recorder.Code >= http.StatusBadRequest {
+				var response struct {
+					Error struct {
+						Code    string `json:"code"`
+						Message string `json:"message"`
+					} `json:"error"`
+				}
+				_ = json.Unmarshal(recorder.Body.Bytes(), &response)
+				fmt.Printf("LOCAL_TASK_RETRY_RESULT status=%d code=%s message=%q\n", recorder.Code, response.Error.Code, response.Error.Message)
+			}
+			for name, values := range recorder.Header() {
+				for _, value := range values {
+					w.Header().Add(name, value)
+				}
+			}
+			w.WriteHeader(recorder.Code)
+			_, _ = w.Write(recorder.Body.Bytes())
 			return
 		}
 		if activity != nil && r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/api/tasks/") {
@@ -1563,6 +1628,7 @@ type browserActivityCommand struct {
 
 type browserActivityRun struct {
 	name, objective, stage, failure string
+	retryHostID                     string
 	current                         task.Task
 	agentLease                      app.AgentInstanceLease
 	supervisorNonce                 []byte
@@ -1618,6 +1684,15 @@ type browserAcceptanceActivity struct {
 	taskListRequests []browserActivityTaskListRequest
 	taskSnapshots    []browserActivityTaskSnapshotRequest
 	nextWatch        uint64
+}
+
+type browserAcceptanceHosts struct {
+	nativeAcceptanceHosts
+	store *Store
+}
+
+func (h browserAcceptanceHosts) List(ctx context.Context, principal identity.Principal) ([]domainhost.Host, error) {
+	return h.store.ListHostsByOwner(ctx, principal.UserID)
 }
 
 func newBrowserAcceptanceActivity(store *Store, sealer *app.Sealer, conversationID string) (*browserAcceptanceActivity, error) {
@@ -1748,6 +1823,25 @@ func TestBrowserActivityOutcomeVerifyEndpoint(t *testing.T) {
 }
 
 func (a *browserAcceptanceActivity) ExecuteTask(ctx context.Context, current task.Task) error {
+	if current.Objective == browserActivityObjectives["mcp-retry"] {
+		fmt.Printf("LOCAL_MCP_RETRY_EXECUTE status=%s step_retry=%t\n", current.Status, current.StepRetry != nil)
+	}
+	if current.Objective == browserActivityObjectives["mcp-retry"] && current.StepRetry == nil {
+		a.mu.Lock()
+		run := a.runs["mcp-retry"]
+		retryHostID := ""
+		if run != nil {
+			retryHostID = run.retryHostID
+		}
+		a.mu.Unlock()
+		if retryHostID == "" {
+			return errors.New("local MCP retry Host was not prepared")
+		}
+		if _, err := a.store.pool.Exec(ctx, `UPDATE tasks SET host_id=$2 WHERE id=$1 AND status='running'`, current.ID, retryHostID); err != nil {
+			return fmt.Errorf("bind local MCP retry Task to its isolated Host: %w", err)
+		}
+		current.HostID = retryHostID
+	}
 	a.mu.Lock()
 	var run *browserActivityRun
 	for _, candidate := range a.runs {
@@ -2050,9 +2144,6 @@ VALUES ($1,$2,$3,$4,NULL,1,0,1,$5,$6,'',0,$7,$8,$9,'mcp_call',$10,'failed',$11,c
 	if _, err := a.instances.ConfirmStopped(ctx, receipt); err != nil {
 		return fmt.Errorf("confirm local synthetic Agent stop: %w", err)
 	}
-	a.mu.Lock()
-	run.progressStepID = step.ID
-	a.mu.Unlock()
 	return a.verifyActivityEvents(ctx, run, false)
 }
 
@@ -2763,13 +2854,9 @@ func (a *browserAcceptanceActivity) verifyAcceptedOutcome(ctx context.Context, s
 func (a *browserAcceptanceActivity) verifyMCPRetryAccepted(ctx context.Context) error {
 	a.mu.Lock()
 	run := a.runs["mcp-retry"]
-	if run == nil || run.stage != "retry_claimed" {
-		stage := "missing"
-		if run != nil {
-			stage = run.stage
-		}
+	if run == nil {
 		a.mu.Unlock()
-		return fmt.Errorf("MCP retry has not been claimed by the local Task worker (stage %s)", stage)
+		return errors.New("MCP retry scenario is missing")
 	}
 	current, sourceStepID := run.current, run.progressStepID
 	a.mu.Unlock()
@@ -2777,9 +2864,9 @@ func (a *browserAcceptanceActivity) verifyMCPRetryAccepted(ctx context.Context) 
 	if err != nil {
 		return fmt.Errorf("read retried MCP Task: %w", err)
 	}
-	if details.Task.Status != task.StatusRunning || details.Task.CurrentStep != current.CurrentStep ||
+	if details.Task.Status != task.StatusRunning ||
 		!domain.ValidStepID(sourceStepID) || !domain.ValidStepID(details.Task.CurrentStep) {
-		return fmt.Errorf("retried Task state/current step=%s/%s, want running at the reserved retry step", details.Task.Status, details.Task.CurrentStep)
+		return fmt.Errorf("retried Task state/current step=%s/%s, want a running Task at the reserved retry step", details.Task.Status, details.Task.CurrentStep)
 	}
 	var source, attempt *task.Step
 	for i := range details.Steps {
@@ -2796,6 +2883,9 @@ func (a *browserAcceptanceActivity) verifyMCPRetryAccepted(ctx context.Context) 
 		(attempt.Status != task.StepQueued && attempt.Status != task.StepRunning) {
 		return fmt.Errorf("source/retry Task steps are not preserved and linked: source=%+v retry=%+v", source, attempt)
 	}
+	if attempt.ID != details.Task.CurrentStep {
+		return errors.New("running Task current step is not the reserved retry attempt")
+	}
 	var attemptCount, operationCount int
 	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_steps WHERE task_id=$1 AND retry_of_step_id=$2`, current.ID, source.ID).Scan(&attemptCount); err != nil {
 		return fmt.Errorf("count reserved MCP retry attempts: %w", err)
@@ -2807,6 +2897,9 @@ func (a *browserAcceptanceActivity) verifyMCPRetryAccepted(ctx context.Context) 
 	if attemptCount != 1 || operationCount != 1 {
 		return fmt.Errorf("MCP retry created duplicate attempts or connector calls: retry steps=%d source ledger rows=%d", attemptCount, operationCount)
 	}
+	a.mu.Lock()
+	run.current, run.stage = details.Task, "retry_claimed"
+	a.mu.Unlock()
 	return nil
 }
 
