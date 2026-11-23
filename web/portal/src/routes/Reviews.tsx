@@ -48,7 +48,7 @@ export function Reviews() {
     onSuccess: async (_response, request) => {
       actionKeys.current.delete(`approval:${request.item.task_id}:${request.item.approval.id}`);
       await refreshApprovalState(request.item);
-      notify('审核已受理，任务后续状态等待更新。', 'success');
+      notify(`${request.decision === 'approve' ? '已允许本次操作' : '已拒绝本次操作'}，任务后续状态等待更新。`, 'success');
     },
     onError: (error, request) => {
       void refreshApprovalState(request.item);

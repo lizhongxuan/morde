@@ -3,7 +3,9 @@ package app
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 )
@@ -204,6 +206,51 @@ func TestTaskValidationReviewModelResponseIsEncryptedAndFenceBound(t *testing.T)
 	}
 	if _, err := OpenTaskValidationReviewModelResponse(sealer, stored, changed); err == nil {
 		t.Fatal("review model response opened under another claim generation")
+	}
+}
+
+func TestTaskValidationReviewArtifactContentProofRequiresBoundVerifiedText(t *testing.T) {
+	content := "A verified artifact result."
+	digest := sha256.Sum256([]byte(content))
+	ref := TaskValidationEvidenceRefRecord{Kind: TaskValidationEvidenceSideEffect, ID: "a1234567", TaskRevision: 4,
+		Sequence: 5, CallID: "write_result_1"}
+	evidence := &TaskValidationEvidenceRecord{TaskRevision: 4,
+		Claims: []TaskValidationEvidenceClaimRecord{{ID: "c1", EvidenceRefs: []TaskValidationEvidenceRefRecord{ref}}}}
+	proof := TaskValidationReviewArtifactContentProof{Ref: ref, WorkspaceID: "w1234567", Revision: 11,
+		Path: "reports/result.txt", MediaType: "text/plain", SizeBytes: int64(len(content)),
+		SHA256: hex.EncodeToString(digest[:]), ReadbackSHA256: hex.EncodeToString(digest[:]),
+		PreviewSHA256: hex.EncodeToString(digest[:]), PreviewBytes: int64(len(content)), TextContent: true, ContentComplete: true}
+	if err := ValidateTaskValidationReviewArtifactContentProofs([]TaskValidationReviewArtifactContentProof{proof}, evidence); err != nil {
+		t.Fatalf("complete verified artifact proof was rejected: %v", err)
+	}
+
+	partial := proof
+	partial.SizeBytes = 8192
+	partial.PreviewBytes = MaxTaskValidationReviewArtifactPreviewBytes
+	partial.PreviewSHA256 = hex.EncodeToString(bytes.Repeat([]byte{0x11}, 32))
+	partial.ContentComplete = false
+	if err := ValidateTaskValidationReviewArtifactContentProofs([]TaskValidationReviewArtifactContentProof{partial}, evidence); err != nil {
+		t.Fatalf("bounded partial preview should remain valid but insufficient: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*TaskValidationReviewArtifactContentProof){
+		"wrong ref":                  func(value *TaskValidationReviewArtifactContentProof) { value.Ref.CallID = "other_call_1" },
+		"unverified readback digest": func(value *TaskValidationReviewArtifactContentProof) { value.ReadbackSHA256 = strings.Repeat("0", 64) },
+		"complete truncated content": func(value *TaskValidationReviewArtifactContentProof) { value.SizeBytes++ },
+		"preview larger than file":   func(value *TaskValidationReviewArtifactContentProof) { value.PreviewBytes = value.SizeBytes + 1 },
+		"partial content claims complete": func(value *TaskValidationReviewArtifactContentProof) {
+			value.ContentComplete = false
+		},
+		"unsafe workspace path": func(value *TaskValidationReviewArtifactContentProof) { value.Path = "../outside.txt" },
+		"binary marked as text": func(value *TaskValidationReviewArtifactContentProof) { value.MediaType = "application/octet-stream" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			changed := proof
+			mutate(&changed)
+			if err := ValidateTaskValidationReviewArtifactContentProofs([]TaskValidationReviewArtifactContentProof{changed}, evidence); err == nil {
+				t.Fatalf("invalid artifact content proof was accepted: %+v", changed)
+			}
+		})
 	}
 }
 

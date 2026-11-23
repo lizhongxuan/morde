@@ -295,6 +295,7 @@ WHERE review.task_id=$1 AND review.owner_id=$2 AND review.task_revision=$3
   AND task.result=$6 AND sha256(convert_to(task.result,'UTF8'))=review.result_sha256
   AND event.task_revision=review.task_revision AND event.event_type='task.result'
   AND event.result_content_sha256=review.result_sha256
+  AND task_validation_artifact_evidence_current(review.task_id,review.owner_id,review.artifact_content_evidence)
 	FOR SHARE OF review, task, event`, source.TaskID, ownerID, source.TaskRevision, source.EventSequence, digest[:], source.Content).Scan(&state)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pending, nil

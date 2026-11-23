@@ -316,7 +316,7 @@ WHERE s.task_id=$1 ORDER BY s.sequence`, taskID)
 		}
 		if step.FailureReason == "connector_rate_limited" {
 			step.Retryable = false
-			if step.Status == task.StepFailed && agentStopConfirmed && mcpEvidenceCount.Valid && mcpEvidenceCount.Int64 == 1 &&
+			if step.Status == task.StepFailed && mcpEvidenceCount.Valid && mcpEvidenceCount.Int64 == 1 &&
 				mcpStatus.Valid && mcpStatus.String == string(task.OperationFailed) &&
 				mcpCallID.Valid && mcpCallID.String == step.ToolCallKey && mcpToolName.Valid && mcpToolName.String == step.ToolName &&
 				mcpTaskRevision.Valid && revision.Valid && mcpTaskRevision.Int64 == revision.Int64 &&
@@ -324,7 +324,7 @@ WHERE s.task_id=$1 ORDER BY s.sequence`, taskID)
 				if seconds, ok := app.MCPConnectorTerminalRetryAfterSeconds(mcpResult.String); ok && mcpUpdatedAt.Valid {
 					retryAt := mcpUpdatedAt.Time.Add(time.Duration(seconds) * time.Second)
 					step.RetryAfterAt = &retryAt
-					step.Retryable = !retryAt.After(time.Now())
+					step.Retryable = agentStopConfirmed && !retryAt.After(time.Now())
 				}
 			}
 		}

@@ -9,6 +9,8 @@ type ApprovalView = Pick<components['schemas']['TaskPendingRequest'],
 
 export type TaskApprovalDecision = 'approve' | 'reject';
 
+const decisionNotice = '审批范围仅限本次显示的操作。允许后任务会继续尝试执行，最终结果以任务状态为准；拒绝后本次操作不会执行。';
+
 function textDisclosure(value: components['schemas']['TaskApprovalTextDisclosure'] | undefined): string {
   if (!value) return '未知';
   if (value.state !== 'known') return value.state === 'not_applicable' ? '不适用' : '未知';
@@ -90,6 +92,7 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
           <span className="task-approval-review-object">
             {approval.object}{approval.content ? ` · ${approval.content}` : ''}
           </span>
+          <span className="task-approval-review-decision-note">{decisionNotice}</span>
         </span>
       </button>
       <div className="task-approval-review-actions">
@@ -119,6 +122,13 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
           <dt>撤销方式</dt><dd>{textDisclosure(approval.disclosures?.revocation)}</dd>
           {approval.expires_at && <><dt>审批到期</dt><dd>{formatDate(approval.expires_at)}</dd></>}
         </dl>
+        {actionable && <p>{decisionNotice}</p>}
+        {actionable && <div className="chat-approval-actions">
+          <button type="button" className="button button-secondary" disabled={submitting}
+            aria-label={`拒绝：${approval.title}`} onClick={() => onDecision('reject')}>拒绝本次操作</button>
+          <button type="button" className="button button-primary" disabled={submitting}
+            aria-label={`允许：${approval.title}`} onClick={() => onDecision('approve')}>允许本次操作</button>
+        </div>}
       </dialog>
     </article>;
   }
@@ -135,6 +145,7 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
         <dt>替代方案</dt><dd>{alternativesDisclosure(approval.disclosures?.alternatives)}</dd>
         <dt>撤销方式</dt><dd>{textDisclosure(approval.disclosures?.revocation)}</dd></>}
     </dl>
+    {actionable && <p>{decisionNotice}</p>}
     {compact && <details className="task-approval-more"><summary>查看操作详情</summary>
       <dl className="task-approval-disclosures" aria-label="其他审批信息">
         <dt>累计费用</dt><dd>{costDisclosure(approval.disclosures?.cumulative_cost)}</dd>

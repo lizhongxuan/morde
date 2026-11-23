@@ -114,6 +114,14 @@
   white-space: nowrap;
 }
 
+.morde-shell:not(.morde-admin-shell) .task-approval-review-decision-note {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
 .morde-shell:not(.morde-admin-shell) .task-approval-review-actions {
   flex: 0 0 auto;
   display: flex;

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/store/postgres/sqlcgen"
 )
 
 func (s *Store) ClaimTaskValidationReviews(ctx context.Context, workerID string, lease time.Duration, limit int32) ([]app.TaskValidationReviewClaim, error) {
@@ -106,6 +108,62 @@ WHERE task_id=$1 AND task_revision=$2 AND state='processing' AND lease_owner=$3 
 	return result.RowsAffected() == 1, nil
 }
 
+func (s *Store) IsCurrentTaskValidationReviewClaim(ctx context.Context, claim app.TaskValidationReviewClaim) (bool, error) {
+	if ctx == nil || !app.ValidTaskValidationReviewClaim(claim) {
+		return false, domain.InvalidArgument("task_validation_review_claim", "Task validation review claim is invalid")
+	}
+	var current bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM task_validation_reviews review
+  JOIN tasks task ON task.id=review.task_id AND task.owner_id=review.owner_id
+  JOIN task_events event ON event.task_id=review.task_id AND event.sequence=review.result_event_sequence
+    AND event.task_revision=review.task_revision AND event.event_type='task.result'
+    AND event.result_content_sha256=review.result_sha256
+  WHERE review.task_id=$1 AND review.owner_id=$2 AND review.task_revision=$3
+    AND review.result_event_sequence=$4 AND review.result_sha256=$5
+    AND review.state='processing' AND review.lease_owner=$6 AND review.claim_generation=$7
+    AND review.lease_expires_at>clock_timestamp()
+    AND task.initiator_id=$8 AND task.conversation_id=$9 AND task.status='completed'
+    AND task.current_revision=$3 AND task.desired_revision=$3 AND task.result<>''
+    AND sha256(convert_to(task.result,'UTF8'))=review.result_sha256
+)`, claim.TaskID, claim.OwnerID, claim.TaskRevision, claim.ResultEventSequence, claim.ResultSHA256,
+		claim.LeaseOwner, claim.ClaimGeneration, claim.InitiatorID, claim.ConversationID).Scan(&current)
+	if err != nil {
+		return false, fmt.Errorf("verify active Task validation review claim: %w", err)
+	}
+	return current, nil
+}
+
+func lockTaskValidationReviewWorkspaceFence(ctx context.Context, tx pgx.Tx, taskID string) (projectTaskWorkspaceFence, string, string, error) {
+	var workspaceID, projectID, actorID string
+	err := tx.QueryRow(ctx, `SELECT COALESCE(workspace_id,''),COALESCE(project_id,''),initiator_id FROM tasks WHERE id=$1`, taskID).
+		Scan(&workspaceID, &projectID, &actorID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return projectTaskWorkspaceFence{}, "", "", missingTaskError()
+	}
+	if err != nil {
+		return projectTaskWorkspaceFence{}, "", "", fmt.Errorf("read Task Workspace fence before validation completion: %w", err)
+	}
+	if projectID != "" {
+		fence, err := lockProjectTaskWorkspaceFence(ctx, tx, taskID, false)
+		if err != nil {
+			return projectTaskWorkspaceFence{}, "", "", err
+		}
+		return fence, fence.workspaceID, fence.actorID, nil
+	}
+	if workspaceID != "" {
+		ownerID, err := lockWorkspaceOwnershipForRead(ctx, tx, workspaceID)
+		if err != nil || ownerID != actorID {
+			return projectTaskWorkspaceFence{}, "", "", domain.NewError(domain.CodeForbidden, "Task Workspace is not available for validation")
+		}
+		var available bool
+		if err := tx.QueryRow(ctx, `SELECT state='ready' AND deleted_at IS NULL FROM workspaces WHERE id=$1`, workspaceID).Scan(&available); err != nil || !available {
+			return projectTaskWorkspaceFence{}, "", "", domain.NewError(domain.CodeForbidden, "Task Workspace is not available for validation")
+		}
+	}
+	return projectTaskWorkspaceFence{}, workspaceID, actorID, nil
+}
+
 func (s *Store) CompleteTaskValidationReview(ctx context.Context, completion app.TaskValidationReviewCompletion) (bool, error) {
 	claim := completion.Claim
 	if ctx == nil || !app.ValidTaskValidationReviewClaim(claim) {
@@ -113,8 +171,12 @@ func (s *Store) CompleteTaskValidationReview(ctx context.Context, completion app
 	}
 	var completed bool
 	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		projectFence, workspaceID, workspaceTaskActorID, err := lockTaskValidationReviewWorkspaceFence(ctx, tx, claim.TaskID)
+		if err != nil {
+			return err
+		}
 		var result, initiatorID, conversationID string
-		err := tx.QueryRow(ctx, `SELECT task.result,task.initiator_id,task.conversation_id FROM tasks task
+		err = tx.QueryRow(ctx, `SELECT task.result,task.initiator_id,task.conversation_id FROM tasks task
 JOIN task_events event ON event.task_id=task.id AND event.sequence=$4 AND event.task_revision=$3
   AND event.event_type='task.result' AND event.result_content_sha256=$5
 WHERE task.id=$1 AND task.owner_id=$2 AND task.status='completed'
@@ -129,6 +191,26 @@ FOR UPDATE OF task`, claim.TaskID, claim.OwnerID, claim.TaskRevision, claim.Resu
 			return fmt.Errorf("lock current Task validation review result: %w", err)
 		}
 		if initiatorID != claim.InitiatorID || conversationID != claim.ConversationID {
+			return nil
+		}
+		taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: claim.TaskID, OwnerID: claim.OwnerID})
+		if err != nil {
+			return fmt.Errorf("read Task authorization for validation review completion: %w", err)
+		}
+		if taskRow.InitiatorID != workspaceTaskActorID || taskRow.WorkspaceID.Valid && taskRow.WorkspaceID.String != workspaceID ||
+			!taskRow.WorkspaceID.Valid && workspaceID != "" {
+			return domain.NewError(domain.CodeConflict, "Task Workspace binding changed before validation completed")
+		}
+		if projectFence.projectID != "" {
+			if err := verifyProjectTaskWorkspaceFence(ctx, tx, claim.TaskID, projectFence); err != nil {
+				return err
+			}
+		}
+		authorized, err := requireCurrentTaskAuthorization(ctx, tx, taskRow)
+		if err != nil {
+			return err
+		}
+		if !authorized {
 			return nil
 		}
 		scope, current, err := loadTaskValidationReviewScopeInTx(ctx, tx, claim)
@@ -148,7 +230,7 @@ FOR UPDATE OF task`, claim.TaskID, claim.OwnerID, claim.TaskRevision, claim.Resu
 		if err := app.ValidateTaskValidationReviewCompletion(completion, evidence); err != nil {
 			return err
 		}
-		facts, err := loadTaskValidationVerdictFacts(ctx, tx, claim.TaskID, result, evidence, completion.Report)
+		facts, err := loadTaskValidationVerdictFacts(ctx, tx, claim, result, evidence, completion.Report, completion.ArtifactContentProofs)
 		if err != nil {
 			return err
 		}
@@ -166,9 +248,18 @@ FOR UPDATE OF task`, claim.TaskID, claim.OwnerID, claim.TaskRevision, claim.Resu
 		if err != nil || len(report) > app.MaxTaskValidationReviewReportBytes {
 			return domain.InvalidArgument("task_validation_review", "Task validation review report is invalid")
 		}
+		artifactProofs := completion.ArtifactContentProofs
+		if artifactProofs == nil {
+			artifactProofs = []app.TaskValidationReviewArtifactContentProof{}
+		}
+		artifactContentEvidence, err := json.Marshal(artifactProofs)
+		if err != nil || len(artifactContentEvidence) > app.MaxTaskValidationReviewArtifactProofBytes {
+			return domain.InvalidArgument("task_validation_review", "Task artifact content proof exceeds its limit")
+		}
 		updated, err := tx.Exec(ctx, `UPDATE task_validation_reviews review
 SET state='reviewed',lease_owner=NULL,lease_expires_at=NULL,
     validation_state=$25,
+    artifact_content_evidence=$26::jsonb,
     reviewer_session_id=$8,execution_model_id=$9,execution_connection_version=$10,execution_endpoint=$11,execution_configured_model=$12,
     execution_reported_model=$13,execution_model_family=$14,execution_catalog_version=$15,execution_model_call_id=$24,
     reviewer_model_id=$16,reviewer_connection_version=$17,reviewer_endpoint=$18,reviewer_configured_model=$19,reviewer_reported_model=$20,
@@ -193,7 +284,7 @@ WHERE review.task_id=$1 AND review.task_revision=$3 AND review.owner_id=$2
 			completion.ReviewerModel.Endpoint,
 			completion.ReviewerModel.ConfiguredModel, completion.ReviewerModel.ReportedModel,
 			completion.ReviewerModel.Identity.Family, completion.ReviewerModel.Identity.CatalogVersion, report,
-			completion.ExecutionModel.CallID, string(verdict.State))
+			completion.ExecutionModel.CallID, string(verdict.State), artifactContentEvidence)
 		if err != nil {
 			return fmt.Errorf("complete Task validation review: %w", err)
 		}
@@ -203,8 +294,9 @@ WHERE review.task_id=$1 AND review.task_revision=$3 AND review.owner_id=$2
 	return completed, err
 }
 
-func loadTaskValidationVerdictFacts(ctx context.Context, tx pgx.Tx, taskID, result string,
-	evidence *app.TaskValidationEvidenceRecord, report app.TaskValidationReviewReport) (app.TaskValidationVerdictFacts, error) {
+func loadTaskValidationVerdictFacts(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim, result string,
+	evidence *app.TaskValidationEvidenceRecord, report app.TaskValidationReviewReport,
+	artifactProofs []app.TaskValidationReviewArtifactContentProof) (app.TaskValidationVerdictFacts, error) {
 	var hasExecution, hasClarifications bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1 FROM task_steps WHERE task_id=$1 AND (kind='tool' OR tool_name IS NOT NULL)
@@ -217,19 +309,20 @@ func loadTaskValidationVerdictFacts(ctx context.Context, tx pgx.Tx, taskID, resu
   UNION ALL SELECT 1 FROM task_agent_request_reconciliations WHERE task_id=$1
   UNION ALL SELECT 1 FROM task_agent_sessions WHERE task_id=$1 AND parent_session_id IS NOT NULL
   UNION ALL SELECT 1 FROM task_artifacts WHERE task_id=$1
-), EXISTS (SELECT 1 FROM task_clarification_requests WHERE task_id=$1)`, taskID).
+), EXISTS (SELECT 1 FROM task_clarification_requests WHERE task_id=$1)`, claim.TaskID).
 		Scan(&hasExecution, &hasClarifications); err != nil {
 		return app.TaskValidationVerdictFacts{}, fmt.Errorf("read Task validation facts: %w", err)
 	}
 	facts := app.TaskValidationVerdictFacts{ClarificationHistoryKnown: !hasClarifications}
+	eligibleContent := make(map[app.TaskValidationEvidenceRefRecord]struct{})
 	if evidence != nil {
-		eligible := make(map[app.TaskValidationEvidenceRefRecord]struct{})
+		eligibleWeb := make(map[app.TaskValidationEvidenceRefRecord]struct{})
 		rows, err := tx.Query(ctx, `SELECT st.id,st.sequence,st.task_revision,COALESCE(st.tool_call_key,''),d.content_evidence_sha256
 FROM task_steps st JOIN task_step_details d ON d.task_id=st.task_id AND d.step_id=st.id
 WHERE st.task_id=$1 AND st.task_revision=$2 AND st.status='succeeded' AND st.detail_state='available'
   AND d.task_revision=$2 AND st.tool_name IN ('morde_web_search','morde_web_read')
   AND octet_length(d.content_evidence_sha256)=32`,
-			taskID, evidence.TaskRevision)
+			claim.TaskID, evidence.TaskRevision)
 		if err != nil {
 			return app.TaskValidationVerdictFacts{}, fmt.Errorf("read Task web content evidence: %w", err)
 		}
@@ -242,7 +335,7 @@ WHERE st.task_id=$1 AND st.task_revision=$2 AND st.status='succeeded' AND st.det
 				return app.TaskValidationVerdictFacts{}, fmt.Errorf("scan Task web content evidence: %w", err)
 			}
 			if len(digest) == sha256.Size && ref.ID != "" && ref.Sequence > 0 {
-				eligible[ref] = struct{}{}
+				eligibleWeb[ref] = struct{}{}
 			}
 		}
 		if err := rows.Err(); err != nil {
@@ -250,7 +343,19 @@ WHERE st.task_id=$1 AND st.task_revision=$2 AND st.status='succeeded' AND st.det
 			return app.TaskValidationVerdictFacts{}, fmt.Errorf("iterate Task web content evidence: %w", err)
 		}
 		rows.Close()
-		facts.EvidenceContentVerified = verifiedTaskWebContentCoverage(result, evidence.Claims, report.Findings, eligible)
+		for ref := range eligibleWeb {
+			eligibleContent[ref] = struct{}{}
+		}
+	}
+	artifactContent, err := currentTaskValidationReviewArtifactContentRefsInTx(ctx, tx, claim, evidence, artifactProofs)
+	if err != nil {
+		return app.TaskValidationVerdictFacts{}, err
+	}
+	for ref := range artifactContent {
+		eligibleContent[ref] = struct{}{}
+	}
+	if evidence != nil {
+		facts.EvidenceContentVerified = verifiedTaskEvidenceContentCoverage(result, evidence.Claims, report.Findings, eligibleContent)
 	}
 	if hasExecution {
 		facts.TaskExecution = app.TaskValidationFactPresent
@@ -264,7 +369,48 @@ WHERE st.task_id=$1 AND st.task_revision=$2 AND st.status='succeeded' AND st.det
 	return facts, nil
 }
 
-func verifiedTaskWebContentCoverage(result string, claims []app.TaskValidationEvidenceClaimRecord,
+func currentTaskValidationReviewArtifactContentRefsInTx(ctx context.Context, tx pgx.Tx,
+	claim app.TaskValidationReviewClaim, evidence *app.TaskValidationEvidenceRecord,
+	proofs []app.TaskValidationReviewArtifactContentProof) (map[app.TaskValidationEvidenceRefRecord]struct{}, error) {
+	eligible := make(map[app.TaskValidationEvidenceRefRecord]struct{})
+	if err := app.ValidateTaskValidationReviewArtifactContentProofs(proofs, evidence); err != nil {
+		return nil, err
+	}
+	for _, proof := range proofs {
+		if !proof.TextContent || !proof.ContentComplete {
+			continue
+		}
+		var current bool
+		err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM task_artifacts artifact
+  JOIN tasks task ON task.id=artifact.task_id AND task.owner_id=$2
+  JOIN task_steps artifact_step ON artifact_step.task_id=artifact.task_id AND artifact_step.id=artifact.step_id
+  JOIN workspaces workspace ON workspace.id=artifact.workspace_id
+    AND workspace.owner_id=COALESCE(task.workspace_owner_id,task.owner_id)
+    AND workspace.state='ready' AND workspace.deleted_at IS NULL
+  JOIN workspace_revision_files current_file ON current_file.workspace_id=artifact.workspace_id
+    AND current_file.file_path=artifact.path AND current_file.valid_to_revision IS NULL
+  WHERE artifact.id=$3 AND artifact.task_id=$1 AND task.workspace_id=artifact.workspace_id
+    AND artifact.workspace_id=$4 AND artifact.workspace_revision=$5
+    AND artifact.path=$6 AND artifact.media_type=$7 AND artifact.size_bytes=$8 AND artifact.sha256=$9
+    AND artifact_step.sequence=$10 AND artifact_step.task_revision=$11 AND artifact_step.status='succeeded'
+    AND COALESCE(artifact_step.tool_call_key,'')=$12
+    AND current_file.size_bytes=$8 AND current_file.sha256=$9
+    AND (SELECT count(*) FROM task_steps source_step WHERE source_step.task_id=artifact.task_id
+      AND source_step.task_revision=$11 AND source_step.tool_call_key=$12 AND source_step.status='succeeded')=1
+)`, claim.TaskID, claim.OwnerID, proof.Ref.ID, proof.WorkspaceID, proof.Revision, proof.Path, proof.MediaType,
+			proof.SizeBytes, proof.SHA256, proof.Ref.Sequence, proof.Ref.TaskRevision, proof.Ref.CallID).Scan(&current)
+		if err != nil {
+			return nil, fmt.Errorf("verify current Task artifact validation proof: %w", err)
+		}
+		if current {
+			eligible[proof.Ref] = struct{}{}
+		}
+	}
+	return eligible, nil
+}
+
+func verifiedTaskEvidenceContentCoverage(result string, claims []app.TaskValidationEvidenceClaimRecord,
 	findings []app.TaskValidationReviewFinding, eligible map[app.TaskValidationEvidenceRefRecord]struct{}) bool {
 	if len(claims) == 0 || len(eligible) == 0 {
 		return false

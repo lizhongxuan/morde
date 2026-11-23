@@ -63,19 +63,21 @@ type TaskValidationReviewModel struct {
 }
 
 type TaskValidationReviewCompletion struct {
-	Claim          TaskValidationReviewClaim
-	SessionID      string
-	ResponseText   string
-	ExecutionModel TaskValidationReviewModel
-	ReviewerModel  TaskValidationReviewModel
-	Report         TaskValidationReviewReport
+	Claim                 TaskValidationReviewClaim
+	SessionID             string
+	ResponseText          string
+	ExecutionModel        TaskValidationReviewModel
+	ReviewerModel         TaskValidationReviewModel
+	Report                TaskValidationReviewReport
+	ArtifactContentProofs []TaskValidationReviewArtifactContentProof
 }
 
 type TaskValidationReviewInput struct {
-	Objective       string                               `json:"objective"`
-	Result          string                               `json:"result"`
-	Evidence        *TaskValidationEvidenceRecord        `json:"evidence"`
-	EvidenceDetails []TaskValidationReviewEvidenceDetail `json:"evidence_details"`
+	Objective             string                                     `json:"objective"`
+	Result                string                                     `json:"result"`
+	Evidence              *TaskValidationEvidenceRecord              `json:"evidence"`
+	EvidenceDetails       []TaskValidationReviewEvidenceDetail       `json:"evidence_details"`
+	ArtifactContentProofs []TaskValidationReviewArtifactContentProof `json:"-"`
 }
 
 type TaskValidationReviewEvidenceDetail struct {
@@ -100,13 +102,44 @@ type TaskValidationReviewStepDetail struct {
 }
 
 type TaskValidationReviewArtifact struct {
-	SourceCallID string `json:"source_call_id"`
-	Label        string `json:"label"`
-	Path         string `json:"path"`
-	MediaType    string `json:"media_type"`
-	SizeBytes    int64  `json:"size_bytes"`
-	Revision     int64  `json:"revision"`
-	SHA256       string `json:"sha256"`
+	SourceCallID    string                                       `json:"source_call_id"`
+	Label           string                                       `json:"label"`
+	Path            string                                       `json:"path"`
+	MediaType       string                                       `json:"media_type"`
+	SizeBytes       int64                                        `json:"size_bytes"`
+	Revision        int64                                        `json:"revision"`
+	SHA256          string                                       `json:"sha256"`
+	ContentEvidence *TaskValidationReviewArtifactContentEvidence `json:"content_evidence,omitempty"`
+}
+
+// TaskValidationReviewArtifactContentEvidence contains only a verified,
+// bounded text preview. The full file digest is checked by the server against
+// the immutable Workspace manifest before this evidence is accepted.
+type TaskValidationReviewArtifactContentEvidence struct {
+	SHA256        string `json:"sha256"`
+	Preview       string `json:"preview,omitempty"`
+	PreviewSHA256 string `json:"preview_sha256"`
+	PreviewBytes  int64  `json:"preview_bytes"`
+	TextContent   bool   `json:"text_content"`
+	Complete      bool   `json:"complete"`
+	Truncated     bool   `json:"truncated"`
+}
+
+// TaskValidationReviewArtifactContentProof records what the trusted worker
+// read for one artifact reference without persisting user file contents.
+type TaskValidationReviewArtifactContentProof struct {
+	Ref             TaskValidationEvidenceRefRecord `json:"ref"`
+	WorkspaceID     string                          `json:"workspace_id"`
+	Revision        int64                           `json:"revision"`
+	Path            string                          `json:"path"`
+	MediaType       string                          `json:"media_type"`
+	SizeBytes       int64                           `json:"size_bytes"`
+	SHA256          string                          `json:"sha256"`
+	ReadbackSHA256  string                          `json:"readback_sha256"`
+	PreviewSHA256   string                          `json:"preview_sha256,omitempty"`
+	PreviewBytes    int64                           `json:"preview_bytes"`
+	TextContent     bool                            `json:"text_content"`
+	ContentComplete bool                            `json:"content_complete"`
 }
 
 const (
@@ -196,6 +229,9 @@ func ValidateTaskValidationReviewCompletion(value TaskValidationReviewCompletion
 		value.ExecutionModel.Identity.CatalogVersion != value.ReviewerModel.Identity.CatalogVersion {
 		return domain.InvalidArgument("task_validation_review", "task validation review identity is invalid")
 	}
+	if ValidateTaskValidationReviewArtifactContentProofs(value.ArtifactContentProofs, evidence) != nil {
+		return domain.InvalidArgument("task_validation_review", "task validation review artifact proof is invalid")
+	}
 	parsed, err := ParseTaskValidationReviewReport([]byte(value.ResponseText), evidence)
 	providedJSON, providedErr := json.Marshal(value.Report)
 	parsedJSON, parsedErr := json.Marshal(parsed)
@@ -236,4 +272,11 @@ type TaskValidationReviewQueue interface {
 type TaskValidationReviewSnapshotReader interface {
 	GetTaskValidationReviewSnapshot(context.Context, TaskValidationReviewClaim) (TaskDetails, error)
 	GetTaskValidationReviewStepDetail(context.Context, TaskValidationReviewClaim, string) (TaskStepDetail, error)
+	OpenTaskValidationReviewArtifactContent(context.Context, TaskValidationReviewClaim, string) (TaskArtifactContent, error)
+}
+
+// TaskValidationReviewClaimVerifier checks that an internal review claim still
+// owns the active database lease before any evidence is exposed.
+type TaskValidationReviewClaimVerifier interface {
+	IsCurrentTaskValidationReviewClaim(context.Context, TaskValidationReviewClaim) (bool, error)
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -234,7 +236,7 @@ VALUES ($1,$2,'call:hub-command','morde_hub_command',$3,'command',1,1,1,$4,'prep
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	facts, err := loadTaskValidationVerdictFacts(ctx, tx, created.Task.ID, "", nil, app.TaskValidationReviewReport{})
+	facts, err := loadTaskValidationVerdictFacts(ctx, tx, app.TaskValidationReviewClaim{TaskID: created.Task.ID}, "", nil, app.TaskValidationReviewReport{}, nil)
 	if err != nil {
 		t.Fatalf("load Task validation facts: %v", err)
 	}
@@ -258,7 +260,7 @@ func TestPostgresTaskValidationFactsTreatPendingRequestReconciliationAsExecution
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforeFacts, err := loadTaskValidationVerdictFacts(ctx, before, lease.Fence.TaskID, "", nil, app.TaskValidationReviewReport{})
+	beforeFacts, err := loadTaskValidationVerdictFacts(ctx, before, app.TaskValidationReviewClaim{TaskID: lease.Fence.TaskID}, "", nil, app.TaskValidationReviewReport{}, nil)
 	_ = before.Rollback(ctx)
 	if err != nil {
 		t.Fatalf("load validation facts before request reconciliation: %v", err)
@@ -277,7 +279,7 @@ func TestPostgresTaskValidationFactsTreatPendingRequestReconciliationAsExecution
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	facts, err := loadTaskValidationVerdictFacts(ctx, tx, lease.Fence.TaskID, "", nil, app.TaskValidationReviewReport{})
+	facts, err := loadTaskValidationVerdictFacts(ctx, tx, app.TaskValidationReviewClaim{TaskID: lease.Fence.TaskID}, "", nil, app.TaskValidationReviewReport{}, nil)
 	if err != nil {
 		t.Fatalf("load Task validation facts: %v", err)
 	}
@@ -966,5 +968,138 @@ func TestPostgresTaskValidationEvidenceResolvesArtifactSourceCall(t *testing.T) 
 	if len(resolved) != 1 || len(resolved[0].EvidenceRefs) != 1 || resolved[0].EvidenceRefs[0].ID != artifactID ||
 		resolved[0].EvidenceRefs[0].CallID != "write-1" || resolved[0].EvidenceRefs[0].TaskRevision != *current.Task.CurrentRevision {
 		t.Fatalf("resolved artifact source evidence = %+v; want artifact bound to its verified write call", resolved)
+	}
+}
+
+func TestPostgresTaskValidationArtifactEvidenceTracksCurrentWorkspaceFile(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHostWithoutWorkspace(t, ctx, store, owner.ID, "ai", 0)
+	setAgentTestHostRuntime(t, store, hostValue, "validation-artifact-current-file-runtime")
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "validation artifact")
+	binding, err := store.CreateWorkspaceBinding(ctx, workspace.Binding{
+		OwnerID: owner.ID, HostID: hostValue.ID, Workspace: workspaceValue, Directory: workspaceValue.ID,
+		State: workspace.BindingPreparing, BindingVersion: 1, DesiredRevision: workspaceValue.Revision,
+		SyncState: workspace.BindingSyncHealthy, SyncConflicts: []string{},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, workspaceValue.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, workspaceValue.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	path := "reports/result.txt"
+	original := []byte("right")
+	manifest := seedTaskArtifactManifest(t, store, workspaceValue.ID, 0, map[string][]byte{path: original})
+	revision := int64(0)
+	submission := newTestTaskSubmission(t, owner.ID, hostValue.ID, "validation-artifact-current-file", "write and verify a result")
+	submission.Task.WorkspaceID = workspaceValue.ID
+	submission.Task.InputRevision = &revision
+	submission.Task.ContextDigest = hashBytes("validation artifact input")
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "worker-validation-artifact", time.Minute)
+	if err != nil || !found || claimed.ID != created.Task.ID {
+		t.Fatalf("claim Task: claimed=%t task=%s err=%v", found, claimed.ID, err)
+	}
+	const supervisorID = "validation-artifact-current-file-supervisor"
+	authenticator, err := app.NewAgentStopAuthenticator(supervisorID, bytes.Repeat([]byte{0x4d}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, err := app.NewAgentInstanceService(store, authenticator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	started, replayed, err := instances.Start(ctx, app.AgentInstanceStart{
+		Fence: app.AgentInstanceFence{TaskID: claimed.ID, OwnerID: claimed.OwnerID, InitiatorID: claimed.InitiatorID,
+			AgentInstanceID: "agent-validation-artifact", AgentSessionID: "session-validation-artifact",
+			SupervisorID: supervisorID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+			AuthorizationVersion: claimed.Authorization.Version, EngineVersion: "0.2.0-rc.2", ProfileVersion: "v1"},
+		SupervisorNonce: bytes.Repeat([]byte{0x27}, 32), LeaseDuration: 30 * time.Second,
+	})
+	if err != nil || replayed {
+		t.Fatalf("start Task Agent: lease=%+v replayed=%t err=%v", started.Fence, replayed, err)
+	}
+	stepID := mustID(t, domain.NewStepID)
+	callID := "write_result_1"
+	step := task.Step{ID: stepID, TaskID: created.Task.ID, Sequence: 1, Kind: "tool", Status: task.StepSucceeded,
+		Title: "Write result", TaskRevision: &revision, ToolCallKey: callID, ToolName: "morde_workspace_write"}
+	artifactID := mustID(t, domain.NewArtifactID)
+	artifact := addArtifactProof(task.Artifact{ID: artifactID, TaskID: created.Task.ID, StepID: stepID, SourceCallID: callID,
+		Label: "Result", Path: path, MediaType: "text/plain"}, manifest[path])
+	result := "The result file contains right."
+	if err := store.RecordHostReplicaHeartbeat(ctx, hostValue.ID, hostValue.RuntimeGeneration); err != nil {
+		t.Fatal(err)
+	}
+	resultEvent, err := store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: created.Task.ID, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		Status: task.StatusCompleted, CurrentStep: stepID, Result: result, Usage: created.Task.Usage,
+		Steps: []task.Step{step}, Artifacts: []task.Artifact{artifact},
+		ValidationClaims: []app.TaskResultClaim{{ID: "claim-1", StartByte: 0, EndByte: int32(len(result)),
+			EvidenceRefs: []app.TaskValidationEvidenceRef{{Kind: app.TaskValidationEvidenceSideEffect, CallID: callID}}}},
+		Event: task.Event{TaskID: created.Task.ID, Type: "task.result", Payload: []byte(`{"status":"completed"}`)},
+		ToolCall: &app.TaskToolCallProgress{AgentSessionID: started.Fence.AgentSessionID, AgentInstanceID: started.Fence.AgentInstanceID,
+			AgentGeneration: started.Fence.AgentGeneration, AuthorizationVersion: started.Fence.AuthorizationVersion,
+			TaskRevision: revision, CallKey: callID, ToolName: "morde_workspace_write", RequestDigest: hashBytes("morde_workspace_write:" + callID),
+			Phase: "execute", DetailState: "not_recorded"},
+	})
+	if err != nil {
+		t.Fatalf("complete Task with Artifact evidence: %v", err)
+	}
+	details, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.ValidationEvidence == nil || len(details.ValidationEvidence.Claims) != 1 || len(details.ValidationEvidence.Claims[0].EvidenceRefs) != 1 {
+		t.Fatalf("load completed Task evidence: evidence=%+v err=%v", details.ValidationEvidence, err)
+	}
+	ref := details.ValidationEvidence.Claims[0].EvidenceRefs[0]
+	if ref.Kind != app.TaskValidationEvidenceSideEffect || ref.ID != artifactID || ref.Sequence != 1 || ref.CallID != callID ||
+		ref.TaskRevision != revision || details.ValidationEvidence.EventSequence != resultEvent.Sequence {
+		t.Fatalf("resolved Artifact evidence ref = %+v; want current source call and result event", ref)
+	}
+	contentDigest := sha256.Sum256(original)
+	contentProof := app.TaskValidationReviewArtifactContentProof{Ref: ref, WorkspaceID: workspaceValue.ID, Revision: 0,
+		Path: path, MediaType: "text/plain", SizeBytes: int64(len(original)), SHA256: hex.EncodeToString(contentDigest[:]),
+		ReadbackSHA256: hex.EncodeToString(contentDigest[:]), PreviewSHA256: hex.EncodeToString(contentDigest[:]),
+		PreviewBytes: int64(len(original)), TextContent: true, ContentComplete: true}
+	encodedProofs, err := json.Marshal([]app.TaskValidationReviewArtifactContentProof{contentProof})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_validation_reviews
+SET state='reviewed',validation_state='PASS',execution_model_call_id='fixture-validation-call',
+    reviewer_session_id='fixture_reviewer',execution_model_id='paaaaaaa',execution_connection_version=clock_timestamp(),
+    execution_endpoint='http://fixture',execution_configured_model='fixture-execution',execution_reported_model='fixture-execution',
+    execution_model_family='fixture-execution-family',execution_catalog_version='fixture-v1',
+    reviewer_model_id='pbbbbbbb',reviewer_connection_version=clock_timestamp(),reviewer_endpoint='http://fixture',
+    reviewer_configured_model='fixture-reviewer',reviewer_reported_model='fixture-reviewer',
+    reviewer_model_family='fixture-reviewer-family',reviewer_catalog_version='fixture-v1',review_report='{}'::jsonb,
+    reviewed_at=clock_timestamp(),artifact_content_evidence=$2::jsonb
+WHERE task_id=$1 AND task_revision=$3 AND result_event_sequence=$4`, created.Task.ID, string(encodedProofs), revision, resultEvent.Sequence); err != nil {
+		t.Fatalf("seed reviewed Artifact content proof: %v", err)
+	}
+	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Validation.State != app.TaskValidationPass {
+		t.Fatalf("current committed Workspace file validation = %#v err=%v; want PASS", details.Validation, err)
+	}
+	changed := []byte("wrong")
+	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_revisions(workspace_id,revision,file_count,total_bytes)
+VALUES ($1,1,1,$2)`, workspaceValue.ID, len(changed)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE workspace_revision_files SET valid_to_revision=1
+WHERE workspace_id=$1 AND file_path=$2`, workspaceValue.ID, path); err != nil {
+		t.Fatal(err)
+	}
+	seedTaskArtifactManifest(t, store, workspaceValue.ID, 1, map[string][]byte{path: changed})
+	if _, err := store.pool.Exec(ctx, `UPDATE workspaces SET revision=1 WHERE id=$1`, workspaceValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Validation.State != app.TaskValidationPending {
+		t.Fatalf("changed current Workspace file validation = %#v err=%v; want pending", details.Validation, err)
 	}
 }

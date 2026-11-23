@@ -83,7 +83,25 @@ describe('Reviews', () => {
     await user.click(within(card).getByRole('button', { name: '允许：审批 k1234567' }));
     await waitFor(() => expect(respond).toHaveBeenCalledWith('q1234567', 'k1234567',
       { version: 3, decision: 'approve' }, expect.any(String)));
-    expect(await screen.findByText('审核已受理，任务后续状态等待更新。')).toBeInTheDocument();
+    expect(await screen.findByText('已允许本次操作，任务后续状态等待更新。')).toBeInTheDocument();
+  });
+
+  it('confirms an explicit rejection while the task result remains pending', async () => {
+    vi.spyOn(portalApi, 'taskApprovals').mockResolvedValue({
+      items: [item('k1234567', 'pending')], next_cursor: null, pending_count: 1,
+    });
+    const respond = vi.spyOn(portalApi, 'respondToTaskApproval').mockResolvedValue({
+      task_id: 'q1234567', action: 'respond', status: 'queued', unsettled_operation_ids: [],
+    });
+    const user = userEvent.setup();
+    renderReviews();
+
+    const card = await screen.findByRole('group', { name: '审批 k1234567' });
+    await user.click(within(card).getByRole('button', { name: '拒绝：审批 k1234567' }));
+
+    await waitFor(() => expect(respond).toHaveBeenCalledWith('q1234567', 'k1234567',
+      { version: 3, decision: 'reject' }, expect.any(String)));
+    expect(await screen.findByText('已拒绝本次操作，任务后续状态等待更新。')).toBeInTheDocument();
   });
 
   it('does not show an empty or zero state when the approval list fails', async () => {
@@ -178,7 +196,7 @@ describe('Reviews', () => {
     await waitFor(() => expect(respond).toHaveBeenCalledTimes(2));
 
     expect(respond.mock.calls[1]?.[3]).toBe(respond.mock.calls[0]?.[3]);
-    expect(await screen.findByText('审核已受理，任务后续状态等待更新。')).toBeInTheDocument();
+    expect(await screen.findByText('已允许本次操作，任务后续状态等待更新。')).toBeInTheDocument();
   });
 
   it('loads the next UI page and reports a repeated server cursor instead of looping', async () => {

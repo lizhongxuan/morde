@@ -19,6 +19,11 @@ func TestPostgresTaskModelUnknownUsageStaysReservedAcrossRecoveryAndReconcilesOn
 	if err := gateway.SetModelResponseSealer(sealer); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := store.pool.Exec(ctx, `UPDATE model_connections SET checked_at=clock_timestamp(),capability_text=true,
+ capability_tools=false,context_window_tokens=32768,context_window_override_tokens=32768,
+ context_window_source='legacy_manual' WHERE id=$1`, modelID); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.UserID); err != nil {
 		t.Fatal(err)
 	}
@@ -30,7 +35,7 @@ func TestPostgresTaskModelUnknownUsageStaysReservedAcrossRecoveryAndReconcilesOn
  auth_client_installation_id,budget_active_seconds,budget_tool_calls,budget_model_tokens,usage_model_tokens,
  lease_owner,lease_version,lease_expires_at,execution_location,auth_version,auth_expires_at,agent_instance_id,
  agent_generation,agent_session_id,agent_engine_version,agent_profile_version,checkpoint_through_seq,checkpoint_digest)
- VALUES ('q1234567',$1,$1,'c1234567',$2,'task model recovery','running','session',$3,NULL,600,10,500,0,
+ VALUES ('q1234567',$1,$1,'c1234567',$2,'task model recovery','running','session',$3,NULL,600,10,10000,0,
  'worker-1',3,clock_timestamp()+interval '1 hour','server',7,clock_timestamp()+interval '1 hour',
  'agent-1',2,'session-1','engine','profile',0,$4)`, owner.UserID, modelID, owner.TokenID, digest[:]); err != nil {
 		t.Fatal(err)
@@ -89,7 +94,7 @@ VALUES ('q1234567',$1,'agent-1',2,'session-1','session-1',0,0,$2,decode('01','he
 		t.Fatal(err)
 	}
 	budget, err := adminService.Budget(ctx, admin, owner.UserID)
-	if err != nil || !budget.HasUnknown || budget.UsedTokens != 0 {
+	if err != nil || !budget.HasUnknown || budget.UsedTokens != reserved {
 		t.Fatalf("budget while Task model usage is unknown = %+v err=%v", budget, err)
 	}
 	if _, err := gateway.Complete(ctx, call); err == nil || model.calls != 1 {

@@ -617,6 +617,17 @@ func (s *TaskService) GetTaskValidationReviewSnapshot(ctx context.Context, claim
 	if ctx == nil || !ValidTaskValidationReviewClaim(claim) {
 		return TaskDetails{}, domain.InvalidArgument("task_validation_review", "Task validation review claim is invalid")
 	}
+	claimVerifier, ok := s.store.(TaskValidationReviewClaimVerifier)
+	if !ok {
+		return TaskDetails{}, domain.NewError(domain.CodeUnsupported, "Task validation review claim verification is unavailable")
+	}
+	currentClaim, err := claimVerifier.IsCurrentTaskValidationReviewClaim(ctx, claim)
+	if err != nil {
+		return TaskDetails{}, err
+	}
+	if !currentClaim {
+		return TaskDetails{}, domain.NewError(domain.CodeConflict, "Task validation review claim is no longer current")
+	}
 	details, err := s.store.GetTask(ctx, claim.TaskID, claim.InitiatorID)
 	if err != nil {
 		return TaskDetails{}, err

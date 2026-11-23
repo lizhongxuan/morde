@@ -132,13 +132,20 @@ VALUES ($1,$2,$3,$4,$5,$5,0,0,$6,'sealed',$7,$8,$9,$10)`, claimed.ID, owner.ID, 
 	}
 
 	retryClaim, found, err := store.ClaimNextTask(ctx, "step-retry-success-worker", time.Minute)
-	if err != nil || !found || retryClaim.ID != claimed.ID {
+	if err != nil || !found || retryClaim.ID != claimed.ID || retryClaim.StepRetry == nil || retryClaim.CurrentRevision == nil {
 		t.Fatalf("claim queued retry Task: found=%t task=%+v err=%v", found, retryClaim, err)
+	}
+	claimedIntent := retryClaim.StepRetry
+	if *retryClaim.CurrentRevision != retry.Intent.TaskRevision || claimedIntent.TaskID != retry.Intent.TaskID ||
+		claimedIntent.OwnerID != retry.Intent.OwnerID || claimedIntent.TaskRevision != retry.Intent.TaskRevision ||
+		claimedIntent.Attempt != retry.Intent.Attempt || claimedIntent.SourceStepID != retry.Intent.SourceStepID ||
+		claimedIntent.AttemptStepID != retry.Intent.AttemptStepID || claimedIntent.RetryCallID != retry.Intent.RetryCallID {
+		t.Fatalf("claimed retry intent=%+v revision=%v; want request intent=%+v", claimedIntent, retryClaim.CurrentRevision, retry.Intent)
 	}
 	retryNonce := bytes.Repeat([]byte{0x29}, 32)
 	retryAgent, replayed, err := instances.Start(ctx, app.AgentInstanceStart{
 		Fence: app.AgentInstanceFence{TaskID: retryClaim.ID, OwnerID: retryClaim.OwnerID, InitiatorID: retryClaim.InitiatorID,
-			AgentInstanceID: "agent-step-retry-success-2", AgentSessionID: retry.Intent.AgentSessionID,
+			AgentInstanceID: "agent-step-retry-success-2", AgentSessionID: claimedIntent.AgentSessionID,
 			SupervisorID: supervisorID, LeaseOwner: retryClaim.Lease.Owner, LeaseVersion: retryClaim.Lease.Version,
 			AuthorizationVersion: retryClaim.Authorization.Version, EngineVersion: first.Fence.EngineVersion,
 			ProfileVersion: first.Fence.ProfileVersion},
@@ -147,7 +154,7 @@ VALUES ($1,$2,$3,$4,$5,$5,0,0,$6,'sealed',$7,$8,$9,$10)`, claimed.ID, owner.ID, 
 	if err != nil || replayed || retryAgent.Fence.AgentGeneration != 2 {
 		t.Fatalf("start retry Task Agent: fence=%+v replayed=%t err=%v", retryAgent.Fence, replayed, err)
 	}
-	if err := store.ConsumeTaskStepRetryIntent(ctx, retry.Intent, retryAgent.Fence); err != nil {
+	if err := store.ConsumeTaskStepRetryIntent(ctx, *claimedIntent, retryAgent.Fence); err != nil {
 		t.Fatalf("consume retry intent at the execution fence: %v", err)
 	}
 
@@ -169,7 +176,7 @@ VALUES ($1,$2,$3,$4,$5,$5,0,0,$6,'sealed',$7,$8,$9,$10)`, claimed.ID, owner.ID, 
 		ToolCall: &app.TaskToolCallProgress{
 			AgentSessionID: retryAgent.Fence.AgentSessionID, AgentInstanceID: retryAgent.Fence.AgentInstanceID,
 			AgentGeneration: retryAgent.Fence.AgentGeneration, AuthorizationVersion: retryAgent.Fence.AuthorizationVersion,
-			TaskRevision: 0, CallKey: retry.Intent.RetryCallID, ToolName: "file_read",
+			TaskRevision: 0, CallKey: claimedIntent.RetryCallID, ToolName: "file_read",
 			RequestDigest: requestDigest, Phase: "succeeded", DetailState: "available",
 			DetailCiphertext: retryDetail, DetailSHA256: retryDetailDigest, DetailSizeBytes: int32(len(retryPlain)),
 		},

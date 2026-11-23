@@ -835,36 +835,59 @@ describe('Assistant durable tasks', () => {
     expect(activity).toHaveTextContent('执行中');
   });
 
-  it('keeps task validation details out of Task Dynamics', async () => {
-    const taskWithoutValidation = { ...task, result_review: { state: 'published' as const, source_task_id: task.id,
-      source_task_revision: 1, source_event_sequence: 0, reply_message_id: reply.id } };
+  it('shows Task validation separately from task execution and result review', async () => {
+    const taskWithValidation = { ...task, event_sequence: 1, current_revision: 1, desired_revision: 1,
+      validation: { state: 'PASS' as const }, result_review: { state: 'failed' as const, source_task_id: task.id,
+        source_task_revision: 1, source_event_sequence: 1, reply_message_id: null, trigger_message_id: message.id } };
     mockCommon({ conversations: [conversation], messages: [message] });
-    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithoutValidation);
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithValidation);
     renderPage();
 
     const activity = await findTaskActivity(task.id);
-    const taskCard = document.querySelector<HTMLElement>(`.task-activity-card[data-task-id="${task.id}"]`)!;
-    expect(taskCard).not.toHaveTextContent(/校验|通过|待你处理/);
-    expect(within(activity).queryByRole('region', { name: '任务校验' })).not.toBeInTheDocument();
-    expect(activity).toHaveTextContent('停止');
+    const validation = within(activity).getByRole('region', { name: '任务验证' });
+    const resultReview = within(activity).getByRole('region', { name: '结果整理' });
+    expect(validation).toHaveTextContent('验证通过');
+    expect(resultReview).toHaveTextContent('结果整理失败');
+    expect(resultReview).not.toHaveTextContent('验证');
   });
 
   it.each([
-    { state: 'pending', label: '待校验', explanation: '尚未收到可确认的校验结论。' },
-    { state: 'PASS', label: '通过', explanation: '服务端校验已通过。' },
-    { state: 'PASS+NOTES', label: '通过（有备注）', explanation: '校验已通过，包含非阻塞备注。' },
-    { state: 'FAIL', label: '未通过', explanation: '服务端校验未通过。' },
-    { state: 'FUTURE_STATE', label: '未知状态', explanation: '服务端返回了无法识别的校验状态。' },
-  ])('does not expose $state validation content in Task Dynamics', async ({ state, label, explanation }) => {
+    { state: 'pending', label: '待验证', taskStatus: 'running' },
+    { state: 'PASS', label: '验证通过', taskStatus: 'completed' },
+    { state: 'PASS+NOTES', label: '通过（有备注）', taskStatus: 'completed' },
+    { state: 'FAIL', label: '验证未通过', taskStatus: 'completed' },
+  ] as const)('shows Task validation $state as $label', async ({ state, label, taskStatus }) => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, validation: { state } } as Task);
+    const currentTask: Task = { ...task, status: taskStatus,
+      result: taskStatus === 'running' ? null : task.result,
+      finished_at: taskStatus === 'running' ? null : task.finished_at,
+      validation: { state } };
+    vi.spyOn(portalApi, 'task').mockResolvedValue(currentTask);
     renderPage();
 
     const activity = await findTaskActivity(task.id);
-    const taskCard = document.querySelector<HTMLElement>(`.task-activity-card[data-task-id="${task.id}"]`)!;
-    expect(taskCard).not.toHaveTextContent(new RegExp(`${label}|校验|H01|证据引用`));
-    expect(activity).not.toHaveTextContent(new RegExp(`${label}|${explanation}|H01|证据引用`));
-    expect(within(activity).queryByRole('region', { name: '任务校验' })).not.toBeInTheDocument();
+    expect(within(activity).getByRole('region', { name: '任务验证' })).toHaveTextContent(label);
+  });
+
+  it('shows an unknown Task validation state with neutral confirmation copy', async () => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, validation: { state: 'FUTURE_STATE' } } as unknown as Task);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    const validation = within(activity).getByRole('region', { name: '任务验证' });
+    expect(validation).toHaveTextContent('验证状态待确认');
+    expect(validation).not.toHaveTextContent('FUTURE_STATE');
+  });
+
+  it('waits for Task completion before showing a non-pending validation state', async () => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'running', result: null, finished_at: null,
+      validation: { state: 'PASS' } });
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    expect(within(activity).queryByRole('region', { name: '任务验证' })).not.toBeInTheDocument();
   });
 
   it('opens the actual tool result from a work item without a task-wide evidence panel', async () => {
@@ -4653,6 +4676,7 @@ describe('Assistant durable tasks', () => {
     await user.click(screen.getByRole('button', { name: decision === 'approve' ? '允许本次操作' : '拒绝' }));
     await waitFor(() => expect(respond).toHaveBeenCalledWith(task.id, approval.id,
       { version: approval.version, decision }, expect.any(String)));
+    expect(await screen.findByText(`${decision === 'approve' ? '已允许本次操作' : '已拒绝本次操作'}，任务后续状态等待更新。`)).toBeInTheDocument();
   });
 
   it('does not load approval-list items or show approval-list errors in a conversation', async () => {

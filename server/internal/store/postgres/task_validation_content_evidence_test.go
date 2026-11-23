@@ -24,7 +24,7 @@ func TestVerifiedTaskWebContentCoverage(t *testing.T) {
 	finding := app.TaskValidationReviewFinding{ID: app.TaskHardCheckEvidence, Assessment: app.TaskValidationReviewSupports,
 		EvidenceRefs: []app.TaskValidationEvidenceRefRecord{first, second}}
 	eligible := map[app.TaskValidationEvidenceRefRecord]struct{}{first: {}, second: {}}
-	if !verifiedTaskWebContentCoverage(result, claims, []app.TaskValidationReviewFinding{finding}, eligible) {
+	if !verifiedTaskEvidenceContentCoverage(result, claims, []app.TaskValidationReviewFinding{finding}, eligible) {
 		t.Fatal("fully covered claims with successful content evidence should verify")
 	}
 
@@ -50,7 +50,7 @@ func TestVerifiedTaskWebContentCoverage(t *testing.T) {
 				copiedEligible[ref] = struct{}{}
 			}
 			mutate(copiedClaims, &copiedFinding, copiedEligible)
-			if verifiedTaskWebContentCoverage(result, copiedClaims, []app.TaskValidationReviewFinding{copiedFinding}, copiedEligible) {
+			if verifiedTaskEvidenceContentCoverage(result, copiedClaims, []app.TaskValidationReviewFinding{copiedFinding}, copiedEligible) {
 				t.Fatal("invalid content coverage passed")
 			}
 		})
@@ -121,7 +121,7 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, current.Task.ID, current.Task.OwnerID, stepID
 		var facts app.TaskValidationVerdictFacts
 		if err := f.store.WithTx(ctx, func(tx pgx.Tx) error {
 			var factErr error
-			facts, factErr = loadTaskValidationVerdictFacts(ctx, tx, current.Task.ID, result, evidence, report)
+			facts, factErr = loadTaskValidationVerdictFacts(ctx, tx, app.TaskValidationReviewClaim{TaskID: current.Task.ID}, result, evidence, report, nil)
 			return factErr
 		}); err != nil {
 			t.Fatal(err)

@@ -46,9 +46,14 @@ func (s *taskValidationReviewQueueStub) CompleteTaskValidationReview(_ context.C
 }
 
 type taskValidationReviewSnapshotStub struct {
-	details     app.TaskDetails
-	stepDetails map[string]app.TaskStepDetail
+	details          app.TaskDetails
+	stepDetails      map[string]app.TaskStepDetail
+	artifactContents map[string]app.TaskArtifactContent
 }
+
+type reviewArtifactBody struct{ *bytes.Reader }
+
+func (reviewArtifactBody) Close() error { return nil }
 
 func (s taskValidationReviewSnapshotStub) GetTaskValidationReviewSnapshot(context.Context, app.TaskValidationReviewClaim) (app.TaskDetails, error) {
 	return s.details, nil
@@ -60,6 +65,15 @@ func (s taskValidationReviewSnapshotStub) GetTaskValidationReviewStepDetail(_ co
 		return app.TaskStepDetail{}, domain.NewError(domain.CodeNotFound, "task step detail not found")
 	}
 	return detail, nil
+}
+
+func (s taskValidationReviewSnapshotStub) OpenTaskValidationReviewArtifactContent(_ context.Context, _ app.TaskValidationReviewClaim,
+	artifactID string) (app.TaskArtifactContent, error) {
+	content, ok := s.artifactContents[artifactID]
+	if !ok {
+		return app.TaskArtifactContent{}, domain.NewError(domain.CodeNotFound, "Task validation artifact content not found")
+	}
+	return content, nil
 }
 
 type taskValidationReviewModelsStub struct {
@@ -239,7 +253,7 @@ func TestTaskValidationReviewWorkerCompletesToolFreeIndependentReview(t *testing
 	}
 }
 
-func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(t *testing.T) {
+func TestTaskValidationReviewInputIncludesBoundSummariesAndVerifiedArtifactContent(t *testing.T) {
 	t.Run("morde_web_search", func(t *testing.T) {
 		toolName := "morde_web_search"
 		result := "verified result"
@@ -251,7 +265,7 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(
 			Claims: []app.TaskValidationEvidenceClaimRecord{{ID: "c1", StartByte: 0, EndByte: int32(len(result)),
 				EvidenceRefs: []app.TaskValidationEvidenceRefRecord{stepRef, artifactRef}}}}
 		object, inputText, resultText := "search", "validated query summary", "three sources found"
-		artifactContent := "private report bytes are not included in the review packet"
+		artifactContent := "Private report content must be checked against the requested result."
 		artifactDigest := sha256.Sum256([]byte(artifactContent))
 		sourceText := "Example authorized source passage supporting the cited result."
 		sourceDigest := sha256.Sum256([]byte(sourceText))
@@ -270,7 +284,9 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(
 				Label: "Report", Path: "reports/result.txt", MediaType: "text/plain", SizeBytes: int64(len(artifactContent)), SHA256: hex.EncodeToString(artifactDigest[:])}},
 			ValidationEvidence: evidence,
 		}, stepDetails: map[string]app.TaskStepDetail{stepRef.ID: {TaskID: claim.TaskID, StepID: stepRef.ID, DetailState: "available",
-			Object: &object, Input: &inputText, Result: &resultText, ContentEvidence: contentEvidence}}}
+			Object: &object, Input: &inputText, Result: &resultText, ContentEvidence: contentEvidence}},
+			artifactContents: map[string]app.TaskArtifactContent{artifactRef.ID: {Filename: "result.txt", MediaType: "text/plain",
+				SizeBytes: int64(len(artifactContent)), SHA256: hex.EncodeToString(artifactDigest[:]), Body: reviewArtifactBody{Reader: bytes.NewReader([]byte(artifactContent))}}}}
 		withoutCurrentPermission := TaskValidationReviewWorker{options: TaskValidationReviewWorkerOptions{Snapshots: taskValidationReviewSnapshotStub{details: snapshots.details}}}
 		if _, err := withoutCurrentPermission.reviewInput(context.Background(), claim); domain.CodeOf(err) != domain.CodeNotFound {
 			t.Fatalf("review snapshot accepted a step after its access fence changed: %v", err)
@@ -285,17 +301,18 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(
 			!bytes.Contains(encoded, []byte(`"result":"three sources found"`)) ||
 			!bytes.Contains(encoded, []byte(`"content_evidence":{"sha256":"`+hex.EncodeToString(sourceDigest[:])+`","preview":"`)) ||
 			!bytes.Contains(encoded, []byte(sourceText)) ||
-			!bytes.Contains(encoded, []byte(`"state":"artifact_metadata_only"`)) ||
+			!bytes.Contains(encoded, []byte(`"state":"artifact_content_complete"`)) ||
 			!bytes.Contains(encoded, []byte(`"path":"reports/result.txt"`)) ||
 			!bytes.Contains(encoded, []byte(`"source_call_id":"write_report_1"`)) ||
 			!bytes.Contains(encoded, []byte(`"revision":11`)) ||
 			!bytes.Contains(encoded, []byte(`"sha256":"`+hex.EncodeToString(artifactDigest[:])+`"`)) ||
-			bytes.Contains(encoded, []byte(artifactContent)) || bytes.Contains(encoded, []byte("artifact_bytes")) {
+			!bytes.Contains(encoded, []byte(artifactContent)) || bytes.Contains(encoded, []byte("artifact_bytes")) {
 			t.Fatalf("review evidence snapshot = %s, err=%v", encoded, err)
 		}
-		if !strings.Contains(taskValidationReviewSystemPrompt, "不含产物字节") ||
-			!strings.Contains(taskValidationReviewSystemPrompt, "不能证明该操作的运行环境或产物内容正确") {
-			t.Fatal("artifact hash/revision was not described as metadata-only evidence")
+		if !strings.Contains(taskValidationReviewSystemPrompt, "complete=true") ||
+			!strings.Contains(taskValidationReviewSystemPrompt, "不完整预览") ||
+			!strings.Contains(taskValidationReviewSystemPrompt, "不可信文件内容") {
+			t.Fatal("artifact content trust and completeness rules were not described")
 		}
 		mismatchedCall := sourceStep
 		mismatchedCall.ToolCallKey = "write_other_1"
@@ -368,6 +385,20 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndArtifactMetadataOnly(
 				}
 			})
 		}
+		t.Run("artifact content read size is bounded", func(t *testing.T) {
+			boundedSnapshot := snapshots
+			boundedSnapshot.details.Artifacts = append([]task.Artifact(nil), snapshots.details.Artifacts...)
+			boundedSnapshot.details.Artifacts[0].SizeBytes = app.MaxTaskValidationReviewArtifactReadBytes + 1
+			boundedSnapshot.artifactContents = nil
+			worker.options.Snapshots = boundedSnapshot
+			bounded, err := worker.reviewInput(context.Background(), claim)
+			if err != nil || len(bounded.EvidenceDetails) != 2 ||
+				bounded.EvidenceDetails[1].State != "artifact_content_not_read_size_limit" ||
+				bounded.EvidenceDetails[1].Artifact == nil || bounded.EvidenceDetails[1].Artifact.ContentEvidence != nil ||
+				len(bounded.ArtifactContentProofs) != 0 {
+				t.Fatalf("oversized artifact was not kept as insufficient metadata evidence: input=%+v err=%v", bounded, err)
+			}
+		})
 		missingSnapshot := snapshots
 		missingSnapshot.details.Artifacts = nil
 		worker.options.Snapshots = missingSnapshot

@@ -767,6 +767,16 @@ function resultReviewStatusText(review: K2ResultReview, replyVisible: boolean): 
   }
 }
 
+function taskValidationStatusText(validation: Task['validation']): string {
+  switch (validation?.state) {
+    case 'pending': return '待验证';
+    case 'PASS': return '验证通过';
+    case 'PASS+NOTES': return '通过（有备注）';
+    case 'FAIL': return '验证未通过';
+    default: return '验证状态待确认';
+  }
+}
+
 function childJobStatusText(status: string): string {
   if (status === 'queued') return '等待执行';
   if (status === 'running') return '进行中';
@@ -2313,7 +2323,8 @@ export function Assistant() {
         client.invalidateQueries({ queryKey: ['conversation-tasks', conversationID] }),
         client.invalidateQueries({ queryKey: ['task-approvals'] }),
       ]);
-      notify('审核已受理，任务后续状态等待更新。', 'success');
+      const decisionLabel = request.decision === 'approve' ? '已允许本次操作' : '已拒绝本次操作';
+      notify(`${decisionLabel}，任务后续状态等待更新。`, 'success');
     },
     onError: (error, request) => handleTaskActionError(error, request.taskID),
   });
@@ -3144,6 +3155,8 @@ export function Assistant() {
     const hasTaskRevisionFence = Number.isSafeInteger(task.current_revision) && (task.current_revision ?? -1) >= 0 &&
       Number.isSafeInteger(task.desired_revision) && (task.desired_revision ?? -1) >= 0;
     const taskActionPending = taskControl.isPending && taskControl.variables?.taskID === task.id;
+    const showTaskValidation = Boolean(task.validation &&
+      (task.status === 'completed' || task.validation.state === 'pending'));
     const showFeedStatus = !terminalTaskStatuses.has(task.status) ||
       (task.status === 'completed' && (task.result_message_pending || ['pending', 'processing'].includes(task.result_review?.state ?? '')));
     const projectionRead = readK2TaskProjection(task);
@@ -3200,6 +3213,10 @@ export function Assistant() {
           respondToApproval.mutate({ taskID: task.id, approvalID: request.id, version: request.version,
             decision, actionScope, key: taskActionKey(actionScope, fingerprint) });
         }} />}
+      {showTaskValidation && task.validation && <section className="task-activity-k2" aria-label="任务验证">
+        <h3>任务验证</h3>
+        <p role="status">{taskValidationStatusText(task.validation)}</p>
+      </section>}
       {task.clarification_request && <form className="notice notice-warning task-detail-attention" aria-label="补充任务信息"
         onSubmit={(event) => {
           event.preventDefault();

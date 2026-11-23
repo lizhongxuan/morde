@@ -182,7 +182,8 @@ JOIN tasks task ON task.id=review.task_id AND task.status='completed'
 JOIN task_events event ON event.task_id=review.task_id AND event.sequence=review.result_event_sequence
   AND event.task_revision=review.task_revision AND event.event_type='task.result'
   AND event.result_content_sha256=review.result_sha256
-WHERE review.state='reviewed'`, ids, revisions)
+WHERE review.state='reviewed'
+  AND task_validation_artifact_evidence_current(review.task_id,review.owner_id,review.artifact_content_evidence)`, ids, revisions)
 	if err != nil {
 		return nil, fmt.Errorf("read Task validation verdicts: %w", err)
 	}

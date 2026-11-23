@@ -71,6 +71,8 @@ type taskStoreStub struct {
 	grantConnectorID       string
 	grantVersion           int64
 	grantRevoked           TaskMCPConnectorGrant
+	validationClaimCurrent *bool
+	validationClaimErr     error
 }
 
 func TestConversationTaskListFiltersPendingCountByCurrentHostAuthorization(t *testing.T) {
@@ -253,6 +255,13 @@ func (s *taskStoreStub) SubmitTask(_ context.Context, submission TaskSubmission)
 
 func (s *taskStoreStub) GetTask(context.Context, string, string) (TaskDetails, error) {
 	return s.details, s.storeErr
+}
+
+func (s *taskStoreStub) IsCurrentTaskValidationReviewClaim(context.Context, TaskValidationReviewClaim) (bool, error) {
+	if s.validationClaimErr != nil {
+		return false, s.validationClaimErr
+	}
+	return s.validationClaimCurrent == nil || *s.validationClaimCurrent, nil
 }
 
 type pendingExpiryTaskStoreStub struct {
@@ -1218,6 +1227,21 @@ func TestTaskValidationReviewSnapshotHidesRevokedWorkspaceEvidence(t *testing.T)
 	if err != nil || snapshot.ValidationEvidence != nil || len(snapshot.Artifacts) != 0 || snapshot.Steps[0].DetailState != "restricted" ||
 		strings.Contains(snapshot.Steps[0].Summary, "PRIVATE") {
 		t.Fatalf("review snapshot exposed revoked Workspace data: %+v, %v", snapshot, err)
+	}
+}
+
+func TestTaskValidationReviewSnapshotRejectsExpiredClaim(t *testing.T) {
+	current := false
+	store := &taskStoreStub{validationClaimCurrent: &current}
+	service := &TaskService{store: store}
+	claim := TaskValidationReviewClaim{OwnerID: "u1234567", InitiatorID: "u1234567", ConversationID: "c1234567",
+		TaskID: "q1234567", TaskRevision: 1, ResultEventSequence: 2, ResultSHA256: bytes.Repeat([]byte{0x12}, 32),
+		ClaimGeneration: 1, LeaseOwner: "review-worker"}
+	if _, err := service.GetTaskValidationReviewSnapshot(context.Background(), claim); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("expired validation claim error=%v, want conflict", err)
+	}
+	if store.details.Task.ID != "" {
+		t.Fatal("expired validation claim read Task details before checking its active lease")
 	}
 }
 

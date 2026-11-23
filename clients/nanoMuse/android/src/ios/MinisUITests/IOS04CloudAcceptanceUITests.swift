@@ -153,8 +153,12 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
         _ = try await waitForFixtureRun("mcp-retry", stage: "failed", server: url, token: token)
 
         let tasksTab = app.buttons["morde.shell.tab.tasks"]
+        let drawerTasks = app.buttons["morde.shell.drawer.tasks"]
+        if !drawerTasks.isHittable { app.buttons["morde.shell.drawer"].tap() }
+        XCTAssertTrue(drawerTasks.waitForExistence(timeout: 10))
+        XCTAssertTrue(drawerTasks.isHittable)
+        drawerTasks.tap()
         XCTAssertTrue(tasksTab.waitForExistence(timeout: 15))
-        tasksTab.tap()
         let taskRow = app.buttons["morde.tasks.row.\(taskID)"]
         XCTAssertTrue(taskRow.waitForExistence(timeout: 30), "The server-failed Task should appear in the native task list.")
         taskRow.tap()
