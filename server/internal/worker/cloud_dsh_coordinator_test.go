@@ -454,6 +454,79 @@ func TestCloudDSHCoordinatorRunsMatchingTextOnlyTurn(t *testing.T) {
 	}
 }
 
+func TestCloudDSHCoordinatorRaisesRouteOutputBudgetWhenWindowAllows(t *testing.T) {
+	setup := func(window int, known bool) (*CloudDSHConversationCoordinator, *coordinatorTestRuntime, app.ConversationRouteClaim, app.ConversationRouteContext) {
+		claim, value := coordinatorTestClaimAndContext()
+		routeRequest, err := app.ConversationRouteModelRequest(value)
+		if err != nil {
+			t.Fatal(err)
+		}
+		output := `{"action":"reply","task_id":"","question":"","reply":"Hello"}`
+		checkpointPayload := []byte(`{"events":[{"seq":0,"type":"message"}]}`)
+		checkpointDigest := sha256.Sum256(checkpointPayload)
+		modelRequest, err := json.Marshal(map[string]any{
+			"provider": "morde", "model": value.ModelID,
+			"messages": []any{
+				map[string]any{"role": "system", "content": []any{map[string]any{"type": "text", "text": routeRequest.Instructions}}},
+				map[string]any{"role": "user", "content": []any{map[string]any{"type": "text", "text": routeRequest.Input[0].Text}}},
+			},
+			"tools": []any{},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		modelDigest := sha256.Sum256(modelRequest)
+		identity := cloudDSHCoordinatorIdentity(claim, value)
+		from, through := int64(0), int64(0)
+		callID, err := app.DSHConversationCoordinatorModelCallID(identity.ConversationID, identity.MessageID, identity.SessionID, through)
+		if err != nil {
+			t.Fatal(err)
+		}
+		base := func(kind string) cloudDSHCoordinatorFrame {
+			return cloudDSHCoordinatorFrame{Type: kind, Role: "coordinator", ConversationID: identity.ConversationID,
+				MessageID: identity.MessageID, OwnerID: identity.OwnerID, ActorID: identity.ActorID, AgentID: identity.AgentID,
+				Generation: identity.Generation, AuthorizationVersion: identity.AuthorizationVersion, SessionID: identity.SessionID,
+				Purpose: identity.Purpose, OperationID: identity.OperationID}
+		}
+		checkpoint := base("checkpoint")
+		checkpoint.ID, checkpoint.From, checkpoint.Through = "checkpoint-0", &from, &through
+		checkpoint.Payload, checkpoint.SHA256 = string(checkpointPayload), hex.EncodeToString(checkpointDigest[:])
+		model := base("model")
+		model.ID, model.Through, model.Request, model.SHA256 = callID, &through, modelRequest, hex.EncodeToString(modelDigest[:])
+		settled := base("coordinator_settled")
+		settled.State, settled.Through, settled.Result = "completed", &through, output
+		runtime := &coordinatorTestRuntime{stream: &coordinatorTestStream{frames: []cloudDSHCoordinatorFrame{checkpoint, model, settled}}}
+		models := &coordinatorTestModels{response: app.ModelResponse{Text: output, StopReason: "stop",
+			Usage: app.ModelUsage{Known: true, InputTokens: 10, OutputTokens: 5}},
+			routeWindow: window, routeWindowKnown: known}
+		checkpoints := &coordinatorTestCheckpoints{head: app.ConversationCoordinatorCheckpointHead{Through: -1}}
+		coordinator := &CloudDSHConversationCoordinator{options: CloudDSHConversationCoordinatorOptions{
+			Models: models, Checkpoints: checkpoints,
+		}, runtimes: &coordinatorTestRuntimeManager{runtime: runtime}}
+		return coordinator, runtime, claim, value
+	}
+	coordinator, runtime, claim, value := setup(1048576, true)
+	decision, err := coordinator.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != app.ConversationRouteReply || decision.Reply != "Hello" {
+		t.Fatalf("large-window route = %+v, err=%v", decision, err)
+	}
+	if runtime.startRequest["max_tokens"] != app.MaxConversationRouteModelOutputTokens {
+		t.Fatalf("large-window route kept the minimum output budget: max_tokens=%v", runtime.startRequest["max_tokens"])
+	}
+	coordinator, runtime, claim, value = setup(0, false)
+	decision, err = coordinator.ClassifyConversationRoute(context.Background(), claim, value)
+	if err != nil || decision.Action != app.ConversationRouteReply || decision.Reply != "Hello" {
+		t.Fatalf("unknown-window route = %+v, err=%v", decision, err)
+	}
+	routeRequest, err := app.ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runtime.startRequest["max_tokens"] != routeRequest.MaxOutputTokens {
+		t.Fatalf("unknown-window route raised the output budget: max_tokens=%v", runtime.startRequest["max_tokens"])
+	}
+}
+
 func TestCloudDSHCoordinatorRunsBoundedSummarySessionThroughDSH(t *testing.T) {
 	claim, _ := coordinatorTestClaimAndContext()
 	claim.Message.Sequence = 1

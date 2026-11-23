@@ -305,9 +305,12 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		}
 		// The model answered but its output is not valid routing JSON,
 		// even after the repair retry. Use the same heuristic fallback
-		// instead of failing the route.
+		// instead of failing the route. The preview is empty only when
+		// the model returned no text at all; otherwise it shows the
+		// shape of the unusable output.
 		w.options.Logger.Warn("conversation route model output is invalid; applying heuristic fallback",
-			zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID))
+			zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
+			zap.String("invalid_output_preview", decision.InvalidOutputPreview))
 		decision = conversationRouteClassifyFallback(classifyContext)
 	}
 	decision = safeConversationRouteDecision(classifyContext, decision)
@@ -750,10 +753,14 @@ func conversationRouteClassifyFallback(value app.ConversationRouteContext) app.C
 			}
 		}
 	}
-	// When the previous context cannot be confirmed, do not offer to
-	// continue it: ask the user to supply the missing context instead.
-	// This reuses the wording the safety check uses for the same state.
-	if value.PreviousMissing || value.PreviousUnresolved {
+	// When the previous message itself is missing, do not offer to continue
+	// it: ask the user to supply the missing context instead. This reuses
+	// the wording the safety check uses for the same state. A predecessor
+	// that merely ended unresolved (for example waiting_user after a
+	// clarification was delivered) is known state, not missing context,
+	// so it falls through to the continue-or-new question below instead
+	// of demanding the context be resupplied.
+	if value.PreviousMissing {
 		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
 			Question: "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。"}
 	}

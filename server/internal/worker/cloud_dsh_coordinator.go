@@ -171,6 +171,38 @@ func coordinatorRouteContentMatchesClaim(value app.ConversationRouteContext, cla
 	return len(value.ContentSources) > 0 && value.ContentSources[0].MessageID == claim.Message.ID
 }
 
+// coordinatorRouteOutputTokens raises the route classification output
+// budget above the minimum-window-safe default when the selected model
+// window leaves room for it. The builder always emits the 512-token
+// default so a route request still fits the 4096-token minimum window;
+// with a large window (DeepSeek Flash reports 1,048,576 tokens) a reply
+// that quotes or summarizes previous conversation may legitimately need
+// more, and the 512-token default truncated such answers mid-JSON on
+// every attempt. The raise reuses the gateway's exact fit check, so it
+// can never pick a budget the request does not fit; unknown capacity or
+// a resolution failure keeps the default.
+func coordinatorRouteOutputTokens(ctx context.Context, coordinator *CloudDSHConversationCoordinator,
+	claim app.ConversationRouteClaim, modelID string, request app.ModelRequest) int {
+	if coordinator == nil || ctx == nil {
+		return request.MaxOutputTokens
+	}
+	window, known, err := coordinator.ResolveConversationRouteContextWindow(ctx, claim, modelID)
+	if err != nil || !known {
+		return request.MaxOutputTokens
+	}
+	for _, candidate := range []int{app.MaxConversationRouteModelOutputTokens, 1024} {
+		if candidate <= request.MaxOutputTokens {
+			continue
+		}
+		trial := request
+		trial.MaxOutputTokens = candidate
+		if app.ConversationRouteInputFitsContextWindow(trial, window) {
+			return candidate
+		}
+	}
+	return request.MaxOutputTokens
+}
+
 func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim,
 	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
 	if ctx == nil || value.ModelID == "" || claim.Message.ID == "" || value.ActorID != claim.Message.ActorID ||
@@ -206,7 +238,7 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 		"authorization_version": identity.AuthorizationVersion, "session_id": identity.SessionID,
 		"purpose": identity.Purpose, "operation_id": identity.OperationID,
 		"model": value.ModelID, "tools": []any{},
-		"system_prompt": request.Instructions, "max_tokens": request.MaxOutputTokens,
+		"system_prompt": request.Instructions, "max_tokens": coordinatorRouteOutputTokens(ctx, c, claim, value.ModelID, request),
 		"resume": head.Through >= 0,
 	}
 	if head.Through >= 0 {
