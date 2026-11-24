@@ -1,7 +1,8 @@
-import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
+import { cleanup, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { components } from '../api/schema';
 import { TaskApprovalCard } from './TaskApprovalCard';
+import { taskApprovalMcpAppDriver } from './TaskApprovalMcpApp.test-utils';
 
 const approval: components['schemas']['TaskPendingRequest'] = {
   id: 'k1234567', version: 2, status: 'pending', kind: 'approval', title: '删除项目文件',
@@ -19,40 +20,85 @@ const approval: components['schemas']['TaskPendingRequest'] = {
 describe('TaskApprovalCard', () => {
   afterEach(() => cleanup());
 
-  it('states the one-action scope and honest outcome before allowing a decision', () => {
-    const onDecision = vi.fn();
+  it('renders an isolated MCP App and binds its single approval tool to the exact request', async () => {
+    const onDecision = vi.fn().mockResolvedValue(undefined);
     render(<TaskApprovalCard approval={approval} reviewInbox onDecision={onDecision} />);
 
-    expect(screen.getAllByText(/审批范围仅限本次显示的操作/u)).toHaveLength(2);
-    expect(screen.getAllByText(/拒绝后本次操作不会执行/u)).toHaveLength(2);
+    const iframe = screen.getByTitle('MCP App 操作审批');
+    expect(iframe).toHaveAttribute('sandbox', 'allow-scripts');
+    expect(iframe).toHaveAttribute('referrerpolicy', 'no-referrer');
+    expect(iframe.getAttribute('srcdoc')).toContain("default-src 'none'");
+    expect(iframe.getAttribute('srcdoc')).toContain("connect-src 'none'");
+    expect(iframe.getAttribute('srcdoc')).not.toContain('allow-same-origin');
+    const app = taskApprovalMcpAppDriver(iframe as HTMLIFrameElement);
+
+    await app.send({ jsonrpc: '2.0', id: `initialize-${app.nonce}`, method: 'ui/initialize', params: {
+      protocolVersion: '2026-01-26', appInfo: { name: 'forged', version: '1' }, appCapabilities: {},
+    } }, 'null', window as unknown as MessageEventSource);
+    expect(onDecision).not.toHaveBeenCalled();
+    await app.send({ jsonrpc: '2.0', id: `initialize-${app.nonce}`, method: 'ui/initialize', params: {
+      protocolVersion: '2026-01-26', appInfo: { name: 'forged', version: '1' }, appCapabilities: {},
+    } }, 'https://attacker.invalid');
     expect(onDecision).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole('button', { name: '查看操作详情：删除项目文件' }));
-    const dialog = screen.getByRole('dialog');
-    expect(dialog).toHaveTextContent('项目中的草稿文件将不可用。');
-    expect(dialog).toHaveTextContent(/允许后任务会继续尝试执行，最终结果以任务状态为准/u);
-
-    fireEvent.click(within(dialog).getByRole('button', { name: '允许：删除项目文件' }));
-    expect(onDecision).toHaveBeenCalledExactlyOnceWith('approve');
+    await app.initialize();
+    await app.send({ jsonrpc: '2.0', method: 'ui/notifications/size-changed', params: { height: 430 } });
+    expect(iframe).toHaveStyle({ height: '430px' });
+    await app.send({ jsonrpc: '2.0', method: 'ui/notifications/size-changed', params: { height: 10_000 } });
+    expect(iframe).toHaveStyle({ height: '640px' });
+    await app.send({ jsonrpc: '2.0', method: 'ui/notifications/size-changed', params: { height: 400 } }, 'https://attacker.invalid');
+    expect(iframe).toHaveStyle({ height: '640px' });
+    await app.call('stale', { approval_id: approval.id, version: approval.version + 1, decision: 'approve' });
+    expect(onDecision).not.toHaveBeenCalled();
+    await app.call('bad-tool', { approval_id: approval.id, version: approval.version, decision: 'approve' }, 'task_action');
+    expect(onDecision).not.toHaveBeenCalled();
+    await app.call('valid', { approval_id: approval.id, version: approval.version, decision: 'approve' });
+    await waitFor(() => expect(onDecision).toHaveBeenCalledExactlyOnceWith('approve'));
+    expect(app.sent).toContainEqual(expect.objectContaining({ jsonrpc: '2.0', id: 'stale', error: expect.any(Object) }));
+    expect(app.sent).toContainEqual(expect.objectContaining({ jsonrpc: '2.0', id: 'valid', result: expect.objectContaining({ isError: false }) }));
   });
 
-  it('submits an explicit rejection from the operation details dialog', () => {
-    const onDecision = vi.fn();
-    render(<TaskApprovalCard approval={approval} reviewInbox onDecision={onDecision} />);
+  it('does not expose an approval decision when the request is already expired', () => {
+    const expired = { ...approval, status: 'expired' as const, expires_at: '2026-10-21T08:00:00Z' };
+    render(<TaskApprovalCard approval={expired} onDecision={vi.fn()} />);
 
-    fireEvent.click(screen.getByRole('button', { name: '查看操作详情：删除项目文件' }));
-    const dialog = screen.getByRole('dialog');
-    fireEvent.click(within(dialog).getByRole('button', { name: '拒绝：删除项目文件' }));
-
-    expect(onDecision).toHaveBeenCalledExactlyOnceWith('reject');
+    const card = screen.getByRole('region', { name: '审批已到期' });
+    expect(card).toHaveTextContent('审批已到期；该操作已被拒绝并未执行。');
+    expect(card.querySelector('iframe')).toBeNull();
+    expect(screen.queryByRole('button', { name: '允许本次操作' })).not.toBeInTheDocument();
   });
 
-  it('keeps unknown costs visibly unknown instead of rendering them as zero', () => {
-    render(<TaskApprovalCard approval={approval} onDecision={vi.fn()} />);
+  it.each([false, true])('explains an unavailable media preview without exposing a decision (review=%s)', (reviewInbox) => {
+    render(<TaskApprovalCard approval={{ ...approval, media_preview_operation_id: 'o1234567' }}
+      reviewInbox={reviewInbox} onDecision={vi.fn()} />);
 
-    const disclosures = screen.getByLabelText('风险、费用和其他审批信息');
-    expect(disclosures).toHaveTextContent(/本次费用未知/u);
-    expect(disclosures).toHaveTextContent(/累计费用未知/u);
-    expect(disclosures).not.toHaveTextContent('0 CNY');
+    expect(screen.getByRole('status')).toHaveTextContent('媒体预览暂不可用，无法处理此审批。');
+    expect(screen.queryByTitle('MCP App 操作审批')).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /允许|拒绝/ })).not.toBeInTheDocument();
+  });
+
+  it('recreates the embedded view when the server changes the approval version', async () => {
+    const onDecision = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(<TaskApprovalCard approval={approval} onDecision={onDecision} />);
+    const firstFrame = screen.getByTitle('MCP App 操作审批') as HTMLIFrameElement;
+    const firstApp = taskApprovalMcpAppDriver(firstFrame);
+    await firstApp.initialize();
+
+    const updatedApproval = { ...approval, version: approval.version + 1 };
+    rerender(<TaskApprovalCard approval={updatedApproval} onDecision={onDecision} />);
+
+    const updatedFrame = screen.getByTitle('MCP App 操作审批') as HTMLIFrameElement;
+    expect(updatedFrame).not.toBe(firstFrame);
+    const updatedApp = taskApprovalMcpAppDriver(updatedFrame);
+    await updatedApp.initialize();
+    expect(updatedApp.currentApproval()).toMatchObject({ id: approval.id, version: updatedApproval.version });
+    await updatedApp.call('stale-version', {
+      approval_id: approval.id, version: approval.version, decision: 'approve',
+    });
+    expect(onDecision).not.toHaveBeenCalled();
+    await updatedApp.call('current-version', {
+      approval_id: approval.id, version: updatedApproval.version, decision: 'reject',
+    });
+    await waitFor(() => expect(onDecision).toHaveBeenCalledExactlyOnceWith('reject'));
   });
 });

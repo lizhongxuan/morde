@@ -6,7 +6,7 @@ afterEach(() => vi.unstubAllGlobals());
 describe('requestFetch authentication redirects', () => {
   it('leaves the unauthenticated session probe to AuthProvider', async () => {
     const assign = vi.fn();
-    vi.stubGlobal('window', { location: { origin: 'https://portal.example', pathname: '/download', search: '', assign } });
+    vi.stubGlobal('window', { location: { origin: 'https://portal.example', pathname: '/download', search: '', assign }, dispatchEvent: vi.fn() });
     vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 401 })));
 
     await expect(requestFetch('/api/me')).resolves.toMatchObject({ status: 401 });
@@ -15,7 +15,7 @@ describe('requestFetch authentication redirects', () => {
 
   it('redirects a protected request that loses its session', async () => {
     const assign = vi.fn();
-    vi.stubGlobal('window', { location: { origin: 'https://portal.example', pathname: '/workspaces', search: '?tab=local', assign } });
+    vi.stubGlobal('window', { location: { origin: 'https://portal.example', pathname: '/workspaces', search: '?tab=local', assign }, dispatchEvent: vi.fn() });
     vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 401 })));
 
     await requestFetch('/api/workspaces');

@@ -271,8 +271,12 @@ func TestCloudDSHToolBrokerAllowsTaskProgressAfterClaim(t *testing.T) {
 }
 
 func TestSelectedMCPDefinitionsDoNotDisplaceCurrentMessageSearch(t *testing.T) {
-	definitions := []AgentToolDefinition{{ModelTool: ModelTool{Name: cloudDSHCurrentMessageSearchToolName}}}
-	for index := 1; index < maxCloudDSHToolDefinitions-1; index++ {
+	definitions := []AgentToolDefinition{
+		{ModelTool: ModelTool{Name: cloudDSHCurrentHistorySearchToolName}},
+		{ModelTool: ModelTool{Name: cloudDSHCurrentMessageReadToolName}},
+		{ModelTool: ModelTool{Name: cloudDSHCurrentMessageSearchToolName}},
+	}
+	for index := 0; len(definitions) < maxCloudDSHToolDefinitions-1; index++ {
 		definitions = append(definitions, AgentToolDefinition{ModelTool: ModelTool{Name: fmt.Sprintf("optional_%02d", index)}})
 	}
 	selectedMCP := []AgentToolDefinition{
@@ -280,10 +284,12 @@ func TestSelectedMCPDefinitionsDoNotDisplaceCurrentMessageSearch(t *testing.T) {
 		{ModelTool: ModelTool{Name: cloudDSHMCPCallToolName}},
 	}
 	got := appendSelectedMCPDefinitionsWithinLimit(definitions, selectedMCP)
-	if len(got) != len(definitions) || !containsAgentTool(got, cloudDSHCurrentMessageSearchToolName) ||
+	if len(got) != len(definitions) || !containsAgentTool(got, cloudDSHCurrentHistorySearchToolName) ||
+		!containsAgentTool(got, cloudDSHCurrentMessageReadToolName) || !containsAgentTool(got, cloudDSHCurrentMessageSearchToolName) ||
 		containsAgentTool(got, cloudDSHMCPDiscoverToolName) || containsAgentTool(got, cloudDSHMCPCallToolName) {
-		t.Fatalf("optional MCP definitions displaced current-message search at capacity: got=%d search=%t MCP=%t/%t",
-			len(got), containsAgentTool(got, cloudDSHCurrentMessageSearchToolName),
+		t.Fatalf("optional MCP definitions displaced required history tools at capacity: got=%d history=%t read=%t search=%t MCP=%t/%t",
+			len(got), containsAgentTool(got, cloudDSHCurrentHistorySearchToolName), containsAgentTool(got, cloudDSHCurrentMessageReadToolName),
+			containsAgentTool(got, cloudDSHCurrentMessageSearchToolName),
 			containsAgentTool(got, cloudDSHMCPDiscoverToolName), containsAgentTool(got, cloudDSHMCPCallToolName))
 	}
 }

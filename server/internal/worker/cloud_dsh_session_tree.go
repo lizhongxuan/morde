@@ -53,6 +53,8 @@ type cloudDSHSessionState struct {
 	agentRequests           map[string]cloudDSHAgentRequest
 	timedOutAgentRequests   map[string]struct{}
 	verifiedAgentRequests   map[string]struct{}
+	toolSelectionVerified   bool
+	modelResponseObserved   bool
 	settled                 bool
 }
 
@@ -162,6 +164,115 @@ func newCloudDSHSessionState(fence app.AgentInstanceFence, identity cloudDSHIden
 		history: history, images: newCloudDSHImageRegistry(cloudDSHModelFence(fence, identity.SessionID, through)),
 		activeActivities: make(map[string]string), agentRequests: make(map[string]cloudDSHAgentRequest),
 		timedOutAgentRequests: make(map[string]struct{}), verifiedAgentRequests: make(map[string]struct{})}
+}
+
+func cloudDSHToolDefinitionsSummary(definitions []app.AgentToolDefinition) ([32]byte, bool) {
+	tools := cloudDSHToolPayload(definitions)
+	sort.Slice(tools, func(i, j int) bool {
+		left, _ := tools[i]["name"].(string)
+		right, _ := tools[j]["name"].(string)
+		return left < right
+	})
+	encoded, err := json.Marshal(tools)
+	if err != nil {
+		return [32]byte{}, false
+	}
+	return cloudDSHToolPayloadSummary(encoded)
+}
+
+func cloudDSHToolPayloadSummary(raw []byte) ([32]byte, bool) {
+	if !uniqueCloudDSHJSON(raw) {
+		return [32]byte{}, false
+	}
+	var tools []json.RawMessage
+	if json.Unmarshal(raw, &tools) != nil || tools == nil {
+		return [32]byte{}, false
+	}
+	type tool struct {
+		name string
+		data json.RawMessage
+	}
+	canonicalTools := make([]tool, 0, len(tools))
+	seen := make(map[string]struct{}, len(tools))
+	for _, rawTool := range tools {
+		var named struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(rawTool, &named) != nil || !cloudDSHID.MatchString(named.Name) {
+			return [32]byte{}, false
+		}
+		if _, exists := seen[named.Name]; exists {
+			return [32]byte{}, false
+		}
+		seen[named.Name] = struct{}{}
+		canonical, ok := canonicalCloudDSHJSON(rawTool)
+		if !ok {
+			return [32]byte{}, false
+		}
+		canonicalTools = append(canonicalTools, tool{name: named.Name, data: canonical})
+	}
+	sort.Slice(canonicalTools, func(i, j int) bool { return canonicalTools[i].name < canonicalTools[j].name })
+	encodedTools := make([]json.RawMessage, 0, len(canonicalTools))
+	for _, candidate := range canonicalTools {
+		encodedTools = append(encodedTools, candidate.data)
+	}
+	encoded, err := json.Marshal(encodedTools)
+	if err != nil {
+		return [32]byte{}, false
+	}
+	return sha256.Sum256(encoded), true
+}
+
+func cloudDSHCheckpointToolSelection(payload []byte, definitions []app.AgentToolDefinition) (bool, bool, error) {
+	if !uniqueCloudDSHJSON(payload) {
+		return false, false, errors.New("dsh checkpoint tool selection is invalid")
+	}
+	var checkpoint struct {
+		Events []struct {
+			Type string          `json:"type"`
+			Data json.RawMessage `json:"data"`
+		} `json:"events"`
+	}
+	if json.Unmarshal(payload, &checkpoint) != nil || checkpoint.Events == nil {
+		return false, false, errors.New("dsh checkpoint tool selection is invalid")
+	}
+	expected, ok := cloudDSHToolDefinitionsSummary(definitions)
+	if !ok {
+		return false, false, errors.New("dsh tool definition summary is invalid")
+	}
+	headerSeen, assistantMessageSeen := false, false
+	for _, event := range checkpoint.Events {
+		if event.Type == "assistant/message" {
+			assistantMessageSeen = true
+		}
+		if event.Type != "request/header" {
+			continue
+		}
+		var request struct {
+			Header json.RawMessage `json:"header"`
+		}
+		if json.Unmarshal(event.Data, &request) != nil || len(request.Header) == 0 || string(request.Header) == "null" {
+			return false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
+		}
+		var header map[string]json.RawMessage
+		if json.Unmarshal(request.Header, &header) != nil || header == nil {
+			return false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
+		}
+		tools, toolsPresent := header["tools"]
+		if !toolsPresent && len(definitions) == 0 {
+			headerSeen = true
+			continue
+		}
+		if !toolsPresent || len(tools) == 0 || string(tools) == "null" {
+			return false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
+		}
+		actual, valid := cloudDSHToolPayloadSummary(tools)
+		if !valid || !bytes.Equal(actual[:], expected[:]) {
+			return false, assistantMessageSeen, errors.New("dsh checkpoint tool definitions changed")
+		}
+		headerSeen = true
+	}
+	return headerSeen, assistantMessageSeen, nil
 }
 
 func (state *cloudDSHSessionState) noteActivity(phase, activityID, activityState string) {
@@ -2128,12 +2239,18 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				len(page.Payload) == 0 || len(page.Payload) > 1<<20 || !utf8.Valid(page.Payload) || !uniqueCloudDSHJSON(page.Payload) {
 				return errors.New("dsh checkpoint page is unavailable")
 			}
-			if err := state.history.append(page.Payload, page.From, page.Through); err != nil {
-				return err
-			}
 			digest := hex.EncodeToString(page.Digest)
 			if !cloudDSHDigest(page.Payload, digest) || (page.Through == state.restoreThrough && !cloudDSHDigest(page.Payload, hex.EncodeToString(state.restoreDigest))) {
 				return errors.New("dsh checkpoint page digest is invalid")
+			}
+			summaryFound, assistantMessageFound, err := cloudDSHCheckpointToolSelection(page.Payload, state.definitions)
+			if err != nil {
+				return err
+			}
+			state.toolSelectionVerified = state.toolSelectionVerified || summaryFound
+			state.modelResponseObserved = state.modelResponseObserved || assistantMessageFound
+			if err := state.history.append(page.Payload, page.From, page.Through); err != nil {
+				return err
 			}
 			if err := e.resolveCloudDSHAgentRequest(ctx, value, fence, state, request); err != nil {
 				return err
@@ -2147,6 +2264,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			}
 			state.readThrough = page.Through
 			if state.readThrough == state.restoreThrough {
+				if state.modelResponseObserved && !state.toolSelectionVerified {
+					return errors.New("dsh pinned checkpoint lacks its model-visible tool definitions")
+				}
 				state.history.finishRestore()
 				if state.restoreThrough >= 0 {
 					request := cloudDSHAgentRequest{phase: "checkpoint", kind: "checkpoint_write",
@@ -2179,6 +2299,15 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			request, _, err := cloudDSHAgentRequestForFrame(frame, state)
 			if err != nil || state.beginAgentRequest(request) != nil {
 				return errors.New("dsh checkpoint write request could not be tracked")
+			}
+			summaryFound, assistantMessageFound, err := cloudDSHCheckpointToolSelection([]byte(frame.Payload), state.definitions)
+			if err != nil {
+				return err
+			}
+			state.toolSelectionVerified = state.toolSelectionVerified || summaryFound
+			state.modelResponseObserved = state.modelResponseObserved || assistantMessageFound
+			if state.modelResponseObserved && !state.toolSelectionVerified {
+				return errors.New("dsh checkpoint lacks its model-visible tool definitions")
 			}
 			digest, _ := hex.DecodeString(frame.SHA256)
 			historyValue, err := runAgentRequest(state, request, func() (any, error) {

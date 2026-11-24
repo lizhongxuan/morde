@@ -9,8 +9,11 @@ import { startLocalPortalServer } from '../out/morde-local-portal.js';
 test('local Portal serves bundled routes and safely proxies synthetic API requests', async () => {
   const root = mkdtempSync(join(tmpdir(), 'morde-local-portal-'));
   mkdirSync(join(root, 'assets'));
+  mkdirSync(join(root, 'mcp-app'));
   writeFileSync(join(root, 'index.html'), '<!doctype html><html><head></head><body><div id="root"></div></body></html>');
   writeFileSync(join(root, 'assets', 'main.js'), 'export {};');
+  writeFileSync(join(root, 'mcp-app', 'task-approval.js'), 'window.__mordeApprovalApp = true;');
+  writeFileSync(join(root, 'mcp-app', 'task-approval.css'), 'body { color: blue; }');
   const upstreamRequests = [];
   const upstream = createServer((request, response) => {
     if (request.url === '/api/events' || request.url === '/api/events-abort') {
@@ -52,6 +55,24 @@ test('local Portal serves bundled routes and safely proxies synthetic API reques
     assert.match(page.headers.get('content-security-policy'), /frame-src 'self' https:\/\/\*\.hosts\.example\.test/);
     assert.match(await page.text(), /name="morde-service-origin" content="http:\/\/127\.0\.0\.1:/);
     assert.equal((await fetch(`${portal.origin}/assets/main.js`)).status, 200);
+    assert.equal((await fetch(`${portal.origin}/mcp-app/task-approval.js`)).headers.get('content-type'), 'text/javascript; charset=utf-8');
+    assert.equal((await fetch(`${portal.origin}/mcp-app/task-approval.css`)).headers.get('content-type'), 'text/css; charset=utf-8');
+    const sandboxHeaders = { origin: 'null', 'sec-fetch-site': 'cross-site' };
+    for (const asset of ['task-approval.js', 'task-approval.css']) {
+      const response = await fetch(`${portal.origin}/mcp-app/${asset}`, { headers: sandboxHeaders });
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('access-control-allow-origin'), null);
+      assert.equal((await fetch(`${portal.origin}/mcp-app/${asset}`, { headers: { 'sec-fetch-site': 'cross-site' } })).status, 200);
+    }
+    assert.equal((await fetch(`${portal.origin}/assets/main.js`, { headers: sandboxHeaders })).status, 403);
+    assert.equal((await fetch(`${portal.origin}/api/test`, { headers: sandboxHeaders })).status, 403);
+    assert.equal((await fetch(`${portal.origin}/mcp-app/unlisted.js`, { headers: sandboxHeaders })).status, 403);
+    assert.equal((await fetch(`${portal.origin}/mcp-app/task-approval.js?extra=1`, { headers: sandboxHeaders })).status, 403);
+    assert.equal((await fetch(`${portal.origin}/mcp-app/task-approval.js`, { method: 'POST', headers: sandboxHeaders })).status, 403);
+    assert.equal((await fetch(`${portal.origin}/mcp-app/task-approval.js`, {
+      headers: { origin: 'https://attacker.example', 'sec-fetch-site': 'cross-site' },
+    })).status, 403);
+    assert.equal((await fetch(`${portal.origin}/mcp-app/unlisted.js`)).status, 404);
     assert.equal((await fetch(`${portal.origin}/admin/login`)).status, 404);
     assert.equal((await fetch(`${portal.origin}/app/hosts`)).status, 404);
     assert.equal((await fetch(`${portal.origin}/unlisted.js`)).status, 404);

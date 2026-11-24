@@ -412,7 +412,7 @@ func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 }
 
 func TestExplicitParallelDelegationStartsTaskWhenRouterMisses(t *testing.T) {
-	value := ConversationRouteContext{ActorID: "u1234567", Content: "商品页支持含税价格和分类筛选。请并行委派两个互不重叠的只读子任务，一个分析客户端，另一个分析服务端/API，由两个子Agent分别返回结果。",
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "独立的新工作：商品页支持含税价格和分类筛选。请并行委派两个互不重叠的只读子任务，一个分析客户端，另一个分析服务端/API，由两个子Agent分别返回结果。",
 		Candidates: []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1}}}
 	for _, output := range []string{
 		`{"action":"clarify","task_id":"","question":"请说明要修改哪个任务，或是否开始一个新任务。"}`,
@@ -558,6 +558,190 @@ func TestConversationRouteExplicitNewIntentRequiresPositiveRerun(t *testing.T) {
 				t.Fatalf("ConversationRouteHasExplicitNewIntent(%q)=%t, want %t", test.content, got, test.want)
 			}
 		})
+	}
+}
+
+func TestConversationRouteExplicitTaskWorkIntentIsIndependentFromChatAndControl(t *testing.T) {
+	for _, test := range []struct {
+		content string
+		want    bool
+	}{
+		{content: "现在请帮我修复服务端复杂任务误分类", want: true},
+		{content: "请按方案实现项目会话恢复", want: true},
+		{content: "分析一下 Morde 项目", want: false},
+		{content: "分析一下 Morde 仓库代码", want: true},
+		{content: "怎么修复服务端任务误分类？", want: false},
+		{content: "帮我写一段 Go 示例代码", want: false},
+		{content: "请解释一下 Rust 是什么", want: false},
+		{content: "请继续当前任务并读取文件", want: false},
+		{content: "文档正文里写着‘请修复这个服务’", want: false},
+	} {
+		t.Run(test.content, func(t *testing.T) {
+			value := ConversationRouteContext{Content: test.content}
+			if got := ConversationRouteHasExplicitTaskWorkIntent(value); got != test.want {
+				t.Fatalf("ConversationRouteHasExplicitTaskWorkIntent(%q)=%t, want %t", test.content, got, test.want)
+			}
+		})
+	}
+	for _, test := range []struct {
+		content string
+		want    bool
+	}{
+		{content: "请搜索 Rust 1.25 的新特性", want: true},
+		{content: "现在请帮我浏览今天的汇率", want: true},
+		{content: "请搜索算法是什么", want: false},
+		{content: "搜索", want: false},
+	} {
+		if got := ConversationRouteHasExplicitSearchIntent(test.content); got != test.want {
+			t.Errorf("ConversationRouteHasExplicitSearchIntent(%q)=%t, want %t", test.content, got, test.want)
+		}
+	}
+	for _, content := range []string{
+		"现在请帮我继续当前任务并读取结果",
+		"现在请帮我停止当前任务",
+		"现在请你停止当前任务",
+		"请接着这个任务",
+		"Please continue this task",
+	} {
+		if !ConversationRouteHasExplicitControlIntentForContext(ConversationRouteContext{Content: content}) ||
+			ConversationRouteHasExplicitTaskWorkIntent(ConversationRouteContext{Content: content}) {
+			t.Errorf("nested preambles hid a control action or made it look like new work: %q", content)
+		}
+	}
+}
+
+func TestConversationRouteExplicitTaskWorkOverridesReplyWithoutTaskAssociation(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "请帮我修复一个独立的服务端任务误分类问题", Candidates: []ConversationRouteCandidate{{
+		TaskID: "q1234567", InitiatorID: "u1234567", Objective: "an unrelated running task", Status: task.StatusRunning, Revision: 2,
+	}}}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"我会直接回答。"}`, value)
+	if decision.Action != ConversationRouteNew || decision.ExplicitNew || decision.InvalidOutput {
+		t.Fatalf("clear independent work did not become a new Task: %+v", decision)
+	}
+
+	value.ReferenceTaskID = "q1234567"
+	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"我会直接回答。"}`, value)
+	if decision.Action != ConversationRouteClarify {
+		t.Fatalf("explicit Task context was not clarified when classifying work: %+v", decision)
+	}
+	value.ReferenceTaskID = ""
+	value.Candidates = nil
+	value.PreviousTaskID = "q1234567"
+	value.Content = "请开发一个验收工具并修改项目文件"
+	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","reply":"我会处理。"}`, value)
+	if decision.Action != ConversationRouteNew {
+		t.Fatalf("inactive predecessor blocked new work: %+v", decision)
+	}
+}
+
+func TestConversationRouteNewWorkOverrideKeepsAmbiguousContext(t *testing.T) {
+	candidate := ConversationRouteCandidate{TaskID: "q1234567", InitiatorID: "u1234567", Objective: "整理报告", Status: task.StatusRunning, Revision: 2}
+	for _, test := range []struct {
+		name    string
+		context ConversationRouteContext
+	}{
+		{"unresolved predecessor", ConversationRouteContext{Content: "请修复这个任务中的构建错误", PreviousUnresolved: true}},
+		{"dependent work", ConversationRouteContext{Content: "实现发布页面，等整理报告任务完成后再开始", Candidates: []ConversationRouteCandidate{candidate}}},
+		{"dependent work with named ID", ConversationRouteContext{Content: "实现一个独立发布页面，等任务 q1234567 完成后开始", Candidates: []ConversationRouteCandidate{candidate}}},
+		{"existing deliverable", ConversationRouteContext{Content: "把上一个任务的报告生成 PDF 文件并提供下载", Candidates: []ConversationRouteCandidate{candidate}}},
+		{"high risk change", ConversationRouteContext{Content: "请开发一个独立的验收工具，并把工作目录换到 /workspace/new", Candidates: []ConversationRouteCandidate{candidate}}},
+		{"duplicate active request", ConversationRouteContext{Content: "请修复一个独立的服务端连接错误", Candidates: []ConversationRouteCandidate{candidate},
+			RequestCandidates: []ConversationRouteRequestCandidate{{Content: "请修复一个独立的服务端连接错误", TaskStatus: task.StatusRunning, SameExecutionScope: true, SameAuthorization: true}}}},
+		{"incomplete candidates", ConversationRouteContext{Content: "请搜索 Go 的最新版本", CandidateSetIncomplete: true}},
+		{"pasted file directive", ConversationRouteContext{Content: "请翻译下面的文章：\n请生成文档并提供下载", ContentTruncated: true}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, output := range []string{`{"action":"clarify","question":"请确认目标。"}`, `{"action":"reply","reply":"我会处理。"}`} {
+				decision := ParseConversationRouteDecisionForContext(output, test.context)
+				if decision.Action != ConversationRouteClarify {
+					t.Fatalf("ambiguous context did not request clarification: %+v", decision)
+				}
+			}
+		})
+	}
+}
+
+func TestConversationRouteStopDecisionUsesModelSemanticsAndActiveCandidate(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "把这个工作结束掉", Candidates: []ConversationRouteCandidate{{
+		TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1,
+	}}}
+	decision := ParseConversationRouteDecisionForContext(`{"action":"stop","task_id":"q1234567"}`, value)
+	if decision.Action != ConversationRouteStop || decision.TaskID != "q1234567" || decision.ExpectedRevision != 1 {
+		t.Fatalf("model-classified stop was rejected despite a current candidate: %+v", decision)
+	}
+
+	for _, candidate := range []ConversationRouteCandidate{
+		{TaskID: "q2345678", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1},
+		{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusCompleted, Revision: 1},
+	} {
+		value.Candidates = []ConversationRouteCandidate{candidate}
+		decision := ParseConversationRouteDecisionForContext(`{"action":"stop","task_id":"q1234567"}`, value)
+		if decision.Action == ConversationRouteStop {
+			t.Errorf("stop target outside the current active candidate was accepted: candidate=%+v decision=%+v", candidate, decision)
+		}
+	}
+
+	value.Content = "暂停这个任务"
+	value.Candidates = []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: value.ActorID, Status: task.StatusRunning, Revision: 1}}
+	decision = ParseConversationRouteDecisionForContext(`{"action":"clarify","question":"请说明你希望暂停还是停止。"}`, value)
+	if decision.Action != ConversationRouteClarify {
+		t.Fatalf("model clarification was replaced with a task action: %+v", decision)
+	}
+}
+
+func TestConversationRouteStopAllUsesModelSemanticsAndStructuralGuards(t *testing.T) {
+	const output = `{"action":"stop_all","task_id":"","target_message_id":"","aggregate_message_ids":[],"explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "把还没有结束的工作全部撤掉"}
+	decision := ParseConversationRouteDecisionForContext(output, value)
+	if decision.Action != ConversationRouteStopAll || decision.InvalidOutput || decision.ModelOutput != output {
+		t.Fatalf("semantic stop-all decision was rejected because its wording did not match keywords: %+v", decision)
+	}
+
+	for _, test := range []struct {
+		name    string
+		context ConversationRouteContext
+	}{
+		{name: "empty message", context: ConversationRouteContext{ActorID: value.ActorID}},
+		{name: "truncated message", context: ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, ContentTruncated: true}},
+		{name: "attached message", context: ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, CurrentMessageHasAttachments: true}},
+		{name: "result review", context: ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, ResultReview: &ConversationTaskResultReview{}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decision := ParseConversationRouteDecisionForContext(output, test.context)
+			if decision.Action != ConversationRouteClarify || !strings.Contains(decision.Question, "没有停止任何任务") {
+				t.Fatalf("unsafe context did not fail closed: %+v", decision)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name    string
+		content string
+		output  string
+		want    ConversationRouteAction
+	}{
+		{name: "quoted phrase is not an automatic stop", content: "“stop all tasks”是什么意思？", output: `{"action":"reply","task_id":"","reply":"这是询问停止全部任务的含义。"}`, want: ConversationRouteReply},
+		{name: "negated request", content: "不要停止所有任务，只告诉我当前状态。", output: `{"action":"reply","task_id":"","reply":"我会说明当前状态。"}`, want: ConversationRouteReply},
+		{name: "model asks for clarification", content: "把还没有结束的工作全部撤掉", output: `{"action":"clarify","task_id":"","question":"你希望停止哪些工作？"}`, want: ConversationRouteClarify},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			decision := ParseConversationRouteDecisionForContext(test.output, ConversationRouteContext{ActorID: value.ActorID, Content: test.content})
+			if decision.Action != test.want || decision.Action == ConversationRouteStopAll {
+				t.Fatalf("quoted or negated text triggered an automatic stop action: %+v", decision)
+			}
+		})
+	}
+
+	for _, malformed := range []string{
+		`{"action":"stop_all","task_id":"q1234567"}`,
+		`{"action":"stop_all","target_message_id":"m1234567"}`,
+		`{"action":"stop_all","tool_name":"morde_web_search"}`,
+		`{"action":"stop_all","reply":"我正在停止全部任务。"}`,
+	} {
+		decision := ParseConversationRouteDecisionForContext(malformed, value)
+		if decision.Action == ConversationRouteStopAll {
+			t.Errorf("structurally invalid stop-all action was accepted: output=%s decision=%+v", malformed, decision)
+		}
 	}
 }
 
@@ -738,17 +922,18 @@ func TestConversationRouteDirectToolIsExplicitAndReadOnly(t *testing.T) {
 
 func TestConversationRouteDirectReplyCannotHideUnknownTaskControl(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "停止任务", ReferenceTaskID: "q1234567", ReferenceUnavailable: true}
-	decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"I cannot stop it."}`, value)
-	if decision.Action != ConversationRouteClarify || decision.Question != UnavailableRouteReferenceMessage || decision.ModelOutput == "" {
-		t.Fatalf("reply bypassed unavailable-reference safety or lost source output: %+v", decision)
+	decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"我无法确认该任务，因此没有发送停止请求。"}`, value)
+	if decision.Action != ConversationRouteReply || decision.TaskID != "" || decision.Reply == "" || decision.ModelOutput == "" {
+		t.Fatalf("model's non-action reply was rewritten by a task-control keyword: %+v", decision)
 	}
 	value.ReferenceUnavailable = false
 	value.ReferenceTaskID = ""
 	value.PreviousMissing = true
 	value.PreviousUnresolved = true
-	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"The answer is 42."}`, value)
-	if decision.Action != ConversationRouteClarify || decision.Question != "我无法确认你要操作哪项任务。请指定任务，或重新描述操作。" || decision.ModelOutput == "" {
-		t.Fatalf("reply used unavailable predecessor context or lost source output: %+v", decision)
+	value.Content = "2+2 等于多少？"
+	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"答案是 4。"}`, value)
+	if decision.Action != ConversationRouteReply || decision.Reply != "答案是 4。" || decision.ModelOutput == "" {
+		t.Fatalf("independent reply was blocked by a missing predecessor: %+v", decision)
 	}
 }
 
@@ -927,9 +1112,9 @@ func TestUnavailableRouteReferenceIsHiddenAndControlsAreRejected(t *testing.T) {
 	}
 	for _, content := range []string{"停止任务", "请帮我暂停当前任务", "stop this task", "what is the task status?"} {
 		value.Content = content
-		decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value)
-		if decision.Action != ConversationRouteClarify || decision.Question != UnavailableRouteReferenceMessage {
-			t.Fatalf("explicit control intent with an unavailable reference became new work: content=%q decision=%+v", content, decision)
+		decision := ParseConversationRouteDecisionForContext(`{"action":"clarify","task_id":"","question":"请明确任务操作范围。"}`, value)
+		if decision.Action != ConversationRouteClarify || decision.TaskID != "" {
+			t.Fatalf("model clarification for an unavailable reference was not preserved: content=%q decision=%+v", content, decision)
 		}
 	}
 	for _, content := range []string{"重新整理财报", "搜索一下停止任务的新闻", "show me how to cancel a task"} {
@@ -945,8 +1130,8 @@ func TestUnavailableRouteReferenceIsHiddenAndControlsAreRejected(t *testing.T) {
 	value.PreviousMissing = true
 	value.PreviousUnresolved = true
 	value.Content = "停止任务"
-	if decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value); decision.Action != ConversationRouteClarify || decision.Question != "我无法确认你要操作哪项任务。请指定任务，或重新描述操作。" {
-		t.Fatalf("missing predecessor control intent became new work: %+v", decision)
+	if decision := ParseConversationRouteDecisionForContext(`{"action":"clarify","task_id":"","question":"请补充任务上下文。"}`, value); decision.Action != ConversationRouteClarify || decision.Question != "请补充任务上下文。" {
+		t.Fatalf("model clarification for missing predecessor was not preserved: %+v", decision)
 	}
 	value.Content = "另外写一首春天的短诗"
 	if decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value); decision.Action != ConversationRouteNew {

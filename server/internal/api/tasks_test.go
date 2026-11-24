@@ -1011,8 +1011,10 @@ func TestTaskDetailAllowsRestrictedStepDetails(t *testing.T) {
 func TestTaskStepDetailRouteIsNoStoreAndRejectsQueryOrBody(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	service := &taskServiceStub{stepDetail: app.TaskStepDetail{
-		TaskID: "q1234567", StepID: "s1234567", EventSequence: 8, ToolName: "morde_workspace_file_read",
-		DetailState: "available",
+		TaskID: "q1234567", StepID: "s1234567", EventSequence: 8, ToolName: "morde_web_search",
+		DetailState: "available", ContentEvidence: &app.TaskStepContentEvidence{
+			SHA256: strings.Repeat("a", 64), Preview: "Public search result with source URL: https://example.test/article", Truncated: true,
+		},
 	}}
 	engine := gin.New()
 	engine.Use(func(c *gin.Context) {
@@ -1026,7 +1028,9 @@ func TestTaskStepDetailRouteIsNoStoreAndRejectsQueryOrBody(t *testing.T) {
 	engine.ServeHTTP(response, request)
 	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" ||
 		response.Header().Get("Pragma") != "no-cache" || response.Header().Get("Referrer-Policy") != "no-referrer" ||
-		!strings.Contains(response.Body.String(), `"detail_state":"available"`) || service.stepDetailCalls != 1 ||
+		!strings.Contains(response.Body.String(), `"detail_state":"available"`) ||
+		!strings.Contains(response.Body.String(), `"content_evidence":{"sha256":"`+strings.Repeat("a", 64)+`","preview":"Public search result with source URL: https://example.test/article","truncated":true}`) ||
+		service.stepDetailCalls != 1 ||
 		service.stepDetailTaskID != "q1234567" || service.stepDetailStepID != "s1234567" {
 		t.Fatalf("step detail response=%d headers=%v body=%s calls=%d", response.Code, response.Header(), response.Body.String(), service.stepDetailCalls)
 	}

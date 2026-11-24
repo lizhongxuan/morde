@@ -104,7 +104,7 @@ export function Reviews() {
   const renderItem = (item: TaskApprovalItem) => <TaskApprovalCard key={`${item.task_id}:${item.approval.id}`}
     compact reviewInbox approval={item.approval}
     submitting={respond.isPending && respond.variables?.item.approval.id === item.approval.id}
-    onDecision={(decision) => respond.mutate({ item, decision, key: approvalKey(item, decision) })} />;
+    onDecision={(decision) => respond.mutateAsync({ item, decision, key: approvalKey(item, decision) })} />;
   const hasPending = pendingCount === undefined ? pending.length > 0 || Boolean(hasNextPage) : pendingCount > 0;
   const canNext = currentPage < pageCount && !isFetchingNextPage && !cursorLoop &&
     (pending.length >= targetCount || Boolean(hasNextPage));

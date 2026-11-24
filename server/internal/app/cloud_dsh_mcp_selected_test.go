@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -187,6 +188,52 @@ func TestSelectedMCPDiscoveryIsLazyAndChecksToolSchema(t *testing.T) {
 	result, err := broker.Execute(context.Background(), claimed, call)
 	if err != nil || result.Status != AgentToolSucceeded || client.callCalls != 1 || client.lastTool != "lookup" {
 		t.Fatalf("approved selected call = %+v calls=%d err=%v", result, client.callCalls, err)
+	}
+}
+
+func TestSelectedMCPCanCallToolBeyondModelDefinitionLimit(t *testing.T) {
+	tools := make([]MCPConnectorToolDefinition, 65)
+	for index := range tools {
+		tools[index] = MCPConnectorToolDefinition{
+			Name:        fmt.Sprintf("lookup_%02d", index),
+			Description: "Find a synthetic record",
+			InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`),
+		}
+	}
+	client := &cloudDSHMCPClientStub{tools: tools, result: MCPConnectorToolResult{Text: []string{"synthetic result"}}}
+	broker, store, claimed := selectedMCPTestFixture(t, client)
+
+	definitions, err := broker.Definitions(context.Background(), claimed)
+	if err != nil || len(definitions) > maxCloudDSHToolDefinitions {
+		t.Fatalf("bounded model tool definitions = %d, err=%v", len(definitions), err)
+	}
+	if _, err := validateAgentTools(definitions); err != nil {
+		t.Fatalf("model tool definitions are invalid: %v", err)
+	}
+	mcpDefinitionCount := 0
+	for _, definition := range definitions {
+		if definition.Name == cloudDSHMCPDiscoverToolName || definition.Name == cloudDSHMCPCallToolName {
+			mcpDefinitionCount++
+		}
+	}
+	if mcpDefinitionCount != 2 {
+		t.Fatalf("65-item catalog changed the fixed MCP definitions: count=%d definitions=%+v", mcpDefinitionCount, definitions)
+	}
+	discoverSelectedMCPForTest(t, broker, claimed, "k1234567")
+	var pinned []MCPConnectorToolDefinition
+	if err := json.Unmarshal(store.grants[0].ToolSchema, &pinned); err != nil || len(pinned) != 65 || pinned[64].Name != "lookup_64" {
+		t.Fatalf("65-item MCP catalog was not pinned completely: count=%d err=%v", len(pinned), err)
+	}
+
+	call := selectedMCPCallForTest(t, "selected-65th-tool", "k1234567", "lookup_64", `{"query":"local"}`)
+	result, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || result.Status != AgentToolNeedsUser || client.callCalls != 0 {
+		t.Fatalf("65th MCP tool bypassed approval or failed to prepare: result=%+v calls=%d err=%v", result, client.callCalls, err)
+	}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	result, err = broker.Execute(context.Background(), store.details.Task, call)
+	if err != nil || result.Status != AgentToolSucceeded || client.callCalls != 1 || client.lastTool != "lookup_64" {
+		t.Fatalf("approved 65th MCP tool was not dispatched exactly once: result=%+v calls=%d tool=%q err=%v", result, client.callCalls, client.lastTool, err)
 	}
 }
 

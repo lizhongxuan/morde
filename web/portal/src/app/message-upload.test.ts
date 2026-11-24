@@ -7,6 +7,16 @@ const serviceID = '00000000-0000-4000-8000-000000000001';
 afterEach(() => vi.unstubAllGlobals());
 
 describe('resumable message upload', () => {
+  it('does not treat 8 KiB as a message cap and uses UTF-8 bytes for the upload threshold', () => {
+    for (const size of [8191, 8192, 8193]) {
+      expect(needsMessageUpload('x'.repeat(size))).toBe(false);
+      expect(needsMessageUpload('中'.repeat(size))).toBe(false);
+    }
+    expect(needsMessageUpload('🙂'.repeat(8191))).toBe(false);
+    expect(needsMessageUpload('🙂'.repeat(8192))).toBe(false);
+    expect(needsMessageUpload('🙂'.repeat(8193))).toBe(true);
+  });
+
   it('retries missing UTF-8 chunks using the original identity and verifies the full receipt', async () => {
     vi.stubGlobal('crypto', webcrypto);
     const targetBytes = 200 * 1024 + 1;

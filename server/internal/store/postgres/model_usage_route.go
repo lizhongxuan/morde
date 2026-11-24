@@ -1026,6 +1026,8 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 		return !value.Acknowledge && value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 &&
 			len(value.AggregateMessageIDs) == 0 && value.Question != "" &&
 			utf8.ValidString(value.Question) && utf8.RuneCountInString(value.Question) <= 200
+	case app.ConversationRouteStopAll:
+		return app.ValidConversationRouteStopDecision(context, value)
 	case app.ConversationRouteSteer:
 		if value.Acknowledge || value.TaskID == "" || value.TargetMessageID != "" || value.ExplicitNew || value.Question != "" ||
 			value.Reply != "" || value.ExpectedRevision < 0 || len(value.DependencyTaskIDs) != 0 || len(value.AggregateMessageIDs) != 0 ||
@@ -1038,6 +1040,9 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 			}
 		}
 	case app.ConversationRouteUpdate, app.ConversationRouteStatus, app.ConversationRouteStop:
+		if value.Action == app.ConversationRouteStop && !app.ValidConversationRouteStopDecision(context, value) {
+			return false
+		}
 		if value.Action != app.ConversationRouteUpdate && value.Acknowledge || value.ExplicitNew || value.Question != "" ||
 			value.Reply != "" || len(value.DependencyTaskIDs) != 0 || len(value.AggregateMessageIDs) != 0 {
 			return false

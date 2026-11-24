@@ -9595,6 +9595,16 @@ export interface components {
             result: string | null;
             truncated: boolean;
             execution?: components["schemas"]["TaskStepExecution"];
+            content_evidence?: components["schemas"]["TaskStepContentEvidence"];
+        };
+        /** @description Bounded, persisted excerpt from a successful built-in web search/read result, returned only after Task access and evidence identity checks. Treat preview text as untrusted web content; it is not a structured citation list. SHA-256 covers the full captured text before preview truncation. */
+        TaskStepContentEvidence: {
+            /** @description SHA-256 of the full captured result text. */
+            sha256: string;
+            /** @description UTF-8-safe */
+            preview: string;
+            /** @description True when the preview contains only a prefix of the full captured result text. */
+            truncated: boolean;
         };
         /** @description Bounded, redacted execution details for an authorized Task reader; absent fields are unavailable or not applicable. */
         TaskStepExecution: {

@@ -6,6 +6,7 @@ import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
 
 const blockedPaths = ["/admin", "/admin/", "/app", "/app/"];
+const approvalMcpAppAssets = new Set(["mcp-app/task-approval.js", "mcp-app/task-approval.css"]);
 const hopHeaders = new Set(["connection", "host", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade"]);
 // shortcut: proxy request bodies cap at 16 MiB, raise this when a supported API payload needs more.
 const maxProxyRequestBytes = 16 << 20;
@@ -143,9 +144,12 @@ export async function startLocalPortalServer(directory: string, serviceOrigin: s
     let url: URL;
     try { url = new URL(request.url ?? "/", origin); } catch { writeError(response, 400, "Invalid request"); return; }
     if (url.origin !== origin || url.username || url.password) { writeError(response, 403, "Forbidden"); return; }
+    // Sandboxed srcdoc has an opaque origin and fetches only these public assets as cross-site.
+    const sandboxedApprovalAsset = (request.method === "GET" || request.method === "HEAD") && !url.search &&
+      approvalMcpAppAssets.has(url.pathname.slice(1));
     const requestOrigin = request.headers.origin;
-    if (requestOrigin && requestOrigin !== origin) { writeError(response, 403, "Forbidden"); return; }
-    if (request.headers["sec-fetch-site"] === "cross-site") { writeError(response, 403, "Forbidden"); return; }
+    if (requestOrigin && requestOrigin !== origin && !(sandboxedApprovalAsset && requestOrigin === "null")) { writeError(response, 403, "Forbidden"); return; }
+    if (request.headers["sec-fetch-site"] === "cross-site" && !sandboxedApprovalAsset) { writeError(response, 403, "Forbidden"); return; }
     if (blockedPaths.some((path) => url.pathname === path || url.pathname.startsWith(`${path}/`))) { writeError(response, 404, "Not found"); return; }
 
     if (url.pathname === "/api" || url.pathname.startsWith("/api/") || url.pathname === "/mcp" || url.pathname.startsWith("/mcp/") ||
@@ -159,7 +163,7 @@ export async function startLocalPortalServer(directory: string, serviceOrigin: s
     let pathname: string;
     try { pathname = decodeURIComponent(url.pathname); } catch { writeError(response, 400, "Invalid path"); return; }
     const route = pathname === "/" || !extname(pathname);
-    if (!route && !pathname.startsWith("/assets/") && !pathname.startsWith("/ocr/")) { writeError(response, 404, "Not found"); return; }
+    if (!route && !pathname.startsWith("/assets/") && !pathname.startsWith("/ocr/") && !approvalMcpAppAssets.has(pathname.slice(1))) { writeError(response, 404, "Not found"); return; }
     const relativePath = route ? "index.html" : pathname.slice(1);
     const candidatePath = resolve(root, relativePath);
     void fs.realpath(candidatePath).then((filePath) => {

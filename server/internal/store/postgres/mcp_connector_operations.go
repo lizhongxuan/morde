@@ -32,13 +32,28 @@ func (s *Store) PrepareMCPConnectorOperation(ctx context.Context, value app.MCPC
 		if err := lockMCPConnectorTaskLease(ctx, tx, value, leaseOwner); err != nil {
 			return err
 		}
+		stored, err := getMCPConnectorOperationForUpdate(ctx, tx, value.OwnerID, value.TaskID, value.ConnectorID, value.Key)
+		if err == nil {
+			if !sameMCPConnectorOperationRequest(stored, value) {
+				return idempotencyConflict()
+			}
+			// An unknown outcome must never be resent. Returning the stored
+			// ledger record is a read-only replay, so it remains available after
+			// the connector credential or selection used for dispatch is revoked.
+			if stored.Status == task.OperationUnknown {
+				result, replayed = stored, true
+				return nil
+			}
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return fmt.Errorf("read MCP connector operation before authorization: %w", err)
+		}
 		if err := lockMCPConnectorOperationApproval(ctx, tx, value); err != nil {
 			return err
 		}
 		if err := lockCurrentTaskMCPConnectorGrant(ctx, tx, value); err != nil {
 			return err
 		}
-		stored, err := getMCPConnectorOperationForUpdate(ctx, tx, value.OwnerID, value.TaskID, value.ConnectorID, value.Key)
+		stored, err = getMCPConnectorOperationForUpdate(ctx, tx, value.OwnerID, value.TaskID, value.ConnectorID, value.Key)
 		if err == nil {
 			if !sameMCPConnectorOperationRequest(stored, value) {
 				return idempotencyConflict()

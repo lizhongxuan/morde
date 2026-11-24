@@ -526,6 +526,7 @@ WHERE message_id=$1 RETURNING aggregation_deadline`, root.Message.ID).Scan(&root
 	stop := f.receive(t, "route-stop-no-control", "Stop that work", app.ConversationRoutingInput{})
 	if err := f.store.ApplyConversationRoute(ctx, stop, app.ConversationRouteSnapshot{}, app.ConversationRouteDecision{
 		Action: app.ConversationRouteStop, TargetMessageID: root.Message.ID,
+		ModelOutput: fmt.Sprintf(`{"action":"stop","target_message_id":%q}`, root.Message.ID),
 	}); domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("stop using a schedule-only credential = %v, want unauthenticated", err)
 	}
@@ -557,6 +558,7 @@ WHERE message_id=$1`, root.Message.ID); err != nil {
 	snapshot.Context.ModelID = "p1234567"
 	if err := f.store.ApplyConversationRoute(ctx, stop, snapshot, app.ConversationRouteDecision{
 		Action: app.ConversationRouteStop, TargetMessageID: root.Message.ID,
+		ModelOutput: fmt.Sprintf(`{"action":"stop","target_message_id":%q}`, root.Message.ID),
 	}); err != nil {
 		t.Fatal(err)
 	}

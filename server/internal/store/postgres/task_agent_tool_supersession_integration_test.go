@@ -627,6 +627,7 @@ func TestMCPHubAndFileFetchFinalDispatchGatesReturnPendingInput(t *testing.T) {
 			OwnerID: fixture.task.OwnerID, ConnectorID: connectorID, Key: app.AgentOperationKey(callID), ToolName: "search",
 			ConnectorRevision: grant.ConnectorRevision, CredentialVersion: grant.CredentialVersion, GrantVersion: grant.GrantVersion, LeaseVersion: fixture.task.Lease.Version,
 			RequestHash: hashBytes("S03 MCP request"), Status: task.OperationPrepared}
+		operation = bindApprovedMCPConnectorOperationForTest(t, ctx, fixture.route.store, operation)
 		prepared, replayed, err := fixture.route.store.PrepareMCPConnectorOperation(ctx, operation, fixture.task.Lease.Owner)
 		if err != nil || replayed {
 			t.Fatalf("prepare MCP operation = %+v replayed=%t err=%v", prepared, replayed, err)

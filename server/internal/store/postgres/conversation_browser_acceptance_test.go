@@ -766,6 +766,7 @@ const browserAcceptanceStatusContent = "本机浏览器验收：进度如何"
 const browserAcceptanceIndependentContent = "本机浏览器验收：独立总结当前会话"
 const browserAcceptanceQuickReplyContent = "Morde browser acceptance: quick reply"
 const browserAcceptanceAcknowledgedContent = "Morde browser acceptance: long background task"
+const browserAcceptanceStopAllContent = "本地验收：结束我的全部活动工作"
 const browserAcceptanceLongHistorySentinel = "ORCHID-PC-HISTORY-SENTINEL-8472"
 
 type browserAcceptanceModel struct {
@@ -1414,6 +1415,10 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 				PriorRequests []app.ConversationRouteRequestCandidate `json:"prior_requests"`
 			}
 			if json.Unmarshal([]byte(request.Input[0].Text), &input) == nil {
+				if input.Message == browserAcceptanceStopAllContent {
+					return app.ModelResponse{Text: `{"action":"stop_all"}`, StopReason: "stop",
+						Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+				}
 				if input.Message == browserActivityCompletionRaceSteer {
 					for _, candidate := range input.Tasks {
 						if candidate.Objective != browserActivityObjectives["completion-race"] || candidate.Status != task.StatusRunning {

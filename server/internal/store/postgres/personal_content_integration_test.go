@@ -23,6 +23,7 @@ func TestPostgresPersonalContentObjectsAreOwnerScopedVersionedAndSyncable(t *tes
 	objects := []personal.Object{
 		{ObjectType: personal.ObjectTypeProfile, ObjectID: personal.ProfileObjectID, Body: json.RawMessage(`{"name":"Muse","avatar":"dragon"}`)},
 		{ObjectType: personal.ObjectTypeMemory, ObjectID: "global", Body: json.RawMessage(`{"content":"A selected memory.","category":"fact"}`)},
+		{ObjectType: personal.ObjectTypeRuleCandidate, ObjectID: "r_0123abcd", Body: json.RawMessage(`{"scope":"personal","status":"candidate","source_memory_id":"global","source_memory_revision":1}`)},
 		{ObjectType: personal.ObjectTypeSoul, ObjectID: "default", Body: json.RawMessage(`{"name":"Muse","style":"warm","lang":"en","content":"Be clear."}`)},
 		{ObjectType: personal.ObjectTypeDiary, ObjectID: "2026-11-02", Body: json.RawMessage(`{"date":"2026-11-02","content":"<!-- 2026-11-02 12:00:00 -->\nA selected entry."}`)},
 		{ObjectType: personal.ObjectTypeFeedPost, ObjectID: "feedpost_2026-11-02-01", Body: json.RawMessage(`{"title":"A note","type":"reflection","created_at":"2026-11-02T12:00:00Z","liked":true,"body":"A selected post."}`)},
@@ -139,7 +140,18 @@ func TestPostgresPersonalContentObjectsAreOwnerScopedVersionedAndSyncable(t *tes
 	}
 
 	sequence := watermark
-	for i, object := range objects {
+	updateOrder := make([]personal.Object, 0, len(objects))
+	for _, object := range objects {
+		if object.ObjectType == personal.ObjectTypeRuleCandidate {
+			updateOrder = append(updateOrder, object)
+		}
+	}
+	for _, object := range objects {
+		if object.ObjectType != personal.ObjectTypeRuleCandidate {
+			updateOrder = append(updateOrder, object)
+		}
+	}
+	for i, object := range updateOrder {
 		updatedObject := personal.Object{ObjectType: object.ObjectType, ObjectID: object.ObjectID, Body: updatedPersonalContentBody(object)}
 		update := personalContentMutationForTest(t, owner.ID, 200+i, updatedObject, 1)
 		updated, err := store.ApplyPersonalMutation(ctx, principal, update)
@@ -166,7 +178,7 @@ func TestPostgresPersonalContentObjectsAreOwnerScopedVersionedAndSyncable(t *tes
 	if err != nil || len(postSnapshotChanges.Items) != len(objects)*2 {
 		t.Fatalf("content update/delete change page has %d items, want %d: %v", len(postSnapshotChanges.Items), len(objects)*2, err)
 	}
-	for i, object := range objects {
+	for i, object := range updateOrder {
 		update, deletion := postSnapshotChanges.Items[i*2], postSnapshotChanges.Items[i*2+1]
 		if update.ObjectType != object.ObjectType || update.ObjectID != object.ObjectID || update.Operation != "upsert" || update.Revision != 2 ||
 			deletion.ObjectType != object.ObjectType || deletion.ObjectID != object.ObjectID || deletion.Operation != "delete" || deletion.Revision != 3 {
@@ -214,6 +226,8 @@ func updatedPersonalContentBody(object personal.Object) json.RawMessage {
 		return json.RawMessage(`{"name":"Updated Muse","avatar":"dragon"}`)
 	case personal.ObjectTypeMemory:
 		return json.RawMessage(`{"content":"Updated selected memory.","category":"fact"}`)
+	case personal.ObjectTypeRuleCandidate:
+		return json.RawMessage(`{"scope":"personal","status":"candidate","source_memory_id":"global","source_memory_revision":1}`)
 	case personal.ObjectTypeSoul:
 		return json.RawMessage(`{"name":"Muse","style":"warm","lang":"en","content":"Be concise."}`)
 	case personal.ObjectTypeDiary:

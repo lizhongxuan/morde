@@ -1,7 +1,7 @@
 import { Children, isValidElement, useEffect, useRef, useState, type HTMLAttributes, type ReactNode } from 'react';
 import { useOptionalToast } from '../app/toast';
 
-type NoticeProps = HTMLAttributes<HTMLDivElement> & { children: ReactNode };
+type NoticeProps = HTMLAttributes<HTMLDivElement> & { children: ReactNode; inline?: boolean };
 
 function errorText(node: ReactNode): string {
   if (typeof node === 'string' || typeof node === 'number') return String(node);
@@ -9,20 +9,21 @@ function errorText(node: ReactNode): string {
   return Children.toArray(node).map(errorText).join('');
 }
 
-export function FloatingError({ children, className = '', role = 'alert', ...props }: NoticeProps) {
+export function FloatingError({ children, className = '', role = 'alert', inline = false, ...props }: NoticeProps) {
   const [dismissed, setDismissed] = useState(false);
   const toast = useOptionalToast();
   const message = errorText(children).replace(/\s+/g, ' ').trim();
   const toastID = useRef<number | null>(null);
   const anchor = useRef<HTMLSpanElement>(null);
   useEffect(() => {
-    if (!toast || !message || anchor.current?.parentElement?.closest('[hidden]')) return;
+    if (inline || !toast || !message || anchor.current?.parentElement?.closest('[hidden]')) return;
     toastID.current = toast.notify(message, 'error');
     return () => {
       if (toastID.current !== null) toast.dismiss(toastID.current);
       toastID.current = null;
     };
-  }, [message, toast?.dismiss, toast?.notify]);
+  }, [inline, message, toast?.dismiss, toast?.notify]);
+  if (inline) return <div {...props} className={`toast-error-notice ${className}`.trim()} role={role}>{children}</div>;
   if (toast) return <span ref={anchor} hidden />;
   if (dismissed) return null;
   return <div {...props} className={`toast-error-notice ${className}`.trim()} role={role}>

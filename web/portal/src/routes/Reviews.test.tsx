@@ -7,6 +7,7 @@ import { portalApi } from '../app/api';
 import type { components } from '../api/schema';
 import { ApiError } from '../api/client';
 import { ToastNoticeCenter, ToastProvider } from '../app/toast';
+import { submitTaskApprovalMcpAppDecision, taskApprovalMcpAppDriver } from '../components/TaskApprovalMcpApp.test-utils';
 import { Reviews } from './Reviews';
 
 const timestamp = '2026-11-15T08:00:00.000Z';
@@ -60,27 +61,23 @@ describe('Reviews', () => {
     expect(portalApi.tasks).not.toHaveBeenCalled();
   });
 
-  it('shows concise pending cards, opens the full details in a dialog, and submits the snapshot version', async () => {
+  it('shows the pending approval as an isolated MCP App and submits the snapshot version', async () => {
     const pendingItems = ['k1234567', 'k2234567', 'k3234567', 'k4234567', 'k5234567'].map((id) => item(id, 'pending'));
     vi.spyOn(portalApi, 'taskApprovals').mockResolvedValue({ items: [...pendingItems, item('k7654321', 'approved')],
       next_cursor: null, pending_count: 5 });
     const respond = vi.spyOn(portalApi, 'respondToTaskApproval').mockResolvedValue({
       task_id: 'q1234567', action: 'respond', status: 'queued', unsettled_operation_ids: [],
     });
-    const user = userEvent.setup();
     renderReviews();
 
     const card = await screen.findByRole('group', { name: '审批 k1234567' });
     expect(screen.getAllByRole('group', { name: /^审批 /u })).toHaveLength(5);
     expect(screen.queryByRole('group', { name: '审批 k7654321' })).not.toBeInTheDocument();
     expect(screen.queryByText(/已处理的操作/u)).not.toBeInTheDocument();
-    expect(within(card).getAllByRole('button')).toHaveLength(3);
-    await user.click(within(card).getByRole('button', { name: '查看操作详情：审批 k1234567' }));
-    const dialog = screen.getByRole('dialog');
-    expect(dialog).toHaveTextContent('仅读取已授权目录');
-    expect(dialog).toHaveTextContent('可在云端电脑设置中撤销授权');
-    await user.click(within(dialog).getByRole('button', { name: '关闭' }));
-    await user.click(within(card).getByRole('button', { name: '允许：审批 k1234567' }));
+    const driver = taskApprovalMcpAppDriver(within(card).getByTitle('MCP App 操作审批') as HTMLIFrameElement);
+    await driver.initialize();
+    expect(driver.currentApproval()).toMatchObject({ risk: '仅读取已授权目录', revocation: '可在云端电脑设置中撤销授权' });
+    await driver.call('approve-from-review', { approval_id: 'k1234567', version: 3, decision: 'approve' });
     await waitFor(() => expect(respond).toHaveBeenCalledWith('q1234567', 'k1234567',
       { version: 3, decision: 'approve' }, expect.any(String)));
     expect(await screen.findByText('已允许本次操作，任务后续状态等待更新。')).toBeInTheDocument();
@@ -93,11 +90,10 @@ describe('Reviews', () => {
     const respond = vi.spyOn(portalApi, 'respondToTaskApproval').mockResolvedValue({
       task_id: 'q1234567', action: 'respond', status: 'queued', unsettled_operation_ids: [],
     });
-    const user = userEvent.setup();
     renderReviews();
 
     const card = await screen.findByRole('group', { name: '审批 k1234567' });
-    await user.click(within(card).getByRole('button', { name: '拒绝：审批 k1234567' }));
+    await submitTaskApprovalMcpAppDecision(within(card).getByTitle('MCP App 操作审批') as HTMLIFrameElement, 'reject');
 
     await waitFor(() => expect(respond).toHaveBeenCalledWith('q1234567', 'k1234567',
       { version: 3, decision: 'reject' }, expect.any(String)));
@@ -144,17 +140,15 @@ describe('Reviews', () => {
     vi.spyOn(portalApi, 'respondToTaskApproval').mockRejectedValue(new ApiError({
       message: 'approval version is stale', code: 'conflict', status: 409,
     }));
-    const user = userEvent.setup();
     renderReviews();
 
     const pending = await screen.findByRole('group', { name: '审批 k1234567' });
-    await user.click(within(pending).getByRole('button', { name: '允许：审批 k1234567' }));
+    await submitTaskApprovalMcpAppDecision(within(pending).getByTitle('MCP App 操作审批') as HTMLIFrameElement, 'approve');
 
     expect(await screen.findByText('当前没有需要你确认的操作。')).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveTextContent('审核未确认：当前状态已变化，请刷新后核对');
     expect(list).toHaveBeenCalledTimes(2);
-    expect(screen.queryByRole('button', { name: '允许：审批 k1234567' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '拒绝：审批 k1234567' })).not.toBeInTheDocument();
+    expect(screen.queryByTitle('MCP App 操作审批')).not.toBeInTheDocument();
   });
 
   it('removes review actions after access is revoked and the authorized list refreshes', async () => {
@@ -164,18 +158,16 @@ describe('Reviews', () => {
     vi.spyOn(portalApi, 'respondToTaskApproval').mockRejectedValue(new ApiError({
       message: 'approval permission was revoked', code: 'forbidden', status: 403,
     }));
-    const user = userEvent.setup();
     renderReviews();
 
     const pending = await screen.findByRole('group', { name: '审批 k1234567' });
-    await user.click(within(pending).getByRole('button', { name: '允许：审批 k1234567' }));
+    await submitTaskApprovalMcpAppDecision(within(pending).getByTitle('MCP App 操作审批') as HTMLIFrameElement, 'approve');
 
     expect(await screen.findByText('当前没有需要你确认的操作。')).toBeInTheDocument();
     expect(screen.getByRole('alert')).toHaveTextContent('审核未确认');
     expect(list).toHaveBeenCalledTimes(2);
     expect(screen.queryByText('审批 k1234567')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '允许：审批 k1234567' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '拒绝：审批 k1234567' })).not.toBeInTheDocument();
+    expect(screen.queryByTitle('MCP App 操作审批')).not.toBeInTheDocument();
   });
 
   it('reuses the approval idempotency key when a lost response leaves the approval pending', async () => {
@@ -184,15 +176,16 @@ describe('Reviews', () => {
     const respond = vi.spyOn(portalApi, 'respondToTaskApproval')
       .mockRejectedValueOnce(new Error('connection interrupted'))
       .mockResolvedValueOnce({ task_id: 'q1234567', action: 'respond', status: 'queued', unsettled_operation_ids: [] });
-    const user = userEvent.setup();
     renderReviews();
 
     const card = await screen.findByRole('group', { name: '审批 k1234567' });
-    await user.click(within(card).getByRole('button', { name: '允许：审批 k1234567' }));
+    const driver = taskApprovalMcpAppDriver(within(card).getByTitle('MCP App 操作审批') as HTMLIFrameElement);
+    await driver.initialize();
+    const callArguments = { approval_id: 'k1234567', version: 3, decision: 'approve' };
+    await driver.call('retry-1', callArguments);
     await waitFor(() => expect(respond).toHaveBeenCalledTimes(1));
     await waitFor(() => expect(list).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(screen.getByRole('button', { name: '允许：审批 k1234567' })).toBeEnabled());
-    await user.click(screen.getByRole('button', { name: '允许：审批 k1234567' }));
+    await driver.call('retry-2', callArguments);
     await waitFor(() => expect(respond).toHaveBeenCalledTimes(2));
 
     expect(respond.mock.calls[1]?.[3]).toBe(respond.mock.calls[0]?.[3]);

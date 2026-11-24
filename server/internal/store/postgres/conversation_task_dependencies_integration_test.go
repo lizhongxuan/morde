@@ -7,6 +7,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/task"
 )
 
@@ -60,5 +61,65 @@ func TestConversationRouteTaskDependencyWaitsForAndReceivesExactResult(t *testin
 		claimed.DependencyResults[0].TaskID != prerequisiteID || claimed.DependencyResults[0].RequiredRevision != 0 ||
 		claimed.DependencyResults[0].Result != "Revenue was 42." {
 		t.Fatalf("dependent Task did not receive the exact prerequisite result: task=%+v found=%t err=%v", claimed, found, err)
+	}
+}
+
+func TestConversationRouteRejectsDependencyOutsideProjectScope(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	prerequisiteProject := createProjectStoreFixture(t, ctx, f.store, f.ownerID, "Prerequisite scope", "Synthetic scope fixture", "dependency-prerequisite-project")
+	dependentProject := createProjectStoreFixture(t, ctx, f.store, f.ownerID, "Dependent scope", "Synthetic scope fixture", "dependency-dependent-project")
+	createProjectConversation := func(projectID, key string) string {
+		t.Helper()
+		conversationID := mustID(t, domain.NewConversationID)
+		if _, _, err := f.store.CreateProjectConversation(ctx, f.ownerID, conversation.Conversation{
+			ID: conversationID, OwnerID: f.ownerID, ProjectID: projectID, Title: "Dependency scope fixture",
+		}, testIdempotency(f.ownerID, "project_conversation.create", key)); err != nil {
+			t.Fatalf("create project conversation %s: %v", projectID, err)
+		}
+		return conversationID
+	}
+	prerequisiteConversationID := createProjectConversation(prerequisiteProject.ID, "dependency-prerequisite-conversation")
+	dependentConversationID := createProjectConversation(dependentProject.ID, "dependency-dependent-conversation")
+	prerequisiteClaim := f.receiveInConversation(t, prerequisiteConversationID, "dependency-project-prerequisite", "Prepare project data",
+		app.ConversationRoutingInput{ProjectID: prerequisiteProject.ID})
+	prerequisiteSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, prerequisiteClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prerequisiteSnapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, prerequisiteClaim, prerequisiteSnapshot,
+		app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatal(err)
+	}
+	var prerequisiteID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, prerequisiteClaim.Message.ID).Scan(&prerequisiteID); err != nil {
+		t.Fatal(err)
+	}
+
+	dependentClaim := f.receiveInConversation(t, dependentConversationID, "dependency-project-dependent", "Use the prepared project data",
+		app.ConversationRoutingInput{ProjectID: dependentProject.ID})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, dependentClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range snapshot.Context.Candidates {
+		if candidate.TaskID == prerequisiteID {
+			t.Fatal("route snapshot exposed a Task from a different project scope")
+		}
+	}
+	snapshot.Context.ModelID = "p1234567"
+	err = f.store.ApplyConversationRoute(ctx, dependentClaim, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteNew, DependencyTaskIDs: []string{prerequisiteID},
+	})
+	if domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("cross-scope dependency error = %v, want conflict", err)
+	}
+	var taskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(task_id,'') FROM conversation_messages WHERE id=$1`, dependentClaim.Message.ID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	if taskID != "" {
+		t.Fatalf("cross-scope dependency created Task %s", taskID)
 	}
 }

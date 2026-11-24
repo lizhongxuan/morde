@@ -87,19 +87,22 @@ function assertBalancedToolMessages(request) {
   }
 }
 
-test('passes an 18 KB current message intact to the model within its context budget',
+test('passes a current message above 8K DSH-estimated tokens intact within its context budget',
   { timeout: 15_000 }, async t => {
     const prefix = 'head-anchor\n'
     const middle = '\nmiddle-anchor\n'
     const suffix = '\ntail-anchor'
-    const filler = 18 * 1024 - prefix.length - middle.length - suffix.length
+    const filler = 36 * 1024 - prefix.length - middle.length - suffix.length
     const left = Math.floor(filler / 2)
     const content = `${prefix}${'a'.repeat(left)}${middle}${'b'.repeat(filler - left)}${suffix}`
-    assert.equal(Buffer.byteLength(content), 18 * 1024)
+    assert.equal(Buffer.byteLength(content), 36 * 1024)
+    const estimatedMessageTokens = estimateMessage({ role: 'user', content: [{ type: 'text', text: content }] })
+    assert.ok(estimatedMessageTokens > 8_192,
+      `single current message must exceed 8K DSH TokenMeter estimate; got ${estimatedMessageTokens}`)
     const start = {
       type: 'start', version: 1, task_id: 'task_long_input', owner_id: 'owner_long_input',
       agent_id: 'agent_long_input', generation: 1, authorization_version: 1, session_id: 'session_long_input', task_revision: 1,
-      model: 'test-model', tools: [], context_window_tokens: 32_768, max_tokens: 512,
+      model: 'test-model', tools: [], context_window_tokens: 16_384, max_tokens: 512,
       initial_message: { message_id: 'm1234567', content, attachment_ids: [] },
     }
     const child = spawn(process.execPath, ['bin.mjs'], {
@@ -133,6 +136,8 @@ test('passes an 18 KB current message intact to the model within its context bud
     const [code] = await once(child, 'close')
     assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
     assert.equal(modelRequests.length, 1)
+    assert.ok(requestTokenMeterEstimate(modelRequests[0]) <= start.context_window_tokens - start.max_tokens,
+      'complete model input plus reserved output must fit the declared context window')
     const request = JSON.stringify(modelRequests[0].messages)
     assert.ok(request.includes(JSON.stringify(content).slice(1, -1)),
       'model request omitted or truncated the current message')

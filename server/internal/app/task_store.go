@@ -282,7 +282,7 @@ type TaskStepDetail struct {
 	Truncated       bool                            `json:"truncated"`
 	Execution       *TaskStepExecution              `json:"execution,omitempty"`
 	ShellExecution  *TaskStepShellExecutionEvidence `json:"-"`
-	ContentEvidence *TaskStepContentEvidence        `json:"-"`
+	ContentEvidence *TaskStepContentEvidence        `json:"content_evidence,omitempty"`
 }
 
 type TaskStepDetailReader interface {

@@ -50,6 +50,7 @@ type cloudDSHCurrentMessageChunkTestStore struct {
 	corruptOffset *int64
 	readErr       error
 	readOffsets   []int64
+	afterRead     func()
 }
 
 func (s *cloudDSHCurrentMessageChunkTestStore) ReadCurrentConversationMessageChunk(_ context.Context, current task.Task,
@@ -78,6 +79,9 @@ func (s *cloudDSHCurrentMessageChunkTestStore) ReadCurrentConversationMessageChu
 		corrupted := []byte(content)
 		corrupted[0] ^= 1
 		content = string(corrupted)
+	}
+	if s.afterRead != nil {
+		s.afterRead()
 	}
 	return CurrentConversationMessageChunk{MessageID: s.messageID, TaskID: current.ID,
 		Sequence: current.ConversationContext.ThroughSequence + 1, Role: conversation.RoleUser,
@@ -403,7 +407,7 @@ func cloudDSHTestStringPointer(value string) *string {
 	return &value
 }
 
-func TestCloudDSHCurrentMessageReadDefinitionUsesCanonicalPageOffsets(t *testing.T) {
+func TestCloudDSHCurrentMessageReadDefinitionUsesOrderedVerifiedFragments(t *testing.T) {
 	definition := cloudDSHCurrentConversationMessageReadDefinition()
 	var schema struct {
 		Properties map[string]json.RawMessage `json:"properties"`
@@ -414,8 +418,8 @@ func TestCloudDSHCurrentMessageReadDefinitionUsesCanonicalPageOffsets(t *testing
 	}
 	if definition.Name != cloudDSHCurrentMessageReadToolName || schema.Properties["max_runes"] != nil ||
 		len(schema.Required) != 3 || schema.Required[0] != "message_id" || schema.Required[1] != "sha256" || schema.Required[2] != "rune_offset" ||
-		!strings.Contains(definition.Description, "at most 33 pages") || !strings.Contains(definition.Description, "in order") {
-		t.Fatalf("message reader schema did not enforce server-fixed canonical pages: definition=%+v schema=%+v", definition, schema)
+		!strings.Contains(definition.Description, "verifies each canonical page") || !strings.Contains(definition.Description, "in order") {
+		t.Fatalf("message reader schema did not describe ordered verified fragments: definition=%+v schema=%+v", definition, schema)
 	}
 }
 
@@ -571,6 +575,13 @@ func TestCloudDSHCurrentMessageReaderReconstructsOneMiBWithCanonicalPages(t *tes
 			if len(chunk.Content) != MaxConversationMessageChunkBytes-1 {
 				t.Fatalf("first chunk split the boundary rune: bytes=%d, want %d", len(chunk.Content), MaxConversationMessageChunkBytes-1)
 			}
+			legacy, err := json.Marshal(cloudDSHCurrentMessageReadResult{MessageID: messageID, Sequence: source.Sequence,
+				Page: 1, PageCount: len(source.Pages), Role: conversation.RoleUser, RuneOffset: source.Pages[0].RuneOffset,
+				NextRuneOffset: source.Pages[0].NextRuneOffset, TotalRunes: source.TotalRunes, SHA256: hex.EncodeToString(source.SHA256),
+				ChunkSHA256: hex.EncodeToString(source.Pages[0].SHA256), Content: string(store.runes[:source.Pages[0].NextRuneOffset])})
+			if err != nil || string(legacy) != result.Output {
+				t.Fatalf("reader changed an existing complete-page checkpoint: err=%v", err)
+			}
 			if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "long_read_duplicate",
 				Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState || len(baseStore.events) != 1 {
 				t.Fatalf("reader accepted a duplicate page: events=%d err=%v", len(baseStore.events), err)
@@ -617,6 +628,116 @@ func TestCloudDSHCurrentMessageReaderReconstructsOneMiBWithCanonicalPages(t *tes
 		baseStore.details.Task.Usage.ToolCalls == 0 || sha256.Sum256([]byte(rebuilt.String())) != digest {
 		t.Fatalf("bounded reads did not reconstruct the immutable source and all anchors: bytes=%d want=%d toolCalls=%d",
 			rebuilt.Len(), len(content), baseStore.details.Task.Usage.ToolCalls)
+	}
+}
+
+func TestCloudDSHCurrentMessageReaderBoundsEscapedPageOutput(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		unit string
+	}{{"html", "<"}, {"ampersand", "&"}, {"control", "\x01"}, {"backslash", "\\"}, {"unicode separator", "\u2028"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+			claimed.ConversationContext.ThroughSequence = 0
+			authorizer := configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+			messageID, err := domain.NewMessageID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			content := strings.Repeat(tc.unit, (MaxConversationMessageChunkBytes-16)/len(tc.unit)) + "END-锚"
+			source, err := BuildConversationMessageSourceManifest(messageID, 1, content)
+			if err != nil || len(source.Pages) != 1 {
+				t.Fatalf("source pages=%d err=%v", len(source.Pages), err)
+			}
+			claimed.ConversationContext.CurrentMessageSource = source
+			baseStore.details.Task = claimed
+			store := &cloudDSHCurrentMessageChunkTestStore{TaskStore: broker.store, messageID: messageID,
+				taskID: claimed.ID, content: content, runes: []rune(content)}
+			broker.store = store
+			var offset int64
+			var rebuilt strings.Builder
+			for calls := 0; ; calls++ {
+				if calls >= 8 {
+					t.Fatalf("reader failed to make bounded progress at offset %d", offset)
+				}
+				arguments, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(source.SHA256), "rune_offset": offset})
+				if err != nil {
+					t.Fatal(err)
+				}
+				call := ModelToolCall{CallID: fmt.Sprintf("escaped_read_%d", calls), Name: cloudDSHCurrentMessageReadToolName, Arguments: string(arguments)}
+				result, err := broker.execute(context.Background(), claimed, call, false, nil)
+				if err != nil || result.Status != AgentToolSucceeded || len(result.Output) > maxAgentToolOutputBytes {
+					t.Fatalf("read offset=%d outputBytes=%d err=%v", offset, len(result.Output), err)
+				}
+				var chunk cloudDSHCurrentMessageReadResult
+				if err := json.Unmarshal([]byte(result.Output), &chunk); err != nil {
+					t.Fatal(err)
+				}
+				if chunk.Page != 1 || chunk.PageCount != 1 || chunk.RuneOffset != offset ||
+					chunk.NextRuneOffset != offset+int64(utf8.RuneCountInString(chunk.Content)) || chunk.NextRuneOffset <= offset ||
+					chunk.ChunkSHA256 != fmt.Sprintf("%x", sha256.Sum256([]byte(chunk.Content))) {
+					t.Fatalf("reader returned an invalid fragment: %+v", chunk)
+				}
+				if calls == 0 {
+					replayed, err := broker.execute(context.Background(), claimed, call, true, &result.Output)
+					if err != nil || replayed.Output != result.Output || baseStore.details.Task.Usage.ToolCalls != 1 || len(baseStore.events) != 1 {
+						t.Fatalf("fragment checkpoint replay failed: err=%v", err)
+					}
+					if _, err := broker.execute(context.Background(), claimed, call, false, nil); domain.CodeOf(err) != domain.CodeInvalidState {
+						t.Fatalf("reader accepted a repeated fragment: %v", err)
+					}
+					skipped, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(source.SHA256), "rune_offset": chunk.NextRuneOffset + 1})
+					if err != nil {
+						t.Fatal(err)
+					}
+					if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "skipped_fragment",
+						Name: cloudDSHCurrentMessageReadToolName, Arguments: string(skipped)}, false, nil); domain.CodeOf(err) != domain.CodeInvalidState {
+						t.Fatalf("reader accepted a skipped fragment: %v", err)
+					}
+					next, err := json.Marshal(map[string]any{"message_id": messageID, "sha256": hex.EncodeToString(source.SHA256), "rune_offset": chunk.NextRuneOffset})
+					if err != nil {
+						t.Fatal(err)
+					}
+					store.corrupt = true
+					if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "corrupt_fragment",
+						Name: cloudDSHCurrentMessageReadToolName, Arguments: string(next)}, false, nil); err == nil {
+						t.Fatalf("reader accepted a corrupted canonical page on continuation: %v", err)
+					}
+					store.corrupt = false
+					authorizer.revoked = true
+					if denied, err := broker.execute(context.Background(), claimed, call, true, &result.Output); err == nil || denied.Output != "" {
+						t.Fatal("reader replayed a fragment after authorization was revoked")
+					}
+					authorizer.revoked = false
+					store.afterRead = func() { authorizer.revoked = true }
+					if denied, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "revoked_fragment",
+						Name: cloudDSHCurrentMessageReadToolName, Arguments: string(next)}, false, nil); err == nil || denied.Output != "" {
+						t.Fatal("reader returned a fragment after authorization changed during the page read")
+					}
+					store.afterRead = nil
+					authorizer.revoked = false
+					if baseStore.details.Task.Usage.ToolCalls != 1 || len(baseStore.events) != 1 {
+						t.Fatalf("rejected fragments changed usage or progress: calls=%d events=%d", baseStore.details.Task.Usage.ToolCalls, len(baseStore.events))
+					}
+					step := baseStore.details.Steps[len(baseStore.details.Steps)-1]
+					if _, _, err := cloudDSHCurrentMessageReadProgress([]task.Step{step, step}, source); err == nil {
+						t.Fatal("reader accepted duplicate persisted fragment progress")
+					}
+					step.Summary = strings.ReplaceAll(step.Summary, hex.EncodeToString(source.Pages[0].SHA256), strings.Repeat("0", 64))
+					if _, _, err := cloudDSHCurrentMessageReadProgress([]task.Step{step}, source); err == nil {
+						t.Fatal("reader accepted fragment progress with an invalid page digest")
+					}
+				}
+				rebuilt.WriteString(chunk.Content)
+				offset = chunk.NextRuneOffset
+				if chunk.Complete {
+					if calls == 0 || offset != source.TotalRunes || rebuilt.String() != content {
+						t.Fatalf("escaped page was not completely reconstructed: fragments=%d offset=%d", calls+1, offset)
+					}
+					break
+				}
+			}
+		})
 	}
 }
 
@@ -714,6 +835,66 @@ func TestCloudDSHCurrentMessageSearchFindsOneMiBAnchorsWithinBoundedOutput(t *te
 		baseStore.details.Task.Usage.ToolCalls != 1 || len(baseStore.events) != beforeEvents {
 		t.Fatalf("search returned partial results or committed progress after a corrupt page: toolCalls=%d events=%d err=%v",
 			baseStore.details.Task.Usage.ToolCalls, len(baseStore.events), err)
+	}
+}
+
+func TestCloudDSHCurrentMessageSearchReportsMatchesOmittedWithinOnePage(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		content string
+		query   string
+	}{
+		{name: "different terms", content: "FIRST-ANCHOR" + strings.Repeat(" ", 2000) + "SECOND-ANCHOR", query: "FIRST-ANCHOR SECOND-ANCHOR"},
+		{name: "repeated phrase", content: "needle" + strings.Repeat(" ", 2000) + "needle", query: "needle"},
+		{name: "unicode terms", content: "早期要求" + strings.Repeat("界", 2000) + "后期约束", query: "早期要求 后期约束"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+			claimed.ConversationContext.ThroughSequence = 0
+			configureCloudDSHCurrentHistory(t, broker, baseStore, &claimed)
+			messageID, err := domain.NewMessageID()
+			if err != nil {
+				t.Fatal(err)
+			}
+			source, err := BuildConversationMessageSourceManifest(messageID, 1, tc.content)
+			if err != nil || len(source.Pages) != 1 {
+				t.Fatalf("source pages=%d err=%v", len(source.Pages), err)
+			}
+			claimed.ConversationContext.CurrentMessageSource = source
+			baseStore.details.Task = claimed
+			broker.store = &cloudDSHCurrentMessageChunkTestStore{TaskStore: broker.store, messageID: messageID,
+				taskID: claimed.ID, content: tc.content, runes: []rune(tc.content)}
+			arguments, err := json.Marshal(cloudDSHCurrentMessageSearchArguments{MessageID: messageID,
+				SHA256: hex.EncodeToString(source.SHA256), Query: tc.query})
+			if err != nil {
+				t.Fatal(err)
+			}
+			result, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "same_page_search",
+				Name: cloudDSHCurrentMessageSearchToolName, Arguments: string(arguments)}, false, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var output cloudDSHCurrentMessageSearchResult
+			if err := json.Unmarshal([]byte(result.Output), &output); err != nil {
+				t.Fatal(err)
+			}
+			if !output.Complete || !output.Partial || output.TruncationReason != "excerpt_limit" || len(output.Matches) != 1 {
+				t.Fatalf("search must distinguish a complete page scan from omitted matching excerpts: %+v", output)
+			}
+			output.Partial, output.TruncationReason = false, ""
+			stale, err := json.Marshal(output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			checkpoint := string(stale)
+			if _, err := broker.execute(context.Background(), claimed, ModelToolCall{CallID: "same_page_search",
+				Name: cloudDSHCurrentMessageSearchToolName, Arguments: string(arguments)}, true, &checkpoint); domain.CodeOf(err) != domain.CodeInvalidState {
+				t.Fatalf("recovery accepted a checkpoint that concealed omitted matches: %v", err)
+			}
+			if baseStore.details.Task.Usage.ToolCalls != 1 || len(baseStore.events) != 1 {
+				t.Fatalf("rejected checkpoint changed usage or progress: usage=%d events=%d", baseStore.details.Task.Usage.ToolCalls, len(baseStore.events))
+			}
+		})
 	}
 }
 
@@ -889,8 +1070,8 @@ func TestCloudDSHCurrentMessageReaderKeepsOnlyVerifiedPagesAfterTimeout(t *testi
 		Name: cloudDSHCurrentMessageReadToolName, Arguments: string(nextArguments)}, false, nil); domain.CodeOf(err) != domain.CodeUpstreamTimeout {
 		t.Fatalf("timed-out page returned error %v", err)
 	}
-	readThrough, err := cloudDSHCurrentMessageReadThroughPage(baseStore.details.Steps, source)
-	if err != nil || readThrough != 1 || len(baseStore.events) != 1 || baseStore.details.Task.Usage.ToolCalls != 1 {
+	readThrough, _, err := cloudDSHCurrentMessageReadProgress(baseStore.details.Steps, source)
+	if err != nil || readThrough != source.Pages[0].NextRuneOffset || len(baseStore.events) != 1 || baseStore.details.Task.Usage.ToolCalls != 1 {
 		t.Fatalf("timeout exposed or committed an unverified page: read_through=%d events=%d calls=%d err=%v",
 			readThrough, len(baseStore.events), baseStore.details.Task.Usage.ToolCalls, err)
 	}

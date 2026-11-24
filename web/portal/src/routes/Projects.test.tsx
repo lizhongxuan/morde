@@ -255,23 +255,17 @@ describe('Projects API integration', () => {
     expect(within(reply).getByRole('list').querySelectorAll('li')).toHaveLength(2);
   });
 
-  it('stops only the current member’s selected project task', async () => {
+  it('does not expose a direct task-stop button in the project conversation', async () => {
     const mine = { ...task, id: 'qhistory1', conversation_id: projectConversation.id, status: 'running' as const,
       current_revision: 2, desired_revision: 3 };
-    const other = { ...mine, id: 'qhistory2', initiator_id: teammate.user_id };
-    vi.mocked(projectApi.tasks).mockResolvedValue([mine, other]);
-    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([projectHistoryMessage,
-      { ...newerProjectHistoryMessage, task_id: other.id, actor_id: teammate.user_id }]);
-    const stop = vi.spyOn(portalApi, 'taskAction').mockResolvedValue({ task_id: mine.id, action: 'cancel', status: 'cancelling', unsettled_operation_ids: [] });
-    const user = userEvent.setup();
+    vi.mocked(projectApi.tasks).mockResolvedValue([mine]);
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([projectHistoryMessage]);
     renderProjects();
     await openProject();
-    const button = await screen.findByRole('button', { name: '停止此任务' });
-    expect(screen.getAllByRole('button', { name: '停止此任务' })).toHaveLength(1);
-    await user.click(button);
-    await waitFor(() => expect(stop).toHaveBeenCalledWith(mine.id,
-      { action: 'cancel', expected_status: 'running', expected_current_revision: 2, expected_desired_revision: 3 }, expect.any(String)));
-    expect(await screen.findByText('停止请求已受理，正在等待服务端确认任务状态。')).toBeInTheDocument();
+
+    expect(await screen.findByRole('article', { name: '项目对话消息' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '停止此任务' })).not.toBeInTheDocument();
+    expect(portalApi.taskAction).not.toHaveBeenCalled();
   });
 
   it('uses the typed project conversation routes and idempotency headers', async () => {

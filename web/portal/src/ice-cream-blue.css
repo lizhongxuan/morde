@@ -319,7 +319,6 @@
 }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .thinking-bubble { border-color: var(--line); background: #fff; }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .thinking-dots span { background: var(--brand); animation-duration: 1.5s; }
-.morde-pc-theme .project-message-received { border-color: var(--surface); background: var(--brand-soft); }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-composer form {
   color: var(--ink);
   border: 1.5px solid var(--brand-tint);

@@ -1,0 +1,22 @@
+:root {
+  color-scheme: light dark;
+  font: 14px system-ui, sans-serif;
+  color: #26364d;
+  background: #fff;
+}
+
+body { margin: 0; padding: 14px; }
+h2 { margin: 0; font-size: 16px; }
+p { margin: 8px 0; line-height: 1.5; overflow-wrap: anywhere; }
+.object { font-weight: 650; }
+.impact, .explanation { color: #62748d; }
+.rows { display: grid; gap: 5px; margin-top: 9px; }
+.row { display: grid; grid-template-columns: 90px 1fr; gap: 8px; line-height: 1.4; }
+.row span { overflow-wrap: anywhere; }
+details { margin-top: 10px; }
+summary { color: #245fe8; cursor: pointer; }
+.actions { display: flex; gap: 8px; margin-top: 12px; }
+button { padding: 8px 13px; border: 1px solid #a9c9ff; border-radius: 18px; background: #fff; color: #245fe8; font: inherit; cursor: pointer; }
+button:last-child { background: #3778ef; color: #fff; }
+button:disabled { opacity: .55; cursor: wait; }
+.status { min-height: 1.5em; color: #52657e; font-size: 12px; }

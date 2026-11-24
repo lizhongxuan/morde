@@ -24,6 +24,18 @@ describe('FloatingError', () => {
     expect(retry).not.toHaveBeenCalled();
   });
 
+  it('keeps an explicit page recovery action inline when requested', async () => {
+    const retry = vi.fn();
+    const user = userEvent.setup();
+    render(<ToastProvider><ToastNoticeCenter /><main><FloatingError inline>同步未完成。<button type="button" onClick={retry}>重试保存</button></FloatingError></main></ToastProvider>);
+
+    const alert = screen.getByRole('alert');
+    expect(alert).toHaveTextContent('同步未完成。');
+    expect(alert.closest('.error-notice-overlay')).not.toBeInTheDocument();
+    await user.click(within(alert).getByRole('button', { name: '重试保存' }));
+    expect(retry).toHaveBeenCalledOnce();
+  });
+
   it('renders inline without an application provider', () => {
     const { container } = render(<main><p>页面内容</p><FloatingError>接口暂不可用</FloatingError></main>);
     expect(screen.getByRole('alert').parentElement).toBe(container.querySelector('main'));

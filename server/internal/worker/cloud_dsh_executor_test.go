@@ -3773,6 +3773,55 @@ func TestCloudDSHExecutorRecoversCompletedCheckpointWithoutReplayingModel(t *tes
 	}
 }
 
+func TestCloudDSHExecutorRejectsChangedToolDefinitionsDuringRecovery(t *testing.T) {
+	executor, supervisor, store, checkpoints, models, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}}
+	executor.options.Tools = tools
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("initial run = %v", err)
+	}
+	if len(checkpoints.commands) == 0 || len(models.calls) != 1 {
+		t.Fatalf("initial checkpoints=%d model calls=%d; want persisted checkpoint and one model request",
+			len(checkpoints.commands), len(models.calls))
+	}
+	expected := cloudDSHExpectedRootDefinitions([]app.AgentToolDefinition{tool})
+	headerFound := false
+	for _, command := range checkpoints.commands {
+		found, _, err := cloudDSHCheckpointToolSelection(command.Payload, expected)
+		if err != nil {
+			t.Fatalf("persisted checkpoint tool definitions do not match initial Task: %v", err)
+		}
+		headerFound = headerFound || found
+	}
+	if !headerFound {
+		t.Fatal("DSH checkpoint did not persist the model-visible tool definitions")
+	}
+
+	previous := supervisor.launch.Fence
+	tail := checkpoints.commands[len(checkpoints.commands)-1]
+	value.AgentInstanceID = previous.AgentInstanceID
+	value.AgentGeneration = previous.AgentGeneration
+	value.AgentSessionID = previous.AgentSessionID
+	value.AgentEngineVersion = previous.EngineVersion
+	value.AgentProfileVersion = previous.ProfileVersion
+	value.CheckpointThroughSequence = tail.Through
+	value.CheckpointDigest = append([]byte(nil), tail.Digest...)
+	value.Lease.Version++
+	expires := time.Now().Add(time.Minute)
+	value.Lease.ExpiresAt = &expires
+	tools.definitions[0].Description = "Read a changed Workspace file definition."
+
+	err := executor.ExecuteTask(context.Background(), value)
+	if err == nil || errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("recovery with changed tool definitions = %v; expected fail-closed mismatch", err)
+	}
+	if len(checkpoints.reads) == 0 || len(models.calls) != 1 || len(tools.calls) != 0 || len(tools.recoveryCalls) != 0 || store.stopped != 2 {
+		t.Fatalf("checkpoint reads=%d model calls=%d tool calls=%d recovery calls=%d stopped=%d",
+			len(checkpoints.reads), len(models.calls), len(tools.calls), len(tools.recoveryCalls), store.stopped)
+	}
+}
+
 func TestCloudDSHExecutorRecoversCompletedCheckpointWithPendingMessage(t *testing.T) {
 	executor, supervisor, _, checkpoints, models, value := cloudDSHFixture(t)
 	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
@@ -4158,6 +4207,52 @@ func TestCloudDSHToolDefinitionsAllowArgumentFreeTools(t *testing.T) {
 		if validCloudDSHToolDefinitions([]app.AgentToolDefinition{definition}) {
 			t.Fatalf("invalid tool schema was accepted: %s", schema)
 		}
+	}
+}
+
+func TestCloudDSHToolDefinitionsRejectUnclassifiedOverflow(t *testing.T) {
+	definitions := make([]app.AgentToolDefinition, 65)
+	for index := range definitions {
+		definitions[index] = app.AgentToolDefinition{ModelTool: app.ModelTool{
+			Name: fmt.Sprintf("overflow_tool_%02d", index), Description: "A synthetic authorized tool.",
+			Parameters: json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`),
+		}}
+	}
+	if !validCloudDSHToolDefinitions(definitions[:64]) || validCloudDSHToolDefinitions(definitions) {
+		t.Fatal("the current DSH 64-definition boundary was not reproduced")
+	}
+}
+
+func TestCloudDSHCheckpointToolSelectionMatchesPersistedDefinitions(t *testing.T) {
+	definitions := []app.AgentToolDefinition{cloudDSHReadTool(), cloudDSHWriteTool()}
+	tools := cloudDSHToolPayload(definitions)
+	tools[0], tools[1] = tools[1], tools[0]
+	checkpoint := cloudDSHCheckpointPayload("session_1", 0,
+		cloudDSHCheckpointEvent{Sequence: 0, Type: "request/header", Data: map[string]any{
+			"header": map[string]any{"tools": tools},
+		}},
+		cloudDSHCheckpointEvent{Sequence: 1, Type: "assistant/message", Data: map[string]any{}},
+	)
+	headerFound, assistantMessageFound, err := cloudDSHCheckpointToolSelection(checkpoint, definitions)
+	if err != nil || !headerFound || !assistantMessageFound {
+		t.Fatalf("matching checkpoint tool selection = header %v assistant %v err %v", headerFound, assistantMessageFound, err)
+	}
+
+	tools[0]["description"] = "Changed after checkpoint recovery."
+	changed := cloudDSHCheckpointPayload("session_1", 0,
+		cloudDSHCheckpointEvent{Sequence: 0, Type: "request/header", Data: map[string]any{
+			"header": map[string]any{"tools": tools},
+		}},
+	)
+	if _, _, err := cloudDSHCheckpointToolSelection(changed, definitions); err == nil {
+		t.Fatal("checkpoint tool definition change was accepted")
+	}
+
+	missing := cloudDSHCheckpointPayload("session_1", 0,
+		cloudDSHCheckpointEvent{Sequence: 0, Type: "request/header", Data: map[string]any{"header": map[string]any{}}},
+	)
+	if _, _, err := cloudDSHCheckpointToolSelection(missing, definitions); err == nil {
+		t.Fatal("checkpoint request header without tool definitions was accepted")
 	}
 }
 

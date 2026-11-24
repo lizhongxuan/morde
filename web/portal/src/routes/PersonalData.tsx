@@ -542,12 +542,20 @@ export function PersonalData() {
     <div className="design-panel-header">
       <div><h2>我的数据</h2><p>管理个人资料、AI 个性、记忆、动态、灵感和资源库。</p></div>
     </div>
+    <nav className="personal-data-tabs" aria-label="个人数据分类">
+      {sections.filter(({ id }) => id === 'feed' || id === 'ideas' || id === 'preferences').map((section) => <Link
+        key={section.id}
+        className={`button ${activeSection === section.id ? 'button-primary' : 'button-secondary'}`}
+        to={`/personal?section=${section.id}`}
+        aria-current={activeSection === section.id ? 'page' : undefined}
+      >{section.title}</Link>)}
+    </nav>
     <p className="sr-only" aria-live="polite">{syncing ? '正在更新云端数据…' : state?.syncError ? '云端更新待重试' : '保存后自动更新云端'} · {pendingCount} 项待提交 · {conflicts.length} 条冲突草稿</p>
 
     {!serviceInstanceID && <FloatingNotice className="notice-warning">正在确认服务实例；此期间新保存内容只会保存在本机，不会提交到未确认的服务。</FloatingNotice>}
 
-    {localError && <FloatingError className="error-card" role="alert">{localError}<button type="button" className="button button-secondary" onClick={() => void refreshLocal()}>重试</button></FloatingError>}
-    {state?.syncError && <FloatingError className="error-card" role="alert">云端更新未完成：{state.syncError} 本地草稿和附件仍保留。<button type="button" className="button button-secondary" disabled={syncing} onClick={() => void sync()}>重试保存</button></FloatingError>}
+    {localError && <FloatingError inline className="error-card" role="alert">{localError}<button type="button" className="button button-secondary" onClick={() => void refreshLocal()}>重试</button></FloatingError>}
+    {state?.syncError && <FloatingError inline className="error-card" role="alert">云端更新未完成：{state.syncError} 本地草稿和附件仍保留。<button type="button" className="button button-secondary" disabled={syncing} onClick={() => void sync()}>重试保存</button></FloatingError>}
     {actionError && <FloatingError className="error-inline" role="alert">{actionError}</FloatingError>}
     {!state && !localError && <div className="loading-card" role="status">正在读取本地个人数据…</div>}
 
@@ -725,7 +733,7 @@ export function PersonalData() {
     {state && !remoteLoading && activeSection === 'library' && <section className="connection-section" aria-labelledby="personal-library-title">
       <div className="connection-section-heading"><div><h2 id="personal-library-title" className="sr-only">资源库</h2><p className="muted">附件字节保存在本机离线队列；联网后按 4 MiB 分块上传。</p></div></div>
       {quota && <p className="muted" role="status">附件空间：已用 {formatBytes(quota.used_bytes)} / {formatBytes(quota.quota_bytes)} · 剩余 {formatBytes(quota.remaining_bytes)} · 单文件 ≤ {formatBytes(quota.max_attachment_bytes)}</p>}
-      {quotaError && <FloatingError className="error-inline" role="alert">无法读取附件空间：{quotaError}<button type="button" className="button button-small button-secondary" onClick={() => void sync()}>重试</button></FloatingError>}
+      {quotaError && <FloatingError inline className="error-inline" role="alert">无法读取附件空间：{quotaError}<button type="button" className="button button-small button-secondary" onClick={() => void sync()}>重试</button></FloatingError>}
       <form className="form-card form-stack" onSubmit={(event) => event.preventDefault()}>
         <label>类型<select value={libraryKind} onChange={(event) => setLibraryKind(event.target.value as LibraryBody['kind'])}><option value="artifact">文档/产物</option><option value="media">媒体</option></select></label>
         <label>添加文件<input type="file" onChange={(event) => {

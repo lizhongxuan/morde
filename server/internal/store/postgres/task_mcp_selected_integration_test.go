@@ -204,6 +204,7 @@ func TestSelectedTaskMCPDispatchRejectsRevokedCredential(t *testing.T) {
 		ConnectorID: connectorID, ConnectorRevision: grant.ConnectorRevision, CredentialVersion: grant.CredentialVersion,
 		GrantVersion: grant.GrantVersion, LeaseVersion: f.task.Lease.Version, Key: "selected-mcp-operation", ToolName: "lookup",
 		RequestHash: hashBytes("synthetic-selected-mcp-operation"), Status: task.OperationPrepared}
+	operation = bindApprovedMCPConnectorOperationForTest(t, ctx, f.route.store, operation)
 	prepared, replayed, err := f.route.store.PrepareMCPConnectorOperation(ctx, operation, f.task.Lease.Owner)
 	if err != nil || replayed {
 		t.Fatalf("prepare selected MCP call: replay=%t err=%v", replayed, err)
@@ -250,6 +251,7 @@ func TestSelectedTaskMCPRechecksRevisionSenderCredential(t *testing.T) {
 		ConnectorID: connectorID, ConnectorRevision: grant.ConnectorRevision, CredentialVersion: grant.CredentialVersion,
 		GrantVersion: grant.GrantVersion, LeaseVersion: f.task.Lease.Version, Key: "revision-sender-mcp-operation", ToolName: "lookup",
 		RequestHash: hashBytes("synthetic-revision-sender-mcp"), Status: task.OperationPrepared}
+	operation = bindApprovedMCPConnectorOperationForTest(t, ctx, f.route.store, operation)
 	prepared, _, err := f.route.store.PrepareMCPConnectorOperation(ctx, operation, f.task.Lease.Owner)
 	if err != nil {
 		t.Fatal(err)
@@ -356,6 +358,7 @@ VALUES ('p1234567',$1,'synthetic project model','http://127.0.0.1','test',decode
 				ConnectorID: connector.ID, ConnectorRevision: grant.ConnectorRevision, CredentialVersion: grant.CredentialVersion,
 				GrantVersion: grant.GrantVersion, LeaseVersion: f.task.Lease.Version, Key: "project-selected-mcp-operation", ToolName: "lookup",
 				RequestHash: hashBytes("synthetic-project-mcp"), Status: task.OperationPrepared}
+			operation = bindApprovedMCPConnectorOperationForTest(t, ctx, project.store, operation)
 			prepared, _, err := project.store.PrepareMCPConnectorOperation(ctx, operation, f.task.Lease.Owner)
 			if err != nil {
 				t.Fatal(err)

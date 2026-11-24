@@ -31,7 +31,6 @@ type ActionNotice = { kind: 'success' | 'error' | 'unknown'; message: string };
 type LedgerEntry = components['schemas']['ProjectBudgetLedgerEntry'];
 type ResourceKind = components['schemas']['ProjectResourceKind'];
 type ProjectMessageReceipt = { projectID: string; conversationID: string };
-type ProjectTask = Awaited<ReturnType<typeof projectApi.tasks>>[number];
 type ProjectVersionableMessage = ProjectConversationMessage & Pick<VersionableMessage, 'variant_group_id' | 'variant_version' | 'variant_action'>;
 
 function definiteProjectMessageAcceptanceFailure(error: unknown) {
@@ -267,6 +266,18 @@ function UserProjects() {
   const canEditWork = currentMember?.role === 'owner' || currentMember?.role === 'member';
   const sessionInvitations = localOutgoingInvitations[projectID] ?? [];
   const taskByID = new Map(tasks.map((task) => [task.id, task]));
+  const projectIsAgentProcessing = visibleProjectConversationMessages.some((message) => {
+    if (message.role !== 'user' || message.duplicate_of_message_id) return false;
+    const taskID = message.task_id ?? message.related_task_id;
+    if (!taskID) return message.routing_status === 'processing' && !projectConversationMessagesQuery.isError && !projectConversationMessagesQuery.isRefetchError;
+    const query = projectConversationTaskQueriesByID.get(taskID);
+    const task = query?.data;
+    const revisionIsCurrent = task?.current_revision === undefined || task?.desired_revision === undefined ||
+      task.current_revision === task.desired_revision;
+    return latestProjectMessageByTaskID.get(taskID) === message.id && Boolean(task) && !query?.isError && !query?.isRefetchError &&
+      task?.status === 'running' && task.current_revision_started === true && revisionIsCurrent && !task.waiting_reason &&
+      task.pending_request?.status !== 'pending';
+  });
   const projectHostIDs = new Set(resources.filter((resource) => resource.kind === 'host').map((resource) => resource.resource_id));
   const taskHosts = (taskHostsQuery.data?.items ?? []).filter((host) => projectHostIDs.has(host.id) && host.state === 'running' && host.control_state === 'ai');
   const selectedTaskHost = taskHosts.find((host) => host.id === projectHostID);
@@ -526,30 +537,6 @@ function UserProjects() {
       setNotice({ kind: 'error', message: errorDetails(error).message });
       return false;
     }
-  };
-
-  const stopProjectTask = (task: ProjectTask) => {
-    if (!project || task.initiator_id !== user?.id || task.conversation_id !== selectedProjectConversation?.id) return;
-    const hasCurrentRevision = task.current_revision !== undefined;
-    const hasDesiredRevision = task.desired_revision !== undefined;
-    if (hasCurrentRevision !== hasDesiredRevision ||
-      (hasCurrentRevision && (!Number.isSafeInteger(task.current_revision) || task.current_revision! < 0 ||
-        !Number.isSafeInteger(task.desired_revision) || task.desired_revision! < 0))) {
-      setNotice({ kind: 'error', message: '任务修订信息不完整或无效，请刷新状态后重试。' });
-      return;
-    }
-    const body: components['schemas']['TaskActionRequest'] = {
-      action: 'cancel', expected_status: task.status,
-      ...(hasCurrentRevision && hasDesiredRevision ? {
-        expected_current_revision: task.current_revision!, expected_desired_revision: task.desired_revision!,
-      } : {}),
-    };
-    const scope = `stop-project-task:${project.id}:${task.id}`;
-    const key = requestKeyFor(scope, body);
-    void runAction({
-      action: scope, run: () => portalApi.taskAction(task.id, body, key), requestKey: { scope, key },
-      successMessage: '停止请求已受理，正在等待服务端确认任务状态。',
-    });
   };
 
   const queueProjectMessage = () => {
@@ -984,9 +971,6 @@ function UserProjects() {
                           (entry.operation.input.messageID === variantGroup.id || variantGroup.messageIDs.has(entry.operation.input.messageID))) : [];
                         const editingThisMessage = editingMessageVariant?.messageID === message.id;
                         const task = taskByID.get(message.task_id ?? message.related_task_id ?? '');
-                        const taskID = message.task_id ?? message.related_task_id;
-                        const processingTaskQuery = taskID ? projectConversationTaskQueriesByID.get(taskID) : undefined;
-                        const processingTask = processingTaskQuery?.data;
                         const retryAccepted = retryAcceptedMessageIDs.has(message.id);
                         const retryAcceptedStatus = retryAccepted && ['failed', 'pending', 'processing'].includes(message.routing_status ?? '')
                           ? '正在重新处理消息' : null;
@@ -995,13 +979,6 @@ function UserProjects() {
                             ? ` · Task ${message.related_task_id} · 状态 ${task?.status ?? '待核对'}` : ''}`
                           : message.role === 'user' ? retryAcceptedStatus ?? (message.delivery_status === 'applied' ? deliveryStatusText('applied') : null)
                             : routingStatusText(message.routing_status) ?? deliveryStatusText(message.delivery_status);
-                        const processingRevisionIsCurrent = processingTask?.current_revision === undefined || processingTask?.desired_revision === undefined ||
-                          processingTask.current_revision === processingTask.desired_revision;
-                        const isAgentProcessing = message.role === 'user' && !message.duplicate_of_message_id &&
-                          (taskID ? Boolean(latestProjectMessageByTaskID.get(taskID) === message.id && processingTask &&
-                            !processingTaskQuery?.isError && !processingTaskQuery?.isRefetchError && processingTask.status === 'running' &&
-                            processingTask.current_revision_started === true && processingRevisionIsCurrent && !processingTask.waiting_reason && processingTask.pending_request?.status !== 'pending')
-                            : message.routing_status === 'processing' && !projectConversationMessagesQuery.isError && !projectConversationMessagesQuery.isRefetchError);
                         const canEditThisMessage = message.role === 'user' && message.actor_id === user?.id && currentMember && currentMember.role !== 'viewer' && !editingThisMessage;
                         const hasVariantControls = Boolean(variantGroup && (
                           (message.role === 'user' && (variantGroup.versions.size > 1 || Boolean(canEditThisMessage))) ||
@@ -1060,11 +1037,6 @@ function UserProjects() {
                               </span>)}
                             </div>}
                           </>}
-                          {message.role === 'user' && message.agent_acknowledged === true && <span className="project-message-received" role="img"
-                            aria-label="主 Agent 已接下，正在处理" title="主 Agent 已接下，正在处理">👌🏻</span>}
-                          {isAgentProcessing && <div className="chat-message-row chat-message-row-assistant chat-thinking-row project-agent-processing" role="status" aria-label="Morde 正在思考">
-                            <div className="thinking-bubble"><div className="thinking-dots" aria-hidden="true"><span /><span /><span /></div></div>
-                          </div>}
                           {message.role === 'assistant' && message.output_status !== 'streaming' && message.output_status !== 'interrupted' &&
                             <AssistantReplySpeech text={message.content} sessionKey={`project:${project.id}:conversation:${message.conversation_id}`} />}
                           {message.attachment_ids?.length ? <p className="muted">附件 · {message.attachment_ids.length}
@@ -1105,9 +1077,7 @@ function UserProjects() {
                           {message.task_id && <p className="muted">Task {message.task_id} · 状态 {task?.status ?? '未知'}
                             {task && Number.isSafeInteger(task.step_count) && task.step_count! > 0 && Number.isSafeInteger(task.completed_step_count) &&
                               <> · 已完成 {Math.min(task.completed_step_count!, task.step_count!)} / {task.step_count!} 步</>}
-                            {task && task.initiator_id === user?.id && ['queued', 'running', 'waiting_user', 'paused'].includes(task.status) &&
-                              <button type="button" className="button button-small button-secondary" disabled={Boolean(pendingAction)}
-                                onClick={() => stopProjectTask(task)}>停止此任务</button>}
+
                           </p>}
                         </article>;
                       }}
@@ -1120,6 +1090,9 @@ function UserProjects() {
                   {message.status !== 'sending' && <button type="button" className="button button-small button-secondary" onClick={() => void sendProjectMessage({ scope, message }, true)}>核对并重试</button>}
                   </article>}
                 />}
+                {projectIsAgentProcessing && <div className="chat-message-row chat-message-row-assistant chat-thinking-row project-agent-processing" role="status" aria-label="Morde 正在思考">
+                  <div className="thinking-bubble"><div className="thinking-dots" aria-hidden="true"><span /><span /><span /></div></div>
+                </div>}
               </div>
               <form onSubmit={(event) => { event.preventDefault(); queueProjectMessage(); }} className="form-stack">
                 <label htmlFor="project-task-model">文本模型</label>

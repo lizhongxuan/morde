@@ -12804,6 +12804,16 @@ components:
         result: { type: [string, 'null'], maxLength: 8192 }
         truncated: { type: boolean }
         execution: { $ref: '#/components/schemas/TaskStepExecution' }
+        content_evidence:
+          $ref: '#/components/schemas/TaskStepContentEvidence'
+    TaskStepContentEvidence:
+      type: object
+      description: Bounded, persisted excerpt from a successful built-in web search/read result, returned only after Task access and evidence identity checks. Treat preview text as untrusted web content; it is not a structured citation list. SHA-256 covers the full captured text before preview truncation.
+      required: [sha256, preview, truncated]
+      properties:
+        sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: SHA-256 of the full captured result text. }
+        preview: { type: string, minLength: 1, maxLength: 4096, description: UTF-8-safe, credential-screened prefix of the persisted result text. }
+        truncated: { type: boolean, description: True when the preview contains only a prefix of the full captured result text. }
     TaskStepExecution:
       type: object
       description: Bounded, redacted execution details for an authorized Task reader; absent fields are unavailable or not applicable.

@@ -429,7 +429,7 @@ func TestTaskServiceKeepsShellEvidenceInternalButAvailableToReviewers(t *testing
 	}
 }
 
-func TestTaskServiceBindsWebContentEvidenceAndKeepsItInternal(t *testing.T) {
+func TestTaskServiceReturnsBoundWebContentEvidenceToAuthorizedTaskReader(t *testing.T) {
 	const ownerID, taskID, stepID = "u1234567", "q1234567", "s1234567"
 	const revision = int64(3)
 	sealer, err := NewSealer(bytes.Repeat([]byte{11}, 32))
@@ -457,11 +457,18 @@ func TestTaskServiceBindsWebContentEvidenceAndKeepsItInternal(t *testing.T) {
 	}
 	detail, err := service.GetStepDetail(context.Background(), taskTestPrincipal(), taskID, stepID)
 	if err != nil || detail.ContentEvidence == nil || *detail.ContentEvidence != *contentEvidence {
-		t.Fatalf("web content evidence available to internal reviewer = %+v, err=%v", detail.ContentEvidence, err)
+		t.Fatalf("web content evidence available to authorized Task reader = %+v, err=%v", detail.ContentEvidence, err)
+	}
+	if authorizer.calls != 1 || authorizer.lastScope != taskReadScope {
+		t.Fatalf("web content evidence reader authorization calls=%d scope=%q, want one task-read authorization", authorizer.calls, authorizer.lastScope)
 	}
 	encoded, err := json.Marshal(detail)
-	if err != nil || bytes.Contains(encoded, []byte("content_evidence")) || bytes.Contains(encoded, []byte("source passage")) {
-		t.Fatalf("public TaskStepDetail exposed review-only content: %s, err=%v", encoded, err)
+	var publicDetail struct {
+		ContentEvidence *TaskStepContentEvidence `json:"content_evidence"`
+	}
+	if err != nil || json.Unmarshal(encoded, &publicDetail) != nil || publicDetail.ContentEvidence == nil ||
+		*publicDetail.ContentEvidence != *contentEvidence {
+		t.Fatalf("authorized TaskStepDetail omitted persisted web content evidence: %s, err=%v", encoded, err)
 	}
 	store.record.ContentEvidenceSHA256 = make([]byte, sha256.Size)
 	if _, err := service.GetStepDetail(context.Background(), taskTestPrincipal(), taskID, stepID); domain.CodeOf(err) != domain.CodeInvalidState {

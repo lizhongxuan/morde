@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { formatDate } from '../app/format';
 import type { components } from '../api/schema';
+import { TaskApprovalMcpApp, type McpApprovalAppData } from './TaskApprovalMcpApp';
 
 type ApprovalView = Pick<components['schemas']['TaskPendingRequest'],
   'id' | 'version' | 'status' | 'kind' | 'title' | 'object' | 'content' | 'impact' | 'disclosures' |
@@ -38,7 +39,7 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
   submitting?: boolean;
   compact?: boolean;
   reviewInbox?: boolean;
-  onDecision: (decision: TaskApprovalDecision) => void;
+  onDecision: (decision: TaskApprovalDecision) => void | Promise<unknown>;
 }) {
   const [now, setNow] = useState(Date.now);
   const [detailsOpen, setDetailsOpen] = useState(false);
@@ -64,7 +65,7 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
   const actionable = approval.status === 'pending' && !invalidExpiry && !locallyExpired && !approval.media_preview_operation_id;
   const status = locallyExpired && approval.status === 'pending' ? '到期，正在核对状态'
     : ({ pending: '待审核', approved: '已允许', rejected: '已拒绝', cancelled: '已取消', expired: '已过期' } as const)[approval.status];
-  const reviewStatus = approval.media_preview_operation_id ? '请在任务中预览后处理'
+  const reviewStatus = approval.status === 'pending' && approval.media_preview_operation_id ? '媒体预览暂不可用，无法处理此审批。'
     : invalidExpiry && approval.status === 'pending' ? '到期信息无效，正在核对状态' : status;
   const label = approval.status === 'pending' && !locallyExpired ? '需要批准的操作'
     : approval.status === 'expired' || locallyExpired ? '审批已到期' : '已处理的审批';
@@ -80,6 +81,28 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
       else dialog.removeAttribute('open');
     }
   }, [detailsOpen]);
+
+  if (actionable) {
+    const appApproval: McpApprovalAppData = {
+      id: approval.id,
+      version: approval.version,
+      title: approval.title,
+      object: approval.object,
+      content: approval.content,
+      impact: approval.impact,
+      risk: textDisclosure(approval.disclosures?.risk),
+      thisCost: costDisclosure(approval.disclosures?.this_cost),
+      cumulativeCost: costDisclosure(approval.disclosures?.cumulative_cost),
+      alternatives: alternativesDisclosure(approval.disclosures?.alternatives),
+      revocation: textDisclosure(approval.disclosures?.revocation),
+      expiresAt: approval.expires_at,
+    };
+    return <article className={`chat-approval task-approval-card${reviewInbox ? ' task-approval-review-card' : ''}`}
+      role={reviewInbox ? 'group' : 'region'} aria-label={reviewInbox ? approval.title : label}
+      data-approval-id={approval.id} aria-busy={submitting || undefined}>
+      <TaskApprovalMcpApp key={`${approval.id}:${approval.version}`} approval={appApproval} onDecision={onDecision} />
+    </article>;
+  }
 
   if (reviewInbox) {
     return <article className="chat-approval task-approval-card task-approval-review-card" role="group"
@@ -158,6 +181,7 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
     {approval.status === 'expired' ? <p role="status">审批已到期；该操作已被拒绝并未执行。</p>
       : locallyExpired && approval.status === 'pending' ? <p role="status">审批已到期，正在核对服务端状态；当前不能继续操作。</p>
         : invalidExpiry && approval.status === 'pending' ? <p role="status">审批到期信息无效，当前不能继续操作。</p>
+          : approval.status === 'pending' && approval.media_preview_operation_id ? <p role="status">媒体预览暂不可用，无法处理此审批。</p>
           : approval.status === 'cancelled' ? <p role="status">此审批已取消。</p>
             : approval.status === 'approved' || approval.status === 'rejected' ? <p role="status">审批已处理；任务后续状态等待更新。</p>
               : actionable && <div className="chat-approval-actions">

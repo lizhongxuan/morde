@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"morde/server/internal/domain"
@@ -58,6 +60,39 @@ func TestConversationReceiptDefersModelAndHostChecks(t *testing.T) {
 	_, _, err = service.AcceptConversationMessage(context.Background(), principal, "c1234567", command)
 	if err != nil || bytes.Equal(store.receipts[0].RequestHash, store.receipts[2].RequestHash) {
 		t.Fatalf("changed content reused the request fingerprint: %v", err)
+	}
+}
+
+func TestConversationReceiptAcceptsMessagesAroundEightKiBBytesAndRunes(t *testing.T) {
+	principal := taskTestPrincipal()
+	store := &conversationReceiptStoreStub{taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
+		"c1234567": {ID: "c1234567", OwnerID: principal.UserID},
+	}}}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents := make([]string, 0, 6)
+	for _, size := range []int{8191, 8192, 8193} {
+		contents = append(contents, strings.Repeat("x", size))
+	}
+	for _, runes := range []int{8191, 8192, 8193} {
+		contents = append(contents, strings.Repeat("中", runes)+"<&🙂")
+	}
+	for index, content := range contents {
+		messageID := fmt.Sprintf("message-8k-%02d", index)
+		command := AcceptConversationMessageCommand{
+			ServiceInstanceID: "11111111-1111-4111-8111-111111111111",
+			ClientMessageID:   messageID, IdempotencyKey: messageID, Content: content,
+		}
+		message, replayed, err := service.AcceptConversationMessage(context.Background(), principal, "c1234567", command)
+		if err != nil || replayed || message.Content != content {
+			t.Fatalf("8 KiB boundary message %d (bytes=%d runes=%d) = accepted=%t replayed=%t err=%v",
+				index, len(content), len([]rune(content)), err == nil, replayed, err)
+		}
+	}
+	if len(store.receipts) != len(contents) {
+		t.Fatalf("stored %d of %d accepted boundary receipts", len(store.receipts), len(contents))
 	}
 }
 

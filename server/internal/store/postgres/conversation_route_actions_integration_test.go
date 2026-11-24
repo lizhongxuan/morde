@@ -1179,6 +1179,7 @@ func TestConversationRouteStaleDecisionReclassifiesWithoutStoppingTask(t *testin
 	}
 	if err := f.store.ApplyConversationRoute(ctx, second, snapshot, app.ConversationRouteDecision{
 		Action: app.ConversationRouteStop, TaskID: taskID, ExpectedRevision: snapshot.Context.Candidates[0].Revision,
+		ModelOutput: fmt.Sprintf(`{"action":"stop","task_id":%q}`, taskID),
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -1289,7 +1290,8 @@ func TestConversationRouteStopIsAuthorizedAndLeavesSiblingAlone(t *testing.T) {
 		t.Fatalf("running Task candidates = %+v err=%v", snapshot.Context.Candidates, err)
 	}
 	snapshot.Context.ModelID = "p1234567"
-	decision := app.ConversationRouteDecision{Action: app.ConversationRouteStop, TaskID: first}
+	decision := app.ConversationRouteDecision{Action: app.ConversationRouteStop, TaskID: first,
+		ModelOutput: fmt.Sprintf(`{"action":"stop","task_id":%q}`, first)}
 	if _, err := f.store.pool.Exec(ctx, `UPDATE tokens SET revoked_at=clock_timestamp() WHERE id=$1`, f.authorization.TokenID); err != nil {
 		t.Fatal(err)
 	}

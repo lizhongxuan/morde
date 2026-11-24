@@ -593,6 +593,7 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 	query := `SELECT id,initiator_id,objective,status,desired_revision FROM tasks
 WHERE owner_id=$1 AND conversation_id=$2 AND initiator_id=$3
  AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')
+ AND project_id IS NOT DISTINCT FROM NULLIF($11,'')
  AND waiting_reason<>'project_recovery_unavailable'
  AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id=tasks.id)
  AND ($8::text='' OR NOT EXISTS (SELECT 1 FROM conversation_messages origin
@@ -609,7 +610,7 @@ ORDER BY CASE WHEN id=$9 AND $9<>'' THEN 0 WHEN id=$10 AND $10<>'' THEN 1 ELSE 2
 	}
 	rows, err = tx.Query(ctx, query, claim.Message.OwnerID, claim.Message.ConversationID, claim.Message.ActorID,
 		claim.Message.CreatedAt, claim.Message.Sequence, value.PreviousMessageID, descendants, claim.Input.VariantGroupID,
-		claim.Input.ReferenceTaskID, value.PreviousTaskID)
+		claim.Input.ReferenceTaskID, value.PreviousTaskID, claim.Input.ProjectID)
 	if err != nil {
 		return app.ConversationRouteSnapshot{}, fmt.Errorf("read route task candidates: %w", err)
 	}
@@ -914,6 +915,11 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 		} else if decision.ToolName != "" || decision.ToolArguments != "" {
 			return domain.InvalidArgument("route_decision", "direct tool fields are only valid for a tool action")
 		}
+		if (decision.Action == app.ConversationRouteStop || decision.Action == app.ConversationRouteStopAll) &&
+			!app.ValidConversationRouteStopDecision(current.Context, decision) {
+			decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+				Question: "我无法安全确认要停止的任务，请重新说明停止范围。"}
+		}
 		modelID := snapshot.Context.ModelID
 		snapshot.Context.ModelID = ""
 		if !conversationRouteSnapshotsMatch(snapshot, current) {
@@ -929,14 +935,6 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 		}
 		if current.PreviousCycle && decision.Action != app.ConversationRouteClarify {
 			return domain.NewError(domain.CodeConflict, "conversation predecessor chain is invalid")
-		}
-		if (decision.Action == app.ConversationRouteNew || decision.Action == app.ConversationRouteReply) &&
-			app.ConversationRouteHasExplicitControlIntent(current.Context.Content) {
-			if current.Context.ReferenceUnavailable {
-				decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
-			} else if current.PreviousMissing {
-				decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "我无法确认你要操作哪项任务。请指定任务，或重新描述操作。"}
-			}
 		}
 		if current.PreviousMissing && (decision.Action == app.ConversationRouteNew || decision.Action == app.ConversationRouteReply) {
 			var independent bool
@@ -1113,6 +1111,12 @@ WHERE task_id=$1 AND status='dispatched' AND cancel_requested=false`, candidate.
 				return err
 			}
 			return finishConversationRoute(ctx, tx, claim, "routed", "已请求停止该任务，停止完成后会更新状态。", candidate.TaskID, true)
+		case app.ConversationRouteStopAll:
+			response, err := stopAllConversationRouteTasksInTx(ctx, tx, claim)
+			if err != nil {
+				return err
+			}
+			return finishConversationRoute(ctx, tx, claim, "routed", response, "", true)
 		case app.ConversationRouteClarify:
 			if strings.TrimSpace(decision.Question) == "" || !utf8.ValidString(decision.Question) ||
 				strings.ContainsRune(decision.Question, '\x00') || len([]rune(decision.Question)) > 200 {
@@ -1130,6 +1134,61 @@ WHERE task_id=$1 AND status='dispatched' AND cancel_requested=false`, candidate.
 			return domain.InvalidArgument("route_decision", "conversation route action is invalid")
 		}
 	})
+}
+
+func stopAllConversationRouteTasksInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) (string, error) {
+	if err := requireConversationRouteScope(ctx, tx, claim, identity.ScopeTaskControl); err != nil {
+		return "", err
+	}
+	rows, err := tx.Query(ctx, `SELECT id,status FROM tasks
+WHERE owner_id=$1 AND initiator_id=$2 AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')
+ AND NOT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls internal_tool WHERE internal_tool.task_id=tasks.id)
+ORDER BY created_at,id LIMIT 257 FOR UPDATE`, claim.Message.OwnerID, claim.Message.ActorID)
+	if err != nil {
+		return "", fmt.Errorf("lock tasks for explicit stop-all request: %w", err)
+	}
+	type activeTask struct {
+		id     string
+		status task.Status
+	}
+	active := make([]activeTask, 0, 16)
+	for rows.Next() {
+		var item activeTask
+		var status string
+		if err := rows.Scan(&item.id, &status); err != nil {
+			rows.Close()
+			return "", fmt.Errorf("read task for explicit stop-all request: %w", err)
+		}
+		item.status = task.Status(status)
+		active = append(active, item)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return "", fmt.Errorf("iterate tasks for explicit stop-all request: %w", err)
+	}
+	rows.Close()
+	if len(active) > 256 {
+		return "当前活动任务较多，我无法一次安全停止全部；没有任务被停止。请说明要停止的任务范围。", nil
+	}
+	if len(active) == 0 {
+		return "当前没有由你发起且仍在执行的任务。", nil
+	}
+	requested, alreadyStopping := 0, 0
+	for _, item := range active {
+		if item.status == task.StatusCancelling {
+			alreadyStopping++
+			continue
+		}
+		if _, err := tx.Exec(ctx, `UPDATE task_mcp_connector_operations SET cancel_requested=true,updated_at=clock_timestamp()
+WHERE task_id=$1 AND status='dispatched' AND cancel_requested=false`, item.id); err != nil {
+			return "", fmt.Errorf("fence task operation before stop-all cancellation: %w", err)
+		}
+		if err := requestTaskCancellationForAuthorization(ctx, tx, item.id, claim.Message.OwnerID); err != nil {
+			return "", err
+		}
+		requested++
+	}
+	return fmt.Sprintf("已向你发起的 %d 个活动任务提交停止请求；%d 个任务已在停止处理中。我会根据服务端确认结果更新状态。", requested, alreadyStopping), nil
 }
 
 func recordConversationMessageAcknowledgementDecisionInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, acknowledge bool) error {
@@ -2084,8 +2143,9 @@ VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7)`, value.ID, value.OwnerID, claim.Message.ID
 		var requiredRevision int64
 		err := tx.QueryRow(ctx, `SELECT desired_revision FROM tasks
 WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND initiator_id=$4
+ AND project_id IS NOT DISTINCT FROM NULLIF($5,'')
  AND status IN ('queued','running','waiting_user','pausing','paused','cancelling')
- AND waiting_reason<>'project_recovery_unavailable' FOR UPDATE`, dependencyTaskID, value.OwnerID, value.ConversationID, value.InitiatorID).
+ AND waiting_reason<>'project_recovery_unavailable' FOR UPDATE`, dependencyTaskID, value.OwnerID, value.ConversationID, value.InitiatorID, value.ProjectID).
 			Scan(&requiredRevision)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeConflict, "task dependency changed before submission")

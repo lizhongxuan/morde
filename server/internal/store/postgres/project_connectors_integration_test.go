@@ -226,6 +226,7 @@ func prepareProjectMCPOperation(t *testing.T, ctx context.Context, store *Store,
 		}
 		operation.BindingVersion = binding.BindingVersion
 	}
+	operation = bindApprovedMCPConnectorOperationForTest(t, ctx, store, operation)
 	prepared, replayed, err := store.PrepareMCPConnectorOperation(ctx, operation, running.Lease.Owner)
 	if err != nil || replayed || prepared.Status != task.OperationPrepared {
 		t.Fatalf("prepare project MCP operation = %#v replay=%t err=%v", prepared, replayed, err)
@@ -234,6 +235,7 @@ func prepareProjectMCPOperation(t *testing.T, ctx context.Context, store *Store,
 	dispatchedInput.ID = mustID(t, domain.NewOperationID)
 	dispatchedInput.Key = key + "-dispatched"
 	dispatchedInput.RequestHash = hashBytes("request:" + dispatchedInput.Key)
+	dispatchedInput = bindApprovedMCPConnectorOperationForTest(t, ctx, store, dispatchedInput)
 	dispatchedPrepared, replayed, err := store.PrepareMCPConnectorOperation(ctx, dispatchedInput, running.Lease.Owner)
 	if err != nil || replayed {
 		t.Fatalf("prepare dispatched project MCP operation = %#v replay=%t err=%v", dispatchedPrepared, replayed, err)

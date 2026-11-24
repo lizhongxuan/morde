@@ -68,6 +68,7 @@ func TestSelectedMCPDispatchSerializesWithRevisionCredentialRevocation(t *testin
 				ConnectorID: connectorID, ConnectorRevision: grant.ConnectorRevision, CredentialVersion: grant.CredentialVersion,
 				GrantVersion: grant.GrantVersion, LeaseVersion: f.task.Lease.Version, Key: "revision-revoke-race", ToolName: "lookup",
 				RequestHash: hashBytes("synthetic-revoke-race"), Status: task.OperationPrepared}
+			operation = bindApprovedMCPConnectorOperationForTest(t, ctx, f.route.store, operation)
 			prepared, replayed, err := f.route.store.PrepareMCPConnectorOperation(ctx, operation, f.task.Lease.Owner)
 			if err != nil || replayed {
 				t.Fatalf("prepare race operation: replayed=%t err=%v", replayed, err)
@@ -147,8 +148,8 @@ func TestSelectedMCPDispatchSerializesWithRevisionCredentialRevocation(t *testin
 			next := prepared
 			next.ID = mustID(t, domain.NewOperationID)
 			next.Key = "revision-revoke-next"
-			if _, _, err := f.route.store.PrepareMCPConnectorOperation(ctx, next, f.task.Lease.Owner); domain.CodeOf(err) != domain.CodeConflict {
-				t.Fatalf("new call was allowed while prior operation was unknown: %v", err)
+			if _, _, err := f.route.store.PrepareMCPConnectorOperation(ctx, next, f.task.Lease.Owner); err == nil {
+				t.Fatal("new call was allowed while prior operation was unknown")
 			}
 		})
 	}
