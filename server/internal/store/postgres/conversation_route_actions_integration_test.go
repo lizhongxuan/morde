@@ -166,9 +166,11 @@ func TestConversationRouteSnapshotBoundsCandidateSetsWithoutBlockingRouting(t *t
 	if err != nil {
 		t.Fatalf("overflow snapshot failed the route instead of returning bounded context: %v", err)
 	}
-	if !snapshot.Context.CandidateSetIncomplete || len(snapshot.Context.Candidates) != 64 || len(snapshot.Context.RequestCandidates) != 100 {
-		t.Fatalf("candidate bounds/incomplete marker = tasks:%d requests:%d incomplete:%t", len(snapshot.Context.Candidates),
-			len(snapshot.Context.RequestCandidates), snapshot.Context.CandidateSetIncomplete)
+	if !snapshot.Context.CandidateSetIncomplete || !snapshot.Context.TaskCandidateSetIncomplete ||
+		!snapshot.Context.RequestCandidateSetIncomplete || len(snapshot.Context.Candidates) != 64 || len(snapshot.Context.RequestCandidates) != 100 {
+		t.Fatalf("candidate bounds/incomplete markers = tasks:%d requests:%d incomplete:%t task_incomplete:%t request_incomplete:%t",
+			len(snapshot.Context.Candidates), len(snapshot.Context.RequestCandidates), snapshot.Context.CandidateSetIncomplete,
+			snapshot.Context.TaskCandidateSetIncomplete, snapshot.Context.RequestCandidateSetIncomplete)
 	}
 	if snapshot.Context.Candidates[0].TaskID != oldestTaskID {
 		t.Fatalf("explicit task reference was omitted from bounded active candidates: %+v", snapshot.Context.Candidates[0])

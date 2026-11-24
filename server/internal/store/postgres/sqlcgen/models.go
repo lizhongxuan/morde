@@ -2404,6 +2404,7 @@ type TaskValidationReview struct {
 	ReviewedAt                 pgtype.Timestamptz `json:"reviewed_at"`
 	ExecutionModelCallID       pgtype.Text        `json:"execution_model_call_id"`
 	ValidationState            string             `json:"validation_state"`
+	ArtifactContentEvidence    []byte             `json:"artifact_content_evidence"`
 }
 
 type TaskValidationReviewModelResponse struct {
@@ -2836,6 +2837,13 @@ type WorkspaceSyncNodeRevision struct {
 	DesiredRevision int64              `json:"desired_revision"`
 	AppliedRevision int64              `json:"applied_revision"`
 	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type WorkspaceSyncProjectLiveBaseline struct {
+	WorkspaceID string `json:"workspace_id"`
+	SessionID   string `json:"session_id"`
+	Files       []byte `json:"files"`
+	Directories []byte `json:"directories"`
 }
 
 type WorkspaceSyncProjectSource struct {

@@ -38,6 +38,7 @@ func TestPostgresPersonalMemoryHistoryCapturesFirstEditAndPurgesBodiesOnDelete(t
 	firstPage, err := store.GetPersonalMemoryHistoryBatch(ctx, principal, "global", nil, 1)
 	if err != nil || firstPage.ServiceInstanceID != instanceID || !firstPage.HasMore || len(firstPage.Items) != 1 ||
 		firstPage.Items[0].Revision != 2 || !personalJSONEqual(firstPage.Items[0].Body, secondBody) ||
+		firstPage.Items[0].SupersededByRevision != nil ||
 		firstPage.Items[0].SourceStatus != personal.MemoryHistorySourceAvailable || len(firstPage.Items[0].Sources) != 1 ||
 		firstPage.Items[0].Sources[0].Kind != "mutation_receipt" || firstPage.Items[0].Sources[0].ID != "content-write-2" {
 		t.Fatalf("first history page = %+v, %v", firstPage, err)
@@ -48,6 +49,7 @@ func TestPostgresPersonalMemoryHistoryCapturesFirstEditAndPurgesBodiesOnDelete(t
 	}, 10)
 	if err != nil || olderPage.HasMore || len(olderPage.Items) != 1 || olderPage.Items[0].Revision != 1 ||
 		!personalJSONEqual(olderPage.Items[0].Body, firstBody) || !olderPage.Items[0].Restorable ||
+		olderPage.Items[0].SupersededByRevision == nil || *olderPage.Items[0].SupersededByRevision != 2 ||
 		olderPage.Items[0].SourceStatus != personal.MemoryHistorySourceAvailable || len(olderPage.Items[0].Sources) != 1 ||
 		olderPage.Items[0].Sources[0].ID != "content-write-1" || olderPage.Items[0].ChangedAt.IsZero() {
 		t.Fatalf("older history page = %+v, %v", olderPage, err)
@@ -62,6 +64,20 @@ func TestPostgresPersonalMemoryHistoryCapturesFirstEditAndPurgesBodiesOnDelete(t
 	if usedBytes != expectedBytes {
 		t.Fatalf("quota after first edit = %d, want current plus saved baseline %d", usedBytes, expectedBytes)
 	}
+	if _, err := pool.Exec(ctx, `DELETE FROM personal_mutation_receipts WHERE owner_id=$1 AND mutation_id='content-write-2'`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	olderWithoutAuthorizedSuccessor, err := store.GetPersonalMemoryHistoryBatch(ctx, principal, "global", &personal.MemoryHistoryCursor{
+		Version: personal.MemoryHistoryCursorVersion, OwnerID: owner.ID, ServiceInstanceID: instanceID,
+		ObjectType: personal.ObjectTypeMemory, ObjectID: "global", AfterRevision: 2,
+	}, 10)
+	if err != nil || len(olderWithoutAuthorizedSuccessor.Items) != 1 ||
+		olderWithoutAuthorizedSuccessor.Items[0].Revision != 1 ||
+		!personalJSONEqual(olderWithoutAuthorizedSuccessor.Items[0].Body, firstBody) ||
+		olderWithoutAuthorizedSuccessor.Items[0].SourceStatus != personal.MemoryHistorySourceAvailable ||
+		olderWithoutAuthorizedSuccessor.Items[0].SupersededByRevision != nil {
+		t.Fatalf("history exposed a relationship to a revision with unavailable provenance: %+v, %v", olderWithoutAuthorizedSuccessor, err)
+	}
 	if _, err := pool.Exec(ctx, `DELETE FROM personal_mutation_receipts WHERE owner_id=$1 AND mutation_id='content-write-1'`, owner.ID); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +86,8 @@ func TestPostgresPersonalMemoryHistoryCapturesFirstEditAndPurgesBodiesOnDelete(t
 		ObjectType: personal.ObjectTypeMemory, ObjectID: "global", AfterRevision: 2,
 	}, 10)
 	if err != nil || len(withheldPage.Items) != 1 || withheldPage.Items[0].Revision != 1 || len(withheldPage.Items[0].Body) != 0 ||
-		withheldPage.Items[0].Restorable || withheldPage.Items[0].SourceStatus != personal.MemoryHistorySourceUnavailable || len(withheldPage.Items[0].Sources) != 0 {
+		withheldPage.Items[0].Restorable || withheldPage.Items[0].SourceStatus != personal.MemoryHistorySourceUnavailable ||
+		len(withheldPage.Items[0].Sources) != 0 || withheldPage.Items[0].SupersededByRevision != nil {
 		t.Fatalf("history with no longer authorized source was not withheld: %+v, %v", withheldPage, err)
 	}
 
@@ -149,18 +166,20 @@ SET used_bytes=octet_length($2::jsonb::text) WHERE service_instance_id=$1::uuid 
 			t.Fatalf("legacy history revision %d = %d, want %d", index, revision.Revision, 5-index)
 		}
 		if index == 0 {
-			if !personalJSONEqual(revision.Body, []byte(`{"content":"new body"}`)) || !revision.Restorable {
+			if !personalJSONEqual(revision.Body, []byte(`{"content":"new body"}`)) || !revision.Restorable || revision.SupersededByRevision != nil {
 				t.Fatalf("new revision body = %s, restorable=%t", revision.Body, revision.Restorable)
 			}
 			continue
 		}
 		if index == 1 {
-			if !personalJSONEqual(revision.Body, []byte(legacyBody)) || !revision.Restorable {
-				t.Fatalf("first-edit baseline = %s, restorable=%t", revision.Body, revision.Restorable)
+			if !personalJSONEqual(revision.Body, []byte(legacyBody)) || !revision.Restorable ||
+				revision.SupersededByRevision == nil || *revision.SupersededByRevision != 5 {
+				t.Fatalf("first-edit baseline = %s, restorable=%t superseded_by=%v", revision.Body, revision.Restorable, revision.SupersededByRevision)
 			}
 			continue
 		}
-		if len(revision.Body) != 0 || revision.Restorable || revision.SourceStatus != personal.MemoryHistorySourceUnrecorded {
+		if len(revision.Body) != 0 || revision.Restorable || revision.SourceStatus != personal.MemoryHistorySourceUnrecorded ||
+			revision.SupersededByRevision != nil {
 			t.Fatalf("legacy revision %d was fabricated: %+v", revision.Revision, revision)
 		}
 	}

@@ -4563,7 +4563,7 @@ export interface paths {
         };
         /**
          * Read revision history for a personal memory
-         * @description Requires an approved Portal Session or active Client credential. Returns current and prior memory revisions newest first. Historical bodies that were never retained are null and are never reconstructed. A body is restorable only when present and its recorded provenance is still authorized. Suppressed or invalid provenance withholds the body and all source references. Existing PUT with base_revision and Idempotency-Key is used to restore an available body. Missing, deleted, or inaccessible memories return not_found. Prior history bodies count toward personal-data quota and are purged when the memory is deleted.
+         * @description Requires an approved Portal Session or active Client credential. Returns current and prior memory revisions newest first. Historical bodies that were never retained are null and are never reconstructed. A body is restorable only when present and its recorded provenance is still authorized. Suppressed or invalid provenance withholds the body, source references, and superseding revision relationship. Existing PUT with base_revision and Idempotency-Key is used to restore an available body. Missing, deleted, or inaccessible memories return not_found. Prior history bodies count toward personal-data quota and are purged when the memory is deleted.
          */
         get: operations["getPersonalMemoryHistory"];
         put?: never;
@@ -6587,9 +6587,9 @@ export interface components {
         TokenId: string;
         ClientInstallationId: string;
         /** @enum {string} */
-        PersonalMutationObjectType: "profile" | "memory" | "soul" | "diary" | "goal" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        PersonalMutationObjectType: "profile" | "memory" | "rule_candidate" | "soul" | "diary" | "goal" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
         /** @enum {string} */
-        PersonalObjectType: "profile" | "memory" | "soul" | "diary" | "goal" | "schedule" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        PersonalObjectType: "profile" | "memory" | "rule_candidate" | "soul" | "diary" | "goal" | "schedule" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
         /** @description Path-free opaque identifier; exact accepted values depend on object_type. The server rejects . and .. and enforces each type's allowlist. */
         PersonalObjectId: string;
         GoalId: string;
@@ -8354,6 +8354,11 @@ export interface components {
             source_status: "available" | "unrecorded" | "unavailable";
             /** @description Only currently authorized source references are returned; withheld provenance yields an empty array. */
             sources: components["schemas"]["PersonalMemoryHistorySource"][];
+            /**
+             * Format: int64
+             * @description Nearest newer revision for a readable historical revision; null for the current revision or when provenance is withheld.
+             */
+            superseded_by_revision: number | null;
         };
         PersonalMemoryHistoryPage: {
             items: components["schemas"]["PersonalMemoryRevision"][];

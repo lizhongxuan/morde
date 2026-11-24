@@ -15,6 +15,7 @@ import (
 
 const (
 	ObjectTypeMemory           = "memory"
+	ObjectTypeRuleCandidate    = "rule_candidate"
 	ObjectTypeSoul             = "soul"
 	ObjectTypeDiary            = "diary"
 	ObjectTypeGoal             = "goal"
@@ -30,6 +31,7 @@ const (
 var personalSyncObjectTypes = [...]string{
 	ObjectTypeProfile,
 	ObjectTypeMemory,
+	ObjectTypeRuleCandidate,
 	ObjectTypeSoul,
 	ObjectTypeDiary,
 	ObjectTypeGoal,
@@ -51,7 +53,7 @@ func PersonalSyncObjectTypes() []string {
 // IsPersonalSyncObjectType reports whether the type is included in personal sync.
 func IsPersonalSyncObjectType(objectType string) bool {
 	switch objectType {
-	case ObjectTypeProfile, ObjectTypeMemory, ObjectTypeSoul, ObjectTypeDiary, ObjectTypeGoal, ObjectTypeSchedule,
+	case ObjectTypeProfile, ObjectTypeMemory, ObjectTypeRuleCandidate, ObjectTypeSoul, ObjectTypeDiary, ObjectTypeGoal, ObjectTypeSchedule,
 		ObjectTypeFeedPost, ObjectTypeFeedPreferences, ObjectTypeIdeaMark,
 		ObjectTypeLibraryItem, ObjectTypeSkillSetting, ObjectTypeConnectorSetting:
 		return true
@@ -86,6 +88,8 @@ func ValidateObjectIdentifier(objectType, objectID string) error {
 	switch objectType {
 	case ObjectTypeMemory:
 		valid = objectID == "global" || objectID == "user" || isMemoryEntryID(objectID)
+	case ObjectTypeRuleCandidate:
+		valid = isRuleCandidateID(objectID)
 	case ObjectTypeFeedPreferences:
 		valid = objectID == "default"
 	case ObjectTypeSkillSetting:
@@ -134,6 +138,13 @@ func ValidateObjectBody(objectType, objectID string, body []byte) error {
 		}
 		if !decodePersonalObject(body, &value, "content", "category") || !validText(value.Content, 1, 65536) ||
 			(value.Category != nil && runeLength(*value.Category) > 64) {
+			return invalidPersonalBody()
+		}
+	case ObjectTypeRuleCandidate:
+		var value RuleCandidateBody
+		if !decodePersonalObject(body, &value, "scope", "status", "source_memory_id", "source_memory_revision") || value.Scope != "personal" ||
+			(value.Status != RuleCandidatePending && value.Status != RuleCandidateActive) ||
+			ValidateObjectIdentifier(ObjectTypeMemory, value.SourceMemoryID) != nil || value.SourceMemoryRevision < 1 {
 			return invalidPersonalBody()
 		}
 	case ObjectTypeSoul:
@@ -275,6 +286,32 @@ func isMemoryEntryID(value string) bool {
 			continue
 		}
 		return false
+	}
+	return true
+}
+
+const (
+	RuleCandidatePending = "candidate"
+	RuleCandidateActive  = "active"
+)
+
+// RuleCandidateBody points at the source memory instead of copying its text, so
+// forgetting the memory does not leave a second copy in an active rule.
+type RuleCandidateBody struct {
+	Scope                string `json:"scope"`
+	Status               string `json:"status"`
+	SourceMemoryID       string `json:"source_memory_id"`
+	SourceMemoryRevision int64  `json:"source_memory_revision"`
+}
+
+func isRuleCandidateID(value string) bool {
+	if len(value) != len("r_")+8 || !strings.HasPrefix(value, "r_") {
+		return false
+	}
+	for _, char := range value[2:] {
+		if !(char >= 'a' && char <= 'z') && !(char >= '0' && char <= '9') {
+			return false
+		}
 	}
 	return true
 }

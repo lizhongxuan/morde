@@ -64,10 +64,12 @@ enum MIFTaskDynamicsPresentation {
         task.status == "waiting_user" && task.waiting_reason == "dsh_recovery_unresolved"
     }
 
-    static func statusLabel(_ status: String, waitingReason: String? = nil) -> String {
-        let key = isExecuting(status)
+    static func statusLabel(_ status: String, waitingReason: String? = nil,
+                            stopRequestStatus: String? = nil) -> String {
+        let key = status == "running"
             ? "Task executing"
-            : MordeTaskStatusPresentation.localizationKey(status: status, waitingReason: waitingReason)
+            : MordeTaskStatusPresentation.localizationKey(status: status, waitingReason: waitingReason,
+                                                          stopRequestStatus: stopRequestStatus)
         return NSLocalizedString(key, bundle: AppBundle.current, comment: "Task status")
     }
 
@@ -2046,8 +2048,8 @@ struct MIFTaskDetailView: View {
         } else if isLoadingDetail {
             ProgressView(AppLocalized("Loading tasks…"))
                 .frame(maxWidth: .infinity, minHeight: 150)
-        } else if let detailError {
-            MIFTaskErrorState(message: detailError)
+        } else if let message = detailError ?? store.timelineErrors[taskID] {
+            MIFTaskErrorState(message: message)
         } else {
             MIFTaskNotice(text: AppLocalized("Task details unavailable"), symbol: "exclamationmark.circle")
         }
@@ -2061,7 +2063,8 @@ struct MIFTaskDetailView: View {
         let stepsByID = Dictionary(grouping: steps, by: \.id)
         VStack(alignment: .leading, spacing: 0) {
             HStack(spacing: 8) {
-                Text(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason))
+                Text(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason,
+                                                            stopRequestStatus: task.stop_request?.status))
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(MIFTaskDynamicsPresentation.isExecuting(task.status)
                         ? NanoMuseTones.actionText : NanoMuseTones.secondaryText)
@@ -3058,7 +3061,8 @@ private struct MIFTaskListRow: View {
                     .padding(.bottom, 4)
                     .accessibilityIdentifier("morde.tasks.row.detail.\(task.id)")
                 HStack(spacing: 8) {
-                    Text(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason))
+                    Text(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason,
+                                                                stopRequestStatus: task.stop_request?.status))
                         .foregroundStyle(MIFTaskDynamicsPresentation.isExecuting(task.status)
                             ? NanoMuseTones.actionText : NanoMuseTones.muted)
                         .accessibilityIdentifier("morde.tasks.row.status.\(task.id)")
@@ -3088,13 +3092,15 @@ private struct MIFTaskListRow: View {
                 ProgressView().controlSize(.small).tint(.white)
             }
             .frame(width: 44, height: 44)
-            .accessibilityLabel(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason))
+            .accessibilityLabel(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason,
+                                                                       stopRequestStatus: task.stop_request?.status))
         } else {
             Circle()
                 .fill(IconPalette.plainBackground)
                 .frame(width: 44, height: 44)
                 .overlay(RoundedRectangle(cornerRadius: 2).fill(IconPalette.stop).frame(width: 8, height: 8))
-                .accessibilityLabel(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason))
+                .accessibilityLabel(MIFTaskDynamicsPresentation.statusLabel(task.status, waitingReason: task.waiting_reason,
+                                                                           stopRequestStatus: task.stop_request?.status))
         }
     }
 }

@@ -55,14 +55,16 @@ func (s *Store) RequestTaskStepRetry(ctx context.Context, record app.Idempotency
 		if err != nil {
 			return storeError("read task for safe step retry", "task", err)
 		}
-		if !initial.HostID.Valid || initial.ExecutionLocation != "server" {
+		if initial.ExecutionLocation != "server" {
 			return domain.NewError(domain.CodeConflict, "task target does not support safe step retry")
 		}
-		if err := lockTaskTargetHost(ctx, tx, initial.HostID.String, initial.InitiatorID); err != nil {
-			return err
-		}
-		if err := lockAIHost(ctx, tx, initial.HostID.String, initial.InitiatorID); err != nil {
-			return err
+		if initial.HostID.Valid {
+			if err := lockTaskTargetHost(ctx, tx, initial.HostID.String, initial.InitiatorID); err != nil {
+				return err
+			}
+			if err := lockAIHost(ctx, tx, initial.HostID.String, initial.InitiatorID); err != nil {
+				return err
+			}
 		}
 		var locked string
 		if err := tx.QueryRow(ctx, `SELECT id FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, request.TaskID, initial.OwnerID).Scan(&locked); err != nil {
@@ -151,6 +153,9 @@ FROM task_steps WHERE task_id=$1 AND id=$2 FOR UPDATE`, request.TaskID, request.
 		if !connectorRateLimitRetry && !notDispatchedRetry {
 			return domain.NewError(domain.CodeConflict, "step failure is not safe to retry")
 		}
+		if !initial.HostID.Valid && (!connectorRateLimitRetry || current.WorkspaceID.Valid) {
+			return domain.NewError(domain.CodeConflict, "only MCP connector rate-limit steps can retry without a Host")
+		}
 		if connectorRateLimitRetry {
 			previous, err := lockAgentInstance(ctx, tx, current.ID, current.OwnerID, current.AgentGeneration)
 			if err != nil {
@@ -204,15 +209,19 @@ EXISTS(SELECT 1 FROM task_operations WHERE task_id=$1 AND status IN ('prepared',
 			return domain.NewError(domain.CodeConflict, "a newer attempt already exists for this step")
 		}
 
-		var runtimeGeneration int64
-		if err := tx.QueryRow(ctx, `SELECT h.runtime_generation FROM hosts h WHERE h.id=$1 AND h.state='running' AND h.control_state='ai'
+		runtimeGeneration := int64(0)
+		hostID := ""
+		if current.HostID.Valid {
+			hostID = current.HostID.String
+			if err := tx.QueryRow(ctx, `SELECT h.runtime_generation FROM hosts h WHERE h.id=$1 AND h.state='running' AND h.control_state='ai'
 AND h.deleted_at IS NULL AND EXISTS (SELECT 1 FROM host_runtime_heartbeats hb WHERE hb.host_id=h.id
   AND hb.runtime_generation=h.runtime_generation AND hb.last_seen_at > clock_timestamp()-$2::double precision*interval '1 second')`,
-			current.HostID.String, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&runtimeGeneration); err != nil || runtimeGeneration < 1 {
-			if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-				return fmt.Errorf("read Host retry fence: %w", err)
+				hostID, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&runtimeGeneration); err != nil || runtimeGeneration < 1 {
+				if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+					return fmt.Errorf("read Host retry fence: %w", err)
+				}
+				return domain.NewError(domain.CodeConflict, "Host is not ready for a safe step retry")
 			}
-			return domain.NewError(domain.CodeConflict, "Host is not ready for a safe step retry")
 		}
 		workspaceBindingVersion := int64(0)
 		var workspaceRevision *int64
@@ -246,7 +255,7 @@ WHERE wb.host_id=$1 AND wb.workspace_id=$2`, current.HostID.String, current.Work
 			AttemptStepID: request.AttemptStepID, Attempt: source.Attempt + 1, SourceCallID: source.ToolCallKey,
 			RetryCallID: request.RetryCallID, AgentSessionID: current.AgentSessionID, TaskRevision: request.ExpectedTaskRevision,
 			ToolName: source.ToolName, RequestDigest: append([]byte(nil), source.RequestDigest...),
-			AuthorizationVersion: current.AuthVersion, HostID: current.HostID.String, HostRuntimeGeneration: runtimeGeneration,
+			AuthorizationVersion: current.AuthVersion, HostID: hostID, HostRuntimeGeneration: runtimeGeneration,
 			WorkspaceID: current.WorkspaceID.String, InputRevision: int64Pointer(current.InputRevision),
 			WorkspaceCheckpointRevision: int64Pointer(current.WorkspaceCheckpointRevision), WorkspaceBindingVersion: workspaceBindingVersion,
 			WorkspaceRevision: workspaceRevision, CheckpointThroughSequence: current.CheckpointThroughSeq,
@@ -315,14 +324,17 @@ func (s *Store) ConsumeTaskStepRetryIntent(ctx context.Context, intent task.Step
 			Scan(&ownerID, &initiatorID, &hostID); err != nil {
 			return storeError("read task for retry intent consumption", "task", err)
 		}
-		if ownerID != intent.OwnerID || hostID != intent.HostID || initiatorID != fence.InitiatorID || !domain.ValidHostID(hostID) {
+		if ownerID != intent.OwnerID || hostID != intent.HostID || initiatorID != fence.InitiatorID ||
+			(hostID != "" && !domain.ValidHostID(hostID)) {
 			return domain.NewError(domain.CodeConflict, "task retry target changed")
 		}
-		if err := lockTaskTargetHost(ctx, tx, hostID, initiatorID); err != nil {
-			return err
-		}
-		if err := lockAIHost(ctx, tx, hostID, initiatorID); err != nil {
-			return err
+		if hostID != "" {
+			if err := lockTaskTargetHost(ctx, tx, hostID, initiatorID); err != nil {
+				return err
+			}
+			if err := lockAIHost(ctx, tx, hostID, initiatorID); err != nil {
+				return err
+			}
 		}
 		var locked string
 		if err := tx.QueryRow(ctx, `SELECT id FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, intent.TaskID, ownerID).Scan(&locked); err != nil {
@@ -337,7 +349,8 @@ func (s *Store) ConsumeTaskStepRetryIntent(ctx context.Context, intent task.Step
 		}
 		if row.Status != string(task.StatusRunning) || row.LeaseOwner != fence.LeaseOwner || row.LeaseVersion != fence.LeaseVersion ||
 			row.LeaseExpiresAt.Time.Before(time.Now()) || row.CurrentRevision != intent.TaskRevision || row.DesiredRevision != intent.TaskRevision ||
-			row.AgentSessionID != intent.AgentSessionID || row.AuthVersion != intent.AuthorizationVersion || row.HostID.String != intent.HostID ||
+			row.AgentSessionID != intent.AgentSessionID || row.AuthVersion != intent.AuthorizationVersion ||
+			(row.HostID.Valid && row.HostID.String != intent.HostID) || (!row.HostID.Valid && intent.HostID != "") ||
 			row.AgentInstanceID != fence.AgentInstanceID || row.AgentGeneration != fence.AgentGeneration ||
 			row.AgentEngineVersion != fence.EngineVersion || row.AgentProfileVersion != fence.ProfileVersion ||
 			row.CheckpointThroughSeq != intent.CheckpointThroughSequence || !bytes.Equal(row.CheckpointDigest, intent.CheckpointDigest) {
@@ -362,6 +375,9 @@ AND ai.lease_version=$7 AND ai.auth_version=$8 AND ai.state='active' AND ai.leas
 			return domain.NewError(domain.CodeConflict, "task execution authorization changed")
 		}
 		if row.WorkspaceID.Valid {
+			if intent.HostID == "" {
+				return domain.NewError(domain.CodeWorkspaceConflict, "hostless step retry cannot carry a Workspace target")
+			}
 			if !sameNullableInt64(row.InputRevision, intent.InputRevision) || !sameNullableInt64(row.WorkspaceCheckpointRevision, intent.WorkspaceCheckpointRevision) {
 				return domain.NewError(domain.CodeWorkspaceConflict, "task Workspace input fence changed")
 			}
@@ -395,15 +411,17 @@ FROM workspace_bindings wb JOIN workspaces w ON w.id=wb.workspace_id WHERE wb.ho
 		if err := verifyStepRetryDependencies(ctx, tx, row.ID, row.OwnerID, row.InitiatorID, row.ProjectID); err != nil {
 			return err
 		}
-		var runtimeGeneration int64
-		if err := tx.QueryRow(ctx, `SELECT runtime_generation FROM hosts WHERE id=$1 AND state='running' AND control_state='ai'
+		if intent.HostID != "" {
+			var runtimeGeneration int64
+			if err := tx.QueryRow(ctx, `SELECT runtime_generation FROM hosts WHERE id=$1 AND state='running' AND control_state='ai'
 AND deleted_at IS NULL AND EXISTS (SELECT 1 FROM host_runtime_heartbeats hb WHERE hb.host_id=hosts.id
 AND hb.runtime_generation=hosts.runtime_generation AND hb.last_seen_at>clock_timestamp()-$2::double precision*interval '1 second')`,
-			intent.HostID, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&runtimeGeneration); err != nil {
-			return fmt.Errorf("recheck Host retry fence: %w", err)
-		}
-		if runtimeGeneration != intent.HostRuntimeGeneration {
-			return domain.NewError(domain.CodeConflict, "Host runtime changed after retry authorization")
+				intent.HostID, host.RuntimeHeartbeatFreshness.Seconds()).Scan(&runtimeGeneration); err != nil {
+				return fmt.Errorf("recheck Host retry fence: %w", err)
+			}
+			if runtimeGeneration != intent.HostRuntimeGeneration {
+				return domain.NewError(domain.CodeConflict, "Host runtime changed after retry authorization")
+			}
 		}
 		var sourceStatus, sourcePhase, sourceFailureReason, sourceToolName string
 		var sourceRetryable bool
@@ -673,28 +691,30 @@ func verifiedMCPConnectorRateLimitRetryAt(ctx context.Context, tx pgx.Tx, ownerI
 		len(source.RequestDigest) != 32 {
 		return time.Time{}, domain.NewError(domain.CodeConflict, "connector retry evidence is invalid")
 	}
-	rows, err := tx.Query(ctx, `SELECT status,call_id,tool_name,request_hash,task_revision,result,updated_at
+	rows, err := tx.Query(ctx, `SELECT status,call_id,operation_key,connector_id,tool_name,request_hash,task_revision,result,updated_at
 FROM task_mcp_connector_operations WHERE task_id=$1 AND owner_id=$2 AND call_id=$3 FOR SHARE`, taskID, ownerID, source.ToolCallKey)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("read connector retry evidence: %w", err)
 	}
 	defer rows.Close()
 	var count int
-	var status, callID, toolName, result string
+	var status, callID, operationKey, connectorID, toolName, result string
 	var requestHash []byte
 	var taskRevision pgtype.Int8
 	var updatedAt time.Time
 	for rows.Next() {
 		count++
-		if err := rows.Scan(&status, &callID, &toolName, &requestHash, &taskRevision, &result, &updatedAt); err != nil {
+		if err := rows.Scan(&status, &callID, &operationKey, &connectorID, &toolName, &requestHash, &taskRevision, &result, &updatedAt); err != nil {
 			return time.Time{}, fmt.Errorf("read connector retry evidence row: %w", err)
 		}
 	}
 	if err := rows.Err(); err != nil {
 		return time.Time{}, fmt.Errorf("iterate connector retry evidence: %w", err)
 	}
-	if count != 1 || status != string(task.OperationFailed) || callID != source.ToolCallKey || toolName != source.ToolName ||
-		!taskRevision.Valid || taskRevision.Int64 != *source.TaskRevision || !bytes.Equal(requestHash, source.RequestDigest) {
+	if count != 1 || status != string(task.OperationFailed) || callID != source.ToolCallKey ||
+		operationKey != app.AgentOperationKey(source.ToolCallKey) ||
+		!app.IsMCPConnectorOperationToolName(toolName, connectorID) || len(requestHash) != 32 ||
+		!taskRevision.Valid || taskRevision.Int64 != *source.TaskRevision {
 		return time.Time{}, domain.NewError(domain.CodeConflict, "connector retry is not backed by one exact failed operation")
 	}
 	seconds, ok := app.MCPConnectorTerminalRetryAfterSeconds(result)
@@ -733,11 +753,15 @@ EXISTS(SELECT 1 FROM task_mcp_connector_operations WHERE task_id=$1 AND call_id=
 }
 
 func validStepRetryIntent(intent task.StepRetryIntent) bool {
+	hostTarget := intent.HostID != "" && domain.ValidHostID(intent.HostID) && intent.HostRuntimeGeneration > 0
+	hostlessMCP := intent.HostID == "" && intent.HostRuntimeGeneration == 0 && app.IsMCPConnectorStepRetryTool(intent.ToolName) &&
+		intent.WorkspaceID == "" && intent.InputRevision == nil && intent.WorkspaceCheckpointRevision == nil &&
+		intent.WorkspaceBindingVersion == 0 && intent.WorkspaceRevision == nil
 	return domain.ValidTaskID(intent.TaskID) && domain.ValidUserID(intent.OwnerID) && domain.ValidStepID(intent.SourceStepID) &&
 		domain.ValidStepID(intent.AttemptStepID) && intent.Attempt > 1 && intent.SourceCallID != "" && len(intent.SourceCallID) <= 256 &&
 		intent.RetryCallID == "morde_step_retry_"+intent.AttemptStepID && intent.AgentSessionID != "" && intent.TaskRevision >= 0 &&
-		intent.ToolName != "" && len(intent.RequestDigest) == 32 && intent.AuthorizationVersion > 0 && domain.ValidHostID(intent.HostID) &&
-		intent.HostRuntimeGeneration > 0 && intent.CheckpointThroughSequence >= 0 && len(intent.CheckpointDigest) == 32 &&
+		intent.ToolName != "" && len(intent.RequestDigest) == 32 && intent.AuthorizationVersion > 0 && (hostTarget || hostlessMCP) &&
+		intent.CheckpointThroughSequence >= 0 && len(intent.CheckpointDigest) == 32 &&
 		!intent.ExpiresAt.IsZero() && ((intent.WorkspaceID == "" && intent.InputRevision == nil && intent.WorkspaceCheckpointRevision == nil &&
 		intent.WorkspaceBindingVersion == 0 && intent.WorkspaceRevision == nil) ||
 		(domain.ValidWorkspaceID(intent.WorkspaceID) && intent.InputRevision != nil && intent.WorkspaceCheckpointRevision != nil &&

@@ -6602,7 +6602,7 @@ paths:
         Requires an approved Portal Session or active Client credential. Returns current and prior
         memory revisions newest first. Historical bodies that were never retained are null and are
         never reconstructed. A body is restorable only when present and its recorded provenance is
-        still authorized. Suppressed or invalid provenance withholds the body and all source references.
+        still authorized. Suppressed or invalid provenance withholds the body, source references, and superseding revision relationship.
         Existing PUT with base_revision and Idempotency-Key is used to restore an available body.
         Missing, deleted, or inaccessible memories return not_found. Prior history bodies count toward
         personal-data quota and are purged when the memory is deleted.
@@ -9437,8 +9437,8 @@ components:
           items: { $ref: '#/components/schemas/HostMemberPermission' }
     TokenId: { type: string, pattern: '^t[a-z0-9]{7}$' }
     ClientInstallationId: { type: string, pattern: '^i[a-z0-9]{7}$' }
-    PersonalMutationObjectType: { type: string, enum: [profile, memory, soul, diary, goal, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
-    PersonalObjectType: { type: string, enum: [profile, memory, soul, diary, goal, schedule, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
+    PersonalMutationObjectType: { type: string, enum: [profile, memory, rule_candidate, soul, diary, goal, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
+    PersonalObjectType: { type: string, enum: [profile, memory, rule_candidate, soul, diary, goal, schedule, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
     PersonalObjectId:
       type: string
       minLength: 1
@@ -11471,7 +11471,7 @@ components:
     PersonalMemoryRevision:
       type: object
       additionalProperties: false
-      required: [revision, changed_at, body, restorable, source_status, sources]
+      required: [revision, changed_at, body, restorable, source_status, sources, superseded_by_revision]
       properties:
         revision: { type: integer, format: int64, minimum: 1 }
         changed_at: { type: string, format: date-time }
@@ -11486,6 +11486,11 @@ components:
           type: array
           items: { $ref: '#/components/schemas/PersonalMemoryHistorySource' }
           description: Only currently authorized source references are returned; withheld provenance yields an empty array.
+        superseded_by_revision:
+          type: [integer, 'null']
+          format: int64
+          minimum: 1
+          description: Nearest newer revision for a readable historical revision; null for the current revision or when provenance is withheld.
     PersonalMemoryHistoryPage:
       type: object
       additionalProperties: false

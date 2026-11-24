@@ -59,11 +59,7 @@ func (h *api) streamTaskEvents(service TaskService) gin.HandlerFunc {
 			writeError(c, err)
 			return
 		}
-		if isTerminalTaskStatus(events.Status) && len(events.Items) == 0 {
-			if after >= events.CurrentSequence {
-				c.Status(http.StatusNoContent)
-				return
-			}
+		if len(events.Items) == 0 && events.CurrentSequence > after {
 			flusher, startErr := beginTaskEventStream(c)
 			if startErr != nil {
 				writeError(c, domain.NewError(domain.CodeInternal, "internal error"))
@@ -73,6 +69,10 @@ func (h *api) streamTaskEvents(service TaskService) gin.HandlerFunc {
 				return
 			}
 			flusher.Flush()
+			return
+		}
+		if isTerminalTaskStatus(events.Status) && len(events.Items) == 0 {
+			c.Status(http.StatusNoContent)
 			return
 		}
 		if err := validateTaskEvents(events.Items, after); err != nil {
@@ -119,12 +119,13 @@ func (h *api) streamTaskEvents(service TaskService) gin.HandlerFunc {
 					return
 				}
 				if len(newEvents.Items) == 0 {
-					if isTerminalTaskStatus(newEvents.Status) {
-						if newEvents.CurrentSequence > last {
-							if writeErr := writeTaskSnapshotRequired(c.Writer, newEvents.CurrentSequence); writeErr == nil {
-								flusher.Flush()
-							}
+					if newEvents.CurrentSequence > last {
+						if writeErr := writeTaskSnapshotRequired(c.Writer, newEvents.CurrentSequence); writeErr == nil {
+							flusher.Flush()
 						}
+						return
+					}
+					if isTerminalTaskStatus(newEvents.Status) {
 						return
 					}
 					continue

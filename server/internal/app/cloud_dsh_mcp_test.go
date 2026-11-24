@@ -29,6 +29,26 @@ type cloudDSHMCPStoreStub struct {
 	markUnknownErr        error
 }
 
+func TestIsMCPConnectorOperationToolName(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		connectorID string
+		want        bool
+	}{
+		{name: "mcp_k1234567_0123456789ab", connectorID: "k1234567", want: true},
+		{name: "mcp_k1234567_0123456789aB", connectorID: "k1234567"},
+		{name: "mcp_k1234567_0123456789abc", connectorID: "k1234567"},
+		{name: "mcp_k7654321_0123456789ab", connectorID: "k1234567"},
+		{name: "mcp_k1234567_0123456789ab", connectorID: "invalid"},
+	} {
+		t.Run(test.name+"/"+test.connectorID, func(t *testing.T) {
+			if got := IsMCPConnectorOperationToolName(test.name, test.connectorID); got != test.want {
+				t.Fatalf("IsMCPConnectorOperationToolName(%q, %q) = %t, want %t", test.name, test.connectorID, got, test.want)
+			}
+		})
+	}
+}
+
 func TestNewMCPToolTaskStepReusesExactQueuedRetryAttempt(t *testing.T) {
 	const taskID = "q1234567"
 	const sourceStepID = "s1234567"
@@ -408,6 +428,53 @@ func TestCloudDSHMCPTerminalRateLimitFailsTaskAndReplaysLedgerResult(t *testing.
 		status != string(task.StatusFailed) || reason != "connector_rate_limited" ||
 		bytes.Contains(store.events[len(store.events)-1].Payload, []byte("synthetic provider detail")) {
 		t.Fatalf("terminal task result event=%s", store.events[len(store.events)-1].Payload)
+	}
+}
+
+func TestCloudDSHMCPBrokerPersistsSafeDefinitiveFailureReason(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	current := store.details.Task
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-mcp-failure", 1, "session-mcp-failure"
+	current.Authorization.Version = 1
+	store.details.Task = current
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "mcp-failure-call-1", Name: cloudDSHMCPCallToolName,
+		Arguments: `{"connector_id":"k1234567","tool_name":"lookup","arguments":{"token":"private-parameter"}}`,
+		TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+			AuthorizationVersion: current.Authorization.Version}}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, nil)
+	step, err := newAgentStep(current.ID, 1, "tool", task.StepRunning, "Run connector tool", "Running the selected connector tool.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := broker.commitMCPResult(ctx, current, step, current.Usage, call.Name,
+		AgentToolResult{Status: AgentToolFailed, Output: "private-provider-error credential-secret"})
+	if err != nil || result.Status != AgentToolFailed || len(store.toolCalls) != 1 {
+		t.Fatalf("commit definitive MCP failure = %+v, err=%v tool calls=%d", result, err, len(store.toolCalls))
+	}
+	progress := store.toolCalls[0]
+	if progress.FailureReason != taskToolExecutionFailureReason || progress.Retryable || progress.Phase != "execute" ||
+		len(store.details.Steps) != 1 || store.details.Steps[0].FailureReason != taskToolExecutionFailureReason || store.details.Steps[0].Retryable {
+		t.Fatalf("persisted MCP failure evidence = progress:%+v step:%+v", progress, store.details.Steps)
+	}
+	var event struct {
+		Detail map[string]json.RawMessage `json:"detail"`
+	}
+	if err := json.Unmarshal(store.events[0].Payload, &event); err != nil {
+		t.Fatal(err)
+	}
+	var reason string
+	if json.Unmarshal(event.Detail["failure_reason"], &reason) != nil || reason != taskToolExecutionFailureReason ||
+		bytes.Contains(store.events[0].Payload, []byte("private-parameter")) ||
+		bytes.Contains(store.events[0].Payload, []byte("private-provider-error")) ||
+		bytes.Contains(store.events[0].Payload, []byte("credential-secret")) {
+		t.Fatalf("MCP failure event exposed unsafe data or omitted its reason: %s", store.events[0].Payload)
 	}
 }
 

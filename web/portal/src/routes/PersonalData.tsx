@@ -28,6 +28,10 @@ type Section = 'profile' | 'soul' | 'memory' | 'feed' | 'ideas' | 'library' | 'p
 type ProfileBody = { name: string; avatar: 'dragon' | 'emoji'; emoji?: string; color?: string; description?: string; style?: string };
 type SoulBody = { name: string; emoji?: string; style?: string; lang?: string; content: string };
 type MemoryBody = { content: string; category?: string };
+type RuleCandidateBody = {
+  scope: 'personal'; status: 'candidate' | 'active';
+  source_memory_id: string; source_memory_revision: number;
+};
 type FeedPostBody = { title: string; type: string; emoji?: string; created_at?: string; liked?: boolean; body: string };
 type LibraryBody = { name: string; kind: 'artifact' | 'media'; mime?: string; size_bytes?: number; attachment_id?: string };
 type GoalStepBody = { id?: unknown; title?: unknown; status?: unknown };
@@ -129,6 +133,16 @@ function randomMemoryID(existing: Set<string>): string {
   return candidate;
 }
 
+function randomRuleCandidateID(existing: Set<string>): string {
+  let candidate: string;
+  do {
+    const bytes = new Uint8Array(4);
+    globalThis.crypto.getRandomValues(bytes);
+    candidate = `r_${[...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('')}`;
+  } while (existing.has(candidate));
+  return candidate;
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
@@ -186,6 +200,7 @@ export function PersonalData() {
   const quotaError = scopedQuotaError && scopedQuotaError.scope === storeScope ? scopedQuotaError.value : null;
   const [memoryContent, setMemoryContent] = useState('');
   const [memoryCategory, setMemoryCategory] = useState('');
+  const [ruleDraft, setRuleDraft] = useState<{ memoryID: string; revision: number } | null>(null);
   const [feedTitle, setFeedTitle] = useState('');
   const [feedBody, setFeedBody] = useState('');
   const [libraryKind, setLibraryKind] = useState<'artifact' | 'media'>('artifact');
@@ -288,6 +303,7 @@ export function PersonalData() {
   const profileObject = objectOf<ProfileBody>(allObjects, 'profile', 'default');
   const soulObject = objectOf<SoulBody>(allObjects, 'soul', 'default');
   const memoryObjects = allObjects.filter((item) => item.object_type === 'memory');
+  const ruleCandidateObjects = allObjects.filter((item) => item.object_type === 'rule_candidate');
   // Show the confirmed server value, not an offline draft, for this consent.
   const memorySetting = state?.objects[personalObjectKey('skill_setting', 'builtin_memory')];
   const memoryEnabled = memorySetting ? memorySetting.body.enabled === true : state?.snapshotComplete === true;
@@ -359,6 +375,40 @@ export function PersonalData() {
     if (saved) {
       setMemoryContent('');
       setMemoryCategory('');
+    }
+  };
+
+  const saveRuleCandidate = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!ruleDraft || !store) return;
+    const source = state?.objects[personalObjectKey('memory', ruleDraft.memoryID)];
+    if (!source || source.revision !== ruleDraft.revision) {
+      setActionError('来源记忆已变化；请从当前版本重新提议规则。');
+      setRuleDraft(null);
+      return;
+    }
+    const id = randomRuleCandidateID(new Set(ruleCandidateObjects.map((item) => item.object_id)));
+    const saved = await saveObject('rule_candidate', id, {
+      scope: 'personal', status: 'candidate',
+      source_memory_id: ruleDraft.memoryID, source_memory_revision: ruleDraft.revision,
+    });
+    if (saved) setRuleDraft(null);
+  };
+
+  const activateRuleCandidate = (item: PersonalObject) => {
+    const body = item.body as RuleCandidateBody;
+    const source = state?.objects[personalObjectKey('memory', body.source_memory_id)];
+    if (!source || source.revision !== body.source_memory_revision) {
+      setActionError('来源记忆已变化；此候选不会生效，请从当前记忆重新提议。');
+      return;
+    }
+    if (!window.confirm('启用后，Morde 会把这条规则作为个人对话中的常驻指引，在你的请求和现有权限范围内遵循；它不会授予工具权限、跳过审批或增加预算。确定启用吗？')) return;
+    void saveObject('rule_candidate', item.object_id, { ...body, status: 'active' });
+  };
+
+  const deleteRuleCandidate = (item: PersonalObject) => {
+    if (window.confirm('删除此规则候选后，Morde 将不再在个人对话中使用它。确定删除吗？')) {
+      void deleteObject('rule_candidate', item.object_id);
     }
   };
 
@@ -577,6 +627,7 @@ export function PersonalData() {
         disabled={!state.snapshotComplete || syncing || memorySettingPending}
         onChange={(event) => void saveObject('skill_setting', 'builtin_memory', { enabled: event.target.checked })} />允许 AI 使用个人记忆</label>
       <p className="muted">{memorySettingPending ? '同步中，服务端确认后生效。' : '默认开启，仅用于个人对话；关闭后不再读取历史片段或已存记忆。'}</p>
+      <p className="muted">普通记忆只作为事实和表达偏好的参考。你可以从记忆提议一条个人规则；候选只有经你明确确认后，才会作为个人对话的常驻指引。当前请求优先；规则不会授予工具权限、跳过审批或增加预算。</p>
       <form className="form-card form-stack" onSubmit={addMemory}>
         <label>新增记忆<textarea value={memoryContent} maxLength={65536} required onChange={(event) => setMemoryContent(event.target.value)} /></label>
         <label>分类（可选）<input value={memoryCategory} maxLength={64} onChange={(event) => setMemoryCategory(event.target.value)} /></label>
@@ -585,12 +636,37 @@ export function PersonalData() {
       {memoryObjects.length === 0 ? <p className="muted">暂无记忆。</p> : <ScreenPagination
         items={memoryObjects} getKey={(item) => item.object_id} estimatedItemHeight={156} height={300}
         ariaLabel="已保存记忆" className="personal-data-pager"
-        renderItem={(item) => <MemoryRow key={`${storeScope}:${item.object_id}:${item.revision}:${JSON.stringify(item.body)}`} item={item}
+        renderItem={(item) => <MemoryRow key={`${storeScope}:${item.object_id}`} item={item}
           api={personalAPI} canRestore={Boolean(state.snapshotComplete && !syncing && serviceInstanceID)}
+          canProposeRule={Boolean(state.objects[personalObjectKey('memory', item.object_id)]?.revision === item.revision)}
           onSave={(body) => void saveObject('memory', item.object_id, body)}
           onRestore={(body) => saveObject('memory', item.object_id, body)}
+          onProposeRule={() => setRuleDraft({ memoryID: item.object_id, revision: item.revision })}
           onDelete={() => void deleteObject('memory', item.object_id)} />}
       />}
+      {ruleDraft && <form className="form-card form-stack" onSubmit={saveRuleCandidate}>
+        <h3>新建规则候选</h3>
+        <p className="muted">来源：记忆第 {ruleDraft.revision} 版。候选只引用这条记忆，不另存一份文本；想调整内容，请先编辑并保存记忆。保存后仍须单独确认才能启用。</p>
+        <p className="muted">来源内容：{asString(state.objects[personalObjectKey('memory', ruleDraft.memoryID)]?.body.content)}</p>
+        <div className="inline-actions"><button className="button button-primary" type="submit">保存为候选</button>
+          <button className="button button-secondary" type="button" onClick={() => setRuleDraft(null)}>取消</button></div>
+      </form>}
+      <section className="personal-data-setting" aria-labelledby="personal-rule-candidates-title">
+        <h3 id="personal-rule-candidates-title">规则候选</h3>
+        <p className="muted">候选不会自动生效。启用前会检查来源记忆仍是同一版本；启用后可指导个人对话，但不能扩展现有权限或绕过审批。</p>
+        {ruleCandidateObjects.length === 0 ? <p className="muted">暂无规则候选。</p> : ruleCandidateObjects.map((item) => {
+          const body = item.body as RuleCandidateBody;
+          const source = state.objects[personalObjectKey('memory', body.source_memory_id)];
+          const sourceCurrent = Boolean(source && source.revision === body.source_memory_revision);
+          return <article className="model-connection-card" key={`${item.object_id}:${item.revision}`}>
+            <div className="model-connection-main"><p>{sourceCurrent ? asString(source?.body.content) : '来源记忆已变化或不可用。'}</p><small>来源记忆：{body.source_memory_id} 第 {body.source_memory_revision} 版 · 范围：仅个人对话</small>
+              <p className="muted">{!sourceCurrent ? '来源已变化或不可用；此候选不会进入对话上下文。' : body.status === 'active' ? '已确认并启用' : '待你审核'}</p></div>
+            <div className="inline-actions">{body.status === 'candidate' && <button type="button" className="button button-primary"
+              disabled={!sourceCurrent || syncing} onClick={() => activateRuleCandidate(item)}>确认并启用</button>}
+              <button type="button" className="button button-secondary" disabled={syncing} onClick={() => deleteRuleCandidate(item)}>删除候选</button></div>
+          </article>;
+        })}
+      </section>
     </section>}
 
     {state && !remoteLoading && activeSection === 'feed' && <section className="connection-section" aria-labelledby="personal-feed-title">
@@ -741,15 +817,18 @@ function SoulEditor({ value, hasConflict, onSave, onDelete, onInvalid }: {
   </>;
 }
 
-function MemoryRow({ item, api, canRestore, onSave, onRestore, onDelete }: {
+function MemoryRow({ item, api, canRestore, canProposeRule, onSave, onRestore, onProposeRule, onDelete }: {
   item: PersonalObject;
   api: PersonalDataAPI;
   canRestore: boolean;
+  canProposeRule: boolean;
   onSave: (body: MemoryBody) => void;
   onRestore: (body: MemoryBody) => Promise<boolean>;
+  onProposeRule: () => void;
   onDelete: () => void;
 }) {
   const { notify } = useToast();
+  const itemBodySignature = JSON.stringify(item.body);
   const [content, setContent] = useState(asString(item.body.content));
   const [category, setCategory] = useState(asString(item.body.category));
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -759,20 +838,42 @@ function MemoryRow({ item, api, canRestore, onSave, onRestore, onDelete }: {
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
   const requestVersion = useRef(0);
+  const historySectionRef = useRef<HTMLElement | null>(null);
+  useEffect(() => {
+    setContent(asString(item.body.content));
+    setCategory(asString(item.body.category));
+  }, [item.object_id, item.revision, itemBodySignature]);
   useEffect(() => () => { requestVersion.current++; }, [api, item.object_id]);
+  useEffect(() => {
+    if (!historyOpen) return;
+    const target = historySectionRef.current?.querySelector<HTMLElement>('.memory-history-revision')
+      ?? historySectionRef.current;
+    target?.scrollIntoView?.({ block: 'nearest' });
+  }, [historyOpen, history?.length]);
   const loadHistory = async (cursor?: string) => {
     const request = ++requestVersion.current;
     setHistoryLoading(true);
     setHistoryError(null);
     try {
       const page = await api.personalMemoryHistory(item.object_id, cursor, 25);
-      if (requestVersion.current !== request) return;
+      if (requestVersion.current !== request) {
+        setHistoryError('记忆范围已变化，历史结果未采用。请重试。');
+        setHistoryLoading(false);
+        return;
+      }
+      if (!page || !Array.isArray(page.items) ||
+          !(page.next_cursor === null || typeof page.next_cursor === 'string')) {
+        throw new Error('记忆历史响应格式无效。');
+      }
       setHistory((current) => cursor && current ? [...current, ...page.items] : page.items);
       setHistoryCursor(page.next_cursor);
     } catch (error) {
       if (requestVersion.current === request) {
-        if (isTransientNetworkError(error)) notify('网络异常，记忆历史暂时无法读取。', 'error');
-        else setHistoryError(error instanceof Error ? error.message : '无法读取记忆历史。');
+        const message = isTransientNetworkError(error)
+          ? '网络异常，记忆历史暂时无法读取。'
+          : error instanceof Error ? error.message : '无法读取记忆历史。';
+        setHistoryError(message);
+        if (isTransientNetworkError(error)) notify(message, 'error');
       }
     } finally {
       if (requestVersion.current === request) setHistoryLoading(false);
@@ -793,15 +894,20 @@ function MemoryRow({ item, api, canRestore, onSave, onRestore, onDelete }: {
     <div className="model-connection-main"><label>记忆内容<textarea value={content} maxLength={65536} onChange={(event) => setContent(event.target.value)} /></label><label>分类<input value={category} maxLength={64} onChange={(event) => setCategory(event.target.value)} /></label></div>
     <div className="inline-actions"><button type="button" className="button button-secondary" onClick={() => onSave({ content: content.trim(), ...(category.trim() ? { category: category.trim() } : {}) })}>保存修改</button>
       <button type="button" className="button button-secondary" aria-expanded={historyOpen} onClick={toggleHistory}>历史版本</button>
+      {historyOpen && history !== null && <small className="memory-history-count" role="status">已读取 {history.length} 个历史版本。</small>}
+      <button type="button" className="button button-secondary" disabled={!canProposeRule} onClick={onProposeRule}>提议为规则</button>
       <button type="button" className="button button-secondary" onClick={() => {
         if (window.confirm('删除这条记忆会同时清理它的历史正文；历史正文无法恢复。确定删除吗？')) onDelete();
       }}>删除</button></div>
     {restoreNotice && <p className="muted" role="status">{restoreNotice}</p>}
-    {historyOpen && <section className="memory-history" aria-label="记忆历史版本">
+    {historyOpen && <section ref={historySectionRef} className="memory-history" aria-label="记忆历史版本">
       {historyLoading && <p className="muted" role="status">正在读取记忆历史…</p>}
       {historyError && <p className="error-inline" role="alert">历史读取失败：{historyError} <button type="button" className="button button-small button-secondary" disabled={historyLoading} onClick={() => void loadHistory()}>重试</button></p>}
       {history?.map((revision) => <article className="memory-history-revision" key={revision.revision}>
         <div><strong>第 {revision.revision} 版</strong><small>{Number.isFinite(Date.parse(revision.changed_at)) ? new Date(revision.changed_at).toLocaleString() : '时间未知'}</small></div>
+        {revision.revision === item.revision ? <small>当前版本</small>
+          : revision.superseded_by_revision != null ? <small>已由第 {revision.superseded_by_revision} 版替代</small>
+            : revision.source_status === 'available' && <small className="muted">无法确认该版本的后继关系。</small>}
         {revision.body ? <><p>{asString(revision.body.content) || '（空内容）'}</p>{asString(revision.body.category) && <small>分类：{asString(revision.body.category)}</small>}</>
           : <p className="muted">{revision.source_status === 'unavailable' ? '来源当前不可访问，正文已隐藏，无法恢复。' : '未保存该版本正文，无法恢复。'}</p>}
         {revision.sources.length > 0 && <small>来源：{revision.sources.map((source) => source.kind === 'conversation_message'
@@ -809,7 +915,7 @@ function MemoryRow({ item, api, canRestore, onSave, onRestore, onDelete }: {
         {revision.restorable && revision.revision !== item.revision && <button type="button" className="button button-small button-secondary"
           disabled={!canRestore} onClick={() => void restore(revision)}>恢复此版本</button>}
       </article>)}
-      {history && history.length === 0 && <p className="muted">暂无历史版本。</p>}
+      {history !== null && history.length === 0 && <p className="muted">暂无历史版本。</p>}
       {historyCursor && <button type="button" className="button button-small button-secondary" disabled={historyLoading}
         onClick={() => void loadHistory(historyCursor)}>{historyLoading ? '正在读取…' : '加载更多历史'}</button>}
     </section>}

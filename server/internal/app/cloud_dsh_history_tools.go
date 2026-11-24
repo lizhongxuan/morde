@@ -1575,6 +1575,59 @@ func cloudDSHRecentHistorySummaryDefinition() AgentToolDefinition {
 	}, RequiredScope: identity.ScopeTaskRead}
 }
 
+func IsCloudDSHPersonalHistoryReadTool(toolName string) bool {
+	switch toolName {
+	case cloudDSHConversationHistorySearchToolName, cloudDSHRecentHistorySummaryToolName:
+		return true
+	default:
+		return false
+	}
+}
+
+// ValidCloudDSHPersonalHistoryReadCommit ensures the consent fence is attached
+// to the successful, exact DSH call and to the event payload being committed.
+func ValidCloudDSHPersonalHistoryReadCommit(progress TaskProgress) bool {
+	fence := progress.CloudDSHPersonalHistoryRead
+	call := progress.ToolCall
+	if fence == nil || call == nil || fence.SettingRevision < 0 || fence.PersonalChangeWatermark < 0 || fence.TaskRevision < 0 ||
+		fence.CallID == "" || fence.ToolName == "" || !IsCloudDSHPersonalHistoryReadTool(fence.ToolName) ||
+		fence.AgentSessionID == "" || len(fence.AgentSessionID) > 128 || !utf8.ValidString(fence.AgentSessionID) ||
+		strings.ContainsRune(fence.AgentSessionID, '\x00') || fence.AuthorizationVersion < 1 ||
+		progress.Status != task.StatusRunning || progress.Event.Type != "task.step" || progress.Event.TaskID != progress.TaskID ||
+		progress.CurrentStep == "" || len(progress.Steps) != 1 || progress.CloudDSHPersonalMutation != nil ||
+		progress.CloudDSHSkillRead != nil || progress.CloudDSHTaskPlan != nil {
+		return false
+	}
+	step := progress.Steps[0]
+	if call.CallKey != fence.CallID || call.ToolName != fence.ToolName || call.AgentSessionID != fence.AgentSessionID ||
+		call.AuthorizationVersion != fence.AuthorizationVersion || call.TaskRevision != fence.TaskRevision ||
+		step.ID != progress.CurrentStep || step.TaskID != progress.TaskID || step.Sequence < 1 || step.Kind != "tool" ||
+		step.Status != task.StepSucceeded || step.AgentSessionID != fence.AgentSessionID || step.TaskRevision == nil ||
+		*step.TaskRevision != fence.TaskRevision || step.ToolCallKey != fence.CallID || step.ToolName != fence.ToolName {
+		return false
+	}
+	var event struct {
+		StepID   string `json:"step_id"`
+		Sequence int64  `json:"sequence"`
+		Status   string `json:"status"`
+		Detail   struct {
+			Tool                    string `json:"tool"`
+			CallID                  string `json:"call_id"`
+			AuthorizationVersion    int64  `json:"authorization_version"`
+			MemorySettingRevision   int64  `json:"memory_setting_revision"`
+			PersonalChangeWatermark int64  `json:"personal_change_watermark"`
+		} `json:"detail"`
+	}
+	if json.Unmarshal(progress.Event.Payload, &event) != nil {
+		return false
+	}
+	return event.StepID == step.ID && event.Sequence == step.Sequence && event.Status == string(step.Status) &&
+		event.Detail.Tool == fence.ToolName && event.Detail.CallID == fence.CallID &&
+		event.Detail.AuthorizationVersion == fence.AuthorizationVersion &&
+		event.Detail.MemorySettingRevision == fence.SettingRevision &&
+		event.Detail.PersonalChangeWatermark == fence.PersonalChangeWatermark
+}
+
 func (b *CloudDSHToolBroker) executeRecentHistorySummary(ctx context.Context, claimed task.Task, call ModelToolCall,
 	recovering bool, checkpointOutput *string) (AgentToolResult, error) {
 	if ctx == nil || call.Name != cloudDSHRecentHistorySummaryToolName {
@@ -1615,6 +1668,10 @@ func (b *CloudDSHToolBroker) executeRecentHistorySummary(ctx context.Context, cl
 		if !validCloudDSHHistorySummaryCheckpointOutput(*checkpointOutput) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history summary is invalid")
 		}
+		personalChangeWatermark, err := b.personalHistoryChangeWatermark(ctx, principal)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
 		result, err := b.summarizablePersonalHistory(ctx, principal, current.ConversationID)
 		if err != nil {
 			return AgentToolResult{}, err
@@ -1626,10 +1683,20 @@ func (b *CloudDSHToolBroker) executeRecentHistorySummary(ctx context.Context, cl
 		if string(outputBytes) != *checkpointOutput {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history summary changed")
 		}
+		if err := b.revalidatePersonalHistoryAccess(ctx, current, settingRevision); err != nil {
+			return AgentToolResult{}, err
+		}
+		if err := b.revalidatePersonalHistoryChangeWatermark(ctx, principal, personalChangeWatermark); err != nil {
+			return AgentToolResult{}, err
+		}
 		return AgentToolResult{Status: AgentToolSucceeded, Output: *checkpointOutput}, nil
 	}
 	if current.Usage.ToolCalls == int64(^uint64(0)>>1) || current.Usage.ToolCalls >= current.Budget.ToolCalls {
 		return AgentToolResult{}, domain.NewError(domain.CodeQuotaExceeded, "task tool call budget is exhausted")
+	}
+	personalChangeWatermark, err := b.personalHistoryChangeWatermark(ctx, principal)
+	if err != nil {
+		return AgentToolResult{}, err
 	}
 	result, err := b.summarizablePersonalHistory(ctx, principal, current.ConversationID)
 	if err != nil {
@@ -1647,13 +1714,94 @@ func (b *CloudDSHToolBroker) executeRecentHistorySummary(ctx context.Context, cl
 	if err != nil {
 		return AgentToolResult{}, err
 	}
-	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+	if err := b.revalidatePersonalHistoryAccess(ctx, current, settingRevision); err != nil {
+		return AgentToolResult{}, err
+	}
+	if err := b.commitPersonalHistoryReadProgress(ctx, current, step, usage, "task.step", map[string]any{
 		"tool": call.Name, "call_id": call.CallID, "authorization_version": current.Authorization.Version,
-		"memory_setting_revision": settingRevision,
-	}); err != nil {
+		"memory_setting_revision": settingRevision, "personal_change_watermark": personalChangeWatermark,
+	}, settingRevision, personalChangeWatermark); err != nil {
 		return AgentToolResult{}, err
 	}
 	return AgentToolResult{Status: AgentToolSucceeded, Output: output}, nil
+}
+
+func (b *CloudDSHToolBroker) revalidatePersonalHistoryAccess(ctx context.Context, expected task.Task, memorySettingRevision int64) error {
+	details, err := b.currentServerTask(ctx, expected)
+	if err != nil {
+		return err
+	}
+	current := details.Task
+	if current.ID != expected.ID || current.OwnerID != expected.OwnerID || current.InitiatorID != expected.InitiatorID ||
+		current.ProjectID != expected.ProjectID || current.ConversationID != expected.ConversationID ||
+		current.AgentSessionID != expected.AgentSessionID || !sameCloudDSHAuthorization(current.Authorization, expected.Authorization) ||
+		!cloudDSHPersonalHistoryContextMatches(current.ConversationContext, expected.ConversationContext) ||
+		!cloudDSHPersonalContextEligible(current) {
+		return domain.NewError(domain.CodeForbidden, "personal conversation history authorization changed")
+	}
+	principal, ok := cloudDSHPersonalPrincipal(current)
+	if !ok {
+		return domain.NewError(domain.CodeForbidden, "personal conversation history authorization is unavailable")
+	}
+	if b.runtime == nil {
+		return domain.NewError(domain.CodeUnsupported, "personal conversation history authorization cannot be revalidated")
+	}
+	authorizer, ok := b.runtime.authorizer.(interface {
+		AuthorizeTaskExecution(context.Context, identity.Principal, string, identity.Scope) (task.Authorization, error)
+	})
+	if !ok {
+		return domain.NewError(domain.CodeUnsupported, "personal conversation history authorization cannot be revalidated")
+	}
+	validated, err := authorizer.AuthorizeTaskExecution(ctx, principal, "", identity.ScopeTaskRead)
+	if err != nil {
+		return err
+	}
+	validated.Version = current.Authorization.Version
+	if !sameCloudDSHAuthorization(validated, current.Authorization) {
+		return domain.NewError(domain.CodeForbidden, "personal conversation history authorization changed")
+	}
+	enabled, revision, err := b.personalMemorySetting(ctx, principal)
+	if err != nil {
+		return err
+	}
+	if !enabled || revision != memorySettingRevision {
+		return domain.NewError(domain.CodeForbidden, "personal conversation history consent changed")
+	}
+	return nil
+}
+
+func (b *CloudDSHToolBroker) personalHistoryChangeWatermark(ctx context.Context, principal identity.Principal) (int64, error) {
+	if b.personalSync == nil {
+		return 0, domain.NewError(domain.CodeUnsupported, "personal history changes cannot be fenced before result commit")
+	}
+	page, err := b.personalSync.GetSnapshot(ctx, principal, "", 1)
+	if err != nil {
+		return 0, err
+	}
+	if page.Watermark < 0 {
+		return 0, domain.NewError(domain.CodeInternal, "personal history change watermark is invalid")
+	}
+	return page.Watermark, nil
+}
+
+func (b *CloudDSHToolBroker) revalidatePersonalHistoryChangeWatermark(ctx context.Context, principal identity.Principal, expected int64) error {
+	current, err := b.personalHistoryChangeWatermark(ctx, principal)
+	if err != nil {
+		return err
+	}
+	if current != expected {
+		return domain.NewError(domain.CodeInvalidState, "personal conversation history changed while validating checkpointed result")
+	}
+	return nil
+}
+
+func cloudDSHPersonalHistoryContextMatches(current, expected *task.ConversationContext) bool {
+	if current == nil || expected == nil {
+		return current == nil && expected == nil
+	}
+	return current.OwnerID == expected.OwnerID && current.ProjectID == expected.ProjectID &&
+		current.InitiatorID == expected.InitiatorID && current.ConversationID == expected.ConversationID &&
+		current.Scope == expected.Scope && current.ThroughSequence == expected.ThroughSequence && bytes.Equal(current.Digest, expected.Digest)
 }
 
 func (b *CloudDSHToolBroker) summarizablePersonalHistory(ctx context.Context, principal identity.Principal, currentConversationID string) (cloudDSHHistorySummaryResult, error) {
@@ -1784,6 +1932,10 @@ func (b *CloudDSHToolBroker) executeConversationHistorySearch(ctx context.Contex
 		if !validCloudDSHHistorySearchCheckpointOutput(*checkpointOutput, cursor, b.historyCursorKey) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history result is invalid")
 		}
+		personalChangeWatermark, err := b.personalHistoryChangeWatermark(ctx, principal)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
 		var checkpoint cloudDSHHistorySearchResult
 		if decodeStrictRuntimeResult([]byte(*checkpointOutput), &checkpoint) != nil {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history result is invalid")
@@ -1807,10 +1959,20 @@ func (b *CloudDSHToolBroker) executeConversationHistorySearch(ctx context.Contex
 		if len(unsuppressed) != len(messages) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed conversation history result contains deleted messages")
 		}
+		if err := b.revalidatePersonalHistoryAccess(ctx, current, settingRevision); err != nil {
+			return AgentToolResult{}, err
+		}
+		if err := b.revalidatePersonalHistoryChangeWatermark(ctx, principal, personalChangeWatermark); err != nil {
+			return AgentToolResult{}, err
+		}
 		return AgentToolResult{Status: AgentToolSucceeded, Output: *checkpointOutput}, nil
 	}
 	if current.Usage.ToolCalls == int64(^uint64(0)>>1) || current.Usage.ToolCalls >= current.Budget.ToolCalls {
 		return AgentToolResult{}, domain.NewError(domain.CodeQuotaExceeded, "task tool call budget is exhausted")
+	}
+	personalChangeWatermark, err := b.personalHistoryChangeWatermark(ctx, principal)
+	if err != nil {
+		return AgentToolResult{}, err
 	}
 	result, nextCursor, err := b.searchPersonalConversationHistory(ctx, principal, current.ConversationID, args.Query, limit, cursor)
 	if err != nil {
@@ -1840,10 +2002,13 @@ func (b *CloudDSHToolBroker) executeConversationHistorySearch(ctx context.Contex
 	if err != nil {
 		return AgentToolResult{}, err
 	}
-	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+	if err := b.revalidatePersonalHistoryAccess(ctx, current, settingRevision); err != nil {
+		return AgentToolResult{}, err
+	}
+	if err := b.commitPersonalHistoryReadProgress(ctx, current, step, usage, "task.step", map[string]any{
 		"tool": call.Name, "call_id": call.CallID, "authorization_version": current.Authorization.Version,
-		"memory_setting_revision": settingRevision,
-	}); err != nil {
+		"memory_setting_revision": settingRevision, "personal_change_watermark": personalChangeWatermark,
+	}, settingRevision, personalChangeWatermark); err != nil {
 		return AgentToolResult{}, err
 	}
 	return AgentToolResult{Status: AgentToolSucceeded, Output: output}, nil

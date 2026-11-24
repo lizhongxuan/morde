@@ -264,7 +264,12 @@ final class MIFTaskViewsTests: XCTestCase {
         XCTAssertEqual(MIFTaskDynamicsPresentation.orderedTasks(tasks).map(\.id),
                        ["q2222222", "q4444444", "q1111111", "q3333333"])
         XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("running"), AppLocalized("Task executing"))
-        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("cancelling"), AppLocalized("Task executing"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("cancelling", stopRequestStatus: "pending"),
+                       AppLocalized("Stopping; awaiting server confirmation"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("cancelling", stopRequestStatus: "completed"),
+                       AppLocalized("Stop request processed; task update pending"))
+        XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("cancelling"),
+                       AppLocalized("Stop status needs confirmation"))
         XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("queued"), AppLocalized("Queued"))
         XCTAssertEqual(MIFTaskDynamicsPresentation.statusLabel("waiting_user", waitingReason: "approval_required"),
                        AppLocalized("Waiting for approval"))

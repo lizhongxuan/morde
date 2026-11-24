@@ -136,6 +136,27 @@ func cloudDSHMCPToolName(connectorID, remoteName string) string {
 	return cloudDSHMCPToolPrefix + connectorID + "_" + hex.EncodeToString(digest[:6])
 }
 
+// IsMCPConnectorOperationToolName validates the connector-specific alias
+// stored in the MCP operation ledger. The task step keeps the DSH-facing
+// mcp_call name and request digest so a retry can match the pinned checkpoint.
+func IsMCPConnectorOperationToolName(name, connectorID string) bool {
+	if !domain.ValidMCPConnectorID(connectorID) {
+		return false
+	}
+	prefix := cloudDSHMCPToolPrefix + connectorID + "_"
+	if !strings.HasPrefix(name, prefix) || len(name) != len(prefix)+12 {
+		return false
+	}
+	for _, char := range name[len(prefix):] {
+		isDigit := char >= '0' && char <= '9'
+		isLowerHex := char >= 'a' && char <= 'f'
+		if !isDigit && !isLowerHex {
+			return false
+		}
+	}
+	return true
+}
+
 func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails, call ModelToolCall, arguments json.RawMessage,
 	definition AgentToolDefinition, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
 	current := details.Task
@@ -194,8 +215,12 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 			return githubMCPRequestHeaders(connector.EndpointURL, headers), nil
 		},
 	}
-	ctx = withCloudDSHToolActivity(ctx, current, call, b.stepDetailSealer)
-	if activity, ok := cloudDSHToolActivityFromContext(ctx); ok {
+	activity, hasActivity := cloudDSHToolActivityFromContext(ctx)
+	if !hasActivity || activity.call.CallID != call.CallID || activity.current.ID != current.ID || activity.call.TaskFence == nil {
+		ctx = withCloudDSHToolActivity(ctx, current, call, b.stepDetailSealer)
+		activity, hasActivity = cloudDSHToolActivityFromContext(ctx)
+	}
+	if hasActivity {
 		activity.displayObject = source.connectorName
 		ctx = context.WithValue(ctx, cloudDSHToolActivityKey{}, activity)
 	}
@@ -1151,12 +1176,13 @@ func (b *CloudDSHToolBroker) commitMCPResult(ctx context.Context, current task.T
 	}
 	ctx = withTaskToolResultEvidence(ctx, "execute", "")
 	step.Status, step.Summary = task.StepSucceeded, "The cloud dsh MCP tool completed and its result was saved."
+	eventDetail := map[string]any{"tool": name, "operation_status": result.Status}
 	if result.Status == AgentToolFailed {
 		step.Status, step.Summary = task.StepFailed, "The MCP connector reported a definitive tool error."
+		ctx = withTaskToolResultEvidence(ctx, "execute", taskToolExecutionFailureReason)
+		eventDetail["failure_reason"] = taskToolExecutionFailureReason
 	}
-	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
-		"tool": name, "operation_status": result.Status,
-	}); err != nil {
+	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", eventDetail); err != nil {
 		return AgentToolResult{}, err
 	}
 	return result, nil
@@ -1185,7 +1211,9 @@ func (b *CloudDSHToolBroker) FailTerminalToolAttempt(ctx context.Context, claime
 		step := &details.Steps[i]
 		if step.AgentSessionID == fence.AgentSessionID && step.ToolCallKey == call.CallID &&
 			step.Status == task.StepFailed && step.TaskRevision != nil && current.CurrentRevision != nil &&
-			*step.TaskRevision == *current.CurrentRevision && step.Summary == "The connector rate limited this attempt; it was not retried." {
+			*step.TaskRevision == *current.CurrentRevision && step.Summary == "The connector rate limited this attempt; it was not retried." &&
+			step.FailureReason == "connector_rate_limited" && step.Phase == "execute" &&
+			IsMCPConnectorStepRetryTool(step.ToolName) && len(step.RequestDigest) == sha256.Size {
 			failedStep = step
 			break
 		}
@@ -1193,6 +1221,10 @@ func (b *CloudDSHToolBroker) FailTerminalToolAttempt(ctx context.Context, claime
 	if failedStep == nil {
 		return domain.NewError(domain.CodeInvalidState, "terminal MCP result has no matching failed Task step")
 	}
+	// Task step reads suppress Retryable until the Agent stop receipt is
+	// confirmed. This terminal Task transition commits the already-verified
+	// failure evidence, then the stop receipt can make retry available.
+	failedStep.Retryable = true
 	payload, err := json.Marshal(map[string]any{"status": task.StatusFailed, "reason": "connector_rate_limited"})
 	if err != nil {
 		return err

@@ -107,8 +107,26 @@ WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3`, owner.ID, created.Task.I
 		firstKey, hashBytes("cloud-synced metadata result"), session.ID, workspaceValue.Revision); err != nil {
 		t.Fatalf("settle first file.put operation: %v", err)
 	}
+	if _, found, err := store.ClaimNextTask(ctx, "hub-sync-claim-worker", time.Minute); err != nil || found {
+		t.Fatalf("claim completed Workspace sync without a DSH checkpoint: found=%t, err=%v; want no claim", found, err)
+	}
+	checkpointSessionID := "task-hub-sync-root"
+	checkpointDigest := seedTaskClaimRootDSHCheckpoint(t, store, created.Task.ID, owner.ID, checkpointSessionID)
+	if _, err := store.pool.Exec(ctx, `UPDATE task_agent_sessions SET checkpoint_digest=$3
+WHERE task_id=$1 AND session_id=$2`, created.Task.ID, checkpointSessionID, hashBytes("mismatched DSH checkpoint")); err != nil {
+		t.Fatalf("mismatch root Agent Session checkpoint: %v", err)
+	}
+	if _, found, err := store.ClaimNextTask(ctx, "hub-sync-claim-worker", time.Minute); err != nil || found {
+		t.Fatalf("claim completed Workspace sync with mismatched DSH checkpoint: found=%t, err=%v; want no claim", found, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE task_agent_sessions SET checkpoint_digest=$3
+WHERE task_id=$1 AND session_id=$2`, created.Task.ID, checkpointSessionID, checkpointDigest); err != nil {
+		t.Fatalf("restore root Agent Session checkpoint: %v", err)
+	}
 	claimed, found, err := store.ClaimNextTask(ctx, "hub-sync-claim-worker", time.Minute)
-	if err != nil || !found || claimed.ID != created.Task.ID || claimed.Status != "running" {
+	if err != nil || !found || claimed.ID != created.Task.ID || claimed.Status != "running" ||
+		claimed.AgentSessionID != checkpointSessionID || claimed.CheckpointThroughSequence != taskClaimTestCheckpointSequence ||
+		string(claimed.CheckpointDigest) != string(checkpointDigest) {
 		t.Fatalf("claim after Workspace sync commit = %#v, found=%t, err=%v; want the waiting Task", claimed, found, err)
 	}
 

@@ -329,7 +329,7 @@ WHERE v.service_instance_id=$1::uuid AND v.owner_id=$2 AND v.object_type=$3 AND 
 	seen := make(map[string]struct{}, len(proof.Objects))
 	for _, object := range proof.Objects {
 		switch object.ObjectType {
-		case personal.ObjectTypeMemory, personal.ObjectTypeProfile, personal.ObjectTypeSoul, personal.ObjectTypeGoal:
+		case personal.ObjectTypeMemory, personal.ObjectTypeProfile, personal.ObjectTypeSoul, personal.ObjectTypeGoal, personal.ObjectTypeRuleCandidate:
 		default:
 			return invalid()
 		}

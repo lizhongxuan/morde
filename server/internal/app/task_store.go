@@ -422,29 +422,44 @@ type TaskSubmissionResult struct {
 }
 
 type TaskProgress struct {
-	TaskID                   string
-	LeaseOwner               string
-	LeaseVersion             int64
-	Status                   task.Status
-	CurrentStep              string
-	Result                   string
-	WaitingReason            string
-	Usage                    task.Usage
-	ObservationFingerprint   string
-	Steps                    []task.Step
-	ToolCall                 *TaskToolCallProgress
-	AgentCompletionFence     *TaskAgentCompletionFence
-	Artifacts                []task.Artifact
-	Event                    task.Event
-	PendingRequest           *task.PendingRequest
-	TaskMediaApproval        *TaskMediaApprovalCommit
-	ClarificationRequest     *task.ClarificationRequest
-	AssistantMessage         *conversation.Message
-	PublishResultMessage     bool
-	ValidationClaims         []TaskResultClaim
-	CloudDSHSkillRead        *CloudDSHSkillReadCommit
-	CloudDSHPersonalMutation *CloudDSHPersonalMutationCommit
-	CloudDSHTaskPlan         *CloudDSHTaskPlanCommit
+	TaskID                      string
+	LeaseOwner                  string
+	LeaseVersion                int64
+	Status                      task.Status
+	CurrentStep                 string
+	Result                      string
+	WaitingReason               string
+	Usage                       task.Usage
+	ObservationFingerprint      string
+	Steps                       []task.Step
+	ToolCall                    *TaskToolCallProgress
+	AgentCompletionFence        *TaskAgentCompletionFence
+	Artifacts                   []task.Artifact
+	Event                       task.Event
+	PendingRequest              *task.PendingRequest
+	TaskMediaApproval           *TaskMediaApprovalCommit
+	ClarificationRequest        *task.ClarificationRequest
+	AssistantMessage            *conversation.Message
+	PublishResultMessage        bool
+	ValidationClaims            []TaskResultClaim
+	CloudDSHSkillRead           *CloudDSHSkillReadCommit
+	CloudDSHPersonalMutation    *CloudDSHPersonalMutationCommit
+	CloudDSHPersonalHistoryRead *CloudDSHPersonalHistoryReadCommit
+	CloudDSHTaskPlan            *CloudDSHTaskPlanCommit
+}
+
+// CloudDSHPersonalHistoryReadCommit binds a personal-history tool result to
+// the consent revision and personal-data change watermark that authorized the
+// search. PostgreSQL rechecks both in the same transaction that records the
+// successful Task step.
+type CloudDSHPersonalHistoryReadCommit struct {
+	SettingRevision         int64
+	PersonalChangeWatermark int64
+	CallID                  string
+	ToolName                string
+	AgentSessionID          string
+	AuthorizationVersion    int64
+	TaskRevision            int64
 }
 
 // CloudDSHTaskPlanCommit binds an advisory plan update to one durable DSH call.

@@ -75,6 +75,56 @@ func TestFitConversationRouteContextDropsHistoryTextButKeepsReferences(t *testin
 	}
 }
 
+func TestConversationRouteActiveTaskControlEvidenceFitsMinimumWindow(t *testing.T) {
+	controlScope := sha256.Sum256([]byte("control-scope"))
+	executionScope := sha256.Sum256([]byte("execution-scope"))
+	value := app.ConversationRouteContext{
+		ActorID: "u1234567", ModelID: "p1234567", CurrentRequestModelID: "p1234567",
+		Content: "本地验收：最终结果补充为 BLUE。", TimeZone: "Asia/Shanghai",
+		ServerReceivedAt:       time.Date(2026, 11, 24, 10, 0, 0, 0, time.FixedZone("UTC+8", 8*60*60)),
+		CandidateSetIncomplete: true, TaskCandidateSetIncomplete: true,
+		RequestCandidateSetIncomplete: true, HistoryIncomplete: true,
+		ControlScopeDigest: controlScope[:], ExecutionScopeDigest: executionScope[:],
+		Candidates: []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567",
+			Objective: "跨端活动验收：完成结果竞争", Status: task.StatusRunning, Revision: 3}},
+		RequestCandidates: []app.ConversationRouteRequestCandidate{
+			{MessageID: "m1234567", Sequence: 12, Content: "跨端活动验收：完成结果竞争",
+				RoutingStatus: conversation.RoutingRouted, TaskID: "q1234567", TaskStatus: task.StatusRunning,
+				SameExecutionScope: true, SameControlScope: true, SameAuthorization: true,
+				ExecutionScopeDigest: executionScope[:], ControlScopeDigest: controlScope[:],
+				RequestInput: app.ConversationRoutingInput{ModelID: "p1234567", TimeZone: "Asia/Shanghai"}},
+			{MessageID: "m2345678", Sequence: 13, Content: "独立核对另一项 YELLOW 事项。",
+				RoutingStatus: conversation.RoutingRouted, TaskID: "q2345678", TaskStatus: task.StatusCompleted},
+		},
+	}
+	request, err := app.ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !app.ConversationRouteInputFitsContextWindow(request, 4096) {
+		t.Fatalf("minimum-window route lost its safe control context: instructions=%d input=%d",
+			len(request.Instructions), len(request.Input[0].Text))
+	}
+	var body struct {
+		HistoryIncomplete             bool                             `json:"history_incomplete"`
+		TaskCandidateSetIncomplete    bool                             `json:"task_candidate_set_incomplete"`
+		RequestCandidateSetIncomplete bool                             `json:"request_candidate_set_incomplete"`
+		Tasks                         []app.ConversationRouteCandidate `json:"active_tasks"`
+		PriorRequests                 []map[string]any                 `json:"prior_requests"`
+	}
+	if err := json.Unmarshal([]byte(request.Input[0].Text), &body); err != nil {
+		t.Fatal(err)
+	}
+	if !body.HistoryIncomplete || !body.TaskCandidateSetIncomplete || !body.RequestCandidateSetIncomplete ||
+		len(body.Tasks) != 1 || body.Tasks[0].TaskID != "q1234567" ||
+		len(body.PriorRequests) != 2 || body.PriorRequests[0]["same_execution_scope"] != true ||
+		body.PriorRequests[0]["same_control_scope"] != true ||
+		body.PriorRequests[0]["same_authorization"] != true ||
+		body.PriorRequests[1]["content"] != "独立核对另一项 YELLOW 事项。" {
+		t.Fatalf("minimum-window request omitted control or predecessor evidence: %+v", body)
+	}
+}
+
 func TestFitConversationRouteContextDropsOversizedSummary(t *testing.T) {
 	value := app.ConversationRouteContext{ActorID: "u1234567", ModelID: "p1234567", Content: "short current message",
 		SummaryVersion: 1, SummaryText: strings.Repeat("s", 16<<10)}
@@ -102,8 +152,13 @@ func TestTrimConversationRouteHistoryReferencesMarksAuthorizedSearch(t *testing.
 	}
 	value := app.ConversationRouteContext{ActorID: "u1234567", ModelID: "p1234567", Content: "请回忆早期要求",
 		History: append([]app.ConversationRouteHistory(nil), original...)}
-	if !blankConversationRouteHistory(&value) || !blankConversationRouteHistory(&value) ||
-		value.History[0].Content != "" || value.History[1].Content != "" || !value.HistoryIncomplete {
+	if !blankConversationRouteHistory(&value) {
+		t.Fatalf("history text was not safely blanked: %+v", value.History)
+	}
+	if !blankConversationRouteHistory(&value) {
+		t.Fatalf("history text blanking was not idempotent: %+v", value.History)
+	}
+	if value.History[0].Content != "" || value.History[1].Content != "" || !value.HistoryIncomplete {
 		t.Fatalf("history text was not safely blanked before reference trimming: %+v", value.History)
 	}
 	if !trimConversationRouteHistoryReferences(&value) || len(value.History) != 2 || !value.HistoryIncomplete ||
@@ -119,7 +174,7 @@ func TestTrimConversationRouteHistoryReferencesMarksAuthorizedSearch(t *testing.
 		t.Fatal(err)
 	}
 	if !strings.Contains(request.Instructions, "morde_current_conversation_history_search") ||
-		!strings.Contains(request.Instructions, "authorized conversation originals") ||
+		!strings.Contains(request.Instructions, "authorized originals") ||
 		!strings.Contains(request.Input[0].Text, `"history_incomplete":true`) ||
 		strings.Contains(request.Input[0].Text, "m0000001") || !strings.Contains(request.Input[0].Text, "m0000002") {
 		t.Fatalf("incomplete history did not direct the classifier to authorized source search: instructions=%q input=%q",

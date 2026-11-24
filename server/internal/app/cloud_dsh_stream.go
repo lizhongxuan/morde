@@ -53,7 +53,7 @@ func DecodeCloudDSHStreamPersonalProof(encoded string, additional []CloudDSHMemo
 			return false
 		}
 		switch objectType {
-		case personal.ObjectTypeMemory, personal.ObjectTypeProfile, personal.ObjectTypeSoul, personal.ObjectTypeGoal:
+		case personal.ObjectTypeMemory, personal.ObjectTypeProfile, personal.ObjectTypeSoul, personal.ObjectTypeGoal, personal.ObjectTypeRuleCandidate:
 		default:
 			return false
 		}
@@ -72,13 +72,25 @@ func DecodeCloudDSHStreamPersonalProof(encoded string, additional []CloudDSHMemo
 			return invalid()
 		}
 	}
+	memoryVersions := make(map[string]int64, len(proof.Items))
+	for _, item := range proof.Items {
+		memoryVersions[item.ID] = item.Revision
+	}
 	for _, item := range proof.Objects {
 		if item.ObjectType == "" || item.ObjectType == personal.ObjectTypeMemory || !register(item, "") {
 			return invalid()
 		}
+		if item.ObjectType == personal.ObjectTypeRuleCandidate {
+			if item.SourceMemoryID == "" || item.SourceMemoryRevision < 1 ||
+				memoryVersions[item.SourceMemoryID] != item.SourceMemoryRevision {
+				return invalid()
+			}
+		} else if item.SourceMemoryID != "" || item.SourceMemoryRevision != 0 {
+			return invalid()
+		}
 	}
 	for _, item := range additional {
-		if !register(item, "") {
+		if item.ObjectType == personal.ObjectTypeRuleCandidate || item.SourceMemoryID != "" || item.SourceMemoryRevision != 0 || !register(item, "") {
 			return invalid()
 		}
 	}

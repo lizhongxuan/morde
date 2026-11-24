@@ -35,13 +35,19 @@ const conversationContextCompletionWriteCallID = "completion_race_write_once"
 const conversationContextCompletionWriteToolName = "mcp_k1234567_abcdef123456"
 const conversationContextCompletionWriteOutput = `{"record_id":"completion-race-record"}`
 const conversationContextCompletionMemoryProof = "completion-race-test-proof"
+const conversationContextCompletionIndependentContent = "Start another task for an independent request while the first result is being committed."
+const conversationContextCompletionIndependentResult = "The independent request completed without interrupting the first task."
+const conversationContextCompletionResultWindow = 2500 * time.Millisecond
 
 type conversationContextCompletionRaceModel struct {
-	mu    sync.Mutex
-	calls []app.ModelCall
+	mu                  sync.Mutex
+	calls               []app.ModelCall
+	independentTaskID   string
+	independentStarted  chan struct{}
+	independentContinue <-chan struct{}
 }
 
-func (m *conversationContextCompletionRaceModel) Complete(_ context.Context, call app.ModelCall) (app.ModelResponse, error) {
+func (m *conversationContextCompletionRaceModel) Complete(ctx context.Context, call app.ModelCall) (app.ModelResponse, error) {
 	m.mu.Lock()
 	m.calls = append(m.calls, call)
 	callNumber := len(m.calls)
@@ -58,6 +64,28 @@ func (m *conversationContextCompletionRaceModel) Complete(_ context.Context, cal
 			return app.ModelResponse{}, errors.New("first completion request omitted the completed write result")
 		}
 		return app.ModelResponse{Text: "STALE COMPLETION RESULT", StopReason: "stop", Usage: usage}, nil
+	}
+	if callNumber == 4 {
+		m.mu.Lock()
+		independentTaskID := m.independentTaskID
+		m.mu.Unlock()
+		if call.Task == nil || independentTaskID == "" || call.Task.TaskID != independentTaskID {
+			return app.ModelResponse{}, fmt.Errorf("independent request did not retain its own Task identity: task=%+v", call.Task)
+		}
+		if m.independentStarted != nil {
+			select {
+			case m.independentStarted <- struct{}{}:
+			default:
+			}
+		}
+		if m.independentContinue != nil {
+			select {
+			case <-m.independentContinue:
+			case <-ctx.Done():
+				return app.ModelResponse{}, ctx.Err()
+			}
+		}
+		return app.ModelResponse{Text: conversationContextCompletionIndependentResult, StopReason: "stop", Usage: usage}, nil
 	}
 	writeResult, found := f01ToolResult(call.RawRequest, conversationContextCompletionWriteCallID)
 	if callNumber != 3 || !strings.Contains(string(call.RawRequest), conversationContextCompletionSteer) || !found ||
@@ -191,7 +219,20 @@ func (conversationContextSteerRouteClassifier) ResolveConversationRouteModel(_ c
 func (conversationContextSteerRouteClassifier) ClassifyConversationRoute(_ context.Context, claim app.ConversationRouteClaim,
 	value app.ConversationRouteContext) (app.ConversationRouteDecision, error) {
 	if value.ResultReview != nil {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "The revised answer includes BLUE."}, nil
+		replies := make([]string, 0, len(value.ResultReview.Sources))
+		for _, source := range value.ResultReview.Sources {
+			switch source.Content {
+			case "The revised answer includes BLUE.", conversationContextCompletionIndependentResult:
+				replies = append(replies, source.Content)
+			}
+		}
+		if len(replies) == 0 {
+			replies = append(replies, "The revised answer includes BLUE.")
+		}
+		return app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: strings.Join(replies, " ")}, nil
+	}
+	if strings.Contains(claim.Message.Content, conversationContextCompletionIndependentContent) {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}, nil
 	}
 	if claim.Input.ReferenceTaskID == "" && value.ReferenceTaskID == "" {
 		return app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}, nil
@@ -382,7 +423,10 @@ VALUES ('p1234567',$1,'completion race test','http://127.0.0.1','test',decode(re
 	}
 	completionGate := &conversationContextCompletionGate{inner: toolBroker,
 		started: make(chan app.CloudDSHTaskCompletion, 1), release: make(chan struct{})}
-	model := &conversationContextCompletionRaceModel{}
+	independentModelStarted := make(chan struct{}, 1)
+	independentModelRelease := make(chan struct{})
+	model := &conversationContextCompletionRaceModel{independentStarted: independentModelStarted,
+		independentContinue: independentModelRelease}
 	tools := &conversationContextCompletionRaceTools{}
 	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
 		SupervisorID: supervisorID, SummarySealer: sealer, AccountRuntimes: runtimeManager, Instances: instances,
@@ -433,9 +477,32 @@ AND strpos(content,$2)>0`, submitted.Conversation.ID, "STALE COMPLETION RESULT")
 		t.Fatalf("stale assistant receipt escaped the completion gate: count=%d err=%v", staleReceipts, err)
 	}
 	firstSessionID := firstTask.Task.AgentSessionID
+	independentMessage, replayed, err := tasks.AcceptConversationMessage(ctx, principal, submitted.Conversation.ID,
+		app.AcceptConversationMessageCommand{ServiceInstanceID: serviceInstanceID, ClientMessageID: "completion-gate-independent",
+			PreviousClientMessageID: clientMessageID, Content: conversationContextCompletionIndependentContent, ModelID: submitted.Task.ModelID,
+			Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 4, ModelTokens: 2000}, IdempotencyKey: "completion-gate-independent"})
+	if err != nil || replayed {
+		t.Fatalf("accept independent request during completion gate: replayed=%t err=%v", replayed, err)
+	}
+	if found, err := routeWorker.RunOnce(ctx); err != nil || !found {
+		t.Fatalf("route independent request during completion gate: found=%t err=%v", found, err)
+	}
+	var independentTaskID, independentStatus, routeState, routeFailure, messageDeliveryStatus string
+	if err := pool.QueryRow(ctx, `SELECT COALESCE(task.id,''),COALESCE(task.status,''),route.state,route.failure_reason,
+message.delivery_status
+FROM conversation_messages message JOIN conversation_message_routes route ON route.message_id=message.id
+LEFT JOIN tasks task ON task.id=message.task_id WHERE message.id=$1`,
+		independentMessage.ID).Scan(&independentTaskID, &independentStatus, &routeState, &routeFailure, &messageDeliveryStatus); err != nil ||
+		independentTaskID == "" || independentTaskID == submitted.Task.ID || independentStatus != string(task.StatusQueued) {
+		t.Fatalf("independent request did not remain a separate queued Task: task=%q status=%q route=%q/%q delivery=%q err=%v",
+			independentTaskID, independentStatus, routeState, routeFailure, messageDeliveryStatus, err)
+	}
+	model.mu.Lock()
+	model.independentTaskID = independentTaskID
+	model.mu.Unlock()
 	steer, replayed, err := tasks.AcceptConversationMessage(ctx, principal, submitted.Conversation.ID,
 		app.AcceptConversationMessageCommand{ServiceInstanceID: serviceInstanceID, ClientMessageID: "completion-gate-steer",
-			PreviousClientMessageID: clientMessageID, ReferenceTaskID: submitted.Task.ID,
+			PreviousClientMessageID: "completion-gate-independent", ReferenceTaskID: submitted.Task.ID,
 			Content: conversationContextCompletionSteer, ModelID: submitted.Task.ModelID,
 			Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 4, ModelTokens: 2000}, IdempotencyKey: "completion-gate-steer"})
 	if err != nil || replayed {
@@ -475,6 +542,20 @@ AND strpos(content,$2)>0`, submitted.Conversation.ID, "STALE COMPLETION RESULT")
 		case <-ticker.C:
 		}
 	}
+	select {
+	case <-independentModelStarted:
+	case <-ctx.Done():
+		t.Fatalf("independent Task did not start after the first Task completed: %v", ctx.Err())
+	}
+	independentTask, err := store.GetTask(ctx, independentTaskID, owner.ID)
+	if err != nil || independentTask.Task.Status != task.StatusRunning || independentTask.Task.ID == submitted.Task.ID {
+		t.Fatalf("independent Task state while its model call is held: task=%+v err=%v", independentTask.Task, err)
+	}
+	select {
+	case <-time.After(conversationContextCompletionResultWindow):
+	case <-ctx.Done():
+		t.Fatalf("wait for the independent result aggregation window: %v", ctx.Err())
+	}
 	if _, err := store.QueueReadyConversationResultReviews(ctx, 100); err != nil {
 		t.Fatalf("queue completed Task result for conversation delivery: %v", err)
 	}
@@ -487,8 +568,9 @@ AND strpos(content,$2)>0`, submitted.Conversation.ID, "STALE COMPLETION RESULT")
 	if len(modelCalls) >= 3 {
 		thirdWriteResult, thirdToolResultFound = f01ToolResult(modelCalls[2].RawRequest, conversationContextCompletionWriteCallID)
 	}
-	if len(modelCalls) != 3 || modelCalls[0].Task == nil || modelCalls[1].Task == nil || modelCalls[2].Task == nil ||
+	if len(modelCalls) != 4 || modelCalls[0].Task == nil || modelCalls[1].Task == nil || modelCalls[2].Task == nil || modelCalls[3].Task == nil ||
 		modelCalls[0].Task.AgentSessionID != firstSessionID || modelCalls[1].Task.AgentSessionID != firstSessionID || modelCalls[2].Task.AgentSessionID != firstSessionID ||
+		modelCalls[3].Task.TaskID != independentTaskID || modelCalls[3].Task.AgentSessionID == firstSessionID ||
 		!strings.Contains(string(modelCalls[2].RawRequest), conversationContextCompletionSteer) || !thirdToolResultFound ||
 		!strings.Contains(thirdWriteResult, conversationContextCompletionWriteOutput) {
 		t.Fatalf("Task recovery did not reuse the DSH Session and apply steer: model calls=%d third_result_found=%t third_result=%s",
@@ -530,6 +612,50 @@ AND strpos(content,$3)>0`, submitted.Conversation.ID, "The revised answer includ
 		submitted.Task.ID).Scan(&publishedSources); err != nil || publishedSources != 1 {
 		t.Fatalf("published revised result sources=%d err=%v; want one source for the Task", publishedSources, err)
 	}
+	close(independentModelRelease)
+	independentDeadline := time.NewTimer(45 * time.Second)
+	defer independentDeadline.Stop()
+	for {
+		completed, err := store.GetTask(ctx, independentTaskID, owner.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if completed.Task.Status == task.StatusCompleted {
+			if completed.Task.Result != conversationContextCompletionIndependentResult || completed.Task.ID == submitted.Task.ID {
+				t.Fatalf("independent Task result = status %q result %q; want its own completed result",
+					completed.Task.Status, completed.Task.Result)
+			}
+			break
+		}
+		select {
+		case <-ctx.Done():
+			t.Fatalf("independent Task did not complete: %v", ctx.Err())
+		case <-independentDeadline.C:
+			t.Fatalf("independent Task did not complete: status=%q result=%q", completed.Task.Status, completed.Task.Result)
+		case <-ticker.C:
+		}
+	}
+	select {
+	case <-time.After(conversationContextCompletionResultWindow):
+	case <-ctx.Done():
+		t.Fatalf("wait for the independent Task result aggregation window: %v", ctx.Err())
+	}
+	if _, err := store.QueueReadyConversationResultReviews(ctx, 100); err != nil {
+		t.Fatalf("queue independent Task result for conversation delivery: %v", err)
+	}
+	if found, err := routeWorker.RunOnce(ctx); err != nil || !found {
+		t.Fatalf("publish independent Task result: found=%t err=%v", found, err)
+	}
+	var independentReceipts, independentPublishedSources int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1 AND role='assistant'
+AND strpos(content,$2)>0`, submitted.Conversation.ID, conversationContextCompletionIndependentResult).Scan(&independentReceipts); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM conversation_result_sources WHERE task_id=$1 AND state='published'`,
+		independentTaskID).Scan(&independentPublishedSources); err != nil || independentReceipts != 1 || independentPublishedSources != 1 {
+		t.Fatalf("independent result delivery receipts=%d published sources=%d err=%v; want one each",
+			independentReceipts, independentPublishedSources, err)
+	}
 }
 
 func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t *testing.T) {
@@ -561,7 +687,7 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 	if err != nil {
 		t.Fatal(err)
 	}
-	// The two 4 KiB sources cross the 75% summary trigger with the fixed DSH prompt.
+	// Three sub-preview-limit sources cross the 75% summary trigger without making an individual route message incomplete.
 	window := 8_192
 	model, err := store.CreateModelConnection(ctx, app.ModelConnectionRecord{ID: "p1234567", OwnerID: owner.ID,
 		Name: "Local conversation context E2E", BaseURL: "https://models.example.invalid/v1", ModelName: "synthetic-e2e",
@@ -748,9 +874,9 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 	}
 	for chatIndex, conversationID := range conversationIDs {
 		for cycle := 1; cycle <= 3; cycle++ {
-			for source := 1; source <= 2; source++ {
+			for source := 1; source <= 3; source++ {
 				prefix := fmt.Sprintf("E2E source chat=%d cycle=%d source=%d confirmed durable fact. ", chatIndex, cycle, source)
-				content := prefix + strings.Repeat("x", 4000-len(prefix))
+				content := prefix + strings.Repeat("x", 2040-len(prefix))
 				acceptAndRoute(conversationID, content, fmt.Sprintf("context-source-%d-%d-%d", chatIndex, cycle, source))
 			}
 			acceptAndRoute(conversationID, fmt.Sprintf("E2E_COMPACTION_TRIGGER chat=%d cycle=%d", chatIndex, cycle),
@@ -900,8 +1026,8 @@ WHERE owner_id=$1 AND state='committed' AND octet_length(response_ciphertext)>0`
 	modelClient.mu.Lock()
 	summaryCalls, routeCalls := modelClient.summaryCalls, modelClient.routeCalls
 	modelClient.mu.Unlock()
-	if summaryCalls != 10 || routeCalls != 30 {
-		t.Fatalf("synthetic model calls: summaries=%d routes=%d, want 10 and 30", summaryCalls, routeCalls)
+	if summaryCalls != 10 || routeCalls != 39 {
+		t.Fatalf("synthetic model calls: summaries=%d routes=%d, want 10 and 39", summaryCalls, routeCalls)
 	}
 	var claimed task.Task
 	claimed, found, err = store.ClaimNextTask(ctx, "context-e2e-history-task", time.Minute)

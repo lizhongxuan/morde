@@ -387,19 +387,21 @@ func legacyConversationRouteModelRequest(value ConversationRouteContext, request
 		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request is invalid")
 	}
 	var input struct {
-		Summary                map[string]any               `json:"summary,omitempty"`
-		Message                string                       `json:"message"`
-		ReferenceTime          string                       `json:"reference_time,omitempty"`
-		TimeZone               string                       `json:"time_zone,omitempty"`
-		TimeZoneProvided       bool                         `json:"time_zone_provided"`
-		ReferenceTaskID        string                       `json:"reference_task_id,omitempty"`
-		ReferenceUnavailable   bool                         `json:"reference_unavailable,omitempty"`
-		CandidateSetIncomplete bool                         `json:"candidate_set_incomplete,omitempty"`
-		HistoryIncomplete      bool                         `json:"history_incomplete,omitempty"`
-		PreviousUnresolved     bool                         `json:"previous_unresolved,omitempty"`
-		PreviousMissing        bool                         `json:"previous_missing,omitempty"`
-		History                []ConversationRouteHistory   `json:"history"`
-		Tasks                  []ConversationRouteCandidate `json:"active_tasks"`
+		Summary                       map[string]any               `json:"summary,omitempty"`
+		Message                       string                       `json:"message"`
+		ReferenceTime                 string                       `json:"reference_time,omitempty"`
+		TimeZone                      string                       `json:"time_zone,omitempty"`
+		TimeZoneProvided              bool                         `json:"time_zone_provided"`
+		ReferenceTaskID               string                       `json:"reference_task_id,omitempty"`
+		ReferenceUnavailable          bool                         `json:"reference_unavailable,omitempty"`
+		CandidateSetIncomplete        bool                         `json:"candidate_set_incomplete,omitempty"`
+		TaskCandidateSetIncomplete    bool                         `json:"task_candidate_set_incomplete,omitempty"`
+		RequestCandidateSetIncomplete bool                         `json:"request_candidate_set_incomplete,omitempty"`
+		HistoryIncomplete             bool                         `json:"history_incomplete,omitempty"`
+		PreviousUnresolved            bool                         `json:"previous_unresolved,omitempty"`
+		PreviousMissing               bool                         `json:"previous_missing,omitempty"`
+		History                       []ConversationRouteHistory   `json:"history"`
+		Tasks                         []ConversationRouteCandidate `json:"active_tasks"`
 	}
 	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
 		return ModelRequest{}, domain.InvalidArgument("route_context", "legacy route request cannot be decoded")
@@ -569,7 +571,8 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 	}
 	if callErr != nil {
 		result := conversationRouteProviderError(callErr)
-		if routeErr, ok := result.(*domain.Error); ok && routeErr.Code == domain.CodeResultTooLarge {
+		var routeErr *domain.Error
+		if errors.As(result, &routeErr) && routeErr.Code == domain.CodeResultTooLarge {
 			if routeErr.Details == nil {
 				routeErr.Details = make(map[string]any)
 			}

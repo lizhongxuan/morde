@@ -39,7 +39,17 @@ func validClarificationQuestion(value string) bool {
 	return strings.TrimSpace(value) != "" && !strings.ContainsRune(value, '\x00') && utf8.ValidString(value) && utf8.RuneCountInString(value) <= 4096
 }
 
-const taskHubWorkspaceSyncClaimPredicate = `(t.status='waiting_user' AND t.waiting_reason='task_hub_workspace_sync' AND EXISTS (
+const taskRootDSHCheckpointClaimPredicate = `(t.checkpoint_through_seq>=0 AND octet_length(t.checkpoint_digest)=32
+  AND t.agent_session_id<>'' AND EXISTS (
+    SELECT 1 FROM task_agent_sessions root_session
+    WHERE root_session.task_id=t.id AND root_session.owner_id=t.owner_id
+      AND root_session.session_id=t.agent_session_id AND root_session.parent_session_id IS NULL
+      AND root_session.checkpoint_through_seq=t.checkpoint_through_seq
+      AND root_session.checkpoint_digest=t.checkpoint_digest
+  ))`
+
+const taskHubWorkspaceSyncClaimPredicate = `(t.status='waiting_user' AND t.waiting_reason='task_hub_workspace_sync'
+AND ` + taskRootDSHCheckpointClaimPredicate + ` AND EXISTS (
   SELECT 1 FROM task_hub_operations settled
   JOIN task_events wait_event ON wait_event.task_id=t.id AND wait_event.sequence=t.event_seq
   JOIN workspace_sync_sessions sync_session ON sync_session.workspace_id=settled.workspace_id AND sync_session.id=settled.sync_session_id
@@ -276,15 +286,14 @@ func listTaskStepsWithActivity(ctx context.Context, tx pgx.Tx, taskID string) ([
 	rows, err := tx.Query(ctx, `SELECT s.id,s.task_id,s.sequence,s.attempt_no,COALESCE(s.retry_of_step_id,''),s.kind,s.status,s.title,s.summary,
 COALESCE(s.failure_reason,''),s.retryable,s.created_at,COALESCE(s.agent_session_id,''),s.task_revision,COALESCE(s.tool_call_key,''),
 COALESCE(s.tool_name,''),s.request_digest,COALESCE(s.phase,''),s.detail_state,
-COALESCE(mcp.status,''),COALESCE(mcp.call_id,''),COALESCE(mcp.tool_name,''),mcp.request_hash,mcp.task_revision,mcp.result,mcp.updated_at,mcp.evidence_count
-,
+COALESCE(mcp.status,''),COALESCE(mcp.call_id,''),COALESCE(mcp.connector_id,''),COALESCE(mcp.tool_name,''),mcp.request_hash,mcp.task_revision,mcp.result,mcp.updated_at,mcp.evidence_count,
 EXISTS (SELECT 1 FROM task_agent_instances ai WHERE ai.task_id=t.id AND ai.owner_id=t.owner_id
  AND ai.agent_generation=t.agent_generation AND ai.agent_instance_id=t.agent_instance_id AND ai.agent_session_id=t.agent_session_id
  AND ai.state='stopped' AND ((ai.stop_receipt IS NOT NULL AND ai.stop_receipt_digest=sha256(ai.stop_receipt))
    OR (ai.guardian_stop_attestation IS NOT NULL AND ai.guardian_stop_attestation_digest=sha256(ai.guardian_stop_attestation))))
 FROM task_steps s JOIN tasks t ON t.id=s.task_id
 LEFT JOIN LATERAL (
- SELECT status,call_id,tool_name,request_hash,task_revision,result,updated_at,count(*) OVER() AS evidence_count
+ SELECT status,call_id,connector_id,tool_name,request_hash,task_revision,result,updated_at,count(*) OVER() AS evidence_count
  FROM task_mcp_connector_operations
  WHERE task_id=s.task_id AND owner_id=t.owner_id AND call_id=s.tool_call_key
  ORDER BY updated_at DESC, id DESC LIMIT 1
@@ -298,7 +307,7 @@ WHERE s.task_id=$1 ORDER BY s.sequence`, taskID)
 	for rows.Next() {
 		var step task.Step
 		var revision, mcpTaskRevision, mcpEvidenceCount pgtype.Int8
-		var mcpStatus, mcpCallID, mcpToolName pgtype.Text
+		var mcpStatus, mcpCallID, mcpConnectorID, mcpToolName pgtype.Text
 		var mcpRequestHash []byte
 		var mcpResult pgtype.Text
 		var mcpUpdatedAt pgtype.Timestamptz
@@ -306,7 +315,7 @@ WHERE s.task_id=$1 ORDER BY s.sequence`, taskID)
 		if err := rows.Scan(&step.ID, &step.TaskID, &step.Sequence, &step.Attempt, &step.RetryOfStepID, &step.Kind, &step.Status,
 			&step.Title, &step.Summary, &step.FailureReason, &step.Retryable, &step.CreatedAt, &step.AgentSessionID, &revision,
 			&step.ToolCallKey, &step.ToolName, &step.RequestDigest, &step.Phase, &step.DetailState,
-			&mcpStatus, &mcpCallID, &mcpToolName, &mcpRequestHash, &mcpTaskRevision, &mcpResult, &mcpUpdatedAt, &mcpEvidenceCount,
+			&mcpStatus, &mcpCallID, &mcpConnectorID, &mcpToolName, &mcpRequestHash, &mcpTaskRevision, &mcpResult, &mcpUpdatedAt, &mcpEvidenceCount,
 			&agentStopConfirmed); err != nil {
 			return nil, err
 		}
@@ -318,9 +327,10 @@ WHERE s.task_id=$1 ORDER BY s.sequence`, taskID)
 			step.Retryable = false
 			if step.Status == task.StepFailed && mcpEvidenceCount.Valid && mcpEvidenceCount.Int64 == 1 &&
 				mcpStatus.Valid && mcpStatus.String == string(task.OperationFailed) &&
-				mcpCallID.Valid && mcpCallID.String == step.ToolCallKey && mcpToolName.Valid && mcpToolName.String == step.ToolName &&
+				mcpCallID.Valid && mcpCallID.String == step.ToolCallKey && mcpConnectorID.Valid && mcpToolName.Valid &&
+				app.IsMCPConnectorOperationToolName(mcpToolName.String, mcpConnectorID.String) && len(mcpRequestHash) == 32 &&
 				mcpTaskRevision.Valid && revision.Valid && mcpTaskRevision.Int64 == revision.Int64 &&
-				bytes.Equal(mcpRequestHash, step.RequestDigest) && mcpResult.Valid {
+				len(step.RequestDigest) == 32 && mcpResult.Valid {
 				if seconds, ok := app.MCPConnectorTerminalRetryAfterSeconds(mcpResult.String); ok && mcpUpdatedAt.Valid {
 					retryAt := mcpUpdatedAt.Time.Add(time.Duration(seconds) * time.Second)
 					step.RetryAfterAt = &retryAt
@@ -841,7 +851,7 @@ func (s *Store) claimNextTask(ctx context.Context, worker string, leaseDuration 
 SELECT t.initiator_id, t.execution_epoch FROM tasks AS t
 WHERE (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()) OR
   `+taskHubWorkspaceSyncClaimPredicate+` OR
-  (t.status='waiting_user' AND t.waiting_reason='workspace_host_sync' AND EXISTS (
+  (t.status='waiting_user' AND t.waiting_reason='workspace_host_sync' AND `+taskRootDSHCheckpointClaimPredicate+` AND EXISTS (
     SELECT 1 FROM workspace_bindings wb JOIN workspaces w ON w.id=wb.workspace_id
     WHERE wb.host_id=t.host_id AND wb.workspace_id=t.workspace_id
       AND wb.state='active'
@@ -926,7 +936,7 @@ SELECT t.id, t.owner_id, COALESCE(t.host_id,''), t.lease_version,
 WHERE t.initiator_id=$1 AND t.execution_epoch=$2
   AND (t.status='queued' OR (t.status='running' AND t.lease_expires_at <= clock_timestamp()) OR
     `+taskHubWorkspaceSyncClaimPredicate+` OR
-    (t.status='waiting_user' AND t.waiting_reason='workspace_host_sync' AND EXISTS (
+    (t.status='waiting_user' AND t.waiting_reason='workspace_host_sync' AND `+taskRootDSHCheckpointClaimPredicate+` AND EXISTS (
       SELECT 1 FROM workspace_bindings wb JOIN workspaces w ON w.id=wb.workspace_id
       WHERE wb.host_id=t.host_id AND wb.workspace_id=t.workspace_id
         AND wb.state='active'
@@ -1543,6 +1553,41 @@ ORDER BY t.id FOR UPDATE OF t`, actorID, tokenID, installationID)
 	return len(ids), nil
 }
 
+// Host member revocation is a target-authorization revocation rather than a
+// session revocation. Fence only active Tasks started by that member against
+// this Host; the caller already holds the Host lock so Agent startup/renewal
+// and operation authorization serialize with the revocation.
+func stopTasksForHostMemberAuthorization(ctx context.Context, tx pgx.Tx, hostID, actorID string) (int, error) {
+	rows, err := tx.Query(ctx, `SELECT t.id,t.owner_id FROM tasks t
+WHERE t.host_id=$1 AND t.initiator_id=$2
+  AND t.status IN ('queued','running','waiting_user','pausing','paused','cancelling')
+ORDER BY t.id FOR UPDATE OF t`, hostID, actorID)
+	if err != nil {
+		return 0, fmt.Errorf("lock Tasks for Host member authorization revocation: %w", err)
+	}
+	type taskOwner struct{ id, ownerID string }
+	ids := make([]taskOwner, 0)
+	for rows.Next() {
+		var value taskOwner
+		if err := rows.Scan(&value.id, &value.ownerID); err != nil {
+			rows.Close()
+			return 0, fmt.Errorf("read Task for Host member authorization revocation: %w", err)
+		}
+		ids = append(ids, value)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return 0, fmt.Errorf("iterate Tasks for Host member authorization revocation: %w", err)
+	}
+	rows.Close()
+	for _, value := range ids {
+		if err := requestTaskCancellationForAuthorization(ctx, tx, value.id, value.ownerID); err != nil {
+			return 0, err
+		}
+	}
+	return len(ids), nil
+}
+
 func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgress) (task.Event, error) {
 	if progress.TaskID == "" || progress.LeaseOwner == "" || progress.LeaseVersion < 1 || !validTaskStatus(progress.Status) {
 		return task.Event{}, domain.InvalidArgument("progress", "task progress fields are invalid")
@@ -1574,13 +1619,7 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			!utf8.ValidString(call.Phase) || strings.ContainsRune(call.Phase, '\x00') {
 			return task.Event{}, domain.InvalidArgument("tool_call", "task tool call progress is invalid")
 		}
-		if (call.FailureReason != "" && call.FailureReason != "not_dispatched" && call.FailureReason != "connector_rate_limited") ||
-			(call.Retryable && (!((call.FailureReason == "not_dispatched" && call.Phase == "prepare") ||
-				(call.FailureReason == "connector_rate_limited" && call.Phase == "execute" && app.IsMCPConnectorStepRetryTool(call.ToolName))) ||
-				progress.Steps[0].Status != task.StepFailed)) ||
-			(call.FailureReason == "not_dispatched" && (call.Phase != "prepare" || progress.Steps[0].Status != task.StepFailed)) ||
-			(call.FailureReason == "connector_rate_limited" && (!call.Retryable || call.Phase != "execute" ||
-				progress.Steps[0].Status != task.StepFailed || !app.IsMCPConnectorStepRetryTool(call.ToolName))) {
+		if !validTaskToolCallFailureEvidence(*call, progress.Steps[0]) {
 			return task.Event{}, domain.InvalidArgument("tool_call.failure", "task tool failure evidence is invalid")
 		}
 		if call.DetailState == "available" {
@@ -1605,6 +1644,12 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			step.Attempt = 1
 		}
 		progress.Steps[0] = step
+	}
+	requiresPersonalHistoryReadFence := progress.ToolCall != nil && len(progress.Steps) == 1 &&
+		progress.Steps[0].Status == task.StepSucceeded && app.IsCloudDSHPersonalHistoryReadTool(progress.ToolCall.ToolName)
+	if (progress.CloudDSHPersonalHistoryRead != nil || requiresPersonalHistoryReadFence) &&
+		!app.ValidCloudDSHPersonalHistoryReadCommit(progress) {
+		return task.Event{}, domain.InvalidArgument("personal_history_read", "personal history read commit is invalid")
 	}
 	if pending := progress.PendingRequest; pending != nil {
 		hostlessWorkspaceApproval := app.IsHostlessWorkspaceWriteApproval(*pending)
@@ -1907,6 +1952,11 @@ WHERE t.id=$1 AND t.owner_id=$2 AND ec.state='enabled' AND ec.epoch=t.execution_
 			}
 			authorizationDenied = true
 			return nil
+		}
+		if progress.CloudDSHPersonalHistoryRead != nil {
+			if err := requireCloudDSHPersonalHistoryReadFence(ctx, tx, currentTask, currentRevision, progress); err != nil {
+				return err
+			}
 		}
 		if media := progress.TaskMediaApproval; media != nil {
 			if err := persistTaskMediaApprovalCommit(ctx, tx, current, progress, *media); err != nil {
@@ -2548,6 +2598,22 @@ WHERE task_id=$1 AND state IN ('accepted','running','unknown')`, progress.TaskID
 		return task.Event{}, taskLeaseConflict()
 	}
 	return result, err
+}
+
+func validTaskToolCallFailureEvidence(call app.TaskToolCallProgress, step task.Step) bool {
+	switch call.FailureReason {
+	case "":
+		return !call.Retryable
+	case "not_dispatched":
+		return call.Phase == "prepare" && step.Status == task.StepFailed
+	case "connector_rate_limited":
+		return call.Retryable && call.Phase == "execute" && step.Status == task.StepFailed &&
+			app.IsMCPConnectorStepRetryTool(call.ToolName)
+	case "tool_execution_failed":
+		return !call.Retryable && call.Phase == "execute" && step.Kind == "tool" && step.Status == task.StepFailed
+	default:
+		return false
+	}
 }
 
 func persistTaskMediaApprovalCommit(ctx context.Context, tx pgx.Tx, current sqlcgen.Task, progress app.TaskProgress, media app.TaskMediaApprovalCommit) error {

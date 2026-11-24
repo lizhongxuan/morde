@@ -624,6 +624,8 @@ func TestPostgresWorkspaceTaskWaitsForHostAppliedRevisionThenResumes(t *testing.
 	if err != nil || !found || claimed.ID != accepted.Task.ID {
 		t.Fatalf("ClaimNextTask() = %#v, found=%t, err=%v", claimed, found, err)
 	}
+	checkpointSessionID := "workspace-sync-root"
+	checkpointDigest := seedTaskClaimRootDSHCheckpoint(t, store, accepted.Task.ID, owner.ID, checkpointSessionID)
 	file := syncTestFile("task-output.txt", []byte("task output revision"))
 	upload := newTestSyncSession(t, workspaceValue, owner.ID, []workspace.File{file}, []workspace.File{file}, nil)
 	upload.ReplicaID = fmt.Sprintf("host:%s:g%d:%s:b%d", hostValue.ID, hostValue.RuntimeGeneration, workspaceValue.ID, binding.BindingVersion)
@@ -694,8 +696,21 @@ WHERE host_id=$1`, hostValue.ID, host.RuntimeHeartbeatFreshness.Seconds()+1); er
 		t.Fatalf("claim after Host heartbeat expired: found=%t, err=%v", found, err)
 	}
 	recordHeartbeat()
+	if _, err := pool.Exec(ctx, `UPDATE task_agent_sessions SET checkpoint_digest=$3
+WHERE task_id=$1 AND session_id=$2`, accepted.Task.ID, checkpointSessionID, hashBytes("mismatched DSH checkpoint")); err != nil {
+		t.Fatalf("mismatch root Agent Session checkpoint: %v", err)
+	}
+	if _, found, err := store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute); err != nil || found {
+		t.Fatalf("claim after Host apply with mismatched DSH checkpoint: found=%t, err=%v; want no claim", found, err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE task_agent_sessions SET checkpoint_digest=$3
+WHERE task_id=$1 AND session_id=$2`, accepted.Task.ID, checkpointSessionID, checkpointDigest); err != nil {
+		t.Fatalf("restore root Agent Session checkpoint: %v", err)
+	}
 	resumed, found, err := store.ClaimNextTask(ctx, "workspace-sync-worker", time.Minute)
-	if err != nil || !found || resumed.ID != accepted.Task.ID || resumed.WaitingReason != "" {
+	if err != nil || !found || resumed.ID != accepted.Task.ID || resumed.WaitingReason != "" ||
+		resumed.AgentSessionID != checkpointSessionID || resumed.CheckpointThroughSequence != taskClaimTestCheckpointSequence ||
+		string(resumed.CheckpointDigest) != string(checkpointDigest) {
 		t.Fatalf("claim after Host apply = %#v, found=%t, err=%v", resumed, found, err)
 	}
 	complete.TaskID, complete.LeaseOwner, complete.LeaseVersion = resumed.ID, resumed.Lease.Owner, resumed.Lease.Version

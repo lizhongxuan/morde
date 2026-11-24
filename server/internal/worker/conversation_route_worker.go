@@ -289,7 +289,6 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 				zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
 				zap.String("failure_code", string(domain.CodeOf(err))))
 			decision = conversationRouteClassifyFallback(classifyContext)
-			err = nil
 		}
 	}
 	if decision.InvalidOutput {
@@ -362,11 +361,11 @@ func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error
 	}
 	if routeErr.RetryAfter > 0 {
 		retryAfter := routeErr.RetryAfter
-		delaySeconds := retryAfter / time.Second
+		delay := retryAfter / time.Second
 		if retryAfter%time.Second != 0 {
-			delaySeconds++
+			delay++
 		}
-		return delaySeconds * time.Second, true
+		return delay * time.Second, true
 	}
 	shift := min(max(claim.RouteAttempt-1, int64(0)), int64(2))
 	return time.Second << shift, true
@@ -531,22 +530,55 @@ func copyConversationRouteCandidates(value *app.ConversationRouteContext) {
 	value.AggregationCandidates = append(value.AggregationCandidates[:0:0], value.AggregationCandidates...)
 }
 
+func conversationRouteRequestSupportsActiveTaskControl(candidate app.ConversationRouteRequestCandidate,
+	value *app.ConversationRouteContext) bool {
+	if candidate.TaskID == "" || candidate.TaskStatus != task.StatusRunning || !candidate.SameControlScope || !candidate.SameAuthorization ||
+		candidate.RequestInput.ModelID != value.CurrentRequestModelID || candidate.RequestInput.TimeZone != value.TimeZone {
+		return false
+	}
+	for _, active := range value.Candidates {
+		if active.TaskID == candidate.TaskID && active.InitiatorID == value.ActorID &&
+			active.Status == task.StatusRunning && active.Revision >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func conversationRouteTaskHasActiveControlEvidence(candidate app.ConversationRouteCandidate,
+	value *app.ConversationRouteContext) bool {
+	if candidate.TaskID == "" || candidate.InitiatorID != value.ActorID || candidate.Status != task.StatusRunning {
+		return false
+	}
+	for _, prior := range value.RequestCandidates {
+		if prior.TaskID == candidate.TaskID && prior.TaskStatus == task.StatusRunning && prior.SameControlScope && prior.SameAuthorization &&
+			prior.RequestInput.ModelID == value.CurrentRequestModelID && prior.RequestInput.TimeZone == value.TimeZone {
+			return true
+		}
+	}
+	return false
+}
+
 func trimConversationRouteCandidates(value *app.ConversationRouteContext) bool {
 	for index := len(value.RequestCandidates) - 1; index >= 0; index-- {
-		if value.RequestCandidates[index].MessageID == value.PreviousMessageID {
+		candidate := value.RequestCandidates[index]
+		if candidate.MessageID == value.PreviousMessageID || conversationRouteRequestSupportsActiveTaskControl(candidate, value) {
 			continue
 		}
 		value.RequestCandidates = append(value.RequestCandidates[:index], value.RequestCandidates[index+1:]...)
 		value.CandidateSetIncomplete = true
+		value.RequestCandidateSetIncomplete = true
 		return true
 	}
 	for index := len(value.Candidates) - 1; index >= 0; index-- {
-		taskID := value.Candidates[index].TaskID
-		if taskID == value.ReferenceTaskID || taskID == value.PreviousTaskID {
+		candidate := value.Candidates[index]
+		if candidate.TaskID == value.ReferenceTaskID || candidate.TaskID == value.PreviousTaskID ||
+			conversationRouteTaskHasActiveControlEvidence(candidate, value) {
 			continue
 		}
 		value.Candidates = append(value.Candidates[:index], value.Candidates[index+1:]...)
 		value.CandidateSetIncomplete = true
+		value.TaskCandidateSetIncomplete = true
 		return true
 	}
 	if len(value.AggregationCandidates) > 0 {

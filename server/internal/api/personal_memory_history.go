@@ -22,12 +22,13 @@ type personalMemoryHistoryPageResponse struct {
 }
 
 type personalMemoryRevisionResponse struct {
-	Revision     int64                             `json:"revision"`
-	ChangedAt    time.Time                         `json:"changed_at"`
-	Body         json.RawMessage                   `json:"body"`
-	Restorable   bool                              `json:"restorable"`
-	SourceStatus string                            `json:"source_status"`
-	Sources      []personalMemoryHistorySourceView `json:"sources"`
+	Revision             int64                             `json:"revision"`
+	ChangedAt            time.Time                         `json:"changed_at"`
+	Body                 json.RawMessage                   `json:"body"`
+	Restorable           bool                              `json:"restorable"`
+	SourceStatus         string                            `json:"source_status"`
+	Sources              []personalMemoryHistorySourceView `json:"sources"`
+	SupersededByRevision *int64                            `json:"superseded_by_revision"`
 }
 
 type personalMemoryHistorySourceView struct {
@@ -72,6 +73,7 @@ func RegisterPersonalMemoryHistoryRoute(group *gin.RouterGroup, service personal
 			items = append(items, personalMemoryRevisionResponse{
 				Revision: revision.Revision, ChangedAt: revision.ChangedAt, Body: revision.Body,
 				Restorable: revision.Restorable, SourceStatus: revision.SourceStatus, Sources: sources,
+				SupersededByRevision: revision.SupersededByRevision,
 			})
 		}
 		c.JSON(http.StatusOK, personalMemoryHistoryPageResponse{Items: items, NextCursor: cursorPointer(page.NextCursor)})

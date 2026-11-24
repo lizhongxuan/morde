@@ -46,6 +46,17 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let progressTitle: String
     }
 
+    private struct TaskActivityBootstrap: Decodable {
+        let username: String
+        let password: String
+        let activityToken: String
+
+        enum CodingKeys: String, CodingKey {
+            case username, password
+            case activityToken = "activity_token"
+        }
+    }
+
     private struct TaskActivityFixtureRun: Decodable {
         let name: String
         let objective: String
@@ -130,6 +141,381 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
             format: "label CONTAINS %@", configuration.stepTitle
         )).firstMatch
         XCTAssertTrue(currentStep.waitForExistence(timeout: 20), "The same Task's persisted activity should appear on iOS.")
+    }
+
+    @MainActor
+    func testRecoveryUnknownFromSharedLocalPortalIsVisibleOnNativeIOS() async throws {
+        let (configuration, fixture, session) = try await localRecoveryUnknownTaskActivity()
+        defer { session.invalidateAndCancel() }
+
+        let app = openTaskActivityDetail(configuration, expectedObjectivePrefix: "跨端活动验收")
+        defer { app.terminate() }
+
+        let taskStatus = app.staticTexts["morde.task.status"]
+        XCTAssertTrue(taskStatus.waitForExistence(timeout: 20))
+        XCTAssertEqual(taskStatus.label, "操作结果待核对",
+                       "A recovery result without a final answer must remain unknown, not failed or completed.")
+        let unknownStep = app.descendants(matching: .any).matching(NSPredicate(
+            format: "label CONTAINS %@", configuration.stepTitle
+        )).firstMatch
+        XCTAssertTrue(unknownStep.waitForExistence(timeout: 20),
+                      "The current unknown work item should remain visible in the Task timeline.")
+        XCTAssertFalse(app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.task.approval.approve."
+        )).firstMatch.exists, "An unresolved recovery result is not an approval request.")
+
+        app.buttons["morde.task.back"].tap()
+        app.buttons["morde.nav.tab.chat"].tap()
+        let recoveryStatus = app.staticTexts["morde.chat.message.taskRecovery.status.\(configuration.taskID)"]
+        XCTAssertTrue(recoveryStatus.waitForExistence(timeout: 20),
+                      "The original user message should explain that no final answer was returned.")
+        XCTAssertTrue(recoveryStatus.label.contains("尚未返回最终答复"))
+        XCTAssertTrue(recoveryStatus.label.contains("结果未确认"))
+        let lastWork = app.staticTexts["morde.chat.message.taskRecovery.lastWork.\(configuration.taskID)"]
+        XCTAssertTrue(lastWork.waitForExistence(timeout: 10))
+        XCTAssertTrue(lastWork.label.contains("合成文字处理完成"),
+                      "The recovery card should show the persisted last successful work item.")
+        XCTAssertFalse(app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.chat.message.retry-processing."
+        )).firstMatch.exists, "A Task-linked unknown result must not expose message-route retry.")
+
+        let openTask = app.buttons["morde.chat.message.taskRecovery.open.\(configuration.taskID)"]
+        XCTAssertTrue(openTask.waitForExistence(timeout: 10))
+        openTask.tap()
+        XCTAssertTrue(app.staticTexts["morde.task.objective"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["morde.task.objective"].label.hasPrefix("跨端活动验收"),
+                      "The original message entry must open the same shared Task.")
+        let openedTaskStatus = app.staticTexts["morde.task.status"]
+        XCTAssertTrue(openedTaskStatus.waitForExistence(timeout: 10))
+        XCTAssertTrue(openedTaskStatus.label.contains("操作结果待核对"))
+
+        let verifyRequest = try await taskActivityFixtureRequest(
+            configuration: configuration, fixture: fixture, session: session,
+            path: "/__morde_fixture/verify/recovery-unknown", method: "GET")
+        XCTAssertEqual(verifyRequest.1.statusCode, 200,
+                       "The local fixture should confirm that both real clients read the same Task state.")
+    }
+
+    @MainActor
+    func testApprovalWaitingFromSharedLocalPortalIsVisibleOnNativeIOS() async throws {
+        let (configuration, fixture, session) = try await localApprovalTaskActivity()
+        defer { session.invalidateAndCancel() }
+
+        let app = openTaskActivityDetail(configuration, expectedObjectivePrefix: "跨端活动验收")
+        defer { app.terminate() }
+
+        let taskStatus = app.staticTexts["morde.taskDynamics.status"]
+        XCTAssertTrue(taskStatus.waitForExistence(timeout: 20))
+        XCTAssertTrue(taskStatus.label.contains("等你审批"),
+                      "An approval-waiting Task must remain waiting rather than appear failed.")
+        XCTAssertFalse(taskStatus.label.contains("失败"))
+
+        let approvalTitle = app.staticTexts["确认合成测试操作"]
+        XCTAssertTrue(approvalTitle.waitForExistence(timeout: 10))
+        let approvalObject = app.staticTexts["morde.task.approval.object"]
+        XCTAssertTrue(approvalObject.waitForExistence(timeout: 10))
+        XCTAssertEqual(approvalObject.label, "本地合成资源")
+        XCTAssertTrue(app.staticTexts["此测试任务需要用户授权后继续。"].exists)
+
+        let approve = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.task.approval.approve."
+        )).firstMatch
+        let reject = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.task.approval.reject."
+        )).firstMatch
+        XCTAssertTrue(approve.exists, "The pending synthetic approval should expose its approve action.")
+        XCTAssertTrue(reject.exists, "The pending synthetic approval should expose its reject action.")
+
+        let verifyRequest = try await taskActivityFixtureRequest(
+            configuration: configuration, fixture: fixture, session: session,
+            path: "/__morde_fixture/verify/approval", method: "GET")
+        XCTAssertEqual(verifyRequest.1.statusCode, 200,
+                       "The local fixture should confirm matching PC and iOS reads of the approval wait.")
+    }
+
+    @MainActor
+    func testIOSApprovalRevocationRemovesStaleActionsFromNativeTask() async throws {
+        let (configuration, fixture, session) = try await localApprovalTaskActivity(scenario: "approval-revoked")
+        defer { session.invalidateAndCancel() }
+
+        let app = openTaskActivityDetail(configuration, expectedObjectivePrefix: "跨端活动验收")
+        defer { app.terminate() }
+
+        let taskStatus = app.staticTexts["morde.taskDynamics.status"]
+        XCTAssertTrue(taskStatus.waitForExistence(timeout: 20))
+        XCTAssertTrue(taskStatus.label.contains("等你审批"), taskStatus.label)
+        let approve = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.task.approval.approve."
+        )).firstMatch
+        let reject = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.task.approval.reject."
+        )).firstMatch
+        XCTAssertTrue(approve.waitForExistence(timeout: 10))
+        XCTAssertTrue(reject.exists)
+
+        try await waitForTaskActivityWatcher(configuration: configuration, fixture: fixture,
+                                             session: session, expectedStage: "waiting_user")
+        let (_, revokeResponse) = try await taskActivityFixtureRequest(
+            configuration: configuration, fixture: fixture, session: session,
+            path: "/__morde_fixture/advance/approval-revoked/revoke", method: "POST")
+        XCTAssertEqual(revokeResponse.statusCode, 204,
+                       "The local fixture should revoke execution authorization while approval is pending.")
+
+        let approveRemoved = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"),
+                                                       object: approve)
+        let rejectRemoved = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"),
+                                                      object: reject)
+        XCTAssertEqual(XCTWaiter.wait(for: [approveRemoved, rejectRemoved], timeout: 30), .completed,
+                       "Once the pending approval is cancelled, neither decision may remain available.")
+    }
+
+    @MainActor
+    func testIOSSharedHostGrantRevocationRemovesStaleApprovalActions() async throws {
+        let (configuration, fixture, session) = try await localApprovalTaskActivity(scenario: "approval-host-member-revoked")
+        defer { session.invalidateAndCancel() }
+
+        let app = openTaskActivityDetail(configuration, expectedObjectivePrefix: "跨端活动验收")
+        defer { app.terminate() }
+
+        let taskStatus = app.staticTexts["morde.taskDynamics.status"]
+        XCTAssertTrue(taskStatus.waitForExistence(timeout: 20))
+        XCTAssertTrue(taskStatus.label.contains("等你审批"), taskStatus.label)
+        let approve = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.task.approval.approve."
+        )).firstMatch
+        let reject = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.task.approval.reject."
+        )).firstMatch
+        XCTAssertTrue(approve.waitForExistence(timeout: 10))
+        XCTAssertTrue(reject.exists)
+
+        try await waitForTaskActivityWatcher(configuration: configuration, fixture: fixture,
+                                             session: session, expectedStage: "waiting_user")
+        let (_, revokeResponse) = try await taskActivityFixtureRequest(
+            configuration: configuration, fixture: fixture, session: session,
+            path: "/__morde_fixture/advance/approval-host-member-revoked/revoke", method: "POST")
+        XCTAssertEqual(revokeResponse.statusCode, 204,
+                       "The local PostgreSQL fixture should revoke the shared Host grant while approval is pending.")
+
+        let approveRemoved = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"),
+                                                       object: approve)
+        let rejectRemoved = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"),
+                                                      object: reject)
+        XCTAssertEqual(XCTWaiter.wait(for: [approveRemoved, rejectRemoved], timeout: 30), .completed,
+                       "After shared Host access is revoked, neither stale approval decision may remain available.")
+        XCTAssertTrue(taskStatus.label.contains("正在停止") || taskStatus.label.contains("已取消"),
+                      "The same Task must display its actual stopping state after the shared Host grant is revoked: \(taskStatus.label)")
+        XCTAssertFalse(taskStatus.label.contains("等你审批"),
+                       "A Task fenced by Host grant revocation must stop showing the approval wait.")
+        XCTAssertFalse(taskStatus.label.contains("完成"),
+                       "Revocation must not make the Task appear complete.")
+
+        let verifyRequest = try await taskActivityFixtureRequest(
+            configuration: configuration, fixture: fixture, session: session,
+            path: "/__morde_fixture/verify/approval-host-member-revoked", method: "GET")
+        XCTAssertEqual(verifyRequest.1.statusCode, 200,
+                       "The fixture should verify that PC and iOS read the same Host-revoked Task state.")
+    }
+
+    @MainActor
+    func testIOSApprovalResumesTheSameTaskAndPCReadsItsCompletedState() async throws {
+        let (configuration, fixture, session) = try await localApprovalTaskActivity(scenario: "approval-resume")
+        defer { session.invalidateAndCancel() }
+
+        let app = openTaskActivityDetail(configuration, expectedObjectivePrefix: "跨端活动验收")
+        defer { app.terminate() }
+
+        let taskStatus = app.staticTexts["morde.taskDynamics.status"]
+        XCTAssertTrue(taskStatus.waitForExistence(timeout: 20))
+        XCTAssertTrue(taskStatus.label.contains("等你审批"), taskStatus.label)
+        let approve = app.buttons.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@", "morde.task.approval.approve."
+        )).firstMatch
+        XCTAssertTrue(approve.waitForExistence(timeout: 10))
+        approve.tap()
+
+        let completedStatus = app.staticTexts["morde.taskDynamics.status"]
+        XCTAssertTrue(completedStatus.waitForExistence(timeout: 20))
+        let completed = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", "已完成"), object: completedStatus)
+        XCTAssertEqual(XCTWaiter.wait(for: [completed], timeout: 40), .completed,
+                       "The approved Task should resume and finish on the server.")
+
+        var verified = false
+        for _ in 0..<60 {
+            let verifyRequest = try await taskActivityFixtureRequest(
+                configuration: configuration, fixture: fixture, session: session,
+                path: "/__morde_fixture/verify/approval-resume", method: "GET")
+            if verifyRequest.1.statusCode == 200 {
+                verified = true
+                break
+            }
+            XCTAssertEqual(verifyRequest.1.statusCode, 409,
+                           "The fixture should wait only for PC to read the same completed Task.")
+            try await Task.sleep(nanoseconds: 500_000_000)
+        }
+        XCTAssertTrue(verified,
+                      "The local fixture should confirm that PC and iOS both read the same completed Task.")
+    }
+
+    @MainActor
+    func testPCApprovedTaskIsVisibleAsCompletedOnNativeIOS() async throws {
+        let (configuration, fixture, session) = try await localApprovalTaskActivity(
+            scenario: "approval-resume", expectedStage: "completed")
+        defer { session.invalidateAndCancel() }
+
+        let app = openTaskActivityDetail(configuration, expectedObjectivePrefix: "跨端活动验收")
+        defer { app.terminate() }
+
+        let completedStatus = app.staticTexts["morde.taskDynamics.status"]
+        XCTAssertTrue(completedStatus.waitForExistence(timeout: 20))
+        XCTAssertTrue(completedStatus.label.contains("已完成"), completedStatus.label)
+
+        let verifyRequest = try await taskActivityFixtureRequest(
+            configuration: configuration, fixture: fixture, session: session,
+            path: "/__morde_fixture/verify/approval-resume", method: "GET")
+        XCTAssertEqual(verifyRequest.1.statusCode, 200,
+                       "The local fixture should confirm that PC and iOS read the same completed Task.")
+    }
+
+    @MainActor
+    func testInterruptedAssistantMessageFromSharedLocalPortalIsVisibleOnNativeIOS() async throws {
+        let (configuration, fixture, session, _) = try await localInterruptedTaskActivity()
+        defer { session.invalidateAndCancel() }
+
+        let app = openTaskActivityDetail(configuration, expectedObjectivePrefix: "跨端活动验收")
+        defer { app.terminate() }
+
+        let taskStatus = app.staticTexts["morde.taskDynamics.status"]
+        XCTAssertTrue(taskStatus.waitForExistence(timeout: 20))
+        let visibleStopStates = ["正在停止，等待服务端确认", "停止请求已处理，等待任务状态更新",
+                                 "停止状态待确认", "已取消"]
+        XCTAssertTrue(visibleStopStates.contains(taskStatus.label),
+                      "The same Task should show its accepted stop or cancelled state, not a completed result. Got: \(taskStatus.label)")
+
+        app.buttons["morde.task.back"].tap()
+        app.buttons["morde.nav.tab.chat"].tap()
+        let transcript = app.scrollViews["morde.chat.transcript"]
+        XCTAssertTrue(transcript.waitForExistence(timeout: 20))
+
+        let expectedPartialReply = "跨端活动验收：流式回复第一段"
+        let partialReplies = app.staticTexts.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS %@",
+            "morde.chat.message.content.", expectedPartialReply
+        ))
+        let partialReply = partialReplies.firstMatch
+        for _ in 0..<4 where !partialReply.exists {
+            transcript.swipeUp()
+            _ = partialReply.waitForExistence(timeout: 3)
+        }
+        XCTAssertTrue(partialReply.waitForExistence(timeout: 20),
+                      "The interrupted assistant message should retain its partial text in the same conversation.")
+        XCTAssertEqual(partialReply.label, expectedPartialReply,
+                       "The saved assistant message should contain only the text emitted before PC cancellation.")
+        XCTAssertTrue(partialReply.identifier.hasPrefix("morde.chat.message.content."),
+                      "The partial reply should be rendered from its persisted conversation message.")
+        XCTAssertTrue(app.staticTexts["回复已中断"].waitForExistence(timeout: 10),
+                      "The persisted assistant message should clearly show that generation was interrupted.")
+
+        let verifyRequest = try await taskActivityFixtureRequest(
+            configuration: configuration, fixture: fixture, session: session,
+            path: "/__morde_fixture/verify/interrupted", method: "GET")
+        XCTAssertEqual(verifyRequest.1.statusCode, 200,
+                       "The local fixture should confirm that PC and native iOS read the same Task and interrupted message.")
+    }
+
+    @MainActor
+    func testInterruptedAssistantMessageCancelledFromNativeIOSIsVisibleOnPC() async throws {
+        let (configuration, fixture, session, initialStage) = try await localInterruptedTaskActivity(expectedStage: nil)
+        defer { session.invalidateAndCancel() }
+
+        let app = openTaskActivityDetail(configuration, expectedObjectivePrefix: "跨端活动验收")
+        defer { app.terminate() }
+
+        let expectedPartialReply = "跨端活动验收：流式回复第一段"
+        let partialReplies = app.staticTexts.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS %@",
+            "morde.chat.message.content.", expectedPartialReply
+        ))
+        let partialReply = partialReplies.firstMatch
+        if initialStage == "streaming" {
+            app.buttons["morde.task.back"].tap()
+            app.buttons["morde.nav.tab.chat"].tap()
+            let transcript = app.scrollViews["morde.chat.transcript"]
+            XCTAssertTrue(transcript.waitForExistence(timeout: 20))
+            for _ in 0..<4 where !partialReply.exists {
+                transcript.swipeUp()
+                _ = partialReply.waitForExistence(timeout: 3)
+            }
+            XCTAssertTrue(partialReply.waitForExistence(timeout: 20),
+                          "The active assistant stream should show the text already emitted by the shared Task.")
+            XCTAssertEqual(partialReply.label, expectedPartialReply)
+
+            let openTaskDetails = app.buttons["morde.taskDetail.open"]
+            XCTAssertTrue(openTaskDetails.waitForExistence(timeout: 15),
+                          "The conversation should expose the same running Task's native detail view.")
+            openTaskDetails.tap()
+            let cancelTask = app.buttons["morde.task.action.cancel"]
+            XCTAssertTrue(cancelTask.waitForExistence(timeout: 15),
+                          "The native Task detail should expose cancellation for the running Task.")
+            cancelTask.tap()
+            let confirmCancel = app.buttons.matching(NSPredicate(format: "label == %@", "取消任务"))
+                .element(boundBy: 1)
+            XCTAssertTrue(confirmCancel.waitForExistence(timeout: 5),
+                          "iOS should require explicit confirmation before cancelling the Task.")
+            confirmCancel.tap()
+
+            let interruptDeadline = Date().addingTimeInterval(30)
+            var interruptedRun: TaskActivityFixtureRun?
+            while Date() < interruptDeadline {
+                let status = try await taskActivityFixtureStatus(configuration: configuration, fixture: fixture,
+                                                                  session: session)
+                if let run = status.runs.first(where: { $0.name == "interrupted" }),
+                   run.taskID == configuration.taskID, run.stage == "interrupted" {
+                    interruptedRun = run
+                    break
+                }
+                try await Task.sleep(nanoseconds: 300_000_000)
+            }
+            XCTAssertNotNil(interruptedRun,
+                            "The loopback service should persist the native iOS stop request as an interrupted stream.")
+
+            let taskStatus = app.staticTexts["morde.task.status"]
+            XCTAssertTrue(taskStatus.waitForExistence(timeout: 20))
+            let visibleStopStates = ["正在停止，等待服务端确认", "停止请求已处理，等待任务状态更新",
+                                     "停止状态待确认", "已取消"]
+            XCTAssertTrue(visibleStopStates.contains(where: { taskStatus.label.hasPrefix($0) }),
+                          "iOS should show the accepted stop state rather than a completed result. Got: \(taskStatus.label)")
+            app.buttons["morde.task.back"].tap()
+        } else {
+            let taskStatus = app.staticTexts["morde.taskDynamics.status"]
+            XCTAssertTrue(taskStatus.waitForExistence(timeout: 20))
+            let visibleStopStates = ["正在停止，等待服务端确认", "停止请求已处理，等待任务状态更新",
+                                     "停止状态待确认", "已取消"]
+            XCTAssertTrue(visibleStopStates.contains(where: { taskStatus.label.hasPrefix($0) }),
+                          "The interrupted Task should show its accepted stop state. Got: \(taskStatus.label)")
+            app.buttons["morde.task.back"].tap()
+        }
+
+        app.buttons["morde.nav.tab.chat"].tap()
+        let refreshedTranscript = app.scrollViews["morde.chat.transcript"]
+        XCTAssertTrue(refreshedTranscript.waitForExistence(timeout: 20))
+        for _ in 0..<4 where !partialReply.exists {
+            refreshedTranscript.swipeUp()
+            _ = partialReply.waitForExistence(timeout: 3)
+        }
+        XCTAssertTrue(partialReply.waitForExistence(timeout: 20),
+                      "The interrupted assistant message should remain visible after returning to the conversation.")
+        XCTAssertEqual(partialReply.label, expectedPartialReply,
+                       "The native stop must preserve the exact already displayed prefix.")
+        XCTAssertTrue(app.staticTexts["回复已中断"].waitForExistence(timeout: 10),
+                      "The native client should label the saved partial assistant reply as interrupted.")
+
+        let verifyRequest = try await taskActivityFixtureRequest(
+            configuration: configuration, fixture: fixture, session: session,
+            path: "/__morde_fixture/verify/interrupted", method: "GET")
+        XCTAssertEqual(verifyRequest.1.statusCode, 200,
+                       "The local fixture should confirm that PC and native iOS read the same interrupted Task and message.")
     }
 
     @MainActor
@@ -2360,6 +2746,62 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         XCTAssertTrue(app.staticTexts["morde.task.status"].label.contains("已完成"))
         XCTAssertFalse(cancel.exists, "A completed task must no longer expose cancellation.")
         attachScreen(app, named: "MDA-04 approved task detail after refresh")
+    }
+
+    func testMordeTaskApprovalPermissionRevocationHidesStaleActions() {
+        assertMordeTaskApprovalFailureRefreshesSameTask(
+            fixture: "-morde.localTaskPagesApprovalPermissionDeniedFixture",
+            statusCode: 403)
+    }
+
+    func testMordeTaskApprovalUnauthorizedHidesStaleActions() {
+        assertMordeTaskApprovalFailureRefreshesSameTask(
+            fixture: "-morde.localTaskPagesApprovalUnauthorizedFixture",
+            statusCode: 401)
+    }
+
+    func testMordeTaskApprovalNotFoundHidesStaleActions() {
+        assertMordeTaskApprovalFailureRefreshesSameTask(
+            fixture: "-morde.localTaskPagesApprovalNotFoundFixture",
+            statusCode: 404)
+    }
+
+    private func assertMordeTaskApprovalFailureRefreshesSameTask(fixture: String, statusCode: Int) {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskPagesFixture",
+            "-morde.localTaskPagesTaskDetailRequestsFixture",
+            fixture,
+        ])
+        app.buttons["morde.nav.tab.tasks"].tap()
+
+        let task = app.buttons["morde.tasks.row.q0000101"]
+        XCTAssertTrue(task.waitForExistence(timeout: 15))
+        task.tap()
+
+        let approve = app.buttons["morde.task.approval.approve.r0000001"]
+        let reject = app.buttons["morde.task.approval.reject.r0000001"]
+        XCTAssertTrue(approve.waitForExistence(timeout: 15))
+        XCTAssertTrue(reject.exists)
+        approve.tap()
+
+        let status = app.staticTexts["morde.taskDynamics.status"]
+        if statusCode == 401 {
+            XCTAssertTrue(app.buttons["morde.auth.expiredSignIn"].waitForExistence(timeout: 15),
+                          "An expired session must request sign-in before any further Task read.")
+            XCTAssertFalse(status.exists, "A 401 must not retain a Task projection under an expired session.")
+        } else {
+            XCTAssertTrue(status.waitForExistence(timeout: 15))
+            let stopped = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@", "停止状态待确认"),
+                                                    object: status)
+            XCTAssertEqual(XCTWaiter.wait(for: [stopped], timeout: 15), .completed,
+                           "An approval HTTP \(statusCode) response must refresh the same Task status.")
+        }
+        XCTAssertFalse(approve.exists,
+                       "A revoked approval permission must remove the stale approve action.")
+        XCTAssertFalse(reject.exists,
+                       "A revoked approval permission must remove the competing reject action.")
+        app.terminate()
     }
 
     func testMordeTaskClarificationLocksTaskActionsWhileSubmitting() {
@@ -5303,6 +5745,208 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                                          taskID: taskID, objective: objective, stepTitle: stepTitle)
     }
 
+    private func localRecoveryUnknownTaskActivity() async throws ->
+        (TaskActivityConfiguration, TaskActivityFixtureConfiguration, URLSession) {
+        guard let origin = URL(string: "http://127.0.0.1:49379") else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 10,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not construct the loopback Portal origin."])
+        }
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.httpCookieStorage = nil
+        sessionConfiguration.httpShouldSetCookies = false
+        sessionConfiguration.timeoutIntervalForRequest = 8
+        let session = URLSession(configuration: sessionConfiguration,
+            delegate: IOS03NoRedirectURLSessionDelegate(), delegateQueue: nil)
+        let bootstrapURL = origin.appendingPathComponent("__morde_fixture/bootstrap/recovery-unknown")
+        var bootstrapRequest = URLRequest(url: bootstrapURL)
+        bootstrapRequest.httpShouldHandleCookies = false
+        bootstrapRequest.cachePolicy = .reloadIgnoringLocalCacheData
+        bootstrapRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (bootstrapData, bootstrapResponse) = try await session.data(for: bootstrapRequest)
+        guard let httpBootstrapResponse = bootstrapResponse as? HTTPURLResponse,
+              ios03HTTPResponseMatchesOrigin(httpBootstrapResponse, origin: origin),
+              httpBootstrapResponse.statusCode == 200 else {
+            session.invalidateAndCancel()
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 11,
+                          userInfo: [NSLocalizedDescriptionKey: "The loopback recovery fixture bootstrap was unavailable."])
+        }
+        let bootstrap = try JSONDecoder().decode(TaskActivityBootstrap.self, from: bootstrapData)
+        guard !bootstrap.username.isEmpty, bootstrap.password == "client-password-123",
+              !bootstrap.activityToken.isEmpty,
+              bootstrap.activityToken == bootstrap.activityToken.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            session.invalidateAndCancel()
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 12,
+                          userInfo: [NSLocalizedDescriptionKey: "The loopback recovery fixture bootstrap was invalid."])
+        }
+
+        let fixture = TaskActivityFixtureConfiguration(token: bootstrap.activityToken,
+            scenario: "recovery-unknown", progressTitle: "正在整理测试信息")
+        let provisional = TaskActivityConfiguration(origin: origin, username: bootstrap.username,
+            password: bootstrap.password, taskID: "", objective: "", stepTitle: "核对中断的执行状态")
+        let deadline = Date().addingTimeInterval(90)
+        while Date() < deadline {
+            let status = try await taskActivityFixtureStatus(configuration: provisional, fixture: fixture,
+                                                              session: session)
+            if let run = status.runs.first(where: { $0.name == "recovery-unknown" }) {
+                guard run.objective == "跨端活动验收：恢复检查点无法确认" else {
+                    session.invalidateAndCancel()
+                    throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 13,
+                                  userInfo: [NSLocalizedDescriptionKey: "The shared local recovery Task objective did not match."])
+                }
+                if run.stage == "waiting_user", let taskID = run.taskID, !taskID.isEmpty {
+                    let configuration = TaskActivityConfiguration(origin: origin, username: bootstrap.username,
+                        password: bootstrap.password, taskID: taskID, objective: run.objective,
+                        stepTitle: provisional.stepTitle)
+                    return (configuration, fixture, session)
+                }
+            }
+            try await Task.sleep(nanoseconds: 300_000_000)
+        }
+        session.invalidateAndCancel()
+        throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 14,
+                      userInfo: [NSLocalizedDescriptionKey: "The shared recovery Task did not reach waiting_user in the local fixture."])
+    }
+
+    private func localApprovalTaskActivity(scenario: String = "approval", expectedStage: String = "waiting_user") async throws ->
+        (TaskActivityConfiguration, TaskActivityFixtureConfiguration, URLSession) {
+        guard let origin = URL(string: "http://127.0.0.1:49379") else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 20,
+                          userInfo: [NSLocalizedDescriptionKey: "Could not construct the loopback Portal origin."])
+        }
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.httpCookieStorage = nil
+        sessionConfiguration.httpShouldSetCookies = false
+        sessionConfiguration.timeoutIntervalForRequest = 8
+        let session = URLSession(configuration: sessionConfiguration,
+            delegate: IOS03NoRedirectURLSessionDelegate(), delegateQueue: nil)
+        let bootstrapURL = origin.appendingPathComponent("__morde_fixture/bootstrap/\(scenario)")
+        var bootstrapRequest = URLRequest(url: bootstrapURL)
+        bootstrapRequest.httpShouldHandleCookies = false
+        bootstrapRequest.cachePolicy = .reloadIgnoringLocalCacheData
+        bootstrapRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (bootstrapData, bootstrapResponse) = try await session.data(for: bootstrapRequest)
+        guard let httpBootstrapResponse = bootstrapResponse as? HTTPURLResponse,
+              ios03HTTPResponseMatchesOrigin(httpBootstrapResponse, origin: origin),
+              httpBootstrapResponse.statusCode == 200 else {
+            session.invalidateAndCancel()
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 21,
+                          userInfo: [NSLocalizedDescriptionKey: "The loopback approval fixture bootstrap was unavailable."])
+        }
+        let bootstrap = try JSONDecoder().decode(TaskActivityBootstrap.self, from: bootstrapData)
+        guard !bootstrap.username.isEmpty, !bootstrap.password.isEmpty,
+              !bootstrap.activityToken.isEmpty,
+              bootstrap.activityToken == bootstrap.activityToken.trimmingCharacters(in: .whitespacesAndNewlines),
+              !bootstrap.activityToken.contains("\r"), !bootstrap.activityToken.contains("\n") else {
+            session.invalidateAndCancel()
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 22,
+                          userInfo: [NSLocalizedDescriptionKey: "The loopback approval fixture bootstrap was invalid."])
+        }
+
+        let fixture = TaskActivityFixtureConfiguration(token: bootstrap.activityToken,
+            scenario: scenario, progressTitle: "正在整理测试信息")
+        let stepTitle = expectedStage == "completed" ? "已批准的本地合成操作" : "等待用户授权"
+        let provisional = TaskActivityConfiguration(origin: origin, username: bootstrap.username,
+            password: bootstrap.password, taskID: "", objective: "", stepTitle: stepTitle)
+        let expectedObjective: String
+        switch scenario {
+        case "approval-resume": expectedObjective = "跨端活动验收：批准后继续任务"
+        case "approval-revoked": expectedObjective = "跨端活动验收：审批等待期间撤销执行授权"
+        case "approval-host-member-revoked": expectedObjective = "跨端活动验收：审批等待期间撤销共享 Host 授权"
+        default: expectedObjective = "跨端活动验收：等待用户授权"
+        }
+        let deadline = Date().addingTimeInterval(90)
+        while Date() < deadline {
+            let status = try await taskActivityFixtureStatus(configuration: provisional, fixture: fixture,
+                                                              session: session)
+            if let run = status.runs.first(where: { $0.name == scenario }) {
+                guard run.objective == expectedObjective else {
+                    session.invalidateAndCancel()
+                    throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 23,
+                                  userInfo: [NSLocalizedDescriptionKey: "The shared local approval Task objective did not match."])
+                }
+                if run.stage == expectedStage, let taskID = run.taskID, !taskID.isEmpty {
+                    let configuration = TaskActivityConfiguration(origin: origin, username: bootstrap.username,
+                        password: bootstrap.password, taskID: taskID, objective: run.objective,
+                        stepTitle: stepTitle)
+                    return (configuration, fixture, session)
+                }
+            }
+            try await Task.sleep(nanoseconds: 300_000_000)
+        }
+        session.invalidateAndCancel()
+        throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 24,
+                          userInfo: [NSLocalizedDescriptionKey: "The shared approval Task did not reach \(expectedStage) in the local fixture."])
+    }
+
+    private func localInterruptedTaskActivity(expectedStage: String? = "interrupted") async throws ->
+        (TaskActivityConfiguration, TaskActivityFixtureConfiguration, URLSession, String) {
+        let configuredOrigin = ProcessInfo.processInfo.environment["MORDE_INTERRUPTED_FIXTURE_ORIGIN"] ??
+            "http://127.0.0.1:49379"
+        guard let origin = URL(string: configuredOrigin), origin.scheme == "http", origin.host == "127.0.0.1",
+              origin.port != nil, origin.user == nil, origin.password == nil,
+              (origin.path.isEmpty || origin.path == "/"), origin.query == nil, origin.fragment == nil else {
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 30,
+                          userInfo: [NSLocalizedDescriptionKey: "The interrupted fixture must use an explicit loopback HTTP origin."])
+        }
+        let sessionConfiguration = URLSessionConfiguration.ephemeral
+        sessionConfiguration.httpCookieStorage = nil
+        sessionConfiguration.httpShouldSetCookies = false
+        sessionConfiguration.timeoutIntervalForRequest = 8
+        let session = URLSession(configuration: sessionConfiguration,
+            delegate: IOS03NoRedirectURLSessionDelegate(), delegateQueue: nil)
+        let bootstrapURL = origin.appendingPathComponent("__morde_fixture/bootstrap/interrupted")
+        var bootstrapRequest = URLRequest(url: bootstrapURL)
+        bootstrapRequest.httpShouldHandleCookies = false
+        bootstrapRequest.cachePolicy = .reloadIgnoringLocalCacheData
+        bootstrapRequest.setValue("application/json", forHTTPHeaderField: "Accept")
+        let (bootstrapData, bootstrapResponse) = try await session.data(for: bootstrapRequest)
+        guard let httpBootstrapResponse = bootstrapResponse as? HTTPURLResponse,
+              ios03HTTPResponseMatchesOrigin(httpBootstrapResponse, origin: origin),
+              httpBootstrapResponse.statusCode == 200 else {
+            session.invalidateAndCancel()
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 31,
+                          userInfo: [NSLocalizedDescriptionKey: "The loopback interrupted-message fixture bootstrap was unavailable."])
+        }
+        let bootstrap = try JSONDecoder().decode(TaskActivityBootstrap.self, from: bootstrapData)
+        guard !bootstrap.username.isEmpty, !bootstrap.password.isEmpty,
+              !bootstrap.activityToken.isEmpty,
+              bootstrap.activityToken == bootstrap.activityToken.trimmingCharacters(in: .whitespacesAndNewlines),
+              !bootstrap.activityToken.contains("\r"), !bootstrap.activityToken.contains("\n") else {
+            session.invalidateAndCancel()
+            throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 32,
+                          userInfo: [NSLocalizedDescriptionKey: "The loopback interrupted-message fixture bootstrap was invalid."])
+        }
+
+        let fixture = TaskActivityFixtureConfiguration(token: bootstrap.activityToken,
+            scenario: "interrupted", progressTitle: "正在整理测试信息")
+        let provisional = TaskActivityConfiguration(origin: origin, username: bootstrap.username,
+            password: bootstrap.password, taskID: "", objective: "", stepTitle: "流式回复已中断")
+        let deadline = Date().addingTimeInterval(90)
+        while Date() < deadline {
+            let status = try await taskActivityFixtureStatus(configuration: provisional, fixture: fixture,
+                                                              session: session)
+            if let run = status.runs.first(where: { $0.name == "interrupted" }) {
+                guard run.objective.hasPrefix("跨端活动验收"), !run.objective.isEmpty else {
+                    session.invalidateAndCancel()
+                    throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 33,
+                                  userInfo: [NSLocalizedDescriptionKey: "The shared interrupted Task objective did not match the local activity fixture."])
+                }
+                let stageMatches = expectedStage.map { run.stage == $0 } ??
+                    ["streaming", "interrupted"].contains(run.stage)
+                if stageMatches, let taskID = run.taskID, !taskID.isEmpty {
+                    let configuration = TaskActivityConfiguration(origin: origin, username: bootstrap.username,
+                        password: bootstrap.password, taskID: taskID, objective: run.objective,
+                        stepTitle: provisional.stepTitle)
+                    return (configuration, fixture, session, run.stage)
+                }
+            }
+            try await Task.sleep(nanoseconds: 300_000_000)
+        }
+        session.invalidateAndCancel()
+        throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 34,
+                      userInfo: [NSLocalizedDescriptionKey: "The interrupted stream did not reach the expected local fixture stage \(expectedStage ?? "streaming or interrupted")."])
+    }
+
     private func taskActivityFixtureConfiguration(stepTitle: String) throws -> TaskActivityFixtureConfiguration {
         let environment = ProcessInfo.processInfo.environment
         guard let token = environment["MORDE_TASK_ACTIVITY_FIXTURE_TOKEN"], !token.isEmpty,
@@ -5312,7 +5956,7 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         }
         let allowedScenarios: Set<String> = [
             "merge-a", "merge-b", "search", "separate-a", "separate-b",
-            "stream", "stream-other", "failed", "approval",
+            "stream", "stream-other", "failed", "approval", "approval-revoked", "approval-host-member-revoked",
         ]
         guard allowedScenarios.contains(scenario) else {
             throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 3,
@@ -5329,7 +5973,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
     }
 
     @MainActor
-    private func openTaskActivityDetail(_ configuration: TaskActivityConfiguration) -> XCUIApplication {
+    private func openTaskActivityDetail(_ configuration: TaskActivityConfiguration,
+                                        expectedObjectivePrefix: String? = nil) -> XCUIApplication {
         let app = XCUIApplication(bundleIdentifier: "io.morde.app")
         let origin = configuration.origin.absoluteString
         app.launchArguments = ["-morde.server", origin,
@@ -5343,6 +5988,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         )).firstMatch
         XCTAssertTrue(authenticationGate.waitForExistence(timeout: 20))
         if app.buttons["morde.nav.menu"].exists { signOutCurrentMordeAccount(app) }
+        let expiredSessionSignIn = app.buttons["morde.auth.expiredSignIn"]
+        if expiredSessionSignIn.waitForExistence(timeout: 5) { expiredSessionSignIn.tap() }
 
         let usernameField = app.textFields["morde.auth.username"]
         guard usernameField.waitForExistence(timeout: 15) else {
@@ -5371,7 +6018,11 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
 
         let objective = app.staticTexts["morde.task.objective"]
         XCTAssertTrue(objective.waitForExistence(timeout: 20))
-        XCTAssertEqual(objective.label, configuration.objective)
+        if let expectedObjectivePrefix {
+            XCTAssertTrue(objective.label.hasPrefix(expectedObjectivePrefix))
+        } else {
+            XCTAssertEqual(objective.label, configuration.objective)
+        }
         return app
     }
 
@@ -5426,7 +6077,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
     private func waitForTaskActivityWatcher(
         configuration: TaskActivityConfiguration,
         fixture: TaskActivityFixtureConfiguration,
-        session: URLSession
+        session: URLSession,
+        expectedStage: String = "started"
     ) async throws {
         let deadline = Date().addingTimeInterval(30)
         var lastObservation = "fixture run not found"
@@ -5439,13 +6091,13 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
                                   userInfo: [NSLocalizedDescriptionKey: "The configured Task does not match the selected fixture run."])
                 }
                 let iosWatchers = status.activeEventStreams[configuration.taskID]?["ios"] ?? 0
-                if run.stage == "started" && iosWatchers > 0 { return }
-                lastObservation = "stage=\(run.stage), iOS event streams=\(iosWatchers)"
+                if run.stage == expectedStage && iosWatchers > 0 { return }
+                lastObservation = "stage=\(run.stage), expected stage=\(expectedStage), iOS event streams=\(iosWatchers)"
             }
             try await Task.sleep(nanoseconds: 300_000_000)
         }
         throw NSError(domain: "MordeUITests.PortalTaskActivity", code: 9,
-                      userInfo: [NSLocalizedDescriptionKey: "The iOS SSE watcher did not attach to the started fixture Task within 30 seconds (\(lastObservation))."])
+                      userInfo: [NSLocalizedDescriptionKey: "The iOS SSE watcher did not attach to the fixture Task in stage \(expectedStage) within 30 seconds (\(lastObservation))."])
     }
 
     private func advanceTaskActivityFixture(

@@ -57,10 +57,20 @@ func (s *PersonalSyncService) GetMemoryHistory(ctx context.Context, principal id
 		return PersonalMemoryHistoryPage{}, domain.InvalidArgument("cursor", "memory history cursor does not match the current service instance")
 	}
 	previousRevision := int64(^uint64(0) >> 1)
-	for _, revision := range batch.Items {
+	for index, revision := range batch.Items {
 		if revision.Revision < 1 || revision.Revision >= previousRevision || revision.ChangedAt.IsZero() ||
 			!validMemoryHistorySourceStatus(revision.SourceStatus) || revision.Sources == nil {
 			return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "personal memory history revision is invalid")
+		}
+		if revision.SupersededByRevision != nil && *revision.SupersededByRevision <= revision.Revision {
+			return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "personal memory history revision relationship is invalid")
+		}
+		if decoded == nil && index == 0 && revision.SupersededByRevision != nil {
+			return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "current memory revision cannot have a successor")
+		}
+		if decoded != nil && index == 0 && revision.SupersededByRevision != nil &&
+			*revision.SupersededByRevision != decoded.AfterRevision {
+			return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "memory history cursor relationship is invalid")
 		}
 		if decoded != nil && revision.Revision >= decoded.AfterRevision {
 			return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "personal memory history page violates its cursor")
@@ -72,8 +82,22 @@ func (s *PersonalSyncService) GetMemoryHistory(ctx context.Context, principal id
 		} else if !json.Valid(revision.Body) || personal.ValidateObjectBody(personal.ObjectTypeMemory, objectID, revision.Body) != nil || !revision.Restorable {
 			return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "personal memory history body is invalid")
 		}
-		if revision.SourceStatus == personal.MemoryHistorySourceUnavailable && (len(revision.Body) != 0 || revision.Restorable || len(revision.Sources) != 0) {
+		if revision.SourceStatus == personal.MemoryHistorySourceUnavailable &&
+			(len(revision.Body) != 0 || revision.Restorable || len(revision.Sources) != 0 || revision.SupersededByRevision != nil) {
 			return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "unavailable memory history provenance must be withheld")
+		}
+		if len(revision.Body) == 0 && revision.SupersededByRevision != nil {
+			return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "unreadable memory history cannot expose a revision relationship")
+		}
+		if index > 0 && len(revision.Body) != 0 && revision.SourceStatus != personal.MemoryHistorySourceUnavailable {
+			successor := batch.Items[index-1]
+			successorReadable := len(successor.Body) != 0 && successor.SourceStatus == personal.MemoryHistorySourceAvailable
+			if successorReadable && (revision.SupersededByRevision == nil || *revision.SupersededByRevision != successor.Revision) {
+				return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "memory history revision relationship is not the nearest successor")
+			}
+			if !successorReadable && revision.SupersededByRevision != nil {
+				return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "memory history relationship to unavailable provenance must be withheld")
+			}
 		}
 		if revision.SourceStatus == personal.MemoryHistorySourceUnrecorded && len(revision.Sources) != 0 {
 			return PersonalMemoryHistoryPage{}, domain.NewError(domain.CodeInternal, "unrecorded memory history cannot contain sources")

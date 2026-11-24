@@ -153,6 +153,24 @@ func TestPostgresMCPConnectorRateLimitRetryExecutesAndPersistsSuccess(t *testing
 		connectorID = connector.ID
 		return []string{connectorID}
 	})
+	checkpointDigest := hashBytes("m09-mcp-rate-limit-retry-checkpoint")
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE tasks SET checkpoint_through_seq=0,checkpoint_digest=$2 WHERE id=$1`,
+		fixture.task.ID, checkpointDigest); err != nil {
+		t.Fatalf("seed pinned DSH checkpoint: %v", err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_agent_sessions SET checkpoint_through_seq=0,checkpoint_digest=$3
+WHERE task_id=$1 AND session_id=$2`, fixture.task.ID, fixture.fence.AgentSessionID, checkpointDigest); err != nil {
+		t.Fatalf("seed Agent Session checkpoint: %v", err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `INSERT INTO task_agent_checkpoints
+(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,agent_root_session_id,from_seq,through_seq,digest,ciphertext,
+engine_version,profile_version,auth_version,lease_version)
+VALUES ($1,$2,$3,$4,$5,$5,0,0,$6,'sealed',$7,$8,$9,$10)`, fixture.task.ID, fixture.task.OwnerID,
+		fixture.fence.AgentInstanceID, fixture.fence.AgentGeneration, fixture.fence.AgentSessionID, checkpointDigest,
+		fixture.fence.EngineVersion, fixture.fence.ProfileVersion, fixture.fence.AuthorizationVersion, fixture.fence.LeaseVersion); err != nil {
+		t.Fatalf("persist pinned DSH checkpoint: %v", err)
+	}
+	fixture.task.CheckpointThroughSequence, fixture.task.CheckpointDigest = 0, checkpointDigest
 	client := &m09RetryMCPClient{}
 	broker := m09RetryBroker(t, fixture.route.store, client)
 
@@ -182,6 +200,14 @@ func TestPostgresMCPConnectorRateLimitRetryExecutesAndPersistsSuccess(t *testing
 		t.Fatalf("persist terminal MCP Task failure: %v", err)
 	}
 	m09StopSelectedAgent(t, &fixture)
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE tasks SET checkpoint_through_seq=0,checkpoint_digest=$2 WHERE id=$1`,
+		fixture.task.ID, checkpointDigest); err != nil {
+		t.Fatalf("restore pinned DSH checkpoint before user retry: %v", err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_agent_sessions SET checkpoint_through_seq=0,checkpoint_digest=$3
+WHERE task_id=$1 AND session_id=$2`, fixture.task.ID, fixture.fence.AgentSessionID, checkpointDigest); err != nil {
+		t.Fatalf("restore Agent Session checkpoint before user retry: %v", err)
+	}
 
 	details, err := fixture.route.store.GetTask(ctx, fixture.task.ID, fixture.task.OwnerID)
 	if err != nil {
@@ -194,12 +220,27 @@ func TestPostgresMCPConnectorRateLimitRetryExecutesAndPersistsSuccess(t *testing
 			break
 		}
 	}
-	if sourceStep == nil || sourceStep.Status != task.StepFailed || !sourceStep.Retryable || sourceStep.FailureReason != "connector_rate_limited" {
-		t.Fatalf("persisted terminal MCP source step = %+v", sourceStep)
+	if sourceStep == nil || sourceStep.Status != task.StepFailed || sourceStep.Retryable || sourceStep.RetryAfterAt == nil ||
+		!sourceStep.RetryAfterAt.After(time.Now()) || sourceStep.FailureReason != "connector_rate_limited" {
+		t.Fatalf("terminal MCP source step should wait for Retry-After = %+v", sourceStep)
 	}
 	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_mcp_connector_operations SET updated_at=clock_timestamp()-interval '10 minutes'
 WHERE task_id=$1 AND call_id=$2`, fixture.task.ID, sourceCall.CallID); err != nil {
 		t.Fatalf("expire synthetic connector Retry-After: %v", err)
+	}
+	details, err = fixture.route.store.GetTask(ctx, fixture.task.ID, fixture.task.OwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sourceStep = nil
+	for i := range details.Steps {
+		if details.Steps[i].ToolCallKey == sourceCall.CallID {
+			sourceStep = &details.Steps[i]
+			break
+		}
+	}
+	if sourceStep == nil || !sourceStep.Retryable || sourceStep.RetryAfterAt == nil || sourceStep.RetryAfterAt.After(time.Now()) {
+		t.Fatalf("terminal MCP source step should become retryable after Retry-After = %+v", sourceStep)
 	}
 	if details.Task.CurrentRevision == nil {
 		t.Fatal("failed MCP Task has no current revision")
@@ -212,7 +253,7 @@ WHERE task_id=$1 AND call_id=$2`, fixture.task.ID, sourceCall.CallID); err != ni
 		RequestHash: hashBytes("m09-mcp-retry-success:" + sourceStep.ID), RelatedID: sourceStep.ID}
 	requested, err := fixture.route.store.RequestTaskStepRetry(ctx, retryRecord, retryRequest)
 	if err != nil || requested.Replayed || requested.Intent.AttemptStepID != attemptStepID {
-		t.Fatalf("reserve MCP retry intent: intent=%+v replayed=%t err=%v", requested.Intent, requested.Replayed, err)
+		t.Fatalf("reserve MCP retry intent: intent=%+v replayed=%t err=%v task=%+v", requested.Intent, requested.Replayed, err, details.Task)
 	}
 
 	startSelectedMCPAgent(t, &fixture, 2)

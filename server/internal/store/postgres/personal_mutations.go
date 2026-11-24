@@ -119,6 +119,11 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 	if !objectExists && mutation.Delete {
 		return personal.MutationReceipt{}, domain.NewError(domain.CodeNotFound, "personal object not found")
 	}
+	if mutation.ObjectType == personal.ObjectTypeRuleCandidate && !mutation.Delete {
+		if err := validatePersonalRuleCandidateMutationInTx(ctx, tx, instanceID, mutation, objectExists, previousBody); err != nil {
+			return personal.MutationReceipt{}, err
+		}
+	}
 	if mutation.Delete && mutation.ObjectType == personal.ObjectTypeMemory {
 		var previousMemory struct {
 			Content string `json:"content"`
@@ -251,6 +256,58 @@ VALUES ($1::uuid,$2,$3,$4,$5,$6,$7,$8)`, instanceID, mutation.OwnerID, mutation.
 		}
 	}
 	return receipt, nil
+}
+
+func validatePersonalRuleCandidateMutationInTx(ctx context.Context, tx pgx.Tx, instanceID string,
+	mutation personal.Mutation, objectExists bool, previousBody []byte) error {
+	var next personal.RuleCandidateBody
+	if err := json.Unmarshal(mutation.Body, &next); err != nil {
+		return domain.NewError(domain.CodeInvalidArgument, "personal rule candidate is invalid")
+	}
+	if !objectExists {
+		if next.Status != personal.RuleCandidatePending {
+			return domain.NewError(domain.CodeForbidden, "a rule candidate must be reviewed before activation")
+		}
+	} else {
+		var previous personal.RuleCandidateBody
+		if err := json.Unmarshal(previousBody, &previous); err != nil ||
+			personal.ValidateObjectBody(personal.ObjectTypeRuleCandidate, mutation.ObjectID, previousBody) != nil {
+			return domain.NewError(domain.CodeInternal, "stored personal rule candidate is invalid")
+		}
+		if previous.Status != personal.RuleCandidatePending {
+			return domain.NewError(domain.CodeConflict, "an active rule must be removed and proposed again before it can change")
+		}
+		if next.Status == personal.RuleCandidateActive &&
+			(next.Scope != previous.Scope || next.SourceMemoryID != previous.SourceMemoryID ||
+				next.SourceMemoryRevision != previous.SourceMemoryRevision) {
+			return domain.NewError(domain.CodeConflict, "review the unchanged candidate before activating it")
+		}
+	}
+
+	var sourceRevision int64
+	var sourceDeleted bool
+	err := tx.QueryRow(ctx, `SELECT revision,is_deleted FROM account_object_versions
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4 FOR SHARE`,
+		instanceID, mutation.OwnerID, personal.ObjectTypeMemory, next.SourceMemoryID).Scan(&sourceRevision, &sourceDeleted)
+	if errors.Is(err, pgx.ErrNoRows) || err == nil && (sourceDeleted || sourceRevision != next.SourceMemoryRevision) {
+		return domain.NewError(domain.CodeConflict, "the source memory changed or is no longer available; create a new rule candidate")
+	}
+	if err != nil {
+		return fmt.Errorf("check personal rule candidate source revision: %w", err)
+	}
+	var sourceBody []byte
+	if err := tx.QueryRow(ctx, `SELECT body::text FROM personal_objects
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4 FOR SHARE`,
+		instanceID, mutation.OwnerID, personal.ObjectTypeMemory, next.SourceMemoryID).Scan(&sourceBody); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeConflict, "the source memory is no longer available; create a new rule candidate")
+		}
+		return fmt.Errorf("read personal rule candidate source memory: %w", err)
+	}
+	if personal.ValidateObjectBody(personal.ObjectTypeMemory, next.SourceMemoryID, sourceBody) != nil {
+		return domain.NewError(domain.CodeInternal, "stored rule candidate source memory is invalid")
+	}
+	return nil
 }
 
 func suppressPersonalHistoryForDeletedMemoryInTx(ctx context.Context, tx pgx.Tx, serviceInstanceID, ownerID, content string) error {

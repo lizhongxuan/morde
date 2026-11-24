@@ -1624,7 +1624,7 @@ func validTaskResultReviewState(value string) bool {
 
 func validStepStatus(value task.StepStatus) bool {
 	switch value {
-	case task.StepQueued, task.StepRunning, task.StepWaitingUser, task.StepSucceeded, task.StepFailed, task.StepUnknown:
+	case task.StepQueued, task.StepRunning, task.StepWaitingUser, task.StepSucceeded, task.StepFailed, task.StepUnknown, task.StepCancelled:
 		return true
 	default:
 		return false

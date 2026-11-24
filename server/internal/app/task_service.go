@@ -417,7 +417,7 @@ func newFileDeliveryIntentClarification(taskID string, hasWorkspace bool, afterS
 }
 
 func (s *TaskService) List(ctx context.Context, principal identity.Principal, filter TaskListRequest) (TaskPage, error) {
-	if err := validateTaskPrincipal(principal); err != nil {
+	if err := validateTaskReadPrincipal(principal); err != nil {
 		return TaskPage{}, err
 	}
 	if err := validatePageRequest(filter.Page); err != nil {
@@ -439,13 +439,18 @@ func (s *TaskService) List(ctx context.Context, principal identity.Principal, fi
 	}
 	visible := make([]task.Task, 0, len(page.Items))
 	for _, item := range page.Items {
-		if _, err := s.authorizeTask(ctx, principal, item.HostID, taskReadScope); err != nil {
+		revokedAccess, err := s.authorizeTaskRead(ctx, principal, item)
+		if err != nil {
 			switch domain.CodeOf(err) {
 			case domain.CodeNotFound, domain.CodeForbidden:
 				continue
 			default:
 				return TaskPage{}, err
 			}
+		}
+		if revokedAccess {
+			item = taskStatusOnlyProjection(item)
+			delete(page.K2Projections, item.ID)
 		}
 		visible = append(visible, item)
 	}
@@ -476,7 +481,7 @@ func (s *TaskService) ListConversationActiveTasks(ctx context.Context, principal
 
 // ListConversationTasks returns one status view and a count of visible tasks awaiting the caller.
 func (s *TaskService) ListConversationTasks(ctx context.Context, principal identity.Principal, projectID, conversationID string, view ConversationTaskView, page PageRequest) (TaskPage, error) {
-	if err := validateTaskPrincipal(principal); err != nil {
+	if err := validateTaskReadPrincipal(principal); err != nil {
 		return TaskPage{}, err
 	}
 	if view != ConversationTaskViewActive && view != ConversationTaskViewRecent && view != ConversationTaskViewPanel {
@@ -534,13 +539,18 @@ func (s *TaskService) ListConversationTasks(ctx context.Context, principal ident
 			visible = append(visible, item)
 			continue
 		}
-		if _, err := s.authorizeTask(ctx, principal, item.HostID, taskReadScope); err != nil {
+		revokedAccess, err := s.authorizeTaskRead(ctx, principal, item)
+		if err != nil {
 			switch domain.CodeOf(err) {
 			case domain.CodeNotFound, domain.CodeForbidden:
 				continue
 			default:
 				return TaskPage{}, err
 			}
+		}
+		if revokedAccess {
+			item = taskStatusOnlyProjection(item)
+			delete(result.K2Projections, item.ID)
 		}
 		visible = append(visible, item)
 	}
@@ -550,7 +560,7 @@ func (s *TaskService) ListConversationTasks(ctx context.Context, principal ident
 }
 
 func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id string) (TaskDetails, error) {
-	if err := validateTaskPrincipal(principal); err != nil {
+	if err := validateTaskReadPrincipal(principal); err != nil {
 		return TaskDetails{}, err
 	}
 	if !domain.ValidTaskID(id) {
@@ -563,8 +573,12 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 	if details.Task.InternalTool {
 		return TaskDetails{}, domain.NewError(domain.CodeNotFound, "task not found")
 	}
-	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskReadScope); err != nil {
-		return TaskDetails{}, hideTaskAccessError(err)
+	revokedAccess, err := s.authorizeTaskRead(ctx, principal, details.Task)
+	if err != nil {
+		return TaskDetails{}, err
+	}
+	if revokedAccess {
+		return taskStatusOnlyDetails(details), nil
 	}
 	if pending := details.PendingRequest; pending != nil && pending.Status == task.PendingRequestPending && pending.ExpiresAt != nil {
 		expirer, ok := s.store.(TaskPendingRequestExpirer)
@@ -578,8 +592,12 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 		if err != nil {
 			return TaskDetails{}, err
 		}
-		if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskReadScope); err != nil {
-			return TaskDetails{}, hideTaskAccessError(err)
+		revokedAccess, err = s.authorizeTaskRead(ctx, principal, details.Task)
+		if err != nil {
+			return TaskDetails{}, err
+		}
+		if revokedAccess {
+			return taskStatusOnlyDetails(details), nil
 		}
 	}
 	artifactsHidden := false
@@ -1157,7 +1175,7 @@ func clarifiedFileDeliveryIntent(answer string) task.FileDeliveryIntent {
 }
 
 func (s *TaskService) ListEvents(ctx context.Context, principal identity.Principal, id string, after int64, limit int32) (TaskEventPage, error) {
-	if err := validateTaskPrincipal(principal); err != nil {
+	if err := validateTaskReadPrincipal(principal); err != nil {
 		return TaskEventPage{}, err
 	}
 	if !domain.ValidTaskID(id) {
@@ -1177,11 +1195,17 @@ func (s *TaskService) ListEvents(ctx context.Context, principal identity.Princip
 	if err != nil && domain.CodeOf(err) != domain.CodeEventCursorExpired {
 		return TaskEventPage{}, err
 	}
-	if _, err := s.authorizeTask(ctx, principal, page.HostID, taskReadScope); err != nil {
-		return TaskEventPage{}, hideTaskAccessError(err)
+	pageErr := err
+	revokedAccess, authorizationErr := s.authorizeTaskRead(ctx, principal, details.Task)
+	if authorizationErr != nil {
+		return TaskEventPage{}, authorizationErr
 	}
-	if err != nil {
-		return page, err
+	if revokedAccess {
+		return TaskEventPage{HostID: details.Task.HostID, Status: details.Task.Status,
+			CurrentSequence: page.CurrentSequence}, nil
+	}
+	if pageErr != nil {
+		return page, pageErr
 	}
 	previous := after
 	for _, event := range page.Items {
@@ -1236,6 +1260,49 @@ func (s *TaskService) authorizeTask(ctx context.Context, principal identity.Prin
 		return task.Authorization{}, domain.NewError(domain.CodeUnsupported, "task authorization is unavailable")
 	}
 	return s.executionAuthorizer.AuthorizeTaskExecution(ctx, principal, hostID, scope)
+}
+
+func (s *TaskService) authorizeTaskRead(ctx context.Context, principal identity.Principal, value task.Task) (bool, error) {
+	if _, err := s.authorizeTask(ctx, principal, value.HostID, taskReadScope); err != nil {
+		if (domain.CodeOf(err) == domain.CodeNotFound || domain.CodeOf(err) == domain.CodeForbidden) &&
+			canReadInitiatedTask(principal, value) &&
+			(value.Status == task.StatusCancelling || value.Status == task.StatusCancelled) {
+			return true, nil
+		}
+		return false, hideTaskAccessError(err)
+	}
+	return false, nil
+}
+
+func taskStatusOnlyProjection(value task.Task) task.Task {
+	return task.Task{
+		ID: value.ID, OwnerID: value.OwnerID, ProjectID: value.ProjectID, InitiatorID: value.InitiatorID,
+		ConversationID: value.ConversationID, HostID: value.HostID, ExecutionLocation: value.ExecutionLocation,
+		ModelID: value.ModelID, Budget: value.Budget, Status: value.Status,
+		EventSequence: value.EventSequence, Objective: value.Objective, CreatedAt: value.CreatedAt,
+		UpdatedAt: value.UpdatedAt, FinishedAt: value.FinishedAt,
+	}
+}
+
+func taskStatusOnlyDetails(value TaskDetails) TaskDetails {
+	value.Task = taskStatusOnlyProjection(value.Task)
+	value.Dependencies = nil
+	value.ChildJobs = nil
+	value.ResultReview = nil
+	value.Validation = TaskValidationSummary{}
+	value.ValidationEvidence = nil
+	value.AssistantMessage = nil
+	value.CurrentRevisionStarted = nil
+	value.ResultMessagePending = false
+	value.ResultMessagePublished = false
+	value.ScheduleObservation = nil
+	value.Steps = nil
+	value.Agents = nil
+	value.BatchItems = nil
+	value.Artifacts = nil
+	value.PendingRequest = nil
+	value.ClarificationRequests = nil
+	return value
 }
 
 func authorizedTaskHostIDs(ctx context.Context, authorizer TaskAuthorizer, principal identity.Principal, scope identity.Scope) ([]string, error) {

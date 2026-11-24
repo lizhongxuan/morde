@@ -107,25 +107,17 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
     }
 
     func testLocalPortalRetriesConnectorRateLimitFromNativeTaskDetail() async throws {
-        guard let account = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_USER"],
-              let password = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_PASSWORD"],
-              let server = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_SERVER"],
-              let url = URL(string: server), url.scheme == "http",
-              ["localhost", "127.0.0.1"].contains(url.host ?? ""),
-              let port = url.port, (1...65535).contains(port),
-              let token = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_ACTIVITY_TOKEN"],
-              !token.isEmpty else {
-            throw XCTSkip("Set the generated local Portal credentials, loopback URL, and activity token.")
-        }
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:49379"))
+        let fixture = try await readLocalActivityBootstrap(server: url, scenario: "mcp-retry")
 
         let objective = "跨端活动验收：连接器限流后手动重试"
         let app = XCUIApplication()
-        app.launchArguments = ["-morde.server", server]
+        app.launchArguments = ["-morde.server", url.absoluteString, "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
         app.launch()
 
         let accountField = app.textFields["morde.auth.username"]
         if accountField.waitForExistence(timeout: 5) {
-            enterLocalPortalCredentials(app: app, account: account, password: password)
+            enterLocalPortalCredentials(app: app, account: fixture.username, password: fixture.password)
             let loginFormDismissed = XCTNSPredicateExpectation(
                 predicate: NSPredicate(format: "exists == false"), object: accountField)
             await fulfillment(of: [loginFormDismissed], timeout: 30)
@@ -143,14 +135,14 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
         XCTAssertTrue(send.isEnabled)
         send.tap()
 
-        let claimed = try await waitForFixtureRun("mcp-retry", stage: "claimed", server: url, token: token)
+        let claimed = try await waitForFixtureRun("mcp-retry", stage: "claimed", server: url, token: fixture.token)
         let taskID = try XCTUnwrap(claimed.taskID)
-        try await advanceFixture("mcp-retry", phase: "start", server: url, token: token)
-        _ = try await waitForFixtureRun("mcp-retry", stage: "started", server: url, token: token)
-        try await advanceFixture("mcp-retry", phase: "progress", server: url, token: token)
-        _ = try await waitForFixtureRun("mcp-retry", stage: "progress", server: url, token: token)
-        try await advanceFixture("mcp-retry", phase: "fail", server: url, token: token)
-        _ = try await waitForFixtureRun("mcp-retry", stage: "failed", server: url, token: token)
+        try await advanceFixture("mcp-retry", phase: "start", server: url, token: fixture.token)
+        _ = try await waitForFixtureRun("mcp-retry", stage: "started", server: url, token: fixture.token)
+        try await advanceFixture("mcp-retry", phase: "progress", server: url, token: fixture.token)
+        _ = try await waitForFixtureRun("mcp-retry", stage: "progress", server: url, token: fixture.token)
+        try await advanceFixture("mcp-retry", phase: "fail", server: url, token: fixture.token)
+        _ = try await waitForFixtureRun("mcp-retry", stage: "failed", server: url, token: fixture.token)
 
         let tasksTab = app.buttons["morde.shell.tab.tasks"]
         let drawerTasks = app.buttons["morde.shell.drawer.tasks"]
@@ -180,30 +172,43 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
             predicate: NSPredicate(format: "count > %d", sourceStepCount), object: workItems)
         await fulfillment(of: [newAttempt], timeout: 30)
         XCTAssertGreaterThan(workItems.count, sourceStepCount)
-        try await verifyFixture("mcp-retry", server: url, token: token)
+        _ = try await waitForFixtureRun("mcp-retry", stage: "retry_claimed", server: url, token: fixture.token)
+        try await advanceFixture("mcp-retry", phase: "retry-success", server: url, token: fixture.token)
+        _ = try await waitForFixtureRun("mcp-retry", stage: "retry_succeeded", server: url, token: fixture.token)
+        try await verifyFixture("mcp-retry", server: url, token: fixture.token)
+
+        let taskStatus = app.staticTexts["morde.taskDynamics.status"]
+        let taskCompleted = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", "已完成"), object: taskStatus)
+        await fulfillment(of: [taskCompleted], timeout: 30)
+        let retryStep = workItems.matching(
+            NSPredicate(format: "identifier != %@", sourceStep.identifier)).firstMatch
+        XCTAssertTrue(retryStep.waitForExistence(timeout: 15), "The successful retry should remain beside its failed source step.")
+        retryStep.tap()
+        let retryOutcome = app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "本地合成连接器重试成功。")).firstMatch
+        XCTAssertTrue(retryOutcome.waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "已完成")).firstMatch.exists)
+        app.buttons["morde.taskDynamics.workItem.back"].tap()
+        XCTAssertTrue(sourceStep.waitForExistence(timeout: 15), "The original rate-limited work item should remain visible.")
+        sourceStep.tap()
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "失败")).firstMatch
+            .waitForExistence(timeout: 15), "The original work item should retain its failed status after retry success.")
         app.terminate()
     }
 
     func testLocalPortalRetriesRouteFailureFromOriginalMessageWithoutResending() async throws {
-        guard let account = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_USER"],
-              let password = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_PASSWORD"],
-              let server = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_SERVER"],
-              let url = URL(string: server), url.scheme == "http",
-              ["localhost", "127.0.0.1"].contains(url.host ?? ""),
-              let port = url.port, (1...65535).contains(port),
-              let token = ProcessInfo.processInfo.environment["MORDE_IOS_LOCAL_PORTAL_ACTIVITY_TOKEN"],
-              !token.isEmpty else {
-            throw XCTSkip("Set the generated local Portal credentials, loopback URL, and activity token.")
-        }
+        let url = try XCTUnwrap(URL(string: "http://127.0.0.1:49379"))
+        let fixture = try await readLocalActivityBootstrap(server: url, scenario: "route-retry")
 
         let objective = "跨端活动验收：消息路由限流后显式重试"
         let app = XCUIApplication()
-        app.launchArguments = ["-morde.server", server]
+        app.launchArguments = ["-morde.server", url.absoluteString, "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
         app.launch()
 
         let accountField = app.textFields["morde.auth.username"]
         if accountField.waitForExistence(timeout: 5) {
-            enterLocalPortalCredentials(app: app, account: account, password: password)
+            enterLocalPortalCredentials(app: app, account: fixture.username, password: fixture.password)
             let loginFormDismissed = XCTNSPredicateExpectation(
                 predicate: NSPredicate(format: "exists == false"), object: accountField)
             await fulfillment(of: [loginFormDismissed], timeout: 30)
@@ -226,15 +231,50 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
             NSPredicate(format: "identifier BEGINSWITH %@", "morde.chat.message.retry-processing.")).firstMatch
         XCTAssertTrue(retry.waitForExistence(timeout: 45), "The same persisted route-failed message should expose retry.")
         XCTAssertEqual(originalMessage.count, 1, "The failed original should remain a single timeline message.")
-        retry.tap()
 
-        let reply = app.staticTexts.matching(
+        let routeFailure = app.staticTexts.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "morde.chat.message.routingFailure.")).firstMatch
+        XCTAssertTrue(routeFailure.waitForExistence(timeout: 10),
+                      "The failed route should show a safe, user-readable failure reason.")
+        XCTAssertFalse(routeFailure.label.isEmpty)
+        XCTAssertFalse(routeFailure.label.contains("rate_limit_exceeded"),
+                       "Provider response details must not be rendered in the message timeline.")
+        app.terminate()
+
+        let recoveredApp = XCUIApplication()
+        recoveredApp.launchArguments = ["-morde.server", url.absoluteString, "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        recoveredApp.launch()
+        let recoveredAccountField = recoveredApp.textFields["morde.auth.username"]
+        if recoveredAccountField.waitForExistence(timeout: 5) {
+            enterLocalPortalCredentials(app: recoveredApp, account: fixture.username, password: fixture.password)
+            let loginFormDismissed = XCTNSPredicateExpectation(
+                predicate: NSPredicate(format: "exists == false"), object: recoveredAccountField)
+            await fulfillment(of: [loginFormDismissed], timeout: 30)
+        }
+        XCTAssertTrue(recoveredApp.buttons["morde.shell.tab.chat"].waitForExistence(timeout: 30))
+        let recoveredMessages = recoveredApp.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", objective))
+        let recoveredMessage = recoveredMessages.firstMatch
+        let recoveredRetry = recoveredApp.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "morde.chat.message.retry-processing.")).firstMatch
+        XCTAssertTrue(recoveredMessage.waitForExistence(timeout: 30),
+                      "The persisted failed message should return after the iOS client restarts.")
+        XCTAssertEqual(recoveredMessages.count, 1, "Client recovery must not duplicate the original message.")
+        XCTAssertTrue(recoveredRetry.waitForExistence(timeout: 30),
+                      "The same failed route should remain explicitly retryable after client recovery.")
+        let recoveredFailure = recoveredApp.staticTexts.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "morde.chat.message.routingFailure.")).firstMatch
+        XCTAssertTrue(recoveredFailure.exists, "The safe failure reason should be restored from persisted route state.")
+
+        recoveredRetry.tap()
+
+        let reply = recoveredApp.staticTexts.matching(
             NSPredicate(format: "label CONTAINS %@", "本地验收：消息路由恢复成功。")).firstMatch
         XCTAssertTrue(reply.waitForExistence(timeout: 45), "The explicit retry should route the original message to a reply.")
-        XCTAssertEqual(originalMessage.count, 1, "Retry must reuse the original message instead of resending it.")
-        XCTAssertTrue(retry.waitForNonExistence(timeout: 10))
-        try await verifyFixture("route-retry", server: url, token: token)
-        app.terminate()
+        XCTAssertEqual(recoveredMessages.count, 1, "Retry must reuse the original message instead of resending it.")
+        XCTAssertTrue(recoveredRetry.waitForNonExistence(timeout: 10))
+        try await verifyFixture("route-retry", server: url, token: fixture.token)
+        recoveredApp.terminate()
     }
 
     func testLocalPortalLongMessageUploadResumesAfterAppRestart() async throws {
@@ -962,6 +1002,28 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
         }
     }
 
+    private struct LocalActivityBootstrap: Decodable {
+        let username: String
+        let password: String
+        let token: String
+
+        enum CodingKeys: String, CodingKey {
+            case username, password
+            case token = "activity_token"
+        }
+    }
+
+    private func readLocalActivityBootstrap(server: URL, scenario: String) async throws -> LocalActivityBootstrap {
+        var request = URLRequest(url: server.appendingPathComponent("__morde_fixture/bootstrap/\(scenario)"))
+        request.timeoutInterval = 3
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let response = response as? HTTPURLResponse, response.statusCode == 200 else {
+            throw NSError(domain: "MordeLocalFixture", code: 11,
+                          userInfo: [NSLocalizedDescriptionKey: "The local MCP retry bootstrap was unavailable."])
+        }
+        return try JSONDecoder().decode(LocalActivityBootstrap.self, from: data)
+    }
+
     private func waitForFixtureRun(_ name: String, stage: String, server: URL, token: String) async throws -> LocalActivityRun {
         let deadline = Date().addingTimeInterval(30)
         while Date() < deadline {
@@ -1020,15 +1082,21 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
         }
         let accountField = app.textFields["morde.auth.username"]
         XCTAssertTrue(accountField.waitForExistence(timeout: 5))
-        accountField.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
         let keyboard = app.keyboards.firstMatch
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 5), "The username field must receive keyboard focus.")
+        for _ in 0..<3 {
+            accountField.tap()
+            if keyboard.waitForExistence(timeout: 2) { break }
+        }
+        XCTAssertTrue(keyboard.exists, "The username field must receive keyboard focus.")
         accountField.typeText(account)
 
         let passwordField = app.secureTextFields["morde.auth.password"]
         XCTAssertTrue(passwordField.waitForExistence(timeout: 5))
-        passwordField.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.5)).tap()
-        XCTAssertTrue(keyboard.waitForExistence(timeout: 5), "The password field must receive keyboard focus.")
+        for _ in 0..<3 {
+            passwordField.tap()
+            if keyboard.waitForExistence(timeout: 2) { break }
+        }
+        XCTAssertTrue(keyboard.exists, "The password field must receive keyboard focus.")
         passwordField.typeText(password)
         let submit = app.buttons["morde.auth.submit"]
         XCTAssertTrue(submit.isEnabled, "The local test password must reach the secure field before login.")
@@ -1155,6 +1223,159 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
         )
         XCTAssertTrue(memoryCopy.firstMatch.waitForExistence(timeout: 20), "The saved memory marker should round-trip from Morde.")
 
+    }
+
+    func testLocalPersonalMemoryRuleManagementRequiresTwoExplicitConfirmationsAndForgets() throws {
+        let app = XCUIApplication()
+        try openLocalPersonalMemoryManagement(app, port: 49741)
+
+        let memoryContent = app.staticTexts["morde.personalMemory.content.global"]
+        XCTAssertTrue(memoryContent.waitForExistence(timeout: 15))
+        XCTAssertTrue(memoryContent.label.contains("简洁、分点的摘要"))
+
+        app.buttons["morde.personalMemory.propose.global"].tap()
+        confirmPersonalMemoryAction(app)
+        let activate = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "morde.personalMemory.rule.activate.r_")
+        ).firstMatch
+        XCTAssertTrue(activate.waitForExistence(timeout: 15), "The proposal should appear as a pending candidate.")
+        let candidateID = String(activate.identifier.dropFirst("morde.personalMemory.rule.activate.".count))
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.rule.status.\(candidateID)"].label.contains("待确认"))
+
+        if !activate.isHittable { app.scrollViews.firstMatch.swipeUp() }
+        activate.tap()
+        confirmPersonalMemoryAction(app)
+        let activeStatus = app.staticTexts["morde.personalMemory.rule.status.\(candidateID)"]
+        XCTAssertTrue(activeStatus.waitForExistence(timeout: 15))
+        XCTAssertTrue(activeStatus.label.contains("已启用"), "Only the second explicit confirmation activates the rule.")
+
+        app.buttons["morde.personalMemory.edit.global"].tap()
+        XCTAssertTrue(app.staticTexts["纠正个人记忆"].waitForExistence(timeout: 10))
+        let memoryEditor = app.textViews["morde.personalMemory.edit.text.global"]
+        XCTAssertTrue(memoryEditor.waitForExistence(timeout: 10))
+        let originalContent = memoryEditor.value as? String ?? ""
+        XCTAssertFalse(originalContent.isEmpty)
+        memoryEditor.tap()
+        memoryEditor.typeText(String(repeating: XCUIKeyboardKey.delete.rawValue, count: originalContent.count))
+        memoryEditor.typeText("我偏好更新后的简洁摘要。")
+        app.buttons["morde.personalMemory.edit.save.global"].tap()
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.content.global"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.content.global"].label.contains("更新后的简洁摘要"))
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.revision.global"].label.contains("修订 2"))
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.rule.source.\(candidateID)"].label.contains("修订 1"),
+                      "Correcting a memory must not silently rebind an active rule to its new revision.")
+        XCTAssertTrue(app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "此规则当前不可用")
+        ).firstMatch.exists)
+
+        app.buttons["morde.personalMemory.history.global"].tap()
+        XCTAssertTrue(app.staticTexts["记忆修订历史"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.history.revision.2"].waitForExistence(timeout: 10))
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.history.revision.1"].exists)
+        XCTAssertTrue(app.staticTexts.matching(
+            NSPredicate(format: "label CONTAINS %@", "后续修订：2")
+        ).firstMatch.exists, "The previous revision should identify revision 2 as its immediate successor.")
+        app.buttons["morde.personalMemory.history.close"].tap()
+
+        let deleteRule = app.buttons["morde.personalMemory.rule.delete.\(candidateID)"]
+        if !deleteRule.isHittable { app.scrollViews.firstMatch.swipeUp() }
+        deleteRule.tap()
+        confirmPersonalMemoryAction(app)
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.rules.empty"].waitForExistence(timeout: 15))
+
+        let forget = app.buttons["morde.personalMemory.forget.global"]
+        if !forget.isHittable { app.scrollViews.firstMatch.swipeUp() }
+        forget.tap()
+        confirmPersonalMemoryAction(app)
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.empty"].waitForExistence(timeout: 15))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", "记忆已删除")).firstMatch.exists)
+        app.terminate()
+    }
+
+    func testLocalPersonalMemoryHistoryAuthorizationAndStaleActivationFailClosed() throws {
+        let app = XCUIApplication()
+        try openLocalPersonalMemoryManagement(app, port: 49742, extraArguments: [
+            "-morde.localPersonalMemoryUnauthorizedHistoryFixture",
+            "-morde.localPersonalMemoryStaleActivationFixture",
+        ])
+
+        app.buttons["morde.personalMemory.history.global"].tap()
+        let historyError = app.staticTexts["morde.personalMemory.history.error"]
+        XCTAssertTrue(historyError.waitForExistence(timeout: 10))
+        XCTAssertTrue(historyError.label.contains("拒绝此记忆历史读取"))
+        app.buttons["morde.personalMemory.history.close"].tap()
+
+        app.buttons["morde.personalMemory.propose.global"].tap()
+        confirmPersonalMemoryAction(app)
+        let activate = app.buttons.matching(
+            NSPredicate(format: "identifier BEGINSWITH %@", "morde.personalMemory.rule.activate.r_")
+        ).firstMatch
+        XCTAssertTrue(activate.waitForExistence(timeout: 15))
+        let candidateID = String(activate.identifier.dropFirst("morde.personalMemory.rule.activate.".count))
+        if !activate.isHittable { app.scrollViews.firstMatch.swipeUp() }
+        activate.tap()
+        confirmPersonalMemoryAction(app)
+
+        let actionError = app.staticTexts["morde.personalMemory.error"]
+        XCTAssertTrue(actionError.waitForExistence(timeout: 15))
+        XCTAssertTrue(actionError.label.contains("Synthetic memory revision changed"))
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.rule.status.\(candidateID)"].label.contains("待确认"),
+                      "A stale source revision must leave the candidate unactivated.")
+        app.terminate()
+    }
+
+    private func openLocalPersonalMemoryManagement(_ app: XCUIApplication, port: Int,
+                                                  extraArguments: [String] = []) throws {
+        app.launchArguments = ["-morde.server", "https://127.0.0.1:\(port)", "-morde.localRegistrationStub",
+                              "-morde.localRegistrationApproved", "-morde.localPersonalMemoryManagementFixture"] + extraArguments
+        app.launch()
+        let accountField = app.textFields["morde.auth.username"]
+        _ = try XCTUnwrap(accountField.waitForExistence(timeout: 15) ? accountField : nil,
+                          "The isolated loopback fixture test must start with its local login form, not a persisted account session.")
+        enterLocalPortalCredentials(app: app, account: "morde-test-user", password: "synthetic-password")
+        let loginFinished = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"),
+                                                      object: accountField)
+        let signedIn = XCTWaiter.wait(for: [loginFinished], timeout: 20) == .completed
+            && app.buttons["morde.shell.drawer"].waitForExistence(timeout: 5)
+        if !signedIn {
+            let alert = app.alerts.firstMatch
+            let details = alert.exists
+                ? alert.staticTexts.allElementsBoundByIndex.map(\.label).joined(separator: " | ")
+                : "no visible login alert"
+            throw NSError(domain: "MordeLocalFixture", code: 20,
+                          userInfo: [NSLocalizedDescriptionKey:
+                            "Synthetic loopback login did not finish; auth form remains. UI error: \(details)"])
+        }
+
+        app.buttons["morde.shell.drawer"].tap()
+        let settings = app.buttons["morde.shell.settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 10))
+        settings.tap()
+        let accountSettings = app.buttons["morde.settings.account"]
+        XCTAssertTrue(accountSettings.waitForExistence(timeout: 10))
+        accountSettings.tap()
+        for _ in 0..<2 {
+            let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.82))
+            let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.32))
+            start.press(forDuration: 0.1, thenDragTo: end)
+        }
+        let personalMemory = app.buttons.matching(identifier: "morde.account.personalMemory").firstMatch
+        let memoryEntryLabel = app.staticTexts["Memory and rules"].firstMatch
+        XCTAssertTrue(personalMemory.waitForExistence(timeout: 10) || memoryEntryLabel.waitForExistence(timeout: 3),
+                      "The Memory and rules link should appear in the account settings list.")
+        if personalMemory.exists {
+            XCTAssertTrue(personalMemory.label.localizedCaseInsensitiveContains("memory") || personalMemory.label.contains("规则"),
+                          "Unexpected personal-memory entry label: \(personalMemory.label)")
+            personalMemory.tap()
+        } else {
+            memoryEntryLabel.tap()
+        }
+        XCTAssertTrue(app.descendants(matching: .any)
+            .matching(identifier: "morde.personalMemory.management").firstMatch.waitForExistence(timeout: 15))
+    }
+
+    private func confirmPersonalMemoryAction(_ app: XCUIApplication) {
+        app.buttons.matching(identifier: "morde.personalMemory.confirmation.confirm").firstMatch.tap()
     }
 
     private func button(_ app: XCUIApplication, _ primary: String, _ alternate: String) -> XCUIElement {

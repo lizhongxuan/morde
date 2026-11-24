@@ -627,6 +627,7 @@ func TestConversationRouteModelFenceAllowsPrunedCandidateSubset(t *testing.T) {
 	}
 	value.RequestCandidates = value.RequestCandidates[:1]
 	value.CandidateSetIncomplete = true
+	value.RequestCandidateSetIncomplete = true
 	decision, err := gateway.ClassifyConversationRoute(context.Background(), claim, value)
 	if err != nil || decision.Action != app.ConversationRouteReply || client.calls.Load() != 1 {
 		t.Fatalf("bounded candidate subset was not authorized for model dispatch: decision=%+v calls=%d err=%v",

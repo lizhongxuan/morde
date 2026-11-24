@@ -66,7 +66,10 @@ func TestConversationRouteSteerFailsClosedOnStaleOrAmbiguousTargets(t *testing.T
 		{name: "different explicit task", mutate: func(value *ConversationRouteContext) { value.ReferenceTaskID = "q7654321" }},
 		{name: "unavailable reference", mutate: func(value *ConversationRouteContext) { value.ReferenceUnavailable = true }},
 		{name: "missing predecessor", mutate: func(value *ConversationRouteContext) { value.PreviousMissing = true }},
-		{name: "incomplete candidate set", mutate: func(value *ConversationRouteContext) { value.CandidateSetIncomplete = true }},
+		{name: "incomplete Task candidate set", mutate: func(value *ConversationRouteContext) {
+			value.CandidateSetIncomplete = true
+			value.TaskCandidateSetIncomplete = true
+		}},
 		{name: "status request", mutate: func(value *ConversationRouteContext) { value.Content = "请查看任务进度" }},
 		{name: "two eligible tasks", mutate: func(value *ConversationRouteContext) {
 			value.Candidates = append(value.Candidates, ConversationRouteCandidate{TaskID: "q7654321", InitiatorID: value.ActorID,
@@ -84,6 +87,24 @@ func TestConversationRouteSteerFailsClosedOnStaleOrAmbiguousTargets(t *testing.T
 				t.Fatalf("unsafe steer was accepted: %+v", decision)
 			}
 		})
+	}
+}
+
+func TestConversationRouteSteerUsesRetainedEvidenceWhenPriorRequestsWereTrimmed(t *testing.T) {
+	output := `{"action":"steer","task_id":"q1234567"}`
+	value := safeSteerRouteContext()
+	value.CandidateSetIncomplete = true
+	value.RequestCandidateSetIncomplete = true
+	decision := ParseConversationRouteDecisionForContext(output, value)
+	if decision.Action != ConversationRouteSteer || decision.TaskID != "q1234567" || decision.ExpectedRevision != 3 {
+		t.Fatalf("complete active Task proof was rejected because unrelated prior requests were trimmed: %+v", decision)
+	}
+
+	value.Candidates = append(value.Candidates, ConversationRouteCandidate{TaskID: "q7654321", InitiatorID: value.ActorID,
+		Status: task.StatusRunning, Revision: 1})
+	decision = ParseConversationRouteDecisionForContext(output, value)
+	if decision.Action != ConversationRouteClarify || decision.TaskID != "" {
+		t.Fatalf("partial prior requests made an unproved active Task appear unambiguous: %+v", decision)
 	}
 }
 

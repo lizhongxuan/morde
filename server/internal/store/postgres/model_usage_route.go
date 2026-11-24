@@ -19,6 +19,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/project"
+	"morde/server/internal/domain/task"
 )
 
 func resolveRouteModelInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) (string, error) {
@@ -233,11 +234,16 @@ WHERE message_id=$1 AND actor_id=$2 AND state='settled' AND attempt=$3
 	if !conversationRouteCandidateSubset(expected.AggregationCandidates, value.AggregationCandidates) {
 		return domain.NewError(domain.CodeConflict, "authorized route aggregation candidates changed")
 	}
-	candidatesOmitted := len(value.Candidates) < len(expected.Candidates) ||
-		len(value.RequestCandidates) < len(expected.RequestCandidates) ||
+	taskCandidatesOmitted := len(value.Candidates) < len(expected.Candidates)
+	requestCandidatesOmitted := len(value.RequestCandidates) < len(expected.RequestCandidates)
+	candidatesOmitted := taskCandidatesOmitted || requestCandidatesOmitted ||
 		len(value.AggregationCandidates) < len(expected.AggregationCandidates)
 	if value.CandidateSetIncomplete != (expected.CandidateSetIncomplete || candidatesOmitted) {
 		return domain.NewError(domain.CodeConflict, "authorized route candidate completeness changed")
+	}
+	if value.TaskCandidateSetIncomplete != (expected.TaskCandidateSetIncomplete || taskCandidatesOmitted) ||
+		value.RequestCandidateSetIncomplete != (expected.RequestCandidateSetIncomplete || requestCandidatesOmitted) {
+		return domain.NewError(domain.CodeConflict, "authorized route candidate list completeness changed")
 	}
 	containsTask := func(items []app.ConversationRouteCandidate, id string) bool {
 		for _, item := range items {
@@ -255,6 +261,29 @@ WHERE message_id=$1 AND actor_id=$2 AND state='settled' AND attempt=$3
 		}
 		return false
 	}
+	containsActiveTaskControlEvidence := func(candidate app.ConversationRouteCandidate) bool {
+		for _, prior := range expected.RequestCandidates {
+			if prior.TaskID != candidate.TaskID || prior.TaskStatus != task.StatusRunning || !prior.SameControlScope || !prior.SameAuthorization ||
+				prior.RequestInput.ModelID != expected.CurrentRequestModelID || prior.RequestInput.TimeZone != expected.TimeZone {
+				continue
+			}
+			if containsRequest(value.RequestCandidates, prior.MessageID) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, candidate := range expected.Candidates {
+		if candidate.InitiatorID == expected.ActorID && candidate.Status == task.StatusRunning &&
+			!containsActiveTaskControlEvidence(candidate) {
+			for _, prior := range expected.RequestCandidates {
+				if prior.TaskID == candidate.TaskID && prior.TaskStatus == task.StatusRunning && prior.SameControlScope && prior.SameAuthorization &&
+					prior.RequestInput.ModelID == expected.CurrentRequestModelID && prior.RequestInput.TimeZone == expected.TimeZone {
+					return domain.NewError(domain.CodeConflict, "active Task control evidence was omitted")
+				}
+			}
+		}
+	}
 	if (containsTask(expected.Candidates, expected.ReferenceTaskID) && !containsTask(value.Candidates, expected.ReferenceTaskID)) ||
 		(containsTask(expected.Candidates, expected.PreviousTaskID) && !containsTask(value.Candidates, expected.PreviousTaskID)) ||
 		(containsRequest(expected.RequestCandidates, expected.PreviousMessageID) && !containsRequest(value.RequestCandidates, expected.PreviousMessageID)) {
@@ -264,6 +293,8 @@ WHERE message_id=$1 AND actor_id=$2 AND state='settled' AND attempt=$3
 	expected.RequestCandidates = value.RequestCandidates
 	expected.AggregationCandidates = value.AggregationCandidates
 	expected.CandidateSetIncomplete = value.CandidateSetIncomplete
+	expected.TaskCandidateSetIncomplete = value.TaskCandidateSetIncomplete
+	expected.RequestCandidateSetIncomplete = value.RequestCandidateSetIncomplete
 	expected.HistoryIncomplete = expected.HistoryIncomplete || value.HistoryIncomplete
 	if !conversationRouteHistoryProjectionMatches(expected.History, value.History, value.HistoryIncomplete) {
 		return domain.NewError(domain.CodeConflict, "authorized route history changed")

@@ -19,6 +19,25 @@ func validateTaskPrincipal(principal identity.Principal) error {
 	return nil
 }
 
+func validateTaskReadPrincipal(principal identity.Principal) error {
+	if err := validateTaskPrincipal(principal); err != nil {
+		return err
+	}
+	if !principal.HasScope(identity.ScopeTaskRead) {
+		return domain.NewError(domain.CodeForbidden, "task read scope is required")
+	}
+	return nil
+}
+
+func canReadInitiatedTask(principal identity.Principal, value task.Task) bool {
+	if (principal.Kind != identity.KindSession && principal.Kind != identity.KindClient) ||
+		!principal.HasScope(identity.ScopeTaskRead) ||
+		principal.UserID == "" || value.InitiatorID != principal.UserID {
+		return false
+	}
+	return true
+}
+
 func authorizeTaskHost(ctx context.Context, authorizer TaskAuthorizer, principal identity.Principal, hostID string, scope identity.Scope) (task.Authorization, error) {
 	if !domain.ValidHostID(hostID) {
 		return task.Authorization{}, domain.NewError(domain.CodeNotFound, "host not found")

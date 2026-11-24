@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router';
 
@@ -67,7 +67,7 @@ function sharedTestLocks(): LockManager {
 }
 
 import { PersonalData } from './PersonalData';
-import { PersonalDataStore } from './personal-data-store';
+import { PersonalDataStore, personalObjectKey } from './personal-data-store';
 import { PortalLayout } from '../components/PortalLayout';
 import { ToastProvider } from '../app/toast';
 
@@ -364,14 +364,15 @@ describe('PersonalData', () => {
     await user.click(screen.getByRole('link', { name: '记忆' }));
     const toggle = screen.getByRole('checkbox', { name: '允许 AI 使用个人记忆' });
     expect(toggle).toBeChecked();
-    expect(screen.getByText(/默认开启；关闭后/)).toBeInTheDocument();
+    expect(screen.getByText(/默认开启，仅用于个人对话；关闭后/)).toBeInTheDocument();
+    expect(screen.getByText(/候选只有经你明确确认后/)).toBeInTheDocument();
     await user.click(toggle);
     await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledWith(
       'skill_setting', 'builtin_memory', 0, { enabled: false }, expect.any(String), currentUser.id, 'service-personal-test',
     ));
     expect(toggle).toBeChecked();
     expect(toggle).toBeDisabled();
-    expect(screen.getByText('设置正在同步，服务端确认后生效。')).toBeInTheDocument();
+    expect(screen.getByText('同步中，服务端确认后生效。')).toBeInTheDocument();
     confirm({ result_revision: 1, account_change_sequence: 1 });
     await waitFor(() => expect(toggle).not.toBeChecked());
   });
@@ -393,6 +394,38 @@ describe('PersonalData', () => {
     expect(body).toEqual({ content: '喜欢先看结论，再看细节。', category: '沟通偏好' });
     expect(idempotencyKey).toEqual(expect.any(String));
     expect(apiMocks.submitTask).not.toHaveBeenCalled();
+  });
+
+  it('keeps rule candidates pending until explicit approval and binds them to the source memory revision', async () => {
+    const user = userEvent.setup();
+    apiMocks.snapshot.mockResolvedValue({
+      watermark: 4,
+      items: [{ object_type: 'memory', object_id: 'm_abcdef01', revision: 2, body: { content: '我喜欢先看结论。' } }],
+      next_cursor: null,
+    });
+    renderPage();
+    await screen.findByText(/保存后自动更新云端/);
+    await user.click(screen.getByRole('link', { name: '记忆' }));
+    await user.click(screen.getByRole('button', { name: '提议为规则' }));
+    expect(screen.getByText(/^来源内容：/)).toHaveTextContent('我喜欢先看结论。');
+    await user.click(screen.getByRole('button', { name: '保存为候选' }));
+
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledTimes(1));
+    const [type, id, , body] = apiMocks.replace.mock.calls[0] as [string, string, number, {
+      scope: string; status: string; source_memory_id: string; source_memory_revision: number;
+    }];
+    expect(type).toBe('rule_candidate');
+    expect(id).toMatch(/^r_[0-9a-f]{8}$/);
+    expect(body).toEqual({ scope: 'personal', status: 'candidate',
+      source_memory_id: 'm_abcdef01', source_memory_revision: 2 });
+    expect(await screen.findByText('待你审核')).toBeInTheDocument();
+    expect(apiMocks.submitTask).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: '确认并启用' }));
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledTimes(2));
+    const activation = apiMocks.replace.mock.calls[1];
+    expect(activation?.[0]).toBe('rule_candidate');
+    expect((activation?.[3] as { status: string } | undefined)?.status).toBe('active');
   });
 
   it('edits an existing memory with its current revision', async () => {
@@ -427,20 +460,23 @@ describe('PersonalData', () => {
     apiMocks.memoryHistory
       .mockResolvedValueOnce({ items: [
         { revision: 2, changed_at: '2026-11-10T12:00:00Z', body: { content: '当前偏好' }, restorable: true,
-          source_status: 'available', sources: [{ kind: 'mutation_receipt', id: 'receipt-current' }] },
+          source_status: 'available', sources: [{ kind: 'mutation_receipt', id: 'receipt-current' }], superseded_by_revision: null },
       ], next_cursor: 'history-next-001' })
       .mockResolvedValueOnce({ items: [
         { revision: 1, changed_at: '2026-11-09T12:00:00Z', body: { content: '历史偏好', category: '沟通' }, restorable: true,
-          source_status: 'available', sources: [{ kind: 'conversation_message', id: 'm_source01', conversation_id: 'c_source01' }] },
+          source_status: 'available', sources: [{ kind: 'conversation_message', id: 'm_source01', conversation_id: 'c_source01' }], superseded_by_revision: 2 },
       ], next_cursor: null });
     renderPage();
     await screen.findByText(/保存后自动更新云端/);
     await user.click(screen.getByRole('link', { name: '记忆' }));
     await user.click(screen.getByRole('button', { name: '历史版本' }));
 
+    expect(await screen.findByText('已读取 1 个历史版本。')).toBeInTheDocument();
     expect(await screen.findByText('当前偏好', { selector: '.memory-history-revision p' })).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '加载更多历史' }));
+    expect(await screen.findByText('已读取 2 个历史版本。')).toBeInTheDocument();
     expect(await screen.findByText('历史偏好')).toBeInTheDocument();
+    expect(screen.getByText('已由第 2 版替代')).toBeInTheDocument();
     expect(screen.getByText(/会话消息 m_source01/)).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '恢复此版本' }));
     await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledWith(
@@ -448,6 +484,68 @@ describe('PersonalData', () => {
     ));
     expect(apiMocks.memoryHistory).toHaveBeenNthCalledWith(1, 'm_history01', undefined, 25);
     expect(apiMocks.memoryHistory).toHaveBeenNthCalledWith(2, 'm_history01', 'history-next-001', 25);
+  });
+
+  it('keeps an open history read when a memory save is acknowledged', async () => {
+    const user = userEvent.setup();
+    const memoryID = 'm_history_save_race';
+    apiMocks.snapshot.mockResolvedValue({
+      watermark: 4,
+      items: [{ object_type: 'memory', object_id: memoryID, revision: 1, body: { content: '旧记忆' } }],
+      next_cursor: null,
+    });
+    let finishReplace!: (value: { result_revision: number; account_change_sequence: number }) => void;
+    apiMocks.replace.mockImplementationOnce(() => new Promise((resolve) => { finishReplace = resolve; }));
+    let finishHistory!: (value: { items: Array<Record<string, unknown>>; next_cursor: null }) => void;
+    apiMocks.memoryHistory.mockImplementationOnce(() => new Promise((resolve) => { finishHistory = resolve; }));
+
+    renderPage();
+    await screen.findByText(/保存后自动更新云端/);
+    await user.click(screen.getByRole('link', { name: '记忆' }));
+    await user.clear(screen.getByLabelText('记忆内容'));
+    await user.type(screen.getByLabelText('记忆内容'), '新记忆');
+    await user.click(screen.getByRole('button', { name: '保存修改' }));
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalled());
+
+    await user.click(screen.getByRole('button', { name: '历史版本' }));
+    await waitFor(() => expect(apiMocks.memoryHistory).toHaveBeenCalledWith(memoryID, undefined, 25));
+    expect(screen.getByRole('button', { name: '历史版本' })).toHaveAttribute('aria-expanded', 'true');
+
+    await act(async () => finishReplace({ result_revision: 2, account_change_sequence: 5 }));
+    const localStore = new PersonalDataStore(currentUser.id, window.location.origin, undefined, 'service-personal-test');
+    await waitFor(async () => expect((await localStore.read()).objects[personalObjectKey('memory', memoryID)]?.revision).toBe(2));
+    expect(screen.getByRole('button', { name: '历史版本' })).toHaveAttribute('aria-expanded', 'true');
+
+    await act(async () => finishHistory({
+      items: [
+        { revision: 2, changed_at: '2026-11-24T00:00:00Z', body: { content: '新记忆' }, restorable: false,
+          source_status: 'available', sources: [], superseded_by_revision: null },
+        { revision: 1, changed_at: '2026-11-23T00:00:00Z', body: { content: '旧记忆' }, restorable: true,
+          source_status: 'available', sources: [], superseded_by_revision: 2 },
+      ],
+      next_cursor: null,
+    }));
+    expect(await screen.findByText('已读取 2 个历史版本。')).toBeInTheDocument();
+    expect(screen.getByText('旧记忆', { selector: '.memory-history-revision p' })).toBeInTheDocument();
+  });
+
+  it('keeps a transient history read failure visible with an inline retry', async () => {
+    const user = userEvent.setup();
+    apiMocks.snapshot.mockResolvedValue({
+      watermark: 4,
+      items: [{ object_type: 'memory', object_id: 'm_history_network', revision: 1, body: { content: '当前记忆' } }],
+      next_cursor: null,
+    });
+    apiMocks.memoryHistory.mockRejectedValue(new TypeError('Failed to fetch'));
+    renderPage();
+    await screen.findByText(/保存后自动更新云端/);
+    await user.click(screen.getByRole('link', { name: '记忆' }));
+    await user.click(screen.getByRole('button', { name: '历史版本' }));
+
+    expect(await screen.findByText(/历史读取失败：网络异常/, { selector: 'p.error-inline' })).toHaveTextContent(
+      '历史读取失败：网络异常，记忆历史暂时无法读取。',
+    );
+    expect(screen.getByRole('button', { name: '重试' })).toBeEnabled();
   });
 
   it('hides unavailable or unrecorded history bodies and never offers restoration without provenance', async () => {
@@ -459,9 +557,9 @@ describe('PersonalData', () => {
     });
     apiMocks.memoryHistory.mockResolvedValue({ items: [
       { revision: 2, changed_at: '2026-11-10T12:00:00Z', body: null, restorable: false,
-        source_status: 'unrecorded', sources: [] },
+        source_status: 'unrecorded', sources: [], superseded_by_revision: null },
       { revision: 1, changed_at: '2026-11-09T12:00:00Z', body: null, restorable: false,
-        source_status: 'unavailable', sources: [] },
+        source_status: 'unavailable', sources: [], superseded_by_revision: null },
     ], next_cursor: null });
     renderPage();
     await screen.findByText(/保存后自动更新云端/);

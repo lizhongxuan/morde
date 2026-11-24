@@ -252,6 +252,9 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 		if err != nil {
 			t.Fatal(err)
 		}
+		activity.testUserName = owner.Name
+		activity.executionControl = execution
+		activity.ownerPrincipal = principal
 		if retryRun := activity.runs["mcp-retry"]; retryRun != nil {
 			retryHost := createRunningControlHost(t, ctx, store, owner.ID, domainhost.ControlAI, 0)
 			runtimeInstanceID := "browser-m09-retry-" + retryHost.ID
@@ -262,6 +265,18 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 				t.Fatalf("seed local MCP retry Host Runtime heartbeat: %v", err)
 			}
 			retryRun.retryHostID = retryHost.ID
+		}
+		if revokeRun := activity.runs["approval-host-member-revoked"]; revokeRun != nil {
+			hostOwner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+			revokeHost := createRunningControlHost(t, ctx, store, hostOwner.ID, domainhost.ControlAI, 0)
+			if _, err := store.UpsertHostMember(ctx, domainhost.Member{
+				HostID: revokeHost.ID, OwnerID: hostOwner.ID, UserID: owner.ID,
+				Permissions: []domainhost.Permission{domainhost.PermissionDesktopControl},
+			}); err != nil {
+				t.Fatalf("grant local approval Task Host control: %v", err)
+			}
+			revokeRun.revocationHostID = revokeHost.ID
+			revokeRun.revocationHostOwnerID = hostOwner.ID
 		}
 		executor = activity
 	}
@@ -341,7 +356,17 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 			<-retryHostHeartbeatDone
 		}
 	})
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listenAddress := os.Getenv("MORDE_BROWSER_ACCEPTANCE_LISTEN_ADDR")
+	if listenAddress == "" {
+		listenAddress = "127.0.0.1:0"
+	} else {
+		host, _, splitErr := net.SplitHostPort(listenAddress)
+		ip := net.ParseIP(host)
+		if splitErr != nil || ip == nil || !ip.IsLoopback() {
+			t.Fatalf("browser fixture listen address must use a loopback IP, got %q", listenAddress)
+		}
+	}
+	listener, err := net.Listen("tcp", listenAddress)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -374,6 +399,7 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 	if err != nil {
 		t.Fatal(err)
 	}
+	stop := filepath.Join(t.TempDir(), "finish")
 	// The production capability remains disabled until all acceptance checks
 	// pass. This disposable fixture advertises it only to exercise the UI.
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -489,10 +515,20 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 		}
 		if activity != nil && strings.HasPrefix(r.URL.Path, "/__morde_fixture/") {
 			activity.serveControl(w, r)
+			if shouldAutoStopBrowserAcceptance(os.Getenv("MORDE_BROWSER_ACCEPTANCE_AUTO_STOP"), r.URL.Path, activity) {
+				if err := os.WriteFile(stop, []byte("verified"), 0o600); err != nil {
+					t.Errorf("signal completed browser acceptance: %v", err)
+				}
+			}
 			return
 		}
 		if activity != nil && strings.HasPrefix(r.URL.Path, "/api/tasks/") && strings.HasSuffix(r.URL.Path, "/events") {
 			activity.serveTaskEvents(w, r, router)
+			return
+		}
+		if activity != nil && activity.runs["interrupted"] != nil && r.Method == http.MethodPost &&
+			strings.HasPrefix(r.URL.Path, "/api/tasks/") && strings.HasSuffix(r.URL.Path, "/actions") {
+			activity.serveTaskAction(w, r, router)
 			return
 		}
 		if activity != nil && activity.runs["mcp-retry"] != nil && r.Method == http.MethodPost &&
@@ -524,6 +560,10 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 		}
 		if activity != nil && r.Method == http.MethodGet && r.URL.Path == "/api/conversations/"+activity.conversationID+"/tasks" {
 			activity.serveConversationTasks(w, r, router)
+			return
+		}
+		if activity != nil && r.Method == http.MethodGet && r.URL.Path == "/api/conversations/"+activity.conversationID+"/messages" {
+			activity.serveMessageSnapshot(w, r, router)
 			return
 		}
 		if r.URL.Path == "/api/auth/client-login" {
@@ -569,7 +609,6 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 			t.Errorf("stop browser fixture: %v", err)
 		}
 	})
-	stop := filepath.Join(t.TempDir(), "finish")
 	t.Logf("LOCAL_PORTAL=http://%s TEST_USER=%s MAIN_CONVERSATION=%s STOP_FILE=%s", listener.Addr().String(), owner.Name, mainConversation.ConversationID, stop)
 	if projectAttachmentResume != nil {
 		t.Logf("PROJECT_ID=%s PROJECT_CONVERSATION_ID=%s", projectAttachmentResume.projectID, projectAttachmentResume.conversationID)
@@ -610,7 +649,8 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 				if activity != nil {
 					minimumReplies = 0
 					for _, scenario := range activity.required {
-						if scenario != "failed" && scenario != "approval" && scenario != "mcp-retry" && scenario != "target-control" {
+						if scenario != "failed" && scenario != "approval" && scenario != "approval-revoked" && scenario != "approval-host-member-revoked" && scenario != "mcp-retry" &&
+							scenario != "recovery-unknown" && scenario != "target-control" {
 							minimumReplies = 1
 							break
 						}
@@ -1374,6 +1414,25 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 				PriorRequests []app.ConversationRouteRequestCandidate `json:"prior_requests"`
 			}
 			if json.Unmarshal([]byte(request.Input[0].Text), &input) == nil {
+				if input.Message == browserActivityCompletionRaceSteer {
+					for _, candidate := range input.Tasks {
+						if candidate.Objective != browserActivityObjectives["completion-race"] || candidate.Status != task.StatusRunning {
+							continue
+						}
+						body, err := json.Marshal(map[string]string{"action": "steer", "task_id": candidate.TaskID})
+						if err != nil {
+							return app.ModelResponse{}, err
+						}
+						return app.ModelResponse{Text: string(body), StopReason: "stop",
+							Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+					}
+					return app.ModelResponse{Text: `{"action":"clarify","question":"无法确认要补充到哪个运行中的任务。"}`, StopReason: "stop",
+						Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+				}
+				if input.Message == browserActivityCompletionRaceIndependent {
+					return app.ModelResponse{Text: `{"action":"new","task_id":"","explicit_new":false,"acknowledge":true}`, StopReason: "stop",
+						Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
+				}
 				if input.Message == browserActivityObjectives["route-retry"] && model.routeRetry != nil {
 					if model.routeRetry.failFirstRouteCall() {
 						return app.ModelResponse{}, &app.ModelClientError{Kind: app.ModelErrorRateLimited,
@@ -1580,10 +1639,13 @@ AND message.delivery_status='applied' AND route.state='routed'`, ownerID, conver
 // written to a mode-0600 file inside the test's temporary directory.
 // No file or user-provided content is needed by any of these scenarios.
 // With MORDE_BROWSER_ACTIVITY=1, GET /__morde_fixture/status lists the fixed
-// inputs and stages. POST /__morde_fixture/advance/{name}/{start|progress|
-// stream|complete|fail|approval} releases one stage, without a request body.
+// inputs and stages. A selected scenario exposes a loopback-only bootstrap at
+// GET /__morde_fixture/bootstrap/{scenario} for native UI tests.
+// MORDE_BROWSER_ACCEPTANCE_LISTEN_ADDR may select a fixed loopback port; absent
+// it, the fixture binds a random loopback port. POST /__morde_fixture/advance/{name}/{start|progress|
+// stream|complete|candidate|commit|fail|approval|clarification|unknown|retry-success} releases one stage, without a request body.
 // The search scenario uses a fixed local result and never accesses the network.
-// MORDE_BROWSER_ACTIVITY_SCENARIOS=search,failed,approval,target-control selects individual
+// MORDE_BROWSER_ACTIVITY_SCENARIOS=search,queued,failed,approval,approval-resume,approval-host-member-revoked,clarification,recovery-unknown,completion-race,target-control selects individual
 // scenarios; omit it to require the full merge, separate, search, stream and
 // reconnect set. target-control waits for two similar independent Tasks, then
 // verifies that stopping B leaves A running. For a full run, merge-a and merge-b must complete within the
@@ -1591,30 +1653,53 @@ AND message.delivery_status='applied' AND route.state='routed'`, ownerID, conver
 // than maxConversationResultWindow apart. Start stream before submitting
 // stream-other, then disconnect both clients using
 // POST /__morde_fixture/disconnect/stream before completing the pair.
+// MORDE_BROWSER_ACCEPTANCE_AUTO_STOP=1 lets the fixture stop itself after all
+// selected activity scenarios have passed their verify endpoints.
 // GET /__morde_fixture/verify/{merge|separate|reconnect|search|stream|failed|
-// approval|target-control} checks result identity and ordering, reconnect cursors, or the
+// approval|approval-resume|approval-revoked|approval-host-member-revoked|clarification|recovery-unknown|completion-race|interrupted|mcp-retry|route-retry|target-control} checks result identity and ordering, reconnect cursors, or the
 // persisted accepted route and requested Task outcome. The fixture does not
 // pass until all selected checks succeed; visual deduplication still needs to
-// be checked in both clients after refresh/relaunch.
+// be checked in both clients after refresh/relaunch. MORDE_BROWSER_ACTIVITY_CROSS_CLIENT=1
+// requires matching PC and iOS Task reads for recovery-unknown; =approval
+// requires matching reads for the approval-waiting scenario; =approval-revoked
+// requires both clients to read the same authorization-fenced approval Task;
+// =approval-host-member-revoked requires both clients to read the same Task
+// after its shared Host member grant is revoked;
+// =approval-resume
+// requires matching completed Task reads after an approval; =interrupted
+// requires both clients to read the same persisted interrupted assistant message.
 var browserActivityObjectives = map[string]string{
-	"merge-a":          "跨端活动验收：合并 A",
-	"merge-b":          "跨端活动验收：合并 B",
-	"search":           "在本地示例索引中搜索 Morde 消息路由",
-	"separate-a":       "跨端活动验收：分开 A",
-	"separate-b":       "跨端活动验收：分开 B",
-	"stream":           "跨端活动验收：流式",
-	"stream-other":     "跨端活动验收：流式后的独立任务",
-	"failed":           "跨端活动验收：已接单后任务失败",
-	"approval":         "跨端活动验收：等待用户授权",
-	"mcp-retry":        "跨端活动验收：连接器限流后手动重试",
-	"route-retry":      "跨端活动验收：消息路由限流后显式重试",
-	"target-control-a": "跨端活动验收：整理项目总结 A",
-	"target-control-b": "跨端活动验收：整理项目总结 B",
+	"merge-a":                      "跨端活动验收：合并 A",
+	"merge-b":                      "跨端活动验收：合并 B",
+	"search":                       "在本地示例索引中搜索 Morde 消息路由",
+	"separate-a":                   "跨端活动验收：分开 A",
+	"separate-b":                   "跨端活动验收：分开 B",
+	"stream":                       "跨端活动验收：流式",
+	"stream-other":                 "跨端活动验收：流式后的独立任务",
+	"queued":                       "跨端活动验收：排队状态确认",
+	"failed":                       "跨端活动验收：已接单后任务失败",
+	"approval":                     "跨端活动验收：等待用户授权",
+	"approval-resume":              "跨端活动验收：批准后继续任务",
+	"approval-revoked":             "跨端活动验收：审批等待期间撤销执行授权",
+	"approval-host-member-revoked": "跨端活动验收：审批等待期间撤销共享 Host 授权",
+	"clarification":                "跨端活动验收：需要补充信息",
+	"recovery-unknown":             "跨端活动验收：恢复检查点无法确认",
+	"completion-race":              "跨端活动验收：完成结果竞争",
+	"interrupted":                  "跨端活动验收：取消流式回复",
+	"mcp-retry":                    "跨端活动验收：连接器限流后手动重试",
+	"route-retry":                  "跨端活动验收：消息路由限流后显式重试",
+	"target-control-a":             "跨端活动验收：整理项目总结 A",
+	"target-control-b":             "跨端活动验收：整理项目总结 B",
 }
 
 const browserActivityStreamPrefix = "跨端活动验收：流式回复第一段"
 const browserActivityStreamSuffix = "，第二段完成。"
 const browserActivitySearchResult = "本地搜索结果：Morde 消息路由先持久接收消息，再异步分流。"
+const browserActivityClarificationAnswer = "保存到 ./reports"
+const browserActivityApprovalResumeResult = "审批已批准，任务已从同一等待点继续完成；未执行外部副作用。"
+const browserActivityCompletionRaceSteer = "本地验收：最终结果补充为 BLUE。"
+const browserActivityCompletionRaceIndependent = "独立核对另一项 YELLOW 事项。"
+const browserActivityCompletionRaceResult = "已按补充要求完成，最终标记为 BLUE。"
 
 func browserActivityProgressTitle(run *browserActivityRun) string {
 	if run.name == "search" {
@@ -1651,10 +1736,22 @@ type browserActivityCommand struct {
 type browserActivityRun struct {
 	name, objective, stage, failure                     string
 	retryHostID                                         string
+	revocationHostID, revocationHostOwnerID             string
 	current                                             task.Task
 	agentLease                                          app.AgentInstanceLease
 	supervisorNonce                                     []byte
 	userMessageID, progressStepID, mcpRetrySourceStepID string
+	mcpRetryCallID                                      string
+	mcpRetryDispatchCount                               int
+	clarificationAnswer                                 string
+	approvalID, approvalCallID                          string
+	approvalVersion                                     int64
+	approvalRequestHash                                 []byte
+	approvalResumeCount                                 int
+	completionCandidate                                 string
+	completionSteerMessageID                            string
+	completionRejected                                  bool
+	stopStatus                                          string
 	streamMessageID, streamTurnID                       string
 	streamSequence                                      int64
 	resultEventSequence                                 int64
@@ -1662,6 +1759,9 @@ type browserActivityRun struct {
 	commands                                            chan browserActivityCommand
 	dropIndex                                           int
 	dropCursors                                         map[string]int64
+	checkpointFence                                     app.AgentCheckpointFence
+	checkpointThrough                                   int64
+	checkpointDigest                                    []byte
 }
 
 type browserActivityEventRequest struct {
@@ -1679,9 +1779,21 @@ type browserActivityTaskListRequest struct {
 }
 
 type browserActivityTaskSnapshotRequest struct {
-	Client     string `json:"client"`
-	TaskID     string `json:"task_id"`
-	StatusCode int    `json:"status_code"`
+	Client        string `json:"client"`
+	TaskID        string `json:"task_id"`
+	StatusCode    int    `json:"status_code"`
+	Status        string `json:"status,omitempty"`
+	WaitingReason string `json:"waiting_reason,omitempty"`
+}
+
+type browserActivityMessageSnapshotRequest struct {
+	Client       string `json:"client"`
+	TaskID       string `json:"task_id"`
+	MessageID    string `json:"message_id"`
+	StatusCode   int    `json:"status_code"`
+	Role         string `json:"role,omitempty"`
+	Content      string `json:"content,omitempty"`
+	OutputStatus string `json:"output_status,omitempty"`
 }
 
 type browserActivityWatch struct {
@@ -1691,21 +1803,30 @@ type browserActivityWatch struct {
 }
 
 type browserAcceptanceActivity struct {
-	store            *Store
-	instances        *app.AgentInstanceService
-	checkpoints      *app.AgentCheckpointService
-	conversationID   string
-	controlToken     string
-	supervisorKey    []byte
-	required         []string
-	mu               sync.Mutex
-	runs             map[string]*browserActivityRun
-	verified         map[string]bool
-	watches          map[uint64]browserActivityWatch
-	requests         []browserActivityEventRequest
-	taskListRequests []browserActivityTaskListRequest
-	taskSnapshots    []browserActivityTaskSnapshotRequest
-	nextWatch        uint64
+	store                     *Store
+	executionControl          *app.ExecutionControlService
+	ownerPrincipal            identity.Principal
+	instances                 *app.AgentInstanceService
+	checkpoints               *app.AgentCheckpointService
+	conversationID            string
+	testUserName              string
+	controlToken              string
+	supervisorKey             []byte
+	required                  []string
+	mu                        sync.Mutex
+	runs                      map[string]*browserActivityRun
+	verified                  map[string]bool
+	validationPreviewInjected bool
+	watches                   map[uint64]browserActivityWatch
+	requests                  []browserActivityEventRequest
+	taskListRequests          []browserActivityTaskListRequest
+	taskSnapshots             []browserActivityTaskSnapshotRequest
+	messageSnapshots          []browserActivityMessageSnapshotRequest
+	nextWatch                 uint64
+}
+
+func shouldAutoStopBrowserAcceptance(enabled, path string, activity *browserAcceptanceActivity) bool {
+	return enabled == "1" && activity != nil && strings.HasPrefix(path, "/__morde_fixture/verify/") && activity.assertVerified() == nil
 }
 
 type browserAcceptanceHosts struct {
@@ -1759,15 +1880,23 @@ func browserActivitySelection(raw string) ([]string, []string, error) {
 	}
 
 	groups := map[string][]string{
-		"merge":          {"merge-a", "merge-b"},
-		"separate":       {"separate-a", "separate-b"},
-		"search":         {"search"},
-		"stream":         {"stream", "stream-other"},
-		"failed":         {"failed"},
-		"approval":       {"approval"},
-		"mcp-retry":      {"mcp-retry"},
-		"route-retry":    {"route-retry"},
-		"target-control": {"target-control-a", "target-control-b"},
+		"merge":                        {"merge-a", "merge-b"},
+		"separate":                     {"separate-a", "separate-b"},
+		"search":                       {"search"},
+		"stream":                       {"stream", "stream-other"},
+		"queued":                       {"queued"},
+		"failed":                       {"failed"},
+		"approval":                     {"approval"},
+		"approval-resume":              {"approval-resume"},
+		"approval-revoked":             {"approval-revoked"},
+		"approval-host-member-revoked": {"approval-host-member-revoked"},
+		"clarification":                {"clarification"},
+		"recovery-unknown":             {"recovery-unknown"},
+		"completion-race":              {"completion-race"},
+		"interrupted":                  {"interrupted"},
+		"mcp-retry":                    {"mcp-retry"},
+		"route-retry":                  {"route-retry"},
+		"target-control":               {"target-control-a", "target-control-b"},
 	}
 	var selected, required []string
 	seen := make(map[string]bool)
@@ -1799,11 +1928,20 @@ func TestBrowserActivitySelection(t *testing.T) {
 			required: "merge,separate,search,stream,reconnect"},
 		{name: "search only", input: "search", selected: "search", required: "search"},
 		{name: "stream includes reconnect", input: "stream", selected: "stream,stream-other", required: "stream,reconnect"},
+		{name: "queued only", input: "queued", selected: "queued", required: "queued"},
 		{name: "failed only", input: "failed", selected: "failed", required: "failed"},
 		{name: "approval only", input: "approval", selected: "approval", required: "approval"},
+		{name: "approval resume only", input: "approval-resume", selected: "approval-resume", required: "approval-resume"},
+		{name: "approval authorization revocation only", input: "approval-revoked", selected: "approval-revoked", required: "approval-revoked"},
+		{name: "shared Host member grant revocation only", input: "approval-host-member-revoked", selected: "approval-host-member-revoked", required: "approval-host-member-revoked"},
+		{name: "clarification only", input: "clarification", selected: "clarification", required: "clarification"},
+		{name: "recovery unknown only", input: "recovery-unknown", selected: "recovery-unknown", required: "recovery-unknown"},
+		{name: "completion race only", input: "completion-race", selected: "completion-race", required: "completion-race"},
+		{name: "interrupted only", input: "interrupted", selected: "interrupted", required: "interrupted"},
 		{name: "MCP rate-limit retry only", input: "mcp-retry", selected: "mcp-retry", required: "mcp-retry"},
 		{name: "message route retry only", input: "route-retry", selected: "route-retry", required: "route-retry"},
 		{name: "failed and approval", input: "failed,approval", selected: "failed,approval", required: "failed,approval"},
+		{name: "approval and clarification", input: "approval,clarification", selected: "approval,clarification", required: "approval,clarification"},
 		{name: "target control starts two running tasks", input: "target-control",
 			selected: "target-control-a,target-control-b", required: "target-control"},
 		{name: "combined logical scenarios", input: "search, merge", selected: "search,merge-a,merge-b", required: "search,merge"},
@@ -1829,20 +1967,87 @@ func TestBrowserActivitySelection(t *testing.T) {
 	}
 }
 
+func TestBrowserAcceptanceAutoStopRequiresAllVerifiedScenarios(t *testing.T) {
+	activity := &browserAcceptanceActivity{required: []string{"approval-host-member-revoked"},
+		verified: map[string]bool{"approval-host-member-revoked": true}}
+	if !shouldAutoStopBrowserAcceptance("1", "/__morde_fixture/verify/approval-host-member-revoked", activity) {
+		t.Fatal("auto-stop should follow successful verification of all selected scenarios")
+	}
+	if shouldAutoStopBrowserAcceptance("1", "/__morde_fixture/verify/approval-host-member-revoked", nil) {
+		t.Fatal("auto-stop should require an activity fixture")
+	}
+	if shouldAutoStopBrowserAcceptance("1", "/__morde_fixture/advance/approval-host-member-revoked/approval", activity) {
+		t.Fatal("auto-stop should not follow an advance request")
+	}
+	activity.verified["approval-host-member-revoked"] = false
+	if shouldAutoStopBrowserAcceptance("1", "/__morde_fixture/verify/approval-host-member-revoked", activity) {
+		t.Fatal("auto-stop should wait until verification succeeds")
+	}
+	activity.verified["approval-host-member-revoked"] = true
+	if shouldAutoStopBrowserAcceptance("0", "/__morde_fixture/verify/approval-host-member-revoked", activity) {
+		t.Fatal("auto-stop should remain opt-in")
+	}
+}
+
+func TestBrowserActivityCrossClientScenario(t *testing.T) {
+	for _, test := range []struct {
+		value string
+		want  string
+	}{
+		{value: "", want: ""},
+		{value: "1", want: "recovery-unknown"},
+		{value: "recovery-unknown", want: "recovery-unknown"},
+		{value: "approval", want: "approval"},
+		{value: "approval-resume", want: "approval-resume"},
+		{value: "approval-revoked", want: "approval-revoked"},
+		{value: "approval-host-member-revoked", want: "approval-host-member-revoked"},
+		{value: "interrupted", want: "interrupted"},
+		{value: " unsupported ", want: ""},
+	} {
+		t.Run(test.value, func(t *testing.T) {
+			t.Setenv("MORDE_BROWSER_ACTIVITY_CROSS_CLIENT", test.value)
+			if got := browserActivityCrossClientScenario(); got != test.want {
+				t.Fatalf("browserActivityCrossClientScenario() = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
 func TestBrowserActivityOutcomeVerifyEndpoint(t *testing.T) {
-	for _, scenario := range []string{"failed", "approval"} {
+	for _, scenario := range []string{"failed", "approval", "approval-resume", "approval-revoked", "approval-host-member-revoked", "clarification", "recovery-unknown", "completion-race", "interrupted", "mcp-retry"} {
 		t.Run(scenario, func(t *testing.T) {
+			stage := "progress"
+			if scenario == "mcp-retry" {
+				stage = "retry_claimed"
+			}
 			activity := &browserAcceptanceActivity{controlToken: "fixture-token", runs: map[string]*browserActivityRun{
-				scenario: {name: scenario, stage: "progress"},
+				scenario: {name: scenario, stage: stage},
 			}}
 			request := httptest.NewRequest(http.MethodGet, "/__morde_fixture/verify/"+scenario, nil)
 			request.Header.Set("X-Morde-Fixture-Token", activity.controlToken)
 			response := httptest.NewRecorder()
 			activity.serveControl(response, request)
-			if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "has not reached") {
+			wantError := "has not reached"
+			if scenario == "approval-revoked" || scenario == "approval-host-member-revoked" {
+				wantError = "authorization revocation is incomplete"
+			}
+			if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), wantError) {
 				t.Fatalf("verify endpoint status=%d body=%q", response.Code, response.Body.String())
 			}
 		})
+	}
+}
+
+func TestBrowserActivityInterruptedVerifyEndpoint(t *testing.T) {
+	activity := &browserAcceptanceActivity{controlToken: "fixture-token", runs: map[string]*browserActivityRun{
+		"interrupted": {name: "interrupted", stage: "streaming"},
+	}}
+	request := httptest.NewRequest(http.MethodGet, "/__morde_fixture/verify/interrupted", nil)
+	request.Header.Set("X-Morde-Fixture-Token", activity.controlToken)
+	response := httptest.NewRecorder()
+	activity.serveControl(response, request)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "has not reached the cancelled stage") {
+		t.Fatalf("verify endpoint status=%d body=%q", response.Code, response.Body.String())
 	}
 }
 
@@ -1878,11 +2083,72 @@ func (a *browserAcceptanceActivity) ExecuteTask(ctx context.Context, current tas
 		a.mu.Unlock()
 		return (browserAcceptanceExecutor{store: a.store}).ExecuteTask(ctx, current)
 	}
-	if run.stage == "failed" && current.StepRetry != nil {
-		run.current, run.stage = current, "retry_claimed"
+	if run.name == "mcp-retry" && current.StepRetry != nil {
+		if run.stage != "failed" {
+			a.mu.Unlock()
+			return errors.New("MCP retry fixture received an unexpected retry execution")
+		}
+		run.current, run.stage = current, "retry_starting"
 		a.mu.Unlock()
-		<-ctx.Done()
-		return ctx.Err()
+		lease, retriedTask, err := a.startMCPRetryExecution(ctx, current)
+		if err != nil {
+			a.failRun(run, err)
+			return err
+		}
+		a.mu.Lock()
+		run.current = retriedTask
+		run.mcpRetryCallID = current.StepRetry.RetryCallID
+		run.stage = "retry_claimed"
+		a.mu.Unlock()
+		renewContext, cancelRenew := context.WithCancel(ctx)
+		defer cancelRenew()
+		renewErr := make(chan error, 1)
+		renewDone := make(chan struct{})
+		defer func() { <-renewDone }()
+		go func() {
+			defer close(renewDone)
+			ticker := time.NewTicker(8 * time.Second)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-renewContext.Done():
+					return
+				case <-ticker.C:
+					if _, err := a.instances.Renew(renewContext, lease.Fence, app.MaxAgentLease); err != nil {
+						select {
+						case renewErr <- err:
+						default:
+						}
+						return
+					}
+				}
+			}
+		}()
+		return a.waitPhase(ctx, run, "retry-success", "retry_succeeded", renewErr, func() error {
+			return a.commitMCPRetrySuccessOutcome(ctx, run, lease)
+		})
+	}
+	if run.name == "clarification" && run.stage == "waiting_user" && run.current.ID == current.ID {
+		run.current, run.stage = current, "clarification_resuming"
+		a.mu.Unlock()
+		if err := a.commitClarificationContinuation(ctx, run); err != nil {
+			a.mu.Lock()
+			run.stage, run.failure = "failed", err.Error()
+			a.mu.Unlock()
+			return err
+		}
+		return nil
+	}
+	if run.name == "approval-resume" && run.stage == "waiting_user" && run.current.ID == current.ID {
+		run.current, run.stage = current, "approval_resuming"
+		a.mu.Unlock()
+		if err := a.commitApprovalContinuation(ctx, run); err != nil {
+			a.mu.Lock()
+			run.stage, run.failure = "failed", err.Error()
+			a.mu.Unlock()
+			return err
+		}
+		return nil
 	}
 	if run.stage != "awaiting_message" || current.ConversationID != a.conversationID {
 		a.mu.Unlock()
@@ -1953,9 +2219,19 @@ func (a *browserAcceptanceActivity) ExecuteTask(ctx context.Context, current tas
 			return a.commitFailedOutcome(ctx, run)
 		})
 	}
-	if run.name == "approval" {
+	if run.name == "approval" || run.name == "approval-resume" || run.name == "approval-revoked" || run.name == "approval-host-member-revoked" {
 		return a.waitPhase(ctx, run, "approval", "waiting_user", renewErr, func() error {
 			return a.commitApprovalOutcome(ctx, run, lease)
+		})
+	}
+	if run.name == "clarification" {
+		return a.waitPhase(ctx, run, "clarification", "waiting_user", renewErr, func() error {
+			return a.commitClarificationOutcome(ctx, run)
+		})
+	}
+	if run.name == "recovery-unknown" {
+		return a.waitPhase(ctx, run, "unknown", "waiting_user", renewErr, func() error {
+			return a.commitRecoveryUnknownOutcome(ctx, run)
 		})
 	}
 	if run.name == "mcp-retry" {
@@ -1964,7 +2240,7 @@ func (a *browserAcceptanceActivity) ExecuteTask(ctx context.Context, current tas
 		})
 	}
 	var delta app.CloudDSHTextDelta
-	if run.name == "stream" {
+	if run.name == "stream" || run.name == "interrupted" {
 		if err := a.waitPhase(ctx, run, "stream", "streaming", renewErr, func() error {
 			var err error
 			delta, err = a.startStream(ctx, run, lease)
@@ -1972,10 +2248,252 @@ func (a *browserAcceptanceActivity) ExecuteTask(ctx context.Context, current tas
 		}); err != nil {
 			return err
 		}
+		if run.name == "interrupted" {
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	}
+	if run.name == "completion-race" {
+		if err := a.waitPhase(ctx, run, "candidate", "completion_candidate", renewErr, func() error {
+			a.mu.Lock()
+			run.completionCandidate = "STALE COMPLETION RESULT"
+			a.mu.Unlock()
+			return nil
+		}); err != nil {
+			return err
+		}
+		return a.waitPhase(ctx, run, "commit", "completed", renewErr, func() error {
+			return a.completeAfterSteer(ctx, run)
+		})
 	}
 	return a.waitPhase(ctx, run, "complete", "completed", renewErr, func() error {
 		return a.complete(ctx, run, delta)
 	})
+}
+
+func (a *browserAcceptanceActivity) commitClarificationContinuation(ctx context.Context, run *browserActivityRun) error {
+	current := run.current
+	details, err := a.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return fmt.Errorf("read resumed clarification Task: %w", err)
+	}
+	if details.Task.Status != task.StatusRunning || len(details.ClarificationRequests) != 1 {
+		return errors.New("clarification continuation requires a running Task and one answered request")
+	}
+	request := details.ClarificationRequests[0]
+	if request.Status != task.ClarificationAnswered || request.Answer != browserActivityClarificationAnswer {
+		return errors.New("clarification continuation did not receive the expected persisted answer")
+	}
+	var lastSequence int64
+	for _, step := range details.Steps {
+		if step.Sequence > lastSequence {
+			lastSequence = step.Sequence
+		}
+	}
+	progressStepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	resultStepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	progress := task.Step{ID: progressStepID, TaskID: current.ID, Sequence: lastSequence + 1, Kind: "progress",
+		Status: task.StepSucceeded, Title: "收到补充信息", Summary: "已记录你提供的报告目录，继续完成本地合成任务。"}
+	result := "已收到补充信息：报告目录为 " + request.Answer + "。本地合成任务已继续完成；未创建文件。"
+	resultStep := task.Step{ID: resultStepID, TaskID: current.ID, Sequence: lastSequence + 2, Kind: "result",
+		Status: task.StepSucceeded, Title: "处理完成", Summary: "本地合成任务已根据补充信息完成。"}
+	payload, err := json.Marshal(map[string]any{"result": result, "step_id": resultStep.ID, "status": string(task.StepSucceeded)})
+	if err != nil {
+		return fmt.Errorf("encode resumed clarification result: %w", err)
+	}
+	event, err := a.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: current.ID, LeaseOwner: current.Lease.Owner,
+		LeaseVersion: current.Lease.Version, Status: task.StatusCompleted, CurrentStep: resultStep.ID, Result: result,
+		Usage: current.Usage, Steps: []task.Step{progress, resultStep}, PublishResultMessage: true,
+		Event: task.Event{Type: "task.result", Payload: payload}})
+	if err != nil {
+		return fmt.Errorf("commit resumed clarification result: %w", err)
+	}
+	completed, err := a.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return fmt.Errorf("read completed clarification Task: %w", err)
+	}
+	a.mu.Lock()
+	run.current = completed.Task
+	run.resultEventSequence = event.Sequence
+	run.clarificationAnswer = request.Answer
+	a.mu.Unlock()
+	if err := a.verifyActivityEvents(ctx, run, true); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	run.stage = "completed"
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *browserAcceptanceActivity) startMCPRetryExecution(ctx context.Context, current task.Task) (app.AgentInstanceLease, task.Task, error) {
+	if current.StepRetry == nil || current.StepRetry.TaskID != current.ID || current.StepRetry.OwnerID != current.OwnerID ||
+		current.StepRetry.AgentSessionID != current.AgentSessionID || current.StepRetry.RetryCallID == "" {
+		return app.AgentInstanceLease{}, task.Task{}, errors.New("claimed MCP retry has no valid immutable intent")
+	}
+	nonce := make([]byte, 32)
+	if _, err := rand.Read(nonce); err != nil {
+		return app.AgentInstanceLease{}, task.Task{}, fmt.Errorf("create MCP retry supervisor nonce: %w", err)
+	}
+	engineVersion, profileVersion := current.AgentEngineVersion, current.AgentProfileVersion
+	if engineVersion == "" {
+		engineVersion = "0.2.0-rc.2"
+	}
+	if profileVersion == "" {
+		profileVersion = "v1"
+	}
+	lease, replayed, err := a.instances.Start(ctx, app.AgentInstanceStart{Fence: app.AgentInstanceFence{
+		TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+		AgentInstanceID: "browser_retry_agent_" + current.StepRetry.AttemptStepID,
+		AgentSessionID:  current.StepRetry.AgentSessionID, SupervisorID: "browser-fixture-supervisor",
+		LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
+		AuthorizationVersion: current.Authorization.Version, EngineVersion: engineVersion, ProfileVersion: profileVersion,
+	}, SupervisorNonce: nonce, LeaseDuration: app.MaxAgentLease})
+	if err != nil || replayed {
+		if err == nil {
+			err = errors.New("MCP retry Agent start unexpectedly replayed")
+		}
+		return app.AgentInstanceLease{}, task.Task{}, fmt.Errorf("start synthetic MCP retry Agent: %w", err)
+	}
+	if lease.Fence.AgentGeneration <= current.AgentGeneration || lease.Fence.AgentSessionID != current.StepRetry.AgentSessionID {
+		return app.AgentInstanceLease{}, task.Task{}, errors.New("synthetic MCP retry Agent did not advance the pinned session generation")
+	}
+	if err := a.store.ConsumeTaskStepRetryIntent(ctx, *current.StepRetry, lease.Fence); err != nil {
+		return app.AgentInstanceLease{}, task.Task{}, fmt.Errorf("consume MCP retry intent at the synthetic Agent fence: %w", err)
+	}
+	details, err := a.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return app.AgentInstanceLease{}, task.Task{}, fmt.Errorf("read claimed MCP retry Task after intent consumption: %w", err)
+	}
+	if details.Task.AgentInstanceID != lease.Fence.AgentInstanceID || details.Task.AgentGeneration != lease.Fence.AgentGeneration ||
+		details.Task.Status != task.StatusRunning {
+		return app.AgentInstanceLease{}, task.Task{}, errors.New("synthetic MCP retry fence was not durably consumed")
+	}
+	consumedIntent := *current.StepRetry
+	consumedIntent.Consumed = true
+	details.Task.StepRetry = &consumedIntent
+	a.mu.Lock()
+	run := a.runs["mcp-retry"]
+	if run != nil {
+		run.agentLease = lease
+		run.supervisorNonce = append([]byte(nil), nonce...)
+	}
+	a.mu.Unlock()
+	return lease, details.Task, nil
+}
+
+func (a *browserAcceptanceActivity) commitMCPRetrySuccessOutcome(ctx context.Context, run *browserActivityRun,
+	lease app.AgentInstanceLease) error {
+	a.mu.Lock()
+	current, sourceStepID, retryCallID, dispatchCount := run.current, run.mcpRetrySourceStepID, run.mcpRetryCallID, run.mcpRetryDispatchCount
+	nonce := append([]byte(nil), run.supervisorNonce...)
+	a.mu.Unlock()
+	intent := current.StepRetry
+	if intent == nil || !intent.Consumed || intent.SourceStepID != sourceStepID || intent.RetryCallID != retryCallID ||
+		intent.AttemptStepID != current.CurrentStep || dispatchCount != 0 {
+		return errors.New("synthetic MCP retry execution lost its consumed single-use intent")
+	}
+	details, err := a.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return fmt.Errorf("read MCP retry Task before synthetic success: %w", err)
+	}
+	var source, attempt *task.Step
+	for i := range details.Steps {
+		step := &details.Steps[i]
+		if step.ID == sourceStepID {
+			source = step
+		}
+		if step.ID == intent.AttemptStepID {
+			attempt = step
+		}
+	}
+	if details.Task.Status != task.StatusRunning || source == nil || attempt == nil || source.Status != task.StepFailed ||
+		source.FailureReason != "connector_rate_limited" ||
+		(attempt.Status != task.StepQueued && attempt.Status != task.StepRunning) ||
+		attempt.RetryOfStepID != source.ID || attempt.Attempt != intent.Attempt || attempt.ToolCallKey != intent.RetryCallID ||
+		attempt.ToolName != intent.ToolName || !bytes.Equal(attempt.RequestDigest, intent.RequestDigest) {
+		return fmt.Errorf("synthetic MCP retry source or reserved attempt changed: source=%+v retry=%+v", source, attempt)
+	}
+	if len(intent.RequestDigest) != sha256.Size {
+		return errors.New("synthetic MCP retry request digest is invalid")
+	}
+	operationID, err := domain.NewOperationID()
+	if err != nil {
+		return err
+	}
+	operationResult := `{"is_error":false,"text":["synthetic connector result after explicit retry"]}`
+	inserted, err := a.store.pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
+(id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
+host_id,workspace_id,binding_version,task_revision,call_id,operation_key,tool_name,request_hash,status,result)
+SELECT $1,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,$2,
+host_id,workspace_id,binding_version,$3,$4,$5,tool_name,request_hash,'succeeded',$6
+FROM task_mcp_connector_operations WHERE task_id=$7 AND owner_id=$8 AND call_id=$9 AND status='failed'
+AND request_hash=$10`, operationID, current.Lease.Version, intent.TaskRevision, intent.RetryCallID,
+		app.AgentOperationKey(intent.RetryCallID), operationResult, current.ID, current.OwnerID, intent.SourceCallID,
+		intent.RequestDigest)
+	if err != nil {
+		return fmt.Errorf("persist one synthetic successful MCP retry operation: %w", err)
+	}
+	if inserted.RowsAffected() != 1 {
+		return fmt.Errorf("synthetic MCP retry operation rows inserted=%d, want exactly one", inserted.RowsAffected())
+	}
+	a.mu.Lock()
+	run.mcpRetryDispatchCount++
+	dispatchCount = run.mcpRetryDispatchCount
+	a.mu.Unlock()
+	if dispatchCount != 1 {
+		return fmt.Errorf("synthetic MCP retry dispatch count=%d, want one", dispatchCount)
+	}
+	step := *attempt
+	step.Status, step.Summary, step.Phase = task.StepSucceeded, "本地合成连接器重试成功。", "execute"
+	step.AgentSessionID, step.TaskRevision = intent.AgentSessionID, &intent.TaskRevision
+	step.ToolCallKey, step.ToolName = intent.RetryCallID, intent.ToolName
+	step.RequestDigest = append([]byte(nil), intent.RequestDigest...)
+	step.FailureReason, step.Retryable = "", false
+	result := "本地合成连接器在用户显式重试后成功。"
+	payload, err := json.Marshal(map[string]any{"result": result, "step_id": step.ID, "status": string(task.StepSucceeded)})
+	if err != nil {
+		return fmt.Errorf("encode synthetic MCP retry result: %w", err)
+	}
+	usage := current.Usage
+	usage.ToolCalls++
+	event, err := a.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: current.ID, LeaseOwner: current.Lease.Owner,
+		LeaseVersion: current.Lease.Version, Status: task.StatusCompleted, CurrentStep: step.ID, Result: result,
+		Usage: usage, Steps: []task.Step{step}, PublishResultMessage: true,
+		ToolCall: &app.TaskToolCallProgress{AgentSessionID: lease.Fence.AgentSessionID, AgentInstanceID: lease.Fence.AgentInstanceID,
+			AgentGeneration: lease.Fence.AgentGeneration, AuthorizationVersion: lease.Fence.AuthorizationVersion,
+			TaskRevision: intent.TaskRevision, CallKey: intent.RetryCallID, ToolName: intent.ToolName,
+			RequestDigest: append([]byte(nil), intent.RequestDigest...), Phase: "execute", DetailState: "not_recorded"},
+		Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: payload}})
+	if err != nil {
+		return fmt.Errorf("commit successful synthetic MCP retry step and Task result: %w", err)
+	}
+	receipt := app.AgentStopReceipt{Fence: lease.Fence, SupervisorNonce: nonce, TreeStopped: true}
+	signingPayload, err := app.AgentStopReceiptSigningPayload(receipt)
+	if err != nil {
+		return fmt.Errorf("encode synthetic MCP retry Agent stop receipt: %w", err)
+	}
+	signer := hmac.New(sha256.New, a.supervisorKey)
+	_, _ = signer.Write(signingPayload)
+	receipt.Signature = signer.Sum(nil)
+	if _, err := a.instances.ConfirmStopped(ctx, receipt); err != nil {
+		return fmt.Errorf("confirm synthetic MCP retry Agent stopped: %w", err)
+	}
+	completed, err := a.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return fmt.Errorf("read completed synthetic MCP retry Task: %w", err)
+	}
+	a.mu.Lock()
+	run.current = completed.Task
+	run.resultEventSequence = event.Sequence
+	a.mu.Unlock()
+	return a.verifyActivityEvents(ctx, run, true)
 }
 
 func (a *browserAcceptanceActivity) waitPhase(ctx context.Context, run *browserActivityRun, expected, next string,
@@ -2070,6 +2588,11 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.ID).Scan(&u
 	} else if !replayed {
 		return app.AgentInstanceLease{}, errors.New("start checkpoint replay created a second checkpoint")
 	}
+	a.mu.Lock()
+	run.checkpointFence = fence
+	run.checkpointThrough = command.Through
+	run.checkpointDigest = append([]byte(nil), command.Digest...)
+	a.mu.Unlock()
 	return lease, nil
 }
 
@@ -2134,9 +2657,9 @@ func (a *browserAcceptanceActivity) commitMCPRetryFailureOutcome(ctx context.Con
 	if _, err := a.store.pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
 (id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
 host_id,workspace_id,binding_version,task_revision,call_id,operation_key,tool_name,request_hash,status,result,updated_at)
-VALUES ($1,$2,$3,$4,NULL,1,0,1,$5,$6,'',0,$7,$8,$9,'mcp_call',$10,'failed',$11,clock_timestamp()-interval '2 seconds')`,
+VALUES ($1,$2,$3,$4,NULL,1,0,1,$5,$6,'',0,$7,$8,$9,'mcp_k1234567_0123456789ab',$10,'failed',$11,clock_timestamp()-interval '2 seconds')`,
 		operationID, current.ID, current.OwnerID, connectorID, current.Lease.Version, current.HostID, revision,
-		callID, "browser-rate-limit-source-"+current.ID, requestDigest[:], operationResult); err != nil {
+		callID, app.AgentOperationKey(callID), requestDigest[:], operationResult); err != nil {
 		return fmt.Errorf("seed local MCP rate-limit ledger: %w", err)
 	}
 	step := task.Step{ID: stepID, TaskID: current.ID, Sequence: 3, Kind: "tool", Status: task.StepFailed,
@@ -2199,6 +2722,141 @@ func (a *browserAcceptanceActivity) commitApprovalOutcome(ctx context.Context, r
 		Event: task.Event{Type: "task.waiting_user", Payload: []byte(`{"reason":"approval_required"}`)}, PendingRequest: pending})
 	if err != nil {
 		return fmt.Errorf("commit synthetic approval wait: %w", err)
+	}
+	if run.name == "approval-host-member-revoked" {
+		if run.revocationHostID == "" || run.revocationHostOwnerID == "" {
+			return errors.New("local shared Host grant fixture was not prepared")
+		}
+		bound, err := a.store.pool.Exec(ctx, `UPDATE tasks SET host_id=$2 WHERE id=$1 AND initiator_id=$3 AND status='waiting_user'`,
+			current.ID, run.revocationHostID, current.InitiatorID)
+		if err != nil {
+			return fmt.Errorf("bind approval-waiting Task to shared Host: %w", err)
+		}
+		if bound.RowsAffected() != 1 {
+			return fmt.Errorf("bind approval-waiting Task to shared Host affected %d rows, want one", bound.RowsAffected())
+		}
+		current.HostID = run.revocationHostID
+	}
+	a.mu.Lock()
+	run.current = current
+	run.approvalID, run.approvalVersion = pending.ID, pending.Version
+	run.approvalCallID = pending.CallID
+	run.approvalRequestHash = append([]byte(nil), pending.RequestHash...)
+	a.mu.Unlock()
+	return a.verifyActivityEvents(ctx, run, false)
+}
+
+func (a *browserAcceptanceActivity) commitApprovalContinuation(ctx context.Context, run *browserActivityRun) error {
+	current := run.current
+	details, err := a.store.GetTask(ctx, current.ID, current.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read approved synthetic Task: %w", err)
+	}
+	if details.Task.Status != task.StatusRunning || details.PendingRequest == nil ||
+		details.PendingRequest.ID != run.approvalID || details.PendingRequest.Version != run.approvalVersion ||
+		details.PendingRequest.Status != task.PendingRequestApproved ||
+		details.PendingRequest.Decision != task.PendingDecisionApprove ||
+		details.PendingRequest.CallID != run.approvalCallID ||
+		!bytes.Equal(details.PendingRequest.RequestHash, run.approvalRequestHash) {
+		return errors.New("approval continuation did not resume the exact approved Task call")
+	}
+
+	progress := task.Step{ID: run.progressStepID, TaskID: current.ID, Sequence: 2, Kind: "progress",
+		Status: task.StepSucceeded, Title: browserActivityProgressTitle(run), Summary: "审批已批准，任务从原等待点继续；未执行外部副作用。"}
+	resultStepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	resultStep := task.Step{ID: resultStepID, TaskID: current.ID, Sequence: 3, Kind: "result",
+		Status: task.StepSucceeded, Title: "处理完成", Summary: "本地合成操作已获批准，任务从原等待点继续完成。"}
+	payload, err := json.Marshal(map[string]any{"result": browserActivityApprovalResumeResult,
+		"step_id": resultStep.ID, "status": task.StepSucceeded, "approval_id": run.approvalID,
+		"approval_version": run.approvalVersion, "call_id": run.approvalCallID})
+	if err != nil {
+		return fmt.Errorf("encode synthetic approval continuation result: %w", err)
+	}
+	event, err := a.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: current.ID, LeaseOwner: current.Lease.Owner,
+		LeaseVersion: current.Lease.Version, Status: task.StatusCompleted, CurrentStep: resultStep.ID,
+		Result: browserActivityApprovalResumeResult, Usage: current.Usage, Steps: []task.Step{progress, resultStep},
+		PublishResultMessage: true,
+		Event:                task.Event{TaskID: current.ID, Type: "task.result", Payload: payload}})
+	if err != nil {
+		return fmt.Errorf("commit synthetic approval continuation: %w", err)
+	}
+	completed, err := a.store.GetTask(ctx, current.ID, current.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read completed synthetic approval Task: %w", err)
+	}
+	a.mu.Lock()
+	run.current = completed.Task
+	run.resultEventSequence = event.Sequence
+	run.approvalResumeCount++
+	run.stage = "completed"
+	a.mu.Unlock()
+	return a.verifyActivityEvents(ctx, run, true)
+}
+
+func (a *browserAcceptanceActivity) commitClarificationOutcome(ctx context.Context, run *browserActivityRun) error {
+	current := run.current
+	modelStepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	clarificationStepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	clarificationID, err := domain.NewPendingRequestID()
+	if err != nil {
+		return err
+	}
+	callID := "browser-clarification-" + current.ID
+	question := "请告诉我应该把报告保存到哪个目录？"
+	modelStep := task.Step{ID: modelStepID, TaskID: current.ID, Sequence: 3, Kind: "model", Status: task.StepSucceeded,
+		Title: "整理任务要求", Summary: "已识别还缺少一个必要信息。"}
+	clarificationStep := task.Step{ID: clarificationStepID, TaskID: current.ID, Sequence: 4, Kind: "clarification",
+		Status: task.StepWaitingUser, Title: "需要补充一个信息", Summary: question}
+	request := &task.ClarificationRequest{ID: clarificationID, TaskID: current.ID, Version: 1,
+		ModelStepID: modelStep.ID, CallID: callID, Question: question, Status: task.ClarificationPending}
+	payload, err := json.Marshal(map[string]any{"reason": "clarification_required", "step_id": clarificationStep.ID,
+		"clarification_id": request.ID, "clarification_version": request.Version, "call_id": request.CallID})
+	if err != nil {
+		return err
+	}
+	_, err = a.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: current.ID, LeaseOwner: current.Lease.Owner,
+		LeaseVersion: current.Lease.Version, Status: task.StatusWaitingUser, CurrentStep: clarificationStep.ID,
+		WaitingReason: "clarification_required", Usage: current.Usage, Steps: []task.Step{modelStep, clarificationStep},
+		Event: task.Event{Type: "task.waiting_user", Payload: payload}, ClarificationRequest: request})
+	if err != nil {
+		return fmt.Errorf("commit synthetic clarification wait: %w", err)
+	}
+	return a.verifyActivityEvents(ctx, run, false)
+}
+
+func (a *browserAcceptanceActivity) commitRecoveryUnknownOutcome(ctx context.Context, run *browserActivityRun) error {
+	current := run.current
+	if !domain.ValidStepID(run.progressStepID) {
+		return errors.New("recovery-unknown fixture is missing its previously running progress step")
+	}
+	confirmedStep := task.Step{ID: run.progressStepID, TaskID: current.ID, Sequence: 2, Kind: "progress",
+		Status: task.StepSucceeded, Title: browserActivityProgressTitle(run), Summary: browserActivityProgressSummary(run, true)}
+	stepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	step := task.Step{ID: stepID, TaskID: current.ID, Sequence: 3, Kind: "progress", Status: task.StepUnknown,
+		Title: "核对中断的执行状态", Summary: "无法确认上次响应是否完整，任务已暂停等待核对。"}
+	result := "恢复检查无法确认上一轮响应是否完成；任务已暂停，请在任务详情核对后再继续。"
+	payload, err := json.Marshal(map[string]any{"reason": "dsh_recovery_unresolved", "step_id": step.ID})
+	if err != nil {
+		return err
+	}
+	_, err = a.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: current.ID, LeaseOwner: current.Lease.Owner,
+		LeaseVersion: current.Lease.Version, Status: task.StatusWaitingUser, CurrentStep: step.ID,
+		WaitingReason: "dsh_recovery_unresolved", Result: result, Usage: current.Usage, Steps: []task.Step{confirmedStep, step},
+		Event: task.Event{Type: "task.waiting_user", Payload: payload}})
+	if err != nil {
+		return fmt.Errorf("commit synthetic unresolved recovery wait: %w", err)
 	}
 	return a.verifyActivityEvents(ctx, run, false)
 }
@@ -2270,6 +2928,180 @@ SELECT $1,'task',$2,$3,$4,$1,id,updated_at,0,$5,$6,$7,$7,$8,$9,$10,1,$11,$12 FRO
 	run.streamMessageID, run.streamTurnID, run.streamSequence = messageID, turnID, sequence
 	a.mu.Unlock()
 	return delta, nil
+}
+
+func (a *browserAcceptanceActivity) completeAfterSteer(ctx context.Context, run *browserActivityRun) error {
+	a.mu.Lock()
+	current, checkpointFence := run.current, run.checkpointFence
+	checkpointThrough, checkpointDigest := run.checkpointThrough, append([]byte(nil), run.checkpointDigest...)
+	candidateResult, progressStepID := run.completionCandidate, run.progressStepID
+	a.mu.Unlock()
+	if current.ID == "" || candidateResult == "" || !domain.ValidStepID(progressStepID) || checkpointThrough < 1 || len(checkpointDigest) != sha256.Size {
+		return errors.New("completion-race fixture is missing its fenced candidate")
+	}
+	var pendingRoute int
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages message
+JOIN conversation_message_routes route ON route.message_id=message.id
+WHERE message.task_id=$1 AND message.owner_id=$2 AND message.content=$3 AND message.delivery_status='pending'
+ AND message.delivery_mode='steer' AND route.state='routed'`, current.ID, current.OwnerID,
+		browserActivityCompletionRaceSteer).Scan(&pendingRoute); err != nil || pendingRoute != 1 {
+		return fmt.Errorf("completion-race steer was not routed to the original Task before commit: count=%d: %w", pendingRoute, err)
+	}
+	staleStepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	stalePayload, err := json.Marshal(map[string]any{"result": candidateResult, "step_id": staleStepID})
+	if err != nil {
+		return fmt.Errorf("encode stale completion candidate: %w", err)
+	}
+	_, err = a.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: current.ID, LeaseOwner: current.Lease.Owner,
+		LeaseVersion: current.Lease.Version, Status: task.StatusCompleted, CurrentStep: staleStepID, Result: candidateResult,
+		Usage: current.Usage, Steps: []task.Step{{ID: staleStepID, TaskID: current.ID, Sequence: 3, Kind: "result",
+			Status: task.StepSucceeded, Title: "处理完成", Summary: "补充到达前生成的旧结果候选。"}}, PublishResultMessage: true,
+		AgentCompletionFence: &app.TaskAgentCompletionFence{AgentSessionID: checkpointFence.AgentSessionID,
+			AgentInstanceID: checkpointFence.AgentInstanceID, AgentGeneration: checkpointFence.AgentGeneration,
+			AuthorizationVersion: checkpointFence.AuthorizationVersion, CheckpointThroughSequence: checkpointThrough,
+			CheckpointDigest: checkpointDigest},
+		Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: stalePayload}})
+	var pendingErr *app.TaskInputPendingError
+	if !errors.Is(err, app.ErrTaskInputPending) || !errors.As(err, &pendingErr) || len(pendingErr.PendingMessages) != 1 ||
+		pendingErr.PendingMessages[0].Content != browserActivityCompletionRaceSteer {
+		if err == nil {
+			return errors.New("stale completion candidate was not fenced by the routed steer")
+		}
+		pendingCount := 0
+		if pendingErr != nil {
+			pendingCount = len(pendingErr.PendingMessages)
+		}
+		return fmt.Errorf("stale completion candidate was not fenced by the routed steer: pending_count=%d: %w", pendingCount, err)
+	}
+	var staleEvents, staleReceipts int
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1 AND event_type='task.result'`, current.ID).Scan(&staleEvents); err != nil {
+		return fmt.Errorf("check rejected completion event: %w", err)
+	}
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE task_id=$1 AND role='assistant'`, current.ID).Scan(&staleReceipts); err != nil {
+		return fmt.Errorf("check rejected completion receipt: %w", err)
+	}
+	if staleEvents != 0 || staleReceipts != 0 {
+		return fmt.Errorf("rejected completion candidate escaped its fence: events=%d receipts=%d", staleEvents, staleReceipts)
+	}
+	if err := a.waitForIndependentCompletionResultWindow(ctx, current); err != nil {
+		return err
+	}
+	pendingMessages, err := a.checkpoints.PendingMessages(ctx, checkpointFence)
+	if err != nil || len(pendingMessages) != 1 || pendingMessages[0].Mode != app.AgentMessageDeliverySteer ||
+		pendingMessages[0].Content != browserActivityCompletionRaceSteer {
+		return fmt.Errorf("read pending steer from the original Agent session: messages=%+v: %w", pendingMessages, err)
+	}
+	steer := pendingMessages[0]
+	checkpointPayload, err := json.Marshal(map[string]any{"header": map[string]any{"id": checkpointFence.AgentSessionID},
+		"from_seq": checkpointThrough + 1, "events": []any{
+			map[string]any{"seq": checkpointThrough + 1, "type": "agent/inbox/spliced", "data": map[string]any{
+				"target": "next-step", "start": 0, "inserted": []any{map[string]any{"id": steer.ID, "role": "user",
+					"content": []any{map[string]string{"type": "text", "text": steer.Content}},
+					"source":  map[string]string{"kind": "user"}}}}},
+			map[string]any{"seq": checkpointThrough + 2, "type": "user/message", "data": map[string]any{"id": steer.ID,
+				"role": "user", "content": []any{map[string]string{"type": "text", "text": steer.Content}}}},
+			map[string]any{"seq": checkpointThrough + 3, "type": "turn/start", "data": map[string]any{"turn": 2}},
+		}})
+	if err != nil {
+		return fmt.Errorf("encode resumed Agent session checkpoint: %w", err)
+	}
+	checkpointSum := sha256.Sum256(checkpointPayload)
+	checkpointDigest = checkpointSum[:]
+	checkpointCommand := app.AgentCheckpointCommand{Fence: checkpointFence, From: checkpointThrough + 1,
+		Through: checkpointThrough + 3, Digest: checkpointDigest, Payload: checkpointPayload}
+	replayed, err := a.checkpoints.Save(ctx, checkpointCommand)
+	if err != nil {
+		return fmt.Errorf("save resumed original-session steer checkpoint: %w", err)
+	}
+	if replayed {
+		return errors.New("save resumed original-session steer checkpoint: unexpectedly replayed checkpoint")
+	}
+	a.mu.Lock()
+	run.checkpointThrough, run.checkpointDigest, run.completionSteerMessageID = checkpointCommand.Through,
+		append([]byte(nil), checkpointCommand.Digest...), steer.ID
+	a.mu.Unlock()
+	resultStepID, err := domain.NewStepID()
+	if err != nil {
+		return err
+	}
+	progressStep := task.Step{ID: progressStepID, TaskID: current.ID, Sequence: 2, Kind: "progress", Status: task.StepSucceeded,
+		Title: browserActivityProgressTitle(run), Summary: "已收到补充要求，并在原会话中继续处理。"}
+	resultStep := task.Step{ID: resultStepID, TaskID: current.ID, Sequence: 3, Kind: "result", Status: task.StepSucceeded,
+		Title: "处理完成", Summary: "最终结果已按 BLUE 补充要求更新。"}
+	resultPayload, err := json.Marshal(map[string]any{"result": browserActivityCompletionRaceResult, "step_id": resultStep.ID})
+	if err != nil {
+		return fmt.Errorf("encode revised completion result: %w", err)
+	}
+	event, err := a.store.CommitTaskProgress(ctx, app.TaskProgress{TaskID: current.ID, LeaseOwner: current.Lease.Owner,
+		LeaseVersion: current.Lease.Version, Status: task.StatusCompleted, CurrentStep: resultStep.ID,
+		Result: browserActivityCompletionRaceResult, Usage: current.Usage, Steps: []task.Step{progressStep, resultStep},
+		PublishResultMessage: true,
+		AgentCompletionFence: &app.TaskAgentCompletionFence{AgentSessionID: checkpointFence.AgentSessionID,
+			AgentInstanceID: checkpointFence.AgentInstanceID, AgentGeneration: checkpointFence.AgentGeneration,
+			AuthorizationVersion: checkpointFence.AuthorizationVersion, CheckpointThroughSequence: checkpointCommand.Through,
+			CheckpointDigest: checkpointCommand.Digest},
+		Event: task.Event{TaskID: current.ID, Type: "task.result", Payload: resultPayload}})
+	if err != nil {
+		return fmt.Errorf("commit revised completion after applying steer: %w", err)
+	}
+	completed, err := a.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return fmt.Errorf("read revised completion Task: %w", err)
+	}
+	a.mu.Lock()
+	run.current, run.resultEventSequence, run.completionRejected = completed.Task, event.Sequence, true
+	a.mu.Unlock()
+	return a.verifyActivityEvents(ctx, run, true)
+}
+
+func (a *browserAcceptanceActivity) waitForIndependentCompletionResultWindow(ctx context.Context, original task.Task) error {
+	deadline := time.NewTimer(30 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		var independentTaskID string
+		if err := a.store.pool.QueryRow(ctx, `SELECT COALESCE((SELECT message.task_id FROM conversation_messages message
+JOIN conversation_message_routes route ON route.message_id=message.id
+WHERE message.owner_id=$1 AND message.conversation_id=$2 AND message.content=$3
+ AND message.role='user' AND message.task_id<>$4 AND message.delivery_status='applied' AND route.state='routed'
+ORDER BY message.created_at DESC LIMIT 1),'')`, original.OwnerID, a.conversationID,
+			browserActivityCompletionRaceIndependent, original.ID).Scan(&independentTaskID); err != nil {
+			return fmt.Errorf("find independent completion-race Task: %w", err)
+		}
+		if independentTaskID != "" {
+			var status string
+			var resultAt time.Time
+			if err := a.store.pool.QueryRow(ctx, `SELECT task.status,COALESCE(event.created_at,'epoch'::timestamptz)
+FROM tasks task LEFT JOIN task_events event ON event.task_id=task.id AND event.event_type='task.result'
+WHERE task.id=$1 AND task.owner_id=$2`, independentTaskID, original.OwnerID).Scan(&status, &resultAt); err != nil {
+				return fmt.Errorf("read independent completion-race result time: %w", err)
+			}
+			if status == string(task.StatusCompleted) && !resultAt.IsZero() && resultAt.After(time.Unix(0, 0)) {
+				readyAt := resultAt.Add(maxConversationResultWindow + 250*time.Millisecond)
+				if delay := time.Until(readyAt); delay > 0 {
+					timer := time.NewTimer(delay)
+					defer timer.Stop()
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-timer.C:
+					}
+				}
+				return nil
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-deadline.C:
+			return errors.New("independent completion-race Task did not finish within 30 seconds")
+		case <-ticker.C:
+		}
+	}
 }
 
 func (a *browserAcceptanceActivity) complete(ctx context.Context, run *browserActivityRun, delta app.CloudDSHTextDelta) error {
@@ -2345,7 +3177,7 @@ func (a *browserAcceptanceActivity) verifyActivityEvents(ctx context.Context, ru
 		return err
 	}
 	var previous int64
-	starts, progress, results, streamEvents := 0, 0, 0, 0
+	starts, progress, results, matchingResultEvents, streamEvents := 0, 0, 0, 0, 0
 	for _, event := range events {
 		if event.Sequence <= previous {
 			return errors.New("task event sequence is not strictly increasing")
@@ -2366,17 +3198,22 @@ func (a *browserAcceptanceActivity) verifyActivityEvents(ctx context.Context, ru
 		}
 		if event.Type == "task.result" {
 			results++
-			if completed && event.Sequence != run.resultEventSequence {
-				return errors.New("task result event identity changed")
+			if completed && event.Sequence == run.resultEventSequence {
+				matchingResultEvents++
 			}
 		}
 		if event.Type == "task.message" {
 			streamEvents++
 		}
 	}
-	if starts != 1 || run.progressStepID != "" && progress != 1 || completed && results != 1 ||
+	wantResults := 1
+	if run.name == "mcp-retry" {
+		wantResults = 2
+	}
+	if starts != 1 || run.progressStepID != "" && progress != 1 || completed && (results != wantResults || matchingResultEvents != 1) ||
 		completed && run.name == "stream" && streamEvents < 2 {
-		return fmt.Errorf("unexpected task events: start=%d progress=%d result=%d stream=%d", starts, progress, results, streamEvents)
+		return fmt.Errorf("unexpected task events: start=%d progress=%d result=%d matching_final_result=%d stream=%d",
+			starts, progress, results, matchingResultEvents, streamEvents)
 	}
 	return nil
 }
@@ -2386,6 +3223,7 @@ type browserActivityRunView struct {
 	Objective           string `json:"objective"`
 	Stage               string `json:"stage"`
 	Failure             string `json:"failure,omitempty"`
+	StopStatus          string `json:"stop_status,omitempty"`
 	TaskID              string `json:"task_id,omitempty"`
 	UserMessageID       string `json:"user_message_id,omitempty"`
 	StreamMessageID     string `json:"stream_message_id,omitempty"`
@@ -2395,16 +3233,28 @@ type browserActivityRunView struct {
 
 func browserActivityView(run *browserActivityRun) browserActivityRunView {
 	return browserActivityRunView{Name: run.name, Objective: run.objective, Stage: run.stage, Failure: run.failure,
-		TaskID: run.current.ID, UserMessageID: run.userMessageID, StreamMessageID: run.streamMessageID,
+		StopStatus: run.stopStatus, TaskID: run.current.ID, UserMessageID: run.userMessageID, StreamMessageID: run.streamMessageID,
 		StreamSequence: run.streamSequence, ResultEventSequence: run.resultEventSequence}
 }
 
 func (a *browserAcceptanceActivity) serveControl(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/__morde_fixture/"), "/")
+	if len(parts) == 2 && parts[0] == "bootstrap" && r.Method == http.MethodGet {
+		if a.runs[parts[1]] == nil {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]string{
+			"username": a.testUserName, "password": "client-password-123", "activity_token": a.controlToken,
+		})
+		return
+	}
 	if r.Header.Get("X-Morde-Fixture-Token") != a.controlToken {
 		http.Error(w, "fixture control is unauthorized", http.StatusUnauthorized)
 		return
 	}
-	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/__morde_fixture/"), "/")
 	if len(parts) == 1 && parts[0] == "status" && r.Method == http.MethodGet {
 		a.mu.Lock()
 		runs := make([]browserActivityRunView, 0, len(a.runs))
@@ -2422,11 +3272,12 @@ func (a *browserAcceptanceActivity) serveControl(w http.ResponseWriter, r *http.
 		requests := append([]browserActivityEventRequest(nil), a.requests...)
 		taskListRequests := append([]browserActivityTaskListRequest(nil), a.taskListRequests...)
 		taskSnapshots := append([]browserActivityTaskSnapshotRequest(nil), a.taskSnapshots...)
+		messageSnapshots := append([]browserActivityMessageSnapshotRequest(nil), a.messageSnapshots...)
 		a.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{"runs": runs, "active_event_streams": active,
 			"event_requests": requests, "conversation_task_list_requests": taskListRequests,
-			"task_snapshot_requests": taskSnapshots})
+			"task_snapshot_requests": taskSnapshots, "message_snapshot_requests": messageSnapshots})
 		return
 	}
 	if len(parts) == 3 && parts[0] == "advance" && r.Method == http.MethodPost {
@@ -2463,8 +3314,63 @@ func (a *browserAcceptanceActivity) serveControl(w http.ResponseWriter, r *http.
 		case "approval":
 			result["agent_acknowledged"], result["task_status"] = true, string(task.StatusWaitingUser)
 			result["waiting_reason"], result["pending_request_status"] = "approval_required", string(task.PendingRequestPending)
+		case "approval-resume":
+			a.mu.Lock()
+			run := a.runs["approval-resume"]
+			if run != nil {
+				result["task_id"], result["task_status"] = run.current.ID, string(run.current.Status)
+				result["approval_id"], result["approval_version"] = run.approvalID, run.approvalVersion
+				result["synthetic_resume_count"] = run.approvalResumeCount
+			}
+			a.mu.Unlock()
+		case "approval-revoked":
+			a.mu.Lock()
+			run := a.runs["approval-revoked"]
+			if run != nil {
+				result["task_id"], result["task_status"] = run.current.ID, run.stopStatus
+				result["approval_id"], result["approval_version"] = run.approvalID, run.approvalVersion
+			}
+			a.mu.Unlock()
+		case "approval-host-member-revoked":
+			a.mu.Lock()
+			run := a.runs["approval-host-member-revoked"]
+			if run != nil {
+				result["task_id"], result["task_status"] = run.current.ID, run.stopStatus
+				result["approval_id"], result["approval_version"] = run.approvalID, run.approvalVersion
+				result["host_id"] = run.revocationHostID
+			}
+			a.mu.Unlock()
+		case "clarification":
+			a.mu.Lock()
+			run := a.runs["clarification"]
+			completed, answer := run != nil && run.stage == "completed", ""
+			if run != nil {
+				answer = run.clarificationAnswer
+			}
+			a.mu.Unlock()
+			result["agent_acknowledged"] = true
+			if completed {
+				result["task_status"], result["clarification_status"], result["answer"] = string(task.StatusCompleted), string(task.ClarificationAnswered), answer
+			} else {
+				result["task_status"], result["waiting_reason"], result["clarification_status"] = string(task.StatusWaitingUser), "clarification_required", string(task.ClarificationPending)
+			}
+		case "recovery-unknown":
+			result["agent_acknowledged"], result["task_status"] = true, string(task.StatusWaitingUser)
+			result["waiting_reason"], result["current_step_status"] = "dsh_recovery_unresolved", string(task.StepUnknown)
+		case "interrupted":
+			a.mu.Lock()
+			run := a.runs["interrupted"]
+			if run != nil {
+				result["task_id"], result["task_status"] = run.current.ID, run.stopStatus
+				result["assistant_message_id"], result["assistant_message_status"] = run.streamMessageID, string(conversation.OutputInterrupted)
+				result["assistant_message_content"] = browserActivityStreamPrefix
+			}
+			a.mu.Unlock()
+		case "queued":
+			result["task_status"] = string(task.StatusCompleted)
 		case "mcp-retry":
-			result["agent_acknowledged"], result["task_status"] = true, "running"
+			result["agent_acknowledged"], result["task_status"] = true, string(task.StatusCompleted)
+			result["retry_step_status"], result["mcp_operation_count"] = string(task.StepSucceeded), 2
 		case "target-control":
 			result["target_task_id"] = a.runs["target-control-b"].current.ID
 			result["sibling_task_id"] = a.runs["target-control-a"].current.ID
@@ -2488,6 +3394,56 @@ func (a *browserAcceptanceActivity) assertVerified() error {
 }
 
 func (a *browserAcceptanceActivity) advance(ctx context.Context, name, phase string) error {
+	if phase == "revoke" {
+		if name != "approval-revoked" && name != "approval-host-member-revoked" {
+			return errors.New("authorization revocation is only available for approval-revoked scenarios")
+		}
+		a.mu.Lock()
+		run := a.runs[name]
+		if run == nil || run.stage != "waiting_user" || run.busy || run.current.ID == "" {
+			stage := "missing"
+			if run != nil {
+				stage = run.stage
+			}
+			a.mu.Unlock()
+			return fmt.Errorf("authorization revocation is unavailable at stage %s", stage)
+		}
+		run.busy = true
+		current := run.current
+		executionControl, ownerPrincipal := a.executionControl, a.ownerPrincipal
+		hostID, hostOwnerID := run.revocationHostID, run.revocationHostOwnerID
+		a.mu.Unlock()
+		var err error
+		if name == "approval-host-member-revoked" {
+			if hostID == "" || hostOwnerID == "" || ownerPrincipal.UserID != current.InitiatorID {
+				err = errors.New("shared Host grant revocation fixture is missing its Host or Task initiator")
+			} else {
+				err = a.store.RevokeHostMember(ctx, hostID, hostOwnerID, current.InitiatorID)
+			}
+		} else if executionControl == nil || ownerPrincipal.UserID != current.InitiatorID {
+			err = errors.New("authorization revocation fixture is missing its account execution control")
+		} else {
+			var control execution.Control
+			control, err = executionControl.Status(ctx, ownerPrincipal)
+			if err == nil {
+				_, err = executionControl.StopAll(ctx, ownerPrincipal, control.Epoch, "browser-approval-revocation-stop-all")
+			}
+		}
+		a.mu.Lock()
+		run.busy = false
+		if err != nil {
+			run.stage, run.failure = "failed", err.Error()
+		} else {
+			run.stage, run.stopStatus = "revoked", string(task.StatusCancelling)
+			run.current.Status = task.StatusCancelling
+			run.current.WaitingReason = ""
+		}
+		a.mu.Unlock()
+		if err != nil {
+			return fmt.Errorf("apply authorization cancellation fence: %w", err)
+		}
+		return nil
+	}
 	a.mu.Lock()
 	run := a.runs[name]
 	if run == nil {
@@ -2495,13 +3451,18 @@ func (a *browserAcceptanceActivity) advance(ctx context.Context, name, phase str
 		return errors.New("unknown synthetic scenario")
 	}
 	expected := map[string]string{"start": "claimed", "progress": "started", "stream": "progress", "complete": "progress",
-		"fail": "progress", "approval": "progress"}[phase]
+		"candidate": "progress", "commit": "completion_candidate",
+		"fail": "progress", "approval": "progress", "clarification": "progress", "unknown": "progress", "retry-success": "retry_claimed"}[phase]
 	if name == "stream" && phase == "complete" {
 		expected = "streaming"
 	}
-	if expected == "" || phase == "stream" && name != "stream" ||
-		phase == "fail" && name != "failed" && name != "mcp-retry" || phase == "approval" && name != "approval" ||
-		(name == "failed" || name == "approval") && phase == "complete" || run.stage != expected || run.busy {
+	if expected == "" || phase == "stream" && name != "stream" && name != "interrupted" ||
+		(phase == "candidate" || phase == "commit") && name != "completion-race" ||
+		phase == "complete" && name == "completion-race" ||
+		phase == "fail" && name != "failed" && name != "mcp-retry" || phase == "approval" && name != "approval" && name != "approval-resume" && name != "approval-revoked" && name != "approval-host-member-revoked" ||
+		phase == "clarification" && name != "clarification" || phase == "unknown" && name != "recovery-unknown" ||
+		phase == "retry-success" && name != "mcp-retry" ||
+		(name == "failed" || name == "approval" || name == "clarification" || name == "recovery-unknown") && phase == "complete" || run.stage != expected || run.busy {
 		stage := run.stage
 		a.mu.Unlock()
 		return fmt.Errorf("phase %s is unavailable at stage %s", phase, stage)
@@ -2596,24 +3557,475 @@ func (a *browserAcceptanceActivity) serveConversationTasks(w http.ResponseWriter
 	_, _ = w.Write(recorder.Body.Bytes())
 }
 
+func browserActivityCrossClientScenario() string {
+	switch strings.TrimSpace(os.Getenv("MORDE_BROWSER_ACTIVITY_CROSS_CLIENT")) {
+	case "1", "recovery-unknown":
+		return "recovery-unknown"
+	case "approval":
+		return "approval"
+	case "approval-resume":
+		return "approval-resume"
+	case "approval-revoked":
+		return "approval-revoked"
+	case "approval-host-member-revoked":
+		return "approval-host-member-revoked"
+	case "interrupted":
+		return "interrupted"
+	default:
+		return ""
+	}
+}
+
 func (a *browserAcceptanceActivity) serveTaskSnapshot(w http.ResponseWriter, r *http.Request, next http.Handler) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/tasks/")
+	if !domain.ValidTaskID(id) {
+		next.ServeHTTP(w, r)
+		return
+	}
 	recorder := httptest.NewRecorder()
 	next.ServeHTTP(recorder, r)
+	body := recorder.Body.Bytes()
+	validationPreviewApplied := false
+	if recorder.Code == http.StatusOK {
+		preview, injected, err := a.withValidationEvidencePreview(r.Context(), id, body)
+		if err != nil {
+			http.Error(w, "local validation evidence preview failed", http.StatusInternalServerError)
+			return
+		}
+		if injected {
+			body = preview
+			validationPreviewApplied = true
+		}
+	}
+	crossClientScenario := browserActivityCrossClientScenario()
+	crossClientTaskSnapshot := false
+	if crossClientScenario != "" {
+		a.mu.Lock()
+		run := a.runs[crossClientScenario]
+		crossClientTaskSnapshot = run != nil && run.current.ID == id
+		a.mu.Unlock()
+	}
 	client := "browser"
 	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		client = "ios"
+	} else if crossClientTaskSnapshot {
+		cookie, err := r.Cookie("ch_portal")
+		if err != nil || cookie.Value == "" {
+			client = "other"
+		}
+	}
+	snapshotStatus, waitingReason := "", ""
+	if crossClientTaskSnapshot && recorder.Code == http.StatusOK {
+		var snapshot struct {
+			Status        string  `json:"status"`
+			WaitingReason *string `json:"waiting_reason"`
+		}
+		if json.Unmarshal(body, &snapshot) == nil {
+			snapshotStatus = snapshot.Status
+			if snapshot.WaitingReason != nil {
+				waitingReason = *snapshot.WaitingReason
+			}
+		}
 	}
 	a.mu.Lock()
 	a.taskSnapshots = append(a.taskSnapshots, browserActivityTaskSnapshotRequest{
 		Client: client, TaskID: id, StatusCode: recorder.Code,
+		Status: snapshotStatus, WaitingReason: waitingReason,
 	})
 	a.mu.Unlock()
 	for key, values := range recorder.Header() {
 		w.Header()[key] = append([]string(nil), values...)
 	}
+	if validationPreviewApplied {
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+	}
+	w.WriteHeader(recorder.Code)
+	_, _ = w.Write(body)
+}
+
+func (a *browserAcceptanceActivity) serveTaskAction(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/tasks/"), "/actions")
+	if !domain.ValidTaskID(id) {
+		next.ServeHTTP(w, r)
+		return
+	}
+	body, readErr := io.ReadAll(r.Body)
+	if readErr != nil {
+		http.Error(w, "unable to read local task action", http.StatusBadRequest)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	var request struct {
+		Action string `json:"action"`
+	}
+	_ = json.Unmarshal(body, &request)
+	recorder := httptest.NewRecorder()
+	next.ServeHTTP(recorder, r)
+	if request.Action == string(task.ActionCancel) && recorder.Code == http.StatusAccepted {
+		if err := a.confirmInterruptedCancellation(id, recorder.Body.Bytes()); err != nil {
+			a.mu.Lock()
+			if run := a.runs["interrupted"]; run != nil && run.current.ID == id {
+				run.failure = err.Error()
+			}
+			a.mu.Unlock()
+		}
+	}
+	for key, values := range recorder.Header() {
+		w.Header()[key] = append([]string(nil), values...)
+	}
 	w.WriteHeader(recorder.Code)
 	_, _ = w.Write(recorder.Body.Bytes())
+}
+
+func (a *browserAcceptanceActivity) confirmInterruptedCancellation(taskID string, responseBody []byte) error {
+	a.mu.Lock()
+	run := a.runs["interrupted"]
+	if run == nil || run.current.ID != taskID || run.stage != "streaming" || run.streamMessageID == "" {
+		a.mu.Unlock()
+		return errors.New("cancel did not target the active interrupted-stream fixture")
+	}
+	current, messageID := run.current, run.streamMessageID
+	a.mu.Unlock()
+
+	var response struct {
+		TaskID string `json:"task_id"`
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(responseBody, &response); err != nil || response.TaskID != taskID ||
+		(response.Status != string(task.StatusCancelling) && response.Status != string(task.StatusCancelled)) {
+		return fmt.Errorf("cancel action returned an unexpected Task state: task=%s status=%s", response.TaskID, response.Status)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var persistedStatus string
+	if err := a.store.pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id=$1 AND initiator_id=$2`,
+		taskID, current.InitiatorID).Scan(&persistedStatus); err != nil {
+		return fmt.Errorf("read interrupted Task state after cancel: %w", err)
+	}
+	if (persistedStatus != string(task.StatusCancelling) && persistedStatus != string(task.StatusCancelled)) ||
+		(response.Status != persistedStatus && persistedStatus != string(task.StatusCancelled)) {
+		return fmt.Errorf("cancelled stream Task state is inconsistent: response=%s persisted=%s", response.Status, persistedStatus)
+	}
+
+	var storedTaskID, role, content, outputStatus string
+	var revision int64
+	if err := a.store.pool.QueryRow(ctx, `SELECT task_id,role,content,output_status,output_task_revision
+FROM conversation_messages WHERE id=$1`, messageID).Scan(&storedTaskID, &role, &content, &outputStatus, &revision); err != nil {
+		return fmt.Errorf("read interrupted assistant message: %w", err)
+	}
+	var snapshotMessageID, snapshotContent, snapshotStatus string
+	var snapshotRevision int64
+	if err := a.store.pool.QueryRow(ctx, `SELECT message_id,content,status,task_revision
+FROM task_assistant_message_snapshots WHERE task_id=$1`, taskID).
+		Scan(&snapshotMessageID, &snapshotContent, &snapshotStatus, &snapshotRevision); err != nil {
+		return fmt.Errorf("read interrupted assistant message snapshot: %w", err)
+	}
+	var assistantMessages int
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE task_id=$1 AND role='assistant'`, taskID).
+		Scan(&assistantMessages); err != nil {
+		return fmt.Errorf("count interrupted assistant messages: %w", err)
+	}
+	if storedTaskID != taskID || role != string(conversation.RoleAssistant) || content != browserActivityStreamPrefix ||
+		outputStatus != string(conversation.OutputInterrupted) || snapshotMessageID != messageID ||
+		snapshotContent != content || snapshotStatus != outputStatus || snapshotRevision != revision || assistantMessages != 1 {
+		return fmt.Errorf("interrupted stream persistence mismatch: task=%s role=%s status=%s snapshot=%s/%s/%s messages=%d",
+			storedTaskID, role, outputStatus, snapshotMessageID, snapshotStatus, snapshotContent, assistantMessages)
+	}
+	a.mu.Lock()
+	if run := a.runs["interrupted"]; run != nil && run.current.ID == taskID {
+		run.stage, run.stopStatus = "interrupted", persistedStatus
+	}
+	a.mu.Unlock()
+	return nil
+}
+
+func (a *browserAcceptanceActivity) serveMessageSnapshot(w http.ResponseWriter, r *http.Request, next http.Handler) {
+	recorder := httptest.NewRecorder()
+	next.ServeHTTP(recorder, r)
+	if recorder.Code == http.StatusOK {
+		client := "browser"
+		if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+			client = "ios"
+		}
+		var page struct {
+			Items []struct {
+				ID           string `json:"id"`
+				TaskID       string `json:"task_id"`
+				Role         string `json:"role"`
+				Content      string `json:"content"`
+				OutputStatus string `json:"output_status"`
+			} `json:"items"`
+		}
+		if json.Unmarshal(recorder.Body.Bytes(), &page) == nil {
+			a.mu.Lock()
+			run := a.runs["interrupted"]
+			taskID := ""
+			if run != nil && run.stage == "interrupted" {
+				taskID = run.current.ID
+			}
+			a.mu.Unlock()
+			if taskID != "" {
+				for _, item := range page.Items {
+					if item.TaskID != taskID {
+						continue
+					}
+					a.mu.Lock()
+					a.messageSnapshots = append(a.messageSnapshots, browserActivityMessageSnapshotRequest{
+						Client: client, TaskID: item.TaskID, MessageID: item.ID, StatusCode: recorder.Code,
+						Role: item.Role, Content: item.Content, OutputStatus: item.OutputStatus,
+					})
+					a.mu.Unlock()
+				}
+			}
+		}
+	}
+	for key, values := range recorder.Header() {
+		w.Header()[key] = append([]string(nil), values...)
+	}
+	w.WriteHeader(recorder.Code)
+	_, _ = w.Write(recorder.Body.Bytes())
+}
+
+func verifyCrossClientTaskSnapshots(snapshots []browserActivityTaskSnapshotRequest, taskID, status, waitingReason string) error {
+	var latestByClient = make(map[string]browserActivityTaskSnapshotRequest, 2)
+	for _, snapshot := range snapshots {
+		if snapshot.StatusCode != http.StatusOK || (snapshot.Client != "browser" && snapshot.Client != "ios") {
+			continue
+		}
+		latestByClient[snapshot.Client] = snapshot
+	}
+	pc, hasPC := latestByClient["browser"]
+	ios, hasIOS := latestByClient["ios"]
+	if !hasPC {
+		return errors.New("cross-client verification is missing a successful PC Task snapshot")
+	}
+	if !hasIOS {
+		return errors.New("cross-client verification is missing a successful iOS Task snapshot")
+	}
+	if pc.TaskID != taskID || ios.TaskID != taskID || pc.TaskID != ios.TaskID {
+		return fmt.Errorf("clients read different Tasks: PC=%s iOS=%s expected=%s", pc.TaskID, ios.TaskID, taskID)
+	}
+	if pc.Status != status || pc.WaitingReason != waitingReason ||
+		ios.Status != status || ios.WaitingReason != waitingReason ||
+		pc.Status != ios.Status || pc.WaitingReason != ios.WaitingReason {
+		return fmt.Errorf("client snapshots disagree: PC=%s/%s iOS=%s/%s expected=%s/%s",
+			pc.Status, pc.WaitingReason, ios.Status, ios.WaitingReason, status, waitingReason)
+	}
+	return nil
+}
+
+func verifyRecoveryUnknownClientSnapshots(snapshots []browserActivityTaskSnapshotRequest, taskID string) error {
+	return verifyCrossClientTaskSnapshots(snapshots, taskID, string(task.StatusWaitingUser), "dsh_recovery_unresolved")
+}
+
+func verifyApprovalClientSnapshots(snapshots []browserActivityTaskSnapshotRequest, taskID string) error {
+	return verifyCrossClientTaskSnapshots(snapshots, taskID, string(task.StatusWaitingUser), "approval_required")
+}
+
+func verifyApprovalResumeClientSnapshots(snapshots []browserActivityTaskSnapshotRequest, taskID string) error {
+	latestByClient := make(map[string]browserActivityTaskSnapshotRequest, 2)
+	for _, snapshot := range snapshots {
+		if snapshot.Client == "browser" || snapshot.Client == "ios" {
+			latestByClient[snapshot.Client] = snapshot
+		}
+	}
+	pc, hasPC := latestByClient["browser"]
+	ios, hasIOS := latestByClient["ios"]
+	if !hasPC {
+		return errors.New("approval-resume verification is missing a PC Task snapshot")
+	}
+	if !hasIOS {
+		return errors.New("approval-resume verification is missing an iOS Task snapshot")
+	}
+	for _, snapshot := range []browserActivityTaskSnapshotRequest{pc, ios} {
+		if snapshot.StatusCode != http.StatusOK || snapshot.TaskID != taskID ||
+			snapshot.Status != string(task.StatusCompleted) || snapshot.WaitingReason != "" {
+			return fmt.Errorf("%s did not read the completed approved Task: status_code=%d task=%s state=%s/%s",
+				snapshot.Client, snapshot.StatusCode, snapshot.TaskID, snapshot.Status, snapshot.WaitingReason)
+		}
+	}
+	return nil
+}
+
+func verifyInterruptedMessageSnapshots(snapshots []browserActivityMessageSnapshotRequest, taskID, messageID string) error {
+	latestByClient := make(map[string]browserActivityMessageSnapshotRequest, 2)
+	for _, snapshot := range snapshots {
+		if snapshot.Client == "browser" || snapshot.Client == "ios" {
+			latestByClient[snapshot.Client] = snapshot
+		}
+	}
+	pc, hasPC := latestByClient["browser"]
+	ios, hasIOS := latestByClient["ios"]
+	if !hasPC {
+		return errors.New("interrupted cross-client verification is missing a successful PC message read")
+	}
+	if !hasIOS {
+		return errors.New("interrupted cross-client verification is missing a successful iOS message read")
+	}
+	for _, snapshot := range []browserActivityMessageSnapshotRequest{pc, ios} {
+		if snapshot.StatusCode != http.StatusOK || snapshot.TaskID != taskID || snapshot.MessageID != messageID ||
+			snapshot.Role != string(conversation.RoleAssistant) || snapshot.Content != browserActivityStreamPrefix ||
+			snapshot.OutputStatus != string(conversation.OutputInterrupted) {
+			return fmt.Errorf("%s did not read the expected interrupted assistant message: status=%d task=%s message=%s role=%s output_status=%s content=%q",
+				snapshot.Client, snapshot.StatusCode, snapshot.TaskID, snapshot.MessageID, snapshot.Role, snapshot.OutputStatus, snapshot.Content)
+		}
+	}
+	if pc.TaskID != ios.TaskID || pc.MessageID != ios.MessageID || pc.Content != ios.Content || pc.OutputStatus != ios.OutputStatus {
+		return fmt.Errorf("PC and iOS read different interrupted assistant messages: PC=%s/%s/%q/%s iOS=%s/%s/%q/%s",
+			pc.TaskID, pc.MessageID, pc.Content, pc.OutputStatus, ios.TaskID, ios.MessageID, ios.Content, ios.OutputStatus)
+	}
+	return nil
+}
+
+func TestVerifyInterruptedMessageSnapshots(t *testing.T) {
+	pc := browserActivityMessageSnapshotRequest{Client: "browser", TaskID: "t1234567", MessageID: "m1234567",
+		StatusCode: http.StatusOK, Role: string(conversation.RoleAssistant), Content: browserActivityStreamPrefix,
+		OutputStatus: string(conversation.OutputInterrupted)}
+	ios := pc
+	ios.Client = "ios"
+	for _, test := range []struct {
+		name      string
+		snapshots []browserActivityMessageSnapshotRequest
+		wantErr   bool
+	}{
+		{name: "matching client reads", snapshots: []browserActivityMessageSnapshotRequest{pc, ios}},
+		{name: "missing PC read", snapshots: []browserActivityMessageSnapshotRequest{ios}, wantErr: true},
+		{name: "missing iOS read", snapshots: []browserActivityMessageSnapshotRequest{pc}, wantErr: true},
+		{name: "different message identity", snapshots: []browserActivityMessageSnapshotRequest{pc,
+			{Client: "ios", TaskID: ios.TaskID, MessageID: "m7654321", StatusCode: http.StatusOK,
+				Role: ios.Role, Content: ios.Content, OutputStatus: ios.OutputStatus}}, wantErr: true},
+		{name: "different persisted content", snapshots: []browserActivityMessageSnapshotRequest{pc,
+			{Client: "ios", TaskID: ios.TaskID, MessageID: ios.MessageID, StatusCode: http.StatusOK,
+				Role: ios.Role, Content: browserActivityStreamPrefix + browserActivityStreamSuffix, OutputStatus: ios.OutputStatus}}, wantErr: true},
+		{name: "wrong output status", snapshots: []browserActivityMessageSnapshotRequest{pc,
+			{Client: "ios", TaskID: ios.TaskID, MessageID: ios.MessageID, StatusCode: http.StatusOK,
+				Role: ios.Role, Content: ios.Content, OutputStatus: string(conversation.OutputCompleted)}}, wantErr: true},
+		{name: "non-200 read", snapshots: []browserActivityMessageSnapshotRequest{
+			{Client: "browser", TaskID: pc.TaskID, MessageID: pc.MessageID, StatusCode: http.StatusForbidden}, ios}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := verifyInterruptedMessageSnapshots(test.snapshots, "t1234567", "m1234567")
+			if (err != nil) != test.wantErr {
+				t.Fatalf("verifyInterruptedMessageSnapshots() error=%v wantErr=%t", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestVerifyRecoveryUnknownClientSnapshots(t *testing.T) {
+	taskID := "t1234567"
+	pc := browserActivityTaskSnapshotRequest{Client: "browser", TaskID: taskID, StatusCode: http.StatusOK,
+		Status: string(task.StatusWaitingUser), WaitingReason: "dsh_recovery_unresolved"}
+	ios := browserActivityTaskSnapshotRequest{Client: "ios", TaskID: taskID, StatusCode: http.StatusOK,
+		Status: string(task.StatusWaitingUser), WaitingReason: "dsh_recovery_unresolved"}
+	tests := []struct {
+		name      string
+		snapshots []browserActivityTaskSnapshotRequest
+		wantErr   bool
+	}{
+		{name: "matching snapshots", snapshots: []browserActivityTaskSnapshotRequest{pc, ios}},
+		{name: "missing PC snapshot", snapshots: []browserActivityTaskSnapshotRequest{ios}, wantErr: true},
+		{name: "missing iOS snapshot", snapshots: []browserActivityTaskSnapshotRequest{pc}, wantErr: true},
+		{name: "different task IDs", snapshots: []browserActivityTaskSnapshotRequest{
+			pc, {Client: "ios", TaskID: "t7654321", StatusCode: http.StatusOK,
+				Status: string(task.StatusWaitingUser), WaitingReason: "dsh_recovery_unresolved"},
+		}, wantErr: true},
+		{name: "wrong status", snapshots: []browserActivityTaskSnapshotRequest{
+			{Client: "browser", TaskID: taskID, StatusCode: http.StatusOK,
+				Status: string(task.StatusFailed), WaitingReason: "dsh_recovery_unresolved"}, ios,
+		}, wantErr: true},
+		{name: "wrong waiting reason", snapshots: []browserActivityTaskSnapshotRequest{
+			pc, {Client: "ios", TaskID: taskID, StatusCode: http.StatusOK,
+				Status: string(task.StatusWaitingUser), WaitingReason: "approval_required"},
+		}, wantErr: true},
+		{name: "non-200 snapshots do not satisfy verification", snapshots: []browserActivityTaskSnapshotRequest{
+			{Client: "browser", TaskID: taskID, StatusCode: http.StatusForbidden},
+			{Client: "ios", TaskID: taskID, StatusCode: http.StatusInternalServerError},
+		}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := verifyRecoveryUnknownClientSnapshots(test.snapshots, taskID)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("verifyRecoveryUnknownClientSnapshots() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestVerifyApprovalClientSnapshots(t *testing.T) {
+	taskID := "t1234567"
+	pc := browserActivityTaskSnapshotRequest{Client: "browser", TaskID: taskID, StatusCode: http.StatusOK,
+		Status: string(task.StatusWaitingUser), WaitingReason: "approval_required"}
+	ios := browserActivityTaskSnapshotRequest{Client: "ios", TaskID: taskID, StatusCode: http.StatusOK,
+		Status: string(task.StatusWaitingUser), WaitingReason: "approval_required"}
+	tests := []struct {
+		name      string
+		snapshots []browserActivityTaskSnapshotRequest
+		wantErr   bool
+	}{
+		{name: "matching snapshots", snapshots: []browserActivityTaskSnapshotRequest{pc, ios}},
+		{name: "missing PC snapshot", snapshots: []browserActivityTaskSnapshotRequest{ios}, wantErr: true},
+		{name: "missing iOS snapshot", snapshots: []browserActivityTaskSnapshotRequest{pc}, wantErr: true},
+		{name: "different Task IDs", snapshots: []browserActivityTaskSnapshotRequest{
+			pc, {Client: "ios", TaskID: "t7654321", StatusCode: http.StatusOK,
+				Status: string(task.StatusWaitingUser), WaitingReason: "approval_required"},
+		}, wantErr: true},
+		{name: "failed Task", snapshots: []browserActivityTaskSnapshotRequest{
+			pc, {Client: "ios", TaskID: taskID, StatusCode: http.StatusOK,
+				Status: string(task.StatusFailed), WaitingReason: "approval_required"},
+		}, wantErr: true},
+		{name: "wrong waiting reason", snapshots: []browserActivityTaskSnapshotRequest{
+			pc, {Client: "ios", TaskID: taskID, StatusCode: http.StatusOK,
+				Status: string(task.StatusWaitingUser), WaitingReason: "dsh_recovery_unresolved"},
+		}, wantErr: true},
+		{name: "non-200 client snapshot", snapshots: []browserActivityTaskSnapshotRequest{
+			pc, {Client: "ios", TaskID: taskID, StatusCode: http.StatusForbidden,
+				Status: string(task.StatusWaitingUser), WaitingReason: "approval_required"},
+		}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := verifyApprovalClientSnapshots(test.snapshots, taskID)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("verifyApprovalClientSnapshots() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestVerifyApprovalResumeClientSnapshots(t *testing.T) {
+	taskID := "t1234567"
+	pc := browserActivityTaskSnapshotRequest{Client: "browser", TaskID: taskID, StatusCode: http.StatusOK,
+		Status: string(task.StatusCompleted)}
+	ios := browserActivityTaskSnapshotRequest{Client: "ios", TaskID: taskID, StatusCode: http.StatusOK,
+		Status: string(task.StatusCompleted)}
+	for _, test := range []struct {
+		name      string
+		snapshots []browserActivityTaskSnapshotRequest
+		wantErr   bool
+	}{
+		{name: "both clients read completed Task", snapshots: []browserActivityTaskSnapshotRequest{pc, ios}},
+		{name: "missing PC", snapshots: []browserActivityTaskSnapshotRequest{ios}, wantErr: true},
+		{name: "missing iOS", snapshots: []browserActivityTaskSnapshotRequest{pc}, wantErr: true},
+		{name: "different Task", snapshots: []browserActivityTaskSnapshotRequest{
+			pc, {Client: "ios", TaskID: "t7654321", StatusCode: http.StatusOK, Status: string(task.StatusCompleted)},
+		}, wantErr: true},
+		{name: "still waiting", snapshots: []browserActivityTaskSnapshotRequest{
+			pc, {Client: "ios", TaskID: taskID, StatusCode: http.StatusOK,
+				Status: string(task.StatusWaitingUser), WaitingReason: "approval_required"},
+		}, wantErr: true},
+		{name: "latest read failed", snapshots: []browserActivityTaskSnapshotRequest{
+			pc, ios, {Client: "ios", TaskID: taskID, StatusCode: http.StatusUnauthorized},
+		}, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			err := verifyApprovalResumeClientSnapshots(test.snapshots, taskID)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("verifyApprovalResumeClientSnapshots() error = %v, wantErr %t", err, test.wantErr)
+			}
+		})
+	}
 }
 
 func (a *browserAcceptanceActivity) disconnect(name string) error {
@@ -2697,14 +4109,32 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 	if scenario == "target-control" {
 		return a.verifyTargetControl(ctx)
 	}
-	if scenario == "failed" || scenario == "approval" {
+	if scenario == "clarification" {
+		return a.verifyClarificationOutcome(ctx)
+	}
+	if scenario == "approval-resume" {
+		return a.verifyApprovalResumeOutcome(ctx)
+	}
+	if scenario == "approval-revoked" || scenario == "approval-host-member-revoked" {
+		return a.verifyApprovalRevokedOutcome(ctx, scenario)
+	}
+	if scenario == "completion-race" {
+		if err := a.verifyCompletionRace(ctx); err != nil {
+			return err
+		}
+		return a.verifyCompletionRaceOutcome(ctx)
+	}
+	if scenario == "failed" || scenario == "approval" || scenario == "recovery-unknown" {
 		return a.verifyAcceptedOutcome(ctx, scenario)
 	}
 	if scenario == "mcp-retry" {
-		return a.verifyMCPRetryAccepted(ctx)
+		return a.verifyMCPRetrySucceeded(ctx)
 	}
 	if scenario == "route-retry" {
 		return a.verifyRouteRetryAccepted(ctx)
+	}
+	if scenario == "interrupted" {
+		return a.verifyInterrupted(ctx)
 	}
 	var names []string
 	switch scenario {
@@ -2716,6 +4146,8 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 		names = []string{"search"}
 	case "stream":
 		names = []string{"stream", "stream-other"}
+	case "queued":
+		names = []string{"queued"}
 	default:
 		return errors.New("unknown synthetic verification")
 	}
@@ -2792,12 +4224,26 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 			}
 		}
 	}
-	if scenario == "search" {
+	if scenario == "search" || scenario == "queued" {
 		run := runs[0]
 		message := matched[run.TaskID]
-		if counts[run.TaskID] != 1 || message.ID == "" || len(message.Sources) != 1 ||
-			!strings.Contains(message.Content, browserActivitySearchResult) {
-			return errors.New("fixed local search result is missing, duplicated or detached from its task")
+		wantContent := browserActivityResult(run.Name, run.Objective)
+		if scenario == "search" {
+			wantContent = browserActivitySearchResult
+		}
+		if counts[run.TaskID] != 1 || message.ID == "" || len(message.Sources) != 1 || !strings.Contains(message.Content, wantContent) {
+			if scenario == "search" {
+				return errors.New("fixed local search result is missing, duplicated or detached from its task")
+			}
+			return errors.New("queued Task result is missing, duplicated or detached from its task")
+		}
+		if scenario == "search" && os.Getenv("MORDE_BROWSER_ACTIVITY_VALIDATION_PREVIEW") == "1" {
+			a.mu.Lock()
+			injected := a.validationPreviewInjected
+			a.mu.Unlock()
+			if !injected {
+				return errors.New("PC did not load the local validation evidence preview")
+			}
 		}
 		return nil
 	}
@@ -2815,6 +4261,222 @@ func (a *browserAcceptanceActivity) verifyResult(ctx context.Context, scenario s
 		return errors.New("results outside the grouping window were not published separately")
 	}
 	return nil
+}
+
+func (a *browserAcceptanceActivity) verifyCompletionRace(ctx context.Context) error {
+	a.mu.Lock()
+	run := a.runs["completion-race"]
+	if run == nil || run.stage != "completed" || !run.completionRejected || run.completionCandidate == "" ||
+		run.completionSteerMessageID == "" || run.current.ID == "" {
+		stage := "missing"
+		if run != nil {
+			stage = run.stage
+		}
+		a.mu.Unlock()
+		return fmt.Errorf("completion-race Task has not reached its fenced completion stage (stage=%s)", stage)
+	}
+	current, originalMessageID, steerMessageID, resultEventSequence := run.current, run.userMessageID,
+		run.completionSteerMessageID, run.resultEventSequence
+	a.mu.Unlock()
+	details, err := a.store.GetTask(ctx, current.ID, current.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read completed completion-race Task: %w", err)
+	}
+	if details.Task.Status != task.StatusCompleted || details.Task.Result != browserActivityCompletionRaceResult ||
+		strings.Contains(details.Task.Result, "STALE") || resultEventSequence < 1 {
+		return fmt.Errorf("completion-race result status/content/sequence mismatch: %s/%q/%d",
+			details.Task.Status, details.Task.Result, resultEventSequence)
+	}
+	var routedTaskID, deliveryStatus, deliveryMode, routeState string
+	if err := a.store.pool.QueryRow(ctx, `SELECT COALESCE(message.task_id,''),message.delivery_status,message.delivery_mode,route.state
+FROM conversation_messages message JOIN conversation_message_routes route ON route.message_id=message.id
+WHERE message.id=$1 AND message.owner_id=$2 AND message.conversation_id=$3 AND message.role='user'`,
+		steerMessageID, current.OwnerID, a.conversationID).Scan(&routedTaskID, &deliveryStatus, &deliveryMode, &routeState); err != nil ||
+		routedTaskID != current.ID || deliveryStatus != "applied" || deliveryMode != string(app.AgentMessageDeliverySteer) || routeState != "routed" {
+		if err != nil {
+			return fmt.Errorf("steer was not applied to the original Task: %w", err)
+		}
+		return fmt.Errorf("steer was not applied to the original Task: task=%q delivery=%s/%s route=%s",
+			routedTaskID, deliveryStatus, deliveryMode, routeState)
+	}
+	var independentMessageID, independentTaskID, independentDelivery, independentRoute string
+	err = a.store.pool.QueryRow(ctx, `SELECT message.id,COALESCE(message.task_id,''),message.delivery_status,route.state
+FROM conversation_messages message JOIN conversation_message_routes route ON route.message_id=message.id
+WHERE message.owner_id=$1 AND message.conversation_id=$2 AND message.role='user' AND message.content=$3`,
+		current.OwnerID, a.conversationID, browserActivityCompletionRaceIndependent).Scan(&independentMessageID,
+		&independentTaskID, &independentDelivery, &independentRoute)
+	if err != nil {
+		return fmt.Errorf("read independent request route: %w", err)
+	}
+	if independentTaskID == "" || independentTaskID == current.ID || independentDelivery != "applied" || independentRoute != "routed" {
+		return fmt.Errorf("independent request was not routed to a separate Task: message=%q task=%q delivery=%s route=%s",
+			independentMessageID, independentTaskID, independentDelivery, independentRoute)
+	}
+	independentDetails, err := a.store.GetTask(ctx, independentTaskID, current.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read independent completion-race Task: %w", err)
+	}
+	if independentDetails.Task.Status != task.StatusCompleted ||
+		independentDetails.Task.Result != "本地验收回复："+browserActivityCompletionRaceIndependent {
+		return fmt.Errorf("independent Task result was changed by the first Task: status=%s result=%q",
+			independentDetails.Task.Status, independentDetails.Task.Result)
+	}
+	page, err := a.store.ListMessages(ctx, current.InitiatorID, a.conversationID, app.PageRequest{Limit: 100})
+	if err != nil {
+		return fmt.Errorf("read completion-race conversation results: %w", err)
+	}
+	resultMessages := make(map[string]conversation.Message, 2)
+	resultCounts := map[string]int{current.ID: 0, independentTaskID: 0}
+	for _, message := range page.Items {
+		if message.Role != conversation.RoleAssistant {
+			continue
+		}
+		for _, source := range message.Sources {
+			if source.TaskID != current.ID && source.TaskID != independentTaskID {
+				continue
+			}
+			resultCounts[source.TaskID]++
+			if source.TaskID == current.ID && (message.ID == "" || len(message.Sources) != 1 ||
+				source.UserMessageID != originalMessageID || source.TaskRevision != 0 || source.EventSequence != resultEventSequence ||
+				source.Content != browserActivityCompletionRaceResult || !strings.Contains(message.Content, browserActivityCompletionRaceResult)) {
+				return errors.New("original Task result source is stale or detached")
+			}
+			if source.TaskID == independentTaskID && (message.ID == "" || len(message.Sources) != 1 ||
+				source.UserMessageID != independentMessageID || source.TaskRevision != 0 ||
+				source.Content != independentDetails.Task.Result || !strings.Contains(message.Content, independentDetails.Task.Result)) {
+				return errors.New("independent Task result source is detached or mixed")
+			}
+			resultMessages[source.TaskID] = message
+		}
+		if strings.Contains(message.Content, "STALE COMPLETION RESULT") {
+			return errors.New("stale completion candidate was published to the conversation")
+		}
+	}
+	if resultCounts[current.ID] != 1 || resultCounts[independentTaskID] != 1 ||
+		resultMessages[current.ID].ID == "" || resultMessages[independentTaskID].ID == "" ||
+		resultMessages[current.ID].ID == resultMessages[independentTaskID].ID {
+		return fmt.Errorf("Task results were missing, duplicated or combined: original=%d/%q independent=%d/%q",
+			resultCounts[current.ID], resultMessages[current.ID].ID, resultCounts[independentTaskID], resultMessages[independentTaskID].ID)
+	}
+	return nil
+}
+
+func (a *browserAcceptanceActivity) verifyCompletionRaceOutcome(ctx context.Context) error {
+	a.mu.Lock()
+	run := a.runs["completion-race"]
+	if run == nil {
+		a.mu.Unlock()
+		return errors.New("completion-race scenario is missing")
+	}
+	current, steerMessageID, stage := run.current, run.completionSteerMessageID, run.stage
+	completionRejected := run.completionRejected
+	a.mu.Unlock()
+	if stage != "completed" || !completionRejected {
+		return fmt.Errorf("completion-race has not reached a fenced completed result (stage=%s)", stage)
+	}
+	details, err := a.store.GetTask(ctx, current.ID, current.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read completion-race Task: %w", err)
+	}
+	if details.Task.Status != task.StatusCompleted || details.Task.Result != browserActivityCompletionRaceResult ||
+		!domain.ValidMessageID(steerMessageID) {
+		return errors.New("completion-race Task did not preserve the steered final result")
+	}
+	var resultEvents, correctResultEvents, steerMessages int
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*),count(*) FILTER (WHERE payload->>'result'=$2)
+FROM task_events WHERE task_id=$1 AND event_type='task.result'`, current.ID, browserActivityCompletionRaceResult).
+		Scan(&resultEvents, &correctResultEvents); err != nil {
+		return fmt.Errorf("read completion-race result events: %w", err)
+	}
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages message
+JOIN conversation_message_routes route ON route.message_id=message.id
+WHERE message.id=$1 AND message.task_id=$2 AND message.role='user' AND message.content=$3
+ AND message.delivery_status='applied' AND route.state='routed'`, steerMessageID, current.ID, browserActivityCompletionRaceSteer).Scan(&steerMessages); err != nil {
+		return fmt.Errorf("read applied completion-race steer: %w", err)
+	}
+	if resultEvents != 1 || correctResultEvents != 1 || steerMessages != 1 {
+		return fmt.Errorf("completion-race final evidence is inconsistent: result_events=%d correct_results=%d applied_steers=%d",
+			resultEvents, correctResultEvents, steerMessages)
+	}
+	page, err := a.store.ListMessages(ctx, current.InitiatorID, a.conversationID, app.PageRequest{Limit: 100})
+	if err != nil {
+		return fmt.Errorf("read completion-race delivered result: %w", err)
+	}
+	matchingResults := 0
+	for _, message := range page.Items {
+		if message.Role != conversation.RoleAssistant {
+			continue
+		}
+		for _, source := range message.Sources {
+			if source.TaskID != current.ID {
+				continue
+			}
+			if source.Content != browserActivityCompletionRaceResult || !strings.Contains(message.Content, browserActivityCompletionRaceResult) ||
+				strings.Contains(message.Content, "STALE COMPLETION RESULT") {
+				return errors.New("stale completion candidate escaped into the delivered Task result")
+			}
+			matchingResults++
+		}
+	}
+	if matchingResults != 1 {
+		return fmt.Errorf("completion-race delivered %d Task-linked result facts, want one", matchingResults)
+	}
+	return nil
+}
+
+func (a *browserAcceptanceActivity) verifyInterrupted(ctx context.Context) error {
+	a.mu.Lock()
+	run := a.runs["interrupted"]
+	if run == nil {
+		a.mu.Unlock()
+		return errors.New("interrupted scenario is missing")
+	}
+	current, messageID, stage, failure, stopStatus := run.current, run.streamMessageID, run.stage, run.failure, run.stopStatus
+	messages := append([]browserActivityMessageSnapshotRequest(nil), a.messageSnapshots...)
+	a.mu.Unlock()
+	if stage != "interrupted" {
+		if failure != "" {
+			return fmt.Errorf("interrupted scenario has not reached the cancelled stage: %s", failure)
+		}
+		return fmt.Errorf("interrupted scenario has not reached the cancelled stage (stage=%s)", stage)
+	}
+	if current.ID == "" || messageID == "" {
+		return errors.New("interrupted scenario is missing its Task or assistant message identity")
+	}
+	var taskStatus string
+	if err := a.store.pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id=$1 AND initiator_id=$2`,
+		current.ID, current.InitiatorID).Scan(&taskStatus); err != nil {
+		return fmt.Errorf("read interrupted Task status: %w", err)
+	}
+	if taskStatus != string(task.StatusCancelling) && taskStatus != string(task.StatusCancelled) {
+		return fmt.Errorf("interrupted Task status=%s, want cancelling or cancelled", taskStatus)
+	}
+	var taskID, content, outputStatus string
+	var revision int64
+	if err := a.store.pool.QueryRow(ctx, `SELECT task_id,content,output_status,output_task_revision
+FROM conversation_messages WHERE id=$1`, messageID).Scan(&taskID, &content, &outputStatus, &revision); err != nil {
+		return fmt.Errorf("read cancelled assistant message: %w", err)
+	}
+	var snapshotMessageID, snapshotContent, snapshotStatus string
+	var snapshotRevision int64
+	if err := a.store.pool.QueryRow(ctx, `SELECT message_id,content,status,task_revision
+FROM task_assistant_message_snapshots WHERE task_id=$1`, current.ID).
+		Scan(&snapshotMessageID, &snapshotContent, &snapshotStatus, &snapshotRevision); err != nil {
+		return fmt.Errorf("read cancelled assistant message snapshot: %w", err)
+	}
+	var finalResultEvents int
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1 AND event_type='task.result'`, current.ID).
+		Scan(&finalResultEvents); err != nil {
+		return fmt.Errorf("count final result events after cancel: %w", err)
+	}
+	if taskID != current.ID || taskStatus != stopStatus && taskStatus != string(task.StatusCancelled) ||
+		content != browserActivityStreamPrefix || outputStatus != string(conversation.OutputInterrupted) ||
+		snapshotMessageID != messageID || snapshotContent != content || snapshotStatus != outputStatus ||
+		snapshotRevision != revision || finalResultEvents != 0 {
+		return fmt.Errorf("cancelled stream evidence mismatch: task=%s task_status=%s content=%q output_status=%s snapshot=%s/%q/%s result_events=%d",
+			taskID, taskStatus, content, outputStatus, snapshotMessageID, snapshotContent, snapshotStatus, finalResultEvents)
+	}
+	return verifyInterruptedMessageSnapshots(messages, current.ID, messageID)
 }
 
 func (a *browserAcceptanceActivity) verifyTargetControl(ctx context.Context) error {
@@ -2863,9 +4525,60 @@ func (a *browserAcceptanceActivity) verifyTargetControl(ctx context.Context) err
 	return nil
 }
 
+func (a *browserAcceptanceActivity) verifyClarificationOutcome(ctx context.Context) error {
+	a.mu.Lock()
+	run := a.runs["clarification"]
+	if run == nil {
+		a.mu.Unlock()
+		return errors.New("clarification scenario is missing")
+	}
+	stage := run.stage
+	if stage != "completed" {
+		a.mu.Unlock()
+		return a.verifyAcceptedOutcome(ctx, "clarification")
+	}
+	current, userMessageID, answer, resultEventSequence := run.current, run.userMessageID, run.clarificationAnswer, run.resultEventSequence
+	a.mu.Unlock()
+
+	details, err := a.store.GetTask(ctx, current.ID, current.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read completed clarification Task: %w", err)
+	}
+	if details.Task.Status != task.StatusCompleted || len(details.ClarificationRequests) != 1 ||
+		details.ClarificationRequests[0].Status != task.ClarificationAnswered ||
+		details.ClarificationRequests[0].Answer != browserActivityClarificationAnswer || answer != browserActivityClarificationAnswer ||
+		!strings.Contains(details.Task.Result, answer) || resultEventSequence < 1 {
+		return errors.New("completed clarification Task does not preserve the submitted answer and result")
+	}
+	page, err := a.store.ListMessages(ctx, current.InitiatorID, a.conversationID, app.PageRequest{Limit: 100})
+	if err != nil {
+		return fmt.Errorf("read clarification result message: %w", err)
+	}
+	matchingResults := 0
+	for _, message := range page.Items {
+		if message.Role != conversation.RoleAssistant {
+			continue
+		}
+		for _, source := range message.Sources {
+			if source.TaskID != current.ID {
+				continue
+			}
+			if source.UserMessageID != userMessageID || source.TaskRevision != 0 || source.EventSequence != resultEventSequence ||
+				source.Content != details.Task.Result || !strings.Contains(message.Content, details.Task.Result) {
+				return errors.New("clarification result is detached from its answered Task revision")
+			}
+			matchingResults++
+		}
+	}
+	if matchingResults != 1 {
+		return fmt.Errorf("expected one original-session clarification result, got %d", matchingResults)
+	}
+	return nil
+}
+
 func (a *browserAcceptanceActivity) verifyAcceptedOutcome(ctx context.Context, scenario string) error {
 	wantStage, wantStatus := "failed", task.StatusFailed
-	if scenario == "approval" {
+	if scenario == "approval" || scenario == "clarification" || scenario == "recovery-unknown" {
 		wantStage, wantStatus = "waiting_user", task.StatusWaitingUser
 	}
 	a.mu.Lock()
@@ -2878,7 +4591,7 @@ func (a *browserAcceptanceActivity) verifyAcceptedOutcome(ctx context.Context, s
 		a.mu.Unlock()
 		return fmt.Errorf("scenario %s has not reached %s (stage %s)", scenario, wantStage, stage)
 	}
-	current, userMessageID := run.current, run.userMessageID
+	current, userMessageID, progressStepID := run.current, run.userMessageID, run.progressStepID
 	a.mu.Unlock()
 
 	details, err := a.store.GetTask(ctx, current.ID, current.InitiatorID)
@@ -2893,14 +4606,56 @@ func (a *browserAcceptanceActivity) verifyAcceptedOutcome(ctx context.Context, s
 		if details.PendingRequest != nil {
 			return errors.New("failed task unexpectedly has a pending approval request")
 		}
-	} else if details.Task.WaitingReason != "approval_required" || details.PendingRequest == nil ||
+	} else if scenario == "approval" && (details.Task.WaitingReason != "approval_required" || details.PendingRequest == nil ||
 		!domain.ValidPendingRequestID(details.PendingRequest.ID) || details.PendingRequest.TaskID != current.ID || details.PendingRequest.Version < 1 ||
 		details.PendingRequest.Kind != "approval" || details.PendingRequest.Status != task.PendingRequestPending ||
 		details.PendingRequest.Decision != "" || len(details.PendingRequest.RequestHash) != sha256.Size ||
 		details.PendingRequest.RuntimeGeneration < 0 || details.PendingRequest.RuntimeInstanceID == "" ||
 		details.PendingRequest.ControlVersion < 0 || details.PendingRequest.CallID == "" || details.PendingRequest.ToolName == "" ||
-		details.PendingRequest.ExpiresAt != nil && !details.PendingRequest.ExpiresAt.After(time.Now()) {
+		details.PendingRequest.ExpiresAt != nil && !details.PendingRequest.ExpiresAt.After(time.Now())) {
 		return errors.New("waiting task does not have a valid active approval request")
+	} else if scenario == "clarification" {
+		if details.Task.WaitingReason != "clarification_required" || len(details.ClarificationRequests) != 1 {
+			return errors.New("waiting task does not have one active clarification request")
+		}
+		request := details.ClarificationRequests[0]
+		if !domain.ValidPendingRequestID(request.ID) || request.TaskID != current.ID || request.Version != 1 ||
+			request.ModelStepID == "" || request.CallID == "" || request.Question != "请告诉我应该把报告保存到哪个目录？" ||
+			request.Status != task.ClarificationPending || request.Answer != "" {
+			return errors.New("persisted clarification request is incomplete or not pending")
+		}
+		var currentStep *task.Step
+		for i := range details.Steps {
+			if details.Steps[i].ID == details.Task.CurrentStep {
+				currentStep = &details.Steps[i]
+				break
+			}
+		}
+		if currentStep == nil || currentStep.Kind != "clarification" || currentStep.Status != task.StepWaitingUser {
+			return errors.New("clarification task does not point to its waiting work item")
+		}
+	} else if scenario == "recovery-unknown" {
+		if details.Task.WaitingReason != "dsh_recovery_unresolved" || details.PendingRequest != nil || len(details.ClarificationRequests) != 0 ||
+			!strings.Contains(details.Task.Result, "恢复检查无法确认上一轮响应是否完成") {
+			return errors.New("recovery-unknown task did not preserve its unresolved state without inventing a request")
+		}
+		var currentStep, lastConfirmedStep *task.Step
+		for i := range details.Steps {
+			if details.Steps[i].ID == details.Task.CurrentStep {
+				currentStep = &details.Steps[i]
+			}
+			if details.Steps[i].ID == progressStepID {
+				lastConfirmedStep = &details.Steps[i]
+			}
+		}
+		if lastConfirmedStep == nil || lastConfirmedStep.Sequence != 2 || lastConfirmedStep.Kind != "progress" ||
+			lastConfirmedStep.Status != task.StepSucceeded || lastConfirmedStep.Summary != "合成文字处理完成。" {
+			return errors.New("recovery-unknown task is missing its last confirmed successful work item")
+		}
+		if currentStep == nil || currentStep.Kind != "progress" || currentStep.Status != task.StepUnknown ||
+			!strings.Contains(currentStep.Summary, "无法确认上次响应是否完整") {
+			return errors.New("recovery-unknown task does not point to a clearly unknown progress step")
+		}
 	}
 	page, err := a.store.ListMessages(ctx, current.InitiatorID, a.conversationID, app.PageRequest{Limit: 100})
 	if err != nil {
@@ -2910,28 +4665,243 @@ func (a *browserAcceptanceActivity) verifyAcceptedOutcome(ctx context.Context, s
 		if message.ID == userMessageID && message.TaskID == current.ID && message.Role == conversation.RoleUser &&
 			message.AgentAcknowledged && message.RoutingStatus == conversation.RoutingRouted &&
 			message.DeliveryStatus == conversation.DeliveryApplied {
+			if scenario == browserActivityCrossClientScenario() {
+				a.mu.Lock()
+				snapshots := append([]browserActivityTaskSnapshotRequest(nil), a.taskSnapshots...)
+				a.mu.Unlock()
+				switch scenario {
+				case "approval":
+					return verifyApprovalClientSnapshots(snapshots, current.ID)
+				case "recovery-unknown":
+					return verifyRecoveryUnknownClientSnapshots(snapshots, current.ID)
+				}
+			}
 			return nil
 		}
 	}
 	return errors.New("synthetic route was not persisted with agent_acknowledged=true")
 }
 
-func (a *browserAcceptanceActivity) verifyMCPRetryAccepted(ctx context.Context) error {
+func (a *browserAcceptanceActivity) verifyApprovalResumeOutcome(ctx context.Context) error {
+	a.mu.Lock()
+	run := a.runs["approval-resume"]
+	if run == nil {
+		a.mu.Unlock()
+		return errors.New("approval-resume scenario is missing")
+	}
+	current, userMessageID := run.current, run.userMessageID
+	resultEventSequence := run.resultEventSequence
+	approvalID, approvalVersion, approvalCallID := run.approvalID, run.approvalVersion, run.approvalCallID
+	approvalRequestHash := append([]byte(nil), run.approvalRequestHash...)
+	resumeCount, stage := run.approvalResumeCount, run.stage
+	snapshots := append([]browserActivityTaskSnapshotRequest(nil), a.taskSnapshots...)
+	a.mu.Unlock()
+	if stage != "completed" {
+		return fmt.Errorf("approval-resume scenario has not reached completed (stage %s)", stage)
+	}
+	if resumeCount != 1 || !domain.ValidPendingRequestID(approvalID) || approvalVersion < 1 ||
+		approvalCallID == "" || len(approvalRequestHash) != sha256.Size {
+		return fmt.Errorf("approval continuation state stage=%s resumes=%d approval=%s/%d call=%s hash_bytes=%d",
+			stage, resumeCount, approvalID, approvalVersion, approvalCallID, len(approvalRequestHash))
+	}
+
+	details, err := a.store.GetTask(ctx, current.ID, current.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read completed approval-resume Task: %w", err)
+	}
+	pending := details.PendingRequest
+	if details.Task.ID != current.ID || details.Task.Status != task.StatusCompleted || details.Task.WaitingReason != "" ||
+		pending == nil || pending.ID != approvalID || pending.Version != approvalVersion ||
+		pending.Status != task.PendingRequestApproved || pending.Decision != task.PendingDecisionApprove ||
+		pending.CallID != approvalCallID || !bytes.Equal(pending.RequestHash, approvalRequestHash) {
+		return errors.New("completed Task is not bound to the exact approved request")
+	}
+	var completedStep *task.Step
+	for i := range details.Steps {
+		if details.Steps[i].ID == details.Task.CurrentStep {
+			completedStep = &details.Steps[i]
+			break
+		}
+	}
+	if completedStep == nil || completedStep.Status != task.StepSucceeded || completedStep.Kind != "result" ||
+		completedStep.Title != "处理完成" || details.Task.Result != browserActivityApprovalResumeResult {
+		return errors.New("approval-resume Task did not finish its explicit local synthetic continuation")
+	}
+
+	events, err := a.store.ListTaskEvents(ctx, current.InitiatorID, current.ID, 0, 100)
+	if err != nil {
+		return fmt.Errorf("read approval-resume Task events: %w", err)
+	}
+	responseEvents, resultEvents := 0, 0
+	for _, event := range events {
+		switch event.Type {
+		case "task.response":
+			responseEvents++
+			var response struct {
+				PendingID      string `json:"pending_id"`
+				PendingVersion int64  `json:"pending_version"`
+				Decision       string `json:"decision"`
+				Status         string `json:"status"`
+			}
+			if err := json.Unmarshal(event.Payload, &response); err != nil || response.PendingID != approvalID ||
+				response.PendingVersion != approvalVersion || response.Decision != string(task.PendingDecisionApprove) ||
+				response.Status != string(task.StatusQueued) {
+				return errors.New("approval response event does not match the approved request identity")
+			}
+		case "task.result":
+			resultEvents++
+			var result struct {
+				Status          task.StepStatus `json:"status"`
+				Result          string          `json:"result"`
+				StepID          string          `json:"step_id"`
+				ApprovalID      string          `json:"approval_id"`
+				ApprovalVersion int64           `json:"approval_version"`
+				CallID          string          `json:"call_id"`
+			}
+			if err := json.Unmarshal(event.Payload, &result); err != nil || result.Status != task.StepSucceeded ||
+				result.Result != browserActivityApprovalResumeResult || result.StepID != details.Task.CurrentStep ||
+				result.ApprovalID != approvalID || result.ApprovalVersion != approvalVersion || result.CallID != approvalCallID {
+				return errors.New("completion event does not match the approved request identity")
+			}
+		}
+	}
+	if responseEvents != 1 || resultEvents != 1 {
+		return fmt.Errorf("approval-resume Task events contain %d approval responses and %d results, want one each", responseEvents, resultEvents)
+	}
+	page, err := a.store.ListMessages(ctx, current.InitiatorID, a.conversationID, app.PageRequest{Limit: 100})
+	if err != nil {
+		return fmt.Errorf("read approval-resume accepted route: %w", err)
+	}
+	accepted := false
+	assistantMessageIDs := make([]string, 0, len(page.Items))
+	for _, message := range page.Items {
+		if message.ID == userMessageID && message.TaskID == current.ID && message.Role == conversation.RoleUser &&
+			message.AgentAcknowledged && message.RoutingStatus == conversation.RoutingRouted &&
+			message.DeliveryStatus == conversation.DeliveryApplied {
+			accepted = true
+		}
+		if message.Role == conversation.RoleAssistant && message.DeliveryStatus == conversation.DeliveryApplied {
+			assistantMessageIDs = append(assistantMessageIDs, message.ID)
+		}
+	}
+	if !accepted {
+		return errors.New("approval-resume Task is missing its persisted accepted user message")
+	}
+	resultSources, err := a.store.ListConversationResultSources(ctx, current.InitiatorID, a.conversationID, assistantMessageIDs)
+	if err != nil {
+		return fmt.Errorf("read approval-resume published result provenance: %w", err)
+	}
+	approvalResultSources := 0
+	for _, sources := range resultSources {
+		for _, source := range sources {
+			if source.TaskID != current.ID {
+				continue
+			}
+			if source.UserMessageID != userMessageID || source.Content != browserActivityApprovalResumeResult ||
+				source.EventSequence != resultEventSequence {
+				return errors.New("published assistant result is not bound to the completed approval-resume Task result")
+			}
+			approvalResultSources++
+		}
+	}
+	if approvalResultSources != 1 {
+		return fmt.Errorf("approval-resume Task has %d published assistant result sources, want one", approvalResultSources)
+	}
+	return verifyApprovalResumeClientSnapshots(snapshots, current.ID)
+}
+
+func (a *browserAcceptanceActivity) verifyApprovalRevokedOutcome(ctx context.Context, scenario string) error {
+	a.mu.Lock()
+	run := a.runs[scenario]
+	if run == nil {
+		a.mu.Unlock()
+		return fmt.Errorf("%s scenario is missing", scenario)
+	}
+	current, userMessageID := run.current, run.userMessageID
+	approvalID, approvalVersion := run.approvalID, run.approvalVersion
+	hostID, hostOwnerID := run.revocationHostID, run.revocationHostOwnerID
+	stage := run.stage
+	snapshots := append([]browserActivityTaskSnapshotRequest(nil), a.taskSnapshots...)
+	a.mu.Unlock()
+	if stage != "revoked" || !domain.ValidPendingRequestID(approvalID) || approvalVersion < 1 {
+		return fmt.Errorf("approval authorization revocation is incomplete: scenario=%s stage=%s approval=%s/%d", scenario, stage, approvalID, approvalVersion)
+	}
+	details, err := a.store.GetTask(ctx, current.ID, current.InitiatorID)
+	if err != nil {
+		return fmt.Errorf("read authorization-fenced approval Task: %w", err)
+	}
+	if details.Task.Status != task.StatusCancelling && details.Task.Status != task.StatusCancelled {
+		return fmt.Errorf("revoked approval Task status=%s, want cancelling or cancelled", details.Task.Status)
+	}
+	if scenario == "approval-host-member-revoked" && (hostID == "" || hostOwnerID == "" || details.Task.HostID != hostID) {
+		return fmt.Errorf("revoked approval Task Host=%q, fixture Host=%q owner=%q; want matching shared Host target", details.Task.HostID, hostID, hostOwnerID)
+	}
+	if details.Task.WaitingReason != "" || details.PendingRequest == nil || details.PendingRequest.ID != approvalID ||
+		details.PendingRequest.Version != approvalVersion || details.PendingRequest.Status != task.PendingRequestCancelled ||
+		details.StopRequest == nil || details.StopRequest.Action != task.ActionCancel {
+		return errors.New("authorization fence did not clear the wait, cancel the exact approval, and persist a stop request")
+	}
+	if details.Task.Status == task.StatusCancelling && details.StopRequest.Status != task.StopRequestPending ||
+		details.Task.Status == task.StatusCancelled && details.StopRequest.Status != task.StopRequestCompleted {
+		return fmt.Errorf("revoked approval stop request status=%s does not match Task status=%s", details.StopRequest.Status, details.Task.Status)
+	}
+	var hostOperations, connectorOperations, resultEvents int
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_operations WHERE task_id=$1`, current.ID).Scan(&hostOperations); err != nil {
+		return fmt.Errorf("count dispatched Host operations after approval revocation: %w", err)
+	}
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_mcp_connector_operations WHERE task_id=$1`, current.ID).Scan(&connectorOperations); err != nil {
+		return fmt.Errorf("count connector operations after approval revocation: %w", err)
+	}
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1 AND event_type='task.result'`, current.ID).Scan(&resultEvents); err != nil {
+		return fmt.Errorf("count Task result events after approval revocation: %w", err)
+	}
+	if hostOperations != 0 || connectorOperations != 0 || resultEvents != 0 {
+		return fmt.Errorf("revoked approval created work or a completion: Host operations=%d connector operations=%d result events=%d",
+			hostOperations, connectorOperations, resultEvents)
+	}
+	page, err := a.store.ListMessages(ctx, current.InitiatorID, a.conversationID, app.PageRequest{Limit: 100})
+	if err != nil {
+		return fmt.Errorf("read revoked approval Task's accepted route: %w", err)
+	}
+	accepted := false
+	for _, message := range page.Items {
+		if message.ID == userMessageID && message.TaskID == current.ID && message.Role == conversation.RoleUser &&
+			message.AgentAcknowledged && message.RoutingStatus == conversation.RoutingRouted &&
+			message.DeliveryStatus == conversation.DeliveryApplied {
+			accepted = true
+			break
+		}
+	}
+	if !accepted {
+		return errors.New("revoked approval Task is missing its accepted user message")
+	}
+	a.mu.Lock()
+	run.stopStatus = string(details.Task.Status)
+	a.mu.Unlock()
+	return verifyCrossClientTaskSnapshots(snapshots, current.ID, string(details.Task.Status), "")
+}
+
+func (a *browserAcceptanceActivity) verifyMCPRetrySucceeded(ctx context.Context) error {
 	a.mu.Lock()
 	run := a.runs["mcp-retry"]
 	if run == nil {
 		a.mu.Unlock()
 		return errors.New("MCP retry scenario is missing")
 	}
-	current, sourceStepID := run.current, run.mcpRetrySourceStepID
+	current, sourceStepID, retryCallID := run.current, run.mcpRetrySourceStepID, run.mcpRetryCallID
+	stage, dispatchCount := run.stage, run.mcpRetryDispatchCount
 	a.mu.Unlock()
+	if stage != "retry_succeeded" {
+		return fmt.Errorf("MCP retry has not reached successful completion (stage=%s)", stage)
+	}
 	details, err := a.store.GetTask(ctx, current.ID, current.OwnerID)
 	if err != nil {
-		return fmt.Errorf("read retried MCP Task: %w", err)
+		return fmt.Errorf("read completed MCP retry Task: %w", err)
 	}
-	if details.Task.Status != task.StatusRunning ||
-		!domain.ValidStepID(sourceStepID) || !domain.ValidStepID(details.Task.CurrentStep) {
-		return fmt.Errorf("retried Task state/current step=%s/%s, want a running Task at the reserved retry step", details.Task.Status, details.Task.CurrentStep)
+	if details.Task.Status != task.StatusCompleted || details.Task.Result != "本地合成连接器在用户显式重试后成功。" ||
+		!domain.ValidStepID(sourceStepID) ||
+		!domain.ValidStepID(details.Task.CurrentStep) || retryCallID == "" {
+		return fmt.Errorf("MCP retry Task state/current step=%s/%s, want a completed Task at the retry step", details.Task.Status, details.Task.CurrentStep)
 	}
 	var source, attempt *task.Step
 	for i := range details.Steps {
@@ -2944,27 +4914,50 @@ func (a *browserAcceptanceActivity) verifyMCPRetryAccepted(ctx context.Context) 
 		}
 	}
 	if source == nil || attempt == nil || source.Status != task.StepFailed || source.FailureReason != "connector_rate_limited" ||
-		!source.Retryable || attempt.RetryOfStepID != source.ID || attempt.Attempt != 2 ||
-		(attempt.Status != task.StepQueued && attempt.Status != task.StepRunning) {
+		!source.Retryable || attempt.Status != task.StepSucceeded || attempt.RetryOfStepID != source.ID ||
+		attempt.Attempt != 2 || attempt.ToolCallKey != retryCallID || attempt.ToolName != source.ToolName ||
+		!bytes.Equal(attempt.RequestDigest, source.RequestDigest) {
 		return fmt.Errorf("source/retry Task steps are not preserved and linked: source=%+v retry=%+v", source, attempt)
 	}
 	if attempt.ID != details.Task.CurrentStep {
-		return errors.New("running Task current step is not the reserved retry attempt")
+		return errors.New("completed Task current step is not the successful retry attempt")
 	}
-	var attemptCount, operationCount int
+	var attemptCount, operationCount, sourceOperationCount, successfulRetryOperationCount, retryOperationCount int
 	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_steps WHERE task_id=$1 AND retry_of_step_id=$2`, current.ID, source.ID).Scan(&attemptCount); err != nil {
-		return fmt.Errorf("count reserved MCP retry attempts: %w", err)
+		return fmt.Errorf("count successful MCP retry attempts: %w", err)
 	}
-	if err := a.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_mcp_connector_operations WHERE task_id=$1 AND call_id=$2`,
-		current.ID, source.ToolCallKey).Scan(&operationCount); err != nil {
-		return fmt.Errorf("count source MCP operation attempts: %w", err)
+	if err := a.store.pool.QueryRow(ctx, `SELECT count(*),
+count(*) FILTER (WHERE call_id=$2 AND status='failed'),
+count(*) FILTER (WHERE call_id=$3 AND status='succeeded'),
+count(*) FILTER (WHERE call_id=$3)
+FROM task_mcp_connector_operations WHERE task_id=$1`, current.ID, source.ToolCallKey, retryCallID).
+		Scan(&operationCount, &sourceOperationCount, &successfulRetryOperationCount, &retryOperationCount); err != nil {
+		return fmt.Errorf("count source and retry MCP operation ledger rows: %w", err)
 	}
-	if attemptCount != 1 || operationCount != 1 {
-		return fmt.Errorf("MCP retry created duplicate attempts or connector calls: retry steps=%d source ledger rows=%d", attemptCount, operationCount)
+	if attemptCount != 1 || operationCount != 2 || sourceOperationCount != 1 || successfulRetryOperationCount != 1 ||
+		retryOperationCount != 1 || dispatchCount != 1 {
+		return fmt.Errorf("MCP retry duplicated or lost an operation: retry steps=%d ledger rows=%d source failures=%d retry successes=%d retry rows=%d synthetic dispatches=%d",
+			attemptCount, operationCount, sourceOperationCount, successfulRetryOperationCount, retryOperationCount, dispatchCount)
 	}
-	a.mu.Lock()
-	run.current, run.stage = details.Task, "retry_claimed"
-	a.mu.Unlock()
+	var sourceStatus, retryStatus, sourceConnectorID, retryConnectorID, retryOperationKey, retryResult string
+	var sourceDigest, retryDigest []byte
+	if err := a.store.pool.QueryRow(ctx, `SELECT status,request_hash,connector_id FROM task_mcp_connector_operations
+WHERE task_id=$1 AND call_id=$2`, current.ID, source.ToolCallKey).
+		Scan(&sourceStatus, &sourceDigest, &sourceConnectorID); err != nil {
+		return fmt.Errorf("read source MCP failure ledger: %w", err)
+	}
+	if err := a.store.pool.QueryRow(ctx, `SELECT status,request_hash,connector_id,operation_key,result
+FROM task_mcp_connector_operations WHERE task_id=$1 AND call_id=$2`, current.ID, retryCallID).
+		Scan(&retryStatus, &retryDigest, &retryConnectorID, &retryOperationKey, &retryResult); err != nil {
+		return fmt.Errorf("read successful MCP retry ledger: %w", err)
+	}
+	if sourceStatus != "failed" || retryStatus != "succeeded" || sourceConnectorID != retryConnectorID ||
+		!bytes.Equal(sourceDigest, source.RequestDigest) || !bytes.Equal(retryDigest, attempt.RequestDigest) ||
+		retryOperationKey != app.AgentOperationKey(retryCallID) ||
+		retryResult != `{"is_error":false,"text":["synthetic connector result after explicit retry"]}` {
+		return fmt.Errorf("MCP source/retry operation ledger evidence is inconsistent: source=%s retry=%s connectors_match=%t key=%q result=%q",
+			sourceStatus, retryStatus, sourceConnectorID == retryConnectorID, retryOperationKey, retryResult)
+	}
 	return nil
 }
 

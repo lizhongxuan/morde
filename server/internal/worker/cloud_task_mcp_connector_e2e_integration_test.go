@@ -824,11 +824,6 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 			afterInterruption.Task.WaitingReason, afterInterruption.Task.Lease.Owner, afterInterruption.Task.Lease.Version,
 			afterInterruption.Task.Lease.ExpiresAt, err)
 	}
-	recovered, found, err := store.ClaimNextTask(ctx, "f01-mcp-node-recovery", 30*time.Second)
-	if err != nil || !found || recovered.ID != submitted.Task.ID || recovered.AgentSessionID != afterInterruption.Task.AgentSessionID ||
-		recovered.AgentGeneration != afterInterruption.Task.AgentGeneration || recovered.CheckpointThroughSequence < 0 || len(recovered.CheckpointDigest) != 32 {
-		t.Fatalf("claim recoverable MCP task = %#v found=%t err=%v", recovered, found, err)
-	}
 	secondRun, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
 		ToolCapabilities: cloudDSHTestToolCapability{allowed: true}, SupervisorID: "f01-mcp-restart-supervisor", AccountRuntimes: conversationRuntimeManager,
 		Instances: instances, Checkpoints: checkpointCapture, Models: model, Tools: broker,
@@ -836,8 +831,49 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := secondRun.ExecuteTask(ctx, recovered); !errors.Is(err, ErrCloudDSHCompletionPending) {
-		t.Fatalf("recovered dsh run = %v, want completion pending without a production completion adapter", err)
+	recoveryWorker, err := NewTaskWorker(TaskWorkerOptions{
+		Store: store, Executor: secondRun, WorkerID: "f01-mcp-node-recovery", LeaseDuration: 30 * time.Second,
+		PollInterval: 10 * time.Millisecond, MaxConcurrentTasks: 1, MaxConcurrentTasksPerOwner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryCtx, stopRecovery := context.WithCancel(ctx)
+	recoveryDone := make(chan error, 1)
+	go func() { recoveryDone <- recoveryWorker.Run(recoveryCtx) }()
+	recoveryDeadline := time.NewTimer(20 * time.Second)
+	defer recoveryDeadline.Stop()
+	recoveryPoll := time.NewTicker(10 * time.Millisecond)
+	defer recoveryPoll.Stop()
+	for {
+		details, err := store.GetTask(ctx, submitted.Task.ID, owner.ID)
+		if err != nil {
+			stopRecovery()
+			t.Fatalf("read Task recovered by new TaskWorker: %v", err)
+		}
+		if details.Task.Lease.Owner == "f01-mcp-node-recovery" && model.callCount() >= 2 &&
+			details.Task.CheckpointThroughSequence > afterInterruption.Task.CheckpointThroughSequence &&
+			details.Task.AgentGeneration > afterInterruption.Task.AgentGeneration {
+			break
+		}
+		select {
+		case workerErr := <-recoveryDone:
+			stopRecovery()
+			t.Fatalf("new TaskWorker stopped before recovering the MCP Task: %v", workerErr)
+		case <-recoveryDeadline.C:
+			stopRecovery()
+			<-recoveryDone
+			t.Fatalf("new TaskWorker did not recover the MCP Task: model_calls=%d", model.callCount())
+		case <-recoveryPoll.C:
+		case <-ctx.Done():
+			stopRecovery()
+			<-recoveryDone
+			t.Fatalf("wait for new TaskWorker recovery: %v", ctx.Err())
+		}
+	}
+	stopRecovery()
+	if workerErr := <-recoveryDone; !errors.Is(workerErr, context.Canceled) {
+		t.Fatalf("stop recovered TaskWorker = %v, want context cancellation", workerErr)
 	}
 	operation, err = store.GetMCPConnectorOperation(ctx, owner.ID, submitted.Task.ID, connector.ID, operationKey)
 	if err != nil || operation.Status != task.OperationSucceeded || provider.remoteCalls.Load() != 1 || model.callCount() != 2 {
@@ -845,8 +881,10 @@ func TestCloudTaskMCPConnectorSurvivesNodeRestartWithoutRedispatch(t *testing.T)
 			operation, err, provider.remoteCalls.Load(), model.callCount())
 	}
 	details, err := store.GetTask(ctx, submitted.Task.ID, owner.ID)
-	if err != nil || details.Task.CheckpointThroughSequence <= recovered.CheckpointThroughSequence || details.Task.AgentGeneration <= recovered.AgentGeneration {
-		t.Fatalf("recovery did not commit a new checkpoint and Agent generation: task=%#v err=%v", details.Task, err)
+	if err != nil || details.Task.Lease.Owner != "f01-mcp-node-recovery" ||
+		details.Task.CheckpointThroughSequence <= afterInterruption.Task.CheckpointThroughSequence ||
+		details.Task.AgentGeneration <= afterInterruption.Task.AgentGeneration {
+		t.Fatalf("TaskWorker recovery did not retain its claim and commit a new checkpoint/Agent generation: task=%#v err=%v", details.Task, err)
 	}
 }
 

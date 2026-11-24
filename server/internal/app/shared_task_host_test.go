@@ -111,3 +111,54 @@ func TestSharedTaskHostRequiresCurrentActorCredentialAndControlGrant(t *testing.
 		t.Fatal("revoked task credential retained Host access")
 	}
 }
+
+func TestTaskExecutionAllowsSharedHostTaskScopesWithActiveControlGrant(t *testing.T) {
+	ctx := context.Background()
+	const actorID = "u1234567"
+	const hostOwnerID = "u7654321"
+	const hostID = "h1234567"
+	const installationID = "i1234567"
+	now := time.Now()
+	store := &taskSharedHostStore{
+		hostServiceTestWorkspaceStore: &hostServiceTestWorkspaceStore{},
+		value:                         host.Host{ID: hostID, OwnerID: hostOwnerID, State: host.StateRunning},
+		access:                        host.ActorAccess{OwnerID: hostOwnerID, Permissions: []host.Permission{host.PermissionDesktopControl}},
+	}
+	tokens := &credentialTokens{clientActive: true, values: map[string]identity.Token{
+		"t1234567": {ID: "t1234567", OwnerID: actorID, Kind: identity.KindSession, ExpiresAt: now.Add(time.Hour)},
+		"t7654321": {ID: "t7654321", OwnerID: actorID, Kind: identity.KindClient,
+			ClientInstallationID: installationID, ExpiresAt: now.Add(time.Hour)},
+	}}
+	credentials := &CredentialService{
+		users:  &credentialUsers{values: map[string]identity.User{actorID: {ID: actorID, Status: identity.StatusApproved}}},
+		hosts:  store,
+		tokens: tokens,
+	}
+
+	principals := []identity.Principal{
+		{UserID: actorID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"},
+		{UserID: actorID, Role: identity.RoleUser, Kind: identity.KindClient, TokenID: "t7654321", ClientInstallationID: installationID},
+	}
+	for _, principal := range principals {
+		for _, scope := range []identity.Scope{identity.ScopeTaskRead, identity.ScopeTaskSubmit, identity.ScopeTaskControl} {
+			if _, err := credentials.AuthorizeTaskExecution(ctx, principal, hostID, scope); err != nil {
+				t.Errorf("%s with active desktop:control grant could not use %s: %v", principal.Kind, scope, err)
+			}
+		}
+		for _, scope := range []identity.Scope{identity.ScopeScheduleManage, identity.ScopeComputerObserve, identity.ScopeComputerOperate} {
+			if _, err := credentials.AuthorizeTaskExecution(ctx, principal, hostID, scope); err == nil {
+				t.Errorf("%s with shared Host grant unexpectedly used %s", principal.Kind, scope)
+			}
+		}
+	}
+
+	store.access.Permissions = []host.Permission{host.PermissionDesktopView}
+	if _, err := credentials.AuthorizeTaskExecution(ctx, principals[0], hostID, identity.ScopeTaskRead); err == nil {
+		t.Fatal("view-only shared Host member retained Task access")
+	}
+	store.access.Permissions = []host.Permission{host.PermissionDesktopControl}
+	store.access.Disabled = true
+	if _, err := credentials.AuthorizeTaskExecution(ctx, principals[1], hostID, identity.ScopeTaskRead); err == nil {
+		t.Fatal("disabled shared Host member retained Task access")
+	}
+}

@@ -167,11 +167,17 @@ func TestTaskToolCallProgressMarksOnlyExplicitConnectorRateLimitRetryable(t *tes
 	if !IsMCPConnectorStepRetryTool(progress.ToolName) || !SupportsSafeTaskStepRetryTool(progress.ToolName) {
 		t.Fatalf("MCP connector retry tool was not admitted: %q", progress.ToolName)
 	}
-	ordinaryContext := withTaskToolResultEvidence(withCloudDSHToolActivity(context.Background(), current, call, nil), "execute", "")
+	ordinaryContext := withTaskToolResultEvidence(withCloudDSHToolActivity(context.Background(), current, call, nil), "execute", taskToolExecutionFailureReason)
 	ordinaryActivity, _ := cloudDSHToolActivityFromContext(ordinaryContext)
 	ordinary, err := taskToolCallProgress(ordinaryActivity, task.Step{ID: stepID, Status: task.StepFailed, Phase: "prepare"})
-	if err != nil || ordinary == nil || ordinary.FailureReason != "" || ordinary.Retryable {
-		t.Fatalf("ordinary dispatched MCP failure became retryable: progress=%+v err=%v", ordinary, err)
+	if err != nil || ordinary == nil || ordinary.FailureReason != taskToolExecutionFailureReason || ordinary.Retryable || ordinary.Phase != "execute" {
+		t.Fatalf("ordinary dispatched MCP failure evidence = %+v, err=%v", ordinary, err)
+	}
+	unknownContext := withTaskToolResultEvidence(withCloudDSHToolActivity(context.Background(), current, call, nil), "execute", "")
+	unknownActivity, _ := cloudDSHToolActivityFromContext(unknownContext)
+	unknown, err := taskToolCallProgress(unknownActivity, task.Step{ID: stepID, Status: task.StepWaitingUser})
+	if err != nil || unknown == nil || unknown.FailureReason != "" || unknown.Retryable {
+		t.Fatalf("unknown outcome was classified as a definitive failure: progress=%+v err=%v", unknown, err)
 	}
 }
 

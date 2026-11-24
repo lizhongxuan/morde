@@ -175,39 +175,41 @@ type conversationRouteModelRequestCandidate struct {
 }
 
 type ConversationRouteContext struct {
-	ActorID                      string
-	ModelID                      string
-	RouteAttempt                 int64  `json:"-"`
-	Repair                       bool   `json:"-"`
-	SummaryVersion               int64  `json:"-"`
-	SummarySHA256                []byte `json:"-"`
-	SummarySourcesSHA256         []byte `json:"-"`
-	SummaryText                  string `json:"-"`
-	CandidateSetIncomplete       bool
-	HistoryIncomplete            bool
-	PreviousMessageID            string `json:"-"`
-	PreviousTaskID               string `json:"-"`
-	PreviousUnresolved           bool
-	PreviousMissing              bool
-	Content                      string
-	ContentSources               []ConversationRouteMessageSource `json:"-"`
-	CurrentMessageID             string                           `json:"-"`
-	ContentSHA256                []byte                           `json:"-"`
-	ContentBytes                 int64                            `json:"-"`
-	ContentTruncated             bool                             `json:"-"`
-	ExecutionScopeDigest         []byte                           `json:"-"`
-	ControlScopeDigest           []byte                           `json:"-"`
-	TimeZone                     string
-	ServerReceivedAt             time.Time
-	ReferenceTaskID              string
-	ReferenceUnavailable         bool
-	CurrentMessageHasAttachments bool   `json:"-"`
-	CurrentRequestModelID        string `json:"-"`
-	History                      []ConversationRouteHistory
-	Candidates                   []ConversationRouteCandidate
-	RequestCandidates            []ConversationRouteRequestCandidate
-	AggregationCandidates        []ConversationRouteAggregationCandidate
-	ResultReview                 *ConversationTaskResultReview
+	ActorID                       string
+	ModelID                       string
+	RouteAttempt                  int64  `json:"-"`
+	Repair                        bool   `json:"-"`
+	SummaryVersion                int64  `json:"-"`
+	SummarySHA256                 []byte `json:"-"`
+	SummarySourcesSHA256          []byte `json:"-"`
+	SummaryText                   string `json:"-"`
+	CandidateSetIncomplete        bool
+	TaskCandidateSetIncomplete    bool
+	RequestCandidateSetIncomplete bool
+	HistoryIncomplete             bool
+	PreviousMessageID             string `json:"-"`
+	PreviousTaskID                string `json:"-"`
+	PreviousUnresolved            bool
+	PreviousMissing               bool
+	Content                       string
+	ContentSources                []ConversationRouteMessageSource `json:"-"`
+	CurrentMessageID              string                           `json:"-"`
+	ContentSHA256                 []byte                           `json:"-"`
+	ContentBytes                  int64                            `json:"-"`
+	ContentTruncated              bool                             `json:"-"`
+	ExecutionScopeDigest          []byte                           `json:"-"`
+	ControlScopeDigest            []byte                           `json:"-"`
+	TimeZone                      string
+	ServerReceivedAt              time.Time
+	ReferenceTaskID               string
+	ReferenceUnavailable          bool
+	CurrentMessageHasAttachments  bool   `json:"-"`
+	CurrentRequestModelID         string `json:"-"`
+	History                       []ConversationRouteHistory
+	Candidates                    []ConversationRouteCandidate
+	RequestCandidates             []ConversationRouteRequestCandidate
+	AggregationCandidates         []ConversationRouteAggregationCandidate
+	ResultReview                  *ConversationTaskResultReview
 }
 
 type ConversationRouteMessageSource struct {
@@ -288,11 +290,11 @@ const conversationRouteRepairInstructions = `The previous response to this exact
 
 const conversationRouteUnresolvedReplyInstructions = `Even if a previous message is unresolved or missing, use reply for a complete conversational request you can answer from the current message alone, such as a greeting or a self-contained calculation. When previous_missing is true, use new for complete independent work that needs execution, and clarify when the request depends on missing context. Never guess the missing message or claim to act on an existing Task.`
 
-const conversationRouteIncompleteCandidatesInstructions = `When candidate_set_incomplete is true, lists are partial. Use supplied IDs only for update/status/stop/join/dependencies; never infer omitted Task/message IDs. Start new only for clearly independent, self-contained work or the history search required by incomplete history. Clarify ambiguous targets or repeats.`
+const conversationRouteIncompleteCandidatesInstructions = `Incomplete candidate lists omit entries; never infer IDs. If the Task list is incomplete, clarify unreferenced controls. If prior requests are incomplete, use a Task only when a supplied request proves the same control scope, authorization, model, and time zone; clarify ambiguous targets or repeats. Use new only for clearly independent, self-contained work or required history search.`
 
 const conversationRouteIncompleteHistoryInstructions = `When history_incomplete or content_truncated is true, supplied history is incomplete. Never infer omitted details or present excerpts as complete.`
 
-const conversationRouteHistorySearchTaskInstructions = `Incomplete/truncated history is partial; never infer omitted details or present excerpts as complete. If a request depends on a prior detail or requirement missing from it, do not report it unavailable from a preview. Apply Task association; if no supplied Task or prior_request clearly matches, use action "new" with explicit_new=false so the Task Agent searches authorized conversation originals via morde_current_conversation_history_search. Report unavailable only after no match or an authorization block; never claim a match before search.`
+const conversationRouteHistorySearchTaskInstructions = `Incomplete history is partial; never infer omitted details or present excerpts as complete. If a needed prior detail is missing, use new to search authorized originals with morde_current_conversation_history_search unless a supplied Task/prior_request clearly matches. Do not claim a match before search results; report unavailable only if search finds none or authorization blocks it.`
 
 func conversationRouteTextPreview(value string) (string, bool) {
 	return ConversationRouteTextPreview(value, conversationRoutePreviewBytes)
@@ -368,6 +370,7 @@ func ConversationRouteModelRequest(value ConversationRouteContext) (ModelRequest
 		(value.ContentTruncated && len(value.ContentSources) == 0 && !domain.ValidMessageID(value.CurrentMessageID)) ||
 		(len(value.ContentSources) != 0 && (value.CurrentMessageID != "" || len(value.ContentSources) < 2 ||
 			len(value.ContentSources) > MaxConversationRouteAggregateMessages+1 || !validConversationRouteMessageSources(value.ContentSources))) ||
+		((value.TaskCandidateSetIncomplete || value.RequestCandidateSetIncomplete) && !value.CandidateSetIncomplete) ||
 		value.RouteAttempt < 0 ||
 		(value.TimeZone != "" && (len(value.TimeZone) > 64 || strings.TrimSpace(value.TimeZone) != value.TimeZone || value.TimeZone == "Local")) ||
 		(value.ReferenceTaskID != "" && !domain.ValidTaskID(value.ReferenceTaskID)) ||
@@ -500,25 +503,27 @@ func ConversationRouteModelRequest(value ConversationRouteContext) (ModelRequest
 		referenceTime = value.ServerReceivedAt.In(timeZone).Format(time.RFC3339)
 	}
 	type routeInput struct {
-		Summary                map[string]any                          `json:"summary,omitempty"`
-		Message                string                                  `json:"message"`
-		MessageID              string                                  `json:"message_id,omitempty"`
-		MessageBytes           int64                                   `json:"message_bytes,omitempty"`
-		MessageSHA256          string                                  `json:"message_sha256,omitempty"`
-		MessageTruncated       bool                                    `json:"message_truncated,omitempty"`
-		MessageSources         []conversationRouteModelMessageSource   `json:"message_sources,omitempty"`
-		ReferenceTime          string                                  `json:"reference_time,omitempty"`
-		TimeZone               string                                  `json:"time_zone,omitempty"`
-		TimeZoneProvided       bool                                    `json:"time_zone_provided"`
-		ReferenceTaskID        string                                  `json:"reference_task_id,omitempty"`
-		ReferenceUnavailable   bool                                    `json:"reference_unavailable,omitempty"`
-		CandidateSetIncomplete bool                                    `json:"candidate_set_incomplete,omitempty"`
-		HistoryIncomplete      bool                                    `json:"history_incomplete,omitempty"`
-		PreviousUnresolved     bool                                    `json:"previous_unresolved,omitempty"`
-		PreviousMissing        bool                                    `json:"previous_missing,omitempty"`
-		History                []ConversationRouteHistory              `json:"history"`
-		Tasks                  []ConversationRouteCandidate            `json:"active_tasks"`
-		AggregationCandidates  []ConversationRouteAggregationCandidate `json:"aggregation_candidates"`
+		Summary                       map[string]any                          `json:"summary,omitempty"`
+		Message                       string                                  `json:"message"`
+		MessageID                     string                                  `json:"message_id,omitempty"`
+		MessageBytes                  int64                                   `json:"message_bytes,omitempty"`
+		MessageSHA256                 string                                  `json:"message_sha256,omitempty"`
+		MessageTruncated              bool                                    `json:"message_truncated,omitempty"`
+		MessageSources                []conversationRouteModelMessageSource   `json:"message_sources,omitempty"`
+		ReferenceTime                 string                                  `json:"reference_time,omitempty"`
+		TimeZone                      string                                  `json:"time_zone,omitempty"`
+		TimeZoneProvided              bool                                    `json:"time_zone_provided"`
+		ReferenceTaskID               string                                  `json:"reference_task_id,omitempty"`
+		ReferenceUnavailable          bool                                    `json:"reference_unavailable,omitempty"`
+		CandidateSetIncomplete        bool                                    `json:"candidate_set_incomplete,omitempty"`
+		TaskCandidateSetIncomplete    bool                                    `json:"task_candidate_set_incomplete,omitempty"`
+		RequestCandidateSetIncomplete bool                                    `json:"request_candidate_set_incomplete,omitempty"`
+		HistoryIncomplete             bool                                    `json:"history_incomplete,omitempty"`
+		PreviousUnresolved            bool                                    `json:"previous_unresolved,omitempty"`
+		PreviousMissing               bool                                    `json:"previous_missing,omitempty"`
+		History                       []ConversationRouteHistory              `json:"history"`
+		Tasks                         []ConversationRouteCandidate            `json:"active_tasks"`
+		AggregationCandidates         []ConversationRouteAggregationCandidate `json:"aggregation_candidates"`
 	}
 	messageSources := make([]conversationRouteModelMessageSource, len(value.ContentSources))
 	for index, source := range value.ContentSources {
@@ -585,7 +590,9 @@ func ConversationRouteModelRequest(value ConversationRouteContext) (ModelRequest
 		MessageSources:   messageSources,
 		TimeZoneProvided: value.TimeZone != "", ReferenceTaskID: referenceID, ReferenceUnavailable: value.ReferenceUnavailable,
 		CandidateSetIncomplete: value.CandidateSetIncomplete, HistoryIncomplete: historyIncompleteForSearch,
-		PreviousUnresolved: value.PreviousUnresolved, PreviousMissing: value.PreviousMissing, History: history, Tasks: tasks,
+		TaskCandidateSetIncomplete:    value.TaskCandidateSetIncomplete,
+		RequestCandidateSetIncomplete: value.RequestCandidateSetIncomplete,
+		PreviousUnresolved:            value.PreviousUnresolved, PreviousMissing: value.PreviousMissing, History: history, Tasks: tasks,
 		AggregationCandidates: aggregation}
 	priorRequests := make([]conversationRouteModelRequestCandidate, len(value.RequestCandidates))
 	for index, candidate := range value.RequestCandidates {
@@ -1162,7 +1169,7 @@ func ValidConversationRouteSteerTarget(taskID string, value ConversationRouteCon
 		value.PreviousUnresolved ||
 		ConversationRouteHasExplicitControlIntentForContext(value) ||
 		(value.ReferenceTaskID != "" && value.ReferenceTaskID != taskID) ||
-		(value.CandidateSetIncomplete && value.ReferenceTaskID == "") {
+		(value.TaskCandidateSetIncomplete && value.ReferenceTaskID == "") {
 		return false
 	}
 	var targetCount int
@@ -1193,6 +1200,16 @@ func ValidConversationRouteSteerTarget(taskID string, value ConversationRouteCon
 	}
 	if _, eligible := eligibleTasks[taskID]; !eligible {
 		return false
+	}
+	if value.RequestCandidateSetIncomplete && value.ReferenceTaskID == "" {
+		for _, candidate := range value.Candidates {
+			if candidate.InitiatorID != value.ActorID || candidate.Status != task.StatusRunning {
+				continue
+			}
+			if _, eligible := eligibleTasks[candidate.TaskID]; !eligible {
+				return false
+			}
+		}
 	}
 	return value.ReferenceTaskID != "" || len(eligibleTasks) == 1
 }

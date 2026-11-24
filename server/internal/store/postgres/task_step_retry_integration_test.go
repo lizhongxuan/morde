@@ -304,9 +304,9 @@ VALUES ($1,$2,1,'tool','failed','Call selected connector','Connector was rate li
 	if _, err := pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
 (id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
 host_id,workspace_id,binding_version,task_revision,call_id,operation_key,tool_name,request_hash,status,result)
-VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,'mcp_call',$13,'failed',$14)`,
+VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,('mcp_' || $4 || '_0123456789ab'),$13,'failed',$14)`,
 		mustID(t, domain.NewOperationID), f.task.ID, f.route.ownerID, connectorID, int64(1), int64(0), int64(1), f.task.Lease.Version, f.task.HostID, revision,
-		callID, "rate-limit-source-operation", requestDigest, result); err != nil {
+		callID, app.AgentOperationKey(callID), requestDigest, result); err != nil {
 		t.Fatalf("insert failed connector operation evidence: %v", err)
 	}
 
@@ -350,7 +350,7 @@ WHERE task_id=$1 AND call_id=$2`, f.task.ID, callID); err != nil {
 	if _, err := pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
 (id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
 host_id,workspace_id,binding_version,task_revision,call_id,operation_key,tool_name,request_hash,status,result)
-VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,'mcp_call',$13,'failed',$14)`,
+VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,('mcp_' || $4 || '_0123456789ab'),$13,'failed',$14)`,
 		mustID(t, domain.NewOperationID), f.task.ID, f.route.ownerID, connectorID, int64(1), int64(0), int64(1), f.task.Lease.Version, f.task.HostID, revision,
 		callID, "duplicate-call-id-evidence", requestDigest, result); err != nil {
 		t.Fatalf("insert duplicate call-id evidence: %v", err)
@@ -375,7 +375,7 @@ VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,'mcp_call',$13,'failed'
 	if _, err := pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
 (id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
 host_id,workspace_id,binding_version,task_revision,call_id,operation_key,tool_name,request_hash,status)
-VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,'mcp_call',$13,'unknown')`,
+VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,('mcp_' || $4 || '_0123456789ab'),$13,'unknown')`,
 		mustID(t, domain.NewOperationID), f.task.ID, f.route.ownerID, connectorID, int64(1), int64(0), int64(1), f.task.Lease.Version, f.task.HostID, revision,
 		unknownCallID, "unrelated-unknown-operation", hashBytes("unrelated request")); err != nil {
 		t.Fatalf("insert unrelated unknown operation: %v", err)

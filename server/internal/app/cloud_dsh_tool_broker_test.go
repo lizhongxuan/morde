@@ -346,7 +346,18 @@ func (s *cloudDSHBrokerTaskStore) CommitTaskProgress(ctx context.Context, progre
 	current.EventSequence++
 	event := progress.Event
 	event.TaskID, event.Sequence = progress.TaskID, current.EventSequence
-	for _, step := range progress.Steps {
+	steps := append([]task.Step(nil), progress.Steps...)
+	if call := progress.ToolCall; call != nil && len(steps) == 1 {
+		revision := call.TaskRevision
+		steps[0].AgentSessionID, steps[0].TaskRevision = call.AgentSessionID, &revision
+		steps[0].ToolCallKey, steps[0].ToolName = call.CallKey, call.ToolName
+		steps[0].RequestDigest, steps[0].Phase, steps[0].DetailState = append([]byte(nil), call.RequestDigest...), call.Phase, call.DetailState
+		steps[0].FailureReason, steps[0].Retryable = call.FailureReason, call.Retryable
+		if steps[0].Attempt < 1 {
+			steps[0].Attempt = 1
+		}
+	}
+	for _, step := range steps {
 		found := false
 		for index := range s.details.Steps {
 			if s.details.Steps[index].ID == step.ID {
@@ -427,6 +438,53 @@ func TestCloudDSHToolActivityPersistsPreparePhaseAndReusesStepOnReplay(t *testin
 	}
 	if err := json.Unmarshal(store.events[1].Payload, &replayEvent); err != nil || replayEvent.StepID != first.ID {
 		t.Fatalf("replayed activity event step=%q, err=%v; want original %q", replayEvent.StepID, err, first.ID)
+	}
+}
+
+func TestCloudDSHToolBrokerPersistsSafeDefinitiveFailureReason(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	current := store.details.Task
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-failure", 1, "session-failure"
+	current.Authorization.Version = 1
+	store.details.Task = current
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "failure-call-1", Name: cloudDSHWorkspaceReadToolName,
+		Arguments: `{"path":"private-input-value"}`,
+		TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+			AuthorizationVersion: current.Authorization.Version}}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, nil)
+	step, err := newAgentStep(current.ID, 1, "tool", task.StepRunning, "Read file", "Reading the selected file.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := broker.commitResult(ctx, current, step, current.Usage, call.Name,
+		AgentToolResult{Status: AgentToolFailed, Output: "private-error-detail and credential-value"})
+	if err != nil || result.Status != AgentToolFailed || len(store.toolCalls) != 1 {
+		t.Fatalf("commit definitive Host failure = %+v, err=%v tool calls=%d", result, err, len(store.toolCalls))
+	}
+	progress := store.toolCalls[0]
+	if progress.FailureReason != taskToolExecutionFailureReason || progress.Retryable || progress.Phase != "execute" ||
+		len(store.details.Steps) != 1 || store.details.Steps[0].FailureReason != taskToolExecutionFailureReason || store.details.Steps[0].Retryable {
+		t.Fatalf("persisted Host failure evidence = progress:%+v step:%+v", progress, store.details.Steps)
+	}
+	var event struct {
+		Detail map[string]json.RawMessage `json:"detail"`
+	}
+	if err := json.Unmarshal(store.events[0].Payload, &event); err != nil {
+		t.Fatal(err)
+	}
+	var reason string
+	if json.Unmarshal(event.Detail["failure_reason"], &reason) != nil || reason != taskToolExecutionFailureReason ||
+		bytes.Contains(store.events[0].Payload, []byte("private-input-value")) ||
+		bytes.Contains(store.events[0].Payload, []byte("private-error-detail")) ||
+		bytes.Contains(store.events[0].Payload, []byte("credential-value")) {
+		t.Fatalf("Host failure event exposed unsafe data or omitted its reason: %s", store.events[0].Payload)
 	}
 }
 

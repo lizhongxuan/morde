@@ -6,16 +6,56 @@ final class NanoMuseMordePersonalDataTests: XCTestCase {
     func testPersonalObjectAllowlistAndTypeSpecificIdentifiers() {
         XCTAssertTrue(MordePersonalDataContract.syncObjectTypes.contains("connector_setting"))
         XCTAssertTrue(MordePersonalDataContract.syncObjectTypes.contains("schedule"))
+        XCTAssertTrue(MordePersonalDataContract.syncObjectTypes.contains("rule_candidate"))
         XCTAssertFalse(MordePersonalDataContract.mutationObjectTypes.contains("schedule"))
+        XCTAssertFalse(MordePersonalDataContract.mutationObjectTypes.contains("rule_candidate"))
         XCTAssertFalse(MordePersonalDataContract.syncObjectTypes.contains("private_key"))
 
         XCTAssertTrue(MordePersonalDataContract.isValidObjectIdentifier(type: "profile", id: "default"))
         XCTAssertFalse(MordePersonalDataContract.isValidObjectIdentifier(type: "profile", id: "other"))
         XCTAssertTrue(MordePersonalDataContract.isValidObjectIdentifier(type: "memory", id: "m_0123abcd"))
         XCTAssertFalse(MordePersonalDataContract.isValidObjectIdentifier(type: "memory", id: "m_0123ABCD"))
+        XCTAssertTrue(MordePersonalDataContract.isValidObjectIdentifier(type: "rule_candidate", id: "r_0123abcd"))
+        XCTAssertFalse(MordePersonalDataContract.isValidObjectIdentifier(type: "rule_candidate", id: "r_0123ABCD"))
+        XCTAssertFalse(MordePersonalDataContract.isValidObjectIdentifier(type: "rule_candidate", id: "r_0123abcd-extra"))
         XCTAssertTrue(MordePersonalDataContract.isValidObjectIdentifier(type: "schedule", id: "j1234567"))
         XCTAssertFalse(MordePersonalDataContract.isValidObjectIdentifier(type: "schedule", id: "j12345678"))
         XCTAssertFalse(MordePersonalDataContract.isValidObjectIdentifier(type: "library_item", id: "../item"))
+    }
+
+    func testRuleCandidateSnapshotReadingRequiresExactServerBodyAndDoesNotEnableMutations() {
+        func candidate(_ status: String = "candidate", sourceID: String = "m_0123abcd",
+                       sourceRevision: MordePersonalJSONValue = .integer(2),
+                       extra: [String: MordePersonalJSONValue] = [:]) -> MordePersonalJSONValue {
+            var fields: [String: MordePersonalJSONValue] = [
+                "scope": .string("personal"),
+                "status": .string(status),
+                "source_memory_id": .string(sourceID),
+                "source_memory_revision": sourceRevision,
+            ]
+            fields.merge(extra) { _, new in new }
+            return .object(fields)
+        }
+
+        XCTAssertTrue(MordePersonalDataContract.isValidSyncObjectBody(
+            type: "rule_candidate", id: "r_0123abcd", body: candidate()))
+        XCTAssertTrue(MordePersonalDataContract.isValidSyncObjectBody(
+            type: "rule_candidate", id: "r_0123abcd", body: candidate("active", sourceID: "global")))
+
+        for invalid in [
+            candidate("pending"),
+            candidate("active", sourceID: "m_0123ABCD"),
+            candidate("active", sourceRevision: .number(2)),
+            candidate("active", sourceRevision: .integer(0)),
+            candidate("active", extra: ["content": .string("duplicated text")]),
+            .array([]),
+        ] {
+            XCTAssertFalse(MordePersonalDataContract.isValidSyncObjectBody(
+                type: "rule_candidate", id: "r_0123abcd", body: invalid))
+        }
+
+        XCTAssertFalse(MordePersonalDataContract.mutationObjectTypes.contains("rule_candidate"),
+                       "Generic personal-data mutation must not create or activate rule candidates.")
     }
 
     func testLegacySyncPauseDoesNotDisableAutomaticPersonalContentFlushOrCloudReads() {

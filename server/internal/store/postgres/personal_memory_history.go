@@ -11,6 +11,7 @@ import (
 	"morde/server/internal/domain/personal"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 func (s *Store) GetPersonalMemoryHistoryBatch(ctx context.Context, principal identity.Principal, objectID string,
@@ -82,8 +83,11 @@ FOR SHARE OF v,p`, instanceID, principal.UserID, objectID).Scan(&currentRevision
     AND log.operation='upsert' AND log.revision<current.revision
   UNION ALL
   SELECT current.revision,current.changed_at,current.body FROM current_object current
+), revision_lineage AS (
+  SELECT revision,changed_at,body,LEAD(revision) OVER (ORDER BY revision ASC) AS superseded_by_revision
+  FROM revisions
 )
-SELECT revision,changed_at,body FROM revisions
+SELECT revision,changed_at,body,superseded_by_revision FROM revision_lineage
 WHERE ($4::bigint=0 OR revision<$4)
 ORDER BY revision DESC LIMIT $5`, instanceID, principal.UserID, objectID, afterRevision, limit+1)
 		if err != nil {
@@ -93,11 +97,16 @@ ORDER BY revision DESC LIMIT $5`, instanceID, principal.UserID, objectID, afterR
 		for rows.Next() {
 			var item personal.MemoryRevision
 			var body []byte
-			if err := rows.Scan(&item.Revision, &item.ChangedAt, &body); err != nil {
+			var supersededByRevision pgtype.Int8
+			if err := rows.Scan(&item.Revision, &item.ChangedAt, &body, &supersededByRevision); err != nil {
 				rows.Close()
 				return fmt.Errorf("scan personal memory revision: %w", err)
 			}
 			item.Body = append([]byte(nil), body...)
+			if supersededByRevision.Valid {
+				value := supersededByRevision.Int64
+				item.SupersededByRevision = &value
+			}
 			item.Sources = make([]personal.MemoryHistorySource, 0)
 			if len(body) != 0 {
 				item.Restorable = true
@@ -137,10 +146,23 @@ func annotatePersonalMemoryRevisionSourcesInTx(ctx context.Context, tx pgx.Tx, i
 	}
 	revisions := make([]int64, len(items))
 	itemByRevision := make(map[int64]int, len(items))
+	queryRevisionSet := make(map[int64]struct{}, len(items)*2)
 	for index := range items {
 		revisions[index] = items[index].Revision
 		itemByRevision[items[index].Revision] = index
+		queryRevisionSet[items[index].Revision] = struct{}{}
 		items[index].SourceStatus = personal.MemoryHistorySourceUnrecorded
+		if len(items[index].Body) == 0 {
+			items[index].SupersededByRevision = nil
+		}
+		if items[index].SupersededByRevision != nil {
+			queryRevisionSet[*items[index].SupersededByRevision] = struct{}{}
+		}
+	}
+	for revision := range queryRevisionSet {
+		if _, found := itemByRevision[revision]; !found {
+			revisions = append(revisions, revision)
+		}
 	}
 	rows, err := tx.Query(ctx, `SELECT source.object_revision,source.source_order,source.source_kind,source.source_id,
 COALESCE(source.source_conversation_id,''),
@@ -194,10 +216,21 @@ ORDER BY source.object_revision DESC,source.source_order`, instanceID, ownerID, 
 		return fmt.Errorf("iterate personal memory provenance: %w", err)
 	}
 	rows.Close()
+	authorizedRevisions := make(map[int64]bool, len(queryRevisionSet))
+	unavailableRevisions := make(map[int64]bool)
 	for _, value := range values {
-		index, ok := itemByRevision[value.revision]
-		if !ok || value.order < 1 {
+		if _, ok := queryRevisionSet[value.revision]; !ok || value.order < 1 {
 			return domain.NewError(domain.CodeInternal, "personal memory provenance is inconsistent")
+		}
+		if !value.authorized {
+			unavailableRevisions[value.revision] = true
+			authorizedRevisions[value.revision] = false
+		} else if !unavailableRevisions[value.revision] {
+			authorizedRevisions[value.revision] = true
+		}
+		index, ok := itemByRevision[value.revision]
+		if !ok {
+			continue
 		}
 		item := &items[index]
 		if !value.authorized {
@@ -205,6 +238,7 @@ ORDER BY source.object_revision DESC,source.source_order`, instanceID, ownerID, 
 			item.Body = nil
 			item.Restorable = false
 			item.Sources = make([]personal.MemoryHistorySource, 0)
+			item.SupersededByRevision = nil
 			continue
 		}
 		if item.SourceStatus == personal.MemoryHistorySourceUnavailable {
@@ -214,6 +248,12 @@ ORDER BY source.object_revision DESC,source.source_order`, instanceID, ownerID, 
 		item.Sources = append(item.Sources, personal.MemoryHistorySource{
 			Kind: value.kind, ID: value.id, ConversationID: value.conversationID,
 		})
+	}
+	for index := range items {
+		successor := items[index].SupersededByRevision
+		if successor != nil && !authorizedRevisions[*successor] {
+			items[index].SupersededByRevision = nil
+		}
 	}
 	return nil
 }

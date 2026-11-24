@@ -576,6 +576,8 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 
 	var approvalID string
 	var approvalVersion int64
+	var approvalWaitTask task.Task
+	var approvalWaitRequest task.PendingRequest
 	if err := waitF01(t, ctx, func() (bool, error) {
 		bindErr := gateStore.lastDeferredTargetBindError()
 		if bindErr != nil {
@@ -597,6 +599,8 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 		}
 		approvalID = current.PendingRequest.ID
 		approvalVersion = current.PendingRequest.Version
+		approvalWaitTask = current.Task
+		approvalWaitRequest = *current.PendingRequest
 		return true, nil
 	}, executionErrors, nil); err != nil {
 		diagnosticCtx, cancelDiagnostic := context.WithTimeout(context.Background(), 5*time.Second)
@@ -612,6 +616,14 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 			err, executionErr, current.Task.Status, current.Task.WaitingReason, current.Task.HostID, current.Task.WorkspaceID,
 			current.Task.InputRevision, current.Task.WorkspaceCheckpointRevision, model.callCount(), binding.State, binding.BindingVersion,
 			binding.DesiredRevision, binding.AppliedRevision, binding.SyncState, taskErr, bindingErr, observedTools.initialSummary())
+	}
+	if approvalWaitTask.AgentSessionID == "" || approvalWaitTask.CheckpointThroughSequence < 0 ||
+		len(approvalWaitTask.CheckpointDigest) != sha256.Size || approvalWaitRequest.CallID == "" ||
+		len(approvalWaitRequest.RequestHash) != sha256.Size {
+		t.Fatalf("approval wait did not pin a durable DSH checkpoint and exact call identity: session=%q checkpoint=%d digest_bytes=%d pending_id=%q call_id=%q request_hash_bytes=%d",
+			approvalWaitTask.AgentSessionID, approvalWaitTask.CheckpointThroughSequence,
+			len(approvalWaitTask.CheckpointDigest), approvalWaitRequest.ID, approvalWaitRequest.CallID,
+			len(approvalWaitRequest.RequestHash))
 	}
 	if approvalCommand.calls.Load() != 0 {
 		t.Fatalf("Host Workspace command ran before approval: calls=%d", approvalCommand.calls.Load())
@@ -742,7 +754,15 @@ func TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView(t 
 	approvalOperation, approvalOperationErr := store.GetOperation(ctx, owner.ID, acceptedTaskID, f01OperationKey("f01-workspace-command-001"))
 	if details.PendingRequest == nil || details.PendingRequest.Status != task.PendingRequestApproved ||
 		details.PendingRequest.Decision != task.PendingDecisionApprove || approvalOperationErr != nil ||
-		approvalOperation.Status != task.OperationSucceeded || approvalCommand.calls.Load() != 1 || model.callCount() != 3 {
+		approvalOperation.Status != task.OperationSucceeded || approvalCommand.calls.Load() != 1 || model.callCount() != 3 ||
+		details.Task.ID != approvalWaitTask.ID || details.Task.AgentSessionID != approvalWaitTask.AgentSessionID ||
+		details.Task.CheckpointThroughSequence <= approvalWaitTask.CheckpointThroughSequence ||
+		len(details.Task.CheckpointDigest) != sha256.Size || bytes.Equal(details.Task.CheckpointDigest, approvalWaitTask.CheckpointDigest) ||
+		approvalOperation.TaskID != approvalWaitTask.ID || approvalOperation.CallID != approvalWaitRequest.CallID ||
+		approvalOperation.ToolName != approvalWaitRequest.ToolName || approvalOperation.ApprovalID != approvalWaitRequest.ID ||
+		approvalOperation.ApprovalVersion == nil || *approvalOperation.ApprovalVersion != approvalWaitRequest.Version ||
+		!bytes.Equal(approvalOperation.RequestHash, approvalWaitRequest.RequestHash) ||
+		!bytes.Equal(approvalOperation.ApprovalRequestHash, approvalWaitRequest.RequestHash) {
 		t.Fatalf("approval recovery = pending=%#v operation=%#v operation_error=%v Host_calls=%d model_calls=%d",
 			details.PendingRequest, approvalOperation, approvalOperationErr, approvalCommand.calls.Load(), model.callCount())
 	}

@@ -13,6 +13,66 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+func TestPostgresTaskToolFailurePersistsSafeNonRetryableEvidence(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	lease, _, err := f.service.Start(ctx, f.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := f.store.GetTask(ctx, lease.Fence.TaskID, lease.Fence.OwnerID)
+	if err != nil || current.Task.CurrentRevision == nil {
+		t.Fatalf("load running Task revision: task=%+v err=%v", current.Task, err)
+	}
+	stepID, err := domain.NewStepID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sequence int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM task_steps WHERE task_id=$1`, current.Task.ID).Scan(&sequence); err != nil {
+		t.Fatal(err)
+	}
+	step := task.Step{ID: stepID, TaskID: current.Task.ID, Sequence: sequence, Kind: "tool", Status: task.StepFailed,
+		Title: "Read requested source", Summary: "The tool execution failed.", Phase: "execute"}
+	usage := current.Task.Usage
+	usage.ToolCalls++
+	payload, err := json.Marshal(map[string]any{"step_id": step.ID, "sequence": step.Sequence, "kind": step.Kind,
+		"status": step.Status, "title": step.Title, "summary": step.Summary})
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte(`{"url":"https://example.test"}`))
+	_, err = f.store.CommitTaskProgress(ctx, app.TaskProgress{
+		TaskID: current.Task.ID, LeaseOwner: lease.Fence.LeaseOwner, LeaseVersion: lease.Fence.LeaseVersion,
+		Status: task.StatusRunning, CurrentStep: step.ID, Usage: usage, Steps: []task.Step{step},
+		Event: task.Event{TaskID: current.Task.ID, Type: "task.step", Payload: payload},
+		ToolCall: &app.TaskToolCallProgress{
+			AgentSessionID: lease.Fence.AgentSessionID, AgentInstanceID: lease.Fence.AgentInstanceID,
+			AgentGeneration: lease.Fence.AgentGeneration, AuthorizationVersion: lease.Fence.AuthorizationVersion,
+			TaskRevision: *current.Task.CurrentRevision, CallKey: "call-safe-failure-1", ToolName: "morde_web_read",
+			RequestDigest: digest[:], Phase: "execute", DetailState: "not_recorded",
+			FailureReason: "tool_execution_failed", Retryable: false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("persist definitive tool failure: %v", err)
+	}
+	details, err := f.store.GetTask(ctx, current.Task.ID, current.Task.OwnerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, persisted := range details.Steps {
+		if persisted.ID == stepID {
+			if persisted.Status != task.StepFailed || persisted.FailureReason != "tool_execution_failed" || persisted.Retryable ||
+				persisted.Phase != "execute" || persisted.ToolCallKey != "call-safe-failure-1" {
+				t.Fatalf("persisted definitive tool failure = %+v", persisted)
+			}
+			return
+		}
+	}
+	t.Fatalf("Task %s does not contain failed step %s", current.Task.ID, stepID)
+}
+
 func TestPostgresTaskToolStepPersistsFencedDetailAndCascades(t *testing.T) {
 	f := newAgentLifecycleFixture(t)
 	ctx := context.Background()

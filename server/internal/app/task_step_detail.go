@@ -91,6 +91,8 @@ type cloudDSHToolActivity struct {
 
 const maxTaskStepContentEvidencePreviewBytes = 4096
 
+const taskToolExecutionFailureReason = "tool_execution_failed"
+
 func withCloudDSHToolActivity(ctx context.Context, current task.Task, call ModelToolCall, sealer *Sealer) context.Context {
 	if call.TaskFence == nil || call.TaskFence.TaskID != current.ID || call.TaskFence.OwnerID != current.OwnerID ||
 		call.TaskFence.AgentSessionID == "" || current.CurrentRevision == nil || *current.CurrentRevision < 0 ||
@@ -251,6 +253,8 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 	}
 	if step.Status == task.StepFailed && activity.failureReason == "connector_rate_limited" {
 		progress.FailureReason, progress.Retryable = activity.failureReason, true
+	} else if step.Status == task.StepFailed && activity.failureReason == taskToolExecutionFailureReason && phase == "execute" {
+		progress.FailureReason = activity.failureReason
 	} else if step.Status == task.StepFailed && phase == "prepare" {
 		progress.FailureReason, progress.Retryable = "not_dispatched", true
 	}

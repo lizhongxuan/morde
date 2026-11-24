@@ -516,10 +516,63 @@ func TestTrimConversationRouteCandidatesPreservesExplicitTargets(t *testing.T) {
 	value := app.ConversationRouteContext{ReferenceTaskID: "q1234567", PreviousTaskID: "q1234567", PreviousMessageID: "m1234567",
 		RequestCandidates: []app.ConversationRouteRequestCandidate{{MessageID: "m1234567"}, {MessageID: "m2345678"}},
 		Candidates:        []app.ConversationRouteCandidate{{TaskID: "q1234567"}, {TaskID: "q2345678"}}}
-	if !trimConversationRouteCandidates(&value) || !trimConversationRouteCandidates(&value) || !value.CandidateSetIncomplete ||
-		len(value.RequestCandidates) != 1 || value.RequestCandidates[0].MessageID != "m1234567" ||
+	if !trimConversationRouteCandidates(&value) {
+		t.Fatalf("candidate trimming failed: %+v", value)
+	}
+	if !trimConversationRouteCandidates(&value) {
+		t.Fatalf("candidate trimming was not idempotent: %+v", value)
+	}
+	if !value.CandidateSetIncomplete || len(value.RequestCandidates) != 1 || value.RequestCandidates[0].MessageID != "m1234567" ||
 		len(value.Candidates) != 1 || value.Candidates[0].TaskID != "q1234567" {
 		t.Fatalf("candidate trimming lost an explicit target: %+v", value)
+	}
+}
+
+func TestTrimConversationRouteCandidatesPreservesActiveTaskControlEvidence(t *testing.T) {
+	value := app.ConversationRouteContext{
+		ActorID: "u1234567", Content: "补充一项结果", CurrentRequestModelID: "p1234567", TimeZone: "Asia/Shanghai",
+		PreviousMessageID: "m7654321", PreviousTaskID: "q7654321",
+		Candidates: []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567",
+			Status: task.StatusRunning, Revision: 3}},
+		RequestCandidates: []app.ConversationRouteRequestCandidate{
+			{MessageID: "m1234567", Sequence: 1, TaskID: "q1234567", TaskStatus: task.StatusRunning,
+				SameControlScope: true, SameAuthorization: true,
+				RequestInput: app.ConversationRoutingInput{ModelID: "p1234567", TimeZone: "Asia/Shanghai"}},
+			{MessageID: "m7654321", Sequence: 8, TaskID: "q7654321", TaskStatus: task.StatusCompleted},
+			{MessageID: "m2345678", Sequence: 7, Content: "older unrelated request", RoutingStatus: conversation.RoutingRouted},
+		},
+	}
+	if !trimConversationRouteCandidates(&value) || value.TaskCandidateSetIncomplete || !value.RequestCandidateSetIncomplete ||
+		len(value.Candidates) != 1 || len(value.RequestCandidates) != 2 || value.RequestCandidates[0].TaskID != "q1234567" {
+		t.Fatalf("trimming dropped active Task authorization evidence: %+v", value)
+	}
+	if !app.ValidConversationRouteSteerTarget("q1234567", value) {
+		t.Fatalf("retained active Task evidence was not sufficient for a safe steer: %+v", value)
+	}
+}
+
+func TestTrimConversationRouteCandidatesPreservesTaskWithActiveControlEvidence(t *testing.T) {
+	value := app.ConversationRouteContext{
+		ActorID: "u1234567", CurrentRequestModelID: "p1234567", TimeZone: "Asia/Shanghai",
+		PreviousMessageID: "m7654321", PreviousTaskID: "q7654321",
+		Candidates: []app.ConversationRouteCandidate{
+			{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 3},
+			{TaskID: "q7654321", InitiatorID: "u1234567", Status: task.StatusCompleted, Revision: 2},
+			{TaskID: "q2345678", InitiatorID: "u1234567", Status: task.StatusQueued, Revision: 1},
+		},
+		RequestCandidates: []app.ConversationRouteRequestCandidate{
+			{MessageID: "m1234567", Sequence: 1, TaskID: "q1234567", TaskStatus: task.StatusRunning,
+				SameControlScope: true, SameAuthorization: true,
+				RequestInput: app.ConversationRoutingInput{ModelID: "p1234567", TimeZone: "Asia/Shanghai"}},
+			{MessageID: "m7654321", Sequence: 8, TaskID: "q7654321", TaskStatus: task.StatusCompleted},
+		},
+	}
+	if !trimConversationRouteCandidates(&value) || !value.TaskCandidateSetIncomplete || len(value.Candidates) != 2 ||
+		value.Candidates[0].TaskID != "q1234567" || value.Candidates[1].TaskID != "q7654321" {
+		t.Fatalf("unrelated task was not trimmed while preserving the active control target: %+v", value)
+	}
+	if trimConversationRouteCandidates(&value) || len(value.Candidates) != 2 || value.Candidates[0].TaskID != "q1234567" {
+		t.Fatalf("active Task candidate was trimmed away from its authorization evidence: %+v", value)
 	}
 }
 

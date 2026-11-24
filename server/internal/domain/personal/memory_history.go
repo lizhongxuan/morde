@@ -44,12 +44,13 @@ type MemoryHistorySource struct {
 // MemoryRevision uses a nil body when the body is unavailable or provenance
 // policy requires withholding it. Older legacy bodies are never reconstructed.
 type MemoryRevision struct {
-	Revision     int64                 `json:"revision"`
-	ChangedAt    time.Time             `json:"changed_at"`
-	Body         json.RawMessage       `json:"body"`
-	Restorable   bool                  `json:"restorable"`
-	SourceStatus string                `json:"source_status"`
-	Sources      []MemoryHistorySource `json:"sources"`
+	Revision             int64                 `json:"revision"`
+	ChangedAt            time.Time             `json:"changed_at"`
+	Body                 json.RawMessage       `json:"body"`
+	Restorable           bool                  `json:"restorable"`
+	SourceStatus         string                `json:"source_status"`
+	Sources              []MemoryHistorySource `json:"sources"`
+	SupersededByRevision *int64                `json:"superseded_by_revision"`
 }
 
 type MemoryHistoryBatch struct {

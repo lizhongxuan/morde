@@ -151,12 +151,17 @@ func TestNewPersonalSyncServiceRequiresDataKey(t *testing.T) {
 func TestPersonalMemoryHistorySignsCursorAndBindsRequest(t *testing.T) {
 	key := []byte(strings.Repeat("m", 32))
 	changedAt := time.Date(2026, 11, 14, 3, 0, 0, 0, time.UTC)
+	five, four, three := int64(5), int64(4), int64(3)
 	store := &personalSyncStoreStub{historyBatch: personal.MemoryHistoryBatch{
 		ServiceInstanceID: "00000000-0000-4000-8000-000000000001", HasMore: true,
-		Items: []personal.MemoryRevision{{Revision: 4, ChangedAt: changedAt, Body: json.RawMessage(`{"content":"prior"}`),
-			Restorable: true, SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{
-				Kind: "mutation_receipt", ID: "mutation-123",
-			}}}},
+		Items: []personal.MemoryRevision{
+			{Revision: 5, ChangedAt: changedAt, Body: json.RawMessage(`{"content":"current"}`), Restorable: true,
+				SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{Kind: "mutation_receipt", ID: "mutation-125"}}},
+			{Revision: 4, ChangedAt: changedAt.Add(-time.Hour), Body: json.RawMessage(`{"content":"prior"}`),
+				Restorable: true, SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{
+					Kind: "mutation_receipt", ID: "mutation-124",
+				}}, SupersededByRevision: &five},
+		},
 	}}
 	service, err := NewPersonalSyncService(store, key)
 	if err != nil {
@@ -164,19 +169,27 @@ func TestPersonalMemoryHistorySignsCursorAndBindsRequest(t *testing.T) {
 	}
 	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
 	page, err := service.GetMemoryHistory(context.Background(), principal, personal.ObjectTypeMemory, "global", "", 0)
-	if err != nil || len(page.Items) != 1 || page.NextCursor == "" || store.historyCalls != 1 || store.historyObject != "global" ||
+	if err != nil || len(page.Items) != 2 || page.Items[0].Revision != five || page.Items[0].SupersededByRevision != nil ||
+		page.Items[1].Revision != four || page.Items[1].SupersededByRevision == nil || *page.Items[1].SupersededByRevision != five ||
+		page.NextCursor == "" || store.historyCalls != 1 || store.historyObject != "global" ||
 		store.historyLimit != personalSyncDefaultLimit || store.historyCursor != nil {
 		t.Fatalf("GetMemoryHistory() = %+v, err=%v store=%+v", page, err, store)
 	}
 	cursor, err := personal.DecodeMemoryHistoryCursor(page.NextCursor, key)
 	if err != nil || cursor.OwnerID != principal.UserID || cursor.ServiceInstanceID != store.historyBatch.ServiceInstanceID ||
-		cursor.ObjectType != personal.ObjectTypeMemory || cursor.ObjectID != "global" || cursor.AfterRevision != 4 {
+		cursor.ObjectType != personal.ObjectTypeMemory || cursor.ObjectID != "global" || cursor.AfterRevision != four {
 		t.Fatalf("decoded memory history cursor = %+v, err=%v", cursor, err)
 	}
 
-	store.historyBatch = personal.MemoryHistoryBatch{ServiceInstanceID: cursor.ServiceInstanceID, Items: []personal.MemoryRevision{}}
-	if _, err := service.GetMemoryHistory(context.Background(), principal, personal.ObjectTypeMemory, "global", page.NextCursor, 5); err != nil ||
-		store.historyCursor == nil || store.historyCursor.AfterRevision != 4 || store.historyLimit != 5 {
+	store.historyBatch = personal.MemoryHistoryBatch{ServiceInstanceID: cursor.ServiceInstanceID, Items: []personal.MemoryRevision{{
+		Revision: three, ChangedAt: changedAt.Add(-2 * time.Hour), Body: json.RawMessage(`{"content":"older"}`), Restorable: true,
+		SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{Kind: "mutation_receipt", ID: "mutation-123"}},
+		SupersededByRevision: &four,
+	}}}
+	continued, err := service.GetMemoryHistory(context.Background(), principal, personal.ObjectTypeMemory, "global", page.NextCursor, 5)
+	if err != nil || len(continued.Items) != 1 || continued.Items[0].Revision != three ||
+		continued.Items[0].SupersededByRevision == nil || *continued.Items[0].SupersededByRevision != four ||
+		store.historyCursor == nil || store.historyCursor.AfterRevision != four || store.historyLimit != 5 {
 		t.Fatalf("history continuation = cursor %+v limit %d err %v", store.historyCursor, store.historyLimit, err)
 	}
 
@@ -208,10 +221,18 @@ func TestPersonalMemoryHistoryRejectsInvalidProvenanceAndBodyCombinations(t *tes
 	for _, revision := range []personal.MemoryRevision{
 		{Revision: 1, ChangedAt: time.Now(), Body: json.RawMessage(`{"content":"x"}`), Restorable: true,
 			SourceStatus: personal.MemoryHistorySourceUnavailable, Sources: []personal.MemoryHistorySource{}},
+		{Revision: 1, ChangedAt: time.Now(), SourceStatus: personal.MemoryHistorySourceUnavailable, Sources: []personal.MemoryHistorySource{},
+			SupersededByRevision: ptrInt64(2)},
 		{Revision: 1, ChangedAt: time.Now(), Restorable: true,
 			SourceStatus: personal.MemoryHistorySourceUnrecorded, Sources: []personal.MemoryHistorySource{}},
 		{Revision: 1, ChangedAt: time.Now(), Body: json.RawMessage(`{"content":"x"}`), Restorable: true,
 			SourceStatus: personal.MemoryHistorySourceAvailable, Sources: nil},
+		{Revision: 1, ChangedAt: time.Now(), Body: json.RawMessage(`{"content":"x"}`), Restorable: true,
+			SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{Kind: "mutation_receipt", ID: "mutation-123"}},
+			SupersededByRevision: ptrInt64(1)},
+		{Revision: 1, ChangedAt: time.Now(), Body: json.RawMessage(`{"content":"x"}`), Restorable: true,
+			SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{Kind: "mutation_receipt", ID: "mutation-123"}},
+			SupersededByRevision: ptrInt64(2)},
 	} {
 		store := &personalSyncStoreStub{historyBatch: personal.MemoryHistoryBatch{
 			ServiceInstanceID: "00000000-0000-4000-8000-000000000001", Items: []personal.MemoryRevision{revision},
@@ -224,4 +245,33 @@ func TestPersonalMemoryHistoryRejectsInvalidProvenanceAndBodyCombinations(t *tes
 			t.Errorf("invalid history revision %+v error = %v, want internal", revision, err)
 		}
 	}
+}
+
+func TestPersonalMemoryHistoryWithholdsRelationshipWhenSourceIsUnavailable(t *testing.T) {
+	key := []byte(strings.Repeat("k", 32))
+	serviceInstanceID := "00000000-0000-4000-8000-000000000001"
+	cursor, err := personal.EncodeMemoryHistoryCursor(personal.MemoryHistoryCursor{
+		Version: personal.MemoryHistoryCursorVersion, OwnerID: "u1234567", ServiceInstanceID: serviceInstanceID,
+		ObjectType: personal.ObjectTypeMemory, ObjectID: "global", AfterRevision: 2,
+	}, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := &personalSyncStoreStub{historyBatch: personal.MemoryHistoryBatch{
+		ServiceInstanceID: serviceInstanceID,
+		Items: []personal.MemoryRevision{{Revision: 1, ChangedAt: time.Date(2026, 11, 14, 3, 0, 0, 0, time.UTC),
+			SourceStatus: personal.MemoryHistorySourceUnavailable, Sources: []personal.MemoryHistorySource{}, SupersededByRevision: ptrInt64(2)}},
+	}}
+	service, err := NewPersonalSyncService(store, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+	if _, err := service.GetMemoryHistory(context.Background(), principal, personal.ObjectTypeMemory, "global", cursor, 10); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("unavailable provenance relationship error = %v, want internal", err)
+	}
+}
+
+func ptrInt64(value int64) *int64 {
+	return &value
 }

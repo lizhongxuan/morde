@@ -310,6 +310,11 @@ WHERE review.task_id=$1 AND review.owner_id=$2 AND review.task_revision=$3
 }
 
 func conversationTaskResultReceipt(reply string, sources []app.ConversationTaskResultSource, states []app.TaskValidationState) string {
+	return conversationTaskResultReceiptWithDeliveryFacts(reply, sources, states, nil)
+}
+
+func conversationTaskResultReceiptWithDeliveryFacts(reply string, sources []app.ConversationTaskResultSource,
+	states []app.TaskValidationState, deliveryFacts []conversationResultDeliveryFacts) string {
 	const header = "结果摘要（主助手整理，不代表独立验收）：\n"
 	var footer strings.Builder
 	footer.WriteString("\n\nTask 执行状态：completed\n服务端验收状态（当前修订）：")
@@ -319,6 +324,37 @@ func conversationTaskResultReceipt(reply string, sources []app.ConversationTaskR
 			state = states[index]
 		}
 		fmt.Fprintf(&footer, "\n- %s r%d：%s", source.TaskID, source.TaskRevision, state)
+	}
+	var deliveryLines []string
+	for index, source := range sources {
+		if index >= len(deliveryFacts) {
+			break
+		}
+		deliveryLines = append(deliveryLines, conversationResultDeliveryFactLines(source, deliveryFacts[index])...)
+	}
+	remaining := app.MaxConversationRouteReplyRunes - utf8.RuneCountInString(header+footer.String())
+	if len(deliveryLines) > 0 && remaining > 0 {
+		const omittedFactsLine = "部分审批或操作回执未展开，请在 Task 详情核对"
+		noteRunes := utf8.RuneCountInString("\n- " + omittedFactsLine)
+		budget := remaining
+		if noteRunes <= budget {
+			budget -= noteRunes
+		}
+		omitted := false
+		for _, line := range deliveryLines {
+			lineRunes := utf8.RuneCountInString("\n- " + line)
+			if lineRunes > budget {
+				omitted = true
+				continue
+			}
+			footer.WriteString("\n- ")
+			footer.WriteString(line)
+			budget -= lineRunes
+		}
+		if omitted && noteRunes <= remaining {
+			footer.WriteString("\n- ")
+			footer.WriteString(omittedFactsLine)
+		}
 	}
 	suffix := footer.String()
 	available := app.MaxConversationRouteReplyRunes - utf8.RuneCountInString(header+suffix)
@@ -393,14 +429,20 @@ WHERE message_id=$1 AND state='processing'`, replyMessageID); err != nil {
 		return finishConversationRoute(ctx, tx, claim, "routed", "", "", true)
 	}
 	validationStates := make([]app.TaskValidationState, 0, len(review.Sources))
+	deliveryFacts := make([]conversationResultDeliveryFacts, 0, len(review.Sources))
 	for _, source := range review.Sources {
 		state, err := conversationTaskResultValidationStateInTx(ctx, tx, claim.Message.OwnerID, source)
 		if err != nil {
 			return err
 		}
 		validationStates = append(validationStates, state)
+		facts, err := conversationResultDeliveryFactsInTx(ctx, tx, claim.Message.OwnerID, source)
+		if err != nil {
+			return err
+		}
+		deliveryFacts = append(deliveryFacts, facts)
 	}
-	receipt := conversationTaskResultReceipt(reply, review.Sources, validationStates)
+	receipt := conversationTaskResultReceiptWithDeliveryFacts(reply, review.Sources, validationStates, deliveryFacts)
 	if !app.ValidConversationRouteReply(receipt) {
 		return domain.InvalidArgument("result_review", "task result review receipt is invalid")
 	}

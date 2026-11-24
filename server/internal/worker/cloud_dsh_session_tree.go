@@ -1453,14 +1453,15 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err != nil {
 				return errors.New("dsh background job authorization is unavailable")
 			}
-			definitions, err = cloudDSHChildDelegationTools(definitions, canDelegate)
+			childCanDelegate := canDelegate && len(definitions) > 0
+			definitions, err = cloudDSHChildDelegationTools(definitions, childCanDelegate)
 			if err != nil {
 				return err
 			}
 			identity := rootIdentity
 			identity.SessionID = child.SessionID
 			state := newCloudDSHSessionState(fence, identity, rootIdentity.SessionID, child.SpawnKey, definitions,
-				canDelegate, true, child.CheckpointThrough, child.CheckpointDigest)
+				childCanDelegate, true, child.CheckpointThrough, child.CheckpointDigest)
 			state.rootCheckpointThrough = child.RootCheckpointThroughSequence
 			state.background = true
 			states[child.SessionID] = state
@@ -2949,7 +2950,7 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 	}
 	identity := parent.identity
 	identity.SessionID = child.SessionID
-	childCanDelegate := parent.identity.SessionID == fence.AgentSessionID
+	childCanDelegate := parent.identity.SessionID == fence.AgentSessionID && len(definitions) > 0
 	childDefinitions, err := cloudDSHChildDelegationTools(definitions, childCanDelegate)
 	if err != nil {
 		return false, err

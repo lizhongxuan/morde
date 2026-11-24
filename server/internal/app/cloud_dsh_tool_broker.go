@@ -1389,9 +1389,15 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	operationStatus, stepStatus := task.OperationSucceeded, task.StepSucceeded
 	summary := "The cloud dsh tool completed and its result was saved."
+	eventDetail := map[string]any{
+		"tool": call.Name, "operation_key": request.OperationKey, "operation_status": operationStatus,
+	}
 	if result.Status == AgentToolFailed {
 		operationStatus, stepStatus = task.OperationFailed, task.StepFailed
 		summary = "The Host runtime reported a definitive tool failure."
+		ctx = withTaskToolResultEvidence(ctx, "execute", taskToolExecutionFailureReason)
+		eventDetail["operation_status"] = operationStatus
+		eventDetail["failure_reason"] = taskToolExecutionFailureReason
 	}
 	output := boundedToolOutput(result.Output)
 	if _, err := b.store.UpdateOperation(ctx, OperationUpdate{
@@ -1405,9 +1411,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	step.Status, step.Summary = stepStatus, summary
 	ctx = withTaskToolShellExecutionEvidence(ctx, call.Name, result)
-	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
-		"tool": call.Name, "operation_key": request.OperationKey, "operation_status": operationStatus,
-	}); err != nil {
+	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", eventDetail); err != nil {
 		return AgentToolResult{}, err
 	}
 	return AgentToolResult{Status: result.Status, ExternalID: result.ExternalID, Output: output, Images: result.Images}, nil
@@ -1965,12 +1969,13 @@ func modelFailureToolNotDispatched(diagnostic AgentModelFailureDiagnostic) bool 
 func (b *CloudDSHToolBroker) commitResult(ctx context.Context, current task.Task, step task.Step, usage task.Usage, name string, result AgentToolResult) (AgentToolResult, error) {
 	ctx = withTaskToolShellExecutionEvidence(ctx, name, result)
 	step.Status, step.Summary = task.StepSucceeded, "The cloud dsh tool completed and its result was saved."
+	eventDetail := map[string]any{"tool": name, "operation_status": result.Status, "reused": true}
 	if result.Status == AgentToolFailed {
 		step.Status, step.Summary = task.StepFailed, "The Host runtime reported a definitive tool failure."
+		ctx = withTaskToolResultEvidence(ctx, "execute", taskToolExecutionFailureReason)
+		eventDetail["failure_reason"] = taskToolExecutionFailureReason
 	}
-	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
-		"tool": name, "operation_status": result.Status, "reused": true,
-	}); err != nil {
+	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", eventDetail); err != nil {
 		return AgentToolResult{}, err
 	}
 	result.Output = boundedToolOutput(result.Output)
@@ -2175,6 +2180,18 @@ func (b *CloudDSHToolBroker) prepareTaskToolStep(ctx context.Context, current ta
 }
 
 func (b *CloudDSHToolBroker) commitProgress(ctx context.Context, current task.Task, step task.Step, usage task.Usage, status task.Status, waitingReason, eventType string, detail any, pending ...*task.PendingRequest) error {
+	return b.commitProgressWithPersonalHistoryReadFence(ctx, current, step, usage, status, waitingReason, eventType, detail, nil, 0, pending...)
+}
+
+func (b *CloudDSHToolBroker) commitPersonalHistoryReadProgress(ctx context.Context, current task.Task, step task.Step,
+	usage task.Usage, eventType string, detail any, settingRevision, personalChangeWatermark int64) error {
+	return b.commitProgressWithPersonalHistoryReadFence(ctx, current, step, usage, task.StatusRunning, "", eventType,
+		detail, &settingRevision, personalChangeWatermark)
+}
+
+func (b *CloudDSHToolBroker) commitProgressWithPersonalHistoryReadFence(ctx context.Context, current task.Task, step task.Step,
+	usage task.Usage, status task.Status, waitingReason, eventType string, detail any,
+	settingRevision *int64, personalChangeWatermark int64, pending ...*task.PendingRequest) error {
 	if fields, ok := detail.(map[string]any); ok && fields["phase"] == "prepare" {
 		step.Phase = "prepare"
 	}
@@ -2191,6 +2208,17 @@ func (b *CloudDSHToolBroker) commitProgress(ctx context.Context, current task.Ta
 		Status: status, CurrentStep: step.ID, Result: current.Result, WaitingReason: waitingReason,
 		Usage: usage, Steps: []task.Step{step}, Event: task.Event{TaskID: current.ID, Type: eventType, Payload: payload},
 		ToolCall: toolCall,
+	}
+	if settingRevision != nil {
+		if toolCall == nil {
+			return domain.NewError(domain.CodeInvalidState, "personal history read has no durable tool call")
+		}
+		progress.CloudDSHPersonalHistoryRead = &CloudDSHPersonalHistoryReadCommit{
+			SettingRevision: *settingRevision, PersonalChangeWatermark: personalChangeWatermark,
+			CallID: toolCall.CallKey, ToolName: toolCall.ToolName,
+			AgentSessionID: toolCall.AgentSessionID, AuthorizationVersion: toolCall.AuthorizationVersion,
+			TaskRevision: toolCall.TaskRevision,
+		}
 	}
 	if len(pending) > 1 {
 		return domain.InvalidArgument("pending_request", "at most one pending request may be committed")

@@ -194,9 +194,9 @@ VALUES ($1,$2,1,'tool','failed','Call selected connector','Connector was rate li
 	if _, err := store.pool.Exec(ctx, `INSERT INTO task_mcp_connector_operations
 (id,task_id,owner_id,connector_id,builtin_service,connector_revision,credential_version,grant_version,lease_version,
 host_id,workspace_id,binding_version,task_revision,call_id,operation_key,tool_name,request_hash,status,result)
-VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,'mcp_call',$13,'failed',$14)`,
+VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,$8,$9,'',0,$10,$11,$12,('mcp_' || $4 || '_0123456789ab'),$13,'failed',$14)`,
 		mustID(t, domain.NewOperationID), claimed.ID, ownerID, connectorID, int64(1), int64(0), int64(1), started.Fence.LeaseVersion,
-		claimed.HostID, revision, callID, "rate-limit-source-operation-"+suffix, requestDigest, terminalRaw); err != nil {
+		claimed.HostID, revision, callID, app.AgentOperationKey(callID), requestDigest, terminalRaw); err != nil {
 		t.Fatalf("insert failed connector operation evidence: %v", err)
 	}
 	if _, err := store.pool.Exec(ctx, `UPDATE task_mcp_connector_operations SET updated_at=clock_timestamp()-interval '6 minutes'

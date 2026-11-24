@@ -1041,6 +1041,80 @@ func TestTaskServiceListHidesTasksWithoutHostReadAccess(t *testing.T) {
 	}
 }
 
+func TestTaskServicePreservesInitiatorTaskReadAfterHostAccessLoss(t *testing.T) {
+	store := &taskStoreStub{
+		details: TaskDetails{Task: task.Task{
+			ID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", HostID: "h1234567",
+			ExecutionLocation: "server", ModelID: "model-a",
+			Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
+			Status: task.StatusWaitingUser, Result: "private task output",
+		}, PendingRequest: &task.PendingRequest{ID: "r1234567", Title: "private approval"},
+			Steps: []task.Step{{ID: "s1234567", Title: "private step"}}, Artifacts: []task.Artifact{{}}},
+		events: []task.Event{{TaskID: "q1234567", Sequence: 1, Type: "task.status", Payload: []byte(`{}`), CreatedAt: time.Now()}},
+	}
+	authorizer := &taskAuthorizerStub{hostErrors: map[string]error{
+		"h1234567": domain.NewError(domain.CodeForbidden, "host grant was revoked"),
+	}}
+	service, err := NewTaskService(store, authorizer, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := service.Get(context.Background(), taskTestPrincipal(), "q1234567"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("initiator read a still-active Task after Host access was lost: %v", err)
+	}
+	store.details.Task.Status = task.StatusCancelling
+	if details, err := service.Get(context.Background(), taskTestPrincipal(), "q1234567"); err != nil ||
+		details.Task.Status != task.StatusCancelling || details.Task.Result != "" || details.PendingRequest != nil ||
+		len(details.Steps) != 0 || len(details.Artifacts) != 0 || details.Task.ExecutionLocation != "server" ||
+		details.Task.ModelID != "model-a" || details.Task.Budget != (task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000}) {
+		t.Fatalf("initiator did not receive a status-only view after Host grant revocation: details=%#v err=%v", details, err)
+	}
+	if page, err := service.ListEvents(context.Background(), taskTestPrincipal(), "q1234567", 0, 50); err != nil ||
+		page.Status != task.StatusCancelling || len(page.Items) != 0 {
+		t.Fatalf("revoked Task event read exposed activity instead of status only: page=%#v err=%v", page, err)
+	}
+	store.details.Task.Status = task.StatusCancelled
+	if details, err := service.Get(context.Background(), taskTestPrincipal(), "q1234567"); err != nil || details.Task.Status != task.StatusCancelled {
+		t.Fatalf("initiator lost the same Task terminal state after Host grant revocation: details=%#v err=%v", details.Task, err)
+	}
+	store.details.Task.InitiatorID = "u7654321"
+	if _, err := service.Get(context.Background(), taskTestPrincipal(), "q1234567"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("a non-initiator read another member's revoked Task: %v", err)
+	}
+	store.details.Task.InitiatorID = "u1234567"
+	apiKey := identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindAPIKey,
+		TokenID: "t1234567", HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeTaskRead}}
+	store.details.Task.ProjectID = "p1234567"
+	if _, err := service.Get(context.Background(), apiKey, "q1234567"); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("API key bypassed current Host authorization for a shared Task: %v", err)
+	}
+}
+
+func TestTaskServiceTaskListIncludesInitiatorsWhenHostAccessIsUnavailable(t *testing.T) {
+	store := &taskStoreStub{listTasksPage: TaskPage{Items: []task.Task{
+		{ID: "qsafe001", ProjectID: "p1234567", InitiatorID: "u1234567", HostID: "hrevoke1", Status: task.StatusCancelling, Result: "private result"},
+		{ID: "qother01", ProjectID: "p1234567", InitiatorID: "u7654321", HostID: "hrevoke1", Status: task.StatusCancelled},
+		{ID: "qprivate1", InitiatorID: "u1234567", HostID: "hrevoke1", Status: task.StatusCancelling},
+		{ID: "qallowed1", ProjectID: "p1234567", InitiatorID: "u1234567", HostID: "hallow01", Status: task.StatusRunning},
+	}, K2Projections: map[string]TaskK2Projection{
+		"qsafe001": {}, "qother01": {}, "qprivate1": {}, "qallowed1": {},
+	}}}
+	authorizer := &taskAuthorizerStub{hostErrors: map[string]error{
+		"hrevoke1": domain.NewError(domain.CodeNotFound, "host grant was revoked"),
+	}}
+	service, err := NewTaskService(store, authorizer, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := service.List(context.Background(), taskTestPrincipal(), TaskListRequest{})
+	if err != nil || len(page.Items) != 3 || page.Items[0].ID != "qsafe001" || page.Items[1].ID != "qprivate1" ||
+		page.Items[2].ID != "qallowed1" || len(page.K2Projections) != 1 || page.Items[0].Result != "" ||
+		page.Items[0].CurrentStep != "" {
+		t.Fatalf("Task list hid the initiator's Host-unavailable Task or leaked another user's Task: page=%#v err=%v", page, err)
+	}
+}
+
 func TestTaskServiceListEventsValidatesEnvelopeAndAllowsUnknownType(t *testing.T) {
 	store := &taskStoreStub{
 		details: TaskDetails{Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567"}},

@@ -24,19 +24,20 @@ import (
 
 type cloudDSHHistoryTaskStore struct {
 	*cloudDSHBrokerTaskStore
-	conversations         ConversationPage
-	conversationPages     map[string]ConversationPage
-	messages              map[string]MessagePage
-	messagePages          map[string]MessagePage
-	suppressed            map[string]struct{}
-	listOwner             string
-	messageOwners         []string
-	messageIDs            []string
-	conversationCursors   []string
-	messageCursors        []string
-	pageCalls             int
-	afterPage             func()
-	suppressionBatchSizes []int
+	conversations            ConversationPage
+	conversationPages        map[string]ConversationPage
+	messages                 map[string]MessagePage
+	messagePages             map[string]MessagePage
+	suppressed               map[string]struct{}
+	listOwner                string
+	messageOwners            []string
+	messageIDs               []string
+	conversationCursors      []string
+	messageCursors           []string
+	pageCalls                int
+	afterPage                func()
+	afterPersonalHistoryRead func()
+	suppressionBatchSizes    []int
 }
 
 type cloudDSHCurrentMessageChunkTestStore struct {
@@ -160,6 +161,9 @@ func (s *cloudDSHHistoryTaskStore) ListMessages(ctx context.Context, ownerID, co
 	}
 	if page.Limit == cloudDSHHistoryMessageLimit && page.Cursor != "" {
 		if result, ok := s.messagePages[conversationID+"\x00"+page.Cursor]; ok {
+			if s.afterPersonalHistoryRead != nil {
+				s.afterPersonalHistoryRead()
+			}
 			return result, nil
 		}
 		return MessagePage{}, fmt.Errorf("unexpected history message cursor")
@@ -167,13 +171,24 @@ func (s *cloudDSHHistoryTaskStore) ListMessages(ctx context.Context, ownerID, co
 	if (page.Limit != cloudDSHHistoryMessageLimit && page.Limit != cloudDSHHistorySummaryMessageLimit) || page.Cursor != "" {
 		return MessagePage{}, fmt.Errorf("unexpected history message page: %+v", page)
 	}
-	return s.messages[conversationID], nil
+	result := s.messages[conversationID]
+	if s.afterPersonalHistoryRead != nil {
+		s.afterPersonalHistoryRead()
+	}
+	return result, nil
 }
 
 type cloudDSHHistoryTaskAuthorizer struct {
 	authorization task.Authorization
 	revoked       bool
 	calls         int
+}
+
+func configureCloudDSHPersonalHistoryAuthorization(broker *CloudDSHToolBroker, claimed task.Task) *cloudDSHHistoryTaskAuthorizer {
+	authorizer := &cloudDSHHistoryTaskAuthorizer{authorization: claimed.Authorization}
+	broker.runtime.authorizer = authorizer
+	broker.personalSync = &cloudDSHPersonalSnapshotStub{}
+	return authorizer
 }
 
 func (a *cloudDSHHistoryTaskAuthorizer) AuthorizeTaskAction(context.Context, string, identity.Kind, string, string, []identity.Scope, identity.Scope) error {
@@ -985,6 +1000,9 @@ func (s *cloudDSHHistoryTaskStore) ListSuppressedPersonalHistoryMessageIDs(ctx c
 			result[id] = struct{}{}
 		}
 	}
+	if s.afterPersonalHistoryRead != nil {
+		s.afterPersonalHistoryRead()
+	}
 	return result, nil
 }
 
@@ -1081,6 +1099,17 @@ func TestCloudDSHDeletedPersonalMemoryIsFilteredFromHistorySearchAndSummary(t *t
 	}
 }
 
+func cloudDSHHistoryFencedCall(current task.Task, call ModelToolCall) ModelToolCall {
+	call.TaskFence = &ModelTaskFence{
+		TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+		LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
+		AgentInstanceID: current.AgentInstanceID, AgentGeneration: current.AgentGeneration,
+		AgentSessionID: current.AgentSessionID, AgentRootSessionID: current.AgentSessionID,
+		AuthorizationVersion: current.Authorization.Version,
+	}
+	return call
+}
+
 func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope(t *testing.T) {
 	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
 	settingStore := &personalMutationStoreStub{objects: map[string]personal.Object{}}
@@ -1089,6 +1118,7 @@ func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope
 		t.Fatal(err)
 	}
 	broker.personalData = personalData
+	configureCloudDSHPersonalHistoryAuthorization(broker, claimed)
 	disabledSetting := enabledMemorySetting()
 	disabledSetting.Body = json.RawMessage(`{"enabled":false}`)
 	settingStore.objects[personal.ObjectTypeSkillSetting+"/"+cloudDSHMemorySettingID] = disabledSetting
@@ -1174,9 +1204,9 @@ func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope
 	if err := broker.SetHistorySearchCursorSigning("11111111-1111-1111-1111-111111111111", []byte(strings.Repeat("k", 32))); err != nil {
 		t.Fatal(err)
 	}
-	call = ModelToolCall{CallID: "call_history_enabled", Name: cloudDSHConversationHistorySearchToolName,
-		Arguments: `{"query":"茶叶","limit":1,"cursor":null}`}
-	result, err := broker.execute(context.Background(), claimed, call, false, nil)
+	call = cloudDSHHistoryFencedCall(claimed, ModelToolCall{CallID: "call_history_enabled", Name: cloudDSHConversationHistorySearchToolName,
+		Arguments: `{"query":"茶叶","limit":1,"cursor":null}`})
+	result, err := broker.Execute(context.Background(), claimed, call)
 	if err != nil || result.Status != AgentToolSucceeded {
 		t.Fatalf("history search result=%+v err=%v", result, err)
 	}
@@ -1198,8 +1228,9 @@ func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope
 		t.Fatalf("successful history search was not checkpointed and charged exactly once: usage=%+v events=%+v", baseStore.details.Task.Usage, baseStore.events)
 	}
 
-	summaryCall := ModelToolCall{CallID: "call_history_summary", Name: cloudDSHRecentHistorySummaryToolName, Arguments: `{}`}
-	summary, err := broker.execute(context.Background(), claimed, summaryCall, false, nil)
+	summaryCall := cloudDSHHistoryFencedCall(claimed,
+		ModelToolCall{CallID: "call_history_summary", Name: cloudDSHRecentHistorySummaryToolName, Arguments: `{}`})
+	summary, err := broker.Execute(context.Background(), claimed, summaryCall)
 	if err != nil || summary.Status != AgentToolSucceeded {
 		t.Fatalf("recent history summary=%+v err=%v", summary, err)
 	}
@@ -1238,6 +1269,183 @@ func TestCloudDSHConversationHistorySearchDefaultsOnButHonorsOptOutAndOwnerScope
 	}
 }
 
+func TestCloudDSHPersonalHistoryRechecksAccessAfterRead(t *testing.T) {
+	tests := []struct {
+		name     string
+		wantCode domain.ErrorCode
+		mutate   func(*cloudDSHBrokerTaskStore, *personalMutationStoreStub, *cloudDSHHistoryTaskAuthorizer)
+	}{
+		{
+			name:     "memory disabled during read",
+			wantCode: domain.CodeForbidden,
+			mutate: func(_ *cloudDSHBrokerTaskStore, settings *personalMutationStoreStub, _ *cloudDSHHistoryTaskAuthorizer) {
+				setting := enabledMemorySetting()
+				setting.Revision = 2
+				setting.Body = json.RawMessage(`{"enabled":false}`)
+				settings.objects[personal.ObjectTypeSkillSetting+"/"+cloudDSHMemorySettingID] = setting
+			},
+		},
+		{
+			name:     "memory setting changed during read",
+			wantCode: domain.CodeForbidden,
+			mutate: func(_ *cloudDSHBrokerTaskStore, settings *personalMutationStoreStub, _ *cloudDSHHistoryTaskAuthorizer) {
+				setting := enabledMemorySetting()
+				setting.Revision = 2
+				settings.objects[personal.ObjectTypeSkillSetting+"/"+cloudDSHMemorySettingID] = setting
+			},
+		},
+		{
+			name:     "task authorization changed during read",
+			wantCode: domain.CodeForbidden,
+			mutate: func(store *cloudDSHBrokerTaskStore, _ *personalMutationStoreStub, _ *cloudDSHHistoryTaskAuthorizer) {
+				store.details.Task.Authorization.Version++
+			},
+		},
+		{
+			name:     "token revoked during read",
+			wantCode: domain.CodeUnauthenticated,
+			mutate: func(_ *cloudDSHBrokerTaskStore, _ *personalMutationStoreStub, authorizer *cloudDSHHistoryTaskAuthorizer) {
+				authorizer.revoked = true
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			broker, baseStore, claimed, settings, historyStore, authorizer := cloudDSHPersonalHistoryAccessFixture(t)
+			historyStore.afterPersonalHistoryRead = func() { test.mutate(baseStore, settings, authorizer) }
+			call := ModelToolCall{CallID: "call_history_revoke_during_read", Name: cloudDSHConversationHistorySearchToolName,
+				Arguments: `{"query":"cedar","limit":5,"cursor":null}`}
+			result, err := broker.execute(context.Background(), claimed, call, false, nil)
+			if domain.CodeOf(err) != test.wantCode || result.Status != "" || result.Output != "" {
+				t.Fatalf("history result after access changed = %+v, err=%v; want code %s and no result", result, err, test.wantCode)
+			}
+			if len(baseStore.events) != 0 || baseStore.details.Task.Usage.ToolCalls != 0 {
+				t.Fatalf("denied history read committed progress: events=%+v usage=%+v", baseStore.events, baseStore.details.Task.Usage)
+			}
+		})
+	}
+}
+
+func TestCloudDSHRecentHistorySummaryRechecksConsentBeforeCommit(t *testing.T) {
+	broker, baseStore, claimed, settings, historyStore, _ := cloudDSHPersonalHistoryAccessFixture(t)
+	historyStore.afterPersonalHistoryRead = func() {
+		setting := enabledMemorySetting()
+		setting.Revision = 2
+		setting.Body = json.RawMessage(`{"enabled":false}`)
+		settings.objects[personal.ObjectTypeSkillSetting+"/"+cloudDSHMemorySettingID] = setting
+	}
+	call := ModelToolCall{CallID: "call_summary_revoke_during_read", Name: cloudDSHRecentHistorySummaryToolName, Arguments: `{}`}
+	result, err := broker.execute(context.Background(), claimed, call, false, nil)
+	if domain.CodeOf(err) != domain.CodeForbidden || result.Status != "" || result.Output != "" {
+		t.Fatalf("summary after consent changed = %+v, err=%v; want forbidden and no result", result, err)
+	}
+	if len(baseStore.events) != 0 || baseStore.details.Task.Usage.ToolCalls != 0 {
+		t.Fatalf("denied summary committed progress: events=%+v usage=%+v", baseStore.events, baseStore.details.Task.Usage)
+	}
+}
+
+func TestCloudDSHPersonalHistoryCheckpointRecoveryRechecksConsent(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call ModelToolCall
+	}{
+		{name: "history search", call: ModelToolCall{CallID: "call_history_checkpoint", Name: cloudDSHConversationHistorySearchToolName,
+			Arguments: `{"query":"cedar","limit":5,"cursor":null}`}},
+		{name: "recent summary", call: ModelToolCall{CallID: "call_summary_checkpoint", Name: cloudDSHRecentHistorySummaryToolName, Arguments: `{}`}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			broker, baseStore, claimed, settings, historyStore, _ := cloudDSHPersonalHistoryAccessFixture(t)
+			test.call = cloudDSHHistoryFencedCall(claimed, test.call)
+			checkpoint, err := broker.Execute(context.Background(), claimed, test.call)
+			if err != nil || checkpoint.Status != AgentToolSucceeded {
+				t.Fatalf("initial history result = %+v, err=%v", checkpoint, err)
+			}
+			eventsBeforeRecovery := len(baseStore.events)
+			historyStore.afterPersonalHistoryRead = func() {
+				setting := enabledMemorySetting()
+				setting.Revision = 2
+				setting.Body = json.RawMessage(`{"enabled":false}`)
+				settings.objects[personal.ObjectTypeSkillSetting+"/"+cloudDSHMemorySettingID] = setting
+			}
+			result, err := broker.Reconcile(context.Background(), claimed, test.call, &checkpoint.Output)
+			if domain.CodeOf(err) != domain.CodeForbidden || result.Status != "" || result.Output != "" {
+				t.Fatalf("checkpoint returned after consent changed = %+v, err=%v; want forbidden and no result", result, err)
+			}
+			if len(baseStore.events) != eventsBeforeRecovery {
+				t.Fatalf("denied checkpoint recovery committed progress: before=%d after=%d", eventsBeforeRecovery, len(baseStore.events))
+			}
+		})
+	}
+}
+
+func TestCloudDSHPersonalHistoryCheckpointRecoveryRejectsChangedPersonalData(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		call ModelToolCall
+	}{
+		{name: "history search", call: ModelToolCall{CallID: "call_history_checkpoint_watermark", Name: cloudDSHConversationHistorySearchToolName,
+			Arguments: `{"query":"cedar","limit":5,"cursor":null}`}},
+		{name: "recent summary", call: ModelToolCall{CallID: "call_summary_checkpoint_watermark", Name: cloudDSHRecentHistorySummaryToolName, Arguments: `{}`}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			broker, baseStore, claimed, _, historyStore, _ := cloudDSHPersonalHistoryAccessFixture(t)
+			snapshot := broker.personalSync.(*cloudDSHPersonalSnapshotStub)
+			snapshot.watermark, snapshot.watermarkSet = 1, true
+			test.call = cloudDSHHistoryFencedCall(claimed, test.call)
+			checkpoint, err := broker.Execute(context.Background(), claimed, test.call)
+			if err != nil || checkpoint.Status != AgentToolSucceeded {
+				t.Fatalf("initial history result = %+v, err=%v", checkpoint, err)
+			}
+			eventsBeforeRecovery := len(baseStore.events)
+			historyStore.afterPersonalHistoryRead = func() { snapshot.watermark = 2 }
+			result, err := broker.Reconcile(context.Background(), claimed, test.call, &checkpoint.Output)
+			if domain.CodeOf(err) != domain.CodeInvalidState || result.Status != "" || result.Output != "" {
+				t.Fatalf("checkpoint returned after personal data changed = %+v, err=%v; want invalid state and no result", result, err)
+			}
+			if len(baseStore.events) != eventsBeforeRecovery {
+				t.Fatalf("rejected checkpoint recovery committed progress: before=%d after=%d", eventsBeforeRecovery, len(baseStore.events))
+			}
+		})
+	}
+}
+
+func cloudDSHPersonalHistoryAccessFixture(t *testing.T) (*CloudDSHToolBroker, *cloudDSHBrokerTaskStore, task.Task,
+	*personalMutationStoreStub, *cloudDSHHistoryTaskStore, *cloudDSHHistoryTaskAuthorizer) {
+	t.Helper()
+	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
+	settingStore := &personalMutationStoreStub{objects: map[string]personal.Object{
+		personal.ObjectTypeSkillSetting + "/" + cloudDSHMemorySettingID: enabledMemorySetting(),
+	}}
+	personalData, err := NewPersonalMutationService(settingStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.personalData = personalData
+	authorizer := configureCloudDSHPersonalHistoryAuthorization(broker, claimed)
+	previousID, err := domain.NewConversationID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	messageID, err := domain.NewMessageID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	historyStore := &cloudDSHHistoryTaskStore{
+		cloudDSHBrokerTaskStore: baseStore,
+		conversations:           ConversationPage{Items: []conversation.Conversation{{ID: previousID, OwnerID: claimed.OwnerID, Title: "历史"}}},
+		messages: map[string]MessagePage{previousID: {Items: []conversation.Message{{
+			ID: messageID, ConversationID: previousID, OwnerID: claimed.OwnerID, Role: conversation.RoleUser,
+			Content: "the earlier request mentioned cedar", DeliveryStatus: conversation.DeliveryApplied,
+		}}}},
+	}
+	broker.store = historyStore
+	if err := broker.SetHistorySearchCursorSigning("11111111-1111-1111-1111-111111111111", []byte(strings.Repeat("k", 32))); err != nil {
+		t.Fatal(err)
+	}
+	baseStore.details.Task.Budget.ToolCalls = 10
+	return broker, baseStore, claimed, settingStore, historyStore, authorizer
+}
+
 func TestCloudDSHConversationHistorySearchReturnsSourcesAndContinuesWithBoundCursor(t *testing.T) {
 	broker, baseStore, claimed, _, _ := cloudDSHGoalScheduleTaskFixture(t)
 	personalData, err := NewPersonalMutationService(&personalMutationStoreStub{objects: map[string]personal.Object{}})
@@ -1245,6 +1453,7 @@ func TestCloudDSHConversationHistorySearchReturnsSourcesAndContinuesWithBoundCur
 		t.Fatal(err)
 	}
 	broker.personalData = personalData
+	configureCloudDSHPersonalHistoryAuthorization(broker, claimed)
 	if err := broker.SetHistorySearchCursorSigning("11111111-1111-1111-1111-111111111111", []byte(strings.Repeat("k", 32))); err != nil {
 		t.Fatal(err)
 	}
@@ -1303,7 +1512,7 @@ func TestCloudDSHConversationHistorySearchReturnsSourcesAndContinuesWithBoundCur
 		if err != nil {
 			t.Fatal(err)
 		}
-		return ModelToolCall{CallID: callID, Name: cloudDSHConversationHistorySearchToolName, Arguments: string(arguments)}
+		return cloudDSHHistoryFencedCall(claimed, ModelToolCall{CallID: callID, Name: cloudDSHConversationHistorySearchToolName, Arguments: string(arguments)})
 	}
 	decode := func(output string) cloudDSHHistorySearchResult {
 		t.Helper()
@@ -1314,7 +1523,7 @@ func TestCloudDSHConversationHistorySearchReturnsSourcesAndContinuesWithBoundCur
 		return result
 	}
 
-	first, err := broker.execute(context.Background(), claimed, call("call_history_page_1", "茶叶", ""), false, nil)
+	first, err := broker.Execute(context.Background(), claimed, call("call_history_page_1", "茶叶", ""))
 	if err != nil || first.Status != AgentToolSucceeded {
 		t.Fatalf("first history page=%+v err=%v", first, err)
 	}
@@ -1351,7 +1560,7 @@ func TestCloudDSHConversationHistorySearchReturnsSourcesAndContinuesWithBoundCur
 	}
 	baseStore.details.Task = currentTask
 
-	second, err := broker.execute(context.Background(), claimed, call("call_history_page_2", "茶叶", firstPage.NextCursor), false, nil)
+	second, err := broker.Execute(context.Background(), claimed, call("call_history_page_2", "茶叶", firstPage.NextCursor))
 	if err != nil || second.Status != AgentToolSucceeded {
 		t.Fatalf("second history page=%+v err=%v", second, err)
 	}
@@ -1362,7 +1571,7 @@ func TestCloudDSHConversationHistorySearchReturnsSourcesAndContinuesWithBoundCur
 		t.Fatalf("second page repeated a source or omitted the next message page: %+v", secondPage)
 	}
 
-	third, err := broker.execute(context.Background(), claimed, call("call_history_page_3", "茶叶", secondPage.NextCursor), false, nil)
+	third, err := broker.Execute(context.Background(), claimed, call("call_history_page_3", "茶叶", secondPage.NextCursor))
 	if err != nil || third.Status != AgentToolSucceeded {
 		t.Fatalf("third history page=%+v err=%v", third, err)
 	}
@@ -1372,7 +1581,7 @@ func TestCloudDSHConversationHistorySearchReturnsSourcesAndContinuesWithBoundCur
 		t.Fatalf("third page did not continue the message cursor: %+v", thirdPage)
 	}
 
-	fourth, err := broker.execute(context.Background(), claimed, call("call_history_page_4", "茶叶", thirdPage.NextCursor), false, nil)
+	fourth, err := broker.Execute(context.Background(), claimed, call("call_history_page_4", "茶叶", thirdPage.NextCursor))
 	if err != nil || fourth.Status != AgentToolSucceeded {
 		t.Fatalf("fourth history page=%+v err=%v", fourth, err)
 	}

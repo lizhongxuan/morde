@@ -214,8 +214,7 @@ func TestSelectedMCPActivityUsesResolvedToolAndReusesCallIdentity(t *testing.T) 
 		t.Fatalf("selected MCP activity = %+v, err=%v, steps=%+v", result, err, store.details.Steps)
 	}
 	original := store.details.Steps[0]
-	alias := cloudDSHMCPToolName("k1234567", "lookup")
-	if original.AgentSessionID != current.AgentSessionID || original.ToolCallKey != call.CallID || original.ToolName != alias ||
+	if original.AgentSessionID != current.AgentSessionID || original.ToolCallKey != call.CallID || original.ToolName != cloudDSHMCPCallToolName ||
 		original.Title != "Run cloud dsh MCP tool: lookup" || original.TaskRevision == nil || *original.TaskRevision != revision ||
 		original.Status != task.StepWaitingUser {
 		t.Fatalf("selected MCP activity did not capture the resolved action: %+v", original)
@@ -243,7 +242,7 @@ func TestSelectedMCPActivityUsesResolvedToolAndReusesCallIdentity(t *testing.T) 
 	}
 	settled := store.details.Steps[0]
 	if settled.ID != original.ID || settled.Sequence != original.Sequence || settled.ToolCallKey != call.CallID ||
-		settled.ToolName != alias || settled.Title != "Run cloud dsh MCP tool: lookup" || settled.Status != task.StepSucceeded {
+		settled.ToolName != cloudDSHMCPCallToolName || settled.Title != "Run cloud dsh MCP tool: lookup" || settled.Status != task.StepSucceeded {
 		t.Fatalf("selected MCP replay created a different activity: original=%+v settled=%+v", original, settled)
 	}
 }

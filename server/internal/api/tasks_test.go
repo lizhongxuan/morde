@@ -91,6 +91,7 @@ type taskServiceStub struct {
 	eventCalls             int
 	eventAfter             int64
 	eventErrorAfterCall    int
+	eventPages             []app.TaskEventPage
 	revokeTaskID           string
 	revokeConnectorID      string
 	revokeVersion          int64
@@ -292,6 +293,13 @@ func (s *taskServiceStub) ListEvents(_ context.Context, principal identity.Princ
 	s.eventCalls++
 	s.eventPrincipal = principal
 	s.eventAfter = after
+	if len(s.eventPages) > 0 {
+		index := s.eventCalls - 1
+		if index >= len(s.eventPages) {
+			index = len(s.eventPages) - 1
+		}
+		return s.eventPages[index], s.err
+	}
 	status := s.eventStatus
 	if status == "" {
 		status = task.StatusQueued
@@ -888,6 +896,18 @@ func TestTaskResponseIncludesOnlyPendingClarificationForClarificationWait(t *tes
 	}
 }
 
+func TestTaskResponseAllowsCancelledStepsAfterTaskStop(t *testing.T) {
+	now := time.Now().UTC()
+	taskValue := apiTestTask()
+	taskValue.Status = task.StatusCancelled
+	view, err := toTaskResponse(app.TaskDetails{Task: taskValue, Steps: []task.Step{{
+		ID: "s1234567", TaskID: taskValue.ID, Sequence: 1, Kind: "tool", Status: task.StepCancelled, CreatedAt: now,
+	}}})
+	if err != nil || len(view.Steps) != 1 || view.Steps[0].Status != task.StepCancelled {
+		t.Fatalf("cancelled Task with settled cancelled step response = %#v, %v", view.Steps, err)
+	}
+}
+
 func TestGetTaskReturnsChildAndClarificationSteps(t *testing.T) {
 	now := time.Now().UTC()
 	modelStepID := "s1234567"
@@ -1356,6 +1376,19 @@ func TestTaskResponseIncludesPendingStopAndUnsettledOperations(t *testing.T) {
 	})
 	if err == nil || view.StopRequest != nil {
 		t.Fatalf("completed stop must not include unrelated unsettled operations: %#v err=%v", view.StopRequest, err)
+	}
+}
+
+func TestTaskResponseAcceptsRevokedStatusOnlyTaskSnapshot(t *testing.T) {
+	current := apiTestTask()
+	current.Status = task.StatusCancelling
+	current.Result = ""
+	current.CurrentStep = ""
+	view, err := toTaskResponse(app.TaskDetails{Task: current})
+	if err != nil || view.Status != task.StatusCancelling || view.ModelID != current.ModelID || view.ExecutionLocation != current.ExecutionLocation ||
+		view.Budget.ActiveSeconds != current.Budget.ActiveSeconds || view.Budget.ToolCalls != current.Budget.ToolCalls ||
+		view.Budget.ModelTokens != current.Budget.ModelTokens || view.Result != nil || len(view.Steps) != 0 || len(view.Artifacts) != 0 {
+		t.Fatalf("revoked status-only Task response = %#v, err=%v", view, err)
 	}
 }
 
@@ -1864,6 +1897,55 @@ func TestTaskEventsEmitsSnapshotWhenTerminalHistoryIsMissing(t *testing.T) {
 	}
 }
 
+func TestTaskEventsEmitsSnapshotForRevokedNonterminalTask(t *testing.T) {
+	service := &taskServiceStub{
+		eventStatus:          task.StatusCancelling,
+		eventCurrentSequence: 7,
+	}
+	engine := taskAPIRouter(service, nil)
+	response := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/events?after=0", nil))
+	if response.Code != http.StatusOK || response.deadlineCalls != 1 || service.eventCalls != 1 ||
+		!strings.Contains(response.Header().Get("Content-Type"), "text/event-stream") {
+		t.Fatalf("status=%d deadline calls=%d event calls=%d headers=%#v body=%s",
+			response.Code, response.deadlineCalls, service.eventCalls, response.Header(), response.Body.String())
+	}
+	for _, expected := range []string{"id: 7", "event: task.snapshot_required", `data: {"sequence":7}`} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Errorf("revoked Task snapshot response missing %q: %s", expected, response.Body.String())
+		}
+	}
+}
+
+func TestTaskEventsEmitsSnapshotWhenRevocationHidesNewEventsDuringStream(t *testing.T) {
+	statusEvent := task.Event{TaskID: "q1234567", Sequence: 1, Type: "task.status",
+		Payload: []byte(`{"status":"waiting_user"}`), CreatedAt: time.Now().UTC()}
+	service := &taskServiceStub{eventPages: []app.TaskEventPage{
+		{Status: task.StatusWaitingUser, CurrentSequence: 1, Items: []task.Event{statusEvent}},
+		{Status: task.StatusCancelling, CurrentSequence: 2},
+	}}
+	engine := taskAPIRouter(service, nil)
+	request := httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/events?after=0", nil)
+	requestContext, cancel := context.WithCancel(request.Context())
+	request = request.WithContext(requestContext)
+	timer := time.AfterFunc(1800*time.Millisecond, cancel)
+	defer func() {
+		timer.Stop()
+		cancel()
+	}()
+	response := &deadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.deadlineCalls != 1 || service.eventCalls != 2 {
+		t.Fatalf("status=%d deadline calls=%d event calls=%d body=%s",
+			response.Code, response.deadlineCalls, service.eventCalls, response.Body.String())
+	}
+	for _, expected := range []string{"id: 1", "event: task.status", "id: 2", "event: task.snapshot_required", `data: {"sequence":2}`} {
+		if !strings.Contains(response.Body.String(), expected) {
+			t.Errorf("revoked Task stream response missing %q: %s", expected, response.Body.String())
+		}
+	}
+}
+
 func TestTaskEventsEmitsSnapshotCursorWhenHistoryExpired(t *testing.T) {
 	service := &taskServiceStub{
 		eventCurrentSequence: 8,
@@ -1887,7 +1969,9 @@ func TestTaskEventsEmitsSnapshotWhenCursorExpiresDuringStream(t *testing.T) {
 	service := &taskServiceStub{
 		eventCurrentSequence: 8,
 		eventErrorAfterCall:  2,
-		err:                  domain.NewError(domain.CodeEventCursorExpired, "event cursor has expired"),
+		events: []task.Event{{TaskID: "q1234567", Sequence: 4, Type: "task.status",
+			Payload: []byte(`{"status":"running"}`), CreatedAt: time.Now().UTC()}},
+		err: domain.NewError(domain.CodeEventCursorExpired, "event cursor has expired"),
 	}
 	engine := taskAPIRouter(service, nil)
 	request := httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/events?after=3", nil)

@@ -275,61 +275,65 @@ func (w *TaskWorker) runClaimLoop(ctx context.Context) {
 		w.metrics.observeClaim(claimed, time.Now())
 		if err := w.runClaimed(ctx, claimed); err != nil && ctx.Err() == nil {
 			if !errors.Is(err, errTaskExecutorPanicked) {
-				fields := []zap.Field{zap.String("task_id", claimed.ID), zap.String("error_type", fmt.Sprintf("%T", err)), zap.Error(err)}
-				var modelFailure cloudDSHModelFailureDiagnosticSource
-				if errors.As(err, &modelFailure) {
-					diagnostic := modelFailure.ModelFailureDiagnostic()
-					if diagnostic.Stage != "" {
-						fields = append(fields, zap.String("failure_stage", diagnostic.Stage))
-					}
-					fields = append(fields, zap.String("failure_category", diagnostic.Category))
-					if diagnostic.ReasonCode != "" {
-						fields = append(fields, zap.String("failure_reason", diagnostic.ReasonCode))
-					}
-					if diagnostic.ToolName != "" {
-						fields = append(fields, zap.String("tool_name", diagnostic.ToolName))
-					}
-					if diagnostic.ToolCallID != "" {
-						fields = append(fields, zap.String("tool_call_id", diagnostic.ToolCallID))
-					}
-					if diagnostic.Category == "unauthorized_tool" || diagnostic.ReasonCode == "tool_arguments_not_object" ||
-						diagnostic.ReasonCode == "tool_call_metadata_invalid" {
-						fields = append(fields, zap.Bool("tool_dispatched", false))
-					}
-				}
-				var toolFailure interface {
-					ToolExecutionDiagnostic() cloudDSHToolExecutionDiagnostic
-				}
-				if errors.As(err, &toolFailure) {
-					diagnostic := toolFailure.ToolExecutionDiagnostic()
-					fields = append(fields, zap.String("failure_stage", diagnostic.Stage))
-					if diagnostic.ReasonCode != "" {
-						fields = append(fields, zap.String("failure_reason", diagnostic.ReasonCode))
-					}
-					if diagnostic.ToolName != "" {
-						fields = append(fields, zap.String("tool_name", diagnostic.ToolName))
-					}
-					if diagnostic.CallID != "" {
-						fields = append(fields, zap.String("tool_call_id", diagnostic.CallID))
-					}
-					if diagnostic.Dispatch != "" {
-						fields = append(fields, zap.String("tool_dispatch_status", diagnostic.Dispatch))
-					}
-					if diagnostic.ErrorType != "" {
-						fields = append(fields, zap.String("tool_error_type", diagnostic.ErrorType))
-					}
-				}
-				var staged interface{ RuntimeStartupStage() string }
-				if errors.As(err, &staged) {
-					fields = append(fields, zap.String("runtime_startup_stage", staged.RuntimeStartupStage()))
-				}
-				w.logger.Error("task execution stopped", fields...)
+				w.logger.Error("task execution stopped", taskExecutionStoppedFields(claimed.ID, err)...)
 			}
 			if !waitTaskWorker(ctx, w.pollInterval) {
 				break
 			}
 		}
 	}
+}
+
+func taskExecutionStoppedFields(taskID string, err error) []zap.Field {
+	fields := []zap.Field{zap.String("task_id", taskID), zap.String("error_type", fmt.Sprintf("%T", err))}
+	var modelFailure cloudDSHModelFailureDiagnosticSource
+	if errors.As(err, &modelFailure) {
+		diagnostic := modelFailure.ModelFailureDiagnostic()
+		if diagnostic.Stage != "" {
+			fields = append(fields, zap.String("failure_stage", diagnostic.Stage))
+		}
+		fields = append(fields, zap.String("failure_category", diagnostic.Category))
+		if diagnostic.ReasonCode != "" {
+			fields = append(fields, zap.String("failure_reason", diagnostic.ReasonCode))
+		}
+		if diagnostic.ToolName != "" {
+			fields = append(fields, zap.String("tool_name", diagnostic.ToolName))
+		}
+		if diagnostic.ToolCallID != "" {
+			fields = append(fields, zap.String("tool_call_id", diagnostic.ToolCallID))
+		}
+		if diagnostic.Category == "unauthorized_tool" || diagnostic.ReasonCode == "tool_arguments_not_object" ||
+			diagnostic.ReasonCode == "tool_call_metadata_invalid" {
+			fields = append(fields, zap.Bool("tool_dispatched", false))
+		}
+	}
+	var toolFailure interface {
+		ToolExecutionDiagnostic() cloudDSHToolExecutionDiagnostic
+	}
+	if errors.As(err, &toolFailure) {
+		diagnostic := toolFailure.ToolExecutionDiagnostic()
+		fields = append(fields, zap.String("failure_stage", diagnostic.Stage))
+		if diagnostic.ReasonCode != "" {
+			fields = append(fields, zap.String("failure_reason", diagnostic.ReasonCode))
+		}
+		if diagnostic.ToolName != "" {
+			fields = append(fields, zap.String("tool_name", diagnostic.ToolName))
+		}
+		if diagnostic.CallID != "" {
+			fields = append(fields, zap.String("tool_call_id", diagnostic.CallID))
+		}
+		if diagnostic.Dispatch != "" {
+			fields = append(fields, zap.String("tool_dispatch_status", diagnostic.Dispatch))
+		}
+		if diagnostic.ErrorType != "" {
+			fields = append(fields, zap.String("tool_error_type", diagnostic.ErrorType))
+		}
+	}
+	var staged interface{ RuntimeStartupStage() string }
+	if errors.As(err, &staged) {
+		fields = append(fields, zap.String("runtime_startup_stage", staged.RuntimeStartupStage()))
+	}
+	return fields
 }
 
 func (w *TaskWorker) validClaim(value task.Task) bool {

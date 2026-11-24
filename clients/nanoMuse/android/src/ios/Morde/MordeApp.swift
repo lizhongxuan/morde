@@ -81,6 +81,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let taskPagesApprovalUnknownRetryFixtureLaunchArgument = "-morde.localTaskPagesApprovalUnknownRetryFixture"
     static let taskPagesApprovalRetryWithoutCommitFixtureLaunchArgument = "-morde.localTaskPagesApprovalRetryWithoutCommitFixture"
     static let taskPagesApprovalDelayFixtureLaunchArgument = "-morde.localTaskPagesApprovalDelayFixture"
+    static let taskPagesApprovalPermissionDeniedFixtureLaunchArgument = "-morde.localTaskPagesApprovalPermissionDeniedFixture"
+    static let taskPagesApprovalUnauthorizedFixtureLaunchArgument = "-morde.localTaskPagesApprovalUnauthorizedFixture"
+    static let taskPagesApprovalNotFoundFixtureLaunchArgument = "-morde.localTaskPagesApprovalNotFoundFixture"
     private static let taskPagesClarificationDelayFixtureLaunchArgument = "-morde.localTaskPagesClarificationDelayFixture"
     private static let taskDetailLateDeliveryFixtureLaunchArgument = "-morde.localTaskDetailLateDeliveryFixture"
     static let taskPagesApprovalRefreshPendingFixtureLaunchArgument = "-morde.localTaskPagesApprovalRefreshPendingFixture"
@@ -119,6 +122,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
     static let chatAttachmentDownloadBadLengthFixtureLaunchArgument = "-morde.localChatAttachmentDownloadBadLengthFixture"
     static let chatAttachmentDownloadBadETagFixtureLaunchArgument = "-morde.localChatAttachmentDownloadBadETagFixture"
     static let personalSyncUnavailableFixtureLaunchArgument = "-morde.localPersonalSyncUnavailableFixture"
+    static let personalMemoryManagementFixtureLaunchArgument = "-morde.localPersonalMemoryManagementFixture"
+    static let personalMemoryUnauthorizedHistoryFixtureLaunchArgument = "-morde.localPersonalMemoryUnauthorizedHistoryFixture"
+    static let personalMemoryStaleActivationFixtureLaunchArgument = "-morde.localPersonalMemoryStaleActivationFixture"
     static let taskPagesTaskActionDelayFixtureLaunchArgument = "-morde.localTaskPagesTaskActionDelayFixture"
     static let taskPagesTaskActionUnknownRetryFixtureLaunchArgument = "-morde.localTaskPagesTaskActionUnknownRetryFixture"
     static let taskPagesTaskActionServiceUnavailableRetryFixtureLaunchArgument = "-morde.localTaskPagesTaskActionServiceUnavailableRetryFixture"
@@ -169,6 +175,15 @@ private final class MordeAuthURLProtocol: URLProtocol {
     private static let executionFixtureLock = NSLock()
     private static let chatAttachmentFixtureLock = NSLock()
     private static let resourceFixtureLock = NSLock()
+    private static let personalMemoryFixtureLock = NSLock()
+    private static var personalMemoryFixtureExists = true
+    private static var personalMemoryFixtureRevision: Int64 = 1
+    private static var personalMemoryFixtureChangeSequence: Int64 = 5
+    private static var personalMemoryFixtureBody: [String: Any] = [
+        "content": "我喜欢简洁、分点的摘要。", "category": "preference",
+    ]
+    private static var personalMemoryFixturePriorBody: [String: Any]?
+    private static var personalMemoryFixtureCandidates: [String: (revision: Int64, body: [String: Any])] = [:]
     private let delayedResponseLock = NSLock()
     private var delayedResponseWorkItem: DispatchWorkItem?
     private static var taskFixtureEventCount = 0
@@ -970,6 +985,188 @@ private final class MordeAuthURLProtocol: URLProtocol {
         ])) ?? Data()
     }
 
+    private static func resetPersonalMemoryManagementFixture() {
+        personalMemoryFixtureLock.lock(); defer { personalMemoryFixtureLock.unlock() }
+        personalMemoryFixtureExists = true
+        personalMemoryFixtureRevision = 1
+        personalMemoryFixtureChangeSequence = 5
+        personalMemoryFixtureBody = ["content": "我喜欢简洁、分点的摘要。", "category": "preference"]
+        personalMemoryFixturePriorBody = nil
+        personalMemoryFixtureCandidates = [:]
+    }
+
+    private static func personalMemoryManagementFixtureResponse(for request: URLRequest)
+        -> (status: Int, body: Data)? {
+        guard ProcessInfo.processInfo.arguments.contains(personalMemoryManagementFixtureLaunchArgument),
+              request.url?.host == "127.0.0.1", let path = request.url?.path else { return nil }
+        func response(_ status: Int, _ value: [String: Any]) -> (status: Int, body: Data) {
+            (status, (try? JSONSerialization.data(withJSONObject: value)) ?? Data())
+        }
+        if path == "/api/auth/client-login", request.httpMethod == "POST" {
+            resetPersonalMemoryManagementFixture()
+            return nil
+        }
+        if path == "/api/sync/snapshot", request.httpMethod == "GET" {
+            personalMemoryFixtureLock.lock(); defer { personalMemoryFixtureLock.unlock() }
+            var items: [[String: Any]] = []
+            if personalMemoryFixtureExists {
+                items.append(["object_type": "memory", "object_id": "global",
+                    "revision": personalMemoryFixtureRevision,
+                    "body": personalMemoryFixtureBody])
+            }
+            for id in personalMemoryFixtureCandidates.keys.sorted() {
+                guard let candidate = personalMemoryFixtureCandidates[id] else { continue }
+                items.append(["object_type": "rule_candidate", "object_id": id,
+                    "revision": candidate.revision, "body": candidate.body])
+            }
+            return response(200, ["watermark": personalMemoryFixtureChangeSequence,
+                                  "items": items, "next_cursor": NSNull()])
+        }
+        if path == "/api/personal-data/memory/global/history", request.httpMethod == "GET" {
+            if ProcessInfo.processInfo.arguments.contains(personalMemoryUnauthorizedHistoryFixtureLaunchArgument) {
+                return response(403, ["error": ["code": "forbidden", "message": "本地夹具拒绝此记忆历史读取。"]])
+            }
+            personalMemoryFixtureLock.lock(); defer { personalMemoryFixtureLock.unlock() }
+            guard personalMemoryFixtureExists else {
+                return response(404, ["error": ["code": "not_found", "message": "记忆不存在。"]])
+            }
+            var items: [[String: Any]] = [[
+                "revision": personalMemoryFixtureRevision, "changed_at": "2026-11-20T00:00:00Z",
+                "body": personalMemoryFixtureBody, "restorable": true, "source_status": "available",
+                "sources": [["kind": "mutation_receipt", "id": "memory-fixture-current"]],
+                "superseded_by_revision": NSNull(),
+            ]]
+            if personalMemoryFixtureRevision > 1, let priorBody = personalMemoryFixturePriorBody {
+                items.append([
+                    "revision": personalMemoryFixtureRevision - 1, "changed_at": "2026-11-19T00:00:00Z",
+                    "body": priorBody, "restorable": true, "source_status": "available",
+                    "sources": [["kind": "mutation_receipt", "id": "memory-fixture-previous"]],
+                    "superseded_by_revision": personalMemoryFixtureRevision,
+                ])
+            }
+            return response(200, ["items": items, "next_cursor": NSNull()])
+        }
+        if path == "/api/personal-data/memory/global", request.httpMethod == "GET" {
+            personalMemoryFixtureLock.lock(); defer { personalMemoryFixtureLock.unlock() }
+            guard personalMemoryFixtureExists else {
+                return response(404, ["error": ["code": "not_found", "message": "记忆不存在。"]])
+            }
+            return response(200, ["object_type": "memory", "object_id": "global",
+                "revision": personalMemoryFixtureRevision,
+                "body": personalMemoryFixtureBody])
+        }
+        if path == "/api/personal-data/memory/global", request.httpMethod == "PUT" {
+            guard request.value(forHTTPHeaderField: "Idempotency-Key").map(MordePersonalDataContract.isValidIdempotencyKey) == true,
+                  let payload = jsonPayload(request), let baseRevision = payload["base_revision"] as? Int64,
+                  let body = payload["body"] as? [String: Any],
+                  let bodyData = try? JSONSerialization.data(withJSONObject: body),
+                  let decodedBody = try? JSONDecoder().decode(MordePersonalJSONValue.self, from: bodyData),
+                  MordePersonalDataContract.isValidMemoryBody(decodedBody) else {
+                return response(400, ["error": ["code": "bad_request", "message": "记忆内容无效。"]])
+            }
+            personalMemoryFixtureLock.lock(); defer { personalMemoryFixtureLock.unlock() }
+            guard personalMemoryFixtureExists, baseRevision == personalMemoryFixtureRevision else {
+                return response(409, ["error": ["code": "conflict", "message": "Synthetic memory revision changed"]])
+            }
+            personalMemoryFixturePriorBody = personalMemoryFixtureBody
+            personalMemoryFixtureBody = body
+            personalMemoryFixtureRevision += 1
+            personalMemoryFixtureChangeSequence += 1
+            return response(200, ["object_type": "memory", "object_id": "global",
+                "result_revision": personalMemoryFixtureRevision,
+                "account_change_sequence": personalMemoryFixtureChangeSequence, "replay": false])
+        }
+        if path == "/api/personal-data/memory/global", request.httpMethod == "DELETE" {
+            guard let payload = jsonPayload(request), let baseRevision = payload["base_revision"] as? Int64 else {
+                return response(400, ["error": ["code": "bad_request", "message": "缺少记忆修订号。"]])
+            }
+            personalMemoryFixtureLock.lock(); defer { personalMemoryFixtureLock.unlock() }
+            guard personalMemoryFixtureExists, baseRevision == personalMemoryFixtureRevision else {
+                return response(409, ["error": ["code": "conflict", "message": "Synthetic memory revision changed"]])
+            }
+            personalMemoryFixtureExists = false
+            personalMemoryFixtureChangeSequence += 1
+            return response(200, ["object_type": "memory", "object_id": "global",
+                "result_revision": personalMemoryFixtureRevision + 1,
+                "account_change_sequence": personalMemoryFixtureChangeSequence, "replay": false])
+        }
+        let candidatePrefix = "/api/personal-data/rule_candidate/"
+        guard path.hasPrefix(candidatePrefix) else { return nil }
+        let candidateID = String(path.dropFirst(candidatePrefix.count))
+        guard MordePersonalDataContract.isValidObjectIdentifier(type: "rule_candidate", id: candidateID) else {
+            return response(400, ["error": ["code": "bad_request", "message": "规则候选 ID 无效。"]])
+        }
+        if request.httpMethod == "PUT" {
+            guard request.value(forHTTPHeaderField: "Idempotency-Key").map(MordePersonalDataContract.isValidIdempotencyKey) == true,
+                  let payload = jsonPayload(request), let baseRevision = payload["base_revision"] as? Int64,
+                  let body = payload["body"] as? [String: Any],
+                  body["scope"] as? String == "personal",
+                  let status = body["status"] as? String, ["candidate", "active"].contains(status),
+                  body["source_memory_id"] as? String == "global",
+                  let sourceRevision = body["source_memory_revision"] as? Int64 else {
+                return response(400, ["error": ["code": "bad_request", "message": "规则候选请求无效。"]])
+            }
+            personalMemoryFixtureLock.lock(); defer { personalMemoryFixtureLock.unlock() }
+            if status == "active",
+               ProcessInfo.processInfo.arguments.contains(personalMemoryStaleActivationFixtureLaunchArgument),
+               personalMemoryFixtureExists, sourceRevision == personalMemoryFixtureRevision {
+                personalMemoryFixturePriorBody = personalMemoryFixtureBody
+                var changedBody = personalMemoryFixtureBody
+                changedBody["content"] = (changedBody["content"] as? String ?? "") + "（本地夹具并发修订）"
+                personalMemoryFixtureBody = changedBody
+                personalMemoryFixtureRevision += 1
+                personalMemoryFixtureChangeSequence += 1
+                return response(409, ["error": ["code": "conflict", "message": "Synthetic memory revision changed"]])
+            }
+            guard personalMemoryFixtureExists, sourceRevision == personalMemoryFixtureRevision else {
+                return response(409, ["error": ["code": "conflict", "message": "Synthetic memory revision changed"]])
+            }
+            let existing = personalMemoryFixtureCandidates[candidateID]
+            if let existing {
+                guard existing.revision == baseRevision else {
+                    return response(409, ["error": ["code": "conflict", "message": "Synthetic candidate revision changed"]])
+                }
+                guard existing.body["status"] as? String == "candidate", status == "active",
+                      existing.body["source_memory_id"] as? String == body["source_memory_id"] as? String,
+                      existing.body["source_memory_revision"] as? Int64 == sourceRevision else {
+                    return response(409, ["error": ["code": "conflict", "message": "候选已变化，请刷新后重试。"]])
+                }
+            } else if baseRevision != 0 || status != "candidate" {
+                return response(403, ["error": ["code": "forbidden", "message": "新规则必须先作为候选提交。"]])
+            }
+            let revision = (existing?.revision ?? 0) + 1
+            personalMemoryFixtureCandidates[candidateID] = (revision, body)
+            personalMemoryFixtureChangeSequence += 1
+            return response(200, ["object_type": "rule_candidate", "object_id": candidateID,
+                "result_revision": revision, "account_change_sequence": personalMemoryFixtureChangeSequence,
+                "replay": false])
+        }
+        if request.httpMethod == "DELETE" {
+            guard request.value(forHTTPHeaderField: "Idempotency-Key").map(MordePersonalDataContract.isValidIdempotencyKey) == true,
+                  let payload = jsonPayload(request), let baseRevision = payload["base_revision"] as? Int64 else {
+                return response(400, ["error": ["code": "bad_request", "message": "规则候选删除请求无效。"]])
+            }
+            personalMemoryFixtureLock.lock(); defer { personalMemoryFixtureLock.unlock() }
+            guard let existing = personalMemoryFixtureCandidates[candidateID], existing.revision == baseRevision else {
+                return response(409, ["error": ["code": "conflict", "message": "Synthetic candidate revision changed"]])
+            }
+            personalMemoryFixtureCandidates.removeValue(forKey: candidateID)
+            personalMemoryFixtureChangeSequence += 1
+            return response(200, ["object_type": "rule_candidate", "object_id": candidateID,
+                "result_revision": existing.revision + 1,
+                "account_change_sequence": personalMemoryFixtureChangeSequence, "replay": false])
+        }
+        if request.httpMethod == "GET" {
+            personalMemoryFixtureLock.lock(); defer { personalMemoryFixtureLock.unlock() }
+            guard let candidate = personalMemoryFixtureCandidates[candidateID] else {
+                return response(404, ["error": ["code": "not_found", "message": "规则候选不存在。"]])
+            }
+            return response(200, ["object_type": "rule_candidate", "object_id": candidateID,
+                "revision": candidate.revision, "body": candidate.body])
+        }
+        return nil
+    }
+
     private static func personalAttachmentDownloadFixtureResponse(for request: URLRequest)
         -> (status: Int, body: Data, headers: [String: String])? {
         guard ProcessInfo.processInfo.arguments.contains(chatAttachmentFixtureLaunchArgument) ||
@@ -1761,14 +1958,25 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 task["artifacts"] = []
                 return task
             }
-            var task = taskPagesSummary(id: id, status: decision == nil ? "waiting_user" : "completed",
+            let approvalFailureFixtureArguments = [
+                Self.taskPagesApprovalPermissionDeniedFixtureLaunchArgument,
+                Self.taskPagesApprovalUnauthorizedFixtureLaunchArgument,
+                Self.taskPagesApprovalNotFoundFixtureLaunchArgument,
+            ]
+            let permissionRevoked = decision == "revoked" && approvalFailureFixtureArguments.contains {
+                ProcessInfo.processInfo.arguments.contains($0)
+            }
+            var task = taskPagesSummary(id: id,
+                                        status: permissionRevoked ? "cancelling" : (decision == nil ? "waiting_user" : "completed"),
                                         objective: "Local approval fixture")
             task["event_sequence"] = decision == nil ? 1 : 2
-            task["result"] = decision == nil ? NSNull() : "Local decision refreshed"
+            task["result"] = decision == nil || permissionRevoked ? NSNull() : "Local decision refreshed"
             task["waiting_reason"] = decision == nil
                 ? (isOtherWaitReasonFixture ? "mcp_result_unknown" : "approval_required") : NSNull()
-            task["current_step"] = decision == nil
-                ? (isOtherWaitReasonFixture ? "Review operation result" : "Waiting for approval") : NSNull()
+            task["current_step"] = permissionRevoked ? "Stopping after approval permission changed" as Any
+                : (decision == nil
+                    ? (isOtherWaitReasonFixture ? "Review operation result" : "Waiting for approval") as Any
+                    : NSNull())
             task["stop_request"] = NSNull()
             task["pending_request"] = decision == nil && !isOtherWaitReasonFixture
                 ? ["id": "r0000001", "version": 1, "kind": "approval", "title": "Review local change",
@@ -2613,9 +2821,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
     }
 
     override class func canInit(with request: URLRequest) -> Bool {
-        guard usesLocalFixture else { return false }
-        if request.url?.scheme == "https" { return true }
-        return false
+        usesLocalFixture && request.url?.scheme == "https"
     }
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
@@ -2725,6 +2931,7 @@ private final class MordeAuthURLProtocol: URLProtocol {
         }
         let personalAttachmentDownloadResponse = isFixtureOrigin ? Self.personalAttachmentDownloadFixtureResponse(for: request) : nil
         let taskFileFetchResponse = isFixtureOrigin ? Self.taskFileFetchFixtureResponse(for: request) : nil
+        let personalMemoryManagementResponse = isFixtureOrigin ? Self.personalMemoryManagementFixtureResponse(for: request) : nil
         let shouldDelayAttachmentDownloadResponse = isFixtureOrigin &&
             ProcessInfo.processInfo.arguments.contains(Self.chatAttachmentDownloadDelayFixtureLaunchArgument) &&
             personalAttachmentDownloadResponse?.status == 200
@@ -2743,6 +2950,9 @@ private final class MordeAuthURLProtocol: URLProtocol {
             Thread.sleep(forTimeInterval: 2)
             statusCode = 401
             body = Data(#"{"error":{"code":"unauthorized","message":"Synthetic client session expired"}}"#.utf8)
+        } else if let personalMemoryManagementResponse {
+            statusCode = personalMemoryManagementResponse.status
+            body = personalMemoryManagementResponse.body
         } else if personalSyncUnavailableResponse {
             statusCode = 503
             body = Data(#"{"error":{"code":"unavailable","message":"Synthetic personal sync is unavailable"}}"#.utf8)
@@ -3296,6 +3506,26 @@ private final class MordeAuthURLProtocol: URLProtocol {
                 statusCode = 409
                 body = Data(#"{"error":{"code":"conflict","message":"Invalid local approval request"}}"#.utf8)
             }
+        } else if isFixtureOrigin, request.url?.path == "/api/tasks/q0000101/approvals/r0000001/responses",
+                  request.httpMethod == "POST",
+                  (ProcessInfo.processInfo.arguments.contains(Self.taskPagesApprovalPermissionDeniedFixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesApprovalUnauthorizedFixtureLaunchArgument) ||
+                   ProcessInfo.processInfo.arguments.contains(Self.taskPagesApprovalNotFoundFixtureLaunchArgument)) {
+            Self.setTaskPagesApprovalDecision("revoked")
+            let status: Int
+            let code: String
+            if ProcessInfo.processInfo.arguments.contains(Self.taskPagesApprovalUnauthorizedFixtureLaunchArgument) {
+                status = 401
+                code = "unauthorized"
+            } else if ProcessInfo.processInfo.arguments.contains(Self.taskPagesApprovalNotFoundFixtureLaunchArgument) {
+                status = 404
+                code = "not_found"
+            } else {
+                status = 403
+                code = "forbidden"
+            }
+            statusCode = status
+            body = Data("{\"error\":{\"code\":\"\(code)\",\"message\":\"Local approval access changed\"}}".utf8)
         } else if isFixtureOrigin, request.url?.path == "/api/tasks/q0000101/approvals/r0000001/responses",
                   request.httpMethod == "POST",
                   (ProcessInfo.processInfo.arguments.contains(Self.taskPagesApprovalUnknownRetryFixtureLaunchArgument) ||
@@ -5449,6 +5679,63 @@ struct MordePersonalChangePage: Decodable, Equatable, Sendable {
     let next_after_sequence: Int64
     let has_more: Bool
 }
+struct MordePersonalMemoryHistorySource: Decodable, Equatable, Sendable {
+    let kind: String
+    let id: String
+    let conversation_id: String?
+}
+struct MordePersonalMemoryRevision: Decodable, Equatable, Identifiable, Sendable {
+    let revision: Int64
+    let changed_at: String
+    let body: MordePersonalJSONValue?
+    let restorable: Bool
+    let source_status: String
+    let sources: [MordePersonalMemoryHistorySource]
+    let superseded_by_revision: Int64?
+
+    var id: Int64 { revision }
+}
+struct MordePersonalMemoryHistoryPage: Decodable, Equatable, Sendable {
+    let items: [MordePersonalMemoryRevision]
+    let next_cursor: String?
+
+    func isValid(for memoryID: String) -> Bool {
+        guard MordePersonalDataContract.isValidObjectIdentifier(type: "memory", id: memoryID),
+              items.count <= 100, next_cursor.map({ $0.count <= 2048 }) ?? true else { return false }
+        var previousRevision = Int64.max
+        let dateParser = ISO8601DateFormatter()
+        let fractionalDateParser = ISO8601DateFormatter()
+        fractionalDateParser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        for (index, item) in items.enumerated() {
+            guard item.revision > 0, item.revision < previousRevision,
+                  dateParser.date(from: item.changed_at) != nil ||
+                    fractionalDateParser.date(from: item.changed_at) != nil,
+                  ["available", "unrecorded", "unavailable"].contains(item.source_status),
+                  item.body.map(MordePersonalDataContract.isValidMemoryBody) ?? !item.restorable,
+                  item.body == nil || item.restorable,
+                  item.sources.allSatisfy({
+                    !$0.id.isEmpty && (($0.kind == "conversation_message" && !($0.conversation_id ?? "").isEmpty) ||
+                        ($0.kind == "mutation_receipt" && $0.conversation_id == nil))
+                  }) else { return false }
+            if item.source_status == "available", item.sources.isEmpty { return false }
+            if item.source_status == "unrecorded", !item.sources.isEmpty { return false }
+            if item.source_status == "unavailable",
+               item.body != nil || item.restorable || !item.sources.isEmpty || item.superseded_by_revision != nil { return false }
+            if let successor = item.superseded_by_revision, successor <= item.revision { return false }
+            if index > 0, item.body != nil, item.source_status != "unavailable" {
+                let successor = items[index - 1]
+                let successorReadable = successor.body != nil && successor.source_status == "available"
+                if successorReadable {
+                    guard item.superseded_by_revision == successor.revision else { return false }
+                } else if item.superseded_by_revision != nil {
+                    return false
+                }
+            }
+            previousRevision = item.revision
+        }
+        return true
+    }
+}
 struct MordePersonalMutationReceipt: Decodable, Equatable, Sendable {
     let object_type: String
     let object_id: String
@@ -5459,7 +5746,7 @@ struct MordePersonalMutationReceipt: Decodable, Equatable, Sendable {
 
 enum MordePersonalDataContract {
     static let syncObjectTypes: Set<String> = [
-        "profile", "memory", "soul", "diary", "goal", "schedule", "feed_post",
+        "profile", "memory", "rule_candidate", "soul", "diary", "goal", "schedule", "feed_post",
         "feed_preferences", "idea_mark", "library_item", "skill_setting", "connector_setting",
     ]
     static let mutationObjectTypes: Set<String> = [
@@ -5473,11 +5760,41 @@ enum MordePersonalDataContract {
         switch type {
         case "profile", "feed_preferences": return id == "default"
         case "memory": return ["global", "user"].contains(id) || id.range(of: "^m_[0-9a-f]{8}$", options: .regularExpression) != nil
+        case "rule_candidate": return id.range(of: "^r_[0-9a-f]{8}$", options: .regularExpression) != nil
         case "schedule": return id.range(of: "^j[a-z0-9]{7}$", options: .regularExpression) != nil
         case "skill_setting": return id.hasPrefix("builtin_") && id.count > "builtin_".count
         case "connector_setting": return id.hasPrefix("catalogue_") && id.count > "catalogue_".count
         default: return true
         }
+    }
+
+    static func isValidSyncObjectBody(type: String, id: String, body: MordePersonalJSONValue) -> Bool {
+        guard isValidObjectIdentifier(type: type, id: id) else { return false }
+        guard type == "rule_candidate" else { return true }
+        guard case let .object(fields) = body,
+              Set(fields.keys) == Set(["scope", "status", "source_memory_id", "source_memory_revision"]),
+              fields["scope"] == .string("personal"),
+              let statusValue = fields["status"],
+              case let .string(status) = statusValue,
+              ["candidate", "active"].contains(status),
+              let sourceMemoryValue = fields["source_memory_id"],
+              case let .string(sourceMemoryID) = sourceMemoryValue,
+              isValidObjectIdentifier(type: "memory", id: sourceMemoryID),
+              case let .integer(sourceRevision)? = fields["source_memory_revision"],
+              sourceRevision > 0 else { return false }
+        return true
+    }
+
+    static func isValidMemoryBody(_ body: MordePersonalJSONValue) -> Bool {
+        guard case let .object(fields) = body,
+              Set(fields.keys).isSubset(of: Set(["content", "category"])),
+              let contentValue = fields["content"],
+              case let .string(content) = contentValue,
+              (1...65_536).contains(content.unicodeScalars.count) else { return false }
+        if let categoryValue = fields["category"] {
+            guard case let .string(category) = categoryValue, category.unicodeScalars.count <= 64 else { return false }
+        }
+        return true
     }
 
     static func isValidIdempotencyKey(_ value: String) -> Bool {
@@ -6378,6 +6695,31 @@ private func withMordeSecurityScope<T>(_ url: URL, _ operation: () throws -> T) 
 
     func personalChanges(afterSequence: Int64, throughSequence: Int64? = nil) async throws -> MordePersonalChangePage {
         try await MordeClient.shared.personalChanges(afterSequence: afterSequence, throughSequence: throughSequence)
+    }
+
+    func personalMemoryHistory(objectID: String, cursor: String? = nil) async throws -> MordePersonalMemoryHistoryPage {
+        try await MordeClient.shared.personalMemoryHistory(objectID: objectID, cursor: cursor)
+    }
+
+    func proposePersonalRuleCandidate(candidateID: String, sourceMemoryID: String, sourceMemoryRevision: Int64,
+                                      idempotencyKey: String) async throws -> MordePersonalMutationReceipt {
+        try await MordeClient.shared.proposePersonalRuleCandidate(candidateID: candidateID,
+            sourceMemoryID: sourceMemoryID, sourceMemoryRevision: sourceMemoryRevision,
+            idempotencyKey: idempotencyKey)
+    }
+
+    func activatePersonalRuleCandidate(candidateID: String, baseRevision: Int64,
+                                       sourceMemoryID: String, sourceMemoryRevision: Int64,
+                                       idempotencyKey: String) async throws -> MordePersonalMutationReceipt {
+        try await MordeClient.shared.activatePersonalRuleCandidate(candidateID: candidateID,
+            baseRevision: baseRevision, sourceMemoryID: sourceMemoryID,
+            sourceMemoryRevision: sourceMemoryRevision, idempotencyKey: idempotencyKey)
+    }
+
+    func deletePersonalRuleCandidate(candidateID: String, baseRevision: Int64,
+                                     idempotencyKey: String) async throws -> MordePersonalMutationReceipt {
+        try await MordeClient.shared.deletePersonalRuleCandidate(candidateID: candidateID,
+            baseRevision: baseRevision, idempotencyKey: idempotencyKey)
     }
 
     func personalGoal(objectID: String) async throws -> MordePersonalGoalObject? {
@@ -9217,6 +9559,8 @@ private struct MordeIndependentSendTarget {
         do {
             let object: MordePersonalSyncObject = try await call(path)
             guard object.object_type == objectType, object.object_id == objectID, object.revision > 0,
+                  MordePersonalDataContract.isValidSyncObjectBody(
+                    type: object.object_type, id: object.object_id, body: object.body),
                   case .object = object.body,
                   ((try? JSONEncoder().encode(object.body).count) ?? Int.max) <= 1_048_576 else {
                 throw URLError(.cannotParseResponse)
@@ -9225,6 +9569,79 @@ private struct MordeIndependentSendTarget {
         } catch let error as NSError where error.domain == "Morde" && error.code == 404 {
             return nil
         }
+    }
+
+    func proposePersonalRuleCandidate(candidateID: String, sourceMemoryID: String, sourceMemoryRevision: Int64,
+                                      idempotencyKey: String) async throws -> MordePersonalMutationReceipt {
+        guard signedIn, currentDataScope != nil,
+              MordePersonalDataContract.isValidObjectIdentifier(type: "rule_candidate", id: candidateID),
+              MordePersonalDataContract.isValidObjectIdentifier(type: "memory", id: sourceMemoryID),
+              sourceMemoryRevision > 0, MordePersonalDataContract.isValidIdempotencyKey(idempotencyKey) else {
+            throw URLError(.badURL)
+        }
+        guard let source = try await personalObject(objectType: "memory", objectID: sourceMemoryID),
+              source.revision == sourceMemoryRevision,
+              MordePersonalDataContract.isValidMemoryBody(source.body) else {
+            throw NSError(domain: "Morde", code: 409,
+                          userInfo: [NSLocalizedDescriptionKey: "这条记忆已更新或不可用。请刷新后重新提出规则。"])
+        }
+        let body: [String: Any] = [
+            "scope": "personal", "status": "candidate", "source_memory_id": sourceMemoryID,
+            "source_memory_revision": sourceMemoryRevision,
+        ]
+        let receipt: MordePersonalMutationReceipt = try await call(
+            try personalObjectPath(type: "rule_candidate", id: candidateID), method: "PUT",
+            body: ["base_revision": 0, "body": body], key: idempotencyKey)
+        guard receipt.object_type == "rule_candidate", receipt.object_id == candidateID,
+              receipt.result_revision > 0, receipt.account_change_sequence > 0 else {
+            throw URLError(.cannotParseResponse)
+        }
+        return receipt
+    }
+
+    func activatePersonalRuleCandidate(candidateID: String, baseRevision: Int64,
+                                       sourceMemoryID: String, sourceMemoryRevision: Int64,
+                                       idempotencyKey: String) async throws -> MordePersonalMutationReceipt {
+        guard signedIn, currentDataScope != nil, baseRevision > 0, sourceMemoryRevision > 0,
+              MordePersonalDataContract.isValidObjectIdentifier(type: "rule_candidate", id: candidateID),
+              MordePersonalDataContract.isValidObjectIdentifier(type: "memory", id: sourceMemoryID),
+              MordePersonalDataContract.isValidIdempotencyKey(idempotencyKey) else { throw URLError(.badURL) }
+        guard let existing = try await personalObject(objectType: "rule_candidate", objectID: candidateID),
+              existing.revision == baseRevision,
+              case let .object(fields) = existing.body,
+              fields["scope"] == .string("personal"), fields["status"] == .string("candidate"),
+              fields["source_memory_id"] == .string(sourceMemoryID),
+              fields["source_memory_revision"] == .integer(sourceMemoryRevision) else {
+            throw NSError(domain: "Morde", code: 409,
+                          userInfo: [NSLocalizedDescriptionKey: "规则候选已变化或不可用。请刷新后重新确认。"])
+        }
+        let body: [String: Any] = [
+            "scope": "personal", "status": "active", "source_memory_id": sourceMemoryID,
+            "source_memory_revision": sourceMemoryRevision,
+        ]
+        let receipt: MordePersonalMutationReceipt = try await call(
+            try personalObjectPath(type: "rule_candidate", id: candidateID), method: "PUT",
+            body: ["base_revision": baseRevision, "body": body], key: idempotencyKey)
+        guard receipt.object_type == "rule_candidate", receipt.object_id == candidateID,
+              receipt.result_revision > 0, receipt.account_change_sequence > 0 else {
+            throw URLError(.cannotParseResponse)
+        }
+        return receipt
+    }
+
+    func deletePersonalRuleCandidate(candidateID: String, baseRevision: Int64,
+                                     idempotencyKey: String) async throws -> MordePersonalMutationReceipt {
+        guard signedIn, currentDataScope != nil, baseRevision > 0,
+              MordePersonalDataContract.isValidObjectIdentifier(type: "rule_candidate", id: candidateID),
+              MordePersonalDataContract.isValidIdempotencyKey(idempotencyKey) else { throw URLError(.badURL) }
+        let receipt: MordePersonalMutationReceipt = try await call(
+            try personalObjectPath(type: "rule_candidate", id: candidateID), method: "DELETE",
+            body: ["base_revision": baseRevision], key: idempotencyKey)
+        guard receipt.object_type == "rule_candidate", receipt.object_id == candidateID,
+              receipt.result_revision > 0, receipt.account_change_sequence > 0 else {
+            throw URLError(.cannotParseResponse)
+        }
+        return receipt
     }
 
     func replacePersonalObject(objectType: String, objectID: String, baseRevision: Int64,
@@ -9539,7 +9956,7 @@ private struct MordeIndependentSendTarget {
         }
         for item in page.items {
             guard item.revision > 0,
-                  MordePersonalDataContract.isValidObjectIdentifier(type: item.object_type, id: item.object_id),
+                  MordePersonalDataContract.isValidSyncObjectBody(type: item.object_type, id: item.object_id, body: item.body),
                   case .object = item.body,
                   ((try? JSONEncoder().encode(item.body).count) ?? Int.max) <= 1_048_576 else {
                 throw URLError(.cannotParseResponse)
@@ -9579,6 +9996,23 @@ private struct MordeIndependentSendTarget {
             previousSequence = change.change_sequence
         }
         if page.has_more, page.next_after_sequence != previousSequence { throw URLError(.cannotParseResponse) }
+        return page
+    }
+
+    func personalMemoryHistory(objectID: String, cursor: String?) async throws -> MordePersonalMemoryHistoryPage {
+        guard MordePersonalDataContract.isValidObjectIdentifier(type: "memory", id: objectID) else {
+            throw URLError(.badURL)
+        }
+        var components = URLComponents()
+        components.path = "/api/personal-data/memory/\(objectID)/history"
+        components.queryItems = [URLQueryItem(name: "limit", value: "100")]
+        if let cursor {
+            guard cursor.count <= 2048 else { throw URLError(.badURL) }
+            components.queryItems?.append(URLQueryItem(name: "cursor", value: cursor))
+        }
+        guard let path = components.string else { throw URLError(.badURL) }
+        let page: MordePersonalMemoryHistoryPage = try await call(path)
+        guard page.isValid(for: objectID) else { throw URLError(.cannotParseResponse) }
         return page
     }
 
@@ -13322,7 +13756,35 @@ private struct MordeIndependentSendTarget {
                 }
             } else {
                 let failure = error as NSError
-                if failure.domain == "Morde", (400..<500).contains(failure.code),
+                let isApprovalResponse = path.contains("/approvals/") && path.hasSuffix("/responses")
+                if isApprovalResponse, failure.domain == "Morde", [401, 403, 404].contains(failure.code) {
+                    retryAction = nil
+                    retryActionScopeKey = nil
+                    let wasCurrent = selectedTaskIsCurrent()
+                    let message = AppLocalized("Current account is no longer authorized to approve this task")
+                    do {
+                        let refreshed = try await task(id: taskID)
+                        guard actionScope == currentDataScope else { return false }
+                        if selectedTaskIsCurrent() {
+                            _ = upsertConversationTask(refreshed)
+                            currentTask = refreshed
+                            setResourceState(.loaded, for: .taskDetail)
+                            applyCurrentTaskAssistantSnapshot(refreshed)
+                        }
+                        taskTimelineErrors.removeValue(forKey: taskID)
+                        report(message)
+                    } catch {
+                        guard actionScope == currentDataScope else { return false }
+                        discardTaskProjection(taskID: taskID)
+                        taskTimelineErrors[taskID] = message
+                        if wasCurrent {
+                            setResourceState(.failed(message), for: .taskDetail)
+                            self.error = message
+                        } else {
+                            taskPageActionErrors[taskID] = message
+                        }
+                    }
+                } else if failure.domain == "Morde", (400..<500).contains(failure.code),
                    failure.code != 408, failure.code != 429 {
                     retryAction = nil
                     retryActionScopeKey = nil
@@ -15451,6 +15913,12 @@ struct MordeAccountSettingsView: View {
                 } label: {
                     Label("Personal profile", systemImage: "person.crop.circle")
                 }
+                NavigationLink {
+                    MordePersonalMemoryManagementView()
+                } label: {
+                    Label("Memory and rules", systemImage: "brain.head.profile")
+                }
+                .accessibilityIdentifier("morde.account.personalMemory")
             }
 #endif
 
@@ -19290,12 +19758,13 @@ private struct MordeUnconfirmedMessageCard: View {
 }
 
 private enum MordeDesignSettingsDestination: String, CaseIterable, Identifiable {
-    case account, connectors, devices, credentials, permissions, approvalRules, notifications, appearance, about
+    case account, personalMemory, connectors, devices, credentials, permissions, approvalRules, notifications, appearance, about
 
     var id: String { rawValue }
     var title: String {
         switch self {
         case .account: AppLocalized("账号")
+        case .personalMemory: AppLocalized("记忆与规则")
         case .connectors: AppLocalized("连接器")
         case .devices: AppLocalized("设备")
         case .credentials: AppLocalized("安全凭证")
@@ -19334,6 +19803,7 @@ private struct MordeDesignSettingsRoot: View {
                 VStack(alignment: .leading, spacing: 0) {
                     sectionTitle("账号与连接", top: 8)
                     settingRow(.account, value: client.user?.name)
+                    if client.signedIn { settingRow(.personalMemory) }
                     settingRow(.connectors)
                     settingRow(.devices)
                     settingRow(.credentials)
@@ -19427,6 +19897,613 @@ private struct MordeDesignSettingsPressStyle: ButtonStyle {
     }
 }
 
+private struct MordeManagedPersonalMemory: Identifiable, Equatable {
+    let id: String
+    let revision: Int64
+    let content: String
+    let category: String?
+}
+
+private struct MordeManagedPersonalRule: Identifiable, Equatable {
+    let id: String
+    let revision: Int64
+    let sourceMemoryID: String
+    let sourceMemoryRevision: Int64
+    let status: String
+}
+
+private enum MordePersonalMemoryManagementPrompt: Identifiable {
+    case propose(MordeManagedPersonalMemory)
+    case activate(MordeManagedPersonalRule)
+    case deleteRule(MordeManagedPersonalRule)
+    case forget(MordeManagedPersonalMemory)
+
+    var id: String {
+        switch self {
+        case .propose(let memory): "propose-\(memory.id)-\(memory.revision)"
+        case .activate(let rule): "activate-\(rule.id)-\(rule.revision)"
+        case .deleteRule(let rule): "delete-rule-\(rule.id)-\(rule.revision)"
+        case .forget(let memory): "forget-\(memory.id)-\(memory.revision)"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .propose: "提出个人规则候选？"
+        case .activate: "启用这条个人规则？"
+        case .deleteRule(let rule): rule.status == "active" ? "删除已启用规则？" : "删除规则候选？"
+        case .forget: "永久删除这条记忆？"
+        }
+    }
+
+    var confirmTitle: String {
+        switch self {
+        case .propose: "提出候选"
+        case .activate: "确认并启用"
+        case .deleteRule, .forget: "删除"
+        }
+    }
+
+    var isDestructive: Bool {
+        switch self {
+        case .deleteRule, .forget: true
+        case .propose, .activate: false
+        }
+    }
+
+    var message: String {
+        switch self {
+        case .propose(let memory):
+            "将记忆修订 \(memory.revision) 提交为待确认候选；它暂时不会成为常驻指引。"
+        case .activate(let rule):
+            "确认后，仅把记忆 \(rule.sourceMemoryID) 的修订 \(rule.sourceMemoryRevision) 作为个人指引。它不会授予工具权限或审批。"
+        case .deleteRule(let rule):
+            rule.status == "active" ? "删除后，这条规则不再作为个人指引。" : "删除后，这条待确认候选将被移除。"
+        case .forget:
+            "删除会清除这条记忆的历史正文，并屏蔽匹配的本人会话文本。关联规则将失去有效来源。"
+        }
+    }
+}
+
+private enum MordePersonalMemoryManagementSheet: Identifiable {
+    case history(MordeManagedPersonalMemory)
+    case edit(MordeManagedPersonalMemory)
+
+    var id: String {
+        switch self {
+        case .history(let memory): "history-\(memory.id)"
+        case .edit(let memory): "edit-\(memory.id)"
+        }
+    }
+}
+
+struct MordePersonalMemoryManagementView: View {
+    @ObservedObject private var client = MordeClient.shared
+    @State private var memories: [MordeManagedPersonalMemory] = []
+    @State private var rules: [MordeManagedPersonalRule] = []
+    @State private var presentedSheet: MordePersonalMemoryManagementSheet?
+    @State private var prompt: MordePersonalMemoryManagementPrompt?
+    @State private var errorMessage: String?
+    @State private var notice: String?
+    @State private var isLoading = false
+    @State private var isPerformingAction = false
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                Text("查看已授权的个人记忆修订。普通记忆不会自动成为规则；启用候选前需要再次确认。")
+                    .font(.system(size: 14))
+                    .foregroundStyle(NanoMuseTones.secondaryText)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(.footnote)
+                        .foregroundStyle(NanoMuseTones.dangerInk)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("morde.personalMemory.error")
+                }
+                if let notice {
+                    Text(notice)
+                        .font(.footnote)
+                        .foregroundStyle(NanoMuseTones.actionText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .accessibilityIdentifier("morde.personalMemory.notice")
+                }
+
+                HStack {
+                    Text("个人记忆").font(.system(size: 17, weight: .bold)).foregroundStyle(NanoMuseTones.ink)
+                    Spacer()
+                    Button(isLoading ? "正在刷新…" : "刷新") { Task { await refresh() } }
+                        .font(.system(size: 14, weight: .semibold))
+                        .disabled(isLoading || isPerformingAction || !client.signedIn)
+                        .accessibilityIdentifier("morde.personalMemory.refresh")
+                }
+
+                if isLoading && memories.isEmpty {
+                    ProgressView("正在读取个人记忆…").frame(maxWidth: .infinity, alignment: .leading)
+                } else if memories.isEmpty {
+                    Text("当前没有可管理的个人记忆。")
+                        .font(.footnote)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
+                        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16))
+                        .accessibilityIdentifier("morde.personalMemory.empty")
+                } else {
+                    ForEach(memories) { memory in
+                        memoryCard(memory)
+                    }
+                }
+
+                Text("规则候选").font(.system(size: 17, weight: .bold)).foregroundStyle(NanoMuseTones.ink)
+                    .padding(.top, 4)
+                if rules.isEmpty {
+                    Text("尚无规则候选。你可以从一条已保存记忆提出候选。")
+                        .font(.footnote)
+                        .foregroundStyle(NanoMuseTones.secondaryText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(14)
+                        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16))
+                        .accessibilityIdentifier("morde.personalMemory.rules.empty")
+                } else {
+                    ForEach(rules) { rule in
+                        ruleCard(rule)
+                    }
+                }
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 18)
+        }
+        .background(MordeSettingsPalette.canvas.ignoresSafeArea())
+        .accessibilityIdentifier("morde.personalMemory.management")
+        .task { await refresh() }
+        .onChange(of: client.signedIn) { signedIn in
+            if signedIn {
+                Task { await refresh() }
+            } else {
+                memories = []
+                rules = []
+                presentedSheet = nil
+                errorMessage = "登录已结束，请重新登录后查看个人记忆。"
+            }
+        }
+        .sheet(item: $presentedSheet) { sheet in
+            switch sheet {
+            case .history(let memory):
+                MordePersonalMemoryHistorySheet(memory: memory)
+                    .presentationDetents([.large])
+                    .presentationDragIndicator(.visible)
+            case .edit(let memory):
+                MordePersonalMemoryEditSheet(memory: memory) {
+                    do {
+                        try await reloadMemoryObjects()
+                        notice = "记忆已更新为新修订；已有规则仍绑定原修订。"
+                    } catch {
+                        errorMessage = userMessage(for: error)
+                    }
+                }
+                .presentationDetents([.large])
+                .presentationDragIndicator(.visible)
+            }
+        }
+        .confirmationDialog(prompt?.title ?? "", isPresented: Binding(
+            get: { prompt != nil },
+            set: { if !$0 { prompt = nil } }
+        ), titleVisibility: .visible) {
+            if let currentPrompt = prompt {
+                Button(currentPrompt.confirmTitle, role: currentPrompt.isDestructive ? .destructive : nil) {
+                    prompt = nil
+                    Task { await perform(currentPrompt) }
+                }
+                .accessibilityIdentifier("morde.personalMemory.confirmation.confirm")
+                Button("取消", role: .cancel) { prompt = nil }
+                    .accessibilityIdentifier("morde.personalMemory.confirmation.cancel")
+            }
+        } message: {
+            Text(prompt?.message ?? "")
+        }
+    }
+
+    @ViewBuilder
+    private func memoryCard(_ memory: MordeManagedPersonalMemory) -> some View {
+        let alreadyProposed = rules.contains {
+            $0.sourceMemoryID == memory.id && $0.sourceMemoryRevision == memory.revision
+        }
+        VStack(alignment: .leading, spacing: 10) {
+            Text(memory.content)
+                .font(.system(size: 15, weight: .medium))
+                .foregroundStyle(NanoMuseTones.ink)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityIdentifier("morde.personalMemory.content.\(memory.id)")
+            HStack(spacing: 8) {
+                Text("修订 \(memory.revision)")
+                    .accessibilityIdentifier("morde.personalMemory.revision.\(memory.id)")
+                if let category = memory.category, !category.isEmpty { Text("· \(category)") }
+            }
+            .font(.caption)
+            .foregroundStyle(NanoMuseTones.muted)
+            Button("纠正记忆") { presentedSheet = .edit(memory) }
+                .disabled(isLoading || isPerformingAction)
+                .accessibilityIdentifier("morde.personalMemory.edit.\(memory.id)")
+            Button("查看修订历史") { presentedSheet = .history(memory) }
+                .accessibilityIdentifier("morde.personalMemory.history.\(memory.id)")
+            Button(alreadyProposed ? "该修订已有候选或规则" : "提出规则候选") {
+                prompt = .propose(memory)
+            }
+            .disabled(alreadyProposed || isLoading || isPerformingAction)
+            .accessibilityIdentifier("morde.personalMemory.propose.\(memory.id)")
+            Button("忘记此记忆", role: .destructive) { prompt = .forget(memory) }
+                .disabled(isLoading || isPerformingAction)
+                .accessibilityIdentifier("morde.personalMemory.forget.\(memory.id)")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(15)
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+    }
+
+    @ViewBuilder
+    private func ruleCard(_ rule: MordeManagedPersonalRule) -> some View {
+        let source = memories.first(where: { $0.id == rule.sourceMemoryID })
+        let sourceIsCurrent = source?.revision == rule.sourceMemoryRevision
+        VStack(alignment: .leading, spacing: 9) {
+            Text(rule.status == "active" ? "已启用" : "待确认")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(rule.status == "active" ? NanoMuseTones.actionText : NanoMuseTones.secondaryText)
+                .accessibilityIdentifier("morde.personalMemory.rule.status.\(rule.id)")
+            Text("来源记忆 \(rule.sourceMemoryID) · 修订 \(rule.sourceMemoryRevision)")
+                .font(.caption)
+                .foregroundStyle(NanoMuseTones.muted)
+                .accessibilityIdentifier("morde.personalMemory.rule.source.\(rule.id)")
+            if let source, sourceIsCurrent {
+                Text(source.content)
+                    .font(.system(size: 14))
+                    .foregroundStyle(NanoMuseTones.ink)
+                    .lineLimit(4)
+            } else {
+                Text(rule.status == "candidate"
+                    ? "来源记忆已删除或更新；此候选不能启用。"
+                    : "来源记忆已删除或更新；此规则当前不可用。")
+                    .font(.footnote)
+                    .foregroundStyle(NanoMuseTones.dangerInk)
+            }
+            if rule.status == "candidate" {
+                Button("确认并启用") { prompt = .activate(rule) }
+                    .disabled(!sourceIsCurrent || isLoading || isPerformingAction)
+                    .accessibilityIdentifier("morde.personalMemory.rule.activate.\(rule.id)")
+            }
+            Button(rule.status == "active" ? "删除规则" : "删除候选", role: .destructive) {
+                prompt = .deleteRule(rule)
+            }
+            .disabled(isLoading || isPerformingAction)
+            .accessibilityIdentifier("morde.personalMemory.rule.delete.\(rule.id)")
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(15)
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+    }
+
+    private func refresh() async {
+        guard client.signedIn else {
+            memories = []
+            rules = []
+            errorMessage = "请登录后查看个人记忆。"
+            return
+        }
+        isLoading = true
+        errorMessage = nil
+        notice = nil
+        defer { isLoading = false }
+        do {
+            let (loadedMemories, loadedRules) = try await readMemoryObjects()
+            memories = loadedMemories
+            rules = loadedRules
+        } catch {
+            memories = []
+            rules = []
+            errorMessage = userMessage(for: error)
+        }
+    }
+
+    private func readMemoryObjects() async throws -> ([MordeManagedPersonalMemory], [MordeManagedPersonalRule]) {
+        var cursor: String?
+        var seenCursors = Set<String>()
+        var pageCount = 0
+        var loadedMemories: [MordeManagedPersonalMemory] = []
+        var loadedRules: [MordeManagedPersonalRule] = []
+        while true {
+            let page = try await MordeShellAuthorization.shared.personalSnapshot(cursor: cursor)
+            for object in page.items {
+                if object.object_type == "memory" {
+                    guard MordePersonalDataContract.isValidMemoryBody(object.body),
+                          case let .object(fields) = object.body,
+                          case let .string(content)? = fields["content"] else { throw URLError(.cannotParseResponse) }
+                    let category: String?
+                    if case let .string(value)? = fields["category"] { category = value } else { category = nil }
+                    loadedMemories.append(MordeManagedPersonalMemory(id: object.object_id, revision: object.revision,
+                        content: content, category: category))
+                } else if object.object_type == "rule_candidate" {
+                    guard MordePersonalDataContract.isValidSyncObjectBody(type: object.object_type,
+                            id: object.object_id, body: object.body),
+                          case let .object(fields) = object.body,
+                          case let .string(sourceMemoryID)? = fields["source_memory_id"],
+                          case let .integer(sourceRevision)? = fields["source_memory_revision"],
+                          case let .string(status)? = fields["status"] else { throw URLError(.cannotParseResponse) }
+                    loadedRules.append(MordeManagedPersonalRule(id: object.object_id, revision: object.revision,
+                        sourceMemoryID: sourceMemoryID, sourceMemoryRevision: sourceRevision, status: status))
+                }
+            }
+            pageCount += 1
+            guard pageCount <= 100 else { throw URLError(.cannotParseResponse) }
+            guard let nextCursor = page.next_cursor else { break }
+            guard seenCursors.insert(nextCursor).inserted else { throw URLError(.cannotParseResponse) }
+            cursor = nextCursor
+        }
+        return (loadedMemories.sorted { $0.id < $1.id }, loadedRules.sorted { $0.id < $1.id })
+    }
+
+    private func perform(_ action: MordePersonalMemoryManagementPrompt) async {
+        guard client.signedIn, !isPerformingAction else { return }
+        isPerformingAction = true
+        errorMessage = nil
+        notice = nil
+        defer { isPerformingAction = false }
+        do {
+            switch action {
+            case .propose(let memory):
+                let token = UUID().uuidString.lowercased().replacingOccurrences(of: "-", with: "")
+                let candidateID = "r_" + token.prefix(8)
+                _ = try await MordeShellAuthorization.shared.proposePersonalRuleCandidate(
+                    candidateID: candidateID, sourceMemoryID: memory.id,
+                    sourceMemoryRevision: memory.revision, idempotencyKey: UUID().uuidString.lowercased())
+                notice = "规则候选已创建，启用前仍需你确认。"
+            case .activate(let rule):
+                _ = try await MordeShellAuthorization.shared.activatePersonalRuleCandidate(
+                    candidateID: rule.id, baseRevision: rule.revision,
+                    sourceMemoryID: rule.sourceMemoryID, sourceMemoryRevision: rule.sourceMemoryRevision,
+                    idempotencyKey: UUID().uuidString.lowercased())
+                notice = "规则已启用。"
+            case .deleteRule(let rule):
+                _ = try await MordeShellAuthorization.shared.deletePersonalRuleCandidate(
+                    candidateID: rule.id, baseRevision: rule.revision,
+                    idempotencyKey: UUID().uuidString.lowercased())
+                notice = rule.status == "active" ? "规则已删除。" : "规则候选已删除。"
+            case .forget(let memory):
+                _ = try await MordeShellAuthorization.shared.deletePersonalObject(
+                    objectType: "memory", objectID: memory.id, baseRevision: memory.revision,
+                    idempotencyKey: UUID().uuidString.lowercased())
+                notice = "记忆已删除，历史正文已按服务端规则清理。"
+            }
+            try await reloadMemoryObjects()
+        } catch {
+            let message = userMessage(for: error)
+            try? await reloadMemoryObjects()
+            errorMessage = message
+        }
+    }
+
+    private func reloadMemoryObjects() async throws {
+        let (loadedMemories, loadedRules) = try await readMemoryObjects()
+        memories = loadedMemories
+        rules = loadedRules
+    }
+
+    private func userMessage(for error: Error) -> String {
+        let value = error as NSError
+        if value.domain == "Morde" || value.domain == "MordePersonalRevisionConflict" {
+            return value.localizedDescription
+        }
+        return "个人记忆暂时无法读取或保存，请检查连接后重试。"
+    }
+}
+
+private struct MordePersonalMemoryHistorySheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let memory: MordeManagedPersonalMemory
+    @State private var revisions: [MordePersonalMemoryRevision] = []
+    @State private var cursor: String?
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("记忆修订历史").font(.system(size: 18, weight: .bold)).foregroundStyle(NanoMuseTones.ink)
+                Spacer()
+                Button("关闭") { dismiss() }
+                    .accessibilityIdentifier("morde.personalMemory.history.close")
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("记忆 \(memory.id) · 当前修订 \(memory.revision)")
+                        .font(.caption)
+                        .foregroundStyle(NanoMuseTones.muted)
+                    if let errorMessage {
+                        Text(errorMessage).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
+                            .accessibilityIdentifier("morde.personalMemory.history.error")
+                    }
+                    if isLoading && revisions.isEmpty {
+                        ProgressView("正在读取修订历史…")
+                    } else if revisions.isEmpty && errorMessage == nil {
+                        Text("没有可显示的修订历史。")
+                            .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
+                    }
+                    ForEach(revisions) { revision in
+                        revisionCard(revision)
+                    }
+                    if cursor != nil {
+                        Button(isLoading ? "正在读取…" : "读取更早修订") { Task { await loadNextPage() } }
+                            .disabled(isLoading)
+                            .accessibilityIdentifier("morde.personalMemory.history.more")
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.bottom, 24)
+            }
+        }
+        .background(MordeSettingsPalette.canvas.ignoresSafeArea())
+        .task(id: memory.id) { await loadNextPage(reset: true) }
+    }
+
+    @ViewBuilder
+    private func revisionCard(_ revision: MordePersonalMemoryRevision) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("修订 \(revision.revision)").font(.system(size: 15, weight: .bold)).foregroundStyle(NanoMuseTones.ink)
+                .accessibilityIdentifier("morde.personalMemory.history.revision.\(revision.revision)")
+            Text(revision.changed_at).font(.caption).foregroundStyle(NanoMuseTones.muted)
+            if let body = revision.body, MordePersonalDataContract.isValidMemoryBody(body),
+               case let .object(fields) = body, case let .string(content)? = fields["content"] {
+                Text(content).font(.system(size: 14)).foregroundStyle(NanoMuseTones.ink)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text("该修订正文当前不可读取或不可恢复。")
+                    .font(.footnote).foregroundStyle(NanoMuseTones.secondaryText)
+            }
+            Text(historySourceLabel(revision))
+                .font(.caption).foregroundStyle(NanoMuseTones.secondaryText)
+            if let successor = revision.superseded_by_revision {
+                Text("后续修订：\(successor)").font(.caption).foregroundStyle(NanoMuseTones.muted)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(14)
+        .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 16, style: .continuous).strokeBorder(NanoMuseTones.hairline))
+    }
+
+    private func historySourceLabel(_ revision: MordePersonalMemoryRevision) -> String {
+        switch revision.source_status {
+        case "available": "来源已授权：" + revision.sources.map(\.kind).joined(separator: "、")
+        case "unrecorded": "此修订没有可用的来源记录。"
+        default: "来源不可用；服务端已隐藏相关正文和修订关系。"
+        }
+    }
+
+    private func loadNextPage(reset: Bool = false) async {
+        guard !isLoading else { return }
+        isLoading = true
+        defer { isLoading = false }
+        if reset {
+            revisions = []
+            cursor = nil
+            errorMessage = nil
+        }
+        do {
+            let page = try await MordeShellAuthorization.shared.personalMemoryHistory(
+                objectID: memory.id, cursor: cursor)
+            revisions.append(contentsOf: page.items.filter { !revisions.contains($0) })
+            cursor = page.next_cursor
+        } catch {
+            let value = error as NSError
+            errorMessage = value.domain == "Morde" ? value.localizedDescription
+                : "无法读取这条记忆的修订历史。"
+        }
+    }
+}
+
+private struct MordePersonalMemoryEditSheet: View {
+    @Environment(\.dismiss) private var dismiss
+    let memory: MordeManagedPersonalMemory
+    let onSaved: @MainActor () async -> Void
+    @State private var content: String
+    @State private var isSaving = false
+    @State private var errorMessage: String?
+
+    init(memory: MordeManagedPersonalMemory, onSaved: @escaping @MainActor () async -> Void) {
+        self.memory = memory
+        self.onSaved = onSaved
+        _content = State(initialValue: memory.content)
+    }
+
+    private var canSave: Bool {
+        guard !isSaving, content != memory.content,
+              (1...65_536).contains(content.unicodeScalars.count) else { return false }
+        return true
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("纠正个人记忆").font(.system(size: 18, weight: .bold)).foregroundStyle(NanoMuseTones.ink)
+                Spacer()
+                Button("取消") { dismiss() }
+                    .disabled(isSaving)
+                    .accessibilityIdentifier("morde.personalMemory.edit.cancel")
+            }
+            .padding(.horizontal, 20)
+            .padding(.vertical, 16)
+
+            Text("修订 \(memory.revision) · 保存会创建新修订；已有规则仍引用当前绑定的旧修订。")
+                .font(.caption)
+                .foregroundStyle(NanoMuseTones.secondaryText)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 20)
+                .padding(.bottom, 10)
+
+            TextEditor(text: $content)
+                .font(.system(size: 16))
+                .scrollContentBackground(.hidden)
+                .padding(10)
+                .background(NanoMuseTones.surface, in: RoundedRectangle(cornerRadius: 16))
+                .overlay(RoundedRectangle(cornerRadius: 16).strokeBorder(NanoMuseTones.hairline))
+                .padding(.horizontal, 20)
+                .accessibilityIdentifier("morde.personalMemory.edit.text.\(memory.id)")
+
+            if let errorMessage {
+                Text(errorMessage).font(.footnote).foregroundStyle(NanoMuseTones.dangerInk)
+                    .padding(.horizontal, 20)
+                    .padding(.top, 10)
+                    .accessibilityIdentifier("morde.personalMemory.edit.error")
+            }
+
+            Button(isSaving ? "正在保存…" : "保存修订") { Task { await save() } }
+                .font(.system(size: 16, weight: .semibold))
+                .foregroundStyle(.white)
+                .frame(maxWidth: .infinity, minHeight: 48)
+                .background(canSave ? NanoMuseTones.action : NanoMuseTones.muted,
+                            in: RoundedRectangle(cornerRadius: 14))
+                .disabled(!canSave)
+                .padding(.horizontal, 20)
+                .padding(.vertical, 18)
+                .accessibilityIdentifier("morde.personalMemory.edit.save.\(memory.id)")
+        }
+        .background(MordeSettingsPalette.canvas.ignoresSafeArea())
+    }
+
+    private func save() async {
+        guard canSave else { return }
+        isSaving = true
+        errorMessage = nil
+        defer { isSaving = false }
+        var fields: [String: MordePersonalJSONValue] = ["content": .string(content)]
+        if let category = memory.category { fields["category"] = .string(category) }
+        let body = MordePersonalJSONValue.object(fields)
+        guard MordePersonalDataContract.isValidMemoryBody(body) else {
+            errorMessage = "记忆内容不能为空或超过长度限制。"
+            return
+        }
+        do {
+            let receipt = try await MordeShellAuthorization.shared.replacePersonalObject(
+                objectType: "memory", objectID: memory.id, baseRevision: memory.revision,
+                body: body, idempotencyKey: UUID().uuidString.lowercased())
+            guard receipt.object_type == "memory", receipt.object_id == memory.id,
+                  receipt.result_revision > memory.revision, receipt.account_change_sequence > 0 else {
+                throw URLError(.cannotParseResponse)
+            }
+            await onSaved()
+            dismiss()
+        } catch {
+            let value = error as NSError
+            errorMessage = value.domain == "Morde" || value.domain == "MordePersonalRevisionConflict"
+                ? value.localizedDescription : "记忆保存失败，请刷新后重试。"
+        }
+    }
+}
+
 private struct MordeDesignSettingsDetail: View {
     let destination: MordeDesignSettingsDestination
     let onBack: () -> Void
@@ -19450,6 +20527,8 @@ private struct MordeDesignSettingsDetail: View {
         switch destination {
         case .account:
             MordeAccountSettingsView()
+        case .personalMemory:
+            MordePersonalMemoryManagementView()
         case .devices:
             MordeClientInstallationsSettingsView()
         case .credentials:

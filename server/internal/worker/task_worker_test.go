@@ -8,9 +8,47 @@ import (
 	"testing"
 	"time"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain/task"
 )
+
+func TestTaskExecutionStoppedLogUsesSafeDiagnosticFields(t *testing.T) {
+	const rawError = "provider-token=must-not-be-logged"
+	err := cloudDSHToolExecutionFailure{
+		diagnostic: cloudDSHToolExecutionDiagnostic{
+			Stage: "execute", ReasonCode: "tool_execution_failed", ToolName: "mcp_call",
+			CallID: "call-local-1", Dispatch: "result_unknown", ErrorType: "*errors.errorString",
+		},
+		cause: errors.New(rawError),
+	}
+	core, logs := observer.New(zap.ErrorLevel)
+	zap.New(core).Error("task execution stopped", taskExecutionStoppedFields("q1234567", err)...)
+	if entries := logs.All(); len(entries) != 1 {
+		t.Fatalf("logged task execution failures = %d, want 1", len(entries))
+	} else {
+		fields := entries[0].ContextMap()
+		if fields["task_id"] != "q1234567" || fields["failure_reason"] != "tool_execution_failed" ||
+			fields["tool_name"] != "mcp_call" || fields["tool_call_id"] != "call-local-1" ||
+			fields["tool_dispatch_status"] != "result_unknown" || fields["tool_error_type"] != "*errors.errorString" {
+			t.Fatalf("safe diagnostic fields = %#v", fields)
+		}
+		if _, exists := fields["error"]; exists || fmt.Sprint(fields) == rawError || containsTaskLogMarker(fields, rawError) {
+			t.Fatalf("raw task execution error leaked to log fields: %#v", fields)
+		}
+	}
+}
+
+func containsTaskLogMarker(fields map[string]interface{}, marker string) bool {
+	for _, value := range fields {
+		if fmt.Sprint(value) == marker {
+			return true
+		}
+	}
+	return false
+}
 
 type taskLeaseStoreStub struct {
 	claim               func(context.Context, string, time.Duration) (task.Task, bool, error)

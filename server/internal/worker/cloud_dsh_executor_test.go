@@ -20,8 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"go.uber.org/zap"
-	"go.uber.org/zap/zaptest/observer"
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/execution"
@@ -29,6 +27,9 @@ import (
 	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/dshguardian"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestCloudDSHModelFailureCategoryUsesOnlySafeAllowlistedReason(t *testing.T) {
@@ -404,6 +405,7 @@ func (s *cloudDSHTestCheckpoints) PendingMessages(_ context.Context, fence app.A
 }
 
 type cloudDSHTestModels struct {
+	mu        sync.Mutex
 	calls     []app.ModelCall
 	response  app.ModelResponse
 	responses []app.ModelResponse
@@ -438,14 +440,20 @@ func (cloudDSHUnavailableTestTools) AdmitToolCall(context.Context, task.Task, ap
 }
 
 func (m *cloudDSHTestModels) Complete(ctx context.Context, call app.ModelCall) (app.ModelResponse, error) {
+	m.mu.Lock()
 	m.calls = append(m.calls, call)
-	if m.complete != nil {
-		return m.complete(ctx, call)
+	callCount := len(m.calls)
+	complete := m.complete
+	response := m.response
+	responses := append([]app.ModelResponse(nil), m.responses...)
+	m.mu.Unlock()
+	if complete != nil {
+		return complete(ctx, call)
 	}
-	if len(m.responses) >= len(m.calls) {
-		return m.responses[len(m.calls)-1], nil
+	if len(responses) >= callCount {
+		return responses[callCount-1], nil
 	}
-	return m.response, nil
+	return response, nil
 }
 
 type cloudDSHTestTools struct {

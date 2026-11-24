@@ -152,6 +152,62 @@ func TestPostgresHostMemberRevocationCancelsOnlyMemberMCPWork(t *testing.T) {
 	}
 }
 
+func TestPostgresHostMemberRevocationCancelsOnlyMatchingTasks(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	hostOwner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	member := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	hostValue := createRunningControlHost(t, ctx, store, hostOwner.ID, domainhost.ControlAI, 0)
+	if _, err := store.UpsertHostMember(ctx, domainhost.Member{HostID: hostValue.ID, OwnerID: hostOwner.ID, UserID: member.ID,
+		Permissions: []domainhost.Permission{domainhost.PermissionDesktopControl}}); err != nil {
+		t.Fatalf("grant member Host control: %v", err)
+	}
+	target, err := store.SubmitTask(ctx, newTestTaskSubmission(t, member.ID, hostValue.ID, "host-grant-target", "member Task on shared Host"))
+	if err != nil {
+		t.Fatalf("submit member Task on shared Host: %v", err)
+	}
+	memberHostless, err := store.SubmitTask(ctx, newTestTaskSubmission(t, member.ID, "", "host-grant-hostless", "member Task without Host"))
+	if err != nil {
+		t.Fatalf("submit member Task without Host: %v", err)
+	}
+	ownerTask, err := store.SubmitTask(ctx, newTestTaskSubmission(t, hostOwner.ID, hostValue.ID, "host-grant-owner", "Host owner Task"))
+	if err != nil {
+		t.Fatalf("submit Host owner Task: %v", err)
+	}
+
+	if err := store.RevokeHostMember(ctx, hostValue.ID, hostOwner.ID, member.ID); err != nil {
+		t.Fatalf("revoke Host member grant: %v", err)
+	}
+	assertTaskStatus(t, ctx, store, target.Task.ID, task.StatusCancelling)
+	assertTaskStatus(t, ctx, store, memberHostless.Task.ID, task.StatusQueued)
+	assertTaskStatus(t, ctx, store, ownerTask.Task.ID, task.StatusQueued)
+	if _, err := store.UpsertHostMember(ctx, domainhost.Member{HostID: hostValue.ID, OwnerID: hostOwner.ID, UserID: member.ID,
+		Permissions: []domainhost.Permission{domainhost.PermissionDesktopControl}}); err != nil {
+		t.Fatalf("restore member Host control for permission-update case: %v", err)
+	}
+	updatedGrantTask, err := store.SubmitTask(ctx, newTestTaskSubmission(t, member.ID, hostValue.ID, "host-grant-updated", "Task before permission update"))
+	if err != nil {
+		t.Fatalf("submit Task before Host grant update: %v", err)
+	}
+	if _, err := store.UpsertHostMember(ctx, domainhost.Member{HostID: hostValue.ID, OwnerID: hostOwner.ID, UserID: member.ID,
+		Permissions: []domainhost.Permission{domainhost.PermissionDesktopView}}); err != nil {
+		t.Fatalf("remove member desktop control permission: %v", err)
+	}
+	assertTaskStatus(t, ctx, store, updatedGrantTask.Task.ID, task.StatusCancelling)
+	var targetStops, unrelatedStops int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_stop_requests WHERE task_id IN ($1,$2) AND action='cancel' AND status='pending'`,
+		target.Task.ID, updatedGrantTask.Task.ID).Scan(&targetStops); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_stop_requests WHERE task_id IN ($1,$2) AND status='pending'`,
+		memberHostless.Task.ID, ownerTask.Task.ID).Scan(&unrelatedStops); err != nil {
+		t.Fatal(err)
+	}
+	if targetStops != 2 || unrelatedStops != 0 {
+		t.Fatalf("Host member authorization stop scope = target %d, unrelated %d; want 2 and 0", targetStops, unrelatedStops)
+	}
+}
+
 func TestPostgresMCPTokenRevocationRacesDispatch(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()

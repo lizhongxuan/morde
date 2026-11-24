@@ -1464,6 +1464,10 @@ func loadSubmissionResult(ctx context.Context, tx pgx.Tx, ownerID, taskID, messa
 	if err != nil {
 		return app.TaskSubmissionResult{}, storeError("load submitted task", "task", err)
 	}
+	taskValues := []task.Task{taskDomain(taskRow)}
+	if err := populateTaskRevisionProjection(ctx, tx, taskValues); err != nil {
+		return app.TaskSubmissionResult{}, fmt.Errorf("load submitted Task revisions: %w", err)
+	}
 	messageRow, err := queries.GetMessage(ctx, sqlcgen.GetMessageParams{ID: messageID, OwnerID: ownerID})
 	if err != nil {
 		return app.TaskSubmissionResult{}, storeError("load submitted message", "message", err)
@@ -1487,7 +1491,7 @@ func loadSubmissionResult(ctx context.Context, tx pgx.Tx, ownerID, taskID, messa
 		return app.TaskSubmissionResult{}, err
 	}
 	return app.TaskSubmissionResult{
-		Task: taskDomain(taskRow), Message: message, Conversation: conversationDomain(conversationRow),
+		Task: taskValues[0], Message: message, Conversation: conversationDomain(conversationRow),
 	}, nil
 }
 

@@ -1848,8 +1848,9 @@ export const handlers = [
     if (type === "memory") {
       const historyKey = personalObjectKey(user.id, type, objectID);
       const history = personalMemoryHistory.get(historyKey) ?? [];
+      if (history[0]) history[0] = { ...history[0], superseded_by_revision: value.revision };
       history.unshift({ revision: value.revision, changed_at: now(), body: value.body as components["schemas"]["PersonalMemory"],
-        restorable: true, source_status: "available", sources: [{ kind: "mutation_receipt", id: mutationID }] });
+        restorable: true, source_status: "available", sources: [{ kind: "mutation_receipt", id: mutationID }], superseded_by_revision: null });
       personalMemoryHistory.set(historyKey, history);
     }
     const receipt: PersonalMutationReceipt = { object_type: type as PersonalMutationReceipt["object_type"], object_id: objectID, result_revision: value.revision, account_change_sequence: sequence, replay: false };

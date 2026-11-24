@@ -731,6 +731,30 @@ function taskActivityIsExecuting(status: string): boolean {
   return status === 'running' || status === 'cancelling';
 }
 
+function taskStatusText(status: string): string {
+  switch (status) {
+    case 'queued': return '排队中';
+    case 'running': return '执行中';
+    case 'waiting_user': return '等待你处理';
+    case 'pausing': return '正在暂停';
+    case 'paused': return '已暂停';
+    case 'cancelling': return '正在停止';
+    case 'completed': return '已完成';
+    case 'failed': return '失败';
+    case 'cancelled': return '已取消';
+    default: return '状态待确认';
+  }
+}
+
+function taskStatusClass(status: string): string {
+  switch (status) {
+    case 'queued': case 'running': case 'waiting_user': case 'pausing': case 'paused':
+    case 'cancelling': case 'completed': case 'failed': case 'cancelled':
+      return `status-${status}`;
+    default: return 'status-unknown';
+  }
+}
+
 function taskQueuePriorityText(priority: TaskSummary['queue_priority']): string {
   return priority === 'pinned' ? '置顶' : priority === 'background' ? '后台' : priority === 'normal' ? '普通' : '未知';
 }
@@ -775,6 +799,160 @@ function taskValidationStatusText(validation: Task['validation']): string {
     case 'FAIL': return '验证未通过';
     default: return '验证状态待确认';
   }
+}
+
+type TaskValidationEvidenceDetail = NonNullable<Task['validation_detail']>;
+type TaskValidationEvidenceClaim = TaskValidationEvidenceDetail['claims'][number];
+type TaskValidationEvidenceRef = TaskValidationEvidenceClaim['evidence_refs'][number];
+
+function isTaskValidationEvidenceRef(value: unknown): value is TaskValidationEvidenceRef {
+  if (!value || typeof value !== 'object') return false;
+  const ref = value as Partial<TaskValidationEvidenceRef>;
+  return ['source', 'baseline', 'action', 'result', 'side_effect', 'before_after'].includes(ref.kind ?? '') &&
+    typeof ref.id === 'string' && Number.isSafeInteger(ref.task_revision) && (ref.task_revision ?? -1) >= 0 &&
+    Number.isSafeInteger(ref.sequence) && (ref.sequence ?? -1) >= 1;
+}
+
+function taskValidationEvidenceKindText(kind: string): string {
+  switch (kind) {
+    case 'source': return '来源消息';
+    case 'baseline': return '基线工作项';
+    case 'action': return '执行工作项';
+    case 'result': return '结果工作项';
+    case 'side_effect': return '任务成果';
+    case 'before_after': return '对比工作项';
+    default: return '关联记录';
+  }
+}
+
+function taskValidationClaimExcerpt(result: string, startByte: number, endByte: number): { value: string; truncated: boolean } | null {
+  if (!Number.isSafeInteger(startByte) || !Number.isSafeInteger(endByte) || startByte < 0 || endByte <= startByte) return null;
+  const bytes = new TextEncoder().encode(result);
+  if (endByte > bytes.byteLength) return null;
+  try {
+    const excerpt = new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice(startByte, endByte));
+    if (!excerpt.trim()) return null;
+    return safeTaskActivityText(excerpt, 1_200);
+  } catch {
+    return null;
+  }
+}
+
+function validationEvidenceTaskStep(task: Task, ref: TaskValidationEvidenceRef): TaskStep | undefined {
+  if (!['baseline', 'action', 'result', 'before_after'].includes(ref.kind)) return undefined;
+  return task.steps.find((step) => step.id === ref.id && step.sequence === ref.sequence && step.task_revision === ref.task_revision);
+}
+
+function TaskValidationEvidencePanel({ task, messages, onOpenStep }: {
+  task: Task;
+  messages: readonly AssistantDisplayMessage[];
+  onOpenStep: (stepID: string) => void;
+}) {
+  const detail = task.validation_detail;
+  const result = task.result;
+  const currentRevision = task.current_revision;
+  const eventSequence = task.event_sequence;
+  const resultSHA256 = detail?.result_sha256 ?? '';
+  const hasFinalVerdict = task.validation?.state === 'PASS' || task.validation?.state === 'PASS+NOTES' || task.validation?.state === 'FAIL';
+  const envelopeIsCurrent = Boolean(detail && hasFinalVerdict && task.status === 'completed' && result !== null && result.length > 0 &&
+    Number.isSafeInteger(currentRevision) && (currentRevision ?? -1) >= 0 && task.desired_revision === currentRevision &&
+    detail.task_revision === currentRevision && Number.isSafeInteger(detail.event_sequence) && detail.event_sequence >= 1 &&
+    Number.isSafeInteger(eventSequence) && detail.event_sequence <= eventSequence && /^[a-f0-9]{64}$/u.test(resultSHA256) &&
+    Array.isArray(detail.claims) && detail.claims.length > 0 && detail.claims.length <= 64 && detail.claims.every((claim) =>
+      Boolean(claim && Number.isSafeInteger(claim.start_byte) && Number.isSafeInteger(claim.end_byte) && Array.isArray(claim.evidence_refs))));
+  const bindingKey = envelopeIsCurrent && detail
+    ? `${task.id}:${detail.task_revision}:${detail.event_sequence}:${resultSHA256}` : '';
+  const [digestResult, setDigestResult] = useState<{ key: string; matches: boolean } | null>(null);
+
+  useEffect(() => {
+    if (!bindingKey || result === null) return;
+    let active = true;
+    void sha256Hex(new TextEncoder().encode(result)).then((digest) => {
+      if (active) setDigestResult({ key: bindingKey, matches: digest === resultSHA256 });
+    }).catch(() => {
+      if (active) setDigestResult({ key: bindingKey, matches: false });
+    });
+    return () => { active = false; };
+  }, [bindingKey, result, resultSHA256]);
+
+  if (!detail || !envelopeIsCurrent || !bindingKey) return null;
+  const digestMatches = digestResult?.key === bindingKey ? digestResult.matches : null;
+  const currentStepsByID = new Map(task.steps.map((step) => [step.id, step]));
+  const artifactsByID = new Map(task.artifacts.map((artifact) => [artifact.id, artifact]));
+  const messageByID = new Map(messages.map((message) => [message.id, message]));
+  const resolveReference = (ref: TaskValidationEvidenceRef) => {
+    if (!ref || ref.task_revision !== currentRevision || !Number.isSafeInteger(ref.sequence) || ref.sequence < 1 || typeof ref.id !== 'string') {
+      return { label: taskValidationEvidenceKindText(ref?.kind ?? ''), text: '关联记录暂不可访问' } as const;
+    }
+    if (ref.kind === 'source') {
+      const source = messageByID.get(ref.id);
+      const sourceIsCurrent = source?.sequence === ref.sequence && source.task_id === task.id && source.delivery_status === 'applied' &&
+        (source.role === 'user' || source.output_task_revision === ref.task_revision);
+      return sourceIsCurrent
+        ? { label: taskValidationEvidenceKindText(ref.kind), messageID: source.id } as const
+        : { label: taskValidationEvidenceKindText(ref.kind), text: '来源消息未载入当前会话，暂不可跳转' } as const;
+    }
+    if (ref.kind === 'side_effect') {
+      const artifact = artifactsByID.get(ref.id);
+      const step = artifact ? currentStepsByID.get(artifact.step_id) : undefined;
+      const matchesStep = step?.sequence === ref.sequence && step.task_revision === ref.task_revision;
+      if (!artifact || !matchesStep) return { label: taskValidationEvidenceKindText(ref.kind), text: '任务成果暂不可访问' } as const;
+      return hasCompleteVerifiedArtifactProof(artifact)
+        ? { label: taskValidationEvidenceKindText(ref.kind), artifactID: artifact.id, artifactLabel: safeTaskActivityText(artifact.label, 120).value } as const
+        : { label: taskValidationEvidenceKindText(ref.kind), text: '任务成果存在，但当前不可下载' } as const;
+    }
+    const step = validationEvidenceTaskStep(task, ref);
+    if (!step) return { label: taskValidationEvidenceKindText(ref.kind), text: '工作项暂不可访问' } as const;
+    const stepTitleText = safeTaskActivityText(taskActivityStepTitle(step), 120).value;
+    return { label: taskValidationEvidenceKindText(ref.kind), stepID: step.id, stepTitle: stepTitleText } as const;
+  };
+
+  if (digestMatches === null) return <section className="task-activity-k2 task-activity-evidence" aria-label="结果与证据对应关系">
+    <h3>结果与证据对应关系</h3><p role="status">正在核对结果与证据绑定…</p>
+  </section>;
+  if (!digestMatches) return <section className="task-activity-k2 task-activity-evidence" aria-label="结果与证据对应关系">
+    <h3>结果与证据对应关系</h3><p role="status">验证证据未能与当前结果匹配，暂不可查看。</p>
+  </section>;
+
+  const claims = detail.claims.map((claim) => ({
+    excerpt: taskValidationClaimExcerpt(result!, claim.start_byte, claim.end_byte),
+    rawRefs: [...(Array.isArray(claim.evidence_refs) ? claim.evidence_refs : []), ...(claim.performance_comparison ? [claim.performance_comparison.baseline_ref,
+      claim.performance_comparison.after_ref] : [])],
+    comparison: claim.performance_comparison,
+  })).map((claim) => ({ ...claim,
+    refs: claim.rawRefs.filter(isTaskValidationEvidenceRef).filter((ref, index, refs) => refs.findIndex((candidate) =>
+      candidate.kind === ref.kind && candidate.id === ref.id && candidate.task_revision === ref.task_revision && candidate.sequence === ref.sequence) === index),
+    hasInvalidRef: claim.rawRefs.some((ref) => !isTaskValidationEvidenceRef(ref)),
+  }));
+  if (!claims.length) return null;
+  return <section className="task-activity-k2 task-activity-evidence" aria-label="结果与证据对应关系">
+    <h3>结果与证据对应关系</h3>
+    <p className="muted">以下将结果中的陈述关联到当前修订的来源或工作项；关联本身不代表每项副作用都已独立核实。</p>
+    <ol>{claims.map((claim, index) => <li key={`${task.id}:${index}`}>
+      {claim.excerpt ? <blockquote>{claim.excerpt.value}</blockquote>
+        : <p role="status">结果文本范围无效或暂不可用，该条陈述未显示。</p>}
+      {claim.excerpt?.truncated && <small>结果片段已截断。</small>}
+      {claim.comparison && <p className="task-activity-evidence-performance">
+        任务报告的性能对比（未独立核实）：{safeTaskActivityText(claim.comparison.metric, 80).value}，
+        {claim.comparison.before} {safeTaskActivityText(claim.comparison.unit, 24).value} → {claim.comparison.after} {safeTaskActivityText(claim.comparison.unit, 24).value}；
+        变化量 {claim.comparison.delta} {safeTaskActivityText(claim.comparison.unit, 24).value}，环境：{safeTaskActivityText(claim.comparison.environment, 120).value}。
+      </p>}
+      <ul>{claim.refs.map((ref, refIndex) => {
+        const reference = resolveReference(ref);
+        return <li key={`${reference.label}:${refIndex}`}><small>{reference.label}：</small>
+          {'stepID' in reference && reference.stepID
+            ? <button type="button" className="button button-small button-secondary"
+              aria-label={`查看证据工作项：${reference.stepTitle}`} onClick={() => onOpenStep(reference.stepID!)}>{reference.stepTitle}</button>
+            : 'messageID' in reference && reference.messageID
+              ? <a href={`#conversation-message-${encodeURIComponent(reference.messageID)}`}>查看来源消息</a>
+              : 'artifactID' in reference && reference.artifactID
+                ? <a href={portalApi.taskArtifactContentURL(task.id, reference.artifactID)} download
+                  aria-label={`下载核验成果 ${reference.artifactLabel}`}>下载核验成果</a>
+                : <span>{reference.text}</span>}
+        </li>;
+      })}{(claim.hasInvalidRef || claim.refs.length === 0) && <li><small>关联记录：</small><span>部分关联记录暂不可访问</span></li>}</ul>
+    </li>)}</ol>
+  </section>;
 }
 
 function childJobStatusText(status: string): string {
@@ -1653,7 +1831,8 @@ export function Assistant() {
     return Number(taskActivityIsExecuting(rightTask?.status ?? right.status)) - Number(taskActivityIsExecuting(leftTask?.status ?? left.status)) ||
       Date.parse(rightTask?.updated_at ?? right.updated_at) - Date.parse(leftTask?.updated_at ?? left.updated_at) || right.id.localeCompare(left.id);
   });
-  const taskProgressReadError = taskQueries.some((query, index) => query.isError && currentConversationTaskIDs.has(taskIDs[index] ?? ''));
+  const taskProgressReadError = taskQueries.some((query, index) => query.isError && !isResourceNoLongerAccessible(query.error) &&
+    currentConversationTaskIDs.has(taskIDs[index] ?? ''));
   const taskProgressNetworkReadError = taskQueries.some((query, index) => query.isError &&
     isTransientNetworkError(query.error) && currentConversationTaskIDs.has(taskIDs[index] ?? ''));
   const visibleTaskPanelTasks = taskPanelTasks.slice(0, visibleTaskPanelCount);
@@ -2326,7 +2505,21 @@ export function Assistant() {
       const decisionLabel = request.decision === 'approve' ? '已允许本次操作' : '已拒绝本次操作';
       notify(`${decisionLabel}，任务后续状态等待更新。`, 'success');
     },
-    onError: (error, request) => handleTaskActionError(error, request.taskID),
+    onError: async (error, request) => {
+      if (isResourceNoLongerAccessible(error)) {
+        clearTaskActionKey(request.actionScope, request.key);
+        client.removeQueries({ queryKey: ['task', request.taskID], exact: true });
+        await Promise.all([
+          client.invalidateQueries({ queryKey: ['task', request.taskID], exact: true }),
+          client.invalidateQueries({ queryKey: ['assistant-account-tasks'] }),
+          client.invalidateQueries({ queryKey: ['conversation-tasks'] }),
+          client.invalidateQueries({ queryKey: ['task-approvals'] }),
+        ]);
+        notify(errorDetails(error).message, 'error');
+        return;
+      }
+      await handleTaskActionError(error, request.taskID);
+    },
   });
   const answerClarification = useMutation({
     mutationFn: (request: { taskID: string; clarificationID: string; version: number; answer: string; actionScope: string; key: string }) =>
@@ -3129,7 +3322,9 @@ export function Assistant() {
   const renderTaskDetail = (summary: TaskSummary) => {
     const task = allTasksByID.get(summary.id);
     const taskQuery = taskQueries[taskIDs.indexOf(summary.id)];
-    if (!task) return taskQuery?.isError && !isTransientNetworkError(taskQuery.error)
+    if (!task) return isResourceNoLongerAccessible(taskQuery?.error)
+      ? <p className="muted" role="status">任务详情不可访问或已删除。</p>
+      : taskQuery?.isError && !isTransientNetworkError(taskQuery.error)
       ? <FloatingError className="error-inline task-detail-load-error" role="alert">任务工作过程暂不可用。
         <button type="button" className="button button-small button-secondary" onClick={() => void taskQuery.refetch()}>重试</button></FloatingError>
       : <p className="muted" role="status">正在读取任务工作过程…</p>;
@@ -3150,6 +3345,7 @@ export function Assistant() {
     const groups = taskAgentActivityGroups(task);
     const isRunning = taskActivityIsExecuting(task.status);
     const title = taskActivityTitle(task.objective);
+    const taskStatus = taskStatusText(task.status);
     const busy = !terminalTaskStatuses.has(task.status);
     const canCancelTask = task.initiator_id === user?.id && cancellableTaskStatuses.has(task.status);
     const hasTaskRevisionFence = Number.isSafeInteger(task.current_revision) && (task.current_revision ?? -1) >= 0 &&
@@ -3166,6 +3362,8 @@ export function Assistant() {
       (task.conversation_id !== conversationID || displayMessages.some((message) => message.id === review.reply_message_id && message.role === 'assistant' &&
         message.sources?.some((source) => source.task_id === review.source_task_id &&
           source.task_revision === review.source_task_revision && source.event_sequence === review.source_event_sequence))));
+    const verifiedArtifacts = task.artifacts.filter(hasCompleteVerifiedArtifactProof);
+    const hasUnverifiedArtifacts = verifiedArtifacts.length < task.artifacts.length;
     const taskHost = task.host_id ? hostItems.find((host) => host.id === task.host_id) : undefined;
     const browserHandoffRequested = task.waiting_reason === 'clarification' && Boolean(task.clarification_request) && task.steps.some((step) =>
       step.kind === 'tool' && (step.title === 'Run cloud dsh tool: browser_prepare_user_handoff' ||
@@ -3176,8 +3374,8 @@ export function Assistant() {
     return <section className="task-activity" data-task-id={task.id} aria-label={`任务详情：${title}`}>
       <header className="task-activity-heading">
         <div><strong>{title}</strong><small>更新于 {formatDate(task.updated_at)}</small></div>
-        <span className={`task-activity-status task-dynamics-status ${isRunning ? 'is-running' : 'is-stopped'}`}>
-          {isRunning ? '执行中' : task.status === 'failed' ? '失败' : '停止'}
+        <span className={`task-activity-status task-dynamics-status ${taskStatusClass(task.status)} ${isRunning ? 'is-running' : 'is-stopped'}`}>
+          {taskStatus}
         </span>
       </header>
       {task.status === 'queued' && task.queue_priority && <section className="task-activity-k2 task-queue-priority" aria-label="任务优先级">
@@ -3217,6 +3415,8 @@ export function Assistant() {
         <h3>任务验证</h3>
         <p role="status">{taskValidationStatusText(task.validation)}</p>
       </section>}
+      {showTaskValidation && task.validation && <TaskValidationEvidencePanel task={task} messages={displayMessages}
+        onOpenStep={setTaskDetailStepID} />}
       {task.clarification_request && <form className="notice notice-warning task-detail-attention" aria-label="补充任务信息"
         onSubmit={(event) => {
           event.preventDefault();
@@ -3274,12 +3474,13 @@ export function Assistant() {
           重试结果整理
         </button>}
       </section>}
-      {task.artifacts.some(hasCompleteVerifiedArtifactProof) && <section className="task-activity-k2 task-activity-artifacts" aria-label="任务成果">
-        <h3>任务成果</h3><ul>{task.artifacts.filter(hasCompleteVerifiedArtifactProof).map((artifact) => <li key={artifact.id}>
+      {(verifiedArtifacts.length > 0 || hasUnverifiedArtifacts) && <section className="task-activity-k2 task-activity-artifacts" aria-label="任务成果">
+        <h3>任务成果</h3>{verifiedArtifacts.length > 0 && <ul>{verifiedArtifacts.map((artifact) => <li key={artifact.id}>
           <strong>{artifact.label}</strong><small>{artifact.path} · {artifact.media_type} · {formatBytes(artifact.size_bytes!)}</small>
           <a className="task-activity-link" href={portalApi.taskArtifactContentURL(task.id, artifact.id)} download
             aria-label={`下载任务成果 ${artifact.label}`}>下载成果 ↓</a>
-        </li>)}</ul>
+        </li>)}</ul>}
+        {hasUnverifiedArtifacts && <p role="status">有成果尚未通过完整核验，当前不提供下载。请查看相关工作项和任务验证状态。</p>}
       </section>}
       {task.execution_location === 'server' && task.host_id && <div className="inline-actions">
         {taskHost?.state === 'running'
@@ -3315,13 +3516,14 @@ export function Assistant() {
     const task = allTasksByID.get(summary.id);
     const title = taskActivityTitle(task?.objective ?? summary.objective);
     const status = task?.status ?? summary.status;
+    const statusText = taskStatusText(status);
     const updatedAt = task?.updated_at ?? summary.updated_at;
     const isRunning = taskActivityIsExecuting(status);
     const subtitle = taskActivityLatestWorkText(summary, task);
     return <article className="task-activity-card" data-task-id={summary.id} key={summary.id}>
       <button ref={(button) => { if (button) taskCardButtons.current.set(summary.id, button); else taskCardButtons.current.delete(summary.id); }}
         type="button" className="task-activity-card-button"
-        aria-label={`查看任务：${title}，${isRunning ? '执行中' : '停止'}`}
+        aria-label={`查看任务：${title}，${statusText}`}
         onClick={() => {
           if (summary.conversation_id !== conversationID) {
             setTaskDetailStepID(null);
@@ -3840,6 +4042,7 @@ export function Assistant() {
               }
             }}>‹ {taskDetailStepID ? '返回任务详情' : '返回任务列表'}</button></div>
           {selectedTaskSummary ? renderTaskDetail(selectedTaskSummary)
+            : isResourceNoLongerAccessible(selectedTaskQuery?.error) ? <p className="muted" role="status">任务详情不可访问或已删除。</p>
             : selectedTaskQuery?.isError && !isTransientNetworkError(selectedTaskQuery.error) ? <FloatingError className="error-inline task-detail-load-error" role="alert">任务详情暂不可用，当前状态未确认。
               <button type="button" className="button button-small button-secondary" onClick={() => void selectedTaskQuery.refetch()}>重试</button></FloatingError>
               : selectedTaskQuery?.isError ? <p className="muted" role="status">正在读取任务详情…</p>

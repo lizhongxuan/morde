@@ -141,11 +141,16 @@ func TestPersonalSyncChangesRejectInvalidSequencesBeforeServiceCall(t *testing.T
 
 func TestPersonalMemoryHistoryRouteAllowsClientWithBoundPaging(t *testing.T) {
 	services := newServices()
+	supersededBy := int64(5)
 	syncService := &personalSyncServiceStub{historyPage: app.PersonalMemoryHistoryPage{
 		Items: []personal.MemoryRevision{
+			{Revision: 5, ChangedAt: time.Date(2026, 11, 15, 3, 0, 0, 0, time.UTC),
+				Body: json.RawMessage(`{"content":"current memory"}`), Restorable: true,
+				SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{Kind: "mutation_receipt", ID: "mutation-125"}}},
 			{Revision: 4, ChangedAt: time.Date(2026, 11, 14, 3, 0, 0, 0, time.UTC),
 				Body: json.RawMessage(`{"content":"memory"}`), Restorable: true,
-				SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{Kind: "mutation_receipt", ID: "mutation-123"}}},
+				SourceStatus: personal.MemoryHistorySourceAvailable, Sources: []personal.MemoryHistorySource{{Kind: "mutation_receipt", ID: "mutation-123"}},
+				SupersededByRevision: &supersededBy},
 			{Revision: 3, ChangedAt: time.Date(2026, 11, 13, 3, 0, 0, 0, time.UTC),
 				Restorable: false, SourceStatus: personal.MemoryHistorySourceUnrecorded, Sources: []personal.MemoryHistorySource{}},
 		},
@@ -166,9 +171,12 @@ func TestPersonalMemoryHistoryRouteAllowsClientWithBoundPaging(t *testing.T) {
 	if response.Code != http.StatusOK || json.Unmarshal(response.Body.Bytes(), &page) != nil || syncService.historyCalls != 1 ||
 		syncService.historyPrincipal.Kind != identity.KindClient || syncService.historyPrincipal.UserID != testUserID ||
 		syncService.historyType != personal.ObjectTypeMemory || syncService.historyObjectID != "global" ||
-		syncService.historyCursor != "previous-page" || syncService.historyLimit != 1 || len(page.Items) != 2 ||
-		page.Items[0].Revision != 4 || page.Items[0].SourceStatus != personal.MemoryHistorySourceAvailable ||
-		page.Items[1].Revision != 3 || string(page.Items[1].Body) != "null" || page.Items[1].Restorable || !strings.Contains(response.Body.String(), `"body":null`) ||
+		syncService.historyCursor != "previous-page" || syncService.historyLimit != 1 || len(page.Items) != 3 ||
+		page.Items[0].Revision != 5 || page.Items[0].SourceStatus != personal.MemoryHistorySourceAvailable || page.Items[0].SupersededByRevision != nil ||
+		page.Items[1].Revision != 4 || page.Items[1].SupersededByRevision == nil || *page.Items[1].SupersededByRevision != supersededBy ||
+		page.Items[2].Revision != 3 || string(page.Items[2].Body) != "null" || page.Items[2].Restorable || !strings.Contains(response.Body.String(), `"body":null`) ||
+		page.Items[2].SupersededByRevision != nil || !strings.Contains(response.Body.String(), `"superseded_by_revision":5`) ||
+		!strings.Contains(response.Body.String(), `"superseded_by_revision":null`) ||
 		page.NextCursor == nil || *page.NextCursor != "next-signed-cursor" {
 		t.Fatalf("memory history = %d %+v calls=%d owner=%s type=%s id=%s cursor=%s limit=%d body=%s", response.Code, page,
 			syncService.historyCalls, syncService.historyPrincipal.UserID, syncService.historyType, syncService.historyObjectID,

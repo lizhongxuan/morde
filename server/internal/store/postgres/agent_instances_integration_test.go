@@ -681,7 +681,8 @@ FROM task_agent_instances WHERE task_id=$1 AND agent_generation=$2`, lease.Fence
 	if err := f.store.RevokeHostMember(ctx, hostValue.ID, hostOwner.ID, actorID); err != nil {
 		t.Fatalf("revoke Agent actor Host grant: %v", err)
 	}
-	if _, err := f.service.Renew(ctx, lease.Fence, 30*time.Second); domain.CodeOf(err) != domain.CodeInvalidState {
+	if _, err := f.service.Renew(ctx, lease.Fence, 30*time.Second); domain.CodeOf(err) != domain.CodeInvalidState &&
+		domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("Host-bound Agent renewed after member grant revocation: %v", err)
 	}
 	assertSharedHostOperationRejected(t, f.store, beforeRevoke, lease.Fence.OwnerID, lease.Fence.LeaseOwner, "shared-host-after-member-revoke")
@@ -711,7 +712,8 @@ WHERE host_id=$1 AND owner_id=$2 AND user_id=$3 AND revoked_at IS NULL`, hostVal
 	if regrantVersion == initialGrantVersion {
 		t.Fatalf("Host member regrant reused grant version %q", regrantVersion)
 	}
-	if _, err := f.service.Renew(ctx, lease.Fence, 30*time.Second); domain.CodeOf(err) != domain.CodeInvalidState {
+	if _, err := f.service.Renew(ctx, lease.Fence, 30*time.Second); domain.CodeOf(err) != domain.CodeInvalidState &&
+		domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("old Host-bound Agent renewed after member grant was replaced: %v", err)
 	}
 	assertSharedHostOperationRejected(t, f.store, beforeRevoke, lease.Fence.OwnerID, lease.Fence.LeaseOwner, "shared-host-after-member-regrant")
@@ -753,7 +755,8 @@ func TestPostgresAgentHostOfflineAllowsTextButRejectsOperations(t *testing.T) {
 	replacement := request
 	replacement.Fence.AgentInstanceID = "agent-host-offline-replacement"
 	replacement.SupervisorNonce = bytes.Repeat([]byte{8}, 32)
-	if _, _, err := f.service.Start(ctx, replacement); domain.CodeOf(err) != domain.CodeInvalidState {
+	if _, _, err := f.service.Start(ctx, replacement); domain.CodeOf(err) != domain.CodeInvalidState &&
+		domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("unconfirmed Agent was replaced while Host offline: %v", err)
 	}
 	receipt := signAgentLifecycleReceipt(t, f.key, lease.Fence, request.SupervisorNonce)
@@ -800,7 +803,8 @@ func TestPostgresAgentRecoveryRejectsRegrantedHostPermission(t *testing.T) {
 	replacement := request
 	replacement.Fence.AgentInstanceID = "agent-regrant-replacement"
 	replacement.SupervisorNonce = bytes.Repeat([]byte{7}, 32)
-	if _, _, err := f.service.Start(ctx, replacement); domain.CodeOf(err) != domain.CodeInvalidState {
+	if _, _, err := f.service.Start(ctx, replacement); domain.CodeOf(err) != domain.CodeInvalidState &&
+		domain.CodeOf(err) != domain.CodeUnauthenticated {
 		t.Fatalf("regranted Host permission revived an old Agent: %v", err)
 	}
 }

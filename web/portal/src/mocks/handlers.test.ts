@@ -125,10 +125,10 @@ describe("portal personal-data mock reads", () => {
     const firstPage = await api(`${historyPath}?limit=1`);
     const first = await firstPage.json() as components["schemas"]["PersonalMemoryHistoryPage"];
     expect(first.items).toMatchObject([{ revision: 2, body: { content: "第二版" }, restorable: true,
-      source_status: "available", sources: [{ kind: "mutation_receipt", id: "memory-change-0002" }] }]);
+      source_status: "available", sources: [{ kind: "mutation_receipt", id: "memory-change-0002" }], superseded_by_revision: null }]);
     expect(first.next_cursor).toBeTruthy();
     const secondPage = await api(`${historyPath}?limit=1&cursor=${encodeURIComponent(first.next_cursor!)}`);
-    expect(await secondPage.json()).toMatchObject({ items: [{ revision: 1, body: { content: "第一版" } }], next_cursor: null });
+    expect(await secondPage.json()).toMatchObject({ items: [{ revision: 1, body: { content: "第一版" }, superseded_by_revision: 2 }], next_cursor: null });
 
     const memberAPI = createApiClient();
     await memberAPI("/api/auth/login", json("POST", { name: "member", password: "member" }));

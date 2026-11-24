@@ -38,6 +38,20 @@ func (s *Store) UpsertHostMember(ctx context.Context, value host.Member) (host.M
 		if err != nil {
 			return fmt.Errorf("lock Host before member permission update: %w", err)
 		}
+		var priorPermissions []string
+		grantErr := tx.QueryRow(ctx, `SELECT permissions FROM host_members
+WHERE host_id=$1 AND owner_id=$2 AND user_id=$3 FOR UPDATE`,
+			value.HostID, value.OwnerID, value.UserID).Scan(&priorPermissions)
+		if grantErr != nil && !errors.Is(grantErr, pgx.ErrNoRows) {
+			return fmt.Errorf("lock current Host member grant: %w", grantErr)
+		}
+		if grantErr == nil {
+			// Regranting after revocation must not make an old queued Task
+			// executable again under the new permission generation.
+			if _, err := stopTasksForHostMemberAuthorization(ctx, tx, value.HostID, value.UserID); err != nil {
+				return err
+			}
+		}
 		row, err := sqlcgen.New(tx).UpsertHostMember(ctx, sqlcgen.UpsertHostMemberParams{
 			HostID: value.HostID, OwnerID: value.OwnerID, UserID: value.UserID, Permissions: permissions,
 		})
@@ -105,6 +119,9 @@ func (s *Store) RevokeHostMember(ctx context.Context, hostID, ownerID, userID st
 			return domain.NewError(domain.CodeConflict, "Host control transition must finish before member revocation")
 		}
 		if err := requestMCPRuntimeCancellationsForHostMember(ctx, tx, hostOwnerID, userID, hostID); err != nil {
+			return err
+		}
+		if _, err := stopTasksForHostMemberAuthorization(ctx, tx, hostID, userID); err != nil {
 			return err
 		}
 		rows, err := sqlcgen.New(tx).RevokeHostMember(ctx, sqlcgen.RevokeHostMemberParams{HostID: hostID, OwnerID: ownerID, UserID: userID})

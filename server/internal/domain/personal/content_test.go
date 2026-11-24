@@ -9,6 +9,7 @@ func TestPersonalSyncObjectTypeAllowlist(t *testing.T) {
 	want := []string{
 		ObjectTypeProfile,
 		ObjectTypeMemory,
+		ObjectTypeRuleCandidate,
 		ObjectTypeSoul,
 		ObjectTypeDiary,
 		ObjectTypeGoal,
@@ -47,6 +48,7 @@ func TestValidateObjectIdentifier(t *testing.T) {
 		{ObjectTypeMemory, "global"},
 		{ObjectTypeMemory, "user"},
 		{ObjectTypeMemory, "m_0123abcd"},
+		{ObjectTypeRuleCandidate, "r_0123abcd"},
 		{ObjectTypeSoul, "soul_v1"},
 		{ObjectTypeDiary, "2026-11-02"},
 		{ObjectTypeGoal, "g_1234"},
@@ -222,6 +224,29 @@ func TestValidateObjectBodyRejectsFieldLimitAndEnumViolations(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			if err := ValidateObjectBody(test.objectType, test.objectID, []byte(test.body)); err == nil {
 				t.Fatal("invalid body accepted")
+			}
+		})
+	}
+}
+
+func TestValidatePersonalRuleCandidateRequiresPersonalScopeAndMemorySource(t *testing.T) {
+	valid := []byte(`{"scope":"personal","status":"candidate","source_memory_id":"global","source_memory_revision":1}`)
+	if err := ValidateObjectBody(ObjectTypeRuleCandidate, "r_abcdef01", valid); err != nil {
+		t.Fatalf("valid rule candidate rejected: %v", err)
+	}
+	for name, test := range map[string]struct {
+		id   string
+		body string
+	}{
+		"missing source":          {"r_abcdef01", `{"scope":"personal","status":"candidate","source_memory_id":"","source_memory_revision":1}`},
+		"wrong scope":             {"r_abcdef01", `{"scope":"project","status":"candidate","source_memory_id":"global","source_memory_revision":1}`},
+		"wrong status":            {"r_abcdef01", `{"scope":"personal","status":"approved","source_memory_id":"global","source_memory_revision":1}`},
+		"wrong id":                {"bad-id", `{"scope":"personal","status":"candidate","source_memory_id":"global","source_memory_revision":1}`},
+		"missing source revision": {"r_abcdef01", `{"scope":"personal","status":"candidate","source_memory_id":"global","source_memory_revision":0}`},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateObjectBody(ObjectTypeRuleCandidate, test.id, []byte(test.body)); err == nil {
+				t.Fatal("invalid rule candidate was accepted")
 			}
 		})
 	}

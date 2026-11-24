@@ -511,12 +511,24 @@ func (s *CredentialService) authorizeHostAction(ctx context.Context, hostOwnerID
 		}
 		return domain.NewError(domain.CodeNotFound, "host not found")
 	}
-	if value.OwnerID != hostOwnerID || value.State == host.StateDeleted || value.DeletedAt != nil {
+	if value.State == host.StateDeleted || value.DeletedAt != nil {
 		return domain.NewError(domain.CodeNotFound, "host not found")
+	}
+	sharedHostAccess := false
+	if value.OwnerID != hostOwnerID {
+		if hostOwnerID != actorID || (kind != identity.KindSession && kind != identity.KindClient) ||
+			!sharedHostTaskScope(required) || authorizeTaskHostControl(ctx, s.hosts, value, actorID) != nil {
+			return domain.NewError(domain.CodeNotFound, "host not found")
+		}
+		// A task initiator with an active desktop:control grant may use their
+		// own session/client credential for task operations on the shared Host.
+		// Do not extend this path to schedules or computer operations.
+		hostOwnerID = value.OwnerID
+		sharedHostAccess = true
 	}
 	switch kind {
 	case identity.KindSession:
-		if actorID != hostOwnerID {
+		if actorID != hostOwnerID && !sharedHostAccess {
 			return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
 		}
 		if isComputerScope(required) {
@@ -524,7 +536,7 @@ func (s *CredentialService) authorizeHostAction(ctx context.Context, hostOwnerID
 		}
 		return nil
 	case identity.KindClient:
-		if actorID != hostOwnerID || !domain.ValidTokenID(tokenID) || !clientTaskScope(required) {
+		if (actorID != hostOwnerID && !sharedHostAccess) || !domain.ValidTokenID(tokenID) || !clientTaskScope(required) {
 			return domain.NewError(domain.CodeUnauthenticated, "task authorization is unavailable")
 		}
 		token, err := s.tokens.GetTokenByID(ctx, tokenID)
@@ -564,6 +576,15 @@ func clientTaskScope(required identity.Scope) bool {
 	switch required {
 	case identity.ScopeTaskRead, identity.ScopeTaskSubmit, identity.ScopeTaskControl, identity.ScopeScheduleRead, identity.ScopeScheduleManage,
 		identity.ScopeComputerObserve, identity.ScopeComputerOperate:
+		return true
+	default:
+		return false
+	}
+}
+
+func sharedHostTaskScope(required identity.Scope) bool {
+	switch required {
+	case identity.ScopeTaskRead, identity.ScopeTaskSubmit, identity.ScopeTaskControl:
 		return true
 	default:
 		return false

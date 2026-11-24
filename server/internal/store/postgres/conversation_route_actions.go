@@ -616,6 +616,7 @@ ORDER BY CASE WHEN id=$9 AND $9<>'' THEN 0 WHEN id=$10 AND $10<>'' THEN 1 ELSE 2
 	for rows.Next() {
 		if len(value.Context.Candidates) == 64 {
 			value.Context.CandidateSetIncomplete = true
+			value.Context.TaskCandidateSetIncomplete = true
 			break
 		}
 		var item app.ConversationRouteCandidate
@@ -690,6 +691,7 @@ ORDER BY CASE WHEN r.client_message_id=$7 THEN 0 ELSE 1 END,
 	for requestRows.Next() {
 		if len(value.Context.RequestCandidates) == 100 {
 			value.Context.CandidateSetIncomplete = true
+			value.Context.RequestCandidateSetIncomplete = true
 			break
 		}
 		var candidate app.ConversationRouteRequestCandidate

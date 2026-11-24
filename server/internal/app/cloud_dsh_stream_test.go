@@ -38,6 +38,29 @@ func TestCloudDSHStreamPersonalProofRequiresConfirmedVersions(t *testing.T) {
 	}
 }
 
+func TestCloudDSHStreamPersonalProofBindsApprovedRuleToItsMemoryRevision(t *testing.T) {
+	proof := cloudDSHMemoryProof{Version: 2, Enabled: true, Revision: 1,
+		Items: []CloudDSHMemoryVersion{{ID: "global", Revision: 4}},
+		Objects: []CloudDSHMemoryVersion{{ObjectType: personal.ObjectTypeRuleCandidate, ID: "r_abcdef01", Revision: 2,
+			SourceMemoryID: "global", SourceMemoryRevision: 4}}}
+	body, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := DecodeCloudDSHStreamPersonalProof(base64.RawURLEncoding.EncodeToString(body), nil)
+	if err != nil || len(parsed.Objects) != 2 {
+		t.Fatalf("approved rule proof = %+v, %v", parsed, err)
+	}
+	proof.Objects[0].SourceMemoryRevision = 3
+	body, err = json.Marshal(proof)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := DecodeCloudDSHStreamPersonalProof(base64.RawURLEncoding.EncodeToString(body), nil); err == nil {
+		t.Fatal("rule proof with a mismatched source memory revision was accepted")
+	}
+}
+
 func TestCloudDSHStreamResultReusesOnlyMatchingRevisionAndPrefix(t *testing.T) {
 	current := int64(2)
 	snapshotRevision := int64(2)
