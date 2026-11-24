@@ -399,6 +399,27 @@ func TestTaskValidationReviewInputIncludesBoundSummariesAndVerifiedArtifactConte
 				t.Fatalf("oversized artifact was not kept as insufficient metadata evidence: input=%+v err=%v", bounded, err)
 			}
 		})
+		t.Run("text beyond model preview stays incomplete", func(t *testing.T) {
+			largeContent := strings.Repeat("x", app.MaxTaskValidationReviewArtifactPreviewBytes+1)
+			largeDigest := sha256.Sum256([]byte(largeContent))
+			largeSnapshot := snapshots
+			largeSnapshot.details.Artifacts = append([]task.Artifact(nil), snapshots.details.Artifacts...)
+			largeSnapshot.details.Artifacts[0].SizeBytes = int64(len(largeContent))
+			largeSnapshot.details.Artifacts[0].SHA256 = hex.EncodeToString(largeDigest[:])
+			largeSnapshot.artifactContents = map[string]app.TaskArtifactContent{artifactRef.ID: {
+				Filename: "result.txt", MediaType: "text/plain", SizeBytes: int64(len(largeContent)),
+				SHA256: hex.EncodeToString(largeDigest[:]), Body: reviewArtifactBody{Reader: bytes.NewReader([]byte(largeContent))},
+			}}
+			worker.options.Snapshots = largeSnapshot
+			large, err := worker.reviewInput(context.Background(), claim)
+			if err != nil || len(large.EvidenceDetails) != 2 || large.EvidenceDetails[1].State != "artifact_content_partial" ||
+				large.EvidenceDetails[1].Artifact == nil || large.EvidenceDetails[1].Artifact.ContentEvidence == nil ||
+				len(large.EvidenceDetails[1].Artifact.ContentEvidence.Preview) != app.MaxTaskValidationReviewArtifactPreviewBytes ||
+				!large.EvidenceDetails[1].Artifact.ContentEvidence.Truncated || large.EvidenceDetails[1].Artifact.ContentEvidence.Complete ||
+				len(large.ArtifactContentProofs) != 1 || large.ArtifactContentProofs[0].ContentComplete {
+				t.Fatalf("text beyond preview limit was not kept explicitly incomplete: input=%+v err=%v", large, err)
+			}
+		})
 		missingSnapshot := snapshots
 		missingSnapshot.details.Artifacts = nil
 		worker.options.Snapshots = missingSnapshot

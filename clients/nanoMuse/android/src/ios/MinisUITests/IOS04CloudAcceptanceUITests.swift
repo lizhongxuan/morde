@@ -1225,6 +1225,97 @@ final class IOS04CloudAcceptanceUITests: XCTestCase {
 
     }
 
+    func testLiveSharedPersonalMemoryHistoryAndStaleRuleFromPC() throws {
+        guard let server = ProcessInfo.processInfo.environment["MORDE_M08_TEST_SERVER"],
+              let username = ProcessInfo.processInfo.environment["MORDE_M08_TEST_USERNAME"],
+              let password = ProcessInfo.processInfo.environment["MORDE_M08_TEST_PASSWORD"],
+              let url = URL(string: server), url.scheme == "https", url.host != nil,
+              url.user == nil, url.password == nil else {
+            throw XCTSkip("Set MORDE_M08_TEST_SERVER, MORDE_M08_TEST_USERNAME, and MORDE_M08_TEST_PASSWORD for live M08 acceptance.")
+        }
+
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        app.launchArguments = ["-morde.server", server, "-AppleLanguages", "(zh-Hans)", "-AppleLocale", "zh_CN"]
+        app.launch()
+
+        let usernameField = app.textFields["morde.auth.username"]
+        XCTAssertTrue(usernameField.waitForExistence(timeout: 20), "A clean isolated simulator should show the Portal login form.")
+        usernameField.tap()
+        usernameField.typeText(username)
+        let passwordField = app.secureTextFields["morde.auth.password"]
+        passwordField.tap()
+        passwordField.typeText(password)
+        app.buttons["morde.auth.submit"].tap()
+
+        let loginFinished = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"),
+                                                      object: usernameField)
+        XCTAssertEqual(XCTWaiter.wait(for: [loginFinished], timeout: 35), .completed,
+                       "The native client should authenticate to the configured test service.")
+        let drawer = app.buttons["morde.shell.drawer"]
+        XCTAssertTrue(drawer.waitForExistence(timeout: 15))
+        drawer.tap()
+        let settings = app.buttons["morde.shell.settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 10))
+        settings.tap()
+        let accountSettings = app.buttons["morde.settings.account"]
+        XCTAssertTrue(accountSettings.waitForExistence(timeout: 10))
+        accountSettings.tap()
+        for _ in 0..<2 {
+            let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.82))
+            let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.32))
+            start.press(forDuration: 0.1, thenDragTo: end)
+        }
+        let personalMemory = app.buttons["morde.account.personalMemory"]
+        XCTAssertTrue(personalMemory.waitForExistence(timeout: 10))
+        if !personalMemory.isHittable { app.scrollViews.firstMatch.swipeUp() }
+        personalMemory.tap()
+        XCTAssertTrue(app.descendants(matching: .any)
+            .matching(identifier: "morde.personalMemory.management").firstMatch.waitForExistence(timeout: 20))
+
+        let marker = "M08_ACCEPTANCE_2026_11_24_PC"
+        let content = app.staticTexts.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS %@",
+            "morde.personalMemory.content.", marker
+        )).firstMatch
+        XCTAssertTrue(content.waitForExistence(timeout: 25),
+                      "The iOS client should read the synthetic memory previously saved from PC.")
+        XCTAssertTrue(content.label.contains("test-only memory value v3"))
+        let memoryID = String(content.identifier.dropFirst("morde.personalMemory.content.".count))
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.revision.\(memoryID)"].label.contains("修订 3"))
+
+        app.buttons["morde.personalMemory.history.\(memoryID)"].tap()
+        XCTAssertTrue(app.staticTexts["记忆修订历史"].waitForExistence(timeout: 10))
+        for revision in 1...3 {
+            XCTAssertTrue(app.staticTexts["morde.personalMemory.history.revision.\(revision)"].waitForExistence(timeout: 10),
+                          "The shared server should expose revision \(revision) on iOS.")
+        }
+        for historicalValue in [
+            "test-only memory value v1",
+            "test-only memory value v2",
+            "test-only memory value v3",
+        ] {
+            XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label CONTAINS %@", historicalValue)).firstMatch.exists,
+                          "The shared revision history should include \(historicalValue).")
+        }
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label == %@", "后续修订：2")).firstMatch.exists)
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label == %@", "后续修订：3")).firstMatch.exists)
+        app.buttons["morde.personalMemory.history.close"].tap()
+
+        let ruleSource = app.staticTexts.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS %@ AND label CONTAINS %@",
+            "morde.personalMemory.rule.source.", memoryID, "修订 2"
+        )).firstMatch
+        XCTAssertTrue(ruleSource.waitForExistence(timeout: 10),
+                      "The source-revision-bound rule candidate saved from PC should be visible on iOS.")
+        let ruleID = String(ruleSource.identifier.dropFirst("morde.personalMemory.rule.source.".count))
+        XCTAssertTrue(app.staticTexts["morde.personalMemory.rule.status.\(ruleID)"].label.contains("已启用"))
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(
+            format: "label CONTAINS %@", "此规则当前不可用"
+        )).firstMatch.exists, "The stale rule must remain excluded after its source memory changes.")
+        XCTAssertFalse(app.buttons["morde.personalMemory.rule.activate.\(ruleID)"].exists)
+        app.terminate()
+    }
+
     func testLocalPersonalMemoryRuleManagementRequiresTwoExplicitConfirmationsAndForgets() throws {
         let app = XCUIApplication()
         try openLocalPersonalMemoryManagement(app, port: 49741)

@@ -1185,7 +1185,10 @@ WHERE owner_id=$1 AND state='committed' AND octet_length(response_ciphertext)>0`
 		cancelTask()
 		if taskDonePending {
 			select {
-			case <-taskDone:
+			case taskErr := <-taskDone:
+				if taskErr != nil && !errors.Is(taskErr, context.Canceled) {
+					t.Errorf("long-history Task returned while stopping after test cleanup: %v", taskErr)
+				}
 			case <-time.After(15 * time.Second):
 				t.Error("long-history Task did not stop after the test ended")
 			}
@@ -1417,11 +1420,7 @@ func (c *conversationContextE2EModelClient) Complete(ctx context.Context, reques
 			}
 			if json.Unmarshal([]byte(candidate), &routeInput) == nil && routeInput.Message != "" {
 				currentMessage = routeInput.Message
-				break
 			}
-		}
-		if currentMessage != "" {
-			break
 		}
 	}
 	text := request.Instructions

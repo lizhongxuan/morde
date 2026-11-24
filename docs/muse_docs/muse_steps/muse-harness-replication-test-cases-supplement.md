@@ -1,7 +1,7 @@
 # Muse Harness 复刻测试用例 · 补充卷
 
 > 版本：补充卷 v1.0 · 2026-11-24
-> 依据：`muse-harness-reverse-engineering.md`（已证实数字）+ 用户 muse_steps TODO 00–11（2026-11-23）+ `morde-muse-replication-supplement-gaps.md`（缺口与纠正）
+> 依据：`muse-harness-reverse-engineering.md` 与历史分步 TODO。本文保留 75 条原始补充用例；实际状态和冲突修正以《Morde 复刻 Muse 一体化实施与验收 TODO》和最新分步记录为准，历史数值不作为强制门槛。
 > 与主卷的关系：主卷 `muse-harness-replication-test-cases.md` 已有 139 条（2026-11-24 删 17 条不符合方向的，原 156 条），覆盖各步基础行为。本卷不重复主卷，只补三类：(a) 用 Muse 实测数字做的**量化验收线**（分布型断言，不是单次通过）；(b) TODO 里标明“本地完成、端到端待验”的**真实客户端验收**；(c) 缺口文档里点出的**纠正项与未开始步骤**（07 / 08 / 11、Planner brief 规则、合并窗口行为、验证者独立性、线上摘要）。
 > 编号：SUP-<步骤>.<序号>；SUP-0 为跨步骤量化总线；SUP-12 为端到端。每个用例带证据等级：已证实 / 合理推断 / 未知 / Morde 自研 / hermes 补齐。
 

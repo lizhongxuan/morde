@@ -1436,6 +1436,14 @@ func (model *f07BackgroundOutputModel) Complete(ctx context.Context, call app.Mo
 				Arguments: `{"title":"Restartable result","objective":"Return a concise result for the parent.","tool_names":[],"run_in_background":true}`}},
 				StopReason: "tool_calls", Usage: usage}, nil
 		}
+		if callNumber == 2 {
+			select {
+			case <-ctx.Done():
+				return app.ModelResponse{}, ctx.Err()
+			case <-model.interrupted:
+				return app.ModelResponse{}, errors.New("synthetic parent request interrupted for restart")
+			}
+		}
 	case 2:
 		if callNumber == 1 {
 			return app.ModelResponse{Text: "I will review the delegated result before finishing.", StopReason: "stop", Usage: usage}, nil

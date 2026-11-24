@@ -1,7 +1,7 @@
 # Muse 每一步最像哪个开源项目：Morde 复刻对照表
 
 > 版本：v1.0 · 2026-11-23
-> 主依据：`muse-harness-reverse-engineering.md`（逆向工程，证据分级）+ `morde-muse-replication-design.md`（复刻设计方案 §4 十个模块）+ `muse-harness-replication-test-cases.md`（156 条验收用例）
+> 依据：`muse-harness-reverse-engineering.md` 和 `muse-harness-replication-test-cases.md`。本文保留历史开源映射；当前目标与具体源码落点以《Morde 复刻 Muse 最终流程与开发设计》和各步骤 TODO 为准。
 > 阅读规则：每条“Muse 是这样”都带证据等级。**已证实**才当结论用；**合理推断 / 未知**的步骤，其项目映射也标“待验证”，不是定论。项目机制凡是本次查不到出处的，标“未核实”，不编造。Grok Bot 只作**方法论参照**（土豆姐团队的做法），不是开源代码，不要写成“抄 Grok Bot 的代码”。
 > 核实方式：Hermes-agent 与 nanoMuse 是此前已精读 / 自有代码（hermes 固定提交 `0d49d6d9`，见逆向工程 §21–§22）；其余项目本次用公开搜索核实了关键机制（OpenHands 事件流、LangGraph 监督者模式、Claude Agent SDK 钩子与权限、微软 Agent Framework 五种编排、Agno 团队模式、Codex 双轴审批、OpenClaw 三层记忆、LibreChat 延迟工具）。
 
@@ -195,4 +195,4 @@
 - **Muse 结论的证据等级**：本表每条“Muse 是这样”都带证据等级，等级与逆向工程文档一致。凡是合理推断 / 未知的 Muse 结论（U1 分类算法、U2 归并规则、U5 派发判断条件、U6 工具重试 / 超时 / 熔断、U7 上下文窗口与触发条件、U8 卡面字段细节、U9 错误类型与触发条件、U10 验证者选型、U13 记忆写入触发与去重、U18 失败时主对话措辞、U19 展示效果与提问触发阈值），其项目映射也标**待验证**，不是定论。
 - **项目机制的核实状态**：Hermes-agent（固定提交 `0d49d6d9`）与 nanoMuse（自有代码）是此前已精读 / 自有代码；其余项目本次用公开搜索核实了关键机制（见候选项目速览）。凡是本次查不到出处的项目机制，本文未写——没有一条是凭印象编的版本号或机制细节。
 - **Grok Bot 的定位**：方法论参照（土豆姐团队的做法），不是开源代码。本文在 §6、§8、P1-1、P2-2 引用它时都明确写“方法论参照”，不写成“抄 Grok Bot 的代码”。
-- **与复刻设计的分工**：本文只回答“每一步最像哪个开源项目、抄哪一块、不抄哪一块”；模块的详细设计（改哪些文件、验收标准）见 `morde-muse-replication-design.md` §4；验收用例见 `muse-harness-replication-test-cases.md`（TC-1.1–TC-12.21，共 156 条）；Muse 机制的证据分级见 `muse-harness-reverse-engineering.md`。
+- **文档分工**：本文保留开源方案的参考与限制；当前模块设计见《Morde 复刻 Muse 最终流程与开发设计》，实施和验收见《Morde 复刻 Muse 一体化实施与验收 TODO》；Muse 证据等级见 `muse-harness-reverse-engineering.md`。

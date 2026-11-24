@@ -1250,6 +1250,15 @@ Tokenizer 与 token 统计来源：
 - **结论与边界：**只确认原 Task 写入工作项完成、验证状态仍 pending、Workbench 没有已核验产物；不证明写入内容正确或通过。未重放写入或删除结果未知的合成文件。Step06 PC 端到端验收及 M06-01–04 保持未完成；当前没有证据确认本地验证代码有缺陷，Task 等待确认使完整实测尚未闭合。
 - **新增独立正向尝试（21:26 CST）：**在实际 PC 的新隔离旁聊请求创建合成文件 `morde-step06-validation-positive-20261123-b4d2f9.txt`（预期单行 `MORDE_VALIDATION_VALUE=43`）并从本 Task Workspace 读回逐字比较，服务端新建 Task `q9hzwtqd`。客户端显示“任务已中断，Agent 尚未返回最终答复，执行结果未确认；最后完成：处理文件”；只读 Portal 日志在 21:26:45 记录 `task execution stopped`。未取得文件是否写入、实际内容、读回值、比较结果或 Task 验证状态的可靠证据。为避免重复未知副作用，没有重试或清理该合成文件。此尝试不关闭 M06-01–04，也不足以确认代码缺陷。
 
+### M06 云端 Task 复测与本地覆盖补充（2026-11-24）
+
+- **云端版本：**只读核对 `/opt/morde-src` HEAD 为 `80ada17`、工作区干净；本地 HEAD 为 `80ada170`。未修改远端文件、数据库、账号或部署配置。
+- **实际 PC Task：**隔离旁聊 Task `q803q5qw` 的 `file_write` 工作项成功；Task 详情显示 `Task.validation` 为“待验证”。Workbench 只读观察确认 Task `waiting_user`、事件序号 31、没有已核验产物；Portal 日志在 09:31:24 记录 `task_budget_exhausted`。新建的独立 Task `qo9tacuc` 也完成 `file_write`，但 verification 工作项为 `unknown`；只读数据库状态为 `waiting_user`，未生成 Task validation review 记录，Portal 日志在 09:37:23 同样记录 `task_budget_exhausted`。两者均没有读回正文、比较结果、最终 Task 结果或验证报告。不能将写入成功认定为验证通过。
+- **环境干扰：**Task 执行期间 PC 前台切到另一个记忆验收页面并出现规则启用确认；取消了该提示，没有启用规则或修改设置。为避免影响同时进行的验收，没有继续在该 PC 窗口操作。
+- **本地回归：**使用仅绑定 `127.0.0.1` 的一次性 PostgreSQL 16 容器，`CH_TEST_DATABASE_URL=<loopback DSN> go test ./internal/store/postgres -run '^TestPostgresTaskValidation' -count=1` 通过（45.575 秒）。`go test ./internal/app -run 'TaskValidation' -count=1`、`go test ./internal/worker -run 'TaskValidation' -count=1` 通过；Portal 的 validation 状态定向用例 7/7 通过。新增 Worker 用例以 4097 字节文本验证：服务端完整读回和摘要正确时，模型输入仍被截断到 4096 字节，`ContentComplete=false`，状态为 `artifact_content_partial`，不得以此作为内容 PASS。
+- **结论：**本轮自动化验证通过并补齐了超预览边界回归，但远端两次 Task 均在验证完成前耗尽预算。M06-01–04 继续未完成；优先修复/配置可完成 Task 的执行预算与恢复后，再进行同 Task 读回、错误内容、真实 DSH 复核、撤权和并发栅栏验收。没有做服务器提额或数据库修改，没有读取、覆盖或清理结果未知的测试文件。
+- **预算原因核对：**两条 Task 的模型额度均为 50,000；各自唯一一次 settled 模型调用预留约 40,298 / 40,273 token，实际用量约 10.4k。`server/internal/app/model_gateway.go:modelRequestInputTokenReservation` 将输入 UTF‑8 字节数逐字节计入 token 预留，`server/internal/store/postgres/model_usage.go` 先按预留做额度门禁、settle 后才回补实际用量。因此后续轮次仍可能因保守预留超出剩余额度而被拦截；这是由源码与账本推断，未取得失败请求本身的预留值。当前没有模型通用的精确预分词接口，不应降低预留系数或绕过 50,000 上限。修复需使用可验证的 provider/model token estimator，或安全减少重复提示/schema，并在部署后用至少两轮真实模型调用验证。
+
 ### S05-2 动作审批策略与独立账本覆盖（2026-11-23）
 
 - **策略补齐：**按副作用类型明确逐次审批、固定只读 Task scope、Task+目标 scope 三类门禁，并在步骤 05 TODO 中逐类映射持久账本。Hub `command` 需同时具备当前 Task `computer.operate` scope 与目标设备 grant；target grant 不是逐次用户批准。每个 Hub 调用仍有独立 `task_hub_operations` 记录，由 operation key 稳定映射 CallID，绑定 Task/目标/授权版本、请求摘要、lease 和结果；prepare/dispatch 事务复核 Task 授权和目标有效性，目标端再复核 grant。Host `runtimeToolRisk` 的 moderate 类依赖当前 Task scope/Host fence；browser Enter/Backspace/Delete 以及 sensitive/未知 action 走逐次精确批准；外部 MCP 与 Workspace/media 写入绑定 approval。个人写入仅在 owner 的个人 Task 中按用户意图和目标修订执行，并在 Task 事件事务中记录 CallID/Mutation。Hub `file.put` 不暴露为 DSH 工具；未注册 action 拒绝。
@@ -1367,6 +1376,15 @@ Tokenizer 与 token 统计来源：
 
   临时 simulator 与 xcresult 已清理。
 - **边界：**没有连接远端服务、真实模型或外部 API；每次使用新的临时模拟器和本地 fixture，测试完成后清理。
+
+### M08-3 指定测试站点实际 PC 与 iOS 定向复验（2026-11-24）
+
+- **实际 PC 记忆历史：**使用用户已启动的 `make pc` 源码客户端连接用户指定的测试站点，只创建合成记忆（分类 `M08临时验收`，标记 `M08_ACCEPTANCE_2026_11_24_PC`），依次保存 3 个修订。PC 显示 3 个历史版本及第 1→2→3 版的直接替代关系和对应来源；历史查询与可见展示通过。
+- **实际 PC 规则候选：**从第 2 版提议候选后，状态为待审核且未自动启用；在 PC 显式确认后状态变为已启用。将记忆更新为第 3 版后，该候选显示来源记忆已变化/不可用，并注明不会进入对话上下文，启用操作不再可用。期间没有向已有任务会话发送消息或调用真实模型，因此没有验证 DSH 对规则内容的实际行为。
+- **iOS 本地 UI：**在新建隔离模拟器 iPhone 18 Pro / iOS 27.2 运行两个本地 fixture 用例，结果 2 passed、0 failed：`testLocalPersonalMemoryRuleManagementRequiresTwoExplicitConfirmationsAndForgets` 与 `testLocalPersonalMemoryHistoryAuthorizationAndStaleActivationFailClosed`。命令使用 `xcodebuild test -quiet -disableAutomaticPackageResolution -project clients/nanoMuse/android/src/ios/Minis.xcodeproj -scheme morde -destination 'platform=iOS Simulator,id=C29692A5-D24C-47DF-A6EA-4D103FCD3D6E' -derivedDataPath /tmp/morde-m08-ios-derived-20261124 -resultBundlePath /tmp/morde-m08-ios-ui-20261124.xcresult -parallel-testing-enabled NO` 并指定上述两个 `-only-testing`。这是 loopback fixture，不是 iOS 连接测试站点或 PC/iOS 共享存储的证据。
+- **后端与 Portal 定向回归：**`go test ./internal/domain/personal ./internal/app -run 'Test.*(Personal|Memory|History|RuleCandidate)' -count=1`、`go test ./internal/api -run 'TestPersonalMemoryHistoryRoute' -count=1` 通过；Portal `pnpm run typecheck` 通过；`PersonalData.test.tsx` 的历史展示、保存并发、暂时失败及不可用正文测试 4/4 通过。
+- **遗忘与数据状态：**本地 iOS fixture 的遗忘流程通过；本轮没有在测试站点永久删除该合成记忆的 3 个历史正文或其失效规则候选，等待用户对指定测试数据的操作时确认。未直接修改账号或数据库、连接 SSH、上传文件或调用外部模型；记忆与规则候选是经用户授权的 PC 客户端合成验收数据。
+- **状态：**M08-01–04 不勾完成。M08-02 历史版本和 M08-03 候选生命周期已有实际 PC 证据；M08-01 PC/iOS 同账号共享服务端数据及真实撤权体验仍未覆盖，M08-04 的实际 PC 遗忘未执行。完整验收边界见 [M08 TODO](../muse_docs/muse_steps/实施任务TODO/08-记忆与纠正沉淀.md)。
 
 ### S07-11 PostgreSQL 跨账本冲突回执（2026-11-24）
 
@@ -1504,3 +1522,32 @@ Tokenizer 与 token 统计来源：
 - **全量命令：**`make test race cover` 通过，coverage 总计 45.1%（当次未设置 `CH_TEST_DATABASE_URL`，DB 子进程集成用例跳过）；`make generate`、本次修改 Go 文件的 `gofmt -d` 及 `git diff --check` 通过。`make lint` 退出失败，当前全仓报告 32 项 lint 问题；本轮涉及路径没有剩余 lint 报告。
 - **集成结果：**`CH_TEST_DATABASE_URL=<本机一次性 PostgreSQL> make it` 退出失败，Worker 包有两项未通过：`TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 报 `dsh tool result checkpoint has an unsupported error`，`TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart` 的首条路由状态为 `waiting_user`。两项分别定向复跑仍失败，未修改其所在测试/实现路径。首次整包运行中的 S09-38 信号竞态已修复并由 5 次定向重复验证覆盖；修复后未再次运行整套 `make it`。OpenSandbox 集成因缺少专用本地服务环境而按 Makefile 跳过。
 - **边界：**仅使用本地隔离 PostgreSQL、合成 MCP provider 和本地测试代码；未使用外部 API key，未访问测试 Portal、远端主机或外部 Provider。M09 总项及未达到完整验收的子项保持进行中。
+
+### S09-41 M09 恢复用例复核与集成验证边界（2026-11-24）
+
+- **背景任务恢复：**`TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim` 通过。测试夹具让父 Agent 在后台子任务启动后停留于下一次模型调用，随后终止真实 Node 子进程并由新 TaskWorker 从持久 checkpoint 恢复；子任务成功结果仅被父任务按 checkpoint 游标读取一次。checkpoint 对未知工具结果的严格校验保持原样。
+- **长历史摘要恢复：**`TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart` 通过。单条 compaction 源消息不超过 2 KiB 路由预览上限，合成路由模型读取请求中最后一条当前消息，避免旧历史 envelope 被当成本轮输入；用例核对 10 次 summary 和 39 次 route 调用。
+- **重复与数据库回归：**`TestCloudTaskMCPUnknownOperationSurvivesNodeAndTaskWorkerRestart` 在本地 PostgreSQL 连续 5/5 通过。工具失败证据、Host grant 撤销/regrant、recovery 授权栅栏、两类具名 Workspace 等待 checkpoint、5 分钟 Retry-After 等待与 48 小时超限不重派等 7 个 PostgreSQL 定向用例通过。`make it` 中 Worker 包完整通过（388.837 秒）。
+- **全量集成未完成：**`CH_TEST_DATABASE_URL=<本机一次性 PostgreSQL> make it` 的 Store/PostgreSQL 包运行约 16 分钟时被中断以取得栈信息；当时位于 `TestPostgresTaskAgentActivityIsOrderedAndFenced` 的 Goose 临时数据库迁移。命令因此退出失败，不能记为全量通过，也没有证据表明该处是 M09 断言失败。OpenSandbox 按 Makefile 规则跳过，因为未配置其专用服务。
+- **质量门禁：**修复本轮测试代码的忽略返回值问题后，`make lint` 仍报告 32 项全仓问题；本轮修改的两个 Worker 集成测试文件无 lint 报告。`gofmt -d`、`git diff --check` 通过。
+- **状态及环境：**M09-01 至 M09-06 尚有双端故障链路、通用 durable blocker、外部真实连接器和生产 Portal 重启装配等验收未完成，保持进行中。全程仅使用本地容器、合成 Provider 和本地测试进程，未访问外部 Portal、主机或 Provider。
+
+### S07-21 远端部署 PC 短文本交付冒烟（2026-11-24）
+
+- **环境与操作：**使用用户已经启动的实际 `morde-pc`，将服务地址设为用户提供的已重新部署 Portal，并通过提供的测试账号登录。PC 会话列表包含多条既有验收旁聊；选中一条已有步骤 06 Task 的旁聊后，发送“请只回复：PC远端连接验收成功。”。
+- **结果：**PC 在同一旁聊中显示用户消息及精确回复“PC远端连接验收成功。”；没有登录错误，短文本交付可见。该证据仅覆盖当前 Portal 的 PC 登录与一轮短文本交互。
+- **既有状态与边界：**所选旁聊在本轮操作前已有步骤 06 Task，任务详情为“等待你处理”、`Task.validation` 为“待验证”；任务工作项显示此前的 `file_write` 已完成，恢复状态核对待确认。本轮未对该 Task 执行续跑、停止或修改，也未读取/修改其云端文件。未上传文件、未操作数据库或账号。此冒烟不覆盖独立会话隔离、真实 Task/DSH 完成、验证 PASS、同 Task steer 与完成提交竞争、客户端重开恢复或 iOS/跨端；M06-03 与 M07-01–04 继续保持未完成。
+- **本地回归复跑：**`go test ./internal/app -run '^TestConversationRoute' -count=1`、`go test ./internal/worker -run '^(TestFitConversationRouteContext|TestTrimConversationRouteCandidates|TestConversationRouteActiveTaskControlEvidenceFitsMinimumWindow)$' -count=1`、`go test ./internal/app -run 'TaskValidation' -count=1`、`go test ./internal/worker -run 'TaskValidation' -count=1` 均通过；`git diff --check` 通过。它们是本地定向回归，不代表远端验证通过。
+
+### M06 云端 PC 单文件写入与同 Task 读回尝试（2026-11-24）
+
+- **授权与范围：**用户明确授权只为步骤 06 创建一个合成测试文件，不上传本地文件。通过实际 `morde-pc` 的新隔离旁聊提交单文件验证 Task；未访问其他 Task、终端、网络或服务器文件。
+- **观察到的结果：**Task 工作项详情显示 `file_write` 已完成、Host 工具结果已保存、执行位置为云端电脑，参数是相对路径 `morde-step06-positive-20261124-c3p8h6.txt`。原始写入正文未在 UI 展示。Task 状态为“等待你处理”，`Task.validation` 为“待验证”。
+- **读回尝试：**两次在同一旁聊明确指定这条 Task 和同一路径要求只执行 `file_read`，PC 均回复“分类暂时不可用，请说明要操作哪个任务”。没有读回调用、字节比较、Task validation review 或 PASS 证据。没有创建第二个文件、重写/删除该文件，也未改动服务器或数据库。
+- **结论：**只确认写入工具调用完成，不确认文件内容；该单文件仍留在 Task Workspace。此结果不是 M06 正向验收，M06-01–04 继续未完成。后续需先解决现有 Task 的续接/路由，再由同一 Task 只读回当前路径，不得另建文件或跨 Task 读取。
+- **代码路径复核：**本地 `ConversationRouteWorker` 在分类输出无效时，对显式 Task 控制意图采用澄清兜底；自动 steer 仅允许 running 且权限/执行范围匹配的目标。此设计可避免未知副作用被自动重放，但没有提供当前 `waiting_user` Task 的只读续接。最新远端错误日志未检查，不能据此断言本次触发原因；没有改动路由实现。
+
+### S09-42 M09-04.1 拒绝/过期审批证据边界（2026-11-24）
+
+- **验证：**`go test ./internal/app -run '^(TestCloudDSHMCPRejectedExternalCallNeverDispatches|TestCloudDSHMCPExpiredExternalCallNeverDispatches)$' -count=1` 通过；应用层 Broker 在审批拒绝或过期后没有派发 MCP 调用，也没有新增操作账本记录。
+- **边界：**不覆盖完整 TaskWorker/checkpoint 恢复。拒绝后 DSH 可能调用模型生成最终说明，后续 E2E 应断言原副作用没有重派，不要求模型请求为零。M09-04.1 保持进行中；只使用本地合成测试。
