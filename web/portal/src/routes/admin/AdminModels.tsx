@@ -34,7 +34,7 @@ export function AdminModels() {
   const client = useQueryClient();
   const { notify } = useToast();
   const query = useQuery({ queryKey: ['admin', 'model-connections'], queryFn: portalApi.adminModelConnections });
-  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，平台模型列表暂时无法读取。');
+  useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，平台模型列表暂时无法读取。');
   const [formOpen, setFormOpen] = useState(false);
   const [formID, setFormID] = useState<string | null>(null);
   const [form, setForm] = useState<ModelConnectionForm>(emptyForm);
@@ -156,8 +156,9 @@ export function AdminModels() {
     <div className="design-panel-header"><div><h2 id="admin-model-list-title">共享模型连接</h2><p>管理平台模型连接和检查状态。</p></div>
       <button type="button" className="button button-primary" disabled={create.isPending || update.isPending} onClick={openCreate}>＋ 添加平台模型</button></div>
 
-    {query.isPending || (networkError && !query.data) ? <div className="loading-card" role="status">正在加载平台模型连接…</div>
-      : query.isError && !networkError ? <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>
+    {query.isError && query.data && <FloatingError inline className="error-card" role="alert">平台模型列表刷新失败，当前显示最近一次确认的数据。{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+    {query.isPending && !query.data ? <div className="loading-card" role="status">正在加载平台模型连接…</div>
+      : query.isError && !query.data ? <FloatingError inline className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>
         : !models.length ? <div className="empty-card compact"><h2>尚未配置平台模型</h2><p>可选择 GPT 或 DeepSeek 预设，也可以手动填写其他兼容服务。</p><button type="button" className="button button-secondary" onClick={openCreate}>添加平台模型</button></div>
           : <div className="table-wrap"><table><thead><tr><th>连接</th><th>服务地址</th><th>上下文窗口</th><th>密钥</th><th>能力 / 检查状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
             {models.map((model) => <tr key={model.id}>

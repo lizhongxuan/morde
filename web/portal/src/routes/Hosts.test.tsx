@@ -91,7 +91,7 @@ describe('Hosts', () => {
     expect(await screen.findByText('尚未创建 API Key。')).toBeInTheDocument();
   });
 
-  it('keeps the confirmed host list visible and reports a transient refresh failure in a popup', async () => {
+  it('keeps the confirmed host list visible and offers an in-place retry after a transient refresh failure', async () => {
     const read = vi.spyOn(portalApi, 'hosts')
       .mockResolvedValueOnce({ items: [ownedHost] })
       .mockRejectedValueOnce(new TypeError('Failed to fetch'))
@@ -103,19 +103,19 @@ describe('Hosts', () => {
     expect(await screen.findByRole('button', { name: `查看云端电脑 ${ownedHost.name}` })).toBeInTheDocument();
     await act(async () => { await client.invalidateQueries({ queryKey: ['hosts'] }); });
 
-    const notice = await screen.findByRole('alert');
-    expect(notice).toHaveTextContent('云端电脑信息读取失败');
-    expect(notice.closest('.notice-center')).toHaveClass('notice-center-overlay');
+    const notice = await screen.findByText(/主机列表刷新失败，当前仍显示最近一次确认的数据/);
+    expect(document.querySelector('.error-notice-overlay .toast-notice')).toHaveTextContent('云端电脑信息读取失败');
+    expect(notice.closest('.hosts-panel')).toBeInTheDocument();
     expect(screen.getByRole('button', { name: `查看云端电脑 ${ownedHost.name}` })).toBeInTheDocument();
-    expect(document.querySelector('.hosts-panel .error-card')).not.toBeInTheDocument();
+    expect(document.querySelector('.hosts-panel .error-card')).toBeInTheDocument();
 
-    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    await user.click(within(notice.closest('[role="alert"]')!).getByRole('button', { name: '重试' }));
     await waitFor(() => expect(read).toHaveBeenCalledTimes(3));
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
     expect(screen.getByRole('button', { name: `查看云端电脑 ${ownedHost.name}` })).toBeInTheDocument();
   });
 
-  it('keeps the host control status and offers read retry in a popup after a transient failure', async () => {
+  it('keeps the host control status and offers read retry inline after a transient failure', async () => {
     const read = vi.spyOn(portalApi, 'hosts').mockResolvedValue({ items: [ownedHost] });
     vi.spyOn(portalApi, 'hostControl')
       .mockResolvedValueOnce(aiControl(1))
@@ -130,15 +130,14 @@ describe('Hosts', () => {
     expect(await screen.findByText(/电脑控制：云端 AI 控制/)).toBeInTheDocument();
     await act(async () => { await client.invalidateQueries({ queryKey: ['host-control', ownedHost.id] }); });
 
-    const notice = await screen.findByRole('alert');
-    expect(notice).toHaveTextContent('电脑控制状态读取失败');
+    const notice = await screen.findByText(/控制权状态刷新失败/);
+    expect(document.querySelector('.error-notice-overlay .toast-notice')).toHaveTextContent('电脑控制状态读取失败');
     const panel = document.querySelector('.host-control');
     expect(panel).toBeInTheDocument();
-    expect(panel).not.toHaveClass('error-inline');
-    expect(panel?.querySelector('.error-inline')).not.toBeInTheDocument();
-    expect(within(notice).getByRole('button', { name: '重试' })).toBeInTheDocument();
+    expect(panel?.querySelector('.error-inline')).toBeInTheDocument();
+    expect(within(notice.closest('[role="alert"]')!).getByRole('button', { name: '重试读取' })).toBeInTheDocument();
 
-    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    await user.click(within(notice.closest('[role="alert"]')!).getByRole('button', { name: '重试读取' }));
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
     expect(screen.getByText(/电脑控制：云端 AI 控制/)).toBeInTheDocument();
   });

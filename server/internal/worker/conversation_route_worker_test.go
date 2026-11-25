@@ -206,6 +206,32 @@ func TestConversationRouteInvalidOutputLogContainsMetadataOnly(t *testing.T) {
 	}
 }
 
+func TestConversationRouteWorkerPreservesOnlyStructuredFileIntentForTaskActions(t *testing.T) {
+	newDecision := safeConversationRouteDecision(app.ConversationRouteContext{ActorID: "u1234567", Content: "请生成 PDF 文件"},
+		app.ConversationRouteDecision{Action: app.ConversationRouteNew, FileDeliveryIntent: task.FileDeliveryRequired})
+	if newDecision.Action != app.ConversationRouteNew || newDecision.FileDeliveryIntent != task.FileDeliveryRequired {
+		t.Fatalf("new task file intent was changed: %+v", newDecision)
+	}
+
+	value := app.ConversationRouteContext{ActorID: "u1234567", Content: "更新报告",
+		Candidates: []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 3}}}
+	update := safeConversationRouteDecision(value, app.ConversationRouteDecision{Action: app.ConversationRouteUpdate,
+		TaskID: "q1234567", ExpectedRevision: 3, FileDeliveryIntent: task.FileDeliveryNone})
+	if update.Action != app.ConversationRouteUpdate || update.FileDeliveryIntent != task.FileDeliveryNone || update.ExpectedRevision != 3 {
+		t.Fatalf("authorized revision file intent was changed: %+v", update)
+	}
+
+	for _, invalid := range []app.ConversationRouteDecision{
+		{Action: app.ConversationRouteNew, FileDeliveryIntent: task.FileDeliveryIntent("maybe")},
+		{Action: app.ConversationRouteReply, Reply: "Done.", FileDeliveryIntent: task.FileDeliveryRequired},
+	} {
+		decision := safeConversationRouteDecision(value, invalid)
+		if decision.Action != app.ConversationRouteClarify || decision.FileDeliveryIntent != "" {
+			t.Errorf("unsafe file intent reached route application: got=%+v source=%+v", decision, invalid)
+		}
+	}
+}
+
 func TestConversationRouteBudgetFailureLogIncludesStageAndCapacity(t *testing.T) {
 	stub := &routeWorkerStub{}
 	core, logs := observer.New(zap.WarnLevel)
@@ -452,9 +478,9 @@ func TestConversationRouteWorkerRejectsUnsafeDirectReply(t *testing.T) {
 		decision app.ConversationRouteDecision
 		question string
 	}{
-		{name: "task target", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply, TaskID: "q1234567", Reply: "answer"}, question: "请说明要修改哪个任务，或是否开始一个新任务。"},
-		{name: "empty text", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply}, question: "请说明要修改哪个任务，或是否开始一个新任务。"},
-		{name: "model output too long", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "answer", ModelOutput: strings.Repeat("x", app.MaxConversationRouteModelOutputBytes+1)}, question: "请说明要修改哪个任务，或是否开始一个新任务。"},
+		{name: "task target", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply, TaskID: "q1234567", Reply: "answer"}, question: "我还不能安全确认这项操作的目标或范围，因此尚未执行。请补充具体目标，或说明要处理哪项任务。"},
+		{name: "empty text", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply}, question: "我还不能安全确认这项操作的目标或范围，因此尚未执行。请补充具体目标，或说明要处理哪项任务。"},
+		{name: "model output too long", decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply, Reply: "answer", ModelOutput: strings.Repeat("x", app.MaxConversationRouteModelOutputBytes+1)}, question: "我还不能安全确认这项操作的目标或范围，因此尚未执行。请补充具体目标，或说明要处理哪项任务。"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			decision := safeConversationRouteDecision(test.context, test.decision)
@@ -670,15 +696,15 @@ func routeWorkerFallbackSteerContext(stub *routeWorkerStub) {
 	}
 }
 
-func TestConversationRouteWorkerFallsBackToPreviousTaskOnClassifyFailure(t *testing.T) {
+func TestConversationRouteWorkerClarifiesContinuationOnClassifyFailure(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	routeWorkerFallbackSteerContext(stub)
 	stub.snapshot.Context.Content = "补充一点：把标题改成红色"
 	stub.classifyErr = errors.New("provider unavailable")
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
-		stub.applied[0].Action != app.ConversationRouteSteer || stub.applied[0].TaskID != "q1234567" ||
-		stub.applied[0].ExpectedRevision != 1 {
-		t.Fatalf("classify failure did not follow the previous task: failures=%v applied=%+v err=%v",
+		stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].TaskID != "" ||
+		!strings.Contains(stub.applied[0].Question, "尚未执行") {
+		t.Fatalf("classify failure executed an unclassified continuation: failures=%v applied=%+v err=%v",
 			stub.failures, stub.applied, err)
 	}
 }
@@ -704,72 +730,145 @@ func TestConversationRouteWorkerClarifiesHighRiskChangeOnClassifyFailure(t *test
 	}
 }
 
-func TestSafeConversationRouteDecisionRejectsHighRiskSteer(t *testing.T) {
-	for _, content := range []string{"换成另一台电脑", "把工作目录换成 /workspace/new", "把收件人改成 Alice"} {
-		t.Run(content, func(t *testing.T) {
-			context := app.ConversationRouteContext{ActorID: "u1234567", Content: content}
-			stub := &routeWorkerStub{snapshot: app.ConversationRouteSnapshot{Context: context}}
+func TestSafeConversationRouteDecisionPreservesModelSteerAndRequiresSafeTarget(t *testing.T) {
+	for _, content := range []string{"换成另一台电脑", "把工作目录换成 /workspace/new", "把收件人改成 Alice", "调整授权范围"} {
+		t.Run("model classifies "+content, func(t *testing.T) {
+			_, stub := newRouteWorkerTest(t)
 			routeWorkerFallbackSteerContext(stub)
-			context = stub.snapshot.Context
+			context := stub.snapshot.Context
 			context.Content = content
 			decision := safeConversationRouteDecision(context, app.ConversationRouteDecision{
 				Action: app.ConversationRouteSteer, TaskID: "q1234567", ExpectedRevision: 1,
 			})
+			if decision.Action != app.ConversationRouteSteer || decision.TaskID != "q1234567" {
+				t.Fatalf("message keywords rewrote the structured model action: %+v", decision)
+			}
+		})
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*app.ConversationRouteContext)
+	}{
+		{name: "wrong owner", mutate: func(value *app.ConversationRouteContext) { value.Candidates[0].InitiatorID = "u7654321" }},
+		{name: "inactive task", mutate: func(value *app.ConversationRouteContext) { value.Candidates[0].Status = task.StatusWaitingUser }},
+		{name: "authorization mismatch", mutate: func(value *app.ConversationRouteContext) { value.RequestCandidates[0].SameAuthorization = false }},
+		{name: "control scope mismatch", mutate: func(value *app.ConversationRouteContext) { value.RequestCandidates[0].SameControlScope = false }},
+		{name: "stale revision", mutate: func(value *app.ConversationRouteContext) { value.Candidates[0].Revision++ }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			stub := &routeWorkerStub{}
+			routeWorkerFallbackSteerContext(stub)
+			context := stub.snapshot.Context
+			context.Content = "继续这个任务，并调整授权范围。"
+			test.mutate(&context)
+			decision := safeConversationRouteDecision(context, app.ConversationRouteDecision{
+				Action: app.ConversationRouteSteer, TaskID: "q1234567", ExpectedRevision: 1,
+			})
 			if decision.Action != app.ConversationRouteClarify || decision.TaskID != "" {
-				t.Fatalf("high-risk model steer survived safety validation: %+v", decision)
+				t.Fatalf("unsafe or unverified Task target was accepted: %+v", decision)
 			}
 		})
 	}
 }
 
-func TestConversationRouteWorkerFallsBackToNewTaskOnExplicitNewSignal(t *testing.T) {
+func TestSafeConversationRouteDecisionPreservesToolAndKeepsStructuralGuards(t *testing.T) {
+	decision := app.ConversationRouteDecision{Action: app.ConversationRouteTool, ToolName: "morde_web_search",
+		ToolArguments: `{"query":"日本央行利率政策"}`}
+	for _, content := range []string{
+		"请搜索公开网站关于日本央行利率政策的最新信息。",
+		"能否帮我找一下日本央行利率政策的最新公开资料？",
+		"有没有关于日本央行利率政策的最新公开信息？",
+	} {
+		value := app.ConversationRouteContext{ActorID: "u1234567", Content: content}
+		if got := safeConversationRouteDecision(value, decision); got.Action != app.ConversationRouteTool {
+			t.Errorf("search wording changed the structured Tool action for %q: %+v", content, got)
+		}
+	}
+
+	for _, test := range []struct {
+		name   string
+		mutate func(*app.ConversationRouteContext)
+	}{
+		{name: "empty request", mutate: func(value *app.ConversationRouteContext) { value.Content = " " }},
+		{name: "attachment", mutate: func(value *app.ConversationRouteContext) { value.CurrentMessageHasAttachments = true }},
+		{name: "truncated message", mutate: func(value *app.ConversationRouteContext) { value.ContentTruncated = true }},
+		{name: "unavailable reference", mutate: func(value *app.ConversationRouteContext) {
+			value.ReferenceTaskID = "q1234567"
+			value.ReferenceUnavailable = true
+		}},
+		{name: "unresolved predecessor", mutate: func(value *app.ConversationRouteContext) { value.PreviousUnresolved = true }},
+		{name: "incomplete candidates", mutate: func(value *app.ConversationRouteContext) { value.CandidateSetIncomplete = true }},
+		{name: "incomplete history", mutate: func(value *app.ConversationRouteContext) { value.HistoryIncomplete = true }},
+		{name: "result review", mutate: func(value *app.ConversationRouteContext) { value.ResultReview = &app.ConversationTaskResultReview{} }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			value := app.ConversationRouteContext{ActorID: "u1234567", Content: "有没有关于日本央行利率政策的最新公开信息？"}
+			test.mutate(&value)
+			if got := safeConversationRouteDecision(value, decision); got.Action != app.ConversationRouteClarify || got.TaskID != "" {
+				t.Fatalf("structurally ineligible Tool action was accepted: %+v", got)
+			}
+		})
+	}
+	if got := safeConversationRouteDecision(app.ConversationRouteContext{ActorID: "u1234567", Content: "query"},
+		app.ConversationRouteDecision{Action: app.ConversationRouteTool, ToolName: "morde_personal_update", ToolArguments: `{"field":"name"}`}); got.Action != app.ConversationRouteClarify {
+		t.Fatalf("non-allowlisted Tool action was accepted: %+v", got)
+	}
+}
+
+func TestConversationRouteWorkerClarifiesExplicitNewSignalWhenClassificationFails(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	routeWorkerFallbackSteerContext(stub)
 	stub.snapshot.Context.Content = "新开一个任务，帮我写个脚本"
 	stub.classifyErr = errors.New("provider unavailable")
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
-		stub.applied[0].Action != app.ConversationRouteNew || !stub.applied[0].ExplicitNew {
-		t.Fatalf("explicit new-task signal did not start a new task: failures=%v applied=%+v err=%v",
+		stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].TaskID != "" ||
+		!strings.Contains(stub.applied[0].Question, "尚未执行") {
+		t.Fatalf("explicit new-task signal executed without a model decision: failures=%v applied=%+v err=%v",
 			stub.failures, stub.applied, err)
 	}
 }
 
-func TestConversationRouteWorkerFallsBackToNewForClearIndependentWork(t *testing.T) {
+func TestConversationRouteWorkerClarifiesIndependentWorkWhenClassificationFails(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	routeWorkerFallbackSteerContext(stub)
 	stub.snapshot.Context.Content = "请帮我开发一个独立的验收工具"
 	stub.classifyErr = errors.New("provider unavailable")
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
-		stub.applied[0].Action != app.ConversationRouteNew || stub.applied[0].ExplicitNew {
-		t.Fatalf("clear independent work was not routed to a new Task: failures=%v applied=%+v err=%v",
+		stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].TaskID != "" ||
+		!strings.Contains(stub.applied[0].Question, "尚未执行") {
+		t.Fatalf("independent work executed without a model decision: failures=%v applied=%+v err=%v",
 			stub.failures, stub.applied, err)
 	}
 	worker, stub = newRouteWorkerTest(t)
 	stub.snapshot.Context.PreviousTaskID = "q1234567"
 	stub.snapshot.Context.Content = "请开发一个验收工具并修改项目文件"
 	stub.classifyErr = errors.New("provider unavailable")
-	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteNew {
-		t.Fatalf("inactive predecessor blocked independent work: applied=%+v err=%v", stub.applied, err)
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteClarify || !strings.Contains(stub.applied[0].Question, "尚未执行") {
+		t.Fatalf("independent work executed after classification failure: applied=%+v err=%v", stub.applied, err)
 	}
 }
 
-func TestConversationRouteWorkerFallsBackToNewForExplicitDocumentDelivery(t *testing.T) {
+func TestConversationRouteWorkerClarifiesDocumentDeliveryWhenClassificationFails(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	routeWorkerFallbackSteerContext(stub)
 	stub.snapshot.Context.Candidates = nil
 	stub.snapshot.Context.Content = "请帮我写一个设计方案文档，并提供下载"
 	stub.classifyErr = errors.New("provider unavailable")
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
-		stub.applied[0].Action != app.ConversationRouteNew || stub.applied[0].ExplicitNew {
-		t.Fatalf("explicit downloadable document did not start a Task after classification failure: failures=%v applied=%+v err=%v",
+		stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].TaskID != "" ||
+		!strings.Contains(stub.applied[0].Question, "尚未执行") {
+		t.Fatalf("document delivery executed after classification failure: failures=%v applied=%+v err=%v",
 			stub.failures, stub.applied, err)
 	}
 	worker, stub = newRouteWorkerTest(t)
 	routeWorkerFallbackSteerContext(stub)
 	stub.snapshot.Context.Content = "请帮我写一个独立的设计方案文档，并提供下载"
 	stub.classifyErr = errors.New("provider unavailable")
-	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteNew {
-		t.Fatalf("explicit independent document did not start a Task alongside existing work: applied=%+v err=%v", stub.applied, err)
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
+		stub.applied[0].Action != app.ConversationRouteClarify || !strings.Contains(stub.applied[0].Question, "尚未执行") {
+		t.Fatalf("document delivery executed after classification failure: applied=%+v err=%v", stub.applied, err)
 	}
 
 	for _, value := range []app.ConversationRouteContext{
@@ -784,13 +883,13 @@ func TestConversationRouteWorkerFallsBackToNewForExplicitDocumentDelivery(t *tes
 	}
 }
 
-func TestConversationRouteWorkerFallsBackToNewForExplicitSearchWithoutActiveTask(t *testing.T) {
+func TestConversationRouteWorkerClarifiesExplicitSearchWhenClassificationFails(t *testing.T) {
 	for _, test := range []struct {
 		name               string
 		previousUnresolved bool
 		want               app.ConversationRouteAction
 	}{
-		{name: "no active task", want: app.ConversationRouteNew},
+		{name: "no active task", want: app.ConversationRouteClarify},
 		{name: "unresolved predecessor", previousUnresolved: true, want: app.ConversationRouteClarify},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -801,8 +900,9 @@ func TestConversationRouteWorkerFallsBackToNewForExplicitSearchWithoutActiveTask
 			stub.snapshot.Context.Content = "请帮我搜索 Rust 新版本的特性"
 			stub.classifyErr = errors.New("provider unavailable")
 			if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
-				stub.applied[0].Action != test.want || (test.want == app.ConversationRouteNew && stub.applied[0].ExplicitNew) {
-				t.Fatalf("explicit search fallback action=%+v, want=%s failures=%v err=%v",
+				stub.applied[0].Action != test.want || stub.applied[0].TaskID != "" ||
+				!strings.Contains(stub.applied[0].Question, "尚未执行") {
+				t.Fatalf("search request executed without a model decision: applied=%+v want=%s failures=%v err=%v",
 					stub.applied, test.want, stub.failures, err)
 			}
 		})
@@ -817,17 +917,17 @@ func TestConversationRouteWorkerFallsBackToNewForExplicitSearchWithoutActiveTask
 	}
 }
 
-func TestConversationRouteWorkerFallbackBindsExplicitControlToOneTask(t *testing.T) {
+func TestConversationRouteWorkerFallbackDoesNotExecuteUnclassifiedTaskControls(t *testing.T) {
 	for _, test := range []struct {
 		content string
-		action  app.ConversationRouteAction
 	}{
-		{content: "请继续当前任务并读取已授权 Workspace 中的结果", action: app.ConversationRouteUpdate},
-		{content: "现在请帮我继续当前任务并读取结果", action: app.ConversationRouteUpdate},
-		{content: "请接着这个任务", action: app.ConversationRouteUpdate},
-		{content: "Please continue this task", action: app.ConversationRouteUpdate},
-		{content: "请继续当前旁聊里唯一一条现有任务：开始一个隔离的步骤06正向验收 Task。状态为等待你处理；刚才同一 Task 的 file_write 已完成，现在只用它的 Workspace file_read 读取既有相对路径。", action: app.ConversationRouteUpdate},
-		{content: "请查看当前任务状态", action: app.ConversationRouteStatus},
+		{content: "请继续当前任务并读取已授权 Workspace 中的结果"},
+		{content: "现在请帮我继续当前任务并读取结果"},
+		{content: "请接着这个任务"},
+		{content: "Please continue this task"},
+		{content: "请继续当前旁聊里唯一一条现有任务：开始一个隔离的步骤06正向验收 Task。状态为等待你处理；刚才同一 Task 的 file_write 已完成，现在只用它的 Workspace file_read 读取既有相对路径。"},
+		{content: "请查看当前任务状态"},
+		{content: "请停止当前任务"},
 	} {
 		t.Run(test.content, func(t *testing.T) {
 			worker, stub := newRouteWorkerTest(t)
@@ -835,8 +935,9 @@ func TestConversationRouteWorkerFallbackBindsExplicitControlToOneTask(t *testing
 			stub.snapshot.Context.Content = test.content
 			stub.classifyErr = errors.New("provider unavailable")
 			if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
-				stub.applied[0].Action != test.action || stub.applied[0].TaskID != "q1234567" || stub.applied[0].ExpectedRevision != 1 {
-				t.Fatalf("explicit control was not bound to its sole current Task: failures=%v applied=%+v err=%v",
+				stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].TaskID != "" ||
+				stub.applied[0].ExpectedRevision != 0 || !strings.Contains(stub.applied[0].Question, "尚未执行") {
+				t.Fatalf("unclassified task control was not clarified without execution: failures=%v applied=%+v err=%v",
 					stub.failures, stub.applied, err)
 			}
 		})
@@ -883,7 +984,7 @@ func TestConversationRouteWorkerNeverStopsByKeywordWhenClassificationFails(t *te
 			stub.classifyErr = errors.New("provider unavailable")
 			if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
 				stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].TaskID != "" ||
-				!strings.Contains(stub.applied[0].Question, "没有执行") {
+				!strings.Contains(stub.applied[0].Question, "尚未执行") {
 				t.Fatalf("classification failure triggered a keyword stop or unclear fallback: failures=%v applied=%+v err=%v",
 					stub.failures, stub.applied, err)
 			}
@@ -891,7 +992,7 @@ func TestConversationRouteWorkerNeverStopsByKeywordWhenClassificationFails(t *te
 	}
 }
 
-func TestConversationRouteWorkerFallbackContinuesWaitingUserTask(t *testing.T) {
+func TestConversationRouteWorkerClarifiesWaitingUserTaskControlOnClassifyFailure(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	routeWorkerFallbackSteerContext(stub)
 	stub.snapshot.Context.Candidates[0].Status = task.StatusWaitingUser
@@ -899,8 +1000,9 @@ func TestConversationRouteWorkerFallbackContinuesWaitingUserTask(t *testing.T) {
 	stub.snapshot.Context.Content = "请继续当前旁聊里唯一一条现有任务：开始一个隔离的步骤06正向验收 Task。状态为等待你处理；刚才同一 Task 的 file_write 已完成，现在只用它的 Workspace file_read 读取既有相对路径。"
 	stub.classifyErr = errors.New("provider unavailable")
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
-		stub.applied[0].Action != app.ConversationRouteUpdate || stub.applied[0].TaskID != "q1234567" || stub.applied[0].ExpectedRevision != 1 {
-		t.Fatalf("waiting-user Task continuation was not bound to its original Task: failures=%v applied=%+v err=%v",
+		stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].TaskID != "" ||
+		!strings.Contains(stub.applied[0].Question, "尚未执行") {
+		t.Fatalf("waiting-user Task continuation executed without a model decision: failures=%v applied=%+v err=%v",
 			stub.failures, stub.applied, err)
 	}
 }
@@ -914,7 +1016,8 @@ func TestConversationRouteWorkerFallbackClarifiesAmbiguousControlTarget(t *testi
 	stub.snapshot.Context.Content = "请继续这个任务"
 	stub.classifyErr = errors.New("provider unavailable")
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
-		stub.applied[0].Action != app.ConversationRouteClarify || strings.Contains(stub.applied[0].Question, "分类暂时不可用") {
+		stub.applied[0].Action != app.ConversationRouteClarify || strings.Contains(stub.applied[0].Question, "分类暂时不可用") ||
+		!strings.Contains(stub.applied[0].Question, "尚未执行") {
 		t.Fatalf("ambiguous task control was not clarified contextually: failures=%v applied=%+v err=%v",
 			stub.failures, stub.applied, err)
 	}
@@ -1010,21 +1113,6 @@ func TestConversationRouteWorkerFallbackDoesNotApplyHighRiskControlChange(t *tes
 	}
 }
 
-func TestConversationRouteHighRiskDetectorDistinguishesAuthorizedScopeFromScopeChange(t *testing.T) {
-	if app.ConversationRouteHasHighRiskModificationIntent("继续当前任务并读取已授权 Workspace 中的结果") {
-		t.Fatal("describing an already-authorized Workspace was misclassified as changing authorization")
-	}
-	for _, content := range []string{
-		"请调整授权范围",
-		"请授权工具访问这个 Workspace",
-		"把工作目录换到 /workspace/new",
-	} {
-		if !app.ConversationRouteHasHighRiskModificationIntent(content) {
-			t.Errorf("high-risk scope change was not detected: %q", content)
-		}
-	}
-}
-
 func TestConversationRouteWorkerAsksUserWhenClassifyFallbackCannotDecide(t *testing.T) {
 	worker, stub := newRouteWorkerTest(t)
 	routeWorkerFallbackSteerContext(stub)
@@ -1037,17 +1125,16 @@ func TestConversationRouteWorkerAsksUserWhenClassifyFallbackCannotDecide(t *test
 	}
 }
 
-func TestConversationRouteWorkerFallbackDistinguishesMissingFromUnresolvedPredecessor(t *testing.T) {
+func TestConversationRouteWorkerClarificationDistinguishesMissingFromUnresolvedPredecessor(t *testing.T) {
 	// A predecessor that merely ended unresolved (waiting_user after a
-	// clarification) is known state: the user is likely answering it, so
-	// the fallback asks continue-or-new instead of demanding context.
+	// clarification) is known state, so ask how this message relates to it.
 	worker, stub := newRouteWorkerTest(t)
 	stub.snapshot.Context.PreviousUnresolved = true
 	stub.snapshot.Context.Content = "你看看上面那条信息说了什么"
 	stub.classifyErr = errors.New("provider unavailable")
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
 		stub.applied[0].Action != app.ConversationRouteClarify ||
-		stub.applied[0].Question != "上一条请求还没有完成；当前没有执行任务操作。你希望把这条消息作为该任务的补充，还是开始一项独立工作？" {
+		stub.applied[0].Question != "上一条请求还没有完成，这条消息尚未执行。请补充你希望完成的目标，以及它与上一项工作的关系。" {
 		t.Fatalf("unresolved predecessor was treated as missing context: applied=%+v err=%v", stub.applied, err)
 	}
 	// A predecessor row that does not exist at all still asks for context.
@@ -1071,7 +1158,7 @@ func TestConversationRouteWorkerClarifiesTrustedPreviousTaskStopOnClassifyFailur
 	stub.classifyErr = errors.New("provider unavailable")
 	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 0 || len(stub.applied) != 1 ||
 		stub.applied[0].Action != app.ConversationRouteClarify || stub.applied[0].TaskID != "" ||
-		!strings.Contains(stub.applied[0].Question, "没有执行操作") {
+		!strings.Contains(stub.applied[0].Question, "尚未执行") {
 		t.Fatalf("classifier failure did not safely clarify the stop request: failures=%v applied=%+v err=%v",
 			stub.failures, stub.applied, err)
 	}
@@ -1400,15 +1487,15 @@ func TestConversationRouteWorkerRoutesLongMessagesAndExplainsStorageLimit(t *tes
 	}
 }
 
-func TestConversationRouteWorkerFallbackRoutesExplicitLongArticleWithoutTaskAmbiguity(t *testing.T) {
+func TestConversationRouteWorkerClarifiesLongArticleWhenClassificationFails(t *testing.T) {
 	content := "好现在你帮我看下这篇文章说了什么：\n# Morde MVP\n" + strings.Repeat("文章正文。", 24_000)
 	for _, test := range []struct {
 		name            string
 		activeCandidate bool
 		want            app.ConversationRouteAction
 	}{
-		{name: "independent long article", want: app.ConversationRouteNew},
-		{name: "independent article with active task", activeCandidate: true, want: app.ConversationRouteNew},
+		{name: "independent long article", want: app.ConversationRouteClarify},
+		{name: "independent article with active task", activeCandidate: true, want: app.ConversationRouteClarify},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			worker, stub := newRouteWorkerTest(t)
@@ -1438,7 +1525,7 @@ func TestConversationRouteWorkerFallbackRoutesExplicitLongArticleWithoutTaskAmbi
 	}
 }
 
-func TestTruncatedArticleRestartTextIsNotUserIntent(t *testing.T) {
+func TestTruncatedArticleRestartTextDoesNotChangeModelFailureFallback(t *testing.T) {
 	content := "这是一份文档：\n正文里写着重新开始新任务。\n" + strings.Repeat("正文。", 1000)
 	preview, _ := app.ConversationRouteTextPreview(content, 2048)
 	digest := sha256.Sum256([]byte(content))
@@ -1446,14 +1533,14 @@ func TestTruncatedArticleRestartTextIsNotUserIntent(t *testing.T) {
 		CurrentMessageID: "m2345678", ContentBytes: int64(len(content)), ContentSHA256: digest[:],
 		Candidates: []app.ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusWaitingUser}}}
 	if decision := conversationRouteClassifyFallback(value); decision.Action != app.ConversationRouteClarify {
-		t.Fatalf("restart in document bypassed fallback clarification: %+v", decision)
+		t.Fatalf("model failure used article text to start a Task: %+v", decision)
 	}
-	if decision := safeConversationRouteDecision(value, app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}); decision.Action != app.ConversationRouteClarify {
-		t.Fatalf("restart in document bypassed decision validation: %+v", decision)
+	if decision := safeConversationRouteDecision(value, app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}); decision.Action != app.ConversationRouteNew {
+		t.Fatalf("valid model action was overridden by article text: %+v", decision)
 	}
 }
 
-func TestConversationRouteWorkerInvalidOutputWithInterruptedDuplicateExplainsRecovery(t *testing.T) {
+func TestConversationRouteWorkerInvalidOutputClarifiesLongDuplicateWithoutKeywordFallback(t *testing.T) {
 	content := "感动你终于不报错了.好现在你帮我看下这篇文章说了什么：\n# 长文章\n" + strings.Repeat("正文。", 3000)
 	digest := sha256.Sum256([]byte(content))
 	worker, stub := newRouteWorkerTest(t)
@@ -1476,8 +1563,8 @@ func TestConversationRouteWorkerInvalidOutputWithInterruptedDuplicateExplainsRec
 		}
 	}
 	if len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteClarify ||
-		!strings.Contains(stub.applied[0].Question, "相同") || !strings.Contains(stub.applied[0].Question, "重新开始") {
-		t.Fatalf("interrupted duplicate was not explained: applied=%+v", stub.applied)
+		!strings.Contains(stub.applied[0].Question, "尚未执行") || strings.Contains(stub.applied[0].Question, "重新开始") {
+		t.Fatalf("long-message classification used article wording as an action fallback: applied=%+v", stub.applied)
 	}
 }
 

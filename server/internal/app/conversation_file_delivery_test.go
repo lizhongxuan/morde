@@ -2,55 +2,7 @@ package app
 
 import (
 	"testing"
-
-	"morde/server/internal/domain/task"
 )
-
-func TestRoutedFileDeliveryDirective(t *testing.T) {
-	for _, test := range []struct {
-		text         string
-		workspace    bool
-		want         task.FileDeliveryIntent
-		wantExplicit bool
-	}{
-		{"生成 PDF 报告文件并保存到工作区", false, task.FileDeliveryRequired, true},
-		{"我要生产一个md文档", false, task.FileDeliveryRequired, true},
-		{"为五子棋写成 Markdown 文档", false, task.FileDeliveryRequired, true},
-		{"生成 .MD 文件并提供下载", false, task.FileDeliveryRequired, true},
-		{"生成md", false, task.FileDeliveryRequired, true},
-		{"保存为 Markdown 文件", false, task.FileDeliveryRequired, true},
-		{"为五子棋应用写一份设计方案，保存为 Markdown 文件并提供下载", false, task.FileDeliveryRequired, true},
-		{"帮助我写一个设计方案文档，并提供下载", false, task.FileDeliveryRequired, true},
-		{"做个 Excel 表格", false, task.FileDeliveryRequired, true},
-		{"Create and save a PDF report", false, task.FileDeliveryRequired, true},
-		{"修复项目代码", true, task.FileDeliveryRequired, true},
-		{"不要生成文件，只要文字", false, task.FileDeliveryNone, true},
-		{"别生成文件", false, task.FileDeliveryNone, true},
-		{"No file needed; answer in chat", false, task.FileDeliveryNone, true},
-		{"不要生成文件，但请创建 PDF 文件", false, task.FileDeliveryUnclear, true},
-		{"不要生产md文档", false, task.FileDeliveryNone, true},
-		{"只在聊天回答怎么生成 Markdown 文档", false, task.FileDeliveryNone, true},
-		{"写成 Markdown 文件，但只在聊天回答", false, task.FileDeliveryUnclear, true},
-		{"请解释“我要生产一个md文档”是什么意思", false, "", false},
-		{"请告诉我如何生成一个 .md 文档", false, "", false},
-		{"写一份如何生成 Markdown 的教程.md", false, task.FileDeliveryRequired, true},
-		{"请生成一份关于如何生成 Markdown 的教程.md", false, task.FileDeliveryRequired, true},
-		{"不要解释错误，生成 PDF 文件", false, task.FileDeliveryRequired, true},
-		{"帮我分析文件并写一段总结", false, "", false},
-		{"请区别文件格式", false, "", false},
-		{"输出文件内容", false, "", false},
-		{"请告诉我如何生成 PDF 文件", false, "", false},
-		{"把标题改成中文", false, "", false},
-		{"写一份项目报告", false, "", false},
-	} {
-		t.Run(test.text, func(t *testing.T) {
-			got, explicit := RoutedFileDeliveryDirective(test.text, test.workspace)
-			if got != test.want || explicit != test.wantExplicit {
-				t.Fatalf("directive=(%q,%t), want (%q,%t)", got, explicit, test.want, test.wantExplicit)
-			}
-		})
-	}
-}
 
 func TestUnverifiedFileDeliveryClaim(t *testing.T) {
 	for _, test := range []struct {

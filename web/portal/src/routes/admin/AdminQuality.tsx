@@ -8,9 +8,9 @@ type QualityDays = 7 | 30 | 90;
 type QualityData = Awaited<ReturnType<typeof portalApi.adminQuality>>;
 const formatNumber = (value: number) => new Intl.NumberFormat('zh-CN').format(value);
 
-function QualityError({ error, retry }: { error: unknown; retry: () => void }) {
-  return <FloatingError className="error-card" role="alert">
-    {errorDetails(error).message}
+function QualityError({ error, retry, stale = false }: { error: unknown; retry: () => void; stale?: boolean }) {
+  return <FloatingError inline className="error-card" role="alert">
+    {stale ? '刷新失败，当前显示最近一次确认的数据。' : ''}{errorDetails(error).message}
     <button type="button" className="button button-secondary" onClick={retry}>重试</button>
   </FloatingError>;
 }
@@ -33,7 +33,7 @@ function QualityAvailability({ data }: { data: QualityData }) {
 export function AdminQuality() {
   const [days, setDays] = useState<QualityDays>(7);
   const query = useQuery({ queryKey: ['admin', 'quality', days], queryFn: () => portalApi.adminQuality(days) });
-  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，质量与风险数据暂时无法读取。');
+  useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，质量与风险数据暂时无法读取。');
 
   return <section className="admin-content">
     <section className="admin-detail-section" aria-labelledby="admin-quality-heading">
@@ -44,9 +44,12 @@ export function AdminQuality() {
       </select>
     </div></div>
       {query.data && <p className="muted">统计区间：近 {query.data.days} 天</p>}
-      {query.isPending || (networkError && !query.data) ? <div className="loading-card" role="status">正在加载质量与风险数据…</div>
-        : query.isError && !networkError ? <QualityError error={query.error} retry={() => void query.refetch()} />
-          : query.data ? <QualityAvailability data={query.data} /> : <div className="loading-card" role="status">正在加载质量与风险数据…</div>}
+      {query.isPending && !query.data ? <div className="loading-card" role="status">正在加载质量与风险数据…</div>
+        : query.isError && !query.data ? <QualityError error={query.error} retry={() => void query.refetch()} />
+          : query.data ? <>
+            {query.isError && <QualityError error={query.error} retry={() => void query.refetch()} stale />}
+            <QualityAvailability data={query.data} />
+          </> : <div className="loading-card" role="status">正在加载质量与风险数据…</div>}
     </section>
   </section>;
 }

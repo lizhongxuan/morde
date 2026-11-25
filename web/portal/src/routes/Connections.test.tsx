@@ -42,7 +42,7 @@ function createOAuthPopup() {
 describe('Connections', () => {
   afterEach(() => { cleanup(); vi.restoreAllMocks(); });
 
-  it('keeps cached model connections visible and reports a transient refresh failure in a popup', async () => {
+  it('keeps cached model connections visible and offers an in-place retry after a transient refresh failure', async () => {
     const personalModel = { ...model, shared: false, has_api_key: true };
     const read = vi.spyOn(portalApi, 'modelConnections')
       .mockResolvedValueOnce({ items: [personalModel], configuration_status: 'configured' })
@@ -54,28 +54,32 @@ describe('Connections', () => {
 
     await client.invalidateQueries({ queryKey: ['model-connections'] });
 
-    const notice = await screen.findByRole('alert');
-    expect(notice).toHaveTextContent('模型连接状态读取失败');
-    expect(notice.closest('.connections-page')).toBeNull();
+    const notice = await screen.findByText(/模型连接刷新失败，当前显示最近一次确认的连接/);
+    expect(document.querySelector('.error-notice-overlay .toast-notice')).toHaveTextContent('模型连接状态读取失败');
+    expect(notice.closest('.connections-page')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: personalModel.name, level: 3 })).toBeInTheDocument();
-    await userEvent.setup().click(screen.getByRole('button', { name: '重试' }));
+    await userEvent.setup().click(within(notice.closest('[role="alert"]')!).getByRole('button', { name: '重试' }));
     await waitFor(() => expect(read).toHaveBeenCalledTimes(3));
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
   });
 
-  it('keeps the MCP area placeholder and reports an initial network failure in a popup', async () => {
+  it('shows an inline retry when the initial MCP query fails', async () => {
     vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [], configuration_status: 'not_configured' });
-    const connectors = vi.spyOn(portalApi, 'mcpConnectors').mockRejectedValue(new TypeError('Failed to fetch'));
+    const connectors = vi.spyOn(portalApi, 'mcpConnectors')
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue({ items: [mcpConnector] });
     const user = userEvent.setup();
     renderPage();
     await selectArea(user, 'MCP 工具');
 
-    const notice = await screen.findByRole('alert');
-    expect(notice).toHaveTextContent('MCP 工具连接状态读取失败');
-    expect(notice.closest('.connections-page')).toBeNull();
-    expect(screen.getByRole('status')).toHaveTextContent('正在读取工具连接…');
+    const notice = await screen.findByText(/无法读取 MCP 工具连接/);
+    expect(document.querySelector('.error-notice-overlay .toast-notice')).toHaveTextContent('MCP 工具连接状态读取失败');
+    expect(notice.closest('.mcp-connection-section')).toBeInTheDocument();
+    expect(within(notice.closest('[role="alert"]')!).getByRole('button', { name: '重试' })).toBeInTheDocument();
     expect(screen.queryByText('Failed to fetch')).not.toBeInTheDocument();
     expect(connectors).toHaveBeenCalled();
+    await user.click(within(notice.closest('[role="alert"]')!).getByRole('button', { name: '重试' }));
+    expect(await screen.findByRole('heading', { name: '日历工具', level: 3 })).toBeInTheDocument();
   });
 
   it('opens the MCP form in a dialog and clears a cancelled draft', async () => {
@@ -582,8 +586,9 @@ describe('Connections', () => {
     await user.type(screen.getByLabelText('API 密钥'), 'private-test-secret');
     await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('保存结果尚未确认，请先核对模型列表');
-    expect(screen.getByRole('alert')).not.toHaveTextContent('请重新输入后重试');
+    const dialog = screen.getByRole('dialog', { name: '添加个人模型' });
+    expect(await within(dialog).findByText(/保存结果尚未确认，请先核对模型列表/)).toBeInTheDocument();
+    expect(within(dialog).getByRole('alert')).not.toHaveTextContent('请重新输入后重试');
     expect(screen.getByLabelText('API 密钥')).toHaveValue('');
     expect(await screen.findByRole('heading', { name: 'DeepSeek Flash', level: 3 })).toBeInTheDocument();
     expect(list).toHaveBeenCalledTimes(2);
@@ -653,7 +658,8 @@ describe('Connections', () => {
     await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
 
     expect(create).toHaveBeenCalledOnce();
-    expect(await screen.findByRole('alert')).toHaveTextContent('服务地址不在当前域名 allowlist 中');
+    const dialog = screen.getByRole('dialog', { name: '添加个人模型' });
+    expect(await within(dialog).findByText(/服务地址不在当前域名 allowlist 中/)).toBeInTheDocument();
     expect(screen.getByLabelText('API 密钥')).toHaveValue('');
     expect(screen.queryByText('private-test-secret')).not.toBeInTheDocument();
   });
@@ -673,16 +679,16 @@ describe('Connections', () => {
     expect(create).toHaveBeenCalledWith(expect.objectContaining({ api_key: 'local-test-secret' }));
     expect(create.mock.calls[0]?.[0]).not.toHaveProperty('context_window_override_tokens');
     expect(create.mock.calls[0]?.[0]).not.toHaveProperty('context_window_tokens');
-    expect(await screen.findByRole('alert')).toHaveTextContent('服务地址无效或未获服务端允许');
-    expect(screen.getByRole('alert')).toHaveTextContent('密钥已清除，请重新输入后重试');
     const dialog = screen.getByRole('dialog', { name: '添加个人模型' });
+    const formError = await within(dialog).findByText(/服务地址无效或未获服务端允许/);
+    expect(formError.closest('[role="alert"]')).toHaveTextContent('密钥已清除，请重新输入后重试');
     expect(within(dialog).getByRole('alert')).toHaveTextContent('服务地址无效或未获服务端允许');
     expect(screen.getByText('高级设置').closest('details')).not.toHaveAttribute('open');
     expect(screen.getByLabelText('API 密钥')).toHaveValue('');
     expect(screen.getByLabelText('显示名称')).toHaveValue('DeepSeek Flash');
     await user.click(within(dialog).getByRole('button', { name: '取消' }));
-    expect(screen.getByRole('alert')).toHaveTextContent('服务地址无效或未获服务端允许');
-    await user.click(screen.getByRole('button', { name: '关闭通知' }));
+    expect(screen.getByText(/服务地址无效或未获服务端允许/)).toBeInTheDocument();
+    await user.click(screen.getByRole('button', { name: '关闭错误提示' }));
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();
   });
 
@@ -696,6 +702,6 @@ describe('Connections', () => {
     fireEvent.change(screen.getByLabelText('API 密钥'), { target: { value: '   ' } });
     await user.click(screen.getByRole('button', { name: '保存并检查连接' }));
     expect(create).not.toHaveBeenCalled();
-    expect(await screen.findByRole('alert')).toHaveTextContent('API 密钥不能为空');
+    expect(await within(screen.getByRole('dialog', { name: '添加个人模型' })).findByText('API 密钥不能为空。')).toBeInTheDocument();
   });
 });

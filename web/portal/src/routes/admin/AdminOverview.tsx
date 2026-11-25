@@ -7,14 +7,18 @@ import { FloatingError } from '../../components/FloatingError';
 export function AdminOverview() {
   const query = useQuery({ queryKey: ['admin', 'overview'], queryFn: portalApi.adminOverview, refetchInterval: 30000 });
   const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，管理总览暂时无法读取。');
-  if (query.isPending || (networkError && !query.data)) return <div className="loading-card" role="status">正在加载管理总览…</div>;
-  if (query.isError && !networkError) return <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>;
+  if (query.isError && !query.data) return <>
+    {networkError && <div className="loading-card" role="status">正在加载管理总览…</div>}
+    <FloatingError inline className="error-card" role="alert">{networkError ? '网络异常，管理总览暂时无法读取。' : errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>
+  </>;
+  if (query.isPending && !query.data) return <div className="loading-card" role="status">正在加载管理总览…</div>;
   if (!query.data) return <div className="loading-card" role="status">正在加载管理总览…</div>;
 
   const { health, hosts_by_state: hosts, agents_by_state: agents } = query.data;
   const hostStates = Object.entries(hosts);
   const agentStates = Object.entries(agents);
   return <section className="admin-content">
+    {query.isError && <FloatingError inline className="error-card" role="alert">刷新失败，当前显示最近一次确认的总览数据。{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>}
     <section className="design-panel" aria-labelledby="admin-overview-title">
     <div className="design-panel-header"><div><h2 id="admin-overview-title">平台概况</h2><p>服务与资源的当前状态。</p></div><button type="button" className="button button-secondary" disabled={query.isFetching} onClick={() => void query.refetch()}>刷新数据</button></div>
     <div className="admin-detail-facts">

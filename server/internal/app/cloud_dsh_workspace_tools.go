@@ -538,7 +538,9 @@ func (t *cloudDSHWorkspaceTools) write(ctx context.Context, current task.Task, c
 		return receipt, true, nil
 	}
 	if receipt, found, err := findReceipt(); err != nil {
-		return cloudDSHWorkspaceFailure(err), nil
+		// A failed lookup can be an infrastructure error or a deterministic
+		// identity conflict. Only the latter is safe to report as a known failure.
+		return cloudDSHWorkspacePublishFailure(err), nil
 	} else if found && receipt.State != TaskWorkspacePublishPending {
 		return cloudDSHWorkspaceReceiptResult(receipt, operationKey), nil
 	}
@@ -621,10 +623,14 @@ func (t *cloudDSHWorkspaceTools) write(ctx context.Context, current task.Task, c
 			return append([]byte(nil), data...), nil
 		})
 	if err != nil {
-		if found, ok, findErr := findReceipt(); findErr == nil && ok && found.State != TaskWorkspacePublishPending {
-			return cloudDSHWorkspaceReceiptResult(found, operationKey), nil
+		foundReceipt, found, findErr := findReceipt()
+		if findErr != nil || (found && foundReceipt.State == TaskWorkspacePublishPending) {
+			return AgentToolResult{Status: AgentToolUnknown}, nil
 		}
-		return cloudDSHWorkspaceFailure(err), nil
+		if found {
+			return cloudDSHWorkspaceReceiptResult(foundReceipt, operationKey), nil
+		}
+		return cloudDSHWorkspacePublishFailure(err), nil
 	}
 	if !taskWorkspacePublishReceiptMatchesApproval(receipt, call, approval) {
 		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeConflict, "Workspace publish receipt approval binding changed")), nil
@@ -921,6 +927,25 @@ func cloudDSHWorkspaceFailure(err error) AgentToolResult {
 		return AgentToolResult{Status: AgentToolFailed, Output: "The Workspace is busy; retry the same operation."}
 	default:
 		return AgentToolResult{Status: AgentToolFailed, Output: "The Workspace request could not be completed."}
+	}
+}
+
+// cloudDSHWorkspacePublishFailure only turns errors with a known pre-write
+// rejection meaning into Agent-visible failures. Infrastructure, timeouts and
+// unclassified errors stay unknown because the publish result must be reconciled.
+func cloudDSHWorkspacePublishFailure(err error) AgentToolResult {
+	var pending *TaskInputPendingError
+	if errors.As(err, &pending) {
+		return cloudDSHWorkspaceFailure(err)
+	}
+	switch domain.CodeOf(err) {
+	case domain.CodeInvalidArgument, domain.CodeUnauthenticated, domain.CodeForbidden,
+		domain.CodeNotFound, domain.CodeQuotaExceeded, domain.CodeConflict,
+		domain.CodeIdempotencyConflict, domain.CodeWorkspaceConflict,
+		domain.CodeRequestTooLarge, domain.CodeResultTooLarge, domain.CodeInvalidState:
+		return cloudDSHWorkspaceFailure(err)
+	default:
+		return AgentToolResult{Status: AgentToolUnknown}
 	}
 }
 

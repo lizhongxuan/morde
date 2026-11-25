@@ -866,7 +866,9 @@ func TestConversationRouteDefaultComputerDoesNotChangeRevisionTargetContext(t *t
 				t.Fatal(err)
 			}
 			snapshot.Context.ModelID = "p1234567"
-			if err := f.store.ApplyConversationRoute(ctx, initial, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+			if err := f.store.ApplyConversationRoute(ctx, initial, snapshot, app.ConversationRouteDecision{
+				Action: app.ConversationRouteNew, FileDeliveryIntent: task.FileDeliveryNone,
+			}); err != nil {
 				t.Fatal(err)
 			}
 			var taskID, initialIntent string
@@ -906,9 +908,6 @@ func TestConversationRouteDefaultComputerDoesNotChangeRevisionTargetContext(t *t
 				t.Fatal(err)
 			}
 			wantFileIntent := initialIntent
-			if test.changeTaskTarget {
-				wantFileIntent = "required"
-			}
 			if actualIntent != wantFileIntent {
 				t.Fatalf("file delivery intent=%q, want %q", actualIntent, wantFileIntent)
 			}

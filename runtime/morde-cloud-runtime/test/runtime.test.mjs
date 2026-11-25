@@ -1917,6 +1917,74 @@ test('starts a first attachment message once with its authorized context', async
     event.data.source?.plugin === 'morde-context' && event.data.content?.some(block => block.text === initialStart.initial_context)))
 })
 
+test('starts an initial Task message with the complete 128 KiB UTF-8 body', async t => {
+  const limit = 128 * 1024
+  const head = 'MORDE_INITIAL_128K_HEAD_71c2'
+  const middle = 'MORDE_INITIAL_128K_MIDDLE_9b84'
+  const tail = 'MORDE_INITIAL_128K_TAIL_3e16'
+  const fillerBytes = limit - Buffer.byteLength(head + middle + tail, 'utf8')
+  const firstFillerBytes = Math.floor(fillerBytes / 2)
+  const content = head + 'a'.repeat(firstFillerBytes) + middle +
+    'b'.repeat(fillerBytes - firstFillerBytes) + tail
+  assert.equal(Buffer.byteLength(content, 'utf8'), limit)
+
+  const initial = { message_id: 'm128k001', content, attachment_ids: [] }
+  const initialStart = { ...start, initial_message: initial, context_window_tokens: 1_500_000 }
+  delete initialStart.prompt
+  assert.equal(validStart(initialStart), true)
+  let calls = 0
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, initialStart)
+    if (frame.type === 'checkpoint') acknowledgeCheckpoint(proc, frame)
+    if (frame.type === 'model') {
+      calls++
+      const messages = frame.request.messages.filter(message => message.id === initial.message_id)
+      assert.equal(messages.length, 1)
+      const text = messages[0].content.filter(block => block.type === 'text').map(block => block.text).join('')
+      assert.equal(text, content)
+      for (const anchor of [head, middle, tail]) {
+        assert.equal(text.split(anchor).length - 1, 1)
+      }
+      replyWithText(proc, frame, 'Received the complete initial message.')
+    }
+  })
+  t.after(() => child.kill())
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(calls, 1)
+  assert.equal(frames.filter(frame => frame.type === 'tool_call').length, 0)
+})
+
+test('rejects an initial Task message above 128 KiB UTF-8 before model or tool calls', async t => {
+  const limit = 128 * 1024
+  const content = 'a'.repeat(limit - 1) + 'é'
+  assert.equal(Buffer.byteLength(content, 'utf8'), limit + 1)
+  const initial = { message_id: 'm128k002', content, attachment_ids: [] }
+  const initialStart = { ...start, initial_message: initial }
+  delete initialStart.prompt
+  assert.equal(validStart(initialStart), false)
+
+  let modelCalls = 0
+  let toolCalls = 0
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, initialStart)
+    if (frame.type === 'model') {
+      modelCalls++
+      replyWithText(proc, frame, 'Unexpected model call.')
+    }
+    if (frame.type === 'tool_call') {
+      toolCalls++
+      proc.kill()
+    }
+  })
+  t.after(() => child.kill())
+  const [code] = await once(child, 'close')
+  assert.equal(code, 1, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(modelCalls, 0)
+  assert.equal(toolCalls, 0)
+  assert.ok(frames.some(frame => frame.type === 'failed' && frame.code === 'runtime_unavailable'))
+})
+
 test('persists trusted initial context separately from a prompt-only task', async t => {
   const context = 'Authorized personal context.\nMORDE_MEMORY_STATE_V1:opaque-proof'
   const promptStart = { ...start, prompt: 'Summarize my current task.', initial_context: context }
@@ -2108,6 +2176,61 @@ test('refuses a model-requested tool until its gate is available', async () => {
   assert.ok(frames.some(frame => frame.type === 'model_cancel'))
   assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'failed')
   assert.equal(frames.filter(frame => frame.type === 'model').length, 1)
+})
+
+test('nudges the Agent after three identical tool calls without blocking authorized dispatch', { timeout: 15_000 }, async t => {
+  const tool = {
+    name: 'file_read', description: 'Read a file in the authorized workspace.',
+    parameters: {
+      type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false,
+    },
+  }
+  const pages = []
+  const modelRequests = []
+  let modelCalls = 0
+  let toolCalls = 0
+  let reminderSeenByModel = false
+  const { child, frames } = launch((frame, proc) => {
+    if (frame.type === 'ready') send(proc, { ...start, tools: [tool] })
+    if (frame.type === 'checkpoint') {
+      pages.push(JSON.parse(frame.payload))
+      acknowledgeCheckpoint(proc, frame)
+    }
+    if (frame.type === 'model') {
+      modelCalls++
+      modelRequests.push(frame.request)
+      const requestText = JSON.stringify(frame.request.messages)
+      if (modelCalls === 4) reminderSeenByModel = requestText.includes('You are repeating the exact same tool call')
+      if (modelCalls <= 3) {
+        const chunks = [
+          { type: 'tool-call-delta', index: 0, id: `call_repeat_${modelCalls}`, name: tool.name,
+            argumentsDelta: '{"path":"README.md"}' },
+          { type: 'usage', usage: { inputTokens: 2, outputTokens: 1 } },
+          { type: 'finish', reason: { kind: 'tool-calls' } },
+        ]
+        chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', ...taskFence(frame), id: frame.id, index, chunk }))
+        send(proc, { type: 'model_end', ...taskFence(frame), id: frame.id, ok: true })
+      } else {
+        replyWithText(proc, frame, 'The read result is sufficient; I will finish without another call.')
+      }
+    }
+    if (frame.type === 'tool_call') {
+      toolCalls++
+      send(proc, { type: 'tool_result', ...taskFence(frame), id: frame.id, call_id: frame.call_id,
+        status: 'succeeded', output: 'The file has not changed.' })
+    }
+  })
+  t.after(() => child.kill())
+  const [code] = await once(child, 'close')
+  assert.equal(code, 0, `frames: ${frames.map(frame => frame.type).join(', ')}`)
+  assert.equal(modelCalls, 4)
+  assert.equal(toolCalls, 3, 'the advisory guard must not alter Broker authorization or block legitimate dispatch')
+  assert.equal(reminderSeenByModel, true, 'the next Agent turn receives the repeat reminder')
+  const events = pages.flatMap(page => page.events)
+  const reminder = events.find(event => event.type === 'user/message' && event.data.source?.kind === 'repeat-tool-reminder')
+  assert.ok(reminder, 'the reminder is recorded as source-attributed session context')
+  assert.match(reminder.data.content.map(block => block.text ?? '').join(''), /analyze the previous result/i)
+  assert.equal(frames.find(frame => frame.type === 'settled')?.state, 'completed_candidate')
 })
 
 test('rejects a start tool with an open parameter schema', async () => {

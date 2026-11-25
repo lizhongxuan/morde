@@ -65,7 +65,7 @@ describe('HostMemberManager', () => {
     expect(await screen.findByText('还没有共享成员。')).toBeInTheDocument();
   });
 
-  it('keeps confirmed members visible and reports a transient refresh failure in a popup', async () => {
+  it('keeps confirmed members visible and offers an in-place retry after a transient refresh failure', async () => {
     const read = vi.spyOn(portalApi, 'hostMembers')
       .mockResolvedValueOnce({ items: [member] })
       .mockRejectedValueOnce(new TypeError('Failed to fetch'))
@@ -78,13 +78,13 @@ describe('HostMemberManager', () => {
     await act(async () => { await queryClient.invalidateQueries({ queryKey: ['host-members', hostId] }); });
 
     const notice = await screen.findByRole('alert');
-    expect(notice).toHaveTextContent('共享成员读取失败');
-    expect(notice.closest('.notice-center')).toHaveClass('notice-center-overlay');
-    expect(notice.closest('.host-member-manager')).not.toBeInTheDocument();
+    expect(document.querySelector('.error-notice-overlay .toast-notice')).toHaveTextContent('共享成员读取失败');
+    expect(notice.closest('.host-member-manager')).toBeInTheDocument();
     expect(screen.getByText(member.user_id)).toBeInTheDocument();
-    expect(document.querySelector('.host-member-manager .error-card')).not.toBeInTheDocument();
+    const pageError = screen.getAllByRole('alert').find((alert) => alert.closest('.host-member-manager'))!;
+    expect(pageError).toHaveTextContent('最近一次确认的成员');
 
-    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    await user.click(within(pageError).getByRole('button', { name: '重试' }));
     await waitFor(() => expect(read).toHaveBeenCalledTimes(3));
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
     expect(screen.getByText(member.user_id)).toBeInTheDocument();

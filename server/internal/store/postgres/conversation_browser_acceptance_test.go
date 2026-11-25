@@ -1407,7 +1407,7 @@ func (model browserAcceptanceModel) Complete(ctx context.Context, request app.Mo
 		return app.ModelResponse{Text: `{"action":"reply","reply":"本地验收：任务结果已汇总。"}`, StopReason: "stop",
 			Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 5}}, nil
 	}
-	if strings.HasPrefix(request.Instructions, "Classify the user's new message") {
+	if strings.HasPrefix(request.Instructions, "Classify the latest request") {
 		if len(request.Input) > 0 {
 			var input struct {
 				Message       string                                  `json:"message"`

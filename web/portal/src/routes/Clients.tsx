@@ -4,7 +4,6 @@ import { errorDetails, portalApi } from '../app/api';
 import { formatDate } from '../app/format';
 import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
-import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { Link } from 'react-router';
@@ -37,8 +36,9 @@ export function Clients() {
   const refresh = () => { void queryClient.invalidateQueries({ queryKey: ['clients'] }); };
   return <section className="design-panel">
     <div className="design-panel-header"><div><h2>已登录设备</h2><p>管理已登录的电脑和手机。</p></div><Link className="button button-secondary" to="/download">下载客户端</Link></div>
-    {clients.isPending || (!clients.data && isTransientNetworkError(clients.error)) ? <div className="loading-card" role="status">正在加载客户端…</div>
-      : clients.isError && !isTransientNetworkError(clients.error) ? <FloatingError className="error-card" role="alert">{errorDetails(clients.error).message}<button className="button button-secondary" type="button" onClick={() => void clients.refetch()}>重试</button></FloatingError>
+    {clients.isError && clients.data && <FloatingError inline className="error-card" role="alert">客户端列表刷新失败，当前显示最近一次确认的数据。{errorDetails(clients.error).message}<button className="button button-secondary" type="button" onClick={() => void clients.refetch()}>重试</button></FloatingError>}
+    {clients.isPending && !clients.data ? <div className="loading-card" role="status">正在加载客户端…</div>
+      : clients.isError && !clients.data ? <FloatingError inline className="error-card" role="alert">{errorDetails(clients.error).message}<button className="button button-secondary" type="button" onClick={() => void clients.refetch()}>重试</button></FloatingError>
         : clients.data && !clients.data.items.length ? <div className="empty-card compact"><p>还没有已登录的客户端。请在 Morde 电脑或手机应用使用账号密码登录。</p></div>
           : clients.data ? <ScreenPagination
             items={clients.data.items}

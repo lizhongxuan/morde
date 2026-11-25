@@ -70,7 +70,6 @@ func TestConversationRouteSteerFailsClosedOnStaleOrAmbiguousTargets(t *testing.T
 			value.CandidateSetIncomplete = true
 			value.TaskCandidateSetIncomplete = true
 		}},
-		{name: "status request", mutate: func(value *ConversationRouteContext) { value.Content = "请查看任务进度" }},
 		{name: "two eligible tasks", mutate: func(value *ConversationRouteContext) {
 			value.Candidates = append(value.Candidates, ConversationRouteCandidate{TaskID: "q7654321", InitiatorID: value.ActorID,
 				Status: task.StatusRunning, Revision: 1})
@@ -87,6 +86,15 @@ func TestConversationRouteSteerFailsClosedOnStaleOrAmbiguousTargets(t *testing.T
 				t.Fatalf("unsafe steer was accepted: %+v", decision)
 			}
 		})
+	}
+}
+
+func TestConversationRouteUsesAgentActionInsteadOfStatusKeywordOverride(t *testing.T) {
+	value := safeSteerRouteContext()
+	value.Content = "请查看任务进度"
+	decision := ParseConversationRouteDecisionForContext(`{"action":"steer","task_id":"q1234567"}`, value)
+	if decision.Action != ConversationRouteSteer || decision.TaskID != "q1234567" || decision.ExpectedRevision != 3 {
+		t.Fatalf("a structurally valid Agent action was overridden by message wording: %+v", decision)
 	}
 }
 

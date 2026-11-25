@@ -53,7 +53,7 @@ func routeGatewayFixture() (ConversationRouteClaim, ConversationRouteContext) {
 	return claim, ConversationRouteContext{ActorID: claim.Message.ActorID, RouteAttempt: 1, ModelID: "p1234567", Content: claim.Message.Content}
 }
 
-func TestLegacyRouteModelRequestOnlyAddsDirectToolContractForEligibleSearch(t *testing.T) {
+func TestLegacyRouteModelRequestAddsDirectToolContractForStructurallyEligibleContexts(t *testing.T) {
 	query := "请搜索公开网站关于日本央行利率政策的最新信息"
 	eligible := ConversationRouteContext{ActorID: "u1234567", Content: query}
 	request, err := ConversationRouteModelRequest(eligible)
@@ -67,16 +67,19 @@ func TestLegacyRouteModelRequestOnlyAddsDirectToolContractForEligibleSearch(t *t
 
 	digest := sha256.Sum256([]byte(query))
 	for _, test := range []struct {
-		name    string
-		context ConversationRouteContext
+		name             string
+		context          ConversationRouteContext
+		toolInstructions bool
 	}{
-		{"ordinary chat", ConversationRouteContext{ActorID: "u1234567", Content: "你好"}},
-		{"task reference", ConversationRouteContext{ActorID: "u1234567", Content: query, ReferenceTaskID: "q1234567"}},
-		{"attachments", ConversationRouteContext{ActorID: "u1234567", Content: query, CurrentMessageHasAttachments: true}},
-		{"unresolved predecessor", ConversationRouteContext{ActorID: "u1234567", Content: query, PreviousUnresolved: true}},
-		{"task control", ConversationRouteContext{ActorID: "u1234567", Content: query + "，顺便停止当前任务"}},
+		{"ordinary chat", ConversationRouteContext{ActorID: "u1234567", Content: "你好"}, true},
+		{"task reference", ConversationRouteContext{ActorID: "u1234567", Content: query, ReferenceTaskID: "q1234567"}, false},
+		{"attachments", ConversationRouteContext{ActorID: "u1234567", Content: query, CurrentMessageHasAttachments: true}, false},
+		{"unresolved predecessor", ConversationRouteContext{ActorID: "u1234567", Content: query, PreviousUnresolved: true}, false},
+		{"task control wording", ConversationRouteContext{ActorID: "u1234567", Content: query + "，顺便停止当前任务"}, true},
+		{"non-keyword search phrasing", ConversationRouteContext{ActorID: "u1234567", Content: "有没有日本央行利率政策的最新公开信息？"}, true},
 		{"truncated message", ConversationRouteContext{ActorID: "u1234567", Content: query, CurrentMessageID: "m1234567",
-			ContentBytes: int64(len(query)), ContentSHA256: digest[:], ContentTruncated: true}},
+			ContentBytes: int64(len(query)), ContentSHA256: digest[:], ContentTruncated: true}, false},
+		{"incomplete candidate set", ConversationRouteContext{ActorID: "u1234567", Content: query, CandidateSetIncomplete: true}, false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			request, err := ConversationRouteModelRequest(test.context)
@@ -87,8 +90,9 @@ func TestLegacyRouteModelRequestOnlyAddsDirectToolContractForEligibleSearch(t *t
 			if err != nil {
 				t.Fatalf("build legacy route request: %v", err)
 			}
-			if strings.Contains(legacy.Instructions, conversationRouteDirectToolInstructions) {
-				t.Fatalf("ineligible legacy request received the direct-tool contract: %s", legacy.Instructions)
+			got := strings.Contains(legacy.Instructions, conversationRouteDirectToolInstructions)
+			if got != test.toolInstructions {
+				t.Fatalf("legacy direct-tool contract eligibility = %t, want %t: %s", got, test.toolInstructions, legacy.Instructions)
 			}
 		})
 	}

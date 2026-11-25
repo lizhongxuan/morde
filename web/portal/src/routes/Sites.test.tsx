@@ -212,7 +212,8 @@ describe('Sites', () => {
     expect(await screen.findByText('候选快照')).toBeInTheDocument();
     await user.click(screen.getByRole('button', { name: '加载更多版本' }));
     expect(await screen.findByText(/加载更多版本失败：临时网络错误/)).toBeInTheDocument();
-    await user.click(screen.getByRole('button', { name: '重试' }));
+    const retryNotice = screen.getByText(/加载更多版本失败：临时网络错误/).closest('[role="alert"]') as HTMLElement;
+    await user.click(within(retryNotice).getByRole('button', { name: '重试' }));
 
     expect(await screen.findByText('v5')).toBeInTheDocument();
     await waitFor(() => expect(siteReleases).toHaveBeenNthCalledWith(3, site.id, 'release-next'));

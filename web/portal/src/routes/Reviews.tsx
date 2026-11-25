@@ -64,6 +64,7 @@ export function Reviews() {
     ? Math.ceil(pending.length / pageSize) + (hasNextPage ? 1 : 0)
     : Math.ceil(pendingCount / pageSize));
   const currentPage = Math.min(page, pageCount);
+  if (page !== currentPage) setPage(currentPage);
   const firstOnPage = (currentPage - 1) * pageSize;
   const targetCount = Math.min(currentPage * pageSize, pendingCount ?? currentPage * pageSize);
   const currentItems = pending.slice(firstOnPage, firstOnPage + pageSize);
@@ -81,10 +82,6 @@ export function Reviews() {
     : listErrorDetails?.code === 'forbidden' ? '请联系管理员确认审核权限。待处理数量和审核结果尚未确认。'
       : listErrorDetails?.code === 'not_found' ? '审核服务未返回列表，请联系管理员检查服务配置。待处理数量和审核结果尚未确认。'
         : `${listErrorDetails?.message ?? '读取审核事项失败'}。待处理数量和审核结果尚未确认。`;
-
-  useEffect(() => {
-    if (page !== currentPage) setPage(currentPage);
-  }, [page, currentPage]);
 
   useEffect(() => {
     if (showApprovalData && pending.length < targetCount && hasNextPage && !isFetchingNextPage &&

@@ -129,6 +129,59 @@ func TestConversationRouteRepairsOneInvalidOutputWithSeparateMeteredCall(t *test
 	}
 }
 
+func TestConversationRouteModelToolDecisionSettlesAndAppliesDirectTool(t *testing.T) {
+	client := &routeModelClientTest{reply: `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`}
+	store, gateway, principal, claim, _ := routeModelFixture(t, false, client)
+	ctx := context.Background()
+	if err := store.ReleaseConversationRoute(ctx, claim); err != nil {
+		t.Fatal(err)
+	}
+	routeWorker, err := worker.NewConversationRouteWorker(worker.ConversationRouteWorkerOptions{
+		Queue: store, Actions: store, Models: gateway, WorkerID: "route-direct-tool-model-test",
+		LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if found, err := routeWorker.RunOnce(ctx); err != nil || !found {
+		t.Fatalf("run direct-tool route: found=%t err=%v", found, err)
+	}
+	if calls := client.calls.Load(); calls != 1 {
+		t.Fatalf("controlled model calls = %d, want 1", calls)
+	}
+
+	var routeState, deliveryStatus, sourceTaskID string
+	var routeCallState, ledgerState, action string
+	var internalTaskID, internalCallID, toolName string
+	var arguments []byte
+	if err := store.pool.QueryRow(ctx, `SELECT r.state,m.delivery_status,COALESCE(m.task_id,''),c.state,l.state,
+COALESCE(c.decision->>'Action',''),i.task_id,i.call_id,i.tool_name,i.arguments
+FROM conversation_message_routes r
+JOIN conversation_messages m ON m.id=r.message_id
+JOIN conversation_route_model_calls c ON c.message_id=r.message_id AND c.phase='normal' AND c.attempt=r.route_attempt
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+JOIN conversation_route_internal_tool_calls i ON i.message_id=r.message_id
+WHERE r.message_id=$1`, claim.Message.ID).Scan(&routeState, &deliveryStatus, &sourceTaskID,
+		&routeCallState, &ledgerState, &action, &internalTaskID, &internalCallID, &toolName, &arguments); err != nil {
+		t.Fatal(err)
+	}
+	if routeState != "routed" || deliveryStatus != string(conversation.DeliveryApplied) || sourceTaskID != "" ||
+		routeCallState != "settled" || ledgerState != "settled" || action != string(app.ConversationRouteTool) ||
+		internalTaskID == "" || internalCallID != "morde_route_tool_"+claim.Message.ID || toolName != "morde_web_search" {
+		t.Fatalf("direct-tool route not settled and applied: route=%q delivery=%q sourceTask=%q modelCall=%q ledger=%q action=%q internalTask=%q call=%q tool=%q",
+			routeState, deliveryStatus, sourceTaskID, routeCallState, ledgerState, action, internalTaskID, internalCallID, toolName)
+	}
+	var decodedArguments struct {
+		Query string `json:"query"`
+	}
+	if err := json.Unmarshal(arguments, &decodedArguments); err != nil || decodedArguments.Query != "日本央行利率政策" {
+		t.Fatalf("persisted direct-tool arguments = %s, err=%v", arguments, err)
+	}
+	if _, err := store.GetTask(ctx, internalTaskID, principal.UserID); err != nil {
+		t.Fatalf("load persisted internal Broker Task: %v", err)
+	}
+}
+
 func TestConversationRouteModelPhaseUsesResultReviewRetryAttempt(t *testing.T) {
 	value := app.ConversationRouteContext{ResultReview: &app.ConversationTaskResultReview{}}
 	if phase := conversationRouteModelPhase(value); phase != "normal" {

@@ -5,7 +5,6 @@ import { useLocation } from 'react-router';
 import type { components } from '../api/schema';
 import { api, unwrapApiResponse } from '../api/client';
 import { errorDetails, portalApi } from '../app/api';
-import { isTransientNetworkError } from '../api/errors';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { FloatingError, FloatingNotice } from '../components/FloatingError';
@@ -202,13 +201,6 @@ export function GoalsAndSchedules() {
   const detail = goalDetail.data ? toGoalRecord(goalDetail.data) : null;
   const scheduleWriteError = scheduleCreate.error ?? scheduleUpdate.error ?? scheduleAction.error;
   const goalWriteError = goalCreate.error ?? goalUpdate.error ?? goalDelete.error ?? goalStatus.error;
-  const goalsNetworkError = goals.isError && isTransientNetworkError(goals.error);
-  const schedulesNetworkError = schedules.isError && isTransientNetworkError(schedules.error);
-  const hostsNetworkError = hosts.isError && isTransientNetworkError(hosts.error);
-  const preferencesNetworkError = preferences.isError && isTransientNetworkError(preferences.error);
-  const modelsNetworkError = models.isError && isTransientNetworkError(models.error);
-  const goalDetailNetworkError = goalDetail.isError && isTransientNetworkError(goalDetail.error);
-  const runsNetworkError = runs.isError && isTransientNetworkError(runs.error);
 
   return <section className="goals-grid">
     <section className="connection-section" aria-labelledby="goals-title" hidden={activeView !== 'goals'}>
@@ -221,10 +213,12 @@ export function GoalsAndSchedules() {
         onCancel={() => { setGoalFormOpen(false); goalCreate.reset(); }}
         onSubmit={(body) => goalCreate.mutate(body)}
       />}
-      {goalWriteError && <FloatingError className="error-card" role="alert">{errorDetails(goalWriteError).message}</FloatingError>}
-      {goals.isPending || (goalsNetworkError && !goals.data) ? <div className="loading-card" role="status">正在读取目标…</div>
-        : goals.isError && !goalsNetworkError ? <FloatingError className="error-card" role="alert">{errorDetails(goals.error).message}<button type="button" className="button button-secondary" onClick={() => void (goals.isFetchNextPageError ? goals.fetchNextPage() : goals.refetch())}>重试</button></FloatingError>
-          : goalRecords.length === 0 ? <div className="empty-card"><h3>还没有云端目标</h3></div>
+      {goalWriteError && <FloatingError inline className="error-card" role="alert">{errorDetails(goalWriteError).message}</FloatingError>}
+      {goals.isPending && !goals.data ? <div className="loading-card" role="status">正在读取目标…</div>
+        : goals.isError && !goals.data ? <FloatingError inline className="error-card" role="alert">无法读取目标：{errorDetails(goals.error).message}<button type="button" className="button button-secondary" onClick={() => void goals.refetch()}>重试</button></FloatingError>
+          : <>
+            {goals.isError && <FloatingError inline className="error-card" role="alert">目标刷新失败，当前仍显示最近一次确认的数据。{errorDetails(goals.error).message}<button type="button" className="button button-secondary" onClick={() => void goals.refetch()}>重试</button></FloatingError>}
+            {goalRecords.length === 0 ? <div className="empty-card"><h3>还没有云端目标</h3></div>
           : <ScreenPagination
             items={goalRecords}
             getKey={(goal) => goal.object_id}
@@ -245,9 +239,10 @@ export function GoalsAndSchedules() {
                 {deleteGoalID === goal.object_id ? <><button type="button" className="button button-danger" disabled={goalDelete.isPending} onClick={() => goalDelete.mutate(goal.object_id)}>确认删除</button><button type="button" className="button button-secondary" onClick={() => setDeleteGoalID(null)}>取消</button></> : <button type="button" className="button button-danger-quiet" onClick={() => setDeleteGoalID(goal.object_id)}>删除</button>}
               </div>
               {expandedGoalID === goal.object_id && <div className="schedule-runs">
-                {goalDetail.isPending || (goalDetailNetworkError && !goalDetail.data) ? <p role="status">正在读取目标详情…</p>
-                  : goalDetail.isError && !goalDetailNetworkError ? <FloatingError className="error-inline" role="alert">{errorDetails(goalDetail.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void goalDetail.refetch()}>重试</button></FloatingError>
+                {goalDetail.isPending && !goalDetail.data ? <p role="status">正在读取目标详情…</p>
+                  : goalDetail.isError && !goalDetail.data ? <FloatingError inline className="error-inline" role="alert">无法读取目标详情：{errorDetails(goalDetail.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void goalDetail.refetch()}>重试</button></FloatingError>
                     : detail && <>
+                      {goalDetail.isError && <FloatingError inline className="error-inline" role="alert">目标详情刷新失败，当前仍显示最近一次确认的数据。{errorDetails(goalDetail.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void goalDetail.refetch()}>重试</button></FloatingError>}
                       <p><strong>当前状态：</strong>{statusLabel(detail.body.status)} · <strong>服务端修订：</strong>{detail.revision}</p>
                       {editingGoalID === goal.object_id ? <GoalEditorForm
                         initial={detail.body}
@@ -259,6 +254,7 @@ export function GoalsAndSchedules() {
               </div>}
             </article>}
           />}
+          </>}
       {goals.hasNextPage && <button type="button" className="button button-secondary schedule-load-more" disabled={goals.isFetchingNextPage} onClick={() => void goals.fetchNextPage()}>{goals.isFetchingNextPage ? '正在加载…' : '加载更多目标'}</button>}
     </section>
 
@@ -267,9 +263,9 @@ export function GoalsAndSchedules() {
         <div><h2 id="schedules-title" className="sr-only">定时计划</h2><p className="muted">查看计划版本、运行状态和历史记录。</p></div>
         <button type="button" className="button button-primary" disabled={scheduleWriteDenied || hosts.isPending || hosts.isError || preferences.isPending || preferences.isError || defaultHostUnavailable || models.isPending || !modelItems.length} onClick={() => setScheduleForm({ mode: 'create' })}>＋ 新建云端计划</button>
       </div>
-      {scheduleWriteDenied && <FloatingError className="error-inline" role="alert">服务端拒绝了计划写操作（403）。此页已切换为只读状态，不会请求或保存额外授权凭据。</FloatingError>}
-      {scheduleWriteError && <FloatingError className="error-card" role="alert">{errorDetails(scheduleWriteError).message}</FloatingError>}
-      {preferences.isError && !preferencesNetworkError && <FloatingError className="error-card" role="alert">无法读取默认云端电脑设置，不能确定新计划的运行目标。<button type="button" className="button button-secondary" onClick={() => void preferences.refetch()}>重试</button></FloatingError>}
+      {scheduleWriteDenied && <FloatingError inline className="error-inline" role="alert">服务端拒绝了计划写操作（403）。此页已切换为只读状态，不会请求或保存额外授权凭据。</FloatingError>}
+      {scheduleWriteError && <FloatingError inline className="error-card" role="alert">{errorDetails(scheduleWriteError).message}</FloatingError>}
+      {preferences.isError && <FloatingError inline className="error-card" role="alert">无法读取默认云端电脑设置，不能确定新计划的运行目标。{preferences.data && '当前仍显示最近一次确认的设置。'}<button type="button" className="button button-secondary" onClick={() => void preferences.refetch()}>重试</button></FloatingError>}
       {defaultHostUnavailable && <FloatingNotice className="notice-warning" data-notice-label="默认主机不可用">当前默认云端电脑不可用。请先在云端电脑页面重新选择默认电脑；不会自动切换到其他电脑。</FloatingNotice>}
       {scheduleForm && <ScheduleEditor
         key={scheduleForm.mode === 'edit' ? scheduleForm.schedule.id : 'new-schedule'}
@@ -283,14 +279,16 @@ export function GoalsAndSchedules() {
           ? scheduleCreate.mutate(fields)
           : scheduleUpdate.mutate({ id: scheduleForm.schedule.id, fields })}
       />}
-      {(hosts.isError && !hostsNetworkError || models.isError && !modelsNetworkError) && <FloatingError className="error-card" role="alert">
-        <span>{hosts.isError && !hostsNetworkError ? `无法读取可用主机：${errorDetails(hosts.error).message}` : `无法读取可用模型：${errorDetails(models.error).message}`}</span>
-        <button type="button" className="button button-secondary" onClick={() => { if (hosts.isError && !hostsNetworkError) void hosts.refetch(); if (models.isError && !modelsNetworkError) void models.refetch(); }}>重试</button>
+      {(hosts.isError || models.isError) && <FloatingError inline className="error-card" role="alert">
+        <span>{hosts.isError ? `无法读取可用主机${hosts.data ? '，当前仍显示最近一次确认的数据' : ''}：${errorDetails(hosts.error).message}` : `无法读取可用模型${models.data ? '，当前仍显示最近一次确认的数据' : ''}：${errorDetails(models.error).message}`}</span>
+        <button type="button" className="button button-secondary" onClick={() => { if (hosts.isError) void hosts.refetch(); if (models.isError) void models.refetch(); }}>重试</button>
       </FloatingError>}
       {!hosts.isPending && !hosts.isError && !hostItems.length && <FloatingNotice className="notice-warning" data-notice-label="主机不可用">当前没有可访问的主机。可以创建仅文本计划；使用浏览器观察时必须选择 Host。</FloatingNotice>}
-      {schedules.isPending || (schedulesNetworkError && !schedules.data) ? <div className="loading-card" role="status">正在读取定时计划…</div>
-        : schedules.isError && !schedulesNetworkError ? <FloatingError className="error-card" role="alert">{errorDetails(schedules.error).message}<button type="button" className="button button-secondary" onClick={() => void (schedules.isFetchNextPageError ? schedules.fetchNextPage() : schedules.refetch())}>重试</button></FloatingError>
-          : scheduleRecords.length === 0 ? <div className="empty-card"><p>只有通过上方按钮提交创建后，计划才会写入云端。</p></div>
+      {schedules.isPending && !schedules.data ? <div className="loading-card" role="status">正在读取定时计划…</div>
+        : schedules.isError && !schedules.data ? <FloatingError inline className="error-card" role="alert">无法读取定时计划：{errorDetails(schedules.error).message}<button type="button" className="button button-secondary" onClick={() => void schedules.refetch()}>重试</button></FloatingError>
+          : <>
+            {schedules.isError && <FloatingError inline className="error-card" role="alert">计划刷新失败，当前仍显示最近一次确认的数据。{errorDetails(schedules.error).message}<button type="button" className="button button-secondary" onClick={() => void schedules.refetch()}>重试</button></FloatingError>}
+            {scheduleRecords.length === 0 ? <div className="empty-card"><p>只有通过上方按钮提交创建后，计划才会写入云端。</p></div>
             : <ScreenPagination
               items={scheduleRecords}
               getKey={(schedule) => schedule.id}
@@ -317,8 +315,8 @@ export function GoalsAndSchedules() {
                   <button type="button" className="button button-secondary" onClick={() => setExpandedScheduleID((current) => current === schedule.id ? null : schedule.id)}>{expandedScheduleID === schedule.id ? '收起运行记录' : '运行记录'}</button>
                 </div>
                 {expandedScheduleID === schedule.id && <div className="schedule-runs">
-                  {runs.isPending || (runsNetworkError && !runs.data) ? <p role="status">正在读取运行记录…</p>
-                    : runs.isError && !runsNetworkError ? <FloatingError className="error-inline" role="alert">{errorDetails(runs.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void (runs.isFetchNextPageError ? runs.fetchNextPage() : runs.refetch())}>重试</button></FloatingError>
+                  {runs.isPending && !runs.data ? <p role="status">正在读取运行记录…</p>
+                    : runs.isError && !runs.data ? <FloatingError inline className="error-inline" role="alert">无法读取运行记录：{errorDetails(runs.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void runs.refetch()}>重试</button></FloatingError>
                       : scheduleRuns.length ? <ScreenPagination
                         items={scheduleRuns}
                         getKey={(run) => run.id}
@@ -329,12 +327,14 @@ export function GoalsAndSchedules() {
                         className="schedule-run-pagination"
                         renderItem={(run) => <div className="schedule-run-row"><span>{run.scheduled_at ? formatDate(run.scheduled_at) : formatDate(run.created_at)} · {runStatusLabel(run.status)}{run.skip_reason ? ` · ${skipReasonLabel(run.skip_reason)}` : ''}</span><span>计划版本 {run.schedule_version}{run.task_id ? ` · 任务 ${run.task_id}` : ''}</span></div>}
                       />
-                        : <p>还没有运行记录。</p>}
+                      : <p>还没有运行记录。</p>}
+                  {runs.isError && runs.data && <FloatingError inline className="error-inline" role="alert">运行记录刷新失败，当前仍显示最近一次确认的数据。{errorDetails(runs.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void runs.refetch()}>重试</button></FloatingError>}
                   {runs.hasNextPage && <button type="button" className="button button-secondary" disabled={runs.isFetchingNextPage} onClick={() => void runs.fetchNextPage()}>{runs.isFetchingNextPage ? '正在加载…' : '加载更多运行记录'}</button>}
                 </div>}
               </article>;
               }}
             />}
+          </>}
       {schedules.hasNextPage && <button type="button" className="button button-secondary schedule-load-more" disabled={schedules.isFetchingNextPage} onClick={() => void schedules.fetchNextPage()}>{schedules.isFetchingNextPage ? '正在加载…' : '加载更多计划'}</button>}
     </section>
   </section>;
@@ -456,7 +456,7 @@ function ScheduleEditor({ initial, hosts, defaultHost, models, busy, onCancel, o
     <label>错过运行时间时<select value={misfirePolicy} onChange={(event) => setMisfirePolicy(event.target.value as typeof misfirePolicy)}><option value="skip">跳过</option><option value="run_once">补运行一次</option></select></label>
     <fieldset className="fieldset"><legend>通知事件</legend>{(['completed', 'failed', 'waiting_user'] as const).map((value) => <label className="checkbox-row" key={value}><input type="checkbox" checked={notificationEvents.includes(value)} onChange={() => toggleNotification(value)} />{({ completed: '运行完成', failed: '运行失败', waiting_user: '等待用户输入' })[value]}</label>)}</fieldset>
     {!initial && <p className="notice notice-warning">提交后会创建并启用这个云端计划。请检查主机、模型和触发时间。</p>}
-    {formError && <FloatingError>{formError}</FloatingError>}
+    {formError && <FloatingError inline>{formError}</FloatingError>}
     <div className="form-actions"><button type="button" className="button button-secondary" onClick={onCancel}>取消</button><button type="submit" className="button button-primary" disabled={busy || !selectedHostExists || !selectedModelExists || (kind === 'weekly' && weekdays.length === 0)}>{busy ? '保存中…' : initial ? '保存新版本' : '创建并启用'}</button></div>
   </form>;
 }

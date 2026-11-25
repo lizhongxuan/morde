@@ -9495,7 +9495,7 @@ export interface components {
             title: string;
             summary: string;
             /** @enum {string|null} */
-            failure_reason?: "not_dispatched" | "tool_failed_after_dispatch" | "side_effect_unknown" | "authorization_changed" | "resource_changed" | "connector_rate_limited" | null;
+            failure_reason?: "not_dispatched" | "tool_failed_after_dispatch" | "tool_execution_failed" | "side_effect_unknown" | "authorization_changed" | "resource_changed" | "connector_rate_limited" | null;
             /** @description True only when persisted evidence confirms this exact failed operation is safe to retry and any connector retry-after window has elapsed. */
             retryable: boolean;
             /**

@@ -101,4 +101,19 @@ describe('TaskApprovalCard', () => {
     });
     await waitFor(() => expect(onDecision).toHaveBeenCalledExactlyOnceWith('reject'));
   });
+
+  it('replaces the actionable embedded view with a read-only state after the server records a decision', async () => {
+    const onDecision = vi.fn().mockResolvedValue(undefined);
+    const { rerender } = render(<TaskApprovalCard approval={approval} onDecision={onDecision} />);
+    const firstFrame = screen.getByTitle('MCP App 操作审批');
+    await taskApprovalMcpAppDriver(firstFrame as HTMLIFrameElement).initialize();
+
+    rerender(<TaskApprovalCard approval={{ ...approval, status: 'approved', decision: 'approve', responded_at: '2026-11-25T00:00:00Z' }}
+      onDecision={onDecision} />);
+
+    expect(screen.queryByTitle('MCP App 操作审批')).not.toBeInTheDocument();
+    expect(screen.getByRole('region', { name: '已处理的审批' })).toHaveTextContent('审批已处理；任务后续状态等待更新。');
+    expect(screen.queryByRole('button', { name: '允许本次操作' })).not.toBeInTheDocument();
+    expect(onDecision).not.toHaveBeenCalled();
+  });
 });

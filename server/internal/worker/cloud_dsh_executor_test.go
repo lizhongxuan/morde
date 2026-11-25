@@ -2063,6 +2063,55 @@ func TestCloudDSHExecutorRunsAuthorizedToolAndReturnsDurableResultToNextModelCal
 	}
 }
 
+func TestCloudDSHExecutorReturnsDefinitiveToolFailureToSameAgent(t *testing.T) {
+	executor, _, _, _, models, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	const failure = "workspace revision changed before the read completed"
+	tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}, result: app.AgentToolResult{
+		Status: app.AgentToolFailed, Output: failure,
+	}}
+	executor.options.Tools = tools
+	models.responses = []app.ModelResponse{
+		{ToolCalls: []app.ModelToolCall{{CallID: "call_read_failed_1", Name: tool.Name,
+			Arguments: `{"workspace_id":"w1234567","path":"README.md"}`}},
+			StopReason: "tool_calls", Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 2}},
+		{Text: "读取失败，因为工作区版本发生变化；我没有继续使用旧结果。", StopReason: "stop",
+			Usage: app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 1}},
+	}
+
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("definitive tool failure run = %v", err)
+	}
+	if len(tools.calls) != 1 || len(models.calls) != 2 || models.calls[0].Task == nil || models.calls[1].Task == nil ||
+		models.calls[0].Task.AgentSessionID != models.calls[1].Task.AgentSessionID ||
+		!validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID,
+			cloudDSHExpectedRootDefinitions([]app.AgentToolDefinition{tool})) {
+		t.Fatalf("failure was not handled by the same Agent session: tool_calls=%d model_calls=%d", len(tools.calls), len(models.calls))
+	}
+	var second struct {
+		Messages []struct {
+			Role       string `json:"role"`
+			ToolCallID string `json:"toolCallId"`
+			Content    []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(models.calls[1].RawRequest, &second); err != nil {
+		t.Fatal(err)
+	}
+	foundFailure := false
+	for _, message := range second.Messages {
+		if message.Role == "tool" && message.ToolCallID == "call_read_failed_1" && len(message.Content) == 1 &&
+			message.Content[0].Text == "Tool failed: "+failure {
+			foundFailure = true
+		}
+	}
+	if !foundFailure {
+		t.Fatalf("same Agent did not receive the confirmed failure result: %s", models.calls[1].RawRequest)
+	}
+}
+
 func TestCloudDSHExecutorStopsAfterDurableTerminalToolAttempt(t *testing.T) {
 	executor, _, store, _, models, value := cloudDSHFixture(t)
 	logCore, logs := observer.New(zap.WarnLevel)
@@ -2133,17 +2182,18 @@ createInterface({ input: process.stdin }).on('line', raw => {
   if (frame.type === 'start') {
     start = frame
     const payload = JSON.stringify({ header: { id: frame.session_id }, from_seq: 0, events: [
-      { seq: 0, type: 'turn/start', data: { turn: 1 } },
-      { seq: 1, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
+      { seq: 0, type: 'request/header', data: { header: { config: { provider: 'morde', model: frame.model }, tools: frame.tools } } },
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
         message: { role: 'assistant', content: [{ type: 'tool-call', id: callID, name: toolName, arguments: argumentsText }] } } },
-      { seq: 2, type: 'tool/call', data: { turn: 1, step: 1, callId: callID, name: toolName, arguments: argumentsText } },
+      { seq: 3, type: 'tool/call', data: { turn: 1, step: 1, callId: callID, name: toolName, arguments: argumentsText } },
     ] })
-    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_pending', from_seq: 0, through_seq: 2,
+    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_pending', from_seq: 0, through_seq: 3,
       payload, sha256: digest(payload) })
   } else if (frame.type === 'checkpoint_ack') {
     emit({ type: 'agent_activity', ...identity(start), task_revision: start.task_revision,
       observation_sequence: ++sequence, phase: 'tool', state: 'started', activity_id: callID })
-    emit({ type: 'tool_call', id: 'tool_pending', ...identity(start), through_seq: 2, call_id: callID,
+    emit({ type: 'tool_call', id: 'tool_pending', ...identity(start), through_seq: 3, call_id: callID,
       name: toolName, arguments: args })
     emit({ type: 'agent_activity', ...identity(start), task_revision: start.task_revision,
       observation_sequence: ++sequence, phase: 'tool', state: 'waiting', activity_id: callID })
@@ -3300,15 +3350,16 @@ createInterface({ input: process.stdin }).on('line', raw => {
   if (frame.type === 'start') {
     start = frame
     const payload = JSON.stringify({ header: { id: frame.session_id }, from_seq: 0, events: [
-      { seq: 0, type: 'turn/start', data: { turn: 1 } },
-      { seq: 1, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
+      { seq: 0, type: 'request/header', data: { header: { config: { provider: 'morde', model: frame.model }, tools: frame.tools } } },
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
         message: { role: 'assistant', content: [{ type: 'tool-call', id: 'call_gate_1', name: toolName, arguments: argumentsText }] } } },
-      { seq: 2, type: 'tool/call', data: { turn: 1, step: 1, callId: 'call_gate_1', name: toolName, arguments: argumentsText } },
+      { seq: 3, type: 'tool/call', data: { turn: 1, step: 1, callId: 'call_gate_1', name: toolName, arguments: argumentsText } },
     ] })
-    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_gate', from_seq: 0, through_seq: 2,
+    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_gate', from_seq: 0, through_seq: 3,
       payload, sha256: digest(payload) })
   } else if (frame.type === 'checkpoint_ack') {
-    emit({ type: 'tool_call', id: 'tool_gate', ...identity(start), through_seq: 2, call_id: 'call_gate_1',
+    emit({ type: 'tool_call', id: 'tool_gate', ...identity(start), through_seq: 3, call_id: 'call_gate_1',
       name: toolName, arguments: args })
   } else if (frame.type === 'message_delivery') {
     if (frame.version !== 4 || frame.supersede_active !== true || frame.mode !== 'steer' ||
@@ -3415,15 +3466,16 @@ createInterface({ input: process.stdin }).on('line', raw => {
   if (frame.type === 'start') {
     start = frame
     const payload = JSON.stringify({ header: { id: frame.session_id }, from_seq: 0, events: [
-      { seq: 0, type: 'turn/start', data: { turn: 1 } },
-      { seq: 1, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
+      { seq: 0, type: 'request/header', data: { header: { config: { provider: 'morde', model: frame.model }, tools: frame.tools } } },
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
         message: { role: 'assistant', content: [{ type: 'tool-call', id: callID, name: toolName, arguments: argumentsText }] } } },
-      { seq: 2, type: 'tool/call', data: { turn: 1, step: 1, callId: callID, name: toolName, arguments: argumentsText } },
+      { seq: 3, type: 'tool/call', data: { turn: 1, step: 1, callId: callID, name: toolName, arguments: argumentsText } },
     ] })
-    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_dispatched', from_seq: 0, through_seq: 2,
+    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_dispatched', from_seq: 0, through_seq: 3,
       payload, sha256: digest(payload) })
   } else if (frame.type === 'checkpoint_ack') {
-    emit({ type: 'tool_call', id: 'tool_dispatched', ...identity(start), through_seq: 2, call_id: callID,
+    emit({ type: 'tool_call', id: 'tool_dispatched', ...identity(start), through_seq: 3, call_id: callID,
       name: toolName, arguments: args })
   } else if (frame.type === 'message_delivery') {
     if (frame.version !== 3 || frame.supersede_active === true || frame.mode !== 'steer' ||
@@ -3660,17 +3712,18 @@ createInterface({ input: process.stdin }).on('line', raw => {
   if (frame.type === 'start') {
     start = frame
     const payload = JSON.stringify({ header: { id: frame.session_id }, from_seq: 0, events: [
-      { seq: 0, type: 'turn/start', data: { turn: 1 } },
-      { seq: 1, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
+      { seq: 0, type: 'request/header', data: { header: { config: { provider: 'morde', model: frame.model }, tools: frame.tools } } },
+      { seq: 1, type: 'turn/start', data: { turn: 1 } },
+      { seq: 2, type: 'assistant/message', surfaceOp: 'append', data: { turn: 1, step: 1,
         message: { role: 'assistant', content: [{ type: 'tool-call', id: 'call_stale_1', name: toolName, arguments: argumentsText }] } } },
-      { seq: 2, type: 'tool/call', data: { turn: 1, step: 1, callId: 'call_stale_1', name: toolName, arguments: argumentsText } },
-      { seq: 3, type: 'user/message', surfaceOp: 'append', data: { id: 'm7654321', role: 'user',
+      { seq: 3, type: 'tool/call', data: { turn: 1, step: 1, callId: 'call_stale_1', name: toolName, arguments: argumentsText } },
+      { seq: 4, type: 'user/message', surfaceOp: 'append', data: { id: 'm7654321', role: 'user',
         content: [{ type: 'text', text: 'Use the new heading.' }], source: { kind: 'user' } } },
     ] })
-    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_stale', from_seq: 0, through_seq: 3,
+    emit({ type: 'checkpoint', ...identity(frame), id: 'checkpoint_stale', from_seq: 0, through_seq: 4,
       payload, sha256: digest(payload) })
   } else if (frame.type === 'checkpoint_ack') {
-    emit({ type: 'tool_call', id: 'tool_stale', ...identity(start), through_seq: 2, call_id: 'call_stale_1',
+    emit({ type: 'tool_call', id: 'tool_stale', ...identity(start), through_seq: 3, call_id: 'call_stale_1',
       name: toolName, arguments: args })
   }
 })
@@ -3765,11 +3818,22 @@ func TestCloudDSHExecutorRecoversCompletedCheckpointWithoutReplayingModel(t *tes
 		supervisor.launch.Fence.AgentSessionID != previous.AgentSessionID || supervisor.launch.Fence.AgentInstanceID == previous.AgentInstanceID {
 		t.Fatalf("recovery did not retain the session under a new generation: %#v", supervisor.launch.Fence)
 	}
+	passes, previousFrom := 0, int64(-1)
 	for i, request := range checkpoints.reads {
-		if request.Fence != supervisor.launch.Fence || request.Through != tail.Through || !bytes.Equal(request.ThroughDigest, tail.Digest) ||
-			(i == 0 && request.From != 0) || (i > 0 && request.From <= checkpoints.reads[i-1].From) {
+		if request.Fence != supervisor.launch.Fence || request.Through != tail.Through || !bytes.Equal(request.ThroughDigest, tail.Digest) {
 			t.Fatalf("checkpoint read %d was not pinned to the active generation/history: %#v", i, request)
 		}
+		if request.From == 0 {
+			passes++
+			previousFrom = -1
+		}
+		if request.From <= previousFrom {
+			t.Fatalf("checkpoint read %d did not advance within its pinned history pass: %#v", i, request)
+		}
+		previousFrom = request.From
+	}
+	if passes != 2 {
+		t.Fatalf("pinned checkpoint read passes = %d; want preflight selection and Runtime restore", passes)
 	}
 }
 
@@ -3819,6 +3883,104 @@ func TestCloudDSHExecutorRejectsChangedToolDefinitionsDuringRecovery(t *testing.
 	if len(checkpoints.reads) == 0 || len(models.calls) != 1 || len(tools.calls) != 0 || len(tools.recoveryCalls) != 0 || store.stopped != 2 {
 		t.Fatalf("checkpoint reads=%d model calls=%d tool calls=%d recovery calls=%d stopped=%d",
 			len(checkpoints.reads), len(models.calls), len(tools.calls), len(tools.recoveryCalls), store.stopped)
+	}
+}
+
+func TestCloudDSHExecutorRejectsRemovedOrSchemaChangedToolDuringRecovery(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		change func(*app.AgentToolDefinition)
+	}{
+		{name: "removed", change: func(tool *app.AgentToolDefinition) { *tool = app.AgentToolDefinition{} }},
+		{name: "schema changed", change: func(tool *app.AgentToolDefinition) {
+			tool.Parameters = json.RawMessage(`{"type":"object","properties":{"workspace_id":{"type":"string"}},"required":["workspace_id"],"additionalProperties":false}`)
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor, supervisor, store, checkpoints, models, value := cloudDSHFixture(t)
+			tool := cloudDSHReadTool()
+			tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}}
+			executor.options.Tools = tools
+			if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+				t.Fatalf("initial run = %v", err)
+			}
+			previous := supervisor.launch.Fence
+			tail := checkpoints.commands[len(checkpoints.commands)-1]
+			value.AgentInstanceID = previous.AgentInstanceID
+			value.AgentGeneration = previous.AgentGeneration
+			value.AgentSessionID = previous.AgentSessionID
+			value.AgentEngineVersion = previous.EngineVersion
+			value.AgentProfileVersion = previous.ProfileVersion
+			value.CheckpointThroughSequence = tail.Through
+			value.CheckpointDigest = append([]byte(nil), tail.Digest...)
+			value.Lease.Version++
+			expires := time.Now().Add(time.Minute)
+			value.Lease.ExpiresAt = &expires
+			if test.name == "removed" {
+				tools.definitions = nil
+			} else {
+				definition := tools.definitions[0]
+				test.change(&definition)
+				tools.definitions[0] = definition
+			}
+
+			err := executor.ExecuteTask(context.Background(), value)
+			if err == nil || errors.Is(err, ErrCloudDSHCompletionPending) {
+				t.Fatalf("recovery after %s old tool definition = %v; expected fail-closed mismatch", test.name, err)
+			}
+			if len(checkpoints.reads) == 0 || len(models.calls) != 1 || len(tools.calls) != 0 || len(tools.recoveryCalls) != 0 || store.stopped != 2 {
+				t.Fatalf("checkpoint reads=%d model calls=%d tool calls=%d recovery calls=%d stopped=%d",
+					len(checkpoints.reads), len(models.calls), len(tools.calls), len(tools.recoveryCalls), store.stopped)
+			}
+		})
+	}
+}
+
+func TestCloudDSHExecutorRestoresPinnedToolSetWhenCurrentDefinitionsAreAdditive(t *testing.T) {
+	executor, supervisor, store, checkpoints, models, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	tools := &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}}
+	executor.options.Tools = tools
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("initial run = %v", err)
+	}
+	previous := supervisor.launch.Fence
+	tail := checkpoints.commands[len(checkpoints.commands)-1]
+	value.AgentInstanceID = previous.AgentInstanceID
+	value.AgentGeneration = previous.AgentGeneration
+	value.AgentSessionID = previous.AgentSessionID
+	value.AgentEngineVersion = previous.EngineVersion
+	value.AgentProfileVersion = previous.ProfileVersion
+	value.CheckpointThroughSequence = tail.Through
+	value.CheckpointDigest = append([]byte(nil), tail.Digest...)
+	value.Lease.Version++
+	expires := time.Now().Add(time.Minute)
+	value.Lease.ExpiresAt = &expires
+	newTool := app.AgentToolDefinition{ModelTool: app.ModelTool{Name: "file_search", Description: "Search workspace files.",
+		Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)}}
+	tools.definitions = append(tools.definitions, newTool)
+	checkpoints.pending = []app.AgentConversationMessage{{ID: "m1234567", Content: "Use the same pinned tools."}}
+
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("recovery with additive authorized tool = %v", err)
+	}
+	expected := cloudDSHExpectedRootDefinitions([]app.AgentToolDefinition{tool})
+	if len(models.calls) != 2 || !validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, expected) ||
+		bytes.Contains(models.calls[1].RawRequest, []byte(newTool.Name)) || len(tools.calls) != 0 || store.stopped != 2 {
+		t.Fatalf("recovered model did not retain the exact pinned tool set: model calls=%d valid pinned request=%t new tool mentioned=%t tool calls=%d stopped=%d",
+			len(models.calls), len(models.calls) > 1 && validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, expected),
+			len(models.calls) > 1 && bytes.Contains(models.calls[1].RawRequest, []byte(newTool.Name)), len(tools.calls), store.stopped)
+	}
+	headerFound := false
+	for i, command := range checkpoints.commands {
+		found, _, err := cloudDSHCheckpointToolSelection(command.Payload, expected)
+		if err != nil {
+			t.Fatalf("checkpoint %d changed the pinned tool set after additive recovery: %v", i, err)
+		}
+		headerFound = headerFound || found
+	}
+	if !headerFound {
+		t.Fatal("no checkpoint persisted the pinned tool set after additive recovery")
 	}
 }
 
@@ -3994,21 +4156,25 @@ func TestCloudDSHExecutorReconcilesEveryPinnedToolCallBeforeSettling(t *testing.
 
 	value.AgentInstanceID, value.AgentGeneration, value.AgentSessionID = "agent_previous", 1, "session_previous"
 	value.AgentEngineVersion, value.AgentProfileVersion = cloudDSHEngineVersion, cloudDSHProfileVersion
-	value.CheckpointThroughSequence = 7
+	value.CheckpointThroughSequence = 8
 	value.Usage.ToolCalls, value.Budget.ToolCalls = 1, 1
+	rootDefinitions := cloudDSHExpectedRootDefinitions([]app.AgentToolDefinition{tool})
 	payload := cloudDSHCheckpointPayload(value.AgentSessionID, 0,
-		checkpointTurnStart(0, "turn/start", map[string]any{"turn": 1}),
-		checkpointTurnStart(1, "step/start", map[string]any{"turn": 1, "step": 1}),
-		checkpointAssistantCall(2, "call_write_1"),
-		checkpointToolCall(3, "call_write_1"),
-		checkpointToolResult(4, "call_write_1", checkpointToolOutput, 3),
-		checkpointAssistantText(5, "Saved the file."),
-		checkpointTurnEnd(6, "step/end", map[string]any{"turn": 1, "step": 1}),
-		checkpointTurnEnd(7, "turn/end", map[string]any{"turn": 1, "reason": map[string]any{"kind": "completed"}}),
+		checkpointTurnStart(0, "request/header", map[string]any{"header": map[string]any{
+			"config": map[string]any{"provider": "morde", "model": "test-model"}, "tools": cloudDSHToolPayload(rootDefinitions),
+		}}),
+		checkpointTurnStart(1, "turn/start", map[string]any{"turn": 1}),
+		checkpointTurnStart(2, "step/start", map[string]any{"turn": 1, "step": 1}),
+		checkpointAssistantCall(3, "call_write_1"),
+		checkpointToolCall(4, "call_write_1"),
+		checkpointToolResult(5, "call_write_1", checkpointToolOutput, 4),
+		checkpointAssistantText(6, "Saved the file."),
+		checkpointTurnEnd(7, "step/end", map[string]any{"turn": 1, "step": 1}),
+		checkpointTurnEnd(8, "turn/end", map[string]any{"turn": 1, "reason": map[string]any{"kind": "completed"}}),
 	)
 	digest := sha256.Sum256(payload)
 	value.CheckpointDigest = append([]byte(nil), digest[:]...)
-	checkpoints.commands = []app.AgentCheckpointCommand{{From: 0, Through: 7, Digest: digest[:], Payload: payload}}
+	checkpoints.commands = []app.AgentCheckpointCommand{{From: 0, Through: 8, Digest: digest[:], Payload: payload}}
 	previousFence := app.AgentInstanceFence{TaskID: value.ID, OwnerID: value.OwnerID, InitiatorID: value.InitiatorID, AgentInstanceID: value.AgentInstanceID,
 		AgentSessionID: value.AgentSessionID, SupervisorID: "supervisor-test", AgentGeneration: 1,
 		AuthorizationVersion: value.Authorization.Version, LeaseOwner: "previous-worker", LeaseVersion: value.Lease.Version - 1,
@@ -4033,7 +4199,7 @@ createInterface({input:process.stdin}).on('line', line => {
   } else if (frame.type === 'checkpoint_page') {
     send({type:'agent_activity',...identity,task_revision:taskRevision,observation_sequence:++sequence,
       phase:'tool',state:'started',activity_id:'call_write_1'})
-    send({type:'tool_call',id:'tool_1',...identity,through_seq:7,call_id:'call_write_1',name:'file_write',
+    send({type:'tool_call',id:'tool_1',...identity,through_seq:8,call_id:'call_write_1',name:'file_write',
       arguments:{workspace_id:'w1234567',path:'notes.txt',content:'saved'}})
     timer = setInterval(() => send({type:'agent_heartbeat',...identity,task_revision:taskRevision,
       observation_sequence:++sequence,phase:'tool',activity_id:'call_write_1'}),20)
@@ -4043,7 +4209,7 @@ createInterface({input:process.stdin}).on('line', line => {
     send({type:'agent_activity',...identity,task_revision:taskRevision,observation_sequence:++sequence,
       phase:'tool',state:'completed',activity_id:'call_write_1'})
     send({type:'agent_status',...identity,task_revision:taskRevision,observation_sequence:++sequence,status:'idle'})
-    process.stdout.write(JSON.stringify({type:'settled',...identity,state:'completed_candidate',through_seq:7}) + '\n', () => process.exit(0))
+    process.stdout.write(JSON.stringify({type:'settled',...identity,state:'completed_candidate',through_seq:8}) + '\n', () => process.exit(0))
   }
 })
 setInterval(() => {}, 1000)`

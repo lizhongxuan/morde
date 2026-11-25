@@ -9,7 +9,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -279,13 +278,10 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 					}
 				}
 			}
-			// Classification failed after every model-side recovery. Fall
-			// back to the keyword + last-route heuristic instead of
-			// failing the route: follow the previous task on a clear
-			// continuation, start a new task on an explicit new-task
-			// signal, and ask the user when uncertain. An ambiguous
-			// message is never silently dropped into a task.
-			w.options.Logger.Warn("conversation route classification failed; applying heuristic fallback",
+			// Classification failed after every model-side recovery. Use
+			// bounded fallbacks only where they do not execute task-control
+			// actions; ambiguous requests are clarified without execution.
+			w.options.Logger.Warn("conversation route classification failed; requesting safe clarification",
 				zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
 				zap.String("failure_code", string(domain.CodeOf(err))))
 			decision = conversationRouteClassifyFallback(classifyContext)
@@ -304,7 +300,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 			}
 		}
 		// The model output can contain user data, so log metadata only.
-		w.options.Logger.Warn("conversation route model output is invalid; applying heuristic fallback",
+		w.options.Logger.Warn("conversation route model output is invalid; requesting safe clarification",
 			zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
 			zap.String("failure_code", "invalid_model_output"),
 			zap.Int("invalid_output_length_bytes", decision.InvalidOutputLengthBytes),
@@ -695,9 +691,11 @@ func conversationRouteContextSizeDetails(value app.ConversationRouteContext) (in
 }
 
 func safeConversationRouteDecision(value app.ConversationRouteContext, decision app.ConversationRouteDecision) app.ConversationRouteDecision {
-	clarify := app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: "请说明要修改哪个任务，或是否开始一个新任务。"}
+	clarify := app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+		Question: "我还不能安全确认这项操作的目标或范围，因此尚未执行。请补充具体目标，或说明要处理哪项任务。"}
 	clarify.ModelOutput = decision.ModelOutput
 	if !app.ValidConversationRouteModelOutput(decision.ModelOutput) ||
+		!app.ValidConversationRouteFileDeliveryIntent(decision.Action, decision.FileDeliveryIntent) ||
 		decision.Action != app.ConversationRouteReply && decision.Reply != "" ||
 		decision.Action != app.ConversationRouteTool && (decision.ToolName != "" || decision.ToolArguments != "") {
 		return clarify
@@ -734,7 +732,7 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 		}
 		return clarify
 	case app.ConversationRouteNew:
-		if decision.TaskID == "" && decision.TargetMessageID == "" && (!decision.ExplicitNew || app.ConversationRouteHasExplicitNewIntentForContext(value)) &&
+		if decision.TaskID == "" && decision.TargetMessageID == "" &&
 			decision.ExpectedRevision == 0 && decision.Question == "" &&
 			(!decision.ExplicitNew || len(decision.AggregateMessageIDs) == 0) &&
 			app.ValidConversationRouteDependencyIDs(decision.DependencyTaskIDs, value.Candidates) &&
@@ -764,7 +762,6 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 	case app.ConversationRouteSteer:
 		if decision.Acknowledge || decision.TaskID == "" || decision.TargetMessageID != "" || decision.ExplicitNew || decision.Question != "" ||
 			decision.ExpectedRevision < 0 || len(decision.DependencyTaskIDs) != 0 || len(decision.AggregateMessageIDs) != 0 ||
-			app.ConversationRouteHasHighRiskModificationIntent(value.Content) ||
 			!app.ValidConversationRouteSteerTarget(decision.TaskID, value) {
 			return clarify
 		}
@@ -810,283 +807,28 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 	return clarify
 }
 
-// conversationRouteClassifyFallback safely routes a message whose model
-// classification failed. It never issues a stop action: task control must be
-// semantically classified by the model, and uncertain control requests are
-// clarified. Existing narrow fallbacks for independent work and safe
-// continuation remain bounded by the route snapshot.
+// conversationRouteClassifyFallback safely handles a message whose model
+// classification failed. It never derives a task action from message text.
 func conversationRouteClassifyFallback(value app.ConversationRouteContext) app.ConversationRouteDecision {
-	if app.ConversationRouteHasExplicitControlIntentForContext(value) {
-		if value.ReferenceUnavailable {
-			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
-		}
-		if app.ConversationRouteHasExplicitPauseIntentForContext(value) {
-			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-				Question: "当前不能将暂停作为停止执行。请明确是否要停止该任务。"}
-		}
-		if app.ConversationRouteHasExplicitNewIntentForContext(value) {
-			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-				Question: "这条消息同时包含任务操作和新任务，请分别说明目标和要执行的工作。"}
-		}
-		if action, ok := conversationRouteExplicitControlFallbackAction(value.Content); ok &&
-			!app.ConversationRouteHasHighRiskModificationIntent(value.Content) {
-			if candidate, found := conversationRouteExplicitControlFallbackTarget(value); found {
-				return app.ConversationRouteDecision{Action: action, TaskID: candidate.TaskID, ExpectedRevision: candidate.Revision}
-			}
-		}
-		if app.ConversationRouteHasHighRiskModificationIntent(value.Content) {
-			return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-				Question: "这条请求包含可能改变任务计划、目标或权限的内容。我还不能安全确认具体改动，请把要修改的部分说明清楚。"}
-		}
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "我无法安全确认这条任务操作的目标和范围，因此没有执行操作。请明确要操作的任务，或确认是否要停止全部活动任务。"}
+	if value.ReferenceUnavailable {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
 	}
-	if (len(value.Candidates) != 0 || value.ReferenceTaskID != "") &&
-		app.ConversationRouteHasHighRiskModificationIntent(value.Content) {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "这条请求包含可能改变任务计划、目标或权限的内容。我还不能安全确认具体改动，请把要修改的部分说明清楚。"}
-	}
-	if decision, ok := app.ConversationRouteLongMessageFallback(value); ok {
-		return decision
-	}
-	if value.ResultReview == nil && !value.PreviousMissing && !value.PreviousUnresolved && !value.ReferenceUnavailable &&
-		!value.CandidateSetIncomplete && !value.TaskCandidateSetIncomplete && !value.RequestCandidateSetIncomplete &&
-		!value.ContentTruncated && len(value.ContentSources) == 0 && !app.ConversationRouteHasTaskDependencyIntent(value.Content) &&
-		app.ConversationRouteHasExplicitNewIntentForContext(value) {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}
-	}
-	if app.ConversationRouteIndependentFallbackEligible(value) &&
-		len(value.Candidates) == 0 && app.ConversationRouteHasExplicitSearchIntent(value.Content) {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteNew}
-	}
-	if app.ConversationRouteIndependentFallbackEligible(value) {
-		if intent, explicit := app.RoutedFileDeliveryDirective(value.Content, false); explicit && intent == task.FileDeliveryRequired {
-			return app.ConversationRouteDecision{Action: app.ConversationRouteNew}
-		}
-		if app.ConversationRouteHasExplicitTaskWorkIntent(value) {
-			return app.ConversationRouteDecision{Action: app.ConversationRouteNew}
-		}
-	}
-	target := value.ReferenceTaskID
-	if target == "" {
-		target = value.PreviousTaskID
-	}
-	if target != "" && app.ValidConversationRouteSteerTarget(target, value) &&
-		conversationRouteLooksLikeContinuation(value.Content) {
-		for _, candidate := range value.Candidates {
-			if candidate.TaskID == target {
-				return app.ConversationRouteDecision{Action: app.ConversationRouteSteer, TaskID: target,
-					ExpectedRevision: candidate.Revision}
-			}
-		}
-	}
-	// When the previous message itself is missing, do not offer to continue
-	// it: ask the user to supply the missing context instead. This reuses
-	// the wording the safety check uses for the same state. A predecessor
-	// that merely ended unresolved (for example waiting_user after a
-	// clarification was delivered) is known state, not missing context,
-	// so it falls through to the continue-or-new question below instead
-	// of demanding the context be resupplied.
 	if value.PreviousMissing {
 		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
 			Question: "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。"}
 	}
 	if value.PreviousUnresolved {
 		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "上一条请求还没有完成；当前没有执行任务操作。你希望把这条消息作为该任务的补充，还是开始一项独立工作？"}
+			Question: "上一条请求还没有完成，这条消息尚未执行。请补充你希望完成的目标，以及它与上一项工作的关系。"}
 	}
-	if len(value.Candidates) == 0 {
+	if value.ContentTruncated || len(value.ContentSources) != 0 {
 		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "我还不能确定你希望我直接回答，还是开始一项需要执行的工作；当前没有执行任务操作。请补充具体目标。"}
+			Question: "我还不能确认这条请求的完整目标，因此尚未执行。请补充完整需求或说明希望完成的工作。"}
+	}
+	if value.ResultReview != nil {
+		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
+			Question: "我无法确认这条结果反馈的处理意图，因此尚未修改任务结果。请补充希望调整的内容。"}
 	}
 	return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-		Question: "我还不能确定这条请求是要接续哪项任务，还是作为独立工作开始；当前没有执行任务操作。请告诉我目标任务，或补充独立工作的目标。"}
-}
-
-func conversationRouteExplicitControlFallbackAction(content string) (app.ConversationRouteAction, bool) {
-	var normalized strings.Builder
-	for _, char := range strings.ToLower(content) {
-		if unicode.IsSpace(char) || unicode.IsPunct(char) || unicode.IsSymbol(char) {
-			continue
-		}
-		normalized.WriteRune(char)
-	}
-	value := normalized.String()
-	preambles := []string{"麻烦你", "请帮我", "请帮忙", "帮我", "麻烦", "请你", "请", "你能不能", "你能否", "能不能", "能否", "现在", "然后", "please", "couldyou"}
-	for {
-		stripped := false
-		for _, preamble := range preambles {
-			if strings.HasPrefix(value, preamble) {
-				value = strings.TrimPrefix(value, preamble)
-				stripped = true
-				break
-			}
-		}
-		if !stripped {
-			break
-		}
-	}
-	if value == "" {
-		return "", false
-	}
-	var actions []app.ConversationRouteAction
-	stopVerbs := []string{"停止", "停掉", "取消", "撤销", "终止", "stop", "cancel", "terminate", "abort"}
-	continueVerbs := []string{"继续", "恢复", "接着", "续接", "continue", "resume"}
-	statusQueries := []string{"查看", "查询", "查下", "查一下", "看下", "看一下", "检查", "告诉", "汇报", "show", "check", "get", "whatisthe"}
-	if hasRoutePrefix(value, continueVerbs) {
-		actions = append(actions, app.ConversationRouteUpdate)
-	}
-	if hasRoutePrefix(value, statusQueries) && containsRouteIntent(value, []string{"任务", "进度", "状态", "运行到哪", "task", "progress", "status"}) {
-		actions = append(actions, app.ConversationRouteStatus)
-	}
-	if len(actions) != 1 {
-		return "", false
-	}
-	for _, verb := range append(append(stopVerbs, continueVerbs...), statusQueries...) {
-		if strings.HasPrefix(value, verb) && app.ConversationRouteHasExplicitControlIntent(strings.TrimPrefix(value, verb)) {
-			return "", false
-		}
-	}
-	return actions[0], true
-}
-
-func conversationRouteExplicitControlFallbackTarget(value app.ConversationRouteContext) (app.ConversationRouteCandidate, bool) {
-	if value.ContentTruncated || value.ResultReview != nil || value.PreviousMissing || value.ReferenceUnavailable ||
-		value.CurrentMessageHasAttachments ||
-		(value.CandidateSetIncomplete || value.TaskCandidateSetIncomplete || value.RequestCandidateSetIncomplete) && value.ReferenceTaskID == "" {
-		return app.ConversationRouteCandidate{}, false
-	}
-	active := make([]app.ConversationRouteCandidate, 0, len(value.Candidates))
-	for _, candidate := range value.Candidates {
-		if candidate.InitiatorID == value.ActorID && candidate.Revision >= 0 && activeConversationRouteCandidate(candidate.Status) {
-			active = append(active, candidate)
-		}
-	}
-	mentionedIDs := make(map[string]bool)
-	for _, word := range strings.FieldsFunc(strings.ToLower(value.Content), func(char rune) bool {
-		return !(char >= 'a' && char <= 'z' || char >= '0' && char <= '9')
-	}) {
-		if domain.ValidTaskID(word) {
-			mentionedIDs[word] = true
-		}
-	}
-	var exactMatches []app.ConversationRouteCandidate
-	for _, candidate := range active {
-		if mentionedIDs[candidate.TaskID] || !candidate.ObjectiveTruncated && candidate.Objective != "" && strings.Contains(value.Content, candidate.Objective) {
-			exactMatches = append(exactMatches, candidate)
-			delete(mentionedIDs, candidate.TaskID)
-		}
-	}
-	if len(mentionedIDs) != 0 || len(exactMatches) > 1 {
-		return app.ConversationRouteCandidate{}, false
-	}
-	if len(exactMatches) == 1 && value.ReferenceTaskID != "" && value.ReferenceTaskID != exactMatches[0].TaskID {
-		return app.ConversationRouteCandidate{}, false
-	}
-	if len(exactMatches) == 1 {
-		return exactMatches[0], true
-	}
-	if !conversationRouteReferencesCurrentTask(value.Content) {
-		return app.ConversationRouteCandidate{}, false
-	}
-	targetID := value.ReferenceTaskID
-	if targetID == "" {
-		targetID = value.PreviousTaskID
-	}
-	if targetID != "" {
-		var target app.ConversationRouteCandidate
-		count := 0
-		for _, candidate := range active {
-			if candidate.TaskID == targetID {
-				target = candidate
-				count++
-			}
-		}
-		return target, count == 1
-	}
-	if !value.TaskCandidateSetIncomplete && !value.CandidateSetIncomplete && len(active) == 1 {
-		return active[0], true
-	}
-	return app.ConversationRouteCandidate{}, false
-}
-
-func conversationRouteReferencesCurrentTask(content string) bool {
-	var normalized strings.Builder
-	for _, char := range strings.ToLower(content) {
-		if !unicode.IsSpace(char) && !unicode.IsPunct(char) && !unicode.IsSymbol(char) {
-			normalized.WriteRune(char)
-		}
-	}
-	value := normalized.String()
-	if containsRouteIntent(value, []string{"当前任务", "这个任务", "这项任务", "该任务", "此任务", "上个任务", "上一个任务", "现有任务", "原任务", "停止它", "继续它", "currenttask", "thistask", "thattask", "previoustask"}) {
-		return true
-	}
-	for _, prefix := range []string{"请帮我", "麻烦你", "请你", "帮我", "麻烦", "请", "please"} {
-		value = strings.TrimPrefix(value, prefix)
-	}
-	switch value {
-	case "停止", "停止任务", "取消", "取消任务", "暂停", "暂停任务", "继续", "继续任务", "恢复", "恢复任务", "查看任务状态", "查询任务状态", "查看任务进度", "查询任务进度", "stop", "stopthetask", "cancel", "continue", "resume":
-		return true
-	default:
-		return false
-	}
-}
-
-func hasRoutePrefix(value string, prefixes []string) bool {
-	for _, prefix := range prefixes {
-		if strings.HasPrefix(value, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func containsRouteIntent(value string, markers []string) bool {
-	for _, marker := range markers {
-		if strings.Contains(value, marker) {
-			return true
-		}
-	}
-	return false
-}
-
-func activeConversationRouteCandidate(status task.Status) bool {
-	switch status {
-	case task.StatusQueued, task.StatusRunning, task.StatusWaitingUser, task.StatusPausing, task.StatusPaused, task.StatusCancelling:
-		return true
-	default:
-		return false
-	}
-}
-
-// conversationRouteLooksLikeContinuation reports whether the message text
-// reads as an addition or correction to the previous task rather than an
-// independent request. Only narrow, high-precision signals count: a bare
-// acknowledgement, or a leading addition/correction marker. Anything else
-// is treated as uncertain and ends in a clarification question.
-func conversationRouteLooksLikeContinuation(content string) bool {
-	if app.ConversationRouteHasHighRiskModificationIntent(content) {
-		return false
-	}
-	var normalized strings.Builder
-	for _, char := range strings.ToLower(content) {
-		if unicode.IsSpace(char) || unicode.IsPunct(char) || unicode.IsSymbol(char) {
-			continue
-		}
-		normalized.WriteRune(char)
-	}
-	value := normalized.String()
-	if value == "" {
-		return false
-	}
-	switch value {
-	case "好", "好的", "可以", "行", "嗯", "对", "就这样", "没问题", "ok", "yes", "接着":
-		return true
-	}
-	for _, marker := range []string{"补充", "追加", "再加", "加上", "改成", "换成", "调整一下", "修改一下"} {
-		if strings.HasPrefix(value, marker) {
-			return true
-		}
-	}
-	return false
+		Question: "我还不能确认你希望完成什么，因此尚未执行任务操作。请补充具体目标。"}
 }

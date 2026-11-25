@@ -174,7 +174,7 @@ func TestTrimConversationRouteHistoryReferencesMarksAuthorizedSearch(t *testing.
 		t.Fatal(err)
 	}
 	if !strings.Contains(request.Instructions, "morde_current_conversation_history_search") ||
-		!strings.Contains(request.Instructions, "authorized originals") ||
+		!strings.Contains(request.Instructions, "authorized history") ||
 		!strings.Contains(request.Input[0].Text, `"history_incomplete":true`) ||
 		strings.Contains(request.Input[0].Text, "m0000001") || !strings.Contains(request.Input[0].Text, "m0000002") {
 		t.Fatalf("incomplete history did not direct the classifier to authorized source search: instructions=%q input=%q",

@@ -837,8 +837,27 @@ function MemoryRow({ item, api, canRestore, canProposeRule, onSave, onRestore, o
 }) {
   const { notify } = useToast();
   const itemBodySignature = JSON.stringify(item.body);
-  const [content, setContent] = useState(asString(item.body.content));
-  const [category, setCategory] = useState(asString(item.body.category));
+  const draftSignature = JSON.stringify([item.object_id, item.revision, itemBodySignature]);
+  const [draft, setDraft] = useState(() => ({
+    signature: draftSignature,
+    content: asString(item.body.content),
+    category: asString(item.body.category),
+  }));
+  const currentDraft = draft.signature === draftSignature ? draft : {
+    signature: draftSignature,
+    content: asString(item.body.content),
+    category: asString(item.body.category),
+  };
+  const updateDraft = (field: 'content' | 'category', value: string) => {
+    setDraft((previous) => {
+      const base = previous.signature === draftSignature ? previous : {
+        signature: draftSignature,
+        content: asString(item.body.content),
+        category: asString(item.body.category),
+      };
+      return { ...base, [field]: value };
+    });
+  };
   const [historyOpen, setHistoryOpen] = useState(false);
   const [history, setHistory] = useState<PersonalMemoryRevision[] | null>(null);
   const [historyCursor, setHistoryCursor] = useState<string | null>(null);
@@ -847,10 +866,6 @@ function MemoryRow({ item, api, canRestore, canProposeRule, onSave, onRestore, o
   const [restoreNotice, setRestoreNotice] = useState<string | null>(null);
   const requestVersion = useRef(0);
   const historySectionRef = useRef<HTMLElement | null>(null);
-  useEffect(() => {
-    setContent(asString(item.body.content));
-    setCategory(asString(item.body.category));
-  }, [item.object_id, item.revision, itemBodySignature]);
   useEffect(() => () => { requestVersion.current++; }, [api, item.object_id]);
   useEffect(() => {
     if (!historyOpen) return;
@@ -899,8 +914,8 @@ function MemoryRow({ item, api, canRestore, canProposeRule, onSave, onRestore, o
     setRestoreNotice(saved ? `第 ${revision.revision} 版已加入同步；服务端确认后会成为新版本。` : null);
   };
   return <article className="model-connection-card">
-    <div className="model-connection-main"><label>记忆内容<textarea value={content} maxLength={65536} onChange={(event) => setContent(event.target.value)} /></label><label>分类<input value={category} maxLength={64} onChange={(event) => setCategory(event.target.value)} /></label></div>
-    <div className="inline-actions"><button type="button" className="button button-secondary" onClick={() => onSave({ content: content.trim(), ...(category.trim() ? { category: category.trim() } : {}) })}>保存修改</button>
+    <div className="model-connection-main"><label>记忆内容<textarea value={currentDraft.content} maxLength={65536} onChange={(event) => updateDraft('content', event.target.value)} /></label><label>分类<input value={currentDraft.category} maxLength={64} onChange={(event) => updateDraft('category', event.target.value)} /></label></div>
+    <div className="inline-actions"><button type="button" className="button button-secondary" onClick={() => onSave({ content: currentDraft.content.trim(), ...(currentDraft.category.trim() ? { category: currentDraft.category.trim() } : {}) })}>保存修改</button>
       <button type="button" className="button button-secondary" aria-expanded={historyOpen} onClick={toggleHistory}>历史版本</button>
       {historyOpen && history !== null && <small className="memory-history-count" role="status">已读取 {history.length} 个历史版本。</small>}
       <button type="button" className="button button-secondary" disabled={!canProposeRule} onClick={onProposeRule}>提议为规则</button>

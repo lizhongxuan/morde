@@ -376,7 +376,8 @@ describe('GoalsAndSchedules', () => {
     await user.type(screen.getByLabelText('计划内容'), '安全检查');
     await user.click(screen.getByRole('button', { name: '创建并启用' }));
 
-    expect(await screen.findByText(/不会请求或保存额外授权凭据/)).toBeInTheDocument();
+    const denied = await screen.findByText(/不会请求或保存额外授权凭据/);
+    expect(denied.closest('[role="alert"]')).toHaveClass('error-inline');
     expect(screen.getByRole('button', { name: '＋ 新建云端计划' })).toBeDisabled();
   });
 

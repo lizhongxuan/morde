@@ -325,7 +325,7 @@ func TestPostgresTaskPersistsFileDeliveryIntent(t *testing.T) {
 	}
 }
 
-func TestPostgresTaskRevisionPreservesFileDeliveryIntent(t *testing.T) {
+func TestPostgresTaskRevisionDoesNotInventFileDeliveryIntentWithoutSettledDecision(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
 	initial := f.receive(t, "file-intent-start", "Explain what caused the error.", app.ConversationRoutingInput{})
@@ -334,21 +334,29 @@ func TestPostgresTaskRevisionPreservesFileDeliveryIntent(t *testing.T) {
 		t.Fatal(err)
 	}
 	snapshot.Context.ModelID = "p1234567"
-	if err := f.store.ApplyConversationRoute(ctx, initial, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+	if err := f.store.ApplyConversationRoute(ctx, initial, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteNew, FileDeliveryIntent: task.FileDeliveryNone,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	var taskID string
 	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, initial.Message.ID).Scan(&taskID); err != nil {
 		t.Fatal(err)
 	}
-	for index, content := range []string{"Generate and save a PDF report.", "Continue the explanation."} {
-		message := f.receive(t, fmt.Sprintf("file-intent-update-%d", index), content, app.ConversationRoutingInput{ReferenceTaskID: taskID})
+	for index, revision := range []struct {
+		content string
+		intent  task.FileDeliveryIntent
+	}{
+		{content: "Generate and save a PDF report.", intent: task.FileDeliveryRequired},
+		{content: "Continue the explanation."},
+	} {
+		message := f.receive(t, fmt.Sprintf("file-intent-update-%d", index), revision.content, app.ConversationRoutingInput{ReferenceTaskID: taskID})
 		updated, err := f.store.LoadConversationRouteSnapshot(ctx, message)
 		if err != nil || len(updated.Context.Candidates) != 1 {
 			t.Fatalf("file intent revision candidates=%+v err=%v", updated.Context.Candidates, err)
 		}
 		if err := f.store.ApplyConversationRoute(ctx, message, updated, app.ConversationRouteDecision{Action: app.ConversationRouteUpdate,
-			TaskID: taskID, ExpectedRevision: updated.Context.Candidates[0].Revision}); err != nil {
+			TaskID: taskID, ExpectedRevision: updated.Context.Candidates[0].Revision, FileDeliveryIntent: revision.intent}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -370,8 +378,8 @@ func TestPostgresTaskRevisionPreservesFileDeliveryIntent(t *testing.T) {
 		t.Fatalf("apply file intent revisions: applied=%t err=%v", applied, err)
 	}
 	var intent string
-	if err := f.store.pool.QueryRow(ctx, `SELECT file_delivery_intent FROM tasks WHERE id=$1`, taskID).Scan(&intent); err != nil || intent != string(task.FileDeliveryRequired) {
-		t.Fatalf("neutral revision lost the required file intent: intent=%q err=%v", intent, err)
+	if err := f.store.pool.QueryRow(ctx, `SELECT file_delivery_intent FROM tasks WHERE id=$1`, taskID).Scan(&intent); err != nil || intent != string(task.FileDeliveryNone) {
+		t.Fatalf("revision without a settled model decision changed file intent: intent=%q err=%v", intent, err)
 	}
 }
 

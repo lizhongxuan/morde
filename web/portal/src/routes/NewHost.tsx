@@ -55,6 +55,7 @@ export function NewHost() {
   const { user } = useAuth();
   const { notify } = useToast();
   const hosts = useQuery({ queryKey: ['hosts'], queryFn: portalApi.hosts });
+  const hostsNetworkError = hosts.isError && isTransientNetworkError(hosts.error);
   useNetworkReadNotice([{ failed: hosts.isError, error: hosts.error, retry: hosts.refetch }], '云端电脑列表连接失败，已保留当前页面。');
   const ownedHostCount = hosts.data?.items.filter((host) => host.owner_id === user?.id).length ?? 0;
   const [restored] = useState(() => readPendingHostCreate(user?.id));
@@ -115,14 +116,19 @@ export function NewHost() {
     }
   };
 
-  if (hosts.isPending || (!hosts.data && isTransientNetworkError(hosts.error))) return <div className="loading-card" role="status">正在检查云端电脑数量…</div>;
-  if (hosts.isError && !isTransientNetworkError(hosts.error)) return <FloatingError className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>;
+  if (hosts.isPending) return <div className="loading-card" role="status">正在检查云端电脑数量…</div>;
+  if (hostsNetworkError && !hosts.data) return <section>
+    <div className="loading-card" role="status">正在检查云端电脑数量…</div>
+    <FloatingError inline className="error-card" role="alert">云端电脑列表连接失败，无法确认创建配额。<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试读取云端电脑列表</button></FloatingError>
+  </section>;
+  if (hosts.isError && !hostsNetworkError) return <FloatingError inline className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>;
   if (ownedHostCount >= (user?.quota.hosts ?? 0) && !recoveryPending && !recoveryIssue) return <section className="form-card">
     <div className="design-panel-header"><div><h2>无法创建云端电脑</h2><p>已达到云端电脑数量上限。删除或释放现有电脑后，可以再次创建。</p></div>
       <Link className="button button-secondary" to="/hosts">返回云端电脑</Link></div>
   </section>;
   return <section>
-    {recoveryIssue && <FloatingError>
+    {hostsNetworkError && hosts.data && <FloatingError inline className="error-card" role="alert">云端电脑列表刷新失败，当前仍使用最近一次确认的列表。<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试读取云端电脑列表</button></FloatingError>}
+    {recoveryIssue && <FloatingError inline className="error-card" role="alert">
       {recoveryIssue === 'legacy'
         ? '发现旧版电脑创建恢复记录，不能安全重放。请先检查云端电脑列表，确认上次创建结果，再清除本机记录。'
         : '无法读取本机上次创建记录。为避免重复创建，请先检查云端电脑列表并核实结果，再清除本机记录。'}

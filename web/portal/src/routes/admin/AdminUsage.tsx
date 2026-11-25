@@ -16,7 +16,7 @@ function percent(numerator: number, denominator: number) {
 }
 
 function UsageError({ error, retry }: { error: unknown; retry: () => void }) {
-  return <FloatingError className="error-card" role="alert">
+  return <FloatingError inline className="error-card" role="alert">
     {errorDetails(error).message}
     <button type="button" className="button button-secondary" onClick={retry}>重试</button>
   </FloatingError>;
@@ -126,10 +126,11 @@ export function AdminUsage() {
       </select>
     </div></div>
       {usage.data && <p className="muted">统计区间：{usage.data.from} 至 {usage.data.to}</p>}
-      {usage.isPending || (usageNetworkError && !usage.data) ? <div className="loading-card" role="status">正在加载平台模型用量…</div>
-        : usage.isError && !usageNetworkError ? <UsageError error={usage.error} retry={() => void usage.refetch()} />
+      {usage.isPending && !usage.data ? <div className="loading-card" role="status">正在加载平台模型用量…</div>
+        : usage.isError && (!usageNetworkError || !usage.data) ? <UsageError error={usage.error} retry={() => void usage.refetch()} />
           : !usage.data ? <div className="loading-card" role="status">正在加载平台模型用量…</div>
           : <>
+            {usageNetworkError && <UsageError error={usage.error} retry={() => void usage.refetch()} />}
             <UsageMetrics data={usage.data} />
             <UsageByDay data={usage.data} />
             <UsageByModel data={usage.data} />
@@ -137,10 +138,13 @@ export function AdminUsage() {
     </section>
     <section className="admin-detail-section" aria-labelledby="admin-platform-stats-heading">
       <h2 id="admin-platform-stats-heading">平台统计</h2>
-      {stats.isPending || (statsNetworkError && !stats.data) ? <div className="loading-card" role="status">正在加载平台统计…</div>
-        : stats.isError && !statsNetworkError ? <UsageError error={stats.error} retry={() => void stats.refetch()} />
+      {stats.isPending && !stats.data ? <div className="loading-card" role="status">正在加载平台统计…</div>
+        : stats.isError && (!statsNetworkError || !stats.data) ? <UsageError error={stats.error} retry={() => void stats.refetch()} />
           : !stats.data ? <div className="loading-card" role="status">正在加载平台统计…</div>
-            : <PlatformStats data={stats.data} />}
+            : <>
+              {statsNetworkError && <UsageError error={stats.error} retry={() => void stats.refetch()} />}
+              <PlatformStats data={stats.data} />
+            </>}
     </section>
   </section>;
 }

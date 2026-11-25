@@ -6,7 +6,6 @@ import type { HostMember, HostMemberPermission } from '../app/api';
 import { formatDate } from '../app/format';
 import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
-import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from './ConfirmDialog';
 import { FloatingError } from './FloatingError';
 
@@ -100,7 +99,7 @@ export function HostMemberManager({ hostId }: { hostId: string }) {
               aria-describedby={`host-member-user-help-${hostId}`}
             />
             <small id={`host-member-user-help-${hostId}`} className="muted">请输入现有 Morde 账号 ID（u 加 7 位小写字母或数字）；账号是否存在由服务端验证。</small>
-            {userID && !validUserID(userID) && <FloatingError>账号 ID 格式应为 u 加 7 位小写字母或数字。</FloatingError>}
+            {userID && !validUserID(userID) && <FloatingError inline>账号 ID 格式应为 u 加 7 位小写字母或数字。</FloatingError>}
           </div>
         </div>
         <fieldset className="fieldset">
@@ -129,10 +128,12 @@ export function HostMemberManager({ hostId }: { hostId: string }) {
         </div>
       </form>
 
-      {members.isPending || (!members.data && members.isError && isTransientNetworkError(members.error)) ? <div className="loading-card" role="status">正在加载共享成员…</div>
-        : members.isError && !isTransientNetworkError(members.error) ? <FloatingError className="error-card" role="alert">{errorDetails(members.error).message}<button type="button" className="button button-secondary" onClick={() => void members.refetch()}>重试</button></FloatingError>
-          : !members.data?.items.length ? <div className="empty-card compact"><p>还没有共享成员。</p></div>
-            : <div className="device-manager-list">{members.data.items.map((member) => (
+      {members.isPending && !members.data ? <div className="loading-card" role="status">正在加载共享成员…</div>
+        : members.isError && !members.data ? <FloatingError inline className="error-card" role="alert">{errorDetails(members.error).message}<button type="button" className="button button-secondary" onClick={() => void members.refetch()}>重试</button></FloatingError>
+          : members.data && <>
+            {members.isError && <FloatingError inline className="error-card" role="alert">共享成员刷新失败，当前显示最近一次确认的成员。{errorDetails(members.error).message}<button type="button" className="button button-secondary" onClick={() => void members.refetch()}>重试</button></FloatingError>}
+            {!members.data.items.length ? <div className="empty-card compact"><p>还没有共享成员。</p></div>
+              : <div className="device-manager-list">{members.data.items.map((member) => (
               <article className="device-manager-card" key={member.user_id}>
                 <div className="host-card-heading"><div><h4>{member.user_id}</h4><p className="muted">账号 ID</p></div></div>
                 <p className="device-manager-meta">权限：{member.permissions.map((permission) => `${permission}（${permissionTitles[permission]}）`).join('、')}</p>
@@ -141,7 +142,8 @@ export function HostMemberManager({ hostId }: { hostId: string }) {
                   <button type="button" className="button button-danger-quiet" onClick={() => setRevokeConfirmation(member)}>撤销权限</button>
                 </div>
               </article>
-            ))}</div>}
+              ))}</div>}
+          </>}
     </div>}
 
     {inviteConfirmation && <ConfirmDialog

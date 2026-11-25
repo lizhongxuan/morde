@@ -203,8 +203,8 @@ export function Codex() {
     if (!codexBridge?.codexState) return;
     try { setState(parseCodexState(await codexBridge.codexState())); setStateError(''); }
     catch (error) {
-      if (isTransientNetworkError(error)) notify('Codex 状态连接失败，已保留当前内容。', 'error', { label: '重试', onClick: () => void refreshState() });
-      else setStateError(errorDetails(error).message);
+      notify('Codex 状态读取失败，页面保留了最近一次确认的内容。', 'error');
+      setStateError(errorDetails(error).message);
     }
   }, [codexBridge, notify]);
 
@@ -224,8 +224,8 @@ export function Codex() {
       setMessage('已读取 ' + (cursor ? '更多' : '本机') + ' Codex 会话。');
     } catch (error) {
       if (selectedProfileRef.current === requestedProfile) {
-        if (isTransientNetworkError(error)) notify('读取 Codex 会话失败，已保留当前列表。', 'error', { label: '重试', onClick: () => void loadThreads(cursor) });
-        else setThreadError(errorDetails(error).message);
+        notify('读取 Codex 会话失败，页面保留了最近一次确认的列表。', 'error');
+        setThreadError(errorDetails(error).message);
       }
     } finally {
       if (threadRequestSequenceRef.current === requestSequence) {
@@ -245,8 +245,8 @@ export function Codex() {
     const stop = codexBridge?.onCodexState?.(apply);
     if (codexBridge?.codexState) void codexBridge.codexState().then(apply).catch((error: unknown) => {
       if (!active) return;
-      if (isTransientNetworkError(error)) notify('Codex 状态连接失败，已保留当前内容。', 'error', { label: '重试', onClick: () => void refreshState() });
-      else setStateError(errorDetails(error).message);
+      notify('Codex 状态读取失败，页面保留了最近一次确认的内容。', 'error');
+      setStateError(errorDetails(error).message);
     });
     return () => { active = false; stop?.(); };
   }, [codexBridge, notify, refreshState]);
@@ -281,7 +281,6 @@ export function Codex() {
     refetchInterval: eventSyncActive ? 2500 : false,
     retry: false,
   });
-  const selectedEventsNetworkError = selectedEvents.isError && isTransientNetworkError(selectedEvents.error);
   useNetworkReadNotice([{ failed: selectedEvents.isError, error: selectedEvents.error, retry: selectedEvents.refetch }], 'Codex 会话事件暂时无法读取。');
   const events = selectedEvents.data?.pages.flatMap((page) => page.items).sort((left, right) => left.sequence - right.sequence) ?? [];
   const visibleEvents = visibleCodexEvents(events);
@@ -336,7 +335,7 @@ export function Codex() {
   return <section className="codex-route">
     <header className="page-heading"><p className="eyebrow">本机 AI</p><h1>Codex 会话</h1><p>连接本机 Codex 配置后，Morde 会同步该配置可访问的普通与归档会话，包括消息、工具调用、结果和 Codex 提供的推理摘要。iOS 可查看这些会话并在授权范围内接续原会话。</p></header>
     {!codexBridge && <p className="notice notice-warning" role="status">Codex 会话同步需要 morde-pc，请在客户端打开此页面。</p>}
-    {stateError && <FloatingError role="alert">{stateError}<button className="button button-secondary button-small" type="button" onClick={() => void refreshState()}>重试</button></FloatingError>}
+    {stateError && <FloatingError inline role="alert">{stateError}<button className="button button-secondary button-small" type="button" onClick={() => void refreshState()}>重试</button></FloatingError>}
     {state && !state.authenticated && <FloatingNotice className="notice-warning">请先登录 Morde，再连接本机 Codex。</FloatingNotice>}
     {codexBridge && state?.authenticated && <>
       <section className="design-panel" aria-labelledby="codex-connection-title">
@@ -374,7 +373,7 @@ export function Codex() {
         <div className="design-panel-header"><div><h2 id="codex-threads-title">本机 Codex 会话</h2><p>{selectedProfile.connectionAuthorized ? '会话由本机连接持续发现；点击会话可查看已同步事件。' : '连接并授权后，所有可访问会话才会同步到 Morde。'}</p></div>
           <button type="button" className="button button-secondary" disabled={threadLoading || !codexBridge.codexListThreads} onClick={() => void loadThreads(null)}>刷新会话</button>
         </div>
-        {threadError && <FloatingError role="alert">{threadError}<button type="button" className="button button-secondary button-small" onClick={() => void loadThreads(null)}>重试</button></FloatingError>}
+        {threadError && <FloatingError inline role="alert">{threadError}<button type="button" className="button button-secondary button-small" onClick={() => void loadThreads(null)}>重试</button></FloatingError>}
         {!threads.length && !threadLoading && !threadError && <div className="empty-card compact"><p>{selectedProfile.connectionAuthorized ? '正在等待本机 Codex 会话发现。' : '连接后可查看此配置下的会话。'}</p></div>}
         {!!threads.length && <div className="codex-thread-list">
           {threads.map((thread) => {
@@ -395,8 +394,11 @@ export function Codex() {
           <p className="codex-sync-progress" role="status">{selectedMirror.historyComplete ? '历史已同步' : '历史回填中'} · {statusLabel(selectedMirror.snapshotState ?? selectedMirror.status)} · 已载入 {events.length} 项{eventSequence ? ' / ' + eventSequence : ''}
             {selectedMirror.pendingEvents ? ' · ' + selectedMirror.pendingEvents + ' 项待上传' : ''}{selectedMirror.blockedEvents ? ' · ' + selectedMirror.blockedEvents + ' 项受授权范围限制' : ''}</p>
           {selectedMirror.snapshotMessage && <FloatingNotice className="notice-warning">{selectedMirror.snapshotMessage}</FloatingNotice>}
-          {selectedEvents.isError && !selectedEventsNetworkError && <FloatingError role="alert">无法读取会话事件：{errorDetails(selectedEvents.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void selectedEvents.refetch()}>重试</button></FloatingError>}
-          {(selectedEvents.isPending || (selectedEventsNetworkError && !selectedEvents.data)) && <FloatingNotice className="notice-info">正在读取同步的 Codex 会话内容…</FloatingNotice>}
+          {selectedEvents.isError && <FloatingError inline className="error-inline" role="alert">
+            {selectedEvents.data ? 'Codex 会话事件刷新失败，当前显示最近一次确认的内容。' : `无法读取会话事件：${errorDetails(selectedEvents.error).message}`}
+            <button type="button" className="button button-secondary button-small" onClick={() => void (selectedEvents.isFetchNextPageError ? selectedEvents.fetchNextPage() : selectedEvents.refetch())}>重试</button>
+          </FloatingError>}
+          {selectedEvents.isPending && !selectedEvents.data && <FloatingNotice className="notice-info">正在读取同步的 Codex 会话内容…</FloatingNotice>}
           {selectedEvents.data && !events.length && <div className="empty-card compact"><p>该会话当前没有可显示的同步事件。</p></div>}
           {!!visibleEvents.length && <div className="codex-event-list">
             {visibleEvents.map((event) => {

@@ -1237,8 +1237,13 @@ func (e f01RecordingExecutor) ExecuteTask(ctx context.Context, value task.Task) 
 		if definitionsErr != nil {
 			definitions = nil
 		}
+		diagnostic := f01DSHModelDiagnostic([]byte(e.supervisor.output()), value.ModelID, definitions, definitionsErr)
+		var unavailable cloudDSHCheckpointToolDefinitionUnavailable
+		if errors.As(err, &unavailable) {
+			diagnostic += fmt.Sprintf("; resume_tool=%s resume_tool_source=%s", unavailable.toolName, unavailable.source)
+		}
 		err = fmt.Errorf("%w; checkpoint=%s; %s", err, e.checkpoints.failureForTask(value.ID),
-			f01DSHModelDiagnostic([]byte(e.supervisor.output()), value.ModelID, definitions, definitionsErr))
+			diagnostic)
 		select {
 		case e.errors <- err:
 		default:

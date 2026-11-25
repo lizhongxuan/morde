@@ -11,6 +11,7 @@ import SessionPersistence, { assertContiguous, assertStoredId, assertVersion, ma
 import SessionProjectionRegistry from '@deepseek-ai/dsh-session-projection'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import TokenMeter from '@deepseek-ai/dsh-token-meter'
+import * as RepeatToolReminder from '@deepseek-ai/dsh-repeat-tool-reminder'
 import { estimateMessage } from '@deepseek-ai/dsh-token-meter/estimate'
 import ToolResultPruner from '@deepseek-ai/dsh-compaction-tool-result-pruner'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
@@ -1543,8 +1544,11 @@ export async function runAgent(ipc, frame) {
     }
   }
   const compactionPlugin = MordeCompactionEngine
-  const plugins = [SessionStore, SessionProjectionRegistry, AgentRegistry, SystemPrompt, ToolRuntime, nativeToolExecutor, LlmRuntime, persistencePlugin(durables), AgentLoop, checkpointPolicy, TokenMeter, ToolResultPruner, compactionPlugin]
-  for (const plugin of plugins) await ctx.plugin(plugin, plugin === SystemPrompt ? { includeHarnessIdentity: false } : plugin === compactionPlugin ? compactionConfig : undefined)
+  const plugins = [SessionStore, SessionProjectionRegistry, AgentRegistry, SystemPrompt, ToolRuntime, nativeToolExecutor, LlmRuntime, persistencePlugin(durables), AgentLoop, checkpointPolicy, TokenMeter, ToolResultPruner, RepeatToolReminder, compactionPlugin]
+  for (const plugin of plugins) await ctx.plugin(plugin,
+    plugin === SystemPrompt ? { includeHarnessIdentity: false }
+      : plugin === RepeatToolReminder ? { thresholds: [3, 5, 8], argumentsPreviewChars: 500 }
+        : plugin === compactionPlugin ? compactionConfig : undefined)
   ctx.systemPrompt.section({
     name: 'morde:soul', order: ctx.systemPrompt.getSectionOrder('DEPLOYMENT_PERSONA_PREFIX'),
     text: SOUL, interpolate: false,

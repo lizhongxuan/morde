@@ -7,7 +7,6 @@ import { useAuth } from '../app/auth';
 import { formatCpu, formatDate, formatMemory, hostStateLabel } from '../app/format';
 import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
-import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { HostControlPanel } from '../components/HostControlPanel';
 import { HostMemberManager } from '../components/HostMemberManager';
@@ -137,11 +136,15 @@ export function Hosts() {
         <strong>{defaultHost ? '~/workspace/（随电脑持久保存）' : '选择电脑后显示'}</strong>
         {defaultHost && <Link to="/hosts?sync=1">文件同步</Link>}
       </div>
-      {preferences.isError && !isTransientNetworkError(preferences.error) && <FloatingError className="error-inline" role="alert">默认设置暂不可用。
+      {preferences.isError && <FloatingError inline className="error-inline" role="alert">默认设置读取失败{preferences.data ? '，当前仍使用最近一次确认的设置' : ''}。
         <button type="button" className="button button-small button-secondary" onClick={() => void preferences.refetch()}>重试</button>
       </FloatingError>}
     </div>}
-    {hosts.isPending || (!hosts.data && hosts.isError && isTransientNetworkError(hosts.error)) ? <div className="loading-card" aria-live="polite">正在加载主机…</div> : hosts.isError && !isTransientNetworkError(hosts.error) ? <FloatingError className="error-card" role="alert">{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError> : !ownedHosts.length ? <div className="empty-card hosts-empty"><span className="hosts-empty-icon" aria-hidden="true"><MordeIcon name="monitor" /></span><h3>还没有主机</h3><p>创建一台主机开始使用浏览器、终端和文件工具。</p></div> : <ScreenPagination
+    {hosts.isPending && !hosts.data ? <div className="loading-card" aria-live="polite">正在加载主机…</div>
+      : hosts.isError && !hosts.data ? <FloatingError inline className="error-card" role="alert">无法读取主机：{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>
+        : <>
+          {hosts.isError && <FloatingError inline className="error-card" role="alert">主机列表刷新失败，当前仍显示最近一次确认的数据。{errorDetails(hosts.error).message}<button type="button" className="button button-secondary" onClick={() => void hosts.refetch()}>重试</button></FloatingError>}
+          {!ownedHosts.length ? <div className="empty-card hosts-empty"><span className="hosts-empty-icon" aria-hidden="true"><MordeIcon name="monitor" /></span><h3>还没有主机</h3><p>创建一台主机开始使用浏览器、终端和文件工具。</p></div> : <ScreenPagination
       items={displayedHosts}
       getKey={(host) => host.id}
       estimatedItemHeight={72}
@@ -167,11 +170,14 @@ export function Hosts() {
           onEnter={() => void enter(host)} onRenew={() => update.mutate({ action: 'renew', host })} onRelease={() => setLifecycleAction({ host, action: 'release' })} onRestore={() => setLifecycleAction({ action: 'restore', host })} onDelete={() => setDeleting(host)} />;
       }}
     />}
+        </>}
     </section> : <section className="shared-hosts-section design-panel" aria-labelledby="shared-hosts-title">
       <h3 className="hosts-list-title">电脑列表</h3>
-      {sharedHosts.isPending || (!sharedHosts.data && sharedHosts.isError && isTransientNetworkError(sharedHosts.error)) ? <div className="loading-card" role="status">正在加载共享电脑…</div>
-        : sharedHosts.isError && !isTransientNetworkError(sharedHosts.error) ? <FloatingError className="error-card" role="alert">{errorDetails(sharedHosts.error).message}<button type="button" className="button button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>
-          : !sharedHosts.data?.items.length ? <div className="empty-card hosts-empty"><span className="hosts-empty-icon" aria-hidden="true"><MordeIcon name="monitor" /></span><h3>还没有共享电脑</h3><p>还没有人与你共享云端电脑。</p></div>
+      {sharedHosts.isPending && !sharedHosts.data ? <div className="loading-card" role="status">正在加载共享电脑…</div>
+        : sharedHosts.isError && !sharedHosts.data ? <FloatingError inline className="error-card" role="alert">无法读取共享电脑：{errorDetails(sharedHosts.error).message}<button type="button" className="button button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>
+          : <>
+            {sharedHosts.isError && <FloatingError inline className="error-card" role="alert">共享电脑列表刷新失败，当前仍显示最近一次确认的数据。{errorDetails(sharedHosts.error).message}<button type="button" className="button button-secondary" onClick={() => void sharedHosts.refetch()}>重试</button></FloatingError>}
+            {!sharedHosts.data?.items.length ? <div className="empty-card hosts-empty"><span className="hosts-empty-icon" aria-hidden="true"><MordeIcon name="monitor" /></span><h3>还没有共享电脑</h3><p>还没有人与你共享云端电脑。</p></div>
             : <ScreenPagination
               items={displayedSharedHosts}
               getKey={(host) => host.id}
@@ -201,6 +207,7 @@ export function Hosts() {
             </article>;
               }}
             />}
+          </>}
     </section>}
     {deleting && <ConfirmDialog title={`永久删除云端电脑 ${deleting.name || deleting.id}`} description="继续后会永久删除这台云端电脑并释放计算资源。你的 Agent Workspace 文件会保留，可在新云端电脑中继续访问。" confirmLabel="永久删除云端电脑" danger busy={update.isPending} onClose={() => setDeleting(null)} onConfirm={() => update.mutate({ action: 'delete', host: deleting })} />}
     {lifecycleAction && <ConfirmDialog

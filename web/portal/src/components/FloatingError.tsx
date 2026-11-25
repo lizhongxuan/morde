@@ -12,17 +12,19 @@ function errorText(node: ReactNode): string {
 export function FloatingError({ children, className = '', role = 'alert', inline = false, ...props }: NoticeProps) {
   const [dismissed, setDismissed] = useState(false);
   const toast = useOptionalToast();
+  const toastDismiss = toast?.dismiss;
+  const toastNotify = toast?.notify;
   const message = errorText(children).replace(/\s+/g, ' ').trim();
   const toastID = useRef<number | null>(null);
   const anchor = useRef<HTMLSpanElement>(null);
   useEffect(() => {
-    if (inline || !toast || !message || anchor.current?.parentElement?.closest('[hidden]')) return;
-    toastID.current = toast.notify(message, 'error');
+    if (inline || !toastNotify || !message || anchor.current?.parentElement?.closest('[hidden]')) return;
+    toastID.current = toastNotify(message, 'error');
     return () => {
-      if (toastID.current !== null) toast.dismiss(toastID.current);
+      if (toastID.current !== null) toastDismiss?.(toastID.current);
       toastID.current = null;
     };
-  }, [inline, message, toast?.dismiss, toast?.notify]);
+  }, [inline, message, toastDismiss, toastNotify]);
   if (inline) return <div {...props} className={`toast-error-notice ${className}`.trim()} role={role}>{children}</div>;
   if (toast) return <span ref={anchor} hidden />;
   if (dismissed) return null;

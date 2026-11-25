@@ -237,15 +237,20 @@ WHERE id=$1 AND owner_id=$2 AND initiator_id=$3 AND conversation_id=$4 AND proje
 		if err != nil {
 			return err
 		}
-		workspaceSelected := stored.WorkspaceID.Valid || target.target.WorkspaceID != ""
 		hostSelected := target.target.HostID
 		type revision struct {
-			claim    app.ConversationRouteClaim
-			expected int64
+			claim      app.ConversationRouteClaim
+			expected   int64
+			fileIntent task.FileDeliveryIntent
 		}
-		rows, err := tx.Query(ctx, `SELECT i.message_id,i.message_sequence,i.expected_revision,m.content,r.request_metadata,r.authorization_snapshot,r.state
+		rows, err := tx.Query(ctx, `SELECT i.message_id,i.message_sequence,i.expected_revision,m.content,r.request_metadata,r.authorization_snapshot,r.state,
+COALESCE(c.state,''),c.decision,
+EXISTS(SELECT 1 FROM conversation_route_model_calls any_call WHERE any_call.message_id=i.message_id AND any_call.phase='normal')
 FROM task_revision_intents i JOIN conversation_message_routes r ON r.message_id=i.message_id
 JOIN conversation_messages m ON m.id=i.message_id AND m.owner_id=i.owner_id AND m.actor_id=i.initiator_id AND m.conversation_id=i.conversation_id
+LEFT JOIN conversation_route_model_calls c ON c.message_id=i.message_id AND c.service_instance_id=r.service_instance_id
+ AND c.owner_id=i.owner_id AND c.actor_id=i.initiator_id AND c.conversation_id=i.conversation_id
+ AND c.phase='normal' AND c.attempt=r.route_attempt
 WHERE i.task_id=$1 AND i.owner_id=$2 AND i.initiator_id=$3 AND i.conversation_id=$4 AND i.state='stopping'
  AND r.service_instance_id=$5::uuid AND r.owner_id=i.owner_id AND r.actor_id=i.initiator_id AND r.conversation_id=i.conversation_id
  AND m.role='user' AND m.task_id IS NULL
@@ -258,10 +263,13 @@ ORDER BY i.expected_revision FOR UPDATE OF i,r,m`, taskID, ownerID, initiatorID,
 			var item revision
 			var metadata, authorization []byte
 			var routeState string
+			var callState string
+			var decisionJSON []byte
+			var hasNormalCall bool
 			item.claim.ServiceInstanceID = instanceID
 			item.claim.Message.OwnerID, item.claim.Message.ActorID, item.claim.Message.ConversationID = ownerID, initiatorID, conversationID
 			if err := rows.Scan(&item.claim.Message.ID, &item.claim.Message.Sequence, &item.expected, &item.claim.Message.Content,
-				&metadata, &authorization, &routeState); err != nil {
+				&metadata, &authorization, &routeState, &callState, &decisionJSON, &hasNormalCall); err != nil {
 				rows.Close()
 				return fmt.Errorf("scan pending task revision: %w", err)
 			}
@@ -269,6 +277,21 @@ ORDER BY i.expected_revision FOR UPDATE OF i,r,m`, taskID, ownerID, initiatorID,
 				item.claim.Input.ProjectID != projectID || routeState != "waiting_adjustment" || item.expected != current+int64(len(revisions)) {
 				rows.Close()
 				return deferRetry()
+			}
+			if callState == "" {
+				if hasNormalCall {
+					rows.Close()
+					return deferRetry()
+				}
+			} else {
+				var decision app.ConversationRouteDecision
+				if callState != "settled" || len(decisionJSON) == 0 || json.Unmarshal(decisionJSON, &decision) != nil ||
+					!app.ValidConversationRouteFileDeliveryIntent(decision.Action, decision.FileDeliveryIntent) ||
+					decision.Action != app.ConversationRouteUpdate || decision.TaskID != taskID || decision.ExpectedRevision != item.expected {
+					rows.Close()
+					return deferRetry()
+				}
+				item.fileIntent = decision.FileDeliveryIntent
 			}
 			revisions = append(revisions, item)
 		}
@@ -310,14 +333,10 @@ FROM conversation_messages m WHERE m.task_id=$1 AND m.owner_id=$2 AND m.role='us
 			if revision.claim.Input.ChangeTaskTarget {
 				if revision.claim.Input.HostID != "" && revision.claim.Input.HostID != hostSelected {
 					hostSelected = revision.claim.Input.HostID
-					workspaceSelected = stored.WorkspaceID.Valid
-				}
-				if revision.claim.Input.WorkspaceID != "" {
-					workspaceSelected = true
 				}
 			}
-			if directive, specified := app.RoutedFileDeliveryDirective(revision.claim.Message.Content, workspaceSelected); specified {
-				fileIntent = directive
+			if revision.fileIntent != "" {
+				fileIntent = revision.fileIntent
 			}
 		}
 		for index, revision := range revisions {

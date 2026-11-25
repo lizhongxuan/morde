@@ -47,6 +47,13 @@ type TaskStep = Task['steps'][number];
 type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
 type TaskStepDetailWithExecution = Omit<TaskStepDetail, 'execution'> & { execution?: TaskStepDetail['execution'] | null };
 type TaskArtifact = Task['artifacts'][number];
+type ClarificationInteraction = {
+  clarificationID: string;
+  version: number;
+  question: string;
+  status: 'sending' | 'submitted' | 'failed' | 'unknown' | 'revoked';
+  message?: string;
+};
 type AssistantPanelTab = 'tasks' | 'files' | 'computer';
 type AssistantOutletContext = {
   panelOpen: boolean;
@@ -107,8 +114,18 @@ function isPlaceholderConversationTitle(title?: string): boolean {
   return !title?.trim() || ['新对话', '新旁聊', '对话'].includes(title.trim());
 }
 
-function UserMessageContent({ content }: { content: string }) {
-  return <p>{content}</p>;
+function clarificationDraftKey(taskID: string, clarificationID: string, version: number): string {
+  return `${taskID}:${clarificationID}:${version}`;
+}
+
+function UserMessageContent({ content, attachmentIDs = [] }: { content: string; attachmentIDs?: string[] }) {
+  return <>
+    <p>{content}</p>
+    {attachmentIDs.length > 0 && <small className="chat-message-attachments">附件 · {attachmentIDs.length}
+      {attachmentIDs.map((attachmentID, attachmentIndex) => <span key={attachmentID}> · <a
+        href={`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`} download>下载附件 {attachmentIndex + 1}</a></span>)}
+    </small>}
+  </>;
 }
 
 function AssistantConversationRow({ item, isMain, selected, recent, previewTitle, onSelect, onMakeMain, makeMainPending }: {
@@ -484,6 +501,7 @@ function stepPresentationTitle(title: string): string {
   if (name === 'morde_web_read' || name.includes('web_url_read')) return '读取网页';
   if (name === 'morde_workspace_list') return '查看电脑文件';
   if (name === 'morde_workspace_read') return '读取电脑文件';
+  if (name === 'morde_workspace_search') return '搜索工作区文件';
   if (name === 'morde_workspace_write') return '保存电脑文件';
   if (['read_file', 'file_read', 'workspace_read_file'].includes(name)) return '读取电脑文件';
   if (['write_file', 'file_write', 'workspace_write_file'].includes(name)) return '保存电脑文件';
@@ -731,6 +749,7 @@ function taskStepFailureText(step: TaskStep): string {
   switch (step.failure_reason) {
     case 'not_dispatched': return '工具未派发，当前记录未显示它已开始执行。';
     case 'tool_failed_after_dispatch': return '工具已派发后报告失败；展开查看已记录的执行详情。';
+    case 'tool_execution_failed': return '工具执行已确认失败；请查看已记录的执行详情。';
     case 'side_effect_unknown': return '执行结果尚未确认，暂不提供重试；先核对已记录状态，避免重复操作。';
     case 'authorization_changed': return '执行期间授权状态发生变化；请核对权限和操作状态后再继续。';
     case 'resource_changed': return '目标资源状态发生变化；请先核对当前状态，再决定下一步。';
@@ -744,17 +763,18 @@ function taskStepFailureText(step: TaskStep): string {
 function taskActivityStepSummary(step: TaskStep): string {
   const summary = step.summary.trim();
   const source = summary || taskActivityStepTitle(step);
+  if (step.status === 'failed' && step.failure_reason) return `操作失败 — ${taskStepFailureText(step)}`;
   if (/^the model request could not be verified\b/iu.test(source)) return '模型服务未返回可确认的结果。';
   if (/^the cloud dsh session completed\b/iu.test(source)) return '任务会话已结束，结果未能确认。';
   if (/^the task (?:failed|was interrupted)\b|^(?:internal|runtime) error\b|^traceback\b/iu.test(source)) return '此步骤执行失败，详细原因暂不可用。';
   if (/^(?:the cloud dsh (?:mcp )?tool completed and its result was saved|the hostless workspace tool completed and its result was checked)\.?$/iu.test(source)) {
-    if (step.status === 'failed') return `操作失败 — ${taskStepFailureText(step)}`;
     if (step.status === 'unknown') return '结果尚未确认；展开核对已记录的操作状态。';
     if (step.status === 'cancelled') return '操作已取消；没有确认其结果。';
     if (step.status === 'waiting_user') return '操作等待你处理后继续。';
     if (step.status === 'running' || step.status === 'queued') return '操作尚未完成。';
     const title = stepPresentationTitle(step.title);
     if (title === '搜索网页') return '搜索已完成 — 展开查看已记录的查询和网页结果片段。';
+    if (title === '搜索工作区文件') return '工作区文件搜索已完成 — 展开查看已记录的查询与结果。';
     if (title === '读取网页') return '网页已读取 — 展开查看目标地址和已记录内容片段。';
     if (title === '读取电脑文件' || title === '保存电脑文件' || title === '处理文件' || title === '查看电脑文件') {
       return '文件操作已完成 — 展开查看路径和结果。';
@@ -763,7 +783,6 @@ function taskActivityStepSummary(step: TaskStep): string {
     if (title === '操作浏览器' || title === '操作云端电脑') return '操作已完成 — 展开查看目标和实际结果。';
     return '工具调用已完成 — 展开查看已记录的输入与结果。';
   }
-  if (step.status === 'failed') return `操作失败 — ${taskStepFailureText(step)}`;
   return safeTaskActivityText(source, 500).value;
 }
 
@@ -958,6 +977,9 @@ export function Assistant() {
   const [taskDetailStepID, setTaskDetailStepID] = useState<string | null>(null);
   const [visibleTaskPanelCount, setVisibleTaskPanelCount] = useState(5);
   const [pendingTaskActions, setPendingTaskActions] = useState<Map<string, { fingerprint: string; key: string }>>(() => new Map());
+  const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
+  const [clarificationInteractions, setClarificationInteractions] = useState<Record<string, ClarificationInteraction>>({});
+  const clarificationSubmissionsInFlight = useRef(new Set<string>());
   const [taskEventFeeds, setTaskEventFeeds] = useState<Record<string, TaskFeedState>>({});
   const setTaskEventFeed = useCallback((id: string, state: TaskFeedState) => {
     setTaskEventFeeds((current) => current[id] === state ? current : { ...current, [id]: state });
@@ -973,9 +995,11 @@ export function Assistant() {
   const workspacePanelWidth = outletContext?.workspaceWidth ?? standaloneWorkspaceWidth;
   const setTaskPanelTab = outletContext?.setPanelTab ?? setStandaloneTaskPanelTab;
   const setTaskPanelOpen = outletContext?.setPanelOpen ?? setStandaloneTaskPanelOpen;
+  const focusPanelToggle = outletContext?.focusPanelToggle;
   const setWorkspacePanelWidth = outletContext?.setWorkspaceWidth ?? setStandaloneWorkspaceWidth;
   const [conversationSearchVisible, setConversationSearchVisible] = useState(false);
   const [contextSidebarWidth, setContextSidebarWidth] = useState(210);
+  const [dividerMeasurements, setDividerMeasurements] = useState({ contextSidebarMaximum: 420, workspacePanelMaximum: 900, workspacePanelWidth: 560 });
   const assistantLayoutRef = useRef<HTMLDivElement>(null);
   const assistantDividerDrag = useRef<{ side: 'sidebar' | 'workspace'; pointerID: number; x: number; width: number } | null>(null);
   const [computerEmbed, setComputerEmbed] = useState<ComputerEmbedSession | null>(null);
@@ -1873,6 +1897,16 @@ export function Assistant() {
   const selectedVariantMap = new Map(Object.entries(selectedMessageVariantVersions).map(([groupID, version]) => [groupID, version]));
   const variantTimeline = buildMessageVariantTimeline(mergedDisplayMessages, selectedVariantMap);
   const displayMessages = variantTimeline.items;
+  const messageVariantOperationGroups = [...variantTimeline.groups.values()].flatMap((group) => {
+    const groupMessages = [...group.versions.values()].flatMap((version) => version.messages);
+    const interruptedMessages = groupMessages.filter((item) => item.role === 'assistant' && item.output_status === 'interrupted');
+    const operations = variantOutbox.entries.filter((entry) => entry.operation.input.conversationID === conversationID &&
+      (entry.operation.input.messageID === group.id || group.messageIDs.has(entry.operation.input.messageID)) &&
+      entry.operation.status !== 'failed');
+    return group.versions.size > 1 || interruptedMessages.length > 0 || operations.length > 0
+      ? [{ group, groupMessages, interruptedMessages, operations }]
+      : [];
+  });
   const latestUserMessageByTaskID = new Map<string, string>();
   for (const message of displayMessages) {
     const linkedTaskID = message.task_id ?? message.related_task_id;
@@ -2201,6 +2235,74 @@ export function Assistant() {
     return respondToApproval.mutateAsync({ taskID: task.id, approvalID: request.id, version: request.version,
       decision, actionScope, key: taskActionKey(actionScope, fingerprint) });
   };
+  const submitClarificationAnswer = async (task: Task) => {
+    const request = task.clarification_request;
+    if (task.status !== 'waiting_user' || task.waiting_reason !== 'clarification_required' || !request ||
+      task.conversation_id !== conversationID) {
+      notify('澄清请求已变化，请核对任务最新状态。', 'error');
+      return;
+    }
+    const draftKey = clarificationDraftKey(task.id, request.id, request.version);
+    const answer = (clarificationAnswers[draftKey] ?? '').trim();
+    if (!answer) return;
+    if (clarificationSubmissionsInFlight.current.has(task.id)) return;
+    clarificationSubmissionsInFlight.current.add(task.id);
+    const actionScope = `clarification:${task.id}:${request.id}`;
+    const fingerprint = JSON.stringify({ version: request.version, answer });
+    const key = taskActionKey(actionScope, fingerprint);
+    setClarificationInteractions((current) => ({ ...current, [task.id]: {
+      clarificationID: request.id, version: request.version, question: request.question, status: 'sending',
+    } }));
+    try {
+      await portalApi.answerTaskInput(task.id, {
+        clarification_id: request.id,
+        clarification_version: request.version,
+        answer,
+      }, key);
+      clearTaskActionKey(actionScope, key);
+      setClarificationAnswers((current) => ({ ...current, [draftKey]: '' }));
+      setClarificationInteractions((current) => ({ ...current, [task.id]: {
+        clarificationID: request.id, version: request.version, question: request.question,
+        status: 'submitted', message: '补充信息已提交，等待任务状态更新。',
+      } }));
+      await Promise.all([
+        client.invalidateQueries({ queryKey: ['task', task.id] }),
+        client.invalidateQueries({ queryKey: ['assistant-account-tasks'] }),
+        client.invalidateQueries({ queryKey: ['conversation-tasks', conversationID] }),
+      ]);
+      notify('补充信息已提交，等待任务状态更新。', 'success');
+    } catch (error) {
+      const details = errorDetails(error);
+      if (isResourceNoLongerAccessible(error)) {
+        clearTaskActionKey(actionScope, key);
+        setClarificationInteractions((current) => ({ ...current, [task.id]: {
+          clarificationID: request.id, version: request.version, question: request.question,
+          status: 'revoked', message: details.message,
+        } }));
+        client.removeQueries({ queryKey: ['task', task.id], exact: true });
+        await Promise.all([
+          client.invalidateQueries({ queryKey: ['task', task.id], exact: true }),
+          client.invalidateQueries({ queryKey: ['assistant-account-tasks'] }),
+          client.invalidateQueries({ queryKey: ['conversation-tasks'] }),
+        ]);
+        notify(details.message, 'error');
+      } else {
+        const uncertain = !(error instanceof ApiError) || error.status >= 500 || [408, 425, 429].includes(error.status);
+        setClarificationInteractions((current) => ({ ...current, [task.id]: {
+          clarificationID: request.id, version: request.version, question: request.question,
+          status: uncertain ? 'unknown' : 'failed',
+          message: uncertain ? '提交结果待确认；重试相同回答会复用原请求编号。' : details.message,
+        } }));
+        if (details.code === 'conflict') {
+          await client.invalidateQueries({ queryKey: ['task', task.id] });
+          notify('澄清请求状态已变化，已刷新最新任务状态。请核对后再操作。', 'error');
+        } else if (uncertain) notify('补充信息提交结果待确认；重试相同回答会复用原请求编号。', 'error');
+        else notify(details.message, 'error');
+      }
+    } finally {
+      clarificationSubmissionsInFlight.current.delete(task.id);
+    }
+  };
   const cancelComposerAttachmentPreparation = () => {
     const identity = activeComposerDraftIdentity.current;
     if (!identity) return;
@@ -2480,10 +2582,10 @@ export function Assistant() {
     pendingMessageSave.current = previous.catch((error) => { notify(`${errorDetails(error).message} 输入已保留。`, 'error'); });
   };
 
-  const copyAssistantMessage = async (text: string) => {
+  const copyConversationMessage = async (text: string, role: 'user' | 'assistant') => {
     try {
       await navigator.clipboard.writeText(text);
-      notify('已复制回复。', 'success');
+      notify(role === 'assistant' ? '已复制回复。' : '已复制消息。', 'success');
     } catch {
       notify('无法访问剪贴板，请检查系统权限。', 'error');
     }
@@ -2782,13 +2884,13 @@ export function Assistant() {
       setTaskDetailStepID(null);
       setTaskDetailTaskID(null);
       window.requestAnimationFrame(() => {
-        if (outletContext?.focusPanelToggle) outletContext.focusPanelToggle();
+        if (focusPanelToggle) focusPanelToggle();
         else taskPanelToggle.current?.focus();
       });
     };
     window.addEventListener('keydown', closeOnEscape);
     return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [outletContext?.focusPanelToggle, postComputerVisibility, taskPanelOpen]);
+  }, [focusPanelToggle, postComputerVisibility, setTaskPanelOpen, taskPanelOpen]);
   useLayoutEffect(() => {
     const view = conversationView.current;
     if (previousScrollPositionKey.current !== conversationScrollPositionKey) {
@@ -2891,11 +2993,18 @@ export function Assistant() {
     const { message } = entry;
     const alreadyVisible = displayMessages.some((item) => item.client_message_id === message.request.client_message_id);
     if (alreadyVisible) return null;
+    const content = message.request.content || (message.attachments.length ? '发送了附件' : '');
+    const createdAt = new Date(message.createdAt).toISOString();
     return <div className="chat-message-row chat-message-row-user chat-message-row-pending" key={`outbox:${message.request.client_message_id}`}>
       <div className="chat-message-body">
-        <article className="chat-message chat-message-user" aria-label="你的消息">
-          <UserMessageContent content={message.request.content || (message.attachments.length ? '发送了附件' : '')} />
+        <article className="chat-message chat-message-user" aria-label="你的消息" tabIndex={0}>
+          <UserMessageContent content={content} />
         </article>
+        <div className="chat-message-meta">
+          <time className="chat-message-time" dateTime={createdAt} aria-label={`消息时间：${formatDate(createdAt)}`}>{formatDate(createdAt)}</time>
+          <button type="button" className="chat-message-copy" aria-label="复制你的消息" title="复制消息"
+            onClick={() => void copyConversationMessage(content, 'user')}><MordeIcon name="copy" /></button>
+        </div>
       </div>
     </div>;
   };
@@ -3046,7 +3155,7 @@ export function Assistant() {
           : mainConversation.data?.status === 'uninitialized' ? <><h2>正在初始化主会话…</h2><p>正在确认会话状态，已有对话会保留。</p></>
             : <><h2>正在读取主会话…</h2><p>正在读取服务端会话状态。</p></>}
   </div>;
-  const contextSidebarWidthLimits = () => {
+  const contextSidebarWidthLimits = useCallback(() => {
     const layout = assistantLayoutRef.current;
     const columns = layout ? getComputedStyle(layout).gridTemplateColumns.trim().split(/\s+/) : [];
     const panel = layout?.querySelector<HTMLElement>('.assistant-task-panel');
@@ -3054,12 +3163,12 @@ export function Assistant() {
       : panel && getComputedStyle(panel).position !== 'absolute' ? panel.getBoundingClientRect().width : 0;
     const maximum = Math.min(420, (layout?.getBoundingClientRect().width ?? 900) - panelWidth - 320);
     return { minimum: 170, maximum: Math.max(170, maximum) };
-  };
+  }, []);
   const resizeContextSidebar = (width: number) => {
     const { minimum, maximum } = contextSidebarWidthLimits();
     setContextSidebarWidth(Math.round(Math.min(maximum, Math.max(minimum, width))));
   };
-  const workspacePanelWidthLimits = () => {
+  const workspacePanelWidthLimits = useCallback(() => {
     const layout = assistantLayoutRef.current;
     const sidebarWidth = layout?.querySelector<HTMLElement>('.assistant-sidebar')?.getBoundingClientRect().width ?? contextSidebarWidth;
     const layoutWidth = layout?.getBoundingClientRect().width ?? 1200;
@@ -3068,15 +3177,39 @@ export function Assistant() {
       ? Math.min(380, layoutWidth - sidebarWidth)
       : Math.min(900, layoutWidth - (panelColumnReserved ? sidebarWidth + 320 : 12));
     return { minimum: 350, maximum: Math.max(350, maximum) };
-  };
-  const currentWorkspacePanelWidth = () => {
+  }, [contextSidebarWidth]);
+  const currentWorkspacePanelWidth = useCallback(() => {
     if (workspacePanelWidth !== null) return Math.round(workspacePanelWidth);
     const layout = assistantLayoutRef.current;
     const columns = layout ? getComputedStyle(layout).gridTemplateColumns.trim().split(/\s+/) : [];
     if (columns.length > 2) return Math.round(Number.parseFloat(columns[columns.length - 1] ?? '') || 560);
     const panel = layout?.querySelector<HTMLElement>('.assistant-task-panel');
     return Math.round(panel?.getBoundingClientRect().width || workspacePanelWidth || 560);
-  };
+  }, [workspacePanelWidth]);
+  useLayoutEffect(() => {
+    const layout = assistantLayoutRef.current;
+    if (!layout) return;
+    const measure = () => {
+      const next = {
+        contextSidebarMaximum: contextSidebarWidthLimits().maximum,
+        workspacePanelMaximum: workspacePanelWidthLimits().maximum,
+        workspacePanelWidth: currentWorkspacePanelWidth(),
+      };
+      setDividerMeasurements((current) => current.contextSidebarMaximum === next.contextSidebarMaximum &&
+        current.workspacePanelMaximum === next.workspacePanelMaximum && current.workspacePanelWidth === next.workspacePanelWidth
+        ? current : next);
+    };
+    measure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    observer?.observe(layout);
+    const taskPanel = layout.querySelector<HTMLElement>('.assistant-task-panel');
+    if (taskPanel) observer?.observe(taskPanel);
+    window.addEventListener('resize', measure);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+    };
+  }, [contextSidebarWidthLimits, currentWorkspacePanelWidth, taskPanelOpen, taskPanelTab, workspacePanelWidth, workspacePanelWidthLimits]);
   const resizeWorkspacePanel = (width: number) => {
     const { minimum, maximum } = workspacePanelWidthLimits();
     setWorkspacePanelWidth(Math.round(Math.min(maximum, Math.max(minimum, width))));
@@ -3126,7 +3259,7 @@ export function Assistant() {
 
   return <section className="assistant-page">
     <div ref={assistantLayoutRef} style={{ '--pc-context-sidebar-width': `${contextSidebarWidth}px`,
-      ...(!outletContext ? { '--pc-workspace-panel-width': `${workspacePanelWidth ?? currentWorkspacePanelWidth()}px` } : {}) } as CSSProperties}
+      ...(!outletContext ? { '--pc-workspace-panel-width': `${workspacePanelWidth ?? dividerMeasurements.workspacePanelWidth}px` } : {}) } as CSSProperties}
       onPointerMove={(event) => moveDividerDrag(event.pointerId, event.clientX)}
       onPointerUp={(event) => moveDividerDrag(event.pointerId, event.clientX, true)}
       onMouseMove={(event) => moveDividerDrag(-1, event.clientX)}
@@ -3192,7 +3325,7 @@ export function Assistant() {
         </div>
       </aside>
       <button type="button" className="assistant-context-resizer" role="separator" aria-orientation="vertical"
-        aria-label="调整对话侧栏宽度" aria-valuemin={170} aria-valuemax={contextSidebarWidthLimits().maximum} aria-valuenow={contextSidebarWidth}
+        aria-label="调整对话侧栏宽度" aria-valuemin={170} aria-valuemax={dividerMeasurements.contextSidebarMaximum} aria-valuenow={contextSidebarWidth}
         aria-valuetext={`${contextSidebarWidth} 像素`} title="拖动调整对话侧栏宽度"
         onPointerDown={(event) => {
           if (event.button !== 0) return;
@@ -3208,8 +3341,8 @@ export function Assistant() {
         }}
         onKeyDown={(event) => handleDividerKeyDown(event, 'sidebar')} />
       {taskPanelOpen && <button type="button" className="assistant-workspace-resizer" role="separator" aria-orientation="vertical"
-        aria-label="调整右侧工作区宽度" aria-valuemin={350} aria-valuemax={workspacePanelWidthLimits().maximum} aria-valuenow={currentWorkspacePanelWidth()}
-        aria-valuetext={`${currentWorkspacePanelWidth()} 像素`} title="拖动调整右侧工作区宽度"
+        aria-label="调整右侧工作区宽度" aria-valuemin={350} aria-valuemax={dividerMeasurements.workspacePanelMaximum} aria-valuenow={dividerMeasurements.workspacePanelWidth}
+        aria-valuetext={`${dividerMeasurements.workspacePanelWidth} 像素`} title="拖动调整右侧工作区宽度"
         onPointerDown={(event) => {
           if (event.button !== 0) return;
           event.preventDefault();
@@ -3262,11 +3395,23 @@ export function Assistant() {
                 {displayMessages.map((message, index) => {
                   const messageTaskID = message.task_id ?? message.related_task_id ?? '';
                   const messageTask = tasksByID.get(messageTaskID);
-                  const variantGroupID = variantTimeline.groupByMessageID.get(message.id);
-                  const variantGroup = variantGroupID ? variantTimeline.groups.get(variantGroupID) : undefined;
-                  const selectedVariantVersion = variantGroup ? selectedMessageVariantVersions[variantGroup.id] ?? variantGroup.latestVersion : 1;
-                  const groupOperations = variantGroup ? variantOutbox.entries.filter((entry) => entry.operation.input.conversationID === conversationID &&
-                    (entry.operation.input.messageID === variantGroup.id || variantGroup.messageIDs.has(entry.operation.input.messageID))) : [];
+                  const activeClarification = messageTask?.conversation_id === conversationID && messageTask.status === 'waiting_user' &&
+                    messageTask.waiting_reason === 'clarification_required' && messageTask.clarification_request?.question
+                    ? messageTask.clarification_request : null;
+                  const savedClarificationInteraction = messageTaskID ? clarificationInteractions[messageTaskID] : undefined;
+                  const clarificationInteraction = activeClarification && savedClarificationInteraction &&
+                    (savedClarificationInteraction.clarificationID !== activeClarification.id || savedClarificationInteraction.version !== activeClarification.version)
+                    ? undefined : savedClarificationInteraction;
+                  const clarificationDisplay = activeClarification ?? (clarificationInteraction ? {
+                    id: clarificationInteraction.clarificationID,
+                    version: clarificationInteraction.version,
+                    question: clarificationInteraction.question,
+                  } : null);
+                  const clarificationDraftID = activeClarification
+                    ? clarificationDraftKey(messageTaskID, activeClarification.id, activeClarification.version) : '';
+                  const clarificationAnswer = clarificationDraftID ? clarificationAnswers[clarificationDraftID] ?? '' : '';
+                  const showClarificationCard = message.role === 'user' && Boolean(messageTaskID) &&
+                    latestUserMessageByTaskID.get(messageTaskID) === message.id && Boolean(clarificationDisplay);
                   const previous = displayMessages[index - 1];
                   const messageDate = formatDate(message.created_at).split(' ')[0];
                   const showDate = !previous || formatDate(previous.created_at).split(' ')[0] !== messageDate;
@@ -3277,38 +3422,20 @@ export function Assistant() {
                     <div className="chat-message-body">
                     {message.role === 'assistant' && <strong className="chat-message-author">Morde</strong>}
                     <article id={`conversation-message-${encodeURIComponent(message.id)}`} className={`chat-message chat-message-${message.role}`}
-                      aria-label={message.role === 'assistant' ? 'Morde 的回复' : '你的消息'} tabIndex={message.role === 'assistant' ? 0 : undefined}>
-                      {message.role === 'assistant' ? <ChatMarkdown content={message.content} /> : <UserMessageContent content={message.content} />}
+                      aria-label={message.role === 'assistant' ? 'Morde 的回复' : '你的消息'} tabIndex={0}>
+                      {message.role === 'assistant' ? <ChatMarkdown content={message.content} />
+                        : <UserMessageContent content={message.content} attachmentIDs={message.attachment_ids ?? []} />}
                     </article>
-                    {message.attachment_ids?.length ? <small className="chat-message-attachments">附件 · {message.attachment_ids.length}
-                      {message.attachment_ids.map((attachmentID, attachmentIndex) => <span key={attachmentID}> · <a
-                        href={`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`} download>下载附件 {attachmentIndex + 1}</a></span>)}
-                    </small> : null}
-                    {variantGroup && ((message.role === 'user' && variantGroup.versions.size > 1) ||
-                      (message.role === 'assistant' && message.output_status === 'interrupted')) && <div className="message-variant-controls" aria-label="消息版本操作">
-                      {message.role === 'user' && variantGroup.versions.size > 1 && <label className="message-variant-picker">版本
-                        <select aria-label="选择消息版本" value={selectedVariantVersion} onChange={(event) => selectMessageVariantVersion(variantGroup.id, Number(event.target.value))}>
-                          {[...variantGroup.versions.values()].sort((left, right) => left.version - right.version).map((version) => <option key={version.version} value={version.version}>
-                            {`v${version.version} · ${messageVariantActionLabel(version.action)}`}
-                          </option>)}
-                        </select>
-                      </label>}
-                      {message.role === 'assistant' && message.output_status === 'interrupted' && <button type="button"
-                        className="button button-small button-secondary" disabled={groupOperations.some((entry) => entry.operation.status === 'sending')}
-                        onClick={() => void startVariantOperation(variantGroup.id, message.id)}>继续生成</button>}
-                    </div>}
-                    {message.role === 'user' && groupOperations.filter((entry) => entry.operation.status !== 'failed').map((entry) => <div className="message-variant-operation" role="status" key={entry.operation.input.idempotencyKey}>
-                      <span>{entry.operation.status === 'sending' ? '正在创建消息版本…' : entry.operation.status === 'unknown'
-                        ? '操作结果待核对' : '消息版本操作待发送。'}</span>
-                      {(entry.operation.status === 'unknown' || entry.operation.status === 'pending') && <button type="button" className="button button-small button-secondary"
-                        disabled={groupOperations.some((item) => item.operation.status === 'sending')} onClick={() => void sendVariantOperation(entry)}>核对并重试</button>}
-                    </div>)}
-                    {message.role === 'assistant' && <div className="assistant-reply-meta">
-                      <time className="assistant-reply-time" dateTime={message.created_at} aria-label={`回复时间：${formatDate(message.created_at)}`}>{formatDate(message.created_at)}</time>
-                      <button type="button" className="assistant-reply-copy" aria-label="复制 Morde 回复" title="复制回复"
-                        onClick={() => void copyAssistantMessage(message.content)}><MordeIcon name="copy" /></button>
-                    </div>}
-                    </div></div>
+                    <div className="chat-message-meta">
+                      <time className="chat-message-time" dateTime={message.created_at}
+                        aria-label={`${message.role === 'assistant' ? '回复' : '消息'}时间：${formatDate(message.created_at)}`}>{formatDate(message.created_at)}</time>
+                      <button type="button" className="chat-message-copy"
+                        aria-label={message.role === 'assistant' ? '复制 Morde 回复' : '复制你的消息'}
+                        title={message.role === 'assistant' ? '复制回复' : '复制消息'}
+                        onClick={() => void copyConversationMessage(message.content, message.role)}><MordeIcon name="copy" /></button>
+                    </div>
+                    </div>
+                    </div>
                     {message.role === 'user' && messageTaskID && latestUserMessageByTaskID.get(messageTaskID) === message.id &&
                       messageTask?.pending_request &&
                       (messageTask.pending_request.status !== 'pending' || messageTask.status === 'waiting_user') &&
@@ -3320,6 +3447,40 @@ export function Assistant() {
                             onDecision={(decision) => submitApprovalDecision(messageTask, decision)} />
                         </div>
                       </div>}
+                    {showClarificationCard && clarificationDisplay && <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的澄清回复">
+                      <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
+                      <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
+                        <section className="chat-approval task-approval-card conversation-clarification-card" role="region" aria-label="对话中的澄清请求">
+                          <header className="task-approval-card-heading">
+                            <h3>需要补充信息</h3>
+                            <span>{clarificationInteraction?.status === 'submitted' ? '已提交' : clarificationInteraction?.status === 'sending' ? '正在提交' : '等待回复'}</span>
+                          </header>
+                          <p>{safeTaskActivityText(clarificationDisplay.question, 1_000).value}</p>
+                          {clarificationInteraction?.status === 'submitted' && <p role="status">{clarificationInteraction.message}</p>}
+                          {clarificationInteraction?.status === 'sending' && <p role="status">正在提交补充信息…</p>}
+                          {clarificationInteraction?.status === 'unknown' && <p role="status">{clarificationInteraction.message}</p>}
+                          {(clarificationInteraction?.status === 'failed' || clarificationInteraction?.status === 'revoked') &&
+                            <p role="alert">{clarificationInteraction.message}</p>}
+                          {activeClarification && clarificationInteraction?.status !== 'submitted' &&
+                            clarificationInteraction?.status !== 'sending' && clarificationInteraction?.status !== 'revoked' &&
+                            <form aria-label="提交澄清回复" onSubmit={(event) => {
+                              event.preventDefault();
+                              void submitClarificationAnswer(messageTask!);
+                            }}>
+                              <label className="sr-only" htmlFor={`clarification-answer-${encodeURIComponent(messageTaskID)}`}>澄清问题答复</label>
+                              <textarea id={`clarification-answer-${encodeURIComponent(messageTaskID)}`} aria-label="澄清问题答复"
+                                value={clarificationAnswer} maxLength={16_384}
+                                onChange={(event) => setClarificationAnswers((current) => ({ ...current, [clarificationDraftID]: event.target.value }))}
+                                placeholder="在这里补充信息…" />
+                              <div className="chat-approval-actions">
+                                <button type="submit" className="button button-primary" disabled={!clarificationAnswer.trim()}>
+                                  {clarificationInteraction?.status === 'unknown' ? '使用相同回答重试' : '提交并继续'}
+                                </button>
+                              </div>
+                            </form>}
+                        </section>
+                      </div>
+                    </div>}
                   </Fragment>;
                 })}
               </div>}
@@ -3345,6 +3506,37 @@ export function Assistant() {
           onClick={() => { followConversation.current = true; if (conversationView.current) conversationView.current.scrollTop = conversationView.current.scrollHeight; setShowJumpToLatest(false); }}>
           ↓ 回到最新消息</button></div>}
         <section className="assistant-composer" aria-label="发送对话消息">
+          {conversationID && messageVariantOperationGroups.length > 0 && <details className="assistant-message-operations">
+            <summary>消息版本与恢复</summary>
+            <div className="assistant-message-operations-list">
+              {messageVariantOperationGroups.map(({ group, groupMessages, interruptedMessages, operations }) => {
+                const sourceMessage = groupMessages.find((item) => item.role === 'user');
+                const operationLabel = sourceMessage?.content.replace(/\s+/gu, ' ').trim().slice(0, 72) || '对话消息';
+                const selectedVariantVersion = selectedMessageVariantVersions[group.id] ?? group.latestVersion;
+                const operationIsSending = operations.some((entry) => entry.operation.status === 'sending');
+                return <div className="assistant-message-operations-item" key={group.id} aria-label={`消息操作：${operationLabel}`}>
+                  <p>{operationLabel}</p>
+                  {group.versions.size > 1 && <label className="message-variant-picker">版本
+                    <select aria-label={`选择消息版本：${operationLabel}`} value={selectedVariantVersion}
+                      onChange={(event) => selectMessageVariantVersion(group.id, Number(event.target.value))}>
+                      {[...group.versions.values()].sort((left, right) => left.version - right.version).map((version) => <option key={version.version} value={version.version}>
+                        {`v${version.version} · ${messageVariantActionLabel(version.action)}`}
+                      </option>)}
+                    </select>
+                  </label>}
+                  {interruptedMessages.map((interruptedMessage) => <button type="button" key={interruptedMessage.id}
+                    className="button button-small button-secondary" disabled={operationIsSending}
+                    onClick={() => void startVariantOperation(group.id, interruptedMessage.id)}>继续生成</button>)}
+                  {operations.map((entry) => <div className="message-variant-operation" role="status" key={entry.operation.input.idempotencyKey}>
+                    <span>{entry.operation.status === 'sending' ? '正在创建消息版本…' : entry.operation.status === 'unknown'
+                      ? '操作结果待核对' : '消息版本操作待发送。'}</span>
+                    {(entry.operation.status === 'unknown' || entry.operation.status === 'pending') && <button type="button" className="button button-small button-secondary"
+                      disabled={operationIsSending} onClick={() => void sendVariantOperation(entry)}>核对并重试</button>}
+                  </div>)}
+                </div>;
+              })}
+            </div>
+          </details>}
           <form onSubmit={submit}>
             {!composerDraftReady && <p className="muted" role="status">正在恢复此会话草稿…</p>}
             {composerDraftError && <FloatingError className="error-inline" role="alert">草稿尚未可靠保存：{composerDraftError}。当前输入仍保留在页面中。</FloatingError>}

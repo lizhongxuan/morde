@@ -27,17 +27,56 @@ func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 	if input["reference_time"] != "2026-11-12T11:04:05+08:00" || input["time_zone"] != "Asia/Shanghai" || input["time_zone_provided"] != true {
 		t.Fatalf("localized server receipt time missing: %+v", input)
 	}
-	if !strings.Contains(request.Instructions, "jokes") || !strings.Contains(request.Instructions, "reference_time and time_zone") ||
-		!strings.Contains(request.Instructions, "server time is unavailable") ||
+	if !strings.Contains(request.Instructions, "jokes") || !strings.Contains(request.Instructions, "reference_time/time_zone") ||
+		!strings.Contains(request.Instructions, "absent time means unavailable") ||
+		!strings.Contains(request.Instructions, "file_delivery_intent") ||
 		!strings.Contains(request.Instructions, "acknowledgements") ||
 		!strings.Contains(request.Instructions, "only on expected duration, never on the topic") ||
-		!strings.Contains(request.Instructions, "text-only requests for small code snippets") ||
-		!strings.Contains(request.Instructions, "An explicit request to create, write, export, save, or deliver a file or document") ||
-		!strings.Contains(request.Instructions, "unless one bounded public read-only lookup is sufficient for the tool action") ||
-		strings.Contains(request.Instructions, conversationRouteDirectToolInstructions) ||
-		!strings.Contains(request.Instructions, "require a Task; do not replace requested work with a text-only answer") ||
-		!strings.Contains(request.Instructions, "ask for that exact information") {
+		!strings.Contains(request.Instructions, "small code") ||
+		!strings.Contains(request.Instructions, "File/document create, write, export, save or delivery") ||
+		!strings.Contains(request.Instructions, "bounded direct-tool rule below") ||
+		!strings.Contains(request.Instructions, conversationRouteDirectToolInstructions) ||
+		!strings.Contains(request.Instructions, "delegation requires a Task") ||
+		!strings.Contains(request.Instructions, "smallest exact question") {
 		t.Fatalf("direct chat and time rules missing from router instructions: %s", request.Instructions)
+	}
+}
+
+func TestConversationRouteFileDeliveryIntentIsStructuredAndActionScoped(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "请生成 PDF 文件并提供下载。",
+		Candidates: []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 4}}}
+	for _, intent := range []string{"", "none", "required", "unclear"} {
+		for _, test := range []struct {
+			name   string
+			output string
+			action ConversationRouteAction
+			taskID string
+		}{
+			{name: "new", output: `{"action":"new","task_id":"","file_delivery_intent":"` + intent + `"}`, action: ConversationRouteNew},
+			{name: "update", output: `{"action":"update","task_id":"q1234567","file_delivery_intent":"` + intent + `"}`, action: ConversationRouteUpdate, taskID: "q1234567"},
+		} {
+			t.Run(test.name+"/"+intent, func(t *testing.T) {
+				decision := ParseConversationRouteDecisionForContext(test.output, value)
+				if decision.InvalidOutput || decision.Action != test.action || decision.TaskID != test.taskID ||
+					string(decision.FileDeliveryIntent) != intent || decision.ModelOutput != test.output {
+					t.Fatalf("structured file intent was not retained: got=%+v output=%s", decision, test.output)
+				}
+				if test.action == ConversationRouteUpdate && decision.ExpectedRevision != 4 {
+					t.Fatalf("update file intent was not bound to the authorized revision: %+v", decision)
+				}
+			})
+		}
+	}
+	for _, output := range []string{
+		`{"action":"new","file_delivery_intent":"maybe"}`,
+		`{"action":"new","file_delivery_intent":null}`,
+		`{"action":"update","task_id":"q1234567","file_delivery_intent":1}`,
+		`{"action":"reply","task_id":"","question":"","reply":"Done.","file_delivery_intent":"required"}`,
+	} {
+		decision := ParseConversationRouteDecisionForContext(output, value)
+		if !decision.InvalidOutput || decision.Action == ConversationRouteNew || decision.Action == ConversationRouteUpdate {
+			t.Errorf("invalid or action-incompatible file intent was accepted: output=%s decision=%+v", output, decision)
+		}
 	}
 }
 
@@ -134,6 +173,97 @@ func TestConversationRouteAcknowledgementIsExplicitAndLimitedToBackgroundWork(t 
 	}
 }
 
+func TestConversationRouteModelRequestsUseConsistentJSONFieldContract(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "分析这份报告"}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy, err := legacyConversationRouteModelRequest(value, request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fieldList := `keys "action", "task_id", "target_message_id", "aggregate_message_ids", "explicit_new", "question", "reply", "dependency_task_ids", "acknowledge", "file_delivery_intent", "tool_name", "tool_arguments"`
+	for _, prompt := range []struct {
+		name         string
+		instructions string
+		actionRule   string
+	}{
+		{name: "primary", instructions: request.Instructions,
+			actionRule: "Actions: reply (direct self-contained conversation), new (independent work), update (clear change to one identified Task), join"},
+		{name: "legacy", instructions: legacy.Instructions,
+			actionRule: "Actions: reply (direct, self-contained conversation), new (independent work), update (clear change to one identified Task), steer"},
+	} {
+		t.Run(prompt.name, func(t *testing.T) {
+			for _, required := range []string{
+				fieldList,
+				prompt.actionRule,
+				`Always include "acknowledge" as a JSON boolean`,
+				`It may be true only for new, update, or join actions`,
+				`"acknowledge" is the only acceptance signal`,
+				`For action "new" or "update", include the string field "file_delivery_intent"`,
+				`Empty string means no explicit override`,
+				conversationRouteExplicitNewInstructions,
+				`Only action "tool" may set tool_name/tool_arguments`,
+				`Tool calls require the bounded direct-tool rule below`,
+				`Actions:`,
+			} {
+				if !strings.Contains(prompt.instructions, required) {
+					t.Errorf("%s route prompt omitted %q: %s", prompt.name, required, prompt.instructions)
+				}
+			}
+		})
+	}
+}
+
+func TestConversationRouteExplicitNewDistinguishesDuplicateReplayFromRerun(t *testing.T) {
+	const original = "请分析这份报告并列出重点。"
+	scopeDigest := sha256.Sum256([]byte("authorized execution scope"))
+	prior := ConversationRouteRequestCandidate{MessageID: "m1234567", Sequence: 1, Content: original,
+		RoutingStatus: conversation.RoutingRouted, SameExecutionScope: true, SameAuthorization: true, DirectReply: true,
+		ExecutionScopeDigest: scopeDigest[:]}
+	replayContext := ConversationRouteContext{ActorID: "u1234567", Content: original, ExecutionScopeDigest: scopeDigest[:],
+		RequestCandidates: []ConversationRouteRequestCandidate{prior}}
+	request, err := ConversationRouteModelRequest(replayContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var input struct {
+		PriorRequests []conversationRouteModelRequestCandidate `json:"prior_requests"`
+	}
+	if err := json.Unmarshal([]byte(request.Input[0].Text), &input); err != nil {
+		t.Fatal(err)
+	}
+	if len(input.PriorRequests) != 1 || !input.PriorRequests[0].Joinable {
+		t.Fatalf("exact same-scope replay was not exposed as an idempotent candidate: %+v", input.PriorRequests)
+	}
+
+	for _, test := range []struct {
+		name          string
+		content       string
+		modelOutput   string
+		wantExplicit  bool
+		wantDuplicate bool
+	}{
+		{name: "identical replay defaults to idempotent association", content: original,
+			modelOutput: `{"action":"new","explicit_new":false}`, wantDuplicate: true},
+		{name: "clear rerun intent remains a fresh task", content: "请把之前的同一项分析重新执行为一个新任务。",
+			modelOutput: `{"action":"new","explicit_new":true}`, wantExplicit: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ValidConversationRouteExactDuplicateTarget(prior.MessageID, test.content, []ConversationRouteRequestCandidate{prior}); got != test.wantDuplicate {
+				t.Fatalf("exact duplicate eligibility = %t, want %t", got, test.wantDuplicate)
+			}
+			value := replayContext
+			value.Content = test.content
+			decision := ParseConversationRouteDecisionForContext(test.modelOutput, value)
+			if decision.Action != ConversationRouteNew || decision.InvalidOutput || decision.ExplicitNew != test.wantExplicit {
+				t.Fatalf("structured explicit_new decision was not preserved: %+v", decision)
+			}
+		})
+	}
+}
+
 func TestTruncatedAggregateClarificationDoesNotAskToResendSavedSources(t *testing.T) {
 	root, supplement := "root source", "supplement source"
 	rootSHA := sha256.Sum256([]byte(root))
@@ -152,7 +282,7 @@ func TestTruncatedAggregateClarificationDoesNotAskToResendSavedSources(t *testin
 	}
 }
 
-func TestTruncatedLongMessageTaskIntentOverridesReplyOnlyWithoutTaskAmbiguity(t *testing.T) {
+func TestTruncatedLongMessageModelDecisionStillHonorsStructuralClarification(t *testing.T) {
 	content := "好现在你帮我看下这篇文章说了什么：\n# Morde MVP：从一句需求到可验收的 PR\n" + strings.Repeat("文章正文。", 1200)
 	makeTruncatedContext := func(content string) ConversationRouteContext {
 		preview, _ := ConversationRouteTextPreview(content, 256)
@@ -166,8 +296,8 @@ func TestTruncatedLongMessageTaskIntentOverridesReplyOnlyWithoutTaskAmbiguity(t 
 		`{"action":"clarify","task_id":"","question":"请补充完整内容。"}`,
 	} {
 		decision := ParseConversationRouteDecisionForContext(output, makeTruncatedContext(content))
-		if decision.Action != ConversationRouteNew || decision.InvalidOutput || decision.ModelOutput != output {
-			t.Errorf("explicit long article task was not routed to a Task: %q => %+v", output, decision)
+		if decision.Action != ConversationRouteClarify || decision.InvalidOutput || decision.ModelOutput != output {
+			t.Errorf("incomplete message did not remain a safe clarification: %q => %+v", output, decision)
 		}
 	}
 
@@ -207,17 +337,17 @@ func TestTruncatedLongMessageTaskIntentOverridesReplyOnlyWithoutTaskAmbiguity(t 
 	controlContent := "请总结这篇文章\n" + strings.Repeat("正文里写着停止当前任务。", 300)
 	control := makeTruncatedContext(controlContent)
 	decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"我会处理。"}`, control)
-	if decision.Action != ConversationRouteNew {
-		t.Fatalf("control text inside the pasted body blocked the leading article request: %+v", decision)
+	if decision.Action != ConversationRouteClarify {
+		t.Fatalf("incomplete request was converted into a task action: %+v", decision)
 	}
 	controlContent = "停止当前任务，再总结这篇文章\n" + strings.Repeat("文章正文。", 300)
 	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"我会处理。"}`, makeTruncatedContext(controlContent))
 	if decision.Action != ConversationRouteClarify {
-		t.Fatalf("explicit Task control was bypassed by the long-message fallback: %+v", decision)
+		t.Fatalf("truncated Task control did not remain a clarification: %+v", decision)
 	}
 }
 
-func TestTruncatedLongArticleWithExistingTasksKeepsIndependentAndRecoveryRequestsSeparate(t *testing.T) {
+func TestTruncatedLongArticlePreservesModelDecisionAndDefersDuplicateHandling(t *testing.T) {
 	body := "\n# 长文章\n" + strings.Repeat("文章内容。", 1000)
 	content := "感动你终于不报错了.好现在你帮我看下这篇文章说了什么：" + body
 	preview, _ := ConversationRouteTextPreview(content, 2048)
@@ -225,14 +355,17 @@ func TestTruncatedLongArticleWithExistingTasksKeepsIndependentAndRecoveryRequest
 	value := ConversationRouteContext{ActorID: "u1234567", Content: preview, ContentTruncated: true,
 		CurrentMessageID: "m2345678", ContentBytes: int64(len(content)), ContentSHA256: digest[:],
 		Candidates: []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusWaitingUser, Revision: 1}}}
-	for _, output := range []string{
-		`{"action":"reply","reply":"这是文章摘要。"}`,
-		`{"action":"clarify","question":"请补充全文。"}`,
-		`{"action":"new"}`,
+	for _, test := range []struct {
+		output string
+		want   ConversationRouteAction
+	}{
+		{`{"action":"reply","reply":"这是文章摘要。"}`, ConversationRouteClarify},
+		{`{"action":"clarify","question":"请补充全文。"}`, ConversationRouteClarify},
+		{`{"action":"new"}`, ConversationRouteNew},
 	} {
-		decision := ParseConversationRouteDecisionForContext(output, value)
-		if decision.Action != ConversationRouteNew {
-			t.Fatalf("independent article was blocked by another task: output=%s decision=%+v", output, decision)
+		decision := ParseConversationRouteDecisionForContext(test.output, value)
+		if decision.Action != test.want || decision.ModelOutput != test.output {
+			t.Fatalf("model decision changed beyond the incomplete-context guard: output=%s decision=%+v", test.output, decision)
 		}
 	}
 	for _, prefix := range []string{"继续根据这篇文章修改任务", "请看这篇文章并继续现有分析", "请总结这篇文章并更新上一个任务", "不要总结这篇文章，改做别的", "请总结这篇文章并发邮件"} {
@@ -247,29 +380,28 @@ func TestTruncatedLongArticleWithExistingTasksKeepsIndependentAndRecoveryRequest
 		ContentTruncated: true, ContentSHA256: digest[:], TaskID: "q1234567", TaskStatus: task.StatusWaitingUser,
 		RoutingStatus: conversation.RoutingRouted, SameExecutionScope: true, SameAuthorization: true}}
 	decision := ParseConversationRouteDecisionForContext(`{"action":"new"}`, value)
-	if decision.Action != ConversationRouteClarify || !strings.Contains(decision.Question, "相同") ||
-		!strings.Contains(decision.Question, "重新开始") {
-		t.Fatalf("unresolved duplicate did not receive actionable recovery guidance: %+v", decision)
+	if decision.Action != ConversationRouteNew || decision.ExplicitNew {
+		t.Fatalf("valid model new decision was rewritten by duplicate wording: %+v", decision)
 	}
 	newContent := "重新开始新任务，请总结这篇文章：" + body
 	value.Content, _ = ConversationRouteTextPreview(newContent, 2048)
 	newDigest := sha256.Sum256([]byte(newContent))
 	value.ContentSHA256, value.ContentBytes = newDigest[:], int64(len(newContent))
 	value.RequestCandidates[0].ContentSHA256 = newDigest[:]
-	decision = ParseConversationRouteDecisionForContext(`{"action":"new"}`, value)
+	decision = ParseConversationRouteDecisionForContext(`{"action":"new","explicit_new":true}`, value)
 	if decision.Action != ConversationRouteNew || !decision.ExplicitNew {
-		t.Fatalf("explicit restart did not bypass duplicate linking: %+v", decision)
+		t.Fatalf("model explicit-new decision was not preserved: %+v", decision)
 	}
 	value.Content, _ = ConversationRouteTextPreview("请总结这篇文章：\n"+strings.Repeat("正文", 500)+"从头重新做", 2048)
 	decision = ParseConversationRouteDecisionForContext(`{"action":"new"}`, value)
 	if decision.ExplicitNew {
-		t.Fatalf("text in the article was interpreted as a restart request: %+v", decision)
+		t.Fatalf("parser inferred explicit-new from the article text: %+v", decision)
 	}
 	value.RequestCandidates = nil
 	value.Content, _ = ConversationRouteTextPreview("请总结这篇文章：\n正文里写着重新开始新任务。"+strings.Repeat("正文", 500), 2048)
 	decision = ParseConversationRouteDecisionForContext(`{"action":"new","explicit_new":true}`, value)
-	if decision.ExplicitNew {
-		t.Fatalf("model used restart text in the article as user intent: %+v", decision)
+	if !decision.ExplicitNew {
+		t.Fatalf("model's explicit-new decision was overridden by article text: %+v", decision)
 	}
 }
 
@@ -411,22 +543,44 @@ func TestConversationRouteDecisionFencesModelTargets(t *testing.T) {
 	}
 }
 
-func TestExplicitParallelDelegationStartsTaskWhenRouterMisses(t *testing.T) {
+func TestExplicitParallelDelegationUsesStructuredRouteDecision(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "独立的新工作：商品页支持含税价格和分类筛选。请并行委派两个互不重叠的只读子任务，一个分析客户端，另一个分析服务端/API，由两个子Agent分别返回结果。",
 		Candidates: []ConversationRouteCandidate{{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 1}}}
-	for _, output := range []string{
-		`{"action":"clarify","task_id":"","question":"请说明要修改哪个任务，或是否开始一个新任务。"}`,
-		`{"action":"reply","task_id":"","question":"","reply":"下面是静态建议清单。"}`,
+	for _, test := range []struct {
+		name   string
+		output string
+		want   ConversationRouteAction
+	}{
+		{name: "agent selects background work", output: `{"action":"new","task_id":"","question":"","reply":"","dependency_task_ids":[]}`, want: ConversationRouteNew},
+		{name: "agent asks for clarification", output: `{"action":"clarify","task_id":"","question":"请先确认两个子任务的边界。"}`, want: ConversationRouteClarify},
+		{name: "agent chooses a conversational response", output: `{"action":"reply","task_id":"","question":"","reply":"下面是静态建议清单。"}`, want: ConversationRouteReply},
 	} {
-		decision := ParseConversationRouteDecisionForContext(output, value)
-		if decision.Action != ConversationRouteNew || decision.TaskID != "" || decision.Question != "" || decision.Reply != "" ||
-			decision.ModelOutput != output {
-			t.Errorf("explicit parallel delegation did not start independent Task: %q => %+v", output, decision)
+		t.Run(test.name, func(t *testing.T) {
+			decision := ParseConversationRouteDecisionForContext(test.output, value)
+			if decision.Action != test.want || decision.ModelOutput != test.output {
+				t.Fatalf("delegation wording changed the structured decision: got=%+v want=%s", decision, test.want)
+			}
+			if test.want == ConversationRouteNew && (decision.TaskID != "" || decision.Question != "" || decision.Reply != "") {
+				t.Fatalf("valid New decision acquired fields from message text: %+v", decision)
+			}
+		})
+	}
+	if decision := ParseConversationRouteDecisionForContext("not-json", value); !decision.InvalidOutput || decision.Action == ConversationRouteNew {
+		t.Fatalf("invalid Agent output was converted to a Task by delegation wording: %+v", decision)
+	}
+	for _, content := range []string{
+		"独立商品页需求：请安排两个 Agent 分别检查客户端和服务端。",
+		"请把商品页的含税价格与分类筛选分给两个互不重叠的分析步骤。",
+	} {
+		decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":"","reply":"","dependency_task_ids":[]}`,
+			ConversationRouteContext{ActorID: "u1234567", Content: content})
+		if decision.Action != ConversationRouteNew {
+			t.Errorf("same structured New decision changed for delegation rephrase %q: %+v", content, decision)
 		}
 	}
 }
 
-func TestExplicitParallelDelegationFallbackAvoidsQueriesAndNegation(t *testing.T) {
+func TestParallelDelegationReplyIsPreservedForQueriesAndNegation(t *testing.T) {
 	for _, content := range []string{
 		"解释一下“请并行委派两个子Agent”是什么意思？",
 		"不要请并行委派子任务，只说明并行委派的含义。",
@@ -440,31 +594,54 @@ func TestExplicitParallelDelegationFallbackAvoidsQueriesAndNegation(t *testing.T
 	}
 }
 
-func TestExplicitSearchStartsTaskWhenRouterMisses(t *testing.T) {
+func TestExplicitSearchUsesStructuredRouteDecision(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "查阅 OpenAI 官方文档，说明 Structured Outputs 用来解决什么问题，并给出可打开的来源链接。"}
-	for _, output := range []string{
-		`{"action":"clarify","task_id":"","question":"请说明要修改哪个任务，或是否开始一个新任务。"}`,
-		`{"action":"reply","task_id":"","question":"","reply":"Structured Outputs 用于约束输出格式。"}`,
+	for _, test := range []struct {
+		name   string
+		output string
+		want   ConversationRouteAction
+	}{
+		{name: "agent selects a Task for research", output: `{"action":"new","task_id":"","question":"","reply":"","dependency_task_ids":[]}`, want: ConversationRouteNew},
+		{name: "agent answers conversationally", output: `{"action":"reply","task_id":"","question":"","reply":"Structured Outputs 用于约束输出格式。"}`, want: ConversationRouteReply},
+		{name: "agent asks for clarification", output: `{"action":"clarify","task_id":"","question":"你希望我只查官方文档，还是还要比较其他来源？"}`, want: ConversationRouteClarify},
 	} {
-		decision := ParseConversationRouteDecisionForContext(output, value)
-		if decision.Action != ConversationRouteNew || decision.TaskID != "" || decision.Question != "" || decision.Reply != "" ||
-			decision.ModelOutput != output {
-			t.Errorf("explicit source lookup did not start independent Task: %q => %+v", output, decision)
+		t.Run(test.name, func(t *testing.T) {
+			decision := ParseConversationRouteDecisionForContext(test.output, value)
+			if decision.Action != test.want || decision.InvalidOutput || decision.ModelOutput != test.output {
+				t.Fatalf("search wording changed the structured decision: got=%+v want=%s", decision, test.want)
+			}
+		})
+	}
+	for _, content := range []string{
+		"查阅 OpenAI 官方文档，说明 Structured Outputs 用来解决什么问题，并给出可打开的来源链接。",
+		"能否帮我找 OpenAI 官方关于 Structured Outputs 的说明，解释用途并附来源？",
+		"OpenAI 官方文档里 Structured Outputs 的作用是什么，请核对并给我来源链接。",
+	} {
+		decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":"","reply":"","dependency_task_ids":[]}`,
+			ConversationRouteContext{ActorID: "u1234567", Content: content})
+		if decision.Action != ConversationRouteNew {
+			t.Errorf("same structured New decision changed for research rephrase %q: %+v", content, decision)
 		}
 	}
 }
 
-func TestExplicitDownloadableDocumentStartsTaskWhenRouterMisses(t *testing.T) {
-	for _, output := range []string{
-		`{"action":"clarify","task_id":"","question":"请说明要修改哪个任务，或是否开始一个新任务。"}`,
-		`{"action":"reply","task_id":"","question":"","reply":"我可以直接把设计方案写在聊天里。"}`,
+func TestExplicitDownloadableDocumentUsesStructuredRouteDecision(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "帮助我写一个设计方案文档，并且可以下载的"}
+	for _, test := range []struct {
+		name   string
+		output string
+		want   ConversationRouteAction
+	}{
+		{name: "Agent selects a Task", output: `{"action":"new","task_id":"","question":"","reply":"","dependency_task_ids":[]}`, want: ConversationRouteNew},
+		{name: "Agent chooses a conversational reply", output: `{"action":"reply","task_id":"","question":"","reply":"我可以直接把设计方案写在聊天里。"}`, want: ConversationRouteReply},
+		{name: "Agent clarifies", output: `{"action":"clarify","task_id":"","question":"请确认文档格式和下载位置。"}`, want: ConversationRouteClarify},
 	} {
-		decision := ParseConversationRouteDecisionForContext(output, ConversationRouteContext{
-			ActorID: "u1234567", Content: "帮助我写一个设计方案文档，并且可以下载的",
+		t.Run(test.name, func(t *testing.T) {
+			decision := ParseConversationRouteDecisionForContext(test.output, value)
+			if decision.Action != test.want || decision.InvalidOutput || decision.ModelOutput != test.output {
+				t.Fatalf("file-delivery wording changed the structured decision: got=%+v want=%s", decision, test.want)
+			}
 		})
-		if decision.Action != ConversationRouteNew || decision.InvalidOutput || decision.ModelOutput != output {
-			t.Errorf("explicit downloadable document did not start a Task: %q => %+v", output, decision)
-		}
 	}
 	for _, content := range []string{
 		"请告诉我怎么写一个 Markdown 文档",
@@ -476,8 +653,7 @@ func TestExplicitDownloadableDocumentStartsTaskWhenRouterMisses(t *testing.T) {
 			t.Errorf("conversational or negative document request became a Task: %q => %+v", content, decision)
 		}
 	}
-	value := ConversationRouteContext{ActorID: "u1234567", Content: "帮助我写一个设计方案文档，并且可以下载的",
-		PreviousUnresolved: true}
+	value.PreviousUnresolved = true
 	decision := ParseConversationRouteDecisionForContext(`{"action":"clarify","task_id":"","question":"先确认上一条消息"}`, value)
 	if decision.Action != ConversationRouteClarify {
 		t.Fatalf("file intent bypassed an unresolved predecessor: %+v", decision)
@@ -540,101 +716,75 @@ func TestConversationRouteJoinRequiresAuthorizedSameScopeCandidate(t *testing.T)
 	}
 }
 
-func TestConversationRouteExplicitNewIntentRequiresPositiveRerun(t *testing.T) {
+func TestConversationRouteModelActionIsPreservedAcrossSemanticRewrites(t *testing.T) {
+	candidate := ConversationRouteCandidate{TaskID: "q1234567", InitiatorID: "u1234567", Status: task.StatusRunning, Revision: 2}
 	for _, test := range []struct {
+		name    string
 		content string
-		want    bool
+		output  string
+		want    ConversationRouteAction
 	}{
-		{content: "重新开始一个新任务", want: true},
-		{content: "Start another task for the same request", want: true},
-		{content: "请明确重做一遍", want: true},
-		{content: "Do not start another task", want: false},
-		{content: "Don't start a new task", want: false},
-		{content: "继续相同目标，并补充失败处理", want: false},
-		{content: "另一个目标：生成测试方案", want: false},
+		{name: "reply with task vocabulary", content: "请搜索后停止当前任务，再重新开始新任务并把工作目录换到 /workspace/new。", output: `{"action":"reply","reply":"我会直接回答。"}`, want: ConversationRouteReply},
+		{name: "new without restart phrase", content: "请按需求完整完成这项独立工作。", output: `{"action":"new","explicit_new":false,"dependency_task_ids":[]}`, want: ConversationRouteNew},
+		{name: "explicit new without keyword", content: "请继续原来的分析。", output: `{"action":"new","explicit_new":true,"dependency_task_ids":[]}`, want: ConversationRouteNew},
+		{name: "status paraphrase", content: "这件事目前到哪一步了？", output: `{"action":"status","task_id":"q1234567"}`, want: ConversationRouteStatus},
+		{name: "stop paraphrase", content: "把这项工作结束掉。", output: `{"action":"stop","task_id":"q1234567"}`, want: ConversationRouteStop},
+		{name: "stop all paraphrase", content: "把还没有结束的工作全部撤掉。", output: `{"action":"stop_all"}`, want: ConversationRouteStopAll},
+		{name: "tool paraphrase", content: "有没有关于日本央行利率政策的最新公开信息？", output: `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`, want: ConversationRouteTool},
 	} {
-		t.Run(test.content, func(t *testing.T) {
-			if got := ConversationRouteHasExplicitNewIntent(test.content); got != test.want {
-				t.Fatalf("ConversationRouteHasExplicitNewIntent(%q)=%t, want %t", test.content, got, test.want)
+		t.Run(test.name, func(t *testing.T) {
+			value := ConversationRouteContext{ActorID: "u1234567", Content: test.content, Candidates: []ConversationRouteCandidate{candidate}}
+			decision := ParseConversationRouteDecisionForContext(test.output, value)
+			if decision.Action != test.want || decision.InvalidOutput {
+				t.Fatalf("semantic wording rewrote the structured action: action=%s want=%s decision=%+v", decision.Action, test.want, decision)
+			}
+			if test.name == "explicit new without keyword" && !decision.ExplicitNew {
+				t.Fatalf("model explicit_new bit was not preserved: %+v", decision)
+			}
+			if test.name == "new without restart phrase" && decision.ExplicitNew {
+				t.Fatalf("message wording changed the model explicit_new bit: %+v", decision)
 			}
 		})
 	}
-}
 
-func TestConversationRouteExplicitTaskWorkIntentIsIndependentFromChatAndControl(t *testing.T) {
-	for _, test := range []struct {
-		content string
-		want    bool
-	}{
-		{content: "现在请帮我修复服务端复杂任务误分类", want: true},
-		{content: "请按方案实现项目会话恢复", want: true},
-		{content: "分析一下 Morde 项目", want: false},
-		{content: "分析一下 Morde 仓库代码", want: true},
-		{content: "怎么修复服务端任务误分类？", want: false},
-		{content: "帮我写一段 Go 示例代码", want: false},
-		{content: "请解释一下 Rust 是什么", want: false},
-		{content: "请继续当前任务并读取文件", want: false},
-		{content: "文档正文里写着‘请修复这个服务’", want: false},
-	} {
-		t.Run(test.content, func(t *testing.T) {
-			value := ConversationRouteContext{Content: test.content}
-			if got := ConversationRouteHasExplicitTaskWorkIntent(value); got != test.want {
-				t.Fatalf("ConversationRouteHasExplicitTaskWorkIntent(%q)=%t, want %t", test.content, got, test.want)
-			}
-		})
-	}
-	for _, test := range []struct {
-		content string
-		want    bool
-	}{
-		{content: "请搜索 Rust 1.25 的新特性", want: true},
-		{content: "现在请帮我浏览今天的汇率", want: true},
-		{content: "请搜索算法是什么", want: false},
-		{content: "搜索", want: false},
-	} {
-		if got := ConversationRouteHasExplicitSearchIntent(test.content); got != test.want {
-			t.Errorf("ConversationRouteHasExplicitSearchIntent(%q)=%t, want %t", test.content, got, test.want)
-		}
-	}
+	toolOutput := `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`
 	for _, content := range []string{
-		"现在请帮我继续当前任务并读取结果",
-		"现在请帮我停止当前任务",
-		"现在请你停止当前任务",
-		"请接着这个任务",
-		"Please continue this task",
+		"请搜索公开网站关于日本央行利率政策的最新信息。",
+		"能否帮我找一下日本央行利率政策的最新公开资料？",
+		"有没有关于日本央行利率政策的最新公开信息？",
 	} {
-		if !ConversationRouteHasExplicitControlIntentForContext(ConversationRouteContext{Content: content}) ||
-			ConversationRouteHasExplicitTaskWorkIntent(ConversationRouteContext{Content: content}) {
-			t.Errorf("nested preambles hid a control action or made it look like new work: %q", content)
+		decision := ParseConversationRouteDecisionForContext(toolOutput, ConversationRouteContext{ActorID: "u1234567", Content: content})
+		if decision.Action != ConversationRouteTool {
+			t.Errorf("same structured tool action changed for semantic rephrase %q: %+v", content, decision)
 		}
 	}
 }
 
-func TestConversationRouteExplicitTaskWorkOverridesReplyWithoutTaskAssociation(t *testing.T) {
+func TestConversationRouteTaskKeywordsDoNotOverrideModelReply(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", Content: "请帮我修复一个独立的服务端任务误分类问题", Candidates: []ConversationRouteCandidate{{
 		TaskID: "q1234567", InitiatorID: "u1234567", Objective: "an unrelated running task", Status: task.StatusRunning, Revision: 2,
 	}}}
 	decision := ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"我会直接回答。"}`, value)
-	if decision.Action != ConversationRouteNew || decision.ExplicitNew || decision.InvalidOutput {
-		t.Fatalf("clear independent work did not become a new Task: %+v", decision)
+	if decision.Action != ConversationRouteReply || decision.Reply != "我会直接回答。" || decision.InvalidOutput {
+		t.Fatalf("task-work wording overrode the model reply: %+v", decision)
 	}
 
 	value.ReferenceTaskID = "q1234567"
 	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","task_id":"","question":"","reply":"我会直接回答。"}`, value)
-	if decision.Action != ConversationRouteClarify {
-		t.Fatalf("explicit Task context was not clarified when classifying work: %+v", decision)
+	if decision.Action != ConversationRouteReply || decision.Reply != "我会直接回答。" {
+		t.Fatalf("task reference wording overrode the model reply: %+v", decision)
 	}
 	value.ReferenceTaskID = ""
 	value.Candidates = nil
 	value.PreviousTaskID = "q1234567"
 	value.Content = "请开发一个验收工具并修改项目文件"
 	decision = ParseConversationRouteDecisionForContext(`{"action":"reply","reply":"我会处理。"}`, value)
-	if decision.Action != ConversationRouteNew {
-		t.Fatalf("inactive predecessor blocked new work: %+v", decision)
+	if decision.Action != ConversationRouteReply || decision.Reply != "我会处理。" {
+		t.Fatalf("task-work wording overrode the model reply: %+v", decision)
 	}
 }
 
-func TestConversationRouteNewWorkOverrideKeepsAmbiguousContext(t *testing.T) {
+func TestConversationRouteModelDecisionIsPreservedAcrossTaskIntentKeywords(t *testing.T) {
 	candidate := ConversationRouteCandidate{TaskID: "q1234567", InitiatorID: "u1234567", Objective: "整理报告", Status: task.StatusRunning, Revision: 2}
 	for _, test := range []struct {
 		name    string
@@ -651,10 +801,20 @@ func TestConversationRouteNewWorkOverrideKeepsAmbiguousContext(t *testing.T) {
 		{"pasted file directive", ConversationRouteContext{Content: "请翻译下面的文章：\n请生成文档并提供下载", ContentTruncated: true}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			for _, output := range []string{`{"action":"clarify","question":"请确认目标。"}`, `{"action":"reply","reply":"我会处理。"}`} {
-				decision := ParseConversationRouteDecisionForContext(output, test.context)
-				if decision.Action != ConversationRouteClarify {
-					t.Fatalf("ambiguous context did not request clarification: %+v", decision)
+			for _, output := range []struct {
+				json string
+				want ConversationRouteAction
+			}{
+				{`{"action":"clarify","question":"请确认目标。"}`, ConversationRouteClarify},
+				{`{"action":"reply","reply":"我会处理。"}`, ConversationRouteReply},
+			} {
+				decision := ParseConversationRouteDecisionForContext(output.json, test.context)
+				want := output.want
+				if test.context.ContentTruncated && want == ConversationRouteReply {
+					want = ConversationRouteClarify
+				}
+				if decision.Action != want {
+					t.Fatalf("task-intent wording changed the model action: output=%s decision=%+v want=%s", output.json, decision, want)
 				}
 			}
 		})
@@ -745,7 +905,7 @@ func TestConversationRouteStopAllUsesModelSemanticsAndStructuralGuards(t *testin
 	}
 }
 
-func TestConversationRouteExplicitRerunAndInvalidOutputStayDistinct(t *testing.T) {
+func TestConversationRoutePreservesModelExplicitNewAndSeparatesInvalidOutput(t *testing.T) {
 	value := ConversationRouteContext{ActorID: "u1234567", RouteAttempt: 1, Content: "请从头再做，开始一个新任务"}
 	decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","target_message_id":"","explicit_new":true,"question":"","reply":"","dependency_task_ids":[]}`, value)
 	if decision.Action != ConversationRouteNew || !decision.ExplicitNew {
@@ -753,8 +913,8 @@ func TestConversationRouteExplicitRerunAndInvalidOutputStayDistinct(t *testing.T
 	}
 	value.Content = "请继续原来的分析"
 	decision = ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","target_message_id":"","explicit_new":true,"question":"","reply":"","dependency_task_ids":[]}`, value)
-	if !decision.InvalidOutput {
-		t.Fatalf("unsupported explicit_new flag was treated as user ambiguity: %+v", decision)
+	if decision.Action != ConversationRouteNew || !decision.ExplicitNew || decision.InvalidOutput {
+		t.Fatalf("model explicit-new decision was overridden by wording: %+v", decision)
 	}
 	value.Content = "换一个目标，帮我设计 Morde 的发布流程"
 	decision = ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","target_message_id":"","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`, value)
@@ -787,7 +947,7 @@ func TestConversationRouteExecutionScopeIgnoresOnlyCausalPredecessor(t *testing.
 	}
 }
 
-func TestExplicitSearchFallbackAvoidsQuestionsNegationAndActiveTasks(t *testing.T) {
+func TestSearchReplyAndClarificationFollowStructuredDecision(t *testing.T) {
 	for _, content := range []string{
 		"搜索算法是什么？",
 		"请不要搜索 OpenAI 文档，只解释 Structured Outputs。",
@@ -805,7 +965,7 @@ func TestExplicitSearchFallbackAvoidsQuestionsNegationAndActiveTasks(t *testing.
 	}}}
 	decision := ParseConversationRouteDecisionForContext(`{"action":"clarify","task_id":"","question":"请说明要修改哪个任务，或是否开始一个新任务。"}`, value)
 	if decision.Action != ConversationRouteClarify {
-		t.Fatalf("search fallback overrode active-task ambiguity: %+v", decision)
+		t.Fatalf("structured clarification for an ambiguous active-task target was changed: %+v", decision)
 	}
 }
 
@@ -878,28 +1038,39 @@ func TestConversationRouteDirectToolIsExplicitAndReadOnly(t *testing.T) {
 		!strings.Contains(request.Instructions, `"morde_web_search"`) || !strings.Contains(request.Instructions, `action "tool"`) {
 		t.Fatalf("direct tool contract missing from model request: err=%v instructions=%s", err, request.Instructions)
 	}
+	mixedControl := value
+	mixedControl.Content += "，顺便停止当前任务"
+	decision := ParseConversationRouteDecisionForContext(`{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`, mixedControl)
+	if decision.Action != ConversationRouteTool {
+		t.Fatalf("text control keywords vetoed a structurally valid model tool action: %+v", decision)
+	}
 	truncatedDigest := sha256.Sum256([]byte(value.Content))
 	for _, restricted := range []struct {
-		name    string
-		context ConversationRouteContext
+		name             string
+		context          ConversationRouteContext
+		toolInstructions bool
 	}{
-		{"ordinary chat", ConversationRouteContext{ActorID: value.ActorID, Content: "你好"}},
-		{"task reference", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, ReferenceTaskID: "q1234567"}},
-		{"attachments", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, CurrentMessageHasAttachments: true}},
-		{"unresolved predecessor", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, PreviousUnresolved: true}},
-		{"missing predecessor", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, PreviousMissing: true, PreviousUnresolved: true}},
-		{"unavailable reference", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, ReferenceTaskID: "q1234567", ReferenceUnavailable: true}},
+		{"ordinary chat", ConversationRouteContext{ActorID: value.ActorID, Content: "你好"}, true},
+		{"task reference", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, ReferenceTaskID: "q1234567"}, false},
+		{"attachments", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, CurrentMessageHasAttachments: true}, false},
+		{"unresolved predecessor", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, PreviousUnresolved: true}, false},
+		{"missing predecessor", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, PreviousMissing: true, PreviousUnresolved: true}, false},
+		{"unavailable reference", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, ReferenceTaskID: "q1234567", ReferenceUnavailable: true}, false},
 		{"truncated message", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, CurrentMessageID: "m1234567",
-			ContentBytes: int64(len(value.Content)), ContentSHA256: truncatedDigest[:], ContentTruncated: true}},
-		{"task control", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content + "，顺便停止当前任务"}},
+			ContentBytes: int64(len(value.Content)), ContentSHA256: truncatedDigest[:], ContentTruncated: true}, false},
+		{"incomplete candidates", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, CandidateSetIncomplete: true}, false},
+		{"incomplete history", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content, HistoryIncomplete: true}, false},
+		{"task control wording", ConversationRouteContext{ActorID: value.ActorID, Content: value.Content + "，顺便停止当前任务"}, true},
+		{"unfamiliar search phrasing", ConversationRouteContext{ActorID: value.ActorID, Content: "有没有关于日本央行利率政策的最新公开信息？"}, true},
 	} {
 		t.Run("instruction omitted: "+restricted.name, func(t *testing.T) {
 			request, err := ConversationRouteModelRequest(restricted.context)
 			if err != nil {
 				t.Fatalf("build route request: %v", err)
 			}
-			if strings.Contains(request.Instructions, conversationRouteDirectToolInstructions) {
-				t.Fatalf("ineligible request received the direct tool contract: %s", request.Instructions)
+			got := strings.Contains(request.Instructions, conversationRouteDirectToolInstructions)
+			if got != restricted.toolInstructions {
+				t.Fatalf("direct tool contract eligibility = %t, want %t: %s", got, restricted.toolInstructions, request.Instructions)
 			}
 		})
 	}
@@ -1101,10 +1272,19 @@ func TestUnavailableRouteReferenceIsHiddenAndControlsAreRejected(t *testing.T) {
 		strings.Contains(request.Input[0].Text, "q1234567") || strings.Contains(request.Input[0].Text, `"reference_task_id"`) {
 		t.Fatalf("model input exposed an unavailable reference: request=%+v err=%v", request, err)
 	}
-	for _, action := range []string{"update", "status", "stop"} {
-		decision := ParseConversationRouteDecisionForContext(`{"action":"`+action+`","task_id":"q1234567","question":""}`, value)
+	for _, test := range []struct {
+		action  string
+		content string
+	}{
+		{action: "update", content: value.Content},
+		{action: "status", content: value.Content},
+		{action: "stop", content: "停止任务"},
+	} {
+		controlContext := value
+		controlContext.Content = test.content
+		decision := ParseConversationRouteDecisionForContext(`{"action":"`+test.action+`","task_id":"q1234567","question":""}`, controlContext)
 		if decision.Action != ConversationRouteClarify || decision.Question != UnavailableRouteReferenceMessage || decision.TaskID != "" {
-			t.Fatalf("unavailable control was accepted: action=%s decision=%+v", action, decision)
+			t.Fatalf("unavailable structured control was not clarified: action=%s decision=%+v", test.action, decision)
 		}
 	}
 	if decision := ParseConversationRouteDecisionForContext(`{"action":"new","task_id":"","question":""}`, value); decision.Action != ConversationRouteNew {

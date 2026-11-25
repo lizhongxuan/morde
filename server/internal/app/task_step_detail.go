@@ -92,13 +92,18 @@ type cloudDSHToolActivity struct {
 const maxTaskStepContentEvidencePreviewBytes = 4096
 
 const taskToolExecutionFailureReason = "tool_execution_failed"
+const taskToolInvalidArgumentsFailureReason = "invalid_tool_arguments"
+
+func validCloudDSHToolActivityFence(ctx context.Context, current task.Task, call ModelToolCall) bool {
+	return ctx != nil && call.TaskFence != nil && call.TaskFence.TaskID == current.ID && call.TaskFence.OwnerID == current.OwnerID &&
+		call.TaskFence.AgentSessionID != "" && current.CurrentRevision != nil && *current.CurrentRevision >= 0 &&
+		call.TaskFence.AgentInstanceID == current.AgentInstanceID && call.TaskFence.AgentGeneration == current.AgentGeneration &&
+		call.TaskFence.AuthorizationVersion == current.Authorization.Version &&
+		call.TaskFence.LeaseOwner == current.Lease.Owner && call.TaskFence.LeaseVersion == current.Lease.Version
+}
 
 func withCloudDSHToolActivity(ctx context.Context, current task.Task, call ModelToolCall, sealer *Sealer) context.Context {
-	if call.TaskFence == nil || call.TaskFence.TaskID != current.ID || call.TaskFence.OwnerID != current.OwnerID ||
-		call.TaskFence.AgentSessionID == "" || current.CurrentRevision == nil || *current.CurrentRevision < 0 ||
-		call.TaskFence.AgentInstanceID != current.AgentInstanceID || call.TaskFence.AgentGeneration != current.AgentGeneration ||
-		call.TaskFence.AuthorizationVersion != current.Authorization.Version ||
-		call.TaskFence.LeaseOwner != current.Lease.Owner || call.TaskFence.LeaseVersion != current.Lease.Version {
+	if !validCloudDSHToolActivityFence(ctx, current, call) {
 		return ctx
 	}
 	arguments, err := validateAgentToolArguments(call.Arguments)
@@ -111,6 +116,25 @@ func withCloudDSHToolActivity(ctx context.Context, current task.Task, call Model
 	}
 	return context.WithValue(ctx, cloudDSHToolActivityKey{}, cloudDSHToolActivity{call: call, current: current,
 		digest: append([]byte(nil), digest[:]...), sealer: sealer})
+}
+
+// withInvalidRuntimeToolArgumentActivity records only a digest and the normal
+// redacted tool summary for malformed arguments. The digest is domain
+// separated from executable operation hashes so a malformed payload can never
+// be mistaken for a dispatched operation during Task-step reconciliation.
+func withInvalidRuntimeToolArgumentActivity(ctx context.Context, current task.Task, call ModelToolCall, sealer *Sealer) context.Context {
+	if !validCloudDSHToolActivityFence(ctx, current, call) || call.TaskFence.AgentInstanceID == "" ||
+		call.TaskFence.AgentGeneration < 1 || call.TaskFence.InitiatorID != current.InitiatorID ||
+		len(call.Arguments) > maxAgentToolArgsBytes || !utf8.ValidString(call.Arguments) {
+		return ctx
+	}
+	return context.WithValue(ctx, cloudDSHToolActivityKey{}, cloudDSHToolActivity{call: call, current: current,
+		digest: cloudDSHInvalidRuntimeToolArgumentsDigest(call.Name, call.Arguments), sealer: sealer})
+}
+
+func cloudDSHInvalidRuntimeToolArgumentsDigest(name, rawArguments string) []byte {
+	digest := sha256.Sum256([]byte("morde-dsh-invalid-runtime-tool-arguments-v1\x00" + name + "\x00" + rawArguments))
+	return append([]byte(nil), digest[:]...)
 }
 
 func cloudDSHToolActivityFromContext(ctx context.Context) (cloudDSHToolActivity, bool) {
@@ -251,7 +275,10 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 		}
 		progress.ContentEvidenceSHA256 = contentDigest
 	}
-	if step.Status == task.StepFailed && activity.failureReason == "connector_rate_limited" {
+	if step.Status == task.StepFailed && activity.failureReason == taskToolInvalidArgumentsFailureReason && phase == "prepare" {
+		// Invalid arguments are reported in the event detail. Keep the durable
+		// Task failure evidence non-retryable and within the Store's allowlist.
+	} else if step.Status == task.StepFailed && activity.failureReason == "connector_rate_limited" {
 		progress.FailureReason, progress.Retryable = activity.failureReason, true
 	} else if step.Status == task.StepFailed && activity.failureReason == taskToolExecutionFailureReason && phase == "execute" {
 		progress.FailureReason = activity.failureReason

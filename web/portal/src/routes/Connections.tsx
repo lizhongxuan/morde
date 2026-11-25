@@ -58,6 +58,7 @@ export function Connections() {
   const [presetID, setPresetID] = useState('');
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [formError, setFormError] = useState('');
   const [checked, setChecked] = useState<{ id: string; capabilities: ModelConnection['capabilities'] } | null>(null);
   const personalModels = models.data?.items.filter((model) => !model.shared) ?? [];
   const check = useMutation({
@@ -96,9 +97,11 @@ export function Connections() {
     const submittedDraft = draft;
     const apiKey = submittedDraft.apiKey.trim();
     if (submittedDraft.apiKey && !apiKey) {
+      setFormError('API 密钥不能为空。');
       notify('API 密钥不能为空。', 'error');
       return;
     }
+    setFormError('');
     setSaving(true);
     setDraft((current) => ({ ...current, apiKey: '' }));
     try {
@@ -117,6 +120,7 @@ export function Connections() {
       setFormOpen(false);
       setEditingID(null);
       setChecked(null);
+      setFormError('');
       await refreshModels();
       if (!editingID) {
         try {
@@ -130,7 +134,9 @@ export function Connections() {
     } catch (error) {
       const outcomeUnknown = isTransientNetworkError(error);
       void refreshModels();
-      notify(`${outcomeUnknown ? '服务暂时不可用，保存结果尚未确认，请先核对模型列表。' : modelConnectionSaveErrorMessage(error)}${apiKey && !outcomeUnknown ? ' 密钥已清除，请重新输入后重试。' : ''}`, 'error');
+      const message = `${outcomeUnknown ? '服务暂时不可用，保存结果尚未确认，请先核对模型列表。' : modelConnectionSaveErrorMessage(error)}${apiKey && !outcomeUnknown ? ' 密钥已清除，请重新输入后重试。' : ''}`;
+      setFormError(message);
+      notify(message, 'error');
     } finally {
       setSaving(false);
     }
@@ -141,6 +147,7 @@ export function Connections() {
     setDraft(emptyDraft);
     setPresetID('');
     setAdvancedOpen(false);
+    setFormError('');
     setEditingID(null);
     setFormOpen(false);
   };
@@ -215,9 +222,11 @@ export function Connections() {
           </details>
         </div>
         <div className="form-actions"><span><button type="button" className="button button-secondary" disabled={saving} onClick={cancelForm}>取消</button><button type="submit" className="button button-primary" disabled={saving}>{saving ? '正在保存…' : editingID ? '保存修改' : '保存并检查连接'}</button></span></div>
+        {formError && <FloatingError inline className="error-inline" role="alert">{formError}</FloatingError>}
       </form></Modal>}
-      {models.isPending || (!models.data && isTransientNetworkError(models.error)) ? <div className="loading-card" role="status">正在读取模型连接…</div>
-        : models.isError && !isTransientNetworkError(models.error) ? <FloatingError className="error-card" role="alert">{errorDetails(models.error).message}<button className="button button-secondary" type="button" onClick={() => void models.refetch()}>重试</button></FloatingError>
+      {models.isError && models.data && <FloatingError inline className="error-card" role="alert">模型连接刷新失败，当前显示最近一次确认的连接。{errorDetails(models.error).message}<button className="button button-secondary" type="button" onClick={() => void models.refetch()}>重试</button></FloatingError>}
+      {models.isPending && !models.data ? <div className="loading-card" role="status">正在读取模型连接…</div>
+        : models.isError && !models.data ? <FloatingError inline className="error-card" role="alert">{errorDetails(models.error).message}<button className="button button-secondary" type="button" onClick={() => void models.refetch()}>重试</button></FloatingError>
           : !models.data ? <div className="loading-card" role="status">正在读取模型连接…</div>
           : !personalModels.length ? <><div className="connection-empty"><span className="connection-empty-icon" aria-hidden="true"><MordeIcon name="link" /></span><h3>尚未添加个人模型</h3><p>添加模型后，即可在对话中选择使用。</p></div><p className="connection-empty-note"><MordeIcon name="info" />模型配置和密钥仅对当前账号可见。</p></>
         : personalModels.length === 1 ? <div className="model-connection-list">{renderPersonalModel(personalModels[0]!)}</div>
@@ -248,8 +257,8 @@ function ModelCard({ model, shared, checked, check, streamCheck, onEdit }: {
     <div className="model-connection-main">
       <div className="model-connection-heading"><span className="model-provider-icon" aria-hidden="true">{model.model_name.trim().charAt(0).toUpperCase() || 'M'}</span><div className="model-connection-copy"><div className="model-connection-title"><h3>{model.name}</h3><span className={`model-connection-status model-connection-status-${status}`}><span aria-hidden="true" />{status === 'passed' ? '检查通过' : status === 'failed' ? '检查失败' : '尚未检查'}</span></div><p className="muted">{model.model_name} · {modelHostLabel(model.base_url)}</p></div></div>
       {checked?.id === model.id && <p className="notice notice-info model-check-result">本次检查：文本{checked.capabilities.text ? '可用' : '未验证'} · 工具调用{checked.capabilities.tools ? '可用' : '未验证'} · 视觉{checked.capabilities.vision ? '可用' : '未验证'}</p>}
-      {check?.isError && check.variables === model.id && <FloatingError className="error-inline" role="alert">{modelCheckErrorMessage(check.error)}</FloatingError>}
-      {streamCheck?.isError && streamCheck.variables === model.id && <FloatingError className="error-inline" role="alert">{modelCheckErrorMessage(streamCheck.error)}</FloatingError>}
+      {check?.isError && check.variables === model.id && <FloatingError inline className="error-inline" role="alert">{modelCheckErrorMessage(check.error)}</FloatingError>}
+      {streamCheck?.isError && streamCheck.variables === model.id && <FloatingError inline className="error-inline" role="alert">{modelCheckErrorMessage(streamCheck.error)}</FloatingError>}
     </div>
     {!shared && <div className="model-connection-actions"><button type="button" className="button button-secondary button-small" disabled={check?.isPending || streamCheck?.isPending || !onEdit} onClick={onEdit}>编辑</button><button type="button" className="button button-secondary button-small" disabled={check?.isPending || streamCheck?.isPending} onClick={() => check?.mutate(model.id)}>{check?.isPending && check.variables === model.id ? '检查中…' : '检查连接'}</button><button type="button" className="button button-secondary button-small" title={model.capabilities.text ? '检查流式回复会产生一次模型调用' : '先检查文本能力'} disabled={check?.isPending || streamCheck?.isPending || !model.capabilities.text} onClick={() => streamCheck?.mutate(model.id)}>{streamCheck?.isPending && streamCheck.variables === model.id ? '检查中…' : '检查流式回复'}</button></div>}
     <details className="model-connection-details">

@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"testing"
 	"time"
 
@@ -349,14 +350,25 @@ FROM conversation_message_routes r JOIN tasks t ON t.id=$2 WHERE r.message_id=$1
 				t.Fatalf("unavailable Task reference was not detected: %+v err=%v", snapshot.Context, err)
 			}
 			snapshot.Context.ModelID = "p1234567"
-			if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+			stopOutput, err := json.Marshal(struct {
+				Action app.ConversationRouteAction `json:"action"`
+				TaskID string                      `json:"task_id"`
+			}{Action: app.ConversationRouteStop, TaskID: old.ID})
+			if err != nil {
 				t.Fatal(err)
 			}
-			var controlTask string
-			if err := f.store.pool.QueryRow(ctx, `SELECT r.state,COALESCE(m.task_id,'') FROM conversation_message_routes r
-JOIN conversation_messages m ON m.id=r.message_id WHERE r.message_id=$1`, claim.Message.ID).Scan(&routeState, &controlTask); err != nil ||
-				routeState != "waiting_user" || controlTask != "" {
-				t.Fatalf("standalone stop was converted into a new Task: route=%s task=%s err=%v", routeState, controlTask, err)
+			if err := f.store.ApplyConversationRoute(ctx, claim, snapshot, app.ConversationRouteDecision{
+				Action: app.ConversationRouteStop, TaskID: old.ID, ModelOutput: string(stopOutput),
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var controlTask, stopReply string
+			if err := f.store.pool.QueryRow(ctx, `SELECT r.state,COALESCE(m.task_id,''),
+ (SELECT content FROM conversation_messages WHERE conversation_id=m.conversation_id AND role='assistant' ORDER BY sequence DESC LIMIT 1)
+FROM conversation_message_routes r JOIN conversation_messages m ON m.id=r.message_id WHERE r.message_id=$1`, claim.Message.ID).
+				Scan(&routeState, &controlTask, &stopReply); err != nil || routeState != "waiting_user" || controlTask != "" || stopReply == "" {
+				t.Fatalf("unavailable stop target was not clarified without creating a Task: route=%s task=%s reply=%q err=%v",
+					routeState, controlTask, stopReply, err)
 			}
 			claim = projectHistoryClaimWithReference(t, f, "project-unrecoverable-003", old.ID, "重新整理今年的财报")
 			snapshot, err = f.store.LoadConversationRouteSnapshot(ctx, claim)

@@ -997,7 +997,8 @@ WHERE message_id=$1 AND call_id=$3 AND state IN ('dispatched','unknown')`, call.
 }
 
 func validStoredRouteDecision(value app.ConversationRouteDecision, context app.ConversationRouteContext) bool {
-	if !app.ValidConversationRouteModelOutput(value.ModelOutput) {
+	if !app.ValidConversationRouteModelOutput(value.ModelOutput) ||
+		!app.ValidConversationRouteFileDeliveryIntent(value.Action, value.FileDeliveryIntent) {
 		return false
 	}
 	if value.InvalidOutput {
@@ -1008,7 +1009,7 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 	}
 	switch value.Action {
 	case app.ConversationRouteNew:
-		return value.TaskID == "" && value.TargetMessageID == "" && (!value.ExplicitNew || app.ConversationRouteHasExplicitNewIntentForContext(context)) &&
+		return value.TaskID == "" && value.TargetMessageID == "" &&
 			value.ExpectedRevision == 0 && value.Question == "" && value.Reply == "" &&
 			(!value.ExplicitNew || len(value.AggregateMessageIDs) == 0) &&
 			app.ValidConversationRouteDependencyIDs(value.DependencyTaskIDs, context.Candidates) &&
@@ -1022,6 +1023,11 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 		return !value.Acknowledge && value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Question == "" && len(value.DependencyTaskIDs) == 0 &&
 			len(value.AggregateMessageIDs) == 0 &&
 			app.ValidConversationRouteReply(value.Reply)
+	case app.ConversationRouteTool:
+		return !value.Acknowledge && value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 &&
+			value.Question == "" && value.Reply == "" && len(value.DependencyTaskIDs) == 0 && len(value.AggregateMessageIDs) == 0 &&
+			app.ConversationRouteDirectToolContextEligible(context) &&
+			app.ValidConversationRouteDirectToolCall(value.ToolName, json.RawMessage(value.ToolArguments))
 	case app.ConversationRouteClarify:
 		return !value.Acknowledge && value.TaskID == "" && value.TargetMessageID == "" && !value.ExplicitNew && value.ExpectedRevision == 0 && value.Reply == "" && len(value.DependencyTaskIDs) == 0 &&
 			len(value.AggregateMessageIDs) == 0 && value.Question != "" &&

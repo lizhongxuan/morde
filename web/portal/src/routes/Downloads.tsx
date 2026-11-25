@@ -28,7 +28,11 @@ export function Downloads() {
       <section aria-labelledby="download-heading">
         <h1 id="download-heading">下载 morde-pc</h1>
         <p className="download-intro">在 morde-pc 中选择本机项目文件夹，手动同步到指定云端电脑；你的 AI 工具仍可使用本地文件。</p>
-        {(downloads.isPending || (networkError && !downloads.data)) && <p className="loading-card" role="status">正在读取可用版本…</p>}
+        {downloads.isPending && <p className="loading-card" role="status">正在读取可用版本…</p>}
+        {networkError && <div className="error-card" role="alert">
+          <span>{downloads.data ? '网络异常，当前显示最近一次读取的版本。' : '网络异常，可用版本暂时无法读取。'}</span>
+          <button className="button button-secondary" type="button" onClick={() => void downloads.refetch()}>重试</button>
+        </div>}
         {downloads.isError && !networkError && <div className="error-card" role="alert"><span>{errorDetails(downloads.error).message}</span><button className="button button-secondary" type="button" onClick={() => void downloads.refetch()}>重试</button></div>}
         {downloads.data && downloads.data.artifacts.length === 0 && <section className="empty-card download-empty"><h2>当前还没有可下载版本</h2><p>管理员发布桌面安装包后，这里会显示对应电脑的下载入口。</p></section>}
         {downloads.data && downloads.data.artifacts.length > 0 && <>

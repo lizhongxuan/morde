@@ -1087,13 +1087,13 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .message-retry:hover:not(:disabled) { border-color: #d94039; background: #ffe9e7; }
 .assistant-page .message-retry:disabled { cursor: wait; opacity: .55; }
 .assistant-page .chat-message:focus-visible { outline: 2px solid #9cafff; outline-offset: 2px; }
-.assistant-reply-meta { min-height: 24px; margin: 3px 2px 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; opacity: 0; visibility: hidden; transition: opacity .15s, visibility .15s; }
-.chat-message-row-assistant:hover .assistant-reply-meta, .chat-message-row-assistant:focus-within .assistant-reply-meta { opacity: 1; visibility: visible; }
-.assistant-reply-time { color: #9aa6b5; font-size: 10px; }
-.assistant-reply-copy { width: 24px; height: 24px; padding: 4px; display: grid; place-items: center; border: 0; border-radius: 6px; color: #74839a; background: transparent; cursor: pointer; }
-.assistant-reply-copy:hover { color: #1d4ed8; background: #eef4ff; }
-.assistant-reply-copy:focus-visible { outline: 2px solid #9cafff; outline-offset: 1px; }
-.assistant-reply-copy .morde-icon { width: 15px; height: 15px; }
+.chat-message-meta { min-height: 24px; margin: 3px 2px 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; opacity: 0; visibility: hidden; transition: opacity .15s, visibility .15s; }
+.chat-message-row:hover .chat-message-meta, .chat-message-row:focus-within .chat-message-meta { opacity: 1; visibility: visible; }
+.chat-message-time { color: #9aa6b5; font-size: 10px; }
+.chat-message-copy { width: 24px; height: 24px; padding: 4px; display: grid; place-items: center; border: 0; border-radius: 6px; color: #74839a; background: transparent; cursor: pointer; }
+.chat-message-copy:hover { color: #1d4ed8; background: #eef4ff; }
+.chat-message-copy:focus-visible { outline: 2px solid #9cafff; outline-offset: 1px; }
+.chat-message-copy .morde-icon { width: 15px; height: 15px; }
 .assistant-page .assistant-composer { flex: none; padding: 5px 28px 16px; border: 0; background: #fff; }
 .assistant-page .assistant-composer form { width: min(100%, 714px); margin: 0 auto; padding: 14px 14px 10px; border-color: #dfe5f0; border-radius: 15px; box-shadow: 0 6px 25px rgb(52 72 112 / 4%); }
 .assistant-page .assistant-composer textarea { width: 100%; height: 52px; min-height: 52px; max-height: 130px; padding: 0 2px; resize: none; color: #35445e; font-size: 13px; }
@@ -1240,7 +1240,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   .assistant-page .assistant-layout-with-task-panel .assistant-task-panel { position: absolute; z-index: 30; inset: 0 0 0 auto; width: min(360px, calc(100% - 12px)); border: 1px solid var(--line); border-radius: 10px; box-shadow: 0 12px 36px rgb(20 40 65 / 18%); }
   .assistant-page .assistant-layout-with-task-panel .task-panel-list { padding-bottom: max(160px, 24dvh); }
 }
-@media (prefers-reduced-motion: reduce) { .assistant-reply-meta { transition: none; } .thinking-dots span { animation: none; } }
+@media (prefers-reduced-motion: reduce) { .chat-message-meta { transition: none; } .thinking-dots span { animation: none; } }
 
 .assistant-page .task-panel-list[hidden] { display: none; }
 .assistant-page .task-panel-filters { display: flex; gap: 6px; }

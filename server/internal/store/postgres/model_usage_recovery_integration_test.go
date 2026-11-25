@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 )
 
 func TestPostgresStaleModelCallRecovery(t *testing.T) {
@@ -199,5 +200,90 @@ FROM model_call_ledger WHERE owner_id=$1`, principal.UserID).Scan(&unknown, &inF
 	var usage *int64
 	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id='q1234567'`).Scan(&usage); err != nil || usage == nil || *usage != 12 {
 		t.Fatalf("late task usage = %v, %v", usage, err)
+	}
+}
+
+func TestPostgresUnknownSettlementCannotOverwriteSettledModelCall(t *testing.T) {
+	store, adminService, admin, owner, reservation := modelUsageAdminFixture(t)
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO conversations(id,owner_id,title) VALUES ('c1234567',$1,'test')`, owner.UserID); err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256([]byte("task settlement checkpoint"))
+	if _, err := store.pool.Exec(ctx, `INSERT INTO tasks(id,owner_id,conversation_id,model_id,objective,status,auth_kind,auth_token_id,
+ auth_client_installation_id,budget_active_seconds,budget_tool_calls,budget_model_tokens,usage_model_tokens,
+ lease_owner,lease_version,lease_expires_at,execution_location,auth_version,auth_expires_at,agent_instance_id,
+ agent_generation,agent_session_id,agent_engine_version,agent_profile_version,checkpoint_through_seq,checkpoint_digest)
+ VALUES ('q1234567',$1,'c1234567',$2,'test','running','client',$3,$4,600,10,125,0,
+ 'worker-1',3,clock_timestamp()+interval '1 hour','server',7,clock_timestamp()+interval '1 hour',
+ 'agent-1',2,'session-1','engine','profile',0,$5)`, owner.UserID, reservation.ModelID, owner.TokenID,
+		owner.ClientInstallationID, digest[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_sessions(task_id,owner_id,session_id,checkpoint_through_seq,checkpoint_digest)
+VALUES ('q1234567',$1,'session-1',0,$2)`, owner.UserID, digest[:]); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_instances
+(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,engine_version,profile_version,supervisor_id,
+ stop_nonce_digest,lease_owner,lease_version,auth_version,initial_lease_ms,lease_expires_at,state)
+VALUES ('q1234567',$1,'agent-1',2,'session-1','engine','profile','supervisor-1',$2,'worker-1',3,7,30000,
+ clock_timestamp()+interval '30 seconds','active')`, owner.UserID, make([]byte, 32)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_agent_checkpoints(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,agent_root_session_id,
+ from_seq,through_seq,digest,ciphertext,engine_version,profile_version,auth_version,lease_version)
+ VALUES ('q1234567',$1,'agent-1',2,'session-1','session-1',0,0,$2,decode('01','hex'),'engine','profile',7,3)`, owner.UserID, digest[:]); err != nil {
+		t.Fatal(err)
+	}
+	fence := app.ModelTaskFence{TaskID: "q1234567", OwnerID: owner.UserID, InitiatorID: owner.UserID, LeaseOwner: "worker-1", LeaseVersion: 3,
+		AgentInstanceID: "agent-1", AgentGeneration: 2, AgentSessionID: "session-1", AgentRootSessionID: "session-1",
+		AuthorizationVersion: 7, ThroughSequence: 0, EngineVersion: "engine", ProfileVersion: "profile"}
+	callID, err := app.DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation.Source, reservation.Task, reservation.CallID = app.ModelCallTask, &fence, callID
+	if err := store.ReserveModelCall(ctx, reservation); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BeginModelCallDispatch(ctx, reservation); err != nil {
+		t.Fatal(err)
+	}
+	known := app.ModelCallSettlement{Source: reservation.Source, OwnerID: owner.UserID, CallID: reservation.CallID,
+		Usage: app.ModelUsage{Known: true, InputTokens: 14, OutputTokens: 9}}
+	if err := store.SettleModelCall(ctx, known); err != nil {
+		t.Fatalf("settle known model usage: %v", err)
+	}
+	before, err := adminService.Budget(ctx, admin, owner.UserID)
+	if err != nil || before.UsedTokens != 23 || before.InFlight != 0 || before.HasUnknown {
+		t.Fatalf("budget after known settlement = %#v, %v", before, err)
+	}
+	var taskUsage *int64
+	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id=$1`, fence.TaskID).Scan(&taskUsage); err != nil || taskUsage == nil || *taskUsage != 23 {
+		t.Fatalf("Task usage after known settlement = %v, %v", taskUsage, err)
+	}
+
+	unknown := app.ModelCallSettlement{Source: reservation.Source, OwnerID: owner.UserID, CallID: reservation.CallID, Unknown: true}
+	if err := store.SettleModelCall(ctx, unknown); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("unknown fallback after a committed settlement = %v", err)
+	}
+	after, err := adminService.Budget(ctx, admin, owner.UserID)
+	if err != nil || after.UsedTokens != before.UsedTokens || after.InFlight != before.InFlight || after.HasUnknown != before.HasUnknown {
+		t.Fatalf("unknown fallback changed the settled budget: before=%#v after=%#v err=%v", before, after, err)
+	}
+	var taskUsageAfter *int64
+	if err := store.pool.QueryRow(ctx, `SELECT usage_model_tokens FROM tasks WHERE id=$1`, fence.TaskID).Scan(&taskUsageAfter); err != nil || taskUsageAfter == nil || *taskUsageAfter != *taskUsage {
+		t.Fatalf("unknown fallback changed Task usage: before=%v after=%v err=%v", taskUsage, taskUsageAfter, err)
+	}
+	var state string
+	var inputTokens, outputTokens int64
+	if err := store.pool.QueryRow(ctx, `SELECT state,input_tokens,output_tokens FROM model_call_ledger
+WHERE owner_id=$1 AND source=$2 AND call_id=$3`, owner.UserID, string(reservation.Source), reservation.CallID).
+		Scan(&state, &inputTokens, &outputTokens); err != nil || state != "settled" || inputTokens != 14 || outputTokens != 9 {
+		t.Fatalf("unknown fallback overwrote settled call: state=%q input=%d output=%d err=%v", state, inputTokens, outputTokens, err)
 	}
 }

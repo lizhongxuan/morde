@@ -6,7 +6,6 @@ import { useAuth } from '../app/auth';
 import { formatDate } from '../app/format';
 import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
-import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from './ConfirmDialog';
 import { FloatingError } from './FloatingError';
 
@@ -108,7 +107,7 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
     ? status.control_actor_user_id === user?.id ? '你' : `账号 ${status.control_actor_user_id}`
     : '未知';
   const leaseHeldByMe = state === 'user' && status?.control_lease_active === true && status.control_lease_held_by_me;
-  const canRelease = canControl && state === 'user' && !!status
+  const canRelease = canControl && !control.isError && state === 'user' && !!status
     && (status.control_lease_held_by_me || (!status.control_lease_active && canReleaseAnyLease));
   const compactLabel = control.isError ? '控制权状态暂不可用'
     : !status ? '正在确认控制权…'
@@ -195,6 +194,10 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
         {label}
       </button>
       {reason && status && !control.isError && <small className="computer-panel-control-reason" role="status">{reason}</small>}
+      {control.isError && <FloatingError inline className="error-inline" role="alert">
+        {status ? '控制权状态刷新失败；为安全起见，操作已暂停，当前状态仅供参考。' : `无法读取控制权状态：${errorDetails(control.error).message}`}
+        <button type="button" className="button button-secondary button-small" onClick={() => void control.refetch()}>重试读取</button>
+      </FloatingError>}
     </section>;
   }
 
@@ -221,8 +224,7 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
       </div>
       {canControl && !control.isPending && !control.isError && status && !transitioning && state === 'ai' && <button type="button" className={`button ${compact ? 'button-primary' : 'button-secondary'}`} disabled={updateControl.isPending} onClick={() => startAction('take_over')}>{compact ? '接管电脑' : '接管操作'}</button>}
       {canRelease && !transitioning && <button type="button" className={`button ${compact ? 'button-primary' : 'button-secondary'}`} disabled={updateControl.isPending} onClick={() => startAction('release')}>{compact ? '交还 Morde' : '交还 AI'}</button>}
-      {canControl && transition && <button type="button" className={`button ${compact ? 'button-primary' : 'button-secondary'}`} disabled={updateControl.isPending} onClick={resumeTransition}>{transition.action === 'take_over' ? compact ? '继续接管' : '继续接管确认' : compact ? '继续交还' : '继续交还确认'}</button>}
-      {control.isError && !isTransientNetworkError(control.error) && <button type="button" className="button button-secondary" onClick={() => void control.refetch()}>{compact ? '重试' : '重试读取控制状态'}</button>}
+      {canControl && !control.isError && transition && <button type="button" className={`button ${compact ? 'button-primary' : 'button-secondary'}`} disabled={updateControl.isPending} onClick={resumeTransition}>{transition.action === 'take_over' ? compact ? '继续接管' : '继续接管确认' : compact ? '继续交还' : '继续交还确认'}</button>}
       {control.isPending && !status && <span className="muted" role="status">正在读取控制状态…</span>}
     </div>
     {!compact && transition && <p className="host-control-transition" role="status">
@@ -232,7 +234,10 @@ export function HostControlPanel({ host, canControl, canReleaseAnyLease, compact
       {transition.failure_reason === 'operations_pending' && pendingOperationCount === 0 && (transition.action === 'take_over' ? ' 云端仍有未完成操作，继续等待停止回执后再接管。' : ' 云端仍有未完成操作，继续等待工具结束后再交还。')}
     </p>}
     {!compact && transitioning && !transition && <p className="host-control-transition" role="status">控制状态正在切换，尚未收到最终确认；请等待刷新。</p>}
-    {control.isError && !isTransientNetworkError(control.error) && <FloatingError className="error-inline" role="alert">{errorDetails(control.error).message}</FloatingError>}
+    {control.isError && <FloatingError inline className="error-inline" role="alert">
+      {status ? '控制权状态刷新失败；为安全起见，操作已暂停，当前状态仅供参考。' : `无法读取控制权状态：${errorDetails(control.error).message}`}
+      <button type="button" className="button button-secondary button-small" onClick={() => void control.refetch()}>重试读取</button>
+    </FloatingError>}
     {confirmAction && <ConfirmDialog
       title={confirmAction.action === 'take_over' ? `接管主机 ${host.name || host.id}` : `交还主机 ${host.name || host.id} 给 AI`}
       description={confirmAction.action === 'take_over'

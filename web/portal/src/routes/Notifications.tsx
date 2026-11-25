@@ -43,8 +43,10 @@ export function Notifications() {
     </div>
     {markRead.isError && !isTransientNetworkError(markRead.error) && <FloatingError className="error-inline notification-error" role="alert">标记已读失败：{errorDetails(markRead.error).message}</FloatingError>}
     {notifications.isPending ? <div className="loading-card" role="status">正在加载通知…</div>
-      : notifications.isError && !networkError && !notifications.data ? <FloatingError className="error-card" role="alert">无法读取通知：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.refetch()}>重试</button></FloatingError>
-        : networkError && !notifications.data ? <div className="loading-card" role="status">正在加载通知…</div>
+      : notifications.isError && !notifications.data ? <FloatingError inline className="error-card" role="alert">
+        {networkError ? '网络异常，通知暂时无法读取。' : `无法读取通知：${errorDetails(notifications.error).message}`}
+        <button type="button" className="button button-secondary" onClick={() => void notifications.refetch()}>重试</button>
+      </FloatingError>
         : !items.length ? <div className="empty-card"><h2>{unreadOnly ? '没有未读通知' : '还没有通知'}</h2><p>目前没有可查看的历史消息。</p></div>
           : <>
             <p className="muted notification-count">{unreadOnly ? `当前已加载 ${items.length} 条未读通知。` : `当前已加载 ${items.length} 条通知，未读 ${unreadCount} 条。`}</p>
@@ -61,7 +63,7 @@ export function Notifications() {
               ariaLabel="通知列表"
               className="notification-list"
             />
-            {notifications.isFetchNextPageError && !networkError && <FloatingError className="error-card notification-pagination-error" role="alert">加载更多通知失败：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.fetchNextPage()}>重试</button></FloatingError>}
+            {notifications.isFetchNextPageError && !networkError && <FloatingError inline className="error-card notification-pagination-error" role="alert">加载更多通知失败：{errorDetails(notifications.error).message}<button type="button" className="button button-secondary" onClick={() => void notifications.fetchNextPage()}>重试</button></FloatingError>}
             {notifications.hasNextPage && (!notifications.isFetchNextPageError || networkError) && <button type="button" className="button button-secondary notification-load-more" disabled={notifications.isFetchingNextPage} onClick={() => void notifications.fetchNextPage()}>{notifications.isFetchingNextPage ? '正在加载…' : '加载更多通知'}</button>}
           </>}
   </section>;

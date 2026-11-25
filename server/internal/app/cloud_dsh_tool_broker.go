@@ -310,7 +310,7 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		if !goalFollowupReadOnly {
 			definitions = append(definitions, cloudDSHTaskPlanDefinition())
 		}
-		if b.workspaceTools != nil && routed && details.Task.HostID == "" && target.WorkspaceID != "" {
+		if b.workspaceTools != nil && routed && details.Task.HostID == "" && target.HostID == "" && target.WorkspaceID != "" {
 			liveDirectory := false
 			if details.Task.ProjectID == "" {
 				liveDirectory, err = b.workspaceTools.workspaces.UsesLiveDirectorySource(ctx, taskWorkspaceOwner(details.Task), target.WorkspaceID)
@@ -1012,12 +1012,19 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if err != nil {
 		return AgentToolResult{}, err
 	}
+	if routed && target.HostID != "" && cloudDSHWorkspaceToolName(call.Name) {
+		return AgentToolResult{Status: AgentToolFailed,
+			Output: "This task targets a cloud computer. Use that Host's authorized Workspace tools instead."}, nil
+	}
 	if mapping, hostTool := runtimeToolMappingByName(call.Name); routed && hostTool && !mapping.internal {
 		if recovering && checkpointOutput != nil && claimed.HostID == "" {
 			return b.pauseDeferredTarget(ctx, claimed, "target_result_unknown")
 		}
 		arguments, parseErr := validateAgentToolArguments(call.Arguments)
 		if parseErr != nil {
+			if result, handled, handleErr := b.returnInvalidRuntimeToolArguments(ctx, claimed, call, recovering, checkpointOutput); handled {
+				return result, handleErr
+			}
 			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
 		}
 		call.Arguments = string(arguments)
@@ -1090,6 +1097,19 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	arguments, err := validateAgentToolArguments(call.Arguments)
 	if err != nil {
+		if result, handled, handleErr := b.returnInvalidRuntimeToolArguments(ctx, current, call, recovering, checkpointOutput); handled {
+			return result, handleErr
+		}
+		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
+	}
+	if mapping, runtimeTool := runtimeToolMappingByName(call.Name); runtimeTool && !mapping.internal &&
+		!validRuntimeToolArguments(mapping, arguments) {
+		if result, handled, handleErr := b.returnInvalidRuntimeToolArguments(ctx, current, call, recovering, checkpointOutput); handled {
+			return result, handleErr
+		}
+		// A schema-invalid Runtime tool call must never reach Prepare or the
+		// checkpoint reconciler unless the exact Task/Agent fence and current
+		// authorization were verified by returnInvalidRuntimeToolArguments.
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
 	}
 	hash, err := agentOperationHash(call.Name, arguments)
@@ -2051,13 +2071,180 @@ func (b *CloudDSHToolBroker) reconcile(ctx context.Context, request AgentToolReq
 }
 
 func (b *CloudDSHToolBroker) failBeforeDispatch(ctx context.Context, current task.Task, step task.Step, usage task.Usage, name string, cause error) (AgentToolResult, error) {
-	step.Status, step.Summary = task.StepFailed, "The Host tool request could not be prepared."
-	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
-		"tool": name, "phase": "prepare", "failed": true,
-	}); err != nil {
+	summary := "The Host tool request could not be prepared."
+	output := "The Host tool request was not executed because authorization or Host readiness could not be confirmed."
+	detail := map[string]any{"tool": name, "phase": "prepare", "failed": true}
+	var argumentError *runtimeToolArgumentValidationPreDispatchError
+	if errors.As(cause, &argumentError) {
+		summary = "The tool arguments were invalid; the action was not executed."
+		output = invalidRuntimeToolArgumentsResult
+		detail["failure_reason"] = taskToolInvalidArgumentsFailureReason
+		ctx = withTaskToolResultEvidence(ctx, "prepare", taskToolInvalidArgumentsFailureReason)
+	}
+	step.Status, step.Summary = task.StepFailed, summary
+	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", detail); err != nil {
 		return AgentToolResult{}, errors.Join(cause, err)
 	}
-	return AgentToolResult{Status: AgentToolFailed, Output: "The Host tool request was not executed because authorization or Host readiness could not be confirmed."}, nil
+	return AgentToolResult{Status: AgentToolFailed, Output: output}, nil
+}
+
+const invalidRuntimeToolArgumentsResult = "The tool call was not executed because its arguments do not match the declared input format. Correct the arguments and try again."
+
+// returnInvalidRuntimeToolArguments returns a deterministic, sanitized
+// pre-dispatch result to the same DSH session only when the exact runtime tool
+// and scope are currently declared, the DSH call fence is valid, and the
+// operation journal proves that no operation exists. Any ambiguity follows
+// the unknown/error path rather than inviting the Agent to retry a possibly
+// dispatched side effect.
+func (b *CloudDSHToolBroker) returnInvalidRuntimeToolArguments(ctx context.Context, claimed task.Task, call ModelToolCall,
+	recovering bool, checkpointOutput *string) (AgentToolResult, bool, error) {
+	mapping, known := runtimeToolMappingByName(call.Name)
+	if !known || mapping.internal || len(call.Arguments) > maxAgentToolArgsBytes || !utf8.ValidString(call.Arguments) {
+		return AgentToolResult{}, false, nil
+	}
+	details, err := b.currentTaskDetails(ctx, claimed)
+	if err != nil {
+		return AgentToolResult{}, true, err
+	}
+	current := details.Task
+	if current.Status != task.StatusRunning {
+		return AgentToolResult{}, true, domain.NewError(domain.CodeInvalidState, "Task is not running")
+	}
+	definitions, err := b.Definitions(ctx, current)
+	if err != nil {
+		return AgentToolResult{}, true, err
+	}
+	declared := false
+	for _, definition := range definitions {
+		if definition.Name != call.Name {
+			continue
+		}
+		if definition.RequiredScope != mapping.scope {
+			return AgentToolResult{}, true, domain.NewError(domain.CodeForbidden, "dsh tool scope is not available for this Host")
+		}
+		declared = true
+		break
+	}
+	if !declared {
+		return AgentToolResult{}, true, domain.NewError(domain.CodeForbidden, "dsh tool is not available for this Host")
+	}
+
+	activityContext := withInvalidRuntimeToolArgumentActivity(ctx, current, call, b.stepDetailSealer)
+	activity, ok := cloudDSHToolActivityFromContext(activityContext)
+	if !ok {
+		// Without the exact live Task/Agent fence, do not turn argument failures
+		// into Agent-visible tool results.
+		return AgentToolResult{}, false, nil
+	}
+
+	operationKey := agentOperationKey(call.CallID)
+	operation, lookupErr := b.store.GetOperation(ctx, current.OwnerID, current.ID, operationKey)
+	if lookupErr != nil && domain.CodeOf(lookupErr) != domain.CodeNotFound {
+		return b.invalidRuntimeToolArgumentsUnknown(activityContext, current, details.Steps, operationKey,
+			"The prior tool operation could not be checked safely.")
+	}
+	if lookupErr == nil {
+		summary := "A prior tool operation exists for this call, so its result cannot be retried safely."
+		if operation.ID == "" {
+			summary = "The prior tool operation record is incomplete, so its result cannot be retried safely."
+		}
+		return b.invalidRuntimeToolArgumentsUnknown(activityContext, current, details.Steps, operationKey,
+			summary)
+	}
+
+	prior, found, err := matchingInvalidRuntimeArgumentStep(details.Steps, current, activity)
+	if err != nil {
+		return AgentToolResult{}, true, err
+	}
+	if checkpointOutput != nil && (!recovering || !found || prior.Status != task.StepFailed || prior.Phase != "prepare" ||
+		prior.FailureReason != "" || prior.Retryable || prior.Summary != "The tool arguments were invalid; the action was not executed." ||
+		*checkpointOutput != dshToolResultText(AgentToolResult{
+			Status: AgentToolFailed, Output: invalidRuntimeToolArgumentsResult,
+		})) {
+		return b.invalidRuntimeToolArgumentsUnknown(activityContext, current, details.Steps, operationKey,
+			"The checkpointed tool result does not match a recorded pre-dispatch argument failure.")
+	}
+	if found && prior.Status == task.StepFailed {
+		if prior.Phase == "prepare" && prior.FailureReason == "" && !prior.Retryable &&
+			prior.Summary == "The tool arguments were invalid; the action was not executed." {
+			return AgentToolResult{Status: AgentToolFailed, Output: invalidRuntimeToolArgumentsResult}, true, nil
+		}
+		return b.invalidRuntimeToolArgumentsUnknown(activityContext, current, details.Steps, operationKey,
+			"The recorded Task step is not the expected pre-dispatch argument failure.")
+	}
+	if found && (prior.Phase != "prepare" || (prior.Status != task.StepQueued && prior.Status != task.StepRunning)) {
+		return b.invalidRuntimeToolArgumentsUnknown(activityContext, current, details.Steps, operationKey,
+			"The recorded Task step is not in a safe pre-dispatch state.")
+	}
+
+	usage := cloneTaskUsage(current.Usage)
+	step := prior
+	if !found {
+		step, err = newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
+			"Run cloud dsh tool: "+call.Name, "Checking current authorization and validating tool arguments.")
+		if err != nil {
+			return AgentToolResult{}, true, err
+		}
+		if usage.ToolCalls >= current.Budget.ToolCalls {
+			step.Status, step.Summary = task.StepWaitingUser, "The task tool call budget is exhausted."
+			if err := b.commitProgress(activityContext, current, step, usage, task.StatusWaitingUser, "tool_call_budget", "task.waiting_user", nil); err != nil {
+				return AgentToolResult{}, true, err
+			}
+			return AgentToolResult{Status: AgentToolNeedsUser}, true, nil
+		}
+		usage.ToolCalls++
+		if err := b.commitProgress(activityContext, current, step, usage, task.StatusRunning, "", "task.step", map[string]any{
+			"tool": call.Name, "operation_key": operationKey, "phase": "prepare",
+		}); err != nil {
+			return AgentToolResult{}, true, err
+		}
+	}
+	result, err := b.failBeforeDispatch(activityContext, current, step, usage, call.Name,
+		&runtimeToolArgumentValidationPreDispatchError{cause: domain.NewError(domain.CodeInvalidArgument, "runtime tool arguments are invalid")})
+	if err != nil {
+		return AgentToolResult{}, true, err
+	}
+	return result, true, nil
+}
+
+func matchingInvalidRuntimeArgumentStep(steps []task.Step, current task.Task, activity cloudDSHToolActivity) (task.Step, bool, error) {
+	fence := activity.call.TaskFence
+	if fence == nil || current.CurrentRevision == nil {
+		return task.Step{}, false, domain.NewError(domain.CodeInvalidState, "tool call fence is unavailable")
+	}
+	var match task.Step
+	for _, step := range steps {
+		if step.AgentSessionID != fence.AgentSessionID || step.ToolCallKey != activity.call.CallID {
+			continue
+		}
+		if match.ID != "" || step.ToolName != activity.call.Name || step.TaskRevision == nil ||
+			*step.TaskRevision != *current.CurrentRevision || !bytes.Equal(step.RequestDigest, activity.digest) {
+			return task.Step{}, false, domain.NewError(domain.CodeIdempotencyConflict, "tool call identity was reused with different inputs")
+		}
+		match = step
+	}
+	return match, match.ID != "", nil
+}
+
+func (b *CloudDSHToolBroker) invalidRuntimeToolArgumentsUnknown(ctx context.Context, current task.Task, steps []task.Step,
+	operationKey, summary string) (AgentToolResult, bool, error) {
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok {
+		return AgentToolResult{Status: AgentToolUnknown}, true, nil
+	}
+	step, found, err := matchingInvalidRuntimeArgumentStep(steps, current, activity)
+	if err != nil {
+		return AgentToolResult{}, true, err
+	}
+	if !found {
+		step, err = newAgentStep(current.ID, maxStepSequence(steps)+1, "tool", task.StepUnknown,
+			"Tool result needs reconciliation", summary)
+		if err != nil {
+			return AgentToolResult{}, true, err
+		}
+	}
+	result, err := b.pauseUnknown(ctx, current, step, cloneTaskUsage(current.Usage), operationKey, summary)
+	return result, true, err
 }
 
 func (b *CloudDSHToolBroker) pauseForApproval(ctx context.Context, current task.Task, step task.Step, usage task.Usage, request AgentToolRequest, hash []byte, preparation AgentToolPreparation, previous *task.PendingRequest) (AgentToolResult, error) {

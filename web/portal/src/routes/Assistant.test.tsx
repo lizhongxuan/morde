@@ -238,8 +238,8 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const article = await screen.findByRole('article', { name: '你的消息' });
-    expect(within(article).queryByRole('status')).not.toBeInTheDocument();
-    expect(within(article).queryByRole('button')).not.toBeInTheDocument();
+    expect(within(article!).queryByRole('status')).not.toBeInTheDocument();
+    expect(within(article!).queryByRole('button')).not.toBeInTheDocument();
     expect(article.closest('.chat-message-body')).not.toHaveTextContent(/网页搜索|网页读取/u);
     expect(document.querySelector('.task-activity-card[data-task-id="qhidden01"]')).toBeNull();
   });
@@ -355,11 +355,13 @@ describe('Assistant durable tasks', () => {
     await waitFor(() => expect(readContents()).toEqual(['二版提示', '二版回复', '后续提示']));
     expect(view.scrollTop).toBe(140);
     expect(composer).toHaveValue('保留的草稿');
-    await user.selectOptions(screen.getByRole('combobox', { name: '选择消息版本' }), '1');
+    expect(screen.getByText('消息版本与恢复').closest('details')).not.toHaveAttribute('open');
+    await user.click(screen.getByText('消息版本与恢复'));
+    await user.selectOptions(screen.getByRole('combobox', { name: /选择消息版本/u }), '1');
     await waitFor(() => expect(readContents()).toEqual(['原始提示', '原回复', '后续提示']));
     expect(view.scrollTop).toBe(140);
     expect(composer).toHaveValue('保留的草稿');
-    await user.selectOptions(screen.getByRole('combobox', { name: '选择消息版本' }), '2');
+    await user.selectOptions(screen.getByRole('combobox', { name: /选择消息版本/u }), '2');
     await waitFor(() => expect(readContents()).toEqual(['二版提示', '二版回复', '后续提示']));
   });
 
@@ -387,6 +389,14 @@ describe('Assistant durable tasks', () => {
     expect(within(interruptedArticle).queryByRole('button')).not.toBeInTheDocument();
     expect(within(streamingArticle).queryByRole('button', { name: '继续生成' })).not.toBeInTheDocument();
     expect(within(streamingArticle).queryByRole('button', { name: '重新生成文字' })).not.toBeInTheDocument();
+    for (const body of document.querySelectorAll<HTMLElement>('.message-list .chat-message-body')) {
+      const article = body.querySelector<HTMLElement>(':scope > .chat-message');
+      expect(article).not.toBeNull();
+      expect(body.querySelector(':scope > .message-variant-controls, :scope > .message-variant-operation, :scope > .chat-message-attachments')).toBeNull();
+    }
+    expect(screen.queryByRole('button', { name: /停止此任务|停止任务|停止全部任务/u })).not.toBeInTheDocument();
+    expect(screen.getByText('消息版本与恢复').closest('details')).not.toHaveAttribute('open');
+    await user.click(screen.getByText('消息版本与恢复'));
     const continueButton = screen.getByRole('button', { name: '继续生成' });
     expect(continueButton.closest('.chat-message')).toBeNull();
     await user.click(continueButton);
@@ -912,18 +922,35 @@ describe('Assistant durable tasks', () => {
     expect(activity).not.toHaveTextContent('dsh-subagent-session-private');
   });
 
-  it('associates each Morde reply with its timestamp and makes it keyboard accessible', async () => {
+  it('associates user and assistant messages with hover metadata and keyboard access', async () => {
     mockCommon({ conversations: [conversation], messages: [message, reply] });
     renderPage();
 
+    const userMessage = await screen.findByRole('article', { name: '你的消息' });
+    expect(userMessage).toHaveAttribute('tabindex', '0');
+    expect(userMessage.querySelector('.chat-message-meta')).toBeNull();
+    expect(userMessage.querySelector('button, [role="status"]')).toBeNull();
+    const userMeta = userMessage.parentElement?.querySelector('.chat-message-meta');
+    expect(userMeta).not.toBeNull();
+    expect(within(userMeta as HTMLElement).getByLabelText(/消息时间：/)).toHaveAttribute('datetime', message.created_at);
+    expect(within(userMeta as HTMLElement).getByRole('button', { name: '复制你的消息' })).toHaveClass('chat-message-copy');
+
     const response = await screen.findByRole('article', { name: 'Morde 的回复' });
     expect(response).toHaveAttribute('tabindex', '0');
-    const time = within(response.parentElement!).getByLabelText(/回复时间：/);
+    expect(response.querySelector('.chat-message-meta')).toBeNull();
+    expect(response.querySelector('button, [role="status"]')).toBeNull();
+    const responseMeta = response.parentElement?.querySelector('.chat-message-meta');
+    expect(responseMeta).not.toBeNull();
+    const time = within(responseMeta as HTMLElement).getByLabelText(/回复时间：/);
     expect(time).toHaveAttribute('datetime', reply.created_at);
-    expect(time).toHaveClass('assistant-reply-time');
+    expect(time).toHaveClass('chat-message-time');
+    expect(within(responseMeta as HTMLElement).getByRole('button', { name: '复制 Morde 回复' })).toHaveClass('chat-message-copy');
+    const styles = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    expect(styles).toMatch(/\.chat-message-meta\s*\{[^}]*opacity:\s*0;[^}]*visibility:\s*hidden/su);
+    expect(styles).toMatch(/\.chat-message-row:hover\s+\.chat-message-meta,\s*\.chat-message-row:focus-within\s+\.chat-message-meta\s*\{\s*opacity:\s*1;\s*visibility:\s*visible;/u);
   });
 
-  it('sends with Enter, keeps Shift+Enter as a newline, and does not timestamp user messages', async () => {
+  it('sends with Enter, keeps Shift+Enter as a newline, and keeps user metadata outside the bubble', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const accept = vi.mocked(portalApi.acceptConversationMessage);
     const user = userEvent.setup();
@@ -931,6 +958,7 @@ describe('Assistant durable tasks', () => {
 
     const userArticle = await screen.findByRole('article', { name: '你的消息' });
     expect(within(userArticle).queryByRole('time')).not.toBeInTheDocument();
+    expect(userArticle.parentElement?.querySelector('.chat-message-meta')).not.toBeNull();
     const composer = await findReadyComposer();
     expect(composer).toHaveStyle({ resize: 'none' });
     await user.type(composer, '第一行');
@@ -977,6 +1005,8 @@ describe('Assistant durable tasks', () => {
     const link = await screen.findByRole('link', { name: '下载附件 1' });
     expect(link).toHaveAttribute('href', `/api/personal-data/attachments/${attachmentID}`);
     expect(link).toHaveAttribute('download');
+    expect(link.closest('article')).toBeInTheDocument();
+    expect(link.closest('article')?.nextElementSibling).toHaveClass('chat-message-meta');
   });
 
   it('loads older history when scrolled to the top, deduplicates pages, and preserves the scroll anchor', async () => {
@@ -1788,6 +1818,11 @@ describe('Assistant durable tasks', () => {
     expect(article.getByText('刷新后要重试的消息')).toBeInTheDocument();
     expect(article.queryByRole('button')).not.toBeInTheDocument();
     expect(article.queryByRole('status')).not.toBeInTheDocument();
+    const pendingArticle = screen.getByRole('article', { name: '你的消息' });
+    const pendingMeta = pendingArticle.parentElement?.querySelector('.chat-message-meta');
+    expect(pendingMeta).not.toBeNull();
+    expect(within(pendingMeta as HTMLElement).getByLabelText(/消息时间：/)).toHaveAttribute('datetime');
+    expect(within(pendingMeta as HTMLElement).getByRole('button', { name: '复制你的消息' })).toBeInTheDocument();
     expect(create).toHaveBeenCalledOnce();
     expect(accept).not.toHaveBeenCalled();
     expect(pending?.request.client_message_id).toBeTruthy();
@@ -2678,12 +2713,13 @@ describe('Assistant durable tasks', () => {
     const article = await screen.findByText('读取大文件').then((node) => node.closest<HTMLElement>('.chat-message'));
     expect(article).not.toBeNull();
     expect(article).toHaveTextContent('读取大文件');
-    expect(within(article).queryByRole('status')).not.toBeInTheDocument();
-    expect(within(article).queryByRole('button')).not.toBeInTheDocument();
+    expect(within(article!).queryByRole('status')).not.toBeInTheDocument();
+    expect(within(article!).queryByRole('button')).not.toBeInTheDocument();
     expect(screen.queryByText(/synthetic chunk interruption/)).not.toBeInTheDocument();
     expect(submit).toHaveBeenCalledOnce();
     expect(associate).not.toHaveBeenCalled();
     expect(upload).toHaveBeenCalledOnce();
+    await waitFor(() => expect(chunk.mock.calls.map((call) => call[1])).toEqual([0, 1]));
     expect(chunk.mock.calls.map((call) => call[1])).toEqual([0, 1]);
     expect(replace).toHaveBeenCalledOnce();
   });
@@ -2949,6 +2985,11 @@ describe('Assistant durable tasks', () => {
     expect(thinking.querySelectorAll('.thinking-dots span')).toHaveLength(3);
     expect(thinking.querySelector('.thinking-mascot')).not.toBeInTheDocument();
     expect(thinking).not.toHaveTextContent('思考中…');
+    const conversationView = thinking.closest('.conversation-view');
+    expect(conversationView).not.toBeNull();
+    expect(conversationView?.querySelectorAll('.chat-thinking-row')).toHaveLength(1);
+    expect(conversationView?.querySelectorAll('.thinking-dots')).toHaveLength(1);
+    expect(conversationView?.lastElementChild).toBe(thinking);
   });
 
   it('shows thinking while the server is actively routing a durably received message', async () => {
@@ -3383,6 +3424,7 @@ describe('Assistant durable tasks', () => {
 
     const activity = await findTaskActivity(failedTask.id);
     const interruptedReply = await screen.findByText('部分回复');
+    expect(interruptedReply.closest('.chat-message')).not.toBeNull();
     expect(interruptedReply.closest('.chat-message')).not.toHaveTextContent('回复已中断');
     expect(within(activity).getByRole('alert')).toHaveTextContent('任务执行失败，请查看当前状态和处理提示。');
     expect(screen.queryByRole('status', { name: 'Morde 正在思考' })).not.toBeInTheDocument();
@@ -3625,6 +3667,32 @@ describe('Assistant durable tasks', () => {
       .toHaveTextContent('文件操作已完成 — 展开查看路径和结果。');
     const command = within(activity).getByRole('button', { name: '查看工作项：运行命令' });
     expect(command).toHaveTextContent('命令已完成 — 展开查看实际命令、目录、退出码和输出。');
+  });
+
+  it('labels workspace file search and reveals its recorded query and result', async () => {
+    const stepID = 's1234567';
+    const query = '配置文件中的 API base URL';
+    const result = 'config/settings.json: API base URL = https://api.example.test';
+    const completedTask: Task = { ...task, status: 'completed', finished_at: timestamp, event_sequence: 4, steps: [
+      { id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run Hostless Workspace tool: morde_workspace_search',
+        summary: 'The Hostless Workspace tool completed and its result was checked.', created_at: timestamp },
+    ] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: stepID, event_sequence: 4,
+      tool_name: 'morde_workspace_search', detail_state: 'available', object: '工作区文件', input: query, result, truncated: false });
+    const user = userEvent.setup();
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    const search = within(activity).getByRole('button', { name: '查看工作项：搜索工作区文件' });
+    expect(search).toHaveTextContent('工作区文件搜索已完成 — 展开查看已记录的查询与结果。');
+    await user.click(search);
+
+    expect(await within(activity).findByText('输入')).toBeInTheDocument();
+    expect(within(activity).getByText('输入').parentElement).toHaveTextContent(query);
+    expect(within(activity).getByText('结果').parentElement).toHaveTextContent(result);
   });
 
   it('labels a cancelled work item in its list and detail', async () => {
@@ -3991,6 +4059,7 @@ describe('Assistant durable tasks', () => {
     ['not_dispatched', '工具未派发，当前记录未显示它已开始执行。'],
     ['authorization_changed', '执行期间授权状态发生变化；请核对权限和操作状态后再继续。'],
     ['resource_changed', '目标资源状态发生变化；请先核对当前状态，再决定下一步。'],
+    ['tool_execution_failed', '工具执行已确认失败；请查看已记录的执行详情。'],
   ] as const)('shows the recorded %s failure in Task Dynamics without a retry control', async (failureReason, explanation) => {
     const stepID = 's1234567';
     const failedStep: Task['steps'][number] = {
@@ -4040,6 +4109,25 @@ describe('Assistant durable tasks', () => {
     expect(await within(activity).findByText(/原因：工具已派发后报告失败；展开查看已记录的执行详情/)).toBeInTheDocument();
     expect(within(activity).queryByRole('button', { name: /重试/u })).not.toBeInTheDocument();
     expect(retry).not.toHaveBeenCalled();
+  });
+
+  it('shows a recorded failure reason even when the step summary is a generic task failure', async () => {
+    const stepID = 's1234567';
+    const failedStep: Task['steps'][number] = {
+      id: stepID, sequence: 1, attempt: 1, retry_of_step_id: null, retryable: false,
+      failure_reason: 'tool_execution_failed', kind: 'tool', status: 'failed',
+      title: 'Run cloud dsh MCP tool: lookup', summary: 'The task failed while processing the request.', created_at: timestamp,
+      task_revision: 1, tool_name: 'mcp_call', phase: 'execute', detail_state: 'not_recorded',
+    };
+    const failedTask: Task = { ...task, status: 'failed', result: null, finished_at: timestamp, event_sequence: 4,
+      current_revision: 1, desired_revision: 1, steps: [failedStep], step_count: 1 };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(failedTask);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    expect(within(activity).getByRole('button', { name: '查看工作项：使用 MCP 工具：lookup' }))
+      .toHaveTextContent(/操作失败 — 工具执行已确认失败/u);
   });
 
   it('shows truthful task statuses, pins running tasks, and loads five more at a time', async () => {
@@ -4541,15 +4629,17 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     const activity = await findTaskActivity(task.id);
-    expect(within(activity).getByRole('button', { name: '查看工作项：核对任务恢复状态' })).toHaveTextContent('结果尚未确认');
-    await userEvent.setup().click(within(activity).getByRole('button', { name: '查看工作项：核对任务恢复状态' }));
+    const recoveryItem = within(activity).getByRole('button', { name: '查看工作项：核对任务恢复状态' });
+    expect(recoveryItem).toHaveTextContent('模型服务未返回可确认的结果');
+    await userEvent.setup().click(recoveryItem);
     expect(await within(activity).findByText('状态：状态待确认')).toBeInTheDocument();
     expect(screen.queryByText(/category:/)).not.toBeInTheDocument();
     expect(screen.queryByText('Review cloud task recovery')).not.toBeInTheDocument();
     expect(document.querySelector('.chat-message-task-recovery')).toBeNull();
-    const userMessage = screen.getByRole('article', { name: '你的消息' });
-    expect(within(userMessage).queryByRole('status')).not.toBeInTheDocument();
-    expect(within(userMessage).queryByRole('button')).not.toBeInTheDocument();
+    for (const userMessage of screen.getAllByRole('article', { name: '你的消息' })) {
+      expect(within(userMessage).queryByRole('status')).not.toBeInTheDocument();
+      expect(within(userMessage).queryByRole('button')).not.toBeInTheDocument();
+    }
     expect(screen.queryByRole('button', { name: '等待接收' })).not.toBeInTheDocument();
     expect(within(activity).queryByRole('button', { name: /暂停任务|停止任务|补充任务/u })).not.toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: '消息内容' })).toBeEnabled();
@@ -4871,24 +4961,44 @@ describe('Assistant durable tasks', () => {
     expect(getTask).toHaveBeenCalledTimes(2);
   });
 
-  it('routes a clarification reply through the natural language conversation path', async () => {
+  it('answers a clarification from the conversation card without opening task dynamics', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: 'clarification_required', clarification_request: clarification, finished_at: null });
     const answer = vi.spyOn(portalApi, 'answerTaskInput');
-    const accept = vi.spyOn(portalApi, 'acceptConversationMessage')
-      .mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
+    const accept = vi.spyOn(portalApi, 'acceptConversationMessage');
+    answer.mockResolvedValue({ task_id: task.id, action: 'answer_input', status: 'running', unsettled_operation_ids: [] });
     const user = userEvent.setup();
     renderPage();
+    const card = await screen.findByRole('region', { name: '对话中的澄清请求' });
+    expect(card).toHaveTextContent(clarification.question);
+    expect(card.closest('.chat-message')).toBeNull();
+    const assistantRow = card.closest('.chat-message-row');
+    expect(assistantRow).toHaveClass('chat-message-row-assistant');
+    expect(assistantRow).not.toHaveClass('chat-message-row-user');
+    expect(card.closest('.chat-message-row-user')).toBeNull();
+    expect(card.closest('.chat-message-body')?.parentElement).toBe(assistantRow);
+    expect(assistantRow?.parentElement).toHaveClass('message-list');
+    expect(assistantRow?.previousElementSibling).toHaveClass('chat-message-row-user');
+    const styles = readFileSync(resolve(process.cwd(), 'src/styles.css'), 'utf8');
+    expect(styles).toMatch(/\.chat-message-row\s*\{\s*display:\s*flex;/u);
+    expect(styles).toMatch(/\.chat-message-row-user\s*\{\s*justify-content:\s*flex-end;/u);
+    const answerBox = within(card).getByRole('textbox', { name: '澄清问题答复' });
+    await user.type(answerBox, '放到 /workspace/reports');
+    await user.click(within(card).getByRole('button', { name: '提交并继续' }));
+    await waitFor(() => expect(answer).toHaveBeenCalledWith(task.id, {
+      clarification_id: clarification.id, clarification_version: clarification.version, answer: '放到 /workspace/reports',
+    }, expect.any(String)));
+    expect(answer.mock.calls[0]?.[2]).toBeTruthy();
+    expect(await within(card).findByRole('status')).toHaveTextContent('补充信息已提交，等待任务状态更新。');
+    expect(within(card).queryByRole('textbox', { name: '澄清问题答复' })).not.toBeInTheDocument();
+    expect(accept).not.toHaveBeenCalled();
+
+    await openTaskDynamics();
     const activity = await findTaskActivity(task.id);
     expect(within(activity).getByRole('region', { name: '待补充信息' })).toHaveTextContent(clarification.question);
     expect(within(activity).queryByRole('textbox')).not.toBeInTheDocument();
     expect(within(activity).queryByRole('button', { name: /补充|提交并继续/u })).not.toBeInTheDocument();
-    await user.type(await findReadyComposer(), '放到 /workspace/reports');
-    await user.click(screen.getByRole('button', { name: '发送' }));
-    await waitFor(() => expect(accept).toHaveBeenCalledOnce());
-    expect(accept.mock.calls[0]?.[1].content).toBe('放到 /workspace/reports');
-    expect(answer).not.toHaveBeenCalled();
   });
 
   it('links a browser authentication handoff to the exact task host', async () => {
@@ -4919,26 +5029,30 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByRole('form', { name: '补充任务信息' })).not.toBeInTheDocument();
   });
 
-  it('does not create a structured clarification action while a request is waiting', async () => {
+  it('keeps clarification answer controls in the conversation and task details read-only', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: 'clarification_required', clarification_request: clarification, finished_at: null });
     const answer = vi.spyOn(portalApi, 'answerTaskInput');
     renderPage();
+    const card = await screen.findByRole('region', { name: '对话中的澄清请求' });
+    expect(within(card).getByRole('textbox', { name: '澄清问题答复' })).toBeInTheDocument();
     const activity = await findTaskActivity(task.id);
     expect(within(activity).getByRole('region', { name: '待补充信息' })).toHaveTextContent(clarification.question);
-    expect(screen.queryByRole('form', { name: '补充任务信息' })).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: '提交并继续' })).not.toBeInTheDocument();
+    expect(within(activity).queryByRole('form', { name: '提交澄清回复' })).not.toBeInTheDocument();
+    expect(within(activity).queryByRole('textbox', { name: '澄清问题答复' })).not.toBeInTheDocument();
+    expect(within(activity).queryByRole('button', { name: '提交并继续' })).not.toBeInTheDocument();
     expect(answer).not.toHaveBeenCalled();
   });
 
-  it('keeps clarification version changes read-only until the user replies in conversation', async () => {
+  it('keeps clarification details read-only in task dynamics while preserving the conversation card', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
     const getTask = vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null,
       waiting_reason: 'clarification_required', clarification_request: clarification, finished_at: null });
     const answer = vi.spyOn(portalApi, 'answerTaskInput');
     renderPage();
+    expect(await screen.findByRole('region', { name: '对话中的澄清请求' })).toBeInTheDocument();
     const activity = await findTaskActivity(task.id);
     expect(within(activity).getByRole('region', { name: '待补充信息' })).toHaveTextContent(clarification.question);
     expect(screen.queryByRole('form', { name: '补充任务信息' })).not.toBeInTheDocument();
@@ -4951,31 +5065,40 @@ describe('Assistant durable tasks', () => {
     const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', disclosures: unknownApprovalDisclosures, expires_at: null };
     const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null,
-      waiting_reason: kind === 'clarification' ? 'clarification_required' : 'approval_required',
+      waiting_reason: kind === 'approval' ? 'approval_required' : 'clarification_required',
       pending_request: kind === 'approval' ? approval : null,
       clarification_request: kind === 'clarification' ? clarification : null, finished_at: null });
     const revoked = new ApiError({ message: 'Task access was revoked', code: 'not_found', status: 404 });
     const respond = vi.spyOn(portalApi, 'respondToTaskApproval').mockRejectedValue(revoked);
-    const answer = vi.spyOn(portalApi, 'answerTaskInput').mockRejectedValue(revoked);
+    const answer = vi.spyOn(portalApi, 'answerTaskInput');
+    const accept = vi.spyOn(portalApi, 'acceptConversationMessage').mockRejectedValue(revoked);
     const user = userEvent.setup();
     renderPage();
     await openTaskDynamics();
-    await findTaskActivity(task.id);
+    const activity = await findTaskActivity(task.id);
     if (kind === 'approval') {
       const approvalCard = await screen.findByRole('region', { name: '需要批准的操作' });
       await submitTaskApprovalMcpAppDecision(within(approvalCard).getByTitle('MCP App 操作审批') as HTMLIFrameElement, 'approve');
       await waitFor(() => expect(respond).toHaveBeenCalledWith(task.id, approval.id,
         { version: approval.version, decision: 'approve' }, expect.any(String)));
       expect(screen.queryByText('已批准，任务正在恢复。')).not.toBeInTheDocument();
+      expect(await screen.findByRole('alert')).toHaveTextContent('请求的内容不存在');
     } else {
-      await user.type(await screen.findByRole('textbox', { name: '你的回答' }), '放到报告目录');
-      await user.click(screen.getByRole('button', { name: '提交并继续' }));
+      expect(within(activity).getByRole('region', { name: '待补充信息' })).toHaveTextContent(clarification.question);
+      expect(within(activity).queryByRole('textbox')).not.toBeInTheDocument();
+      expect(within(activity).queryByRole('button', { name: /提交并继续/u })).not.toBeInTheDocument();
+      answer.mockRejectedValue(revoked);
+      const clarificationCard = await screen.findByRole('region', { name: '对话中的澄清请求' });
+      await user.type(within(clarificationCard).getByRole('textbox', { name: '澄清问题答复' }), '放到 /workspace/reports');
+      await user.click(within(clarificationCard).getByRole('button', { name: '提交并继续' }));
       await waitFor(() => expect(answer).toHaveBeenCalledWith(task.id, {
-        clarification_id: clarification.id, clarification_version: clarification.version, answer: '放到报告目录',
+        clarification_id: clarification.id, clarification_version: clarification.version, answer: '放到 /workspace/reports',
       }, expect.any(String)));
-      expect(screen.queryByText('补充信息已提交，等待任务状态更新。')).not.toBeInTheDocument();
+      expect(within(clarificationCard).getByRole('alert')).toHaveTextContent('请求的内容不存在');
+      expect(within(clarificationCard).queryByRole('textbox', { name: '澄清问题答复' })).not.toBeInTheDocument();
+      expect(accept).not.toHaveBeenCalled();
+      expect(screen.queryByText(/补充信息已提交|任务正在恢复/u)).not.toBeInTheDocument();
     }
-    expect(await screen.findByRole('alert')).toHaveTextContent('请求的内容不存在');
   });
 
   it.each([401, 403, 404])('clears stale approval actions and refreshes the same Task after HTTP %i', async (status) => {

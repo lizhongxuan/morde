@@ -223,9 +223,9 @@ func cloudDSHToolPayloadSummary(raw []byte) ([32]byte, bool) {
 	return sha256.Sum256(encoded), true
 }
 
-func cloudDSHCheckpointToolSelection(payload []byte, definitions []app.AgentToolDefinition) (bool, bool, error) {
+func cloudDSHCheckpointToolPayloads(payload []byte) ([]json.RawMessage, bool, bool, error) {
 	if !uniqueCloudDSHJSON(payload) {
-		return false, false, errors.New("dsh checkpoint tool selection is invalid")
+		return nil, false, false, errors.New("dsh checkpoint tool selection is invalid")
 	}
 	var checkpoint struct {
 		Events []struct {
@@ -234,13 +234,11 @@ func cloudDSHCheckpointToolSelection(payload []byte, definitions []app.AgentTool
 		} `json:"events"`
 	}
 	if json.Unmarshal(payload, &checkpoint) != nil || checkpoint.Events == nil {
-		return false, false, errors.New("dsh checkpoint tool selection is invalid")
-	}
-	expected, ok := cloudDSHToolDefinitionsSummary(definitions)
-	if !ok {
-		return false, false, errors.New("dsh tool definition summary is invalid")
+		return nil, false, false, errors.New("dsh checkpoint tool selection is invalid")
 	}
 	headerSeen, assistantMessageSeen := false, false
+	var selected []json.RawMessage
+	var selectedSummary [32]byte
 	for _, event := range checkpoint.Events {
 		if event.Type == "assistant/message" {
 			assistantMessageSeen = true
@@ -252,27 +250,238 @@ func cloudDSHCheckpointToolSelection(payload []byte, definitions []app.AgentTool
 			Header json.RawMessage `json:"header"`
 		}
 		if json.Unmarshal(event.Data, &request) != nil || len(request.Header) == 0 || string(request.Header) == "null" {
-			return false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
+			return nil, false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
 		}
 		var header map[string]json.RawMessage
 		if json.Unmarshal(request.Header, &header) != nil || header == nil {
-			return false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
+			return nil, false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
 		}
 		tools, toolsPresent := header["tools"]
-		if !toolsPresent && len(definitions) == 0 {
-			headerSeen = true
-			continue
-		}
-		if !toolsPresent || len(tools) == 0 || string(tools) == "null" {
-			return false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
+		if !toolsPresent {
+			tools = json.RawMessage("[]")
+		} else if len(tools) == 0 || string(tools) == "null" {
+			return nil, false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
 		}
 		actual, valid := cloudDSHToolPayloadSummary(tools)
-		if !valid || !bytes.Equal(actual[:], expected[:]) {
-			return false, assistantMessageSeen, errors.New("dsh checkpoint tool definitions changed")
+		if !valid {
+			return nil, false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
+		}
+		var toolPayloads []json.RawMessage
+		if json.Unmarshal(tools, &toolPayloads) != nil || toolPayloads == nil || len(toolPayloads) > 64 {
+			return nil, false, assistantMessageSeen, errors.New("dsh checkpoint tool selection header is invalid")
+		}
+		if headerSeen && !bytes.Equal(actual[:], selectedSummary[:]) {
+			return nil, false, assistantMessageSeen, errors.New("dsh checkpoint tool definitions changed")
+		}
+		if !headerSeen {
+			selected, selectedSummary = toolPayloads, actual
 		}
 		headerSeen = true
 	}
-	return headerSeen, assistantMessageSeen, nil
+	return selected, headerSeen, assistantMessageSeen, nil
+}
+
+func cloudDSHCheckpointToolSelection(payload []byte, definitions []app.AgentToolDefinition) (bool, bool, error) {
+	selected, headerSeen, assistantMessageSeen, err := cloudDSHCheckpointToolPayloads(payload)
+	if err != nil || !headerSeen {
+		return headerSeen, assistantMessageSeen, err
+	}
+	encoded, err := json.Marshal(selected)
+	if err != nil {
+		return false, assistantMessageSeen, errors.New("dsh checkpoint tool selection is invalid")
+	}
+	actual, valid := cloudDSHToolPayloadSummary(encoded)
+	expected, expectedValid := cloudDSHToolDefinitionsSummary(definitions)
+	if !valid || !expectedValid || !bytes.Equal(actual[:], expected[:]) {
+		return false, assistantMessageSeen, errors.New("dsh checkpoint tool definitions changed")
+	}
+	return true, assistantMessageSeen, nil
+}
+
+func cloudDSHDefinitionsFromCheckpointToolPayload(current []app.AgentToolDefinition, payloads []json.RawMessage,
+	childrenAllowed, evidenceAllowed bool) ([]app.AgentToolDefinition, error) {
+	if len(payloads) > 64 || !validCloudDSHToolDefinitions(current) {
+		return nil, errors.New("dsh checkpoint tool selection is invalid")
+	}
+	currentByName := make(map[string]app.AgentToolDefinition, len(current))
+	for _, definition := range current {
+		currentByName[definition.Name] = definition
+	}
+	base := make([]app.AgentToolDefinition, 0, len(payloads))
+	seen := make(map[string]struct{}, len(payloads))
+	for _, raw := range payloads {
+		var named struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(raw, &named) != nil || !cloudDSHID.MatchString(named.Name) {
+			return nil, errors.New("dsh checkpoint tool selection is invalid")
+		}
+		if _, exists := seen[named.Name]; exists {
+			return nil, errors.New("dsh checkpoint tool selection is duplicated")
+		}
+		seen[named.Name] = struct{}{}
+		if named.Name == cloudDSHDelegateToolName || cloudDSHJobTool(named.Name) || named.Name == cloudDSHResultEvidenceToolName {
+			continue
+		}
+		definition, exists := currentByName[named.Name]
+		if !exists {
+			return nil, cloudDSHCheckpointToolDefinitionUnavailable{toolName: named.Name, source: "base"}
+		}
+		base = append(base, definition)
+		encoded, err := json.Marshal(cloudDSHToolPayload([]app.AgentToolDefinition{definition})[0])
+		if err != nil {
+			return nil, errors.New("dsh checkpoint tool definition is invalid")
+		}
+		actualCanonical, actualOK := canonicalCloudDSHJSON(raw)
+		expectedCanonical, expectedOK := canonicalCloudDSHJSON(encoded)
+		if !actualOK || !expectedOK || !bytes.Equal(actualCanonical, expectedCanonical) {
+			return nil, errors.New("dsh checkpoint tool definition changed")
+		}
+	}
+
+	// The delegate schema enumerates the base tools visible when the session
+	// began. Rebuild it from the checkpoint's exact base set so additive current
+	// tools do not change the historical schema or become visible on resume.
+	expected := make(map[string]app.AgentToolDefinition, len(base)+6)
+	for _, definition := range base {
+		expected[definition.Name] = definition
+	}
+	if childrenAllowed {
+		for _, definition := range cloudDSHJobTools() {
+			expected[definition.Name] = definition
+		}
+		hasDelegableTools := false
+		for _, definition := range base {
+			if definition.Name != "ask_user" {
+				hasDelegableTools = true
+				break
+			}
+		}
+		if hasDelegableTools {
+			delegate := cloudDSHDelegateTool(base)
+			expected[delegate.Name] = delegate
+		}
+	}
+	if evidenceAllowed && len(base) > 0 {
+		evidence := cloudDSHResultEvidenceTool()
+		expected[evidence.Name] = evidence
+	}
+	selected := make([]app.AgentToolDefinition, 0, len(payloads))
+	for _, raw := range payloads {
+		var named struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(raw, &named) != nil {
+			return nil, errors.New("dsh checkpoint tool selection is invalid")
+		}
+		definition, exists := expected[named.Name]
+		if !exists {
+			return nil, cloudDSHCheckpointToolDefinitionUnavailable{toolName: named.Name, source: "derived"}
+		}
+		encoded, err := json.Marshal(cloudDSHToolPayload([]app.AgentToolDefinition{definition})[0])
+		if err != nil {
+			return nil, errors.New("dsh checkpoint tool definition is invalid")
+		}
+		actualCanonical, actualOK := canonicalCloudDSHJSON(raw)
+		expectedCanonical, expectedOK := canonicalCloudDSHJSON(encoded)
+		if !actualOK || !expectedOK || !bytes.Equal(actualCanonical, expectedCanonical) {
+			return nil, errors.New("dsh checkpoint tool definition changed")
+		}
+		selected = append(selected, definition)
+	}
+	if !validCloudDSHToolDefinitions(selected) {
+		return nil, errors.New("dsh checkpoint tool selection is invalid")
+	}
+	return selected, nil
+}
+
+// cloudDSHCheckpointToolDefinitionUnavailable keeps the externally visible
+// error generic while allowing internal recovery diagnostics to identify the
+// definition that disappeared between the saved checkpoint and current
+// authorization snapshot.
+type cloudDSHCheckpointToolDefinitionUnavailable struct {
+	toolName string
+	source   string
+}
+
+func (cloudDSHCheckpointToolDefinitionUnavailable) Error() string {
+	return "dsh checkpoint tool definition is no longer authorized"
+}
+
+func cloudDSHFilterToolDefinitionsBySelection(definitions, selected []app.AgentToolDefinition) []app.AgentToolDefinition {
+	selectedNames := make(map[string]struct{}, len(selected))
+	for _, definition := range selected {
+		selectedNames[definition.Name] = struct{}{}
+	}
+	filtered := make([]app.AgentToolDefinition, 0, len(selected))
+	for _, definition := range definitions {
+		if _, ok := selectedNames[definition.Name]; ok {
+			filtered = append(filtered, definition)
+		}
+	}
+	return filtered
+}
+
+func (e *CloudDSHExecutor) cloudDSHRestorePinnedToolSelection(ctx context.Context, fence app.AgentInstanceFence,
+	sessionID string, through int64, digest []byte, definitions []app.AgentToolDefinition,
+	childrenAllowed, evidenceAllowed bool) ([]app.AgentToolDefinition, bool, error) {
+	if e.options.Checkpoints == nil || !cloudDSHID.MatchString(sessionID) || through < 0 || len(digest) != sha256.Size {
+		return nil, false, errors.New("dsh checkpoint tool selection is unavailable")
+	}
+	history := newCloudDSHCheckpointHistory(sessionID)
+	history.beginRestore()
+	var selected []json.RawMessage
+	var selectedSummary [32]byte
+	headerSeen, assistantMessageSeen := false, false
+	var total int
+	for from := int64(0); from <= through; {
+		page, err := e.options.Checkpoints.ReadPage(ctx, app.AgentCheckpointPageRequest{
+			Fence: fence, SessionID: sessionID, From: from, Through: through, ThroughDigest: append([]byte(nil), digest...),
+		})
+		if err != nil || page.From != from || page.Through < from || page.Through > through || len(page.Payload) == 0 ||
+			len(page.Payload) > 1<<20 || !cloudDSHDigest(page.Payload, hex.EncodeToString(page.Digest)) ||
+			page.Through == through && !bytes.Equal(page.Digest, digest) {
+			return nil, false, errors.New("dsh checkpoint tool selection is unavailable")
+		}
+		total += len(page.Payload)
+		if total > cloudDSHCompletionInputLimit || history.append(page.Payload, page.From, page.Through) != nil {
+			return nil, false, errors.New("dsh checkpoint tool selection is invalid")
+		}
+		payloads, found, assistantFound, err := cloudDSHCheckpointToolPayloads(page.Payload)
+		if err != nil {
+			return nil, false, err
+		}
+		assistantMessageSeen = assistantMessageSeen || assistantFound
+		if found {
+			encoded, err := json.Marshal(payloads)
+			if err != nil {
+				return nil, false, errors.New("dsh checkpoint tool selection is invalid")
+			}
+			actual, ok := cloudDSHToolPayloadSummary(encoded)
+			if !ok || headerSeen && !bytes.Equal(actual[:], selectedSummary[:]) {
+				return nil, false, errors.New("dsh checkpoint tool definitions changed")
+			}
+			if !headerSeen {
+				selected, selectedSummary = payloads, actual
+			}
+			headerSeen = true
+		}
+		from = page.Through + 1
+	}
+	if history.nextSeq != through+1 {
+		return nil, false, errors.New("dsh checkpoint tool selection is incomplete")
+	}
+	if !headerSeen {
+		if assistantMessageSeen {
+			return nil, false, errors.New("dsh pinned checkpoint lacks its model-visible tool definitions")
+		}
+		return append([]app.AgentToolDefinition(nil), definitions...), false, nil
+	}
+	selectedDefinitions, err := cloudDSHDefinitionsFromCheckpointToolPayload(definitions, selected, childrenAllowed, evidenceAllowed)
+	if err != nil {
+		return nil, false, err
+	}
+	return selectedDefinitions, true, nil
 }
 
 func (state *cloudDSHSessionState) noteActivity(phase, activityID, activityState string) {
@@ -1486,16 +1695,26 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	if !validCloudDSHToolDefinitions(rootDefinitions) {
 		return errors.New("dsh tool definitions are unavailable")
 	}
+	rootThrough := int64(-1)
+	var rootDigest []byte
+	if resume {
+		rootThrough, rootDigest = value.CheckpointThroughSequence, value.CheckpointDigest
+		pinnedDefinitions, found, err := e.cloudDSHRestorePinnedToolSelection(ctx, fence, rootIdentity.SessionID,
+			rootThrough, rootDigest, rootDefinitions, toolsAllowed && e.options.Children != nil, toolsAllowed && e.options.Tools != nil)
+		if err != nil {
+			return err
+		}
+		if found {
+			rootDefinitions = pinnedDefinitions
+			baseDefinitions = cloudDSHFilterToolDefinitionsBySelection(baseDefinitions, pinnedDefinitions)
+			canDelegate = toolsAllowed && e.options.Children != nil && cloudDSHToolAllowed(rootDefinitions, cloudDSHDelegateToolName)
+		}
+	}
 	if value.StepRetry != nil {
 		if !resume || !toolsAllowed || e.options.Tools == nil ||
 			!cloudDSHToolAllowed(rootDefinitions, value.StepRetry.ToolName) {
 			return errors.New("dsh step retry tool is not available in the pinned task context")
 		}
-	}
-	rootThrough := int64(-1)
-	var rootDigest []byte
-	if resume {
-		rootThrough, rootDigest = value.CheckpointThroughSequence, value.CheckpointDigest
 	}
 	states := map[string]*cloudDSHSessionState{rootIdentity.SessionID: newCloudDSHSessionState(fence, rootIdentity, "", "",
 		rootDefinitions, canDelegate, resume, rootThrough, rootDigest)}
@@ -2188,12 +2407,8 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			supersedeChildCreate := func(deliveryCtx context.Context, messages []app.AgentConversationMessage) error {
 				return supersedeToolCall(deliveryCtx, messages, frame.SessionID, frame.CallID)
 			}
-			superseded, err := e.createCloudDSHChildSession(ctx, value, fence, frame, states, baseDefinitions, input, supersedeChildCreate, runAgentRequest)
-			if err != nil {
+			if _, err := e.createCloudDSHChildSession(ctx, value, fence, frame, states, baseDefinitions, input, supersedeChildCreate, runAgentRequest); err != nil {
 				return err
-			}
-			if superseded {
-				continue
 			}
 			continue
 		}

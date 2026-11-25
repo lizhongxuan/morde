@@ -40,18 +40,19 @@ describe('NewHost', () => {
     expect(screen.queryByRole('textbox', { name: /云端电脑名称/ })).not.toBeInTheDocument();
   });
 
-  it('keeps the normal loading placeholder and shows a popup when the host list read fails', async () => {
+  it('keeps the host limit read recoverable after a network error', async () => {
     vi.mocked(portalApi.hosts).mockRejectedValueOnce(new TypeError('Failed to fetch')).mockResolvedValue({ items: [] });
     const user = userEvent.setup();
     renderPage();
 
     expect(await screen.findByRole('status')).toHaveTextContent('正在检查云端电脑数量');
-    const notice = await screen.findByRole('alert');
+    await waitFor(() => expect(document.querySelector('.error-notice-overlay [role="alert"]')).toBeInTheDocument());
+    const notice = document.querySelector<HTMLElement>('.error-notice-overlay [role="alert"]')!;
     expect(notice).toHaveTextContent('云端电脑列表连接失败');
-    expect(notice.closest('.notice-center')).toHaveClass('notice-center-overlay');
-    expect(document.querySelector('.error-card')).not.toBeInTheDocument();
+    expect(notice.closest('.error-notice-overlay')).toBeInTheDocument();
+    expect(await screen.findByText(/无法确认创建配额/)).toBeInTheDocument();
 
-    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    await user.click(screen.getByRole('button', { name: '重试读取云端电脑列表' }));
     expect(await screen.findByRole('button', { name: '创建云端电脑' })).toBeEnabled();
     expect(portalApi.hosts).toHaveBeenCalledTimes(2);
     expect(screen.queryByRole('alert')).not.toBeInTheDocument();

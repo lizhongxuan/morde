@@ -867,6 +867,9 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversat
 
 func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.ConversationRouteClaim,
 	snapshot app.ConversationRouteSnapshot, decision app.ConversationRouteDecision) error {
+	if !app.ValidConversationRouteFileDeliveryIntent(decision.Action, decision.FileDeliveryIntent) {
+		return domain.InvalidArgument("route_decision", "file delivery intent is invalid for this route action")
+	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
 		if decision.Action == app.ConversationRouteNew {
 			if err := lockConversationRouteNewScope(ctx, tx, claim); err != nil {
@@ -1019,10 +1022,10 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 				}
 			}
 			return createConversationRouteTask(ctx, tx, claim, routedContent, modelID, decision.DependencyTaskIDs,
-				current.Context.Candidates, current.Summary, nil)
+				decision.FileDeliveryIntent, current.Context.Candidates, current.Summary, nil)
 		case app.ConversationRouteTool:
 			return createConversationRouteTask(ctx, tx, claim, current.Context.Content, modelID, nil,
-				current.Context.Candidates, current.Summary, &decision)
+				task.FileDeliveryNone, current.Context.Candidates, current.Summary, &decision)
 		case app.ConversationRouteReply:
 			if current.Context.ResultReview != nil {
 				return publishConversationResultReviewInTx(ctx, tx, claim, decision.Reply)
@@ -2024,7 +2027,8 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 }
 
 func createConversationRouteTask(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, routedContent string, modelID string,
-	dependencyTaskIDs []string, candidates []app.ConversationRouteCandidate, storedSummary *app.StoredConversationSummary,
+	dependencyTaskIDs []string, fileDeliveryIntent task.FileDeliveryIntent,
+	candidates []app.ConversationRouteCandidate, storedSummary *app.StoredConversationSummary,
 	internalTool *app.ConversationRouteDecision) error {
 	if err := validateInitialRouteAttachments(ctx, tx, claim); err != nil {
 		return err
@@ -2059,9 +2063,12 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 	if strings.TrimSpace(objective) == "" {
 		objective = app.ConversationAttachmentOnlyObjective
 	}
-	fileIntent := task.FileDeliveryNone
-	if directive, specified := app.RoutedFileDeliveryDirective(claim.Message.Content, claim.Input.WorkspaceID != ""); specified {
-		fileIntent = directive
+	fileIntent := fileDeliveryIntent
+	if fileIntent == "" {
+		fileIntent = task.FileDeliveryNone
+	}
+	if !fileIntent.Valid() {
+		return domain.InvalidArgument("route_decision", "file delivery intent is invalid")
 	}
 	value := task.Task{ID: taskID, OwnerID: claim.Message.OwnerID, InitiatorID: claim.Message.ActorID,
 		ProjectID: claim.Input.ProjectID, ConversationID: claim.Message.ConversationID, ModelID: modelID,

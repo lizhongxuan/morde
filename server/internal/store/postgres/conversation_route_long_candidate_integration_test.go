@@ -10,22 +10,23 @@ import (
 	"morde/server/internal/domain/task"
 )
 
-func TestStoredLongRouteDecisionDoesNotTreatArticleTextAsRestart(t *testing.T) {
+func TestStoredExplicitNewDecisionIsNotReinterpretedFromArticleText(t *testing.T) {
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew, ExplicitNew: true}
-	value := app.ConversationRouteContext{ContentTruncated: true, Content: "请总结这篇文章：\n正文写着重新开始新任务。"}
-	if validStoredRouteDecision(decision, value) {
-		t.Fatal("stored decision accepted restart text from the document")
-	}
-	value.Content = "重新开始新任务，请总结这篇文章：\n正文。"
-	if !validStoredRouteDecision(decision, value) {
-		t.Fatal("stored decision rejected the explicit restart request")
+	for _, content := range []string{
+		"帮我检查一下接口的输入校验，并补上测试。",
+		"请总结这篇文章：\n正文写着重新开始新任务。",
+	} {
+		value := app.ConversationRouteContext{ContentTruncated: true, Content: content}
+		if !validStoredRouteDecision(decision, value) {
+			t.Fatalf("stored structured explicit-new decision was rejected for content %q", content)
+		}
 	}
 }
 
-func TestLongArticleFallbackKeepsInterruptedDuplicateAndRoutesIndependentRequest(t *testing.T) {
+func TestLongRouteUsesStructuredDecisionAndPreservesDuplicateIdempotency(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
-	content := "好现在你帮我看下这篇文章说了什么：\n# 长文章\n" + strings.Repeat("文章正文。", 5000)
+	content := "请总结这篇文章：\n# 长文章\n正文引用“重新开始新任务”这句话。\n" + strings.Repeat("文章正文。", 5000)
 	root := f.receive(t, "long-candidate-root-001", content, app.ConversationRoutingInput{})
 	rootSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, root)
 	if err != nil {
@@ -55,70 +56,70 @@ func TestLongArticleFallbackKeepsInterruptedDuplicateAndRoutesIndependentRequest
 	snapshot.Context.ModelID = "p1234567"
 	preview := snapshot.Context
 	app.ProjectConversationRouteMessage(&preview, app.ConversationRouteCurrentMessagePreviewBytes)
-	decision, ok := app.ConversationRouteLongMessageFallback(preview)
-	if !ok || decision.Action != app.ConversationRouteClarify || !strings.Contains(decision.Question, "相同") {
-		t.Fatalf("unresolved duplicate decision = %+v, ok=%t", decision, ok)
+	decision := app.ParseConversationRouteDecisionForContext(`{"action":"new","explicit_new":false,"dependency_task_ids":[]}`, preview)
+	if decision.Action != app.ConversationRouteNew || decision.ExplicitNew || decision.InvalidOutput {
+		t.Fatalf("article wording changed the structured non-explicit New decision: %+v", decision)
 	}
 	if err := f.store.ApplyConversationRoute(ctx, duplicate, snapshot, decision); err != nil {
-		t.Fatalf("apply duplicate recovery guidance: %v", err)
+		t.Fatalf("apply duplicate idempotency decision: %v", err)
 	}
 	var taskCount int
-	var state, oldStatus string
-	if err := f.store.pool.QueryRow(ctx, `SELECT r.state,t.status,
- (SELECT count(*) FROM tasks WHERE conversation_id=r.conversation_id)
- FROM conversation_message_routes r JOIN tasks t ON t.id=$2 WHERE r.message_id=$1`, duplicate.Message.ID, claimed.ID).
-		Scan(&state, &oldStatus, &taskCount); err != nil || state != "waiting_user" || oldStatus != "waiting_user" || taskCount != 1 {
-		t.Fatalf("duplicate changed task state or created work: route=%s old=%s count=%d err=%v", state, oldStatus, taskCount, err)
+	var state, oldStatus, duplicateTaskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT r.state,t.status,COALESCE(root.task_id,''),
+ (SELECT count(*) FROM tasks WHERE conversation_id=duplicate.conversation_id)
+	FROM conversation_message_routes r
+	JOIN conversation_messages duplicate ON duplicate.id=r.message_id
+	JOIN conversation_messages root ON root.id=r.duplicate_of_message_id
+	JOIN tasks t ON t.id=root.task_id AND t.conversation_id=root.conversation_id
+	WHERE r.message_id=$1 AND root.id=$3 AND t.id=$2`, duplicate.Message.ID, claimed.ID, root.Message.ID).
+		Scan(&state, &oldStatus, &duplicateTaskID, &taskCount); err != nil || state != "routed" || oldStatus != "waiting_user" || duplicateTaskID != claimed.ID || taskCount != 1 {
+		t.Fatalf("exact duplicate did not link to the existing Task: route=%s old=%s task=%s count=%d err=%v", state, oldStatus, duplicateTaskID, taskCount, err)
 	}
 
-	independentContent := "请总结这篇文章：\n# 另一篇文章\n" + strings.Repeat("新文章正文。", 5000)
-	independent := f.receive(t, "long-candidate-other-001", independentContent, app.ConversationRoutingInput{
-		PreviousClientMessageID: root.Message.ClientMessageID,
+	clarified := f.receive(t, "long-candidate-clarify-001", content, app.ConversationRoutingInput{
+		PreviousClientMessageID: duplicate.Message.ClientMessageID,
 	})
-	snapshot, err = f.store.LoadConversationRouteSnapshot(ctx, independent)
+	snapshot, err = f.store.LoadConversationRouteSnapshot(ctx, clarified)
 	if err != nil {
 		t.Fatal(err)
 	}
 	snapshot.Context.ModelID = "p1234567"
 	preview = snapshot.Context
 	app.ProjectConversationRouteMessage(&preview, app.ConversationRouteCurrentMessagePreviewBytes)
-	decision, ok = app.ConversationRouteLongMessageFallback(preview)
-	if !ok || decision.Action != app.ConversationRouteNew {
-		t.Fatalf("independent article decision = %+v, ok=%t", decision, ok)
+	decision = app.ParseConversationRouteDecisionForContext(`{"action":"clarify","question":"请补充希望完成的目标。"}`, preview)
+	if decision.Action != app.ConversationRouteClarify {
+		t.Fatalf("body keywords changed the structured Clarify decision: %+v", decision)
 	}
-	if err := f.store.ApplyConversationRoute(ctx, independent, snapshot, decision); err != nil {
-		t.Fatalf("route independent article: %v", err)
+	if err := f.store.ApplyConversationRoute(ctx, clarified, snapshot, decision); err != nil {
+		t.Fatalf("apply structured clarification: %v", err)
 	}
-	var newTaskID, stored string
-	if err := f.store.pool.QueryRow(ctx, `SELECT task_id,content FROM conversation_messages WHERE id=$1`, independent.Message.ID).
-		Scan(&newTaskID, &stored); err != nil || newTaskID == "" || newTaskID == claimed.ID || stored != independentContent {
-		t.Fatalf("independent article source or task changed: new_task=%s err=%v", newTaskID, err)
+	var clarifiedTaskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(task_id,'') FROM conversation_messages WHERE id=$1`, clarified.Message.ID).
+		Scan(&clarifiedTaskID); err != nil || clarifiedTaskID != "" {
+		t.Fatalf("model clarification was reinterpreted as a Task: task=%s err=%v", clarifiedTaskID, err)
 	}
 
-	explicitContent := "重新开始新任务，请总结这篇文章：\n# 新文章\n" + strings.Repeat("正文。", 3000)
-	var previousClientID, explicitTaskID string
-	previousClientID = root.Message.ClientMessageID
-	for _, clientID := range []string{"long-candidate-explicit-001", "long-candidate-explicit-002"} {
-		retry := f.receive(t, clientID, explicitContent, app.ConversationRoutingInput{PreviousClientMessageID: previousClientID})
-		snapshot, err = f.store.LoadConversationRouteSnapshot(ctx, retry)
-		if err != nil {
-			t.Fatal(err)
-		}
-		snapshot.Context.ModelID = "p1234567"
-		preview = snapshot.Context
-		app.ProjectConversationRouteMessage(&preview, app.ConversationRouteCurrentMessagePreviewBytes)
-		decision, ok = app.ConversationRouteLongMessageFallback(preview)
-		if !ok || decision.Action != app.ConversationRouteNew || !decision.ExplicitNew {
-			t.Fatalf("explicit restart decision = %+v, ok=%t", decision, ok)
-		}
-		if err := f.store.ApplyConversationRoute(ctx, retry, snapshot, decision); err != nil {
-			t.Fatalf("apply explicit restart: %v", err)
-		}
-		var taskID string
-		if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, retry.Message.ID).
-			Scan(&taskID); err != nil || taskID == "" || taskID == explicitTaskID {
-			t.Fatalf("explicit restart did not create the requested new task: task=%s err=%v", taskID, err)
-		}
-		explicitTaskID, previousClientID = taskID, retry.Message.ClientMessageID
+	explicitContent := "请总结这篇文章：\n# 再次处理\n" + strings.Repeat("文章正文。", 3000)
+	explicit := f.receive(t, "long-candidate-explicit-001", explicitContent, app.ConversationRoutingInput{
+		PreviousClientMessageID: clarified.Message.ClientMessageID,
+	})
+	snapshot, err = f.store.LoadConversationRouteSnapshot(ctx, explicit)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	preview = snapshot.Context
+	app.ProjectConversationRouteMessage(&preview, app.ConversationRouteCurrentMessagePreviewBytes)
+	decision = app.ParseConversationRouteDecisionForContext(`{"action":"new","explicit_new":true,"dependency_task_ids":[]}`, preview)
+	if decision.Action != app.ConversationRouteNew || !decision.ExplicitNew {
+		t.Fatalf("structured ExplicitNew decision was changed by article wording: %+v", decision)
+	}
+	if err := f.store.ApplyConversationRoute(ctx, explicit, snapshot, decision); err != nil {
+		t.Fatalf("apply structured ExplicitNew decision: %v", err)
+	}
+	var explicitTaskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, explicit.Message.ID).
+		Scan(&explicitTaskID); err != nil || explicitTaskID == "" || explicitTaskID == claimed.ID {
+		t.Fatalf("model ExplicitNew decision did not create a new Task: task=%s err=%v", explicitTaskID, err)
 	}
 }

@@ -5,7 +5,6 @@ import { errorDetails, portalApi } from '../app/api';
 import { formatDate } from '../app/format';
 import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
-import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { Modal } from '../components/Modal';
 import { OnceSecretDialog } from '../components/OnceSecretDialog';
@@ -100,8 +99,9 @@ export function ApiKeys() {
       </div>
     </form></Modal>}
 
-    {keys.isPending || (!keys.data && isTransientNetworkError(keys.error)) ? <div className="loading-card" role="status">正在加载…</div>
-      : keys.isError && !isTransientNetworkError(keys.error) ? <FloatingError className="error-card" role="alert">{errorDetails(keys.error).message}<button className="button button-secondary" type="button" onClick={() => void keys.refetch()}>重试</button></FloatingError>
+    {keys.isError && keys.data && <FloatingError inline className="error-card" role="alert">API Key 列表刷新失败，当前显示最近一次确认的数据。{errorDetails(keys.error).message}<button className="button button-secondary" type="button" onClick={() => void keys.refetch()}>重试</button></FloatingError>}
+    {keys.isPending && !keys.data ? <div className="loading-card" role="status">正在加载…</div>
+      : keys.isError && !keys.data ? <FloatingError inline className="error-card" role="alert">{errorDetails(keys.error).message}<button className="button button-secondary" type="button" onClick={() => void keys.refetch()}>重试</button></FloatingError>
         : keys.data && !keys.data.items.length ? <div className="empty-card compact"><p>尚未创建 API Key。</p></div> : keys.data ? <div className="table-wrap" style={{ padding: '0 10px' }}>
       <div aria-hidden="true" style={{ display: 'grid', gridTemplateColumns: apiKeyGridColumns, gap: 12, minWidth: 850, padding: '10px 8px', borderBottom: '1px solid #e9edf2', color: '#8793a4', background: '#fafbfc', fontSize: 10, fontWeight: 700 }}>
         <span>名称</span><span>权限</span><span>创建时间</span><span>最近使用</span><span>过期时间</span><span>状态</span><span>操作</span>

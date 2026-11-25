@@ -201,6 +201,27 @@ type RuntimeToolExecutor struct {
 	leaseEvery time.Duration
 }
 
+// runtimeToolArgumentValidationPreDispatchError is returned only after Prepare
+// has matched the tool and scope, loaded the current Task, and reauthorized the
+// exact scope without finding a local argument match.
+type runtimeToolArgumentValidationPreDispatchError struct {
+	cause error
+}
+
+func (e *runtimeToolArgumentValidationPreDispatchError) Error() string {
+	if e == nil || e.cause == nil {
+		return "runtime tool arguments are invalid"
+	}
+	return e.cause.Error()
+}
+
+func (e *runtimeToolArgumentValidationPreDispatchError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
+}
+
 func NewRuntimeToolExecutor(store TaskStore, authorizer TaskAuthorizer, fences AgentHostFenceReader, runtime *RuntimeControl, workspaces *WorkspaceSyncService) (*RuntimeToolExecutor, error) {
 	if store == nil || authorizer == nil || fences == nil || runtime == nil || workspaces == nil {
 		return nil, errors.New("runtime tool executor dependencies are required")
@@ -262,12 +283,23 @@ func (e *RuntimeToolExecutor) Definitions(ctx context.Context, claimed task.Task
 
 func (e *RuntimeToolExecutor) Prepare(ctx context.Context, request AgentToolRequest) (AgentToolPreparation, error) {
 	mapping, ok := runtimeToolMappingByName(request.Call.Name)
-	if !ok || mapping.scope != request.RequiredScope || !validRuntimeToolArguments(mapping, request.Arguments) {
+	if !ok || mapping.scope != request.RequiredScope {
+		return AgentToolPreparation{}, domain.NewError(domain.CodeInvalidArgument, "runtime tool request is invalid")
+	}
+	if _, supported := runtimeToolAllowedArgumentFields(mapping.name); !supported {
 		return AgentToolPreparation{}, domain.NewError(domain.CodeInvalidArgument, "runtime tool request is invalid")
 	}
 	current, err := e.currentTask(ctx, request.Task)
 	if err != nil {
 		return AgentToolPreparation{}, err
+	}
+	if err := e.authorize(ctx, current, mapping.scope); err != nil {
+		return AgentToolPreparation{}, err
+	}
+	if !validRuntimeToolArguments(mapping, request.Arguments) {
+		return AgentToolPreparation{}, &runtimeToolArgumentValidationPreDispatchError{
+			cause: domain.NewError(domain.CodeInvalidArgument, "runtime tool arguments are invalid"),
+		}
 	}
 	if workspaceTaskDesktopInputDisabled(current, mapping) {
 		return AgentToolPreparation{}, domain.NewError(domain.CodeUnsupported, "AI desktop input is disabled for Workspace tasks")
@@ -2778,14 +2810,7 @@ func runtimeToolPreparationToken(request AgentToolRequest, fence AgentHostFence,
 	return hex.EncodeToString(sum[:])
 }
 
-func validRuntimeToolArguments(mapping runtimeToolMapping, raw json.RawMessage) bool {
-	if !validAgentJSONObject(raw, maxAgentToolArgsBytes) {
-		return false
-	}
-	var fields map[string]json.RawMessage
-	if json.Unmarshal(raw, &fields) != nil {
-		return false
-	}
+func runtimeToolAllowedArgumentFields(name string) (map[string]bool, bool) {
 	allowed := map[string]map[string]bool{
 		runtimeToolShellExec:           {"workspace_id": true, "command": true, "cwd": true, "timeout": true},
 		runtimeToolFileRead:            {"workspace_id": true, "path": true, "start_line": true, "end_line": true},
@@ -2808,7 +2833,19 @@ func validRuntimeToolArguments(mapping runtimeToolMapping, raw json.RawMessage) 
 		runtimeToolDesktopType:         {"window_id": true, "text": true},
 		runtimeToolDesktopPressKey:     {"window_id": true, "key": true},
 	}
-	accepted, exists := allowed[mapping.name]
+	accepted, exists := allowed[name]
+	return accepted, exists
+}
+
+func validRuntimeToolArguments(mapping runtimeToolMapping, raw json.RawMessage) bool {
+	if !validAgentJSONObject(raw, maxAgentToolArgsBytes) {
+		return false
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil {
+		return false
+	}
+	accepted, exists := runtimeToolAllowedArgumentFields(mapping.name)
 	if !exists {
 		return false
 	}

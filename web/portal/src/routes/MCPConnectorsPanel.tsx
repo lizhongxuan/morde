@@ -4,7 +4,6 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../app/api';
 import { useToast } from '../app/toast';
 import { useNetworkReadNotice } from '../app/use-network-read-notice';
-import { isTransientNetworkError } from '../api/errors';
 import { ConfirmDialog } from '../components/ConfirmDialog';
 import { Modal } from '../components/Modal';
 import { ScreenPagination } from '../components/ScreenPagination';
@@ -287,10 +286,12 @@ export function MCPConnectorsPanel({ areaTabs }: { areaTabs: ReactNode }) {
       </div>
       <div className="form-actions"><button type="button" className="button button-secondary" disabled={creating} onClick={cancelCreate}>取消</button><button type="submit" className="button button-primary" disabled={creating}>{creating ? '正在保存…' : '保存连接'}</button></div>
     </form></Modal>}
-    {connectors.isPending || (!connectors.data && isTransientNetworkError(connectors.error)) ? <div className="loading-card" role="status">正在读取工具连接…</div>
-      : connectors.isError && !isTransientNetworkError(connectors.error) ? <FloatingError className="error-card" role="alert">{errorDetails(connectors.error).message}<button type="button" className="button button-secondary" onClick={() => void connectors.refetch()}>重试</button></FloatingError>
+    {connectors.isPending && !connectors.data ? <div className="loading-card" role="status">正在读取工具连接…</div>
+      : connectors.isError && !connectors.data ? <FloatingError inline className="error-card" role="alert">无法读取 MCP 工具连接：{errorDetails(connectors.error).message}<button type="button" className="button button-secondary" onClick={() => void connectors.refetch()}>重试</button></FloatingError>
         : !connectors.data ? <div className="loading-card" role="status">正在读取工具连接…</div>
-        : !connectors.data.items.length ? <><div className="connection-empty"><span className="connection-empty-icon" aria-hidden="true"><MordeIcon name="link" /></span><h3>尚未添加工具连接</h3><p>启用的连接可用于之后新建的任务。</p></div><p className="connection-empty-note"><MordeIcon name="info" />连接地址仅支持 HTTPS 公网服务。</p></>
+        : <>
+          {connectors.isError && <FloatingError inline className="error-card" role="alert">MCP 工具连接刷新失败，当前仍显示最近一次确认的数据。{errorDetails(connectors.error).message}<button type="button" className="button button-secondary" onClick={() => void connectors.refetch()}>重试</button></FloatingError>}
+          {!connectors.data.items.length ? <><div className="connection-empty"><span className="connection-empty-icon" aria-hidden="true"><MordeIcon name="link" /></span><h3>尚未添加工具连接</h3><p>启用的连接可用于之后新建的任务。</p></div><p className="connection-empty-note"><MordeIcon name="info" />连接地址仅支持 HTTPS 公网服务。</p></>
         : connectors.data.items.length === 1 ? <div className="model-connection-list">{renderConnector(connectors.data.items[0]!)}</div>
           : <ScreenPagination
             items={connectors.data.items}
@@ -301,6 +302,7 @@ export function MCPConnectorsPanel({ areaTabs }: { areaTabs: ReactNode }) {
             className="model-connection-list"
             renderItem={renderConnector}
           />}
+        </>}
     {oauthFlow && <div className="loading-card" role="status">正在等待 {oauthFlow.connector.name} 的 OAuth 授权；完成后会自动刷新连接状态。关闭授权窗口可取消。</div>}
     {oauthSetup && <form className="connection-form form-card" aria-label={`配置 ${oauthSetup.connector.name} OAuth 客户端`} onSubmit={submitOAuthSetup}>
       <p>此 MCP 服务需要先创建 OAuth 客户端。请在 <a href={oauthSetup.developerURL} target="_blank" rel="noopener noreferrer">服务商开发者页面</a> 创建后填写客户端信息。</p>

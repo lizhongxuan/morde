@@ -69,7 +69,7 @@ it('paginates logged-in clients and keeps revoke available on later pages', asyn
   await waitFor(() => expect(revoke.mock.calls[0]?.[0]).toBe(clients[1].id));
 });
 
-it('keeps the confirmed client list visible and reports a transient refresh failure in a popup', async () => {
+it('keeps the confirmed client list visible and retryable after a transient refresh failure', async () => {
   const item = { id: 'cli_12345678', platform: 'desktop', display_name: '工作电脑', expires_at: '2027-10-22T08:00:00Z', revoked: false, created_at: '2026-10-22T08:00:00Z', last_used_at: null };
   const list = vi.spyOn(portalApi, 'clients')
     .mockResolvedValueOnce({ items: [item] as Awaited<ReturnType<typeof portalApi.clients>>['items'] })
@@ -81,11 +81,12 @@ it('keeps the confirmed client list visible and reports a transient refresh fail
 
   await queryClient.invalidateQueries({ queryKey: ['clients'] });
 
-  const notice = await screen.findByRole('alert');
-  expect(notice).toHaveTextContent('客户端列表连接失败');
-  expect(notice.closest('.design-panel')).toBeNull();
+  await screen.findByText(/客户端列表刷新失败/);
+  expect(document.querySelector('.error-notice-overlay .toast-notice')).toHaveTextContent('客户端列表连接失败');
   expect(screen.getByText('工作电脑')).toBeInTheDocument();
-  await userEvent.setup().click(within(notice).getByRole('button', { name: '重试' }));
+  const pageError = screen.getAllByRole('alert').find((alert) => alert.closest('.design-panel'))!;
+  expect(pageError).toHaveTextContent('最近一次确认的数据');
+  await userEvent.setup().click(within(pageError).getByRole('button', { name: '重试' }));
   await waitFor(() => expect(list).toHaveBeenCalledTimes(3));
   await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
 });

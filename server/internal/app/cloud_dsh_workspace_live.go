@@ -15,7 +15,6 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
-	"morde/server/internal/storage/workspacecurrent"
 )
 
 func (t *cloudDSHWorkspaceTools) validateLiveRevision(ctx context.Context, current task.Task, revision int64) error {
@@ -226,7 +225,7 @@ func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Tas
 	}
 	pendingReceipt := false
 	if receipt, found, err := findReceipt(); err != nil {
-		return cloudDSHWorkspaceFailure(err), nil
+		return cloudDSHWorkspacePublishFailure(err), nil
 	} else if found && receipt.State != TaskWorkspacePublishPending {
 		return cloudDSHWorkspaceReceiptResult(receipt, operationKey), nil
 	} else {
@@ -260,10 +259,16 @@ func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Tas
 	}
 	baseline, err := t.readSnapshot(ctx, current, arguments.ExpectedRevision)
 	if err != nil {
+		if pendingReceipt {
+			return AgentToolResult{Status: AgentToolUnknown}, nil
+		}
 		return cloudDSHWorkspaceFailure(err), nil
 	}
 	workspaceValue, err := t.workspaces.store.GetWorkspace(ctx, current.WorkspaceID)
 	if err != nil {
+		if pendingReceipt {
+			return AgentToolResult{Status: AgentToolUnknown}, nil
+		}
 		return AgentToolResult{}, err
 	}
 	if workspaceValue.OwnerID != taskWorkspaceOwner(current) || workspaceValue.State != workspace.StateReady || workspaceValue.DeletedAt != nil ||
@@ -272,6 +277,9 @@ func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Tas
 	}
 	live, err := readWorkspaceLiveSnapshot(ctx, t.workspaces.currentDirectory, taskWorkspaceOwner(current), current.WorkspaceID, t.workspaces.maxOwnerBytes)
 	if err != nil {
+		if pendingReceipt {
+			return AgentToolResult{Status: AgentToolUnknown}, nil
+		}
 		return cloudDSHWorkspaceFailure(err), nil
 	}
 	for blocked := range live.blockedPaths {
@@ -296,10 +304,14 @@ func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Tas
 	}
 	receipt, err := t.workspaces.ReserveTaskWorkspacePublish(ctx, command)
 	if err != nil {
-		if found, ok, findErr := findReceipt(); findErr == nil && ok && found.State != TaskWorkspacePublishPending {
-			return cloudDSHWorkspaceReceiptResult(found, operationKey), nil
+		foundReceipt, found, findErr := findReceipt()
+		if findErr != nil || (found && foundReceipt.State == TaskWorkspacePublishPending) {
+			return AgentToolResult{Status: AgentToolUnknown}, nil
 		}
-		return cloudDSHWorkspaceFailure(err), nil
+		if found {
+			return cloudDSHWorkspaceReceiptResult(foundReceipt, operationKey), nil
+		}
+		return cloudDSHWorkspacePublishFailure(err), nil
 	}
 	if receipt.State != TaskWorkspacePublishPending {
 		if !taskWorkspacePublishReceiptMatchesApproval(receipt, call, approval) {
@@ -322,25 +334,29 @@ func (t *cloudDSHWorkspaceTools) writeLive(ctx context.Context, current task.Tas
 		}
 		if err := t.workspaces.currentDirectory.WriteRegularFile(ctx, taskWorkspaceOwner(current), current.WorkspaceID,
 			arguments.Path, []byte(arguments.Content), mode, expectedSHA); err != nil {
-			if errors.Is(err, workspacecurrent.ErrWriteConflict) {
-				return rejectConflict("Workspace file changed before write")
-			}
-			return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeWorkspaceUnavailable, "live Workspace file could not be written")), nil
+			// The storage adapter can report an error after atomically replacing the
+			// file (for example, a parent-directory fsync failure). Keep this exact
+			// operation pending so a replay can inspect the live file before retrying.
+			return AgentToolResult{Status: AgentToolUnknown}, nil
 		}
 	}
 	updated, err := readWorkspaceLiveSnapshot(ctx, t.workspaces.currentDirectory, taskWorkspaceOwner(current), current.WorkspaceID, t.workspaces.maxOwnerBytes)
 	if err != nil {
-		return cloudDSHWorkspaceFailure(err), nil
+		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
 	receipt, err = t.workspaces.CommitTaskWorkspacePublishDirect(ctx, command, updated.files, updated.emptyDirectories, updated.directories,
 		updated.manifestSHA256, func(_ context.Context, digest string) ([]byte, error) {
 			return updated.readBlock(t.workspaces.currentDirectory, taskWorkspaceOwner(current), current.WorkspaceID, digest)
 		})
 	if err != nil {
-		if found, ok, findErr := findReceipt(); findErr == nil && ok && found.State != TaskWorkspacePublishPending {
-			return cloudDSHWorkspaceReceiptResult(found, operationKey), nil
+		foundReceipt, found, findErr := findReceipt()
+		if findErr != nil || (found && foundReceipt.State == TaskWorkspacePublishPending) {
+			return AgentToolResult{Status: AgentToolUnknown}, nil
 		}
-		return cloudDSHWorkspaceFailure(err), nil
+		if found {
+			return cloudDSHWorkspaceReceiptResult(foundReceipt, operationKey), nil
+		}
+		return cloudDSHWorkspacePublishFailure(err), nil
 	}
 	if !taskWorkspacePublishReceiptMatchesApproval(receipt, call, approval) {
 		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeConflict, "Workspace publish receipt approval binding changed")), nil

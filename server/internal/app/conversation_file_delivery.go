@@ -3,8 +3,6 @@ package app
 import (
 	"regexp"
 	"strings"
-
-	"morde/server/internal/domain/task"
 )
 
 var (
@@ -16,39 +14,6 @@ var (
 	fileDeliveryClaimEnglish = regexp.MustCompile(`(?i)\b(?:saved|created|generated|written|exported|uploaded|stored|delivered)\b`)
 	fileDeliveryClaimTarget  = regexp.MustCompile(`(?i)文件|文档|附件|工作区|pdf|excel|word|ppt|csv|xlsx|docx|pptx|file|document|attachment|workspace|spreadsheet|workbook|presentation|/[a-z0-9_.-]+/`)
 )
-
-// RoutedFileDeliveryDirective only changes a routed Task's intent for an
-// explicit request. Ambiguous requests inherit the previous revision instead
-// of turning an ordinary answer into a required file.
-func RoutedFileDeliveryDirective(content string, hasWorkspace bool) (task.FileDeliveryIntent, bool) {
-	text := strings.ToLower(strings.TrimSpace(content))
-	if text == "" {
-		return "", false
-	}
-	negative := fileDeliveryNegative.MatchString(text)
-	positiveText := fileDeliveryReadOutput.ReplaceAllString(fileDeliveryNegative.ReplaceAllString(text, " "), " ")
-	positive := false
-	for _, clause := range splitFileDeliveryClauses(positiveText) {
-		classification := ClassifyFileDeliveryIntent(clause, hasWorkspace)
-		if classification != task.FileDeliveryRequired {
-			continue
-		}
-		if fileDeliveryQuestionBeforeAction(clause) {
-			continue
-		}
-		positive = true
-	}
-	switch {
-	case positive && negative:
-		return task.FileDeliveryUnclear, true
-	case positive:
-		return task.FileDeliveryRequired, true
-	case negative:
-		return task.FileDeliveryNone, true
-	default:
-		return "", false
-	}
-}
 
 func fileDeliveryQuestionBeforeAction(clause string) bool {
 	match := fileDeliveryAction.FindStringIndex(clause)

@@ -58,6 +58,22 @@ describe('Notifications', () => {
     expect(list).toHaveBeenCalledTimes(2);
   });
 
+  it('keeps the initial list recoverable after a network error', async () => {
+    const list = vi.spyOn(portalApi, 'notifications')
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue({ items: [unread], next_cursor: null });
+    const user = userEvent.setup();
+    renderPage();
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('网络异常，通知暂时无法读取。');
+    const pageAlert = screen.getAllByRole('alert').find((alert) => alert.closest('.design-panel'));
+    expect(pageAlert).toHaveTextContent('网络异常，通知暂时无法读取。');
+    await user.click(within(pageAlert!).getByRole('button', { name: '重试' }));
+
+    expect(await screen.findByText(unread.summary!)).toBeInTheDocument();
+    expect(list).toHaveBeenCalledTimes(2);
+  });
+
   it('filters unread notifications through the API', async () => {
     const list = vi.spyOn(portalApi, 'notifications').mockResolvedValue({ items: [unread], next_cursor: null });
     const user = userEvent.setup();
@@ -125,11 +141,12 @@ describe('Notifications', () => {
     await user.click(screen.getByRole('button', { name: '加载更多通知' }));
     const notice = await screen.findByRole('alert');
     expect(notice).toHaveTextContent('网络异常，通知暂时无法读取。');
-    expect(notice.closest('.notice-center-overlay')).toBeInTheDocument();
+    expect(notice.closest('.error-notice-overlay')).toBeInTheDocument();
     expect(notice.closest('.design-panel')).toBeNull();
     expect(screen.getByText(unread.summary!)).toBeInTheDocument();
+    expect(within(notice).queryByRole('button', { name: '重试' })).not.toBeInTheDocument();
 
-    await user.click(within(notice).getByRole('button', { name: '重试' }));
+    await user.click(screen.getByRole('button', { name: '加载更多通知' }));
     expect(await screen.findByText('第二页通知。')).toBeInTheDocument();
   });
 });

@@ -259,7 +259,14 @@ func resumeCloudDSHT08WorkspaceApproval(store *cloudDSHBrokerTaskStore, status t
 
 type cloudDSHT08WorkspaceStore struct {
 	*syncServiceStore
-	commits int
+	commits                          int
+	commitAttempts                   int
+	commitReturnError                error
+	commitErrorAfterApply            bool
+	receiptLookupFailuresAfterCommit int
+	receiptLookupErrorAfterCommit    error
+	receiptMissingAfterCommitError   bool
+	receiptStateOverrideAfterCommit  TaskWorkspacePublishState
 }
 
 type cloudDSHT08MultiOwnerWorkspaceStore struct {
@@ -323,21 +330,38 @@ func (s *cloudDSHT08WorkspaceStore) GetTaskWorkspacePublishReceipt(ctx context.C
 }
 
 func (s *cloudDSHT08WorkspaceStore) FindTaskWorkspacePublishReceipt(ctx context.Context, ownerID, taskID, workspaceID, operationKey string) (TaskWorkspacePublishReceipt, error) {
+	if s.commitAttempts > 0 && s.receiptLookupFailuresAfterCommit > 0 {
+		s.receiptLookupFailuresAfterCommit--
+		return TaskWorkspacePublishReceipt{}, s.receiptLookupErrorAfterCommit
+	}
+	if s.commitAttempts > 0 && s.receiptMissingAfterCommitError {
+		return TaskWorkspacePublishReceipt{}, domain.NewError(domain.CodeNotFound, "Task Workspace publish receipt not found")
+	}
 	receipt, err := s.syncServiceStore.FindTaskWorkspacePublishReceipt(ctx, ownerID, taskID, workspaceID, operationKey)
 	if err == nil {
 		command := s.taskWorkspacePublishCommands[taskWorkspacePublishReceiptKey(taskID, operationKey)]
 		receipt.RequestHash = hex.EncodeToString(command.RequestHash)
+		if s.receiptStateOverrideAfterCommit != "" {
+			receipt.State = s.receiptStateOverrideAfterCommit
+		}
 	}
 	return receipt, err
 }
 
 func (s *cloudDSHT08WorkspaceStore) CommitTaskWorkspacePublish(ctx context.Context, value TaskWorkspacePublishCommand, files []workspace.File,
 	emptyDirectories []string, directories []workspace.Directory, manifestSHA string) (TaskWorkspacePublishReceipt, error) {
+	s.commitAttempts++
+	if s.commitReturnError != nil && !s.commitErrorAfterApply {
+		return TaskWorkspacePublishReceipt{}, s.commitReturnError
+	}
 	receipt, err := s.syncServiceStore.CommitTaskWorkspacePublish(ctx, value, files, emptyDirectories, directories, manifestSHA)
 	if err == nil {
 		s.commits++
 		receipt.RequestHash = hex.EncodeToString(value.RequestHash)
 		s.taskWorkspacePublishReceipts[taskWorkspacePublishReceiptKey(value.TaskID, value.OperationKey)] = receipt
+		if s.commitReturnError != nil {
+			return TaskWorkspacePublishReceipt{}, s.commitReturnError
+		}
 	}
 	return receipt, err
 }
@@ -692,6 +716,129 @@ func TestCloudDSHWorkspaceWriteRequiresApprovalAndCommitsOnlyTheApprovedCall(t *
 	replayed, err := broker.Reconcile(context.Background(), resumed, call, &checkpoint)
 	if err != nil || replayed.Status != result.Status || replayed.Output != result.Output || workspaceStore.commits != 1 {
 		t.Fatalf("approved Workspace write replay = %#v, err=%v; commits=%d", replayed, err, workspaceStore.commits)
+	}
+}
+
+func TestCloudDSHWorkspaceWriteCommitResponseAndReceiptLookupFailureStaysUnknown(t *testing.T) {
+	_, store, broker, workspaceStore, current := newCloudDSHT08WorkspaceBroker(t)
+	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-lost-commit-response", cloudDSHWorkspaceWriteArguments{
+		ExpectedRevision: 0, Path: "reports/receipt-recovery.txt", Content: "durable write with a lost response",
+	})
+	first, err := broker.Execute(context.Background(), current, call)
+	if err != nil || first.Status != AgentToolNeedsUser {
+		t.Fatalf("initial Workspace write = %#v, err=%v; want approval", first, err)
+	}
+	resumed := resumeCloudDSHT08WorkspaceApproval(store, task.PendingRequestApproved, task.PendingDecisionApprove)
+	workspaceStore.commitReturnError = errors.New("commit response was lost")
+	workspaceStore.commitErrorAfterApply = true
+	workspaceStore.receiptLookupErrorAfterCommit = errors.New("receipt lookup is temporarily unavailable")
+	workspaceStore.receiptLookupFailuresAfterCommit = 1
+
+	result, err := broker.Reconcile(context.Background(), resumed, call, nil)
+	if err != nil || result.Status != AgentToolUnknown || store.details.Task.Status != task.StatusWaitingUser ||
+		store.details.Task.WaitingReason != "tool_result_unknown" || workspaceStore.commitAttempts != 1 ||
+		workspaceStore.commits != 1 || workspaceStore.workspace.Revision != 1 {
+		t.Fatalf("lost commit response and receipt read = %#v, err=%v; task=%#v commits=%d attempts=%d revision=%d",
+			result, err, store.details.Task, workspaceStore.commits, workspaceStore.commitAttempts, workspaceStore.workspace.Revision)
+	}
+
+	// Once receipt reads recover, replaying the pinned call must return the
+	// durable result without dispatching a second Workspace write.
+	recovered := resumeCloudDSHT08WorkspaceApproval(store, task.PendingRequestApproved, task.PendingDecisionApprove)
+	replayed, err := broker.Reconcile(context.Background(), recovered, call, nil)
+	if err != nil || replayed.Status != AgentToolSucceeded || workspaceStore.commitAttempts != 1 ||
+		workspaceStore.commits != 1 || workspaceStore.workspace.Revision != 1 {
+		t.Fatalf("receipt recovery replay = %#v, err=%v; commits=%d attempts=%d revision=%d",
+			replayed, err, workspaceStore.commits, workspaceStore.commitAttempts, workspaceStore.workspace.Revision)
+	}
+}
+
+func TestCloudDSHWorkspaceWriteCommitErrorRequiresReceiptOrKnownPreWriteRejection(t *testing.T) {
+	for _, test := range []struct {
+		name                            string
+		commitError                     error
+		hideReceipt                     bool
+		receiptStateOverrideAfterCommit TaskWorkspacePublishState
+		wantStatus                      AgentToolResultStatus
+		wantWaitingReason               string
+	}{
+		{
+			name:        "quota rejection without a receipt is agent recoverable",
+			commitError: domain.NewError(domain.CodeQuotaExceeded, "workspace quota rejected the publish before commit"),
+			hideReceipt: true,
+			wantStatus:  AgentToolFailed,
+		},
+		{
+			name:        "revision conflict without a receipt is agent recoverable",
+			commitError: domain.NewError(domain.CodeWorkspaceConflict, "workspace revision changed before commit"),
+			hideReceipt: true,
+			wantStatus:  AgentToolFailed,
+		},
+		{
+			name:                            "terminal quota receipt is agent recoverable",
+			commitError:                     errors.New("commit returned an error after quota rejection"),
+			receiptStateOverrideAfterCommit: TaskWorkspacePublishQuotaRejected,
+			wantStatus:                      AgentToolFailed,
+		},
+		{
+			name:                            "terminal conflict receipt is agent recoverable",
+			commitError:                     errors.New("commit returned an error after revision conflict"),
+			receiptStateOverrideAfterCommit: TaskWorkspacePublishConflict,
+			wantStatus:                      AgentToolFailed,
+		},
+		{
+			name:              "pending receipt remains unknown even for a business error",
+			commitError:       domain.NewError(domain.CodeQuotaExceeded, "workspace quota rejected the publish"),
+			wantStatus:        AgentToolUnknown,
+			wantWaitingReason: "tool_result_unknown",
+		},
+		{
+			name:              "infrastructure error without receipt remains unknown",
+			commitError:       errors.New("workspace database connection failed"),
+			hideReceipt:       true,
+			wantStatus:        AgentToolUnknown,
+			wantWaitingReason: "tool_result_unknown",
+		},
+		{
+			name:              "commit timeout without receipt remains unknown",
+			commitError:       context.DeadlineExceeded,
+			hideReceipt:       true,
+			wantStatus:        AgentToolUnknown,
+			wantWaitingReason: "tool_result_unknown",
+		},
+		{
+			name:              "unsupported publish store without receipt remains unknown",
+			commitError:       domain.NewError(domain.CodeUnsupported, "publish store is unavailable"),
+			hideReceipt:       true,
+			wantStatus:        AgentToolUnknown,
+			wantWaitingReason: "tool_result_unknown",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			_, store, broker, workspaceStore, current := newCloudDSHT08WorkspaceBroker(t)
+			call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-commit-error", cloudDSHWorkspaceWriteArguments{
+				ExpectedRevision: 0, Path: "reports/commit-error.txt", Content: "retry only after a known rejection",
+			})
+			first, err := broker.Execute(context.Background(), current, call)
+			if err != nil || first.Status != AgentToolNeedsUser {
+				t.Fatalf("initial Workspace write = %#v, err=%v; want approval", first, err)
+			}
+			resumed := resumeCloudDSHT08WorkspaceApproval(store, task.PendingRequestApproved, task.PendingDecisionApprove)
+			workspaceStore.commitReturnError = test.commitError
+			workspaceStore.receiptMissingAfterCommitError = test.hideReceipt
+			workspaceStore.receiptStateOverrideAfterCommit = test.receiptStateOverrideAfterCommit
+
+			result, err := broker.Reconcile(context.Background(), resumed, call, nil)
+			if err != nil || result.Status != test.wantStatus || workspaceStore.commitAttempts != 1 ||
+				workspaceStore.commits != 0 || workspaceStore.workspace.Revision != 0 {
+				t.Fatalf("Workspace commit error = %#v, err=%v; commits=%d attempts=%d revision=%d",
+					result, err, workspaceStore.commits, workspaceStore.commitAttempts, workspaceStore.workspace.Revision)
+			}
+			if test.wantWaitingReason != "" && (store.details.Task.Status != task.StatusWaitingUser ||
+				store.details.Task.WaitingReason != test.wantWaitingReason) {
+				t.Fatalf("unknown commit result did not pause for reconciliation: task=%#v", store.details.Task)
+			}
+		})
 	}
 }
 

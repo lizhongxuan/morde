@@ -1020,6 +1020,75 @@ func TestRuntimeToolExecutorPrepareRechecksAuthorizationFenceAndCapability(t *te
 	})
 }
 
+func TestRuntimeToolExecutorPrepareMarksOnlyScopedArgumentSchemaErrors(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "file.read", action: "read", result: `{"path":"README.md","text":"unused"}`,
+	}})
+
+	for name, arguments := range map[string]string{
+		"missing workspace id":   `{"path":"README.md"}`,
+		"malformed workspace id": `{"workspace_id":123,"path":"README.md"}`,
+		"invalid workspace id":   `{"workspace_id":"bad-id","path":"README.md"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			request := fixture.request(runtimeToolFileRead, arguments, identity.ScopeComputerObserve)
+			request.Call.Arguments = arguments
+			request.Arguments = json.RawMessage(arguments)
+			_, err := fixture.executor.Prepare(context.Background(), request)
+			var argumentError *runtimeToolArgumentValidationPreDispatchError
+			if !errors.As(err, &argumentError) || domain.CodeOf(err) != domain.CodeInvalidArgument {
+				t.Fatalf("Prepare() error = %v; want typed invalid-argument pre-dispatch error", err)
+			}
+		})
+	}
+
+	invalidRequest := fixture.request(runtimeToolFileRead, `{"workspace_id":"bad-id","path":"README.md"}`, identity.ScopeComputerObserve)
+	var argumentError *runtimeToolArgumentValidationPreDispatchError
+	invalidRequest.RequiredScope = identity.ScopeComputerOperate
+	if _, err := fixture.executor.Prepare(context.Background(), invalidRequest); err == nil || errors.As(err, &argumentError) {
+		t.Fatalf("Prepare(scope mismatch) error = %v; want ordinary request error", err)
+	}
+
+	unknownRequest := fixture.request("unknown-runtime-tool", `{"workspace_id":"bad-id"}`, identity.ScopeComputerObserve)
+	if _, err := fixture.executor.Prepare(context.Background(), unknownRequest); err == nil || errors.As(err, &argumentError) {
+		t.Fatalf("Prepare(unknown tool) error = %v; want ordinary request error", err)
+	}
+
+	fixture.authorizer.errors[identity.ScopeComputerObserve] = domain.NewError(domain.CodeForbidden, "private authorization detail")
+	deniedObserveRequest := fixture.request(runtimeToolFileRead, `{"path":"README.md"}`, identity.ScopeComputerObserve)
+	deniedObserveRequest.Arguments = json.RawMessage(`{"path":"README.md"}`)
+	if _, err := fixture.executor.Prepare(context.Background(), deniedObserveRequest); domain.CodeOf(err) != domain.CodeForbidden || errors.As(err, &argumentError) {
+		t.Fatalf("Prepare(invalid schema after observe revocation) error = %v; want untyped forbidden error", err)
+	}
+	if len(fixture.store.operations) != 0 || fixture.handlers["file.read"].calls.Load() != 0 {
+		t.Fatalf("observe-revoked invalid-schema request caused side effects: operations=%d dispatches=%d",
+			len(fixture.store.operations), fixture.handlers["file.read"].calls.Load())
+	}
+	validRequest := fixture.request(runtimeToolFileRead, `{"path":"README.md"}`, identity.ScopeComputerObserve)
+	if _, err := fixture.executor.Prepare(context.Background(), validRequest); domain.CodeOf(err) != domain.CodeForbidden || errors.As(err, &argumentError) {
+		t.Fatalf("Prepare(authorization failure) error = %v; want untyped forbidden error", err)
+	}
+}
+
+func TestRuntimeToolExecutorPrepareDoesNotClassifyInvalidSchemaAfterOperateRevocation(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "shell.exec", action: "run", result: `{"exit_code":0,"stdout":"unused","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
+	}})
+	fixture.authorizer.errors[identity.ScopeComputerOperate] = domain.NewError(domain.CodeForbidden, "operate scope revoked")
+	request := fixture.request(runtimeToolShellExec, `{"workspace_id":"bad-id","command":"id"}`, identity.ScopeComputerOperate)
+	request.Call.Arguments = string(request.Arguments)
+
+	_, err := fixture.executor.Prepare(context.Background(), request)
+	var argumentError *runtimeToolArgumentValidationPreDispatchError
+	if domain.CodeOf(err) != domain.CodeForbidden || errors.As(err, &argumentError) {
+		t.Fatalf("Prepare(invalid schema after operate revocation) error = %v; want untyped forbidden error", err)
+	}
+	if len(fixture.store.operations) != 0 || fixture.handlers["shell.exec"].calls.Load() != 0 {
+		t.Fatalf("revoked invalid-schema request caused side effects: operations=%d dispatches=%d",
+			len(fixture.store.operations), fixture.handlers["shell.exec"].calls.Load())
+	}
+}
+
 func TestRuntimeToolExecutorRejectsWorkspaceRevisionChangedAfterTaskSubmission(t *testing.T) {
 	t.Run("before preparation", func(t *testing.T) {
 		fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{

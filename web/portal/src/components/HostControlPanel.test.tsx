@@ -38,6 +38,21 @@ describe('HostControlPanel embedded lease recovery', () => {
     expect(setInterval).toHaveBeenCalledWith(expect.any(Function), 10_000);
   });
 
+  it('offers an inline retry after a transient control-status read failure', async () => {
+    vi.spyOn(portalApi, 'hostControl')
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue({ ...expiredLease, control_state: 'ai', control_lease_expires_at: null });
+    renderPanel();
+
+    const error = await screen.findByText(/无法读取控制权状态/);
+    const alert = error.closest('[role="alert"]')!;
+    expect(alert).toHaveClass('error-inline');
+    expect(document.querySelector('.error-notice-overlay .toast-notice')).toHaveTextContent('电脑控制状态读取失败');
+    fireEvent.click(screen.getByRole('button', { name: '重试读取' }));
+
+    expect(await screen.findByRole('button', { name: '接管控制权' })).toBeEnabled();
+  });
+
   it('keeps polling server status while the control action request is pending', async () => {
     const aiStatus: ControlStatus = {
       ...expiredLease, control_state: 'ai', control_version: 2,
@@ -65,7 +80,7 @@ describe('HostControlPanel embedded lease recovery', () => {
   it('lets the owner recover an expired lease by releasing it to AI', async () => {
     let status: ControlStatus = expiredLease;
     vi.spyOn(portalApi, 'hostControl').mockImplementation(async () => status);
-    const action = vi.spyOn(portalApi, 'hostControlAction').mockImplementation(async (_hostID, _request) => {
+    const action = vi.spyOn(portalApi, 'hostControlAction').mockImplementation(async () => {
       const result: ControlStatus = { host_id: host.id, control_state: 'ai', control_version: 5, control_actor_user_id: '',
         control_lease_expires_at: null, control_lease_active: false, control_lease_held_by_me: false, active_transition: null };
       status = result;

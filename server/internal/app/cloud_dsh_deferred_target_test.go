@@ -383,7 +383,7 @@ func TestDeferredComputerExplainsChangedBoundTarget(t *testing.T) {
 func TestDeferredWorkspaceWorksWithoutAComputerAndKeepsItsOriginalRevision(t *testing.T) {
 	fixture, base, broker, workspaceStore, original := newCloudDSHT08WorkspaceBroker(t)
 	deferred := &deferredWorkspaceBrokerTestStore{deferredBrokerTestStore: &deferredBrokerTestStore{
-		cloudDSHBrokerTaskStore: base, target: DeferredTaskTarget{HostID: "h1234567", WorkspaceID: original.WorkspaceID},
+		cloudDSHBrokerTaskStore: base, target: DeferredTaskTarget{WorkspaceID: original.WorkspaceID},
 	}, workspaceStore: workspaceStore}
 	fixture.executor.store, broker.store = deferred, deferred
 	base.details.Task.Authorization.Kind = string(identity.KindSession)
@@ -406,6 +406,35 @@ func TestDeferredWorkspaceWorksWithoutAComputerAndKeepsItsOriginalRevision(t *te
 	if err != nil || reason != "" || resolvedTask.InputRevision == nil || *resolvedTask.InputRevision != 0 ||
 		!strings.Contains(resolved.Arguments, `"expected_revision":0`) {
 		t.Fatalf("retry changed the original Workspace revision: call=%+v reason=%q err=%v", resolved, reason, err)
+	}
+}
+
+func TestDeferredWorkspaceDoesNotExposeOrExecuteForHostTarget(t *testing.T) {
+	fixture, base, broker, workspaceStore, original := newCloudDSHT08WorkspaceBroker(t)
+	deferred := &deferredWorkspaceBrokerTestStore{deferredBrokerTestStore: &deferredBrokerTestStore{
+		cloudDSHBrokerTaskStore: base, target: DeferredTaskTarget{HostID: "h1234567", WorkspaceID: original.WorkspaceID},
+	}, workspaceStore: workspaceStore}
+	fixture.executor.store, broker.store = deferred, deferred
+	base.details.Task.Authorization.Kind = string(identity.KindSession)
+	base.details.Task.WorkspaceID = ""
+	base.details.Task.InputRevision, base.details.Task.WorkspaceCheckpointRevision, base.details.Task.ContextDigest = nil, nil, nil
+	claimed := base.details.Task
+
+	definitions, err := broker.Definitions(context.Background(), claimed)
+	if err != nil || containsAgentTool(definitions, cloudDSHWorkspaceListToolName) ||
+		deferred.workspaceReads != 0 || deferred.workspaceBinds != 0 {
+		t.Fatalf("Host-targeted Task exposed or consulted Hostless Workspace: definitions=%+v reads=%d binds=%d err=%v",
+			definitions, deferred.workspaceReads, deferred.workspaceBinds, err)
+	}
+
+	result, err := broker.Execute(context.Background(), claimed, ModelToolCall{
+		CallID: "host-targeted-workspace-list", Name: cloudDSHWorkspaceListToolName,
+		Arguments: `{"expected_revision":-1}`,
+	})
+	if err != nil || result.Status != AgentToolFailed || !strings.Contains(result.Output, "cloud computer") ||
+		deferred.workspaceReads != 0 || deferred.workspaceBinds != 0 || base.details.Task.HostID != "" {
+		t.Fatalf("forged Hostless Workspace call was not returned as an Agent-visible failure: result=%+v reads=%d binds=%d task=%+v err=%v",
+			result, deferred.workspaceReads, deferred.workspaceBinds, base.details.Task, err)
 	}
 }
 

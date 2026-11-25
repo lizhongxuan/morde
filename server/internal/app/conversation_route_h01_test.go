@@ -122,16 +122,12 @@ func assertH09HistorySearchPolicy(t *testing.T, instructions string) {
 	if !strings.Contains(instructions, conversationRouteHistorySearchTaskInstructions) {
 		t.Fatalf("history search policy missing: %q", instructions)
 	}
-	const noInferenceRule = "never infer omitted details or present excerpts as complete"
-	if strings.Contains(strings.ToLower(conversationRouteHistorySearchTaskInstructions), noInferenceRule) {
-		if !strings.Contains(strings.ToLower(instructions), noInferenceRule) {
-			t.Fatalf("history search policy lost its no-inference rule: %q", instructions)
+	for _, policy := range []string{
+		"choose action \"new\"", "morde_current_conversation_history_search", "repeat/repost the original",
+		"unrelated self-contained questions may reply", "never infer missing details",
+	} {
+		if !strings.Contains(strings.ToLower(instructions), strings.ToLower(policy)) {
+			t.Fatalf("history search routing policy lost %q: %q", policy, instructions)
 		}
-		return
-	}
-	const legacyNoInferenceRule = "Do not infer omitted details or present excerpts as complete"
-	if !strings.Contains(instructions, legacyNoInferenceRule) ||
-		!strings.Contains(instructions, conversationRouteIncompleteHistoryInstructions) {
-		t.Fatalf("history search policy or its separate no-inference safeguard missing: %q", instructions)
 	}
 }

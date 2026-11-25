@@ -125,11 +125,12 @@ export function Sites() {
     <section aria-labelledby="site-create-title">
       <h2 id="site-create-title">创建私有站点</h2>
       <p className="muted">只能选择你拥有且正在运行的主机，以及已完整应用到该主机的工作区。</p>
-      {hosts.isError || workspaces.isError ? <FloatingError className="error-card" role="alert">
+      {(hosts.isError && !hosts.data) || (workspaces.isError && !workspaces.data) ? <FloatingError inline className="error-card" role="alert">
         无法读取主机或工作区绑定状态：{errorDetails(hosts.error ?? workspaces.error).message}
         <button type="button" className="button button-secondary" onClick={() => { void hosts.refetch(); void workspaces.refetch(); }}>重试</button>
-      </FloatingError> : hosts.isPending || workspaces.isPending ? <div className="loading-card" role="status">正在检查主机和工作区绑定…</div>
+      </FloatingError> : (hosts.isPending && !hosts.data) || (workspaces.isPending && !workspaces.data) ? <div className="loading-card" role="status">正在检查主机和工作区绑定…</div>
         : <form className="form-card form-stack" aria-label="创建私有站点" onSubmit={submitSite}>
+          {(hosts.isError || workspaces.isError) && <FloatingError inline className="error-card" role="alert">主机或工作区状态刷新失败，当前仍使用最近一次确认的数据。{errorDetails(hosts.error ?? workspaces.error).message}<button type="button" className="button button-secondary" onClick={() => { void hosts.refetch(); void workspaces.refetch(); }}>重试读取绑定</button></FloatingError>}
           {targets.length ? <>
             <label htmlFor="site-target">运行中的主机和已应用工作区</label>
             <select id="site-target" value={selectedTargetKeyValue} onChange={(event) => { setSelectedTargetKey(event.target.value); createSite.reset(); setCreatedSiteMessage(''); }}>
@@ -145,9 +146,11 @@ export function Sites() {
 
     <section aria-labelledby="sites-list-title">
       <h2 id="sites-list-title">我的站点</h2>
-      {sites.isPending ? <div className="loading-card" role="status">正在加载站点…</div>
-        : sites.isError && !sites.data ? <FloatingError className="error-card" role="alert">无法读取站点：{errorDetails(sites.error).message}<button type="button" className="button button-secondary" onClick={() => void sites.refetch()}>重试</button></FloatingError>
-          : !siteItems.length ? <div className="empty-card"><h3>还没有站点</h3><p>选择符合条件的主机和工作区后，可以创建一个私有站点。</p></div>
+      {sites.isPending && !sites.data ? <div className="loading-card" role="status">正在加载站点…</div>
+        : sites.isError && !sites.data ? <FloatingError inline className="error-card" role="alert">无法读取站点：{errorDetails(sites.error).message}<button type="button" className="button button-secondary" onClick={() => void sites.refetch()}>重试</button></FloatingError>
+          : <>
+            {sites.isError && sites.data && <FloatingError inline className="error-card" role="alert">站点列表刷新失败，当前仍显示最近一次确认的数据。{errorDetails(sites.error).message}<button type="button" className="button button-secondary" onClick={() => void (sites.isFetchNextPageError ? sites.fetchNextPage() : sites.refetch())}>重试</button></FloatingError>}
+            {!siteItems.length ? <div className="empty-card"><h3>还没有站点</h3><p>选择符合条件的主机和工作区后，可以创建一个私有站点。</p></div>
             : <>
               <div className="table-wrap"><table>
                 <thead><tr><th>站点 ID</th><th>主机</th><th>工作区</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead>
@@ -161,9 +164,10 @@ export function Sites() {
                 </tr>)}</tbody>
               </table></div>
               {!selectedSite && <p className="muted">选择一个站点查看或保存它的私有候选快照。</p>}
-              {sites.isFetchNextPageError && <FloatingError className="error-card" role="alert">加载更多站点失败：{errorDetails(sites.error).message}<button type="button" className="button button-secondary" onClick={() => void sites.fetchNextPage()}>重试</button></FloatingError>}
+              {sites.isFetchNextPageError && <FloatingError inline className="error-card" role="alert">加载更多站点失败：{errorDetails(sites.error).message}<button type="button" className="button button-secondary" onClick={() => void sites.fetchNextPage()}>重试</button></FloatingError>}
               {sites.hasNextPage && <button type="button" className="button button-secondary" disabled={sites.isFetchingNextPage} onClick={() => void sites.fetchNextPage()}>{sites.isFetchingNextPage ? '正在加载站点…' : '加载更多站点'}</button>}
             </>}
+          </>}
     </section>
 
     {selectedSite && <section aria-labelledby="site-releases-title">
@@ -175,15 +179,17 @@ export function Sites() {
         {!selectedSiteCanCreateCandidate && <p className="muted">主机或工作区绑定当前不可用，暂不能创建候选快照。</p>}
         <label htmlFor="site-service-port">服务端口（仅记录，不会启动服务）</label>
         <input id="site-service-port" type="number" min={1024} max={65535} step={1} value={servicePort} onChange={(event) => { setServicePort(event.target.value); createCandidate.reset(); }} />
-        {createCandidate.isError && <FloatingError className="error-inline" role="alert">创建候选快照失败：{errorDetails(createCandidate.error).message}</FloatingError>}
-        {materialize.isError && <FloatingError className="error-inline" role="alert">保存私有快照失败：{errorDetails(materialize.error).message}</FloatingError>}
+        {createCandidate.isError && <FloatingError inline className="error-inline" role="alert">创建候选快照失败：{errorDetails(createCandidate.error).message}</FloatingError>}
+        {materialize.isError && <FloatingError inline className="error-inline" role="alert">保存私有快照失败：{errorDetails(materialize.error).message}</FloatingError>}
         <div className="form-actions"><button type="submit" className="button button-primary" disabled={!selectedSiteCanCreateCandidate || selectedWorkspace.state !== 'ready' || selectedWorkspace.revision < 1 || !Number.isInteger(Number(servicePort)) || Number(servicePort) < 1024 || Number(servicePort) > 65535 || releases.isPending || (releases.isError && !releases.data) || releaseItems.some((release) => release.state === 'candidate') || createCandidate.isPending}>
           {createCandidate.isPending ? '正在创建…' : releaseItems.some((release) => release.state === 'candidate') ? '已有候选快照' : createCandidate.isError ? '重试创建候选快照' : '创建候选快照'}
         </button></div>
       </form> : <p className="muted">工作区信息暂不可用，无法创建新的候选快照。</p>}
-      {releases.isPending ? <div className="loading-card" role="status">正在加载版本记录…</div>
-        : releases.isError && !releases.data ? <FloatingError className="error-card" role="alert">无法读取版本记录：{errorDetails(releases.error).message}<button type="button" className="button button-secondary" onClick={() => void releases.refetch()}>重试</button></FloatingError>
-          : !releaseItems.length ? <div className="empty-card"><h3>还没有版本快照</h3><p>创建候选快照后，可以将指定工作区版本保存到私有存储。</p></div>
+      {releases.isPending && !releases.data ? <div className="loading-card" role="status">正在加载版本记录…</div>
+        : releases.isError && !releases.data ? <FloatingError inline className="error-card" role="alert">无法读取版本记录：{errorDetails(releases.error).message}<button type="button" className="button button-secondary" onClick={() => void releases.refetch()}>重试</button></FloatingError>
+          : <>
+            {releases.isError && releases.data && <FloatingError inline className="error-card" role="alert">版本记录刷新失败，当前仍显示最近一次确认的数据。{errorDetails(releases.error).message}<button type="button" className="button button-secondary" onClick={() => void (releases.isFetchNextPageError ? releases.fetchNextPage() : releases.refetch())}>重试</button></FloatingError>}
+            {!releaseItems.length ? <div className="empty-card"><h3>还没有版本快照</h3><p>创建候选快照后，可以将指定工作区版本保存到私有存储。</p></div>
             : <>
               <div className="table-wrap"><table>
                 <thead><tr><th>状态</th><th>工作区版本</th><th>快照大小</th><th>创建时间</th><th>保存时间</th><th>操作</th></tr></thead>
@@ -198,9 +204,10 @@ export function Sites() {
                     : release.materialized_at ? '私有快照已保存' : '—'}</td>
                 </tr>)}</tbody>
               </table></div>
-              {releases.isFetchNextPageError && <FloatingError className="error-card" role="alert">加载更多版本失败：{errorDetails(releases.error).message}<button type="button" className="button button-secondary" onClick={() => void releases.fetchNextPage()}>重试</button></FloatingError>}
+              {releases.isFetchNextPageError && <FloatingError inline className="error-card" role="alert">加载更多版本失败：{errorDetails(releases.error).message}<button type="button" className="button button-secondary" onClick={() => void releases.fetchNextPage()}>重试</button></FloatingError>}
               {releases.hasNextPage && <button type="button" className="button button-secondary" disabled={releases.isFetchingNextPage} onClick={() => void releases.fetchNextPage()}>{releases.isFetchingNextPage ? '正在加载版本…' : '加载更多版本'}</button>}
             </>}
+          </>}
     </section>}
   </section>;
 }

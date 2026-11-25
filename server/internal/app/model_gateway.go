@@ -710,7 +710,8 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			s.observeModelUsage(ModelCallSettlement{Source: call.Source, Unknown: true})
 			return ModelResponse{}, fmt.Errorf("settle project review model call: %w", settleErr)
 		}
-		if (call.Source == ModelCallCompaction || call.Source == ModelCallReview) && !projectCall {
+		if (call.Source == ModelCallTask && !settlement.Unknown ||
+			call.Source == ModelCallCompaction || call.Source == ModelCallReview) && !projectCall {
 			unknownCtx, cancelUnknown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancelUnknown()
 			unknownErr := s.store.SettleModelCall(unknownCtx, ModelCallSettlement{Source: call.Source, OwnerID: ownerID,

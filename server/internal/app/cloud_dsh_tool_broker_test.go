@@ -96,6 +96,304 @@ func TestTextRegenerationExposesNoDSHToolDefinitions(t *testing.T) {
 	}
 }
 
+func TestCloudDSHToolBrokerReturnsArgumentSchemaFailureToAgentBeforeOperationCreation(t *testing.T) {
+	for name, arguments := range map[string]string{
+		"missing workspace id":   `{"path":"README.md"}`,
+		"malformed workspace id": `{"workspace_id":123,"path":"README.md"}`,
+		"invalid workspace id":   `{"workspace_id":"bad-id","path":"README.md"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+				capability: "file.read", action: "read", result: `{"path":"README.md","text":"unused"}`,
+			}})
+			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+			fixture.executor.store = store
+			current := configureInvalidRuntimeToolTask(&store.details.Task)
+			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			call := invalidRuntimeToolCall(current, "call_invalid_workspace_args", runtimeToolFileRead, arguments)
+			result, err := broker.Execute(context.Background(), current, call)
+			if err != nil || result.Status != AgentToolFailed || result.Output != "The tool call was not executed because its arguments do not match the declared input format. Correct the arguments and try again." {
+				t.Fatalf("Execute() = %#v, %v; want sanitized argument failure for the Agent", result, err)
+			}
+			if strings.Contains(result.Output, "bad-id") || strings.Contains(result.Output, "private") {
+				t.Fatalf("raw argument detail escaped to the Agent: %q", result.Output)
+			}
+			if len(store.operations) != 0 || fixture.handlers["file.read"].calls.Load() != 0 {
+				t.Fatalf("invalid arguments created an operation or dispatched: operations=%d calls=%d", len(store.operations), fixture.handlers["file.read"].calls.Load())
+			}
+			if len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepFailed ||
+				store.details.Steps[0].Summary != "The tool arguments were invalid; the action was not executed." ||
+				store.details.Task.Usage.ToolCalls != 1 || store.details.Steps[0].AgentSessionID != call.TaskFence.AgentSessionID ||
+				store.details.Steps[0].ToolCallKey != call.CallID || store.details.Steps[0].FailureReason != "" ||
+				store.details.Steps[0].Retryable ||
+				!bytes.Equal(store.details.Steps[0].RequestDigest, cloudDSHInvalidRuntimeToolArgumentsDigest(call.Name, call.Arguments)) {
+				t.Fatalf("invalid argument step was not durably recorded: task=%#v steps=%#v", store.details.Task, store.details.Steps)
+			}
+		})
+	}
+}
+
+func TestCloudDSHToolBrokerReturnsInvalidRuntimeArgumentsIdempotently(t *testing.T) {
+	for name, arguments := range map[string]string{
+		"malformed object":      `{"workspace_id":"w1234567","path":"private-secret"`,
+		"array":                 `[]`,
+		"null":                  `null`,
+		"schema-invalid object": `{"workspace_id":"w1234567"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			broker, store, fixture, call := newInvalidRuntimeToolBroker(t, runtimeToolFileRead, arguments)
+
+			first, err := broker.Execute(context.Background(), store.details.Task, call)
+			if err != nil || first.Status != AgentToolFailed || first.Output != invalidRuntimeToolArgumentsResult {
+				t.Fatalf("Execute() = %#v, %v; want a sanitized pre-dispatch result for the Agent", first, err)
+			}
+			if len(store.operations) != 0 || fixture.handlers["file.read"].calls.Load() != 0 ||
+				store.details.Task.Usage.ToolCalls != 1 || len(store.details.Steps) != 1 {
+				t.Fatalf("invalid tool call changed execution/accounting: operations=%d handler_calls=%d usage=%+v steps=%+v",
+					len(store.operations), fixture.handlers["file.read"].calls.Load(), store.details.Task.Usage, store.details.Steps)
+			}
+			step := store.details.Steps[0]
+			if step.Status != task.StepFailed || step.Phase != "prepare" || step.FailureReason != "" ||
+				step.Retryable || step.AgentSessionID != call.TaskFence.AgentSessionID || step.ToolCallKey != call.CallID ||
+				!bytes.Equal(step.RequestDigest, cloudDSHInvalidRuntimeToolArgumentsDigest(call.Name, call.Arguments)) {
+				t.Fatalf("invalid argument step lacks exact non-retryable identity: %+v", step)
+			}
+			if operationHash, hashErr := agentOperationHash(call.Name, json.RawMessage(call.Arguments)); hashErr == nil &&
+				bytes.Equal(step.RequestDigest, operationHash[:]) {
+				t.Fatal("invalid-argument identity reused an executable operation hash")
+			}
+			if len(store.toolCalls) != 2 || store.toolCalls[1].FailureReason != "" || store.toolCalls[1].Retryable {
+				t.Fatalf("invalid argument progress violates Store failure evidence contract: %+v", store.toolCalls)
+			}
+			for _, event := range store.events {
+				if strings.Contains(string(event.Payload), "private-secret") || strings.Contains(string(event.Payload), "workspace_id") {
+					t.Fatalf("malformed raw arguments escaped into event payload: %s", event.Payload)
+				}
+			}
+			if !strings.Contains(string(store.events[len(store.events)-1].Payload), `"failure_reason":"invalid_tool_arguments"`) {
+				t.Fatalf("sanitized Task event omitted the argument failure classification: %s", store.events[len(store.events)-1].Payload)
+			}
+
+			checkpointOutput := dshToolResultText(first)
+			for _, checkpoint := range []*string{nil, &checkpointOutput} {
+				replayed, replayErr := broker.Reconcile(context.Background(), store.details.Task, call, checkpoint)
+				if replayErr != nil || replayed.Status != AgentToolFailed || replayed.Output != first.Output {
+					t.Fatalf("Reconcile(%v) = %#v, %v; want the same recorded pre-dispatch result", checkpoint != nil, replayed, replayErr)
+				}
+				if len(store.details.Steps) != 1 || store.details.Task.Usage.ToolCalls != 1 || len(store.toolCalls) != 2 {
+					t.Fatalf("replay duplicated step/accounting: steps=%d usage=%+v tool-call progress=%d",
+						len(store.details.Steps), store.details.Task.Usage, len(store.toolCalls))
+				}
+			}
+
+			wrongArguments := call
+			wrongArguments.Arguments = `[] `
+			if _, replayErr := broker.Reconcile(context.Background(), store.details.Task, wrongArguments, nil); domain.CodeOf(replayErr) != domain.CodeIdempotencyConflict {
+				t.Fatalf("Reconcile(reused CallID with changed raw input) error = %v; want idempotency conflict", replayErr)
+			}
+		})
+	}
+}
+
+func TestCloudDSHToolBrokerFailsClosedForInvalidRuntimeArguments(t *testing.T) {
+	t.Run("authorization denied", func(t *testing.T) {
+		broker, store, fixture, call := newInvalidRuntimeToolBroker(t, runtimeToolFileRead, `{"workspace_id":"w1234567"}`)
+		fixture.authorizer.errors[identity.ScopeComputerObserve] = domain.NewError(domain.CodeForbidden, "private authorization detail")
+
+		result, err := broker.Execute(context.Background(), store.details.Task, call)
+		if err == nil || result.Status == AgentToolFailed || domain.CodeOf(err) != domain.CodeForbidden {
+			t.Fatalf("Execute(authorization denied) = %#v, %v; want ordinary forbidden error, not Agent retry result", result, err)
+		}
+		if len(store.details.Steps) != 0 || store.details.Task.Usage.ToolCalls != 0 || len(store.operations) != 0 ||
+			fixture.handlers["file.read"].calls.Load() != 0 {
+			t.Fatalf("authorization failure was recorded or dispatched: steps=%+v usage=%+v operations=%d handler_calls=%d",
+				store.details.Steps, store.details.Task.Usage, len(store.operations), fixture.handlers["file.read"].calls.Load())
+		}
+	})
+
+	t.Run("scope not declared", func(t *testing.T) {
+		broker, store, fixture, call := newInvalidRuntimeToolBroker(t, runtimeToolShellExec, `{"cwd":123}`)
+		fixture.authorizer.errors[identity.ScopeComputerOperate] = domain.NewError(domain.CodeForbidden, "operate scope denied")
+
+		result, err := broker.Execute(context.Background(), store.details.Task, call)
+		if err == nil || result.Status == AgentToolFailed || domain.CodeOf(err) != domain.CodeForbidden {
+			t.Fatalf("Execute(scope denied) = %#v, %v; want ordinary forbidden error, not Agent retry result", result, err)
+		}
+		if len(store.details.Steps) != 0 || store.details.Task.Usage.ToolCalls != 0 || len(store.operations) != 0 ||
+			fixture.handlers["shell.exec"].calls.Load() != 0 {
+			t.Fatalf("scope failure was recorded or dispatched: steps=%+v usage=%+v operations=%d handler_calls=%d",
+				store.details.Steps, store.details.Task.Usage, len(store.operations), fixture.handlers["shell.exec"].calls.Load())
+		}
+	})
+
+	t.Run("existing operation", func(t *testing.T) {
+		broker, store, fixture, call := newInvalidRuntimeToolBroker(t, runtimeToolFileRead, `{"workspace_id":"w1234567"}`)
+		operationID, err := domain.NewOperationID()
+		if err != nil {
+			t.Fatal(err)
+		}
+		store.operations[agentOperationKey(call.CallID)] = task.Operation{ID: operationID, TaskID: store.details.Task.ID,
+			Key: agentOperationKey(call.CallID), HostID: store.details.Task.HostID}
+
+		result, err := broker.Execute(context.Background(), store.details.Task, call)
+		if err != nil || result.Status != AgentToolUnknown {
+			t.Fatalf("Execute(existing operation) = %#v, %v; want unknown result", result, err)
+		}
+		if len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepUnknown ||
+			store.details.Task.Usage.ToolCalls != 0 || fixture.handlers["file.read"].calls.Load() != 0 {
+			t.Fatalf("existing operation was retried/accounted as a new failure: steps=%+v usage=%+v handler_calls=%d",
+				store.details.Steps, store.details.Task.Usage, fixture.handlers["file.read"].calls.Load())
+		}
+	})
+
+	t.Run("operation lookup error", func(t *testing.T) {
+		fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+			capability: "file.read", action: "read", result: `{"path":"README.md","text":"unused"}`,
+		}})
+		base := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+		store := &cloudDSHOperationLookupErrorStore{cloudDSHBrokerTaskStore: base, lookupErr: errors.New("operation journal unavailable")}
+		fixture.executor.store = store
+		current := configureInvalidRuntimeToolTask(&base.details.Task)
+		broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		call := invalidRuntimeToolCall(current, "invalid-lookup-error", runtimeToolFileRead, `{"workspace_id":"w1234567"}`)
+
+		result, err := broker.Execute(context.Background(), current, call)
+		if err != nil || result.Status != AgentToolUnknown {
+			t.Fatalf("Execute(operation lookup error) = %#v, %v; want unknown result", result, err)
+		}
+		if len(base.details.Steps) != 1 || base.details.Steps[0].Status != task.StepUnknown ||
+			base.details.Task.Usage.ToolCalls != 0 || fixture.handlers["file.read"].calls.Load() != 0 {
+			t.Fatalf("operation lookup error was treated as retryable: steps=%+v usage=%+v handler_calls=%d",
+				base.details.Steps, base.details.Task.Usage, fixture.handlers["file.read"].calls.Load())
+		}
+	})
+
+	t.Run("checkpoint mismatch", func(t *testing.T) {
+		broker, store, fixture, call := newInvalidRuntimeToolBroker(t, runtimeToolFileRead, `{"workspace_id":"w1234567"}`)
+		first, err := broker.Execute(context.Background(), store.details.Task, call)
+		if err != nil || first.Status != AgentToolFailed {
+			t.Fatalf("initial Execute() = %#v, %v", first, err)
+		}
+		wrongOutput := dshToolResultText(AgentToolResult{Status: AgentToolFailed, Output: "different result"})
+
+		result, err := broker.Reconcile(context.Background(), store.details.Task, call, &wrongOutput)
+		if err != nil || result.Status != AgentToolUnknown || store.details.Steps[0].Status != task.StepUnknown ||
+			fixture.handlers["file.read"].calls.Load() != 0 || store.details.Task.Usage.ToolCalls != 1 {
+			t.Fatalf("Reconcile(mismatched checkpoint) = %#v, %v task=%+v steps=%+v", result, err, store.details.Task, store.details.Steps)
+		}
+	})
+
+	t.Run("missing task fence", func(t *testing.T) {
+		broker, store, fixture, call := newInvalidRuntimeToolBroker(t, runtimeToolFileRead, `{"workspace_id":"w1234567"}`)
+		call.TaskFence = nil
+
+		result, err := broker.Execute(context.Background(), store.details.Task, call)
+		if err == nil || result.Status == AgentToolFailed || len(store.details.Steps) != 0 || store.details.Task.Usage.ToolCalls != 0 ||
+			fixture.handlers["file.read"].calls.Load() != 0 {
+			t.Fatalf("Execute(missing fence) = %#v, %v steps=%+v usage=%+v", result, err, store.details.Steps, store.details.Task.Usage)
+		}
+	})
+}
+
+func newInvalidRuntimeToolBroker(t *testing.T, toolName, arguments string) (*CloudDSHToolBroker, *cloudDSHBrokerTaskStore,
+	*runtimeToolExecutorFixture, ModelToolCall) {
+	t.Helper()
+	capability, action := "file.read", "read"
+	if toolName == runtimeToolShellExec {
+		capability, action = "shell.exec", "run"
+	}
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: capability, action: action, result: `{"path":"README.md","text":"unused"}`,
+	}})
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	current := configureInvalidRuntimeToolTask(&store.details.Task)
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := invalidRuntimeToolCall(current, "invalid-"+toolName, toolName, arguments)
+	return broker, store, fixture, call
+}
+
+func configureInvalidRuntimeToolTask(current *task.Task) task.Task {
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-invalid-args", 1, "session-invalid-args"
+	current.Authorization.Version = 1
+	return *current
+}
+
+func invalidRuntimeToolCall(current task.Task, callID, name, arguments string) ModelToolCall {
+	return ModelToolCall{CallID: callID, Name: name, Arguments: arguments,
+		TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+			AuthorizationVersion: current.Authorization.Version}}
+}
+
+type cloudDSHOperationLookupErrorStore struct {
+	*cloudDSHBrokerTaskStore
+	lookupErr error
+}
+
+func (s *cloudDSHOperationLookupErrorStore) GetOperation(context.Context, string, string, string) (task.Operation, error) {
+	return task.Operation{}, s.lookupErr
+}
+
+func TestCloudDSHToolBrokerKeepsAuthorizationFailureOnOriginalPreparePath(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "file.read", action: "read", result: `{"path":"README.md","text":"unused"}`,
+	}})
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	fixture.executor.authorizer = &cloudDSHFailScopeCallAuthorizer{
+		scope: identity.ScopeComputerObserve, failOn: 2,
+		err: domain.NewError(domain.CodeForbidden, "private authorization detail"),
+	}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := broker.Execute(context.Background(), store.details.Task, ModelToolCall{
+		CallID: "call_read_denied", Name: runtimeToolFileRead, Arguments: `{"workspace_id":"w1234567","path":"README.md"}`,
+	})
+	if err != nil || result.Status != AgentToolFailed ||
+		result.Output != "The Host tool request was not executed because authorization or Host readiness could not be confirmed." {
+		t.Fatalf("authorization failure = %#v, %v; want existing generic pre-dispatch failure", result, err)
+	}
+	if strings.Contains(result.Output, "private authorization detail") || len(store.operations) != 0 ||
+		fixture.handlers["file.read"].calls.Load() != 0 || len(store.details.Steps) != 1 ||
+		store.details.Steps[0].Summary != "The Host tool request could not be prepared." {
+		t.Fatalf("authorization failure changed classification or dispatched: result=%#v operations=%d calls=%d steps=%#v",
+			result, len(store.operations), fixture.handlers["file.read"].calls.Load(), store.details.Steps)
+	}
+}
+
+type cloudDSHFailScopeCallAuthorizer struct {
+	scope  identity.Scope
+	failOn int
+	calls  int
+	err    error
+}
+
+func (a *cloudDSHFailScopeCallAuthorizer) AuthorizeTaskAction(_ context.Context, _ string, _ identity.Kind, _ string, _ string, _ []identity.Scope, scope identity.Scope) error {
+	if scope != a.scope {
+		return nil
+	}
+	a.calls++
+	if a.calls == a.failOn {
+		return a.err
+	}
+	return nil
+}
+
 type cloudDSHRecordCaptureStore struct {
 	taskStore       *cloudDSHBrokerTaskStore
 	calls           int

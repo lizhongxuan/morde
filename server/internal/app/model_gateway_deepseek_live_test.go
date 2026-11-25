@@ -263,6 +263,23 @@ func TestDeepSeekFlashDialogueThroughMordeModelGateway(t *testing.T) {
 			!routeStore.settlements[0].usage.Known || routeStore.settlements[0].decision.InvalidOutput {
 			t.Fatalf("long-history route usage was not durably settled: calls=%d settlements=%+v", routeStore.calls, routeStore.settlements)
 		}
+		selfContained := "请只回答数字：1+1等于几？"
+		directClaim := app.ConversationRouteClaim{Message: conversation.Message{ID: "m6789012", ConversationID: "c1234567",
+			OwnerID: principal.UserID, ActorID: principal.UserID, Role: conversation.RoleUser, Sequence: 3,
+			Content: selfContained}, ServiceInstanceID: "00000000-0000-4000-8000-000000000001", RouteAttempt: 1,
+			LeaseOwner: "deepseek-long-history-test", LeaseVersion: 1}
+		directDecision, err := routeGateway.ClassifyConversationRoute(ctx, directClaim, app.ConversationRouteContext{
+			ActorID: principal.UserID, ModelID: "p1234567", RouteAttempt: 1, Content: selfContained,
+			HistoryIncomplete: true,
+			History:           []app.ConversationRouteHistory{{MessageID: "m4567890", Sequence: 1, Role: conversation.RoleUser, Content: archiveText}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if directDecision.Action != app.ConversationRouteReply || strings.TrimSpace(directDecision.Reply) == "" || directDecision.InvalidOutput {
+			t.Fatalf("self-contained question was not answered directly with incomplete history: action=%q invalid=%t reply=%q output=%q",
+				directDecision.Action, directDecision.InvalidOutput, directDecision.Reply, directDecision.ModelOutput)
+		}
 
 		second := complete(t, app.ModelRequest{
 			Instructions: "只依据对话中完整的合成档案回答记录 0400 的 marker、value 和 checksum。用一行中文，包含 marker、value、checksum，不输出 JSON，不要猜测。",

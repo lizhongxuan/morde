@@ -1,7 +1,6 @@
 import { Fragment, useState } from 'react';
 import type { FormEvent } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
-import { isTransientNetworkError } from '../../api/errors';
 import { errorDetails, portalApi } from '../../app/api';
 import { formatDate } from '../../app/format';
 import { useNetworkReadNotice } from '../../app/use-network-read-notice';
@@ -31,9 +30,9 @@ function isConflict(error: unknown) {
   return value?.code === 'conflict' || value?.status === 409;
 }
 
-function ErrorCard({ error, retry }: { error: unknown; retry: () => void }) {
-  return <FloatingError className="error-card" role="alert">
-    {errorMessage(error)}
+function ErrorCard({ error, retry, stale = false }: { error: unknown; retry: () => void; stale?: boolean }) {
+  return <FloatingError inline className="error-card" role="alert">
+    {stale ? '刷新失败，当前显示最近一次确认的数据。' : ''}{errorMessage(error)}
     <button type="button" className="button button-secondary" onClick={retry}>重试</button>
   </FloatingError>;
 }
@@ -67,7 +66,7 @@ function RuleEditor({
 }) {
   if (confirming) return <div className="notice notice-warning" role="group" aria-label={`确认修改通知规则 ${rule.id}`}>
     <p>确认将规则 #{rule.id} 更新为账号数 {draft.threshold}、{draft.enabled ? '启用' : '停用'}？{draft.rearm ? '并重新武装规则。' : ''}</p>
-    {!!mutationError && <FloatingError className="error-inline" role="alert">{errorMessage(mutationError)}</FloatingError>}
+    {!!mutationError && <FloatingError inline className="error-inline" role="alert">{errorMessage(mutationError)}</FloatingError>}
     <div className="inline-actions"><button type="button" className="button button-secondary button-small" disabled={pending} onClick={onCancel}>取消</button><button type="button" className="button button-primary button-small" disabled={pending} onClick={onConfirm}>{pending ? '保存中…' : '确认保存'}</button></div>
   </div>;
 
@@ -78,8 +77,8 @@ function RuleEditor({
       <div className="connection-form-wide"><label htmlFor={`control-edit-note-${rule.id}`}>备注</label><input id={`control-edit-note-${rule.id}`} value={draft.note} onChange={(event) => setDraft({ ...draft, note: event.target.value })} /></div>
       {rule.last_fired_at && <label className="connection-form-wide"><input type="checkbox" checked={draft.rearm} onChange={(event) => setDraft({ ...draft, rearm: event.target.checked })} /> 重新武装此规则，允许它再次触发</label>}
     </div>
-    {validationError && <FloatingError>{validationError}</FloatingError>}
-    {!!mutationError && <FloatingError className="error-inline" role="alert">{errorMessage(mutationError)}</FloatingError>}
+    {validationError && <FloatingError inline>{validationError}</FloatingError>}
+    {!!mutationError && <FloatingError inline className="error-inline" role="alert">{errorMessage(mutationError)}</FloatingError>}
     <div className="form-actions"><button type="button" className="button button-secondary" onClick={onCancel}>取消</button><button type="submit" className="button button-primary">继续保存</button></div>
   </form>;
 }
@@ -88,7 +87,7 @@ export function AdminControls() {
   const client = useQueryClient();
   const queryKey = ['admin', 'controls'];
   const query = useQuery({ queryKey, queryFn: portalApi.adminControls });
-  const networkError = useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，通知规则暂时无法读取。');
+  useNetworkReadNotice([{ failed: query.isError, error: query.error, retry: query.refetch }], '网络异常，通知规则暂时无法读取。');
   const [createDraft, setCreateDraft] = useState({ threshold: '', note: '' });
   const [createConfirmation, setCreateConfirmation] = useState<CreateBody | null>(null);
   const [createError, setCreateError] = useState('');
@@ -205,11 +204,12 @@ export function AdminControls() {
   const changeDisabled = versionConflict || !data?.notify_configured || create.isPending || update.isPending || remove.isPending;
 
   return <section className="admin-content">
-    {versionConflict && <FloatingError className="error-card" role="alert">规则版本已变化。重新加载最新状态后，才能继续修改或删除。<button type="button" className="button button-secondary" onClick={() => void reloadAfterConflict()}>重新加载</button></FloatingError>}
+    {versionConflict && <FloatingError inline className="error-card" role="alert">规则版本已变化。重新加载最新状态后，才能继续修改或删除。<button type="button" className="button button-secondary" onClick={() => void reloadAfterConflict()}>重新加载</button></FloatingError>}
     {notice && <FloatingNotice className="notice-info">{notice}</FloatingNotice>}
 
-    {query.isPending || (networkError && !data) ? <div className="loading-card" role="status">正在加载通知规则…</div>
-      : query.isError && !isTransientNetworkError(query.error) ? <ErrorCard error={query.error} retry={() => void query.refetch()} />
+    {query.isError && data && <ErrorCard error={query.error} retry={() => void query.refetch()} stale />}
+    {query.isPending && !data ? <div className="loading-card" role="status">正在加载通知规则…</div>
+      : query.isError && !data ? <ErrorCard error={query.error} retry={() => void query.refetch()} />
         : data && <>
           <section className="admin-detail-section" aria-labelledby="admin-controls-summary-heading">
             <div className="design-panel-header"><div><h2 id="admin-controls-summary-heading">阈值通知概览</h2><p>所有通知只写入 Morde 本地接收箱，不会发送到外部服务。</p></div><button type="button" className="button button-secondary" disabled={query.isFetching} onClick={() => void query.refetch()}>{query.isFetching ? '正在刷新…' : '刷新数据'}</button></div>
@@ -229,8 +229,8 @@ export function AdminControls() {
                 <div><label htmlFor="admin-control-threshold">账号阈值</label><input id="admin-control-threshold" type="number" min={1} step={1} required value={createDraft.threshold} onChange={(event) => setCreateDraft({ ...createDraft, threshold: event.target.value })} /></div>
                 <div className="connection-form-wide"><label htmlFor="admin-control-note">备注</label><input id="admin-control-note" value={createDraft.note} onChange={(event) => setCreateDraft({ ...createDraft, note: event.target.value })} /></div>
               </div>
-              {createValidationError && <FloatingError>{createValidationError}</FloatingError>}
-              {createError && <FloatingError className="error-inline" role="alert">{createError}</FloatingError>}
+              {createValidationError && <FloatingError inline>{createValidationError}</FloatingError>}
+              {createError && <FloatingError inline className="error-inline" role="alert">{createError}</FloatingError>}
               <button type="submit" className="button button-primary" disabled={changeDisabled}>继续创建</button>
             </form>
             {createConfirmation && <div className="notice notice-warning" role="group" aria-label="确认创建通知规则">
@@ -252,7 +252,7 @@ export function AdminControls() {
                   {edit?.rule.id === rule.id && <tr><td colSpan={6}><RuleEditor rule={edit.rule} draft={edit.draft} setDraft={(draft) => setEdit({ ...edit, draft })} confirming={edit.confirming} pending={update.isPending} validationError={editValidationError} mutationError={update.error} onSubmit={submitEdit} onConfirm={confirmEdit} onCancel={() => { setEdit(null); update.reset(); }} /></td></tr>}
                   {deleteRule?.id === rule.id && <tr><td colSpan={6}><div className="notice notice-warning" role="group" aria-label={`确认删除通知规则 ${rule.id}`}>
                     <p>确认删除阈值为 {formatNumber(rule.threshold)} 的通知规则？此操作会阻止该规则后续触发。</p>
-                    {remove.isError && <FloatingError className="error-inline" role="alert">{errorMessage(remove.error)}</FloatingError>}
+                    {remove.isError && <FloatingError inline className="error-inline" role="alert">{errorMessage(remove.error)}</FloatingError>}
                     <div className="inline-actions"><button type="button" className="button button-secondary button-small" disabled={remove.isPending} onClick={() => { setDeleteRule(null); remove.reset(); }}>取消</button><button type="button" className="button button-danger-quiet button-small" disabled={changeDisabled} onClick={() => remove.mutate(rule)}>{remove.isPending ? '正在删除…' : '确认删除'}</button></div>
                   </div></td></tr>}
                 </Fragment>)}

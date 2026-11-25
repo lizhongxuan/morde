@@ -123,4 +123,21 @@ describe('admin usage and platform statistics', () => {
     expect(usage).toHaveBeenCalledTimes(2);
     expect(stats).toHaveBeenCalledTimes(2);
   });
+
+  it('keeps a transient usage failure retryable in its own section', async () => {
+    const user = userEvent.setup();
+    const usage = vi.spyOn(portalApi, 'adminUsage')
+      .mockRejectedValueOnce(new TypeError('Failed to fetch'))
+      .mockResolvedValue(usageData);
+    vi.spyOn(portalApi, 'adminStats').mockResolvedValue(statsData);
+    renderPage();
+
+    const usageSection = screen.getByRole('heading', { name: '平台模型用量' }).closest('section')!;
+    const alert = await within(usageSection).findByRole('alert');
+    expect(alert).toHaveTextContent('网络连接失败');
+    await user.click(within(alert).getByRole('button', { name: '重试' }));
+
+    expect(await within(usageSection).findByRole('cell', { name: 'model-a' })).toBeInTheDocument();
+    expect(usage).toHaveBeenCalledTimes(2);
+  });
 });

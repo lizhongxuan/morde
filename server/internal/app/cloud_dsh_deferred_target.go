@@ -88,6 +88,9 @@ func deferredWorkspaceToolDefinitions(authorization task.Authorization, liveDire
 
 func (b *CloudDSHToolBroker) prepareDeferredWorkspaceCall(ctx context.Context, claimed task.Task,
 	target DeferredTaskTarget, call ModelToolCall, recovering bool, checkpointOutput *string) (task.Task, ModelToolCall, string, error) {
+	if target.HostID != "" {
+		return task.Task{}, call, "", domain.NewError(domain.CodeForbidden, "Host-targeted tasks cannot bind the Hostless Workspace")
+	}
 	if (claimed.ProjectID == "" && claimed.OwnerID != claimed.InitiatorID) || target.WorkspaceID == "" || b.workspaceTools == nil {
 		return task.Task{}, call, "workspace_unavailable", nil
 	}

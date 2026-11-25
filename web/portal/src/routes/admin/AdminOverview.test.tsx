@@ -49,7 +49,7 @@ describe('admin overview', () => {
 
     expect(await screen.findByText('未就绪')).toBeInTheDocument();
     expect(screen.getByText('数据库暂不可用')).toBeInTheDocument();
-    expect(screen.getByText('0')).toBeInTheDocument();
+    expect(screen.getByText('在线安装数').closest('article')).toHaveTextContent('0');
     expect(screen.getByText('暂无 Host 状态数据。')).toBeInTheDocument();
     expect(screen.getByText('暂无 Agent 状态数据。')).toBeInTheDocument();
   });

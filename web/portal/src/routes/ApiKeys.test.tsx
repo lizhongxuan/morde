@@ -163,7 +163,7 @@ describe('ApiKeys', () => {
     expect(list).toHaveBeenCalledTimes(2);
   });
 
-  it('keeps confirmed key metadata visible after a transient refresh failure', async () => {
+  it('keeps confirmed key metadata visible and retryable after a transient refresh failure', async () => {
     const key = { id: 't1234567', name: '我的密钥', expires_at: '2027-10-22T08:00:00Z', last_used_at: null, revoked: false, created_at: '2026-10-22T08:00:00Z' };
     const list = vi.spyOn(portalApi, 'apiKeys')
       .mockResolvedValueOnce({ items: [key] } as Awaited<ReturnType<typeof portalApi.apiKeys>>)
@@ -174,11 +174,12 @@ describe('ApiKeys', () => {
 
     await client.invalidateQueries({ queryKey: ['apikeys'] });
 
-    const notice = await screen.findByRole('alert');
-    expect(notice).toHaveTextContent('API Key 列表连接失败');
-    expect(notice.closest('.design-panel')).toBeNull();
+    await screen.findByText(/API Key 列表刷新失败/);
+    expect(document.querySelector('.error-notice-overlay .toast-notice')).toHaveTextContent('API Key 列表连接失败');
     expect(screen.getByRole('article', { name: 'API Key 我的密钥' })).toBeInTheDocument();
-    await userEvent.setup().click(screen.getByRole('button', { name: '重试' }));
+    const pageError = screen.getAllByRole('alert').find((alert) => alert.closest('.design-panel'))!;
+    expect(pageError).toHaveTextContent('最近一次确认的数据');
+    await userEvent.setup().click(within(pageError).getByRole('button', { name: '重试' }));
     await waitFor(() => expect(list).toHaveBeenCalledTimes(3));
     await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
   });

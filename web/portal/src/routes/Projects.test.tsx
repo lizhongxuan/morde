@@ -161,7 +161,7 @@ describe('Projects API integration', () => {
     expect(link).toHaveAttribute('download');
   });
 
-  it('shows project acknowledgment and the processing bubble only while its Task is running', async () => {
+  it('shows one bottom thinking indicator only while its Task is running', async () => {
     const userMessage = { ...projectHistoryMessage, actor_id: teammate.user_id, task_id: 'qhistory1', agent_acknowledged: true };
     const progress = { ...projectHistoryMessage, id: 'mprogress1', sequence: 2, role: 'assistant' as const,
       task_id: 'qhistory1', content: '正在整理第一步', output_status: 'streaming' as const };
@@ -176,9 +176,8 @@ describe('Projects API integration', () => {
     renderProjects();
     await openProject();
 
-    const acknowledgment = await screen.findByRole('img', { name: '主 Agent 已接下，正在处理' });
-    expect(acknowledgment).toBeInTheDocument();
     const thinking = await screen.findByRole('status', { name: 'Morde 正在思考' });
+    expect(screen.getAllByRole('status', { name: 'Morde 正在思考' })).toHaveLength(1);
     expect(thinking.querySelectorAll('.thinking-dots span')).toHaveLength(3);
     expect(thinking).not.toHaveTextContent('思考中…');
     const userCard = screen.getByText(userMessage.content).closest('article');
@@ -260,12 +259,13 @@ describe('Projects API integration', () => {
       current_revision: 2, desired_revision: 3 };
     vi.mocked(projectApi.tasks).mockResolvedValue([mine]);
     vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([projectHistoryMessage]);
+    const taskAction = vi.spyOn(portalApi, 'taskAction');
     renderProjects();
     await openProject();
 
     expect(await screen.findByRole('article', { name: '项目对话消息' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '停止此任务' })).not.toBeInTheDocument();
-    expect(portalApi.taskAction).not.toHaveBeenCalled();
+    expect(taskAction).not.toHaveBeenCalled();
   });
 
   it('uses the typed project conversation routes and idempotency headers', async () => {

@@ -1616,6 +1616,12 @@ Tokenizer 与 token 统计来源：
 - **修复与回归：**在明确新任务回退上也要求 `ResultReview == nil`；扩展 `TestConversationRouteWorkerFallsBackToNewForExplicitSearchWithoutActiveTask`，直接验证结果复核上下文不会被搜索或显式重开意图抢走。定向测试通过；最新联合 `cd server && go test ./internal/app ./internal/worker -count=1` 通过（app 21.901 秒、worker 58.868 秒），`go test -race ./internal/app ./internal/worker -count=1` 通过（app 46.253 秒、worker 66.202 秒）。完整 `cd server && make test race cover` 通过，总覆盖率 45.2%；该次未设置 `CH_TEST_DATABASE_URL`，不能计作完整 DB 集成通过。`make lint` 仍报 32 项，均在本轮未修改路径，路由变更文件无 lint 报告。
 - **范围边界：**这是服务端本地自动化中的一条缺陷回归，不是实际用户 PC 复现；不关闭 R14，也不代表 10 条冒烟、54 条核心场景或真实 DSH/模型体验已完成。当前无隔离 PostgreSQL DSN，未运行 DB 集成测试。
 
+### R14 评测汇总基础（2026-11-25）
+
+- **实现：**新增 `server/internal/evaluation/summary.go` 的 `SummarizeRun`，在完整校验 suite 与 run 后生成描述性数据：P0/P1 样本量、准则/标签评分分布、P0 hard-gate 失败及 provider/model/prompt/skill/DSH/build/tool-permissions provenance。N/A 独立于适用分母；未记录的 latency/actual cost 显示 `not_recorded`，不估算总分或通过阈值。
+- **验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/evaluation -count=1` 通过；覆盖 N/A 不充当 pass、分层分母、P0 硬门禁、来源排序不改动输入，以及无效/不完整运行不产生部分报告。
+- **边界：**汇总器不运行模型或 Judge，不采集真实用户对话；此项不构成缺陷复现/修复闭环，不关闭 R14/M11-01–04，也不代表 10 条冒烟、54 条场景、实际 PC 或真实 DSH 通过。
+
 ### R21 8 KiB 字节/字符入口边界（2026-11-24）
 
 - **发现与修改：**未发现前端或服务端把 8 KiB 当成消息硬上限。`message-upload.ts` 用 UTF-8 字节决定 32 KiB 后是否分块上传，单条上限为 8 MiB；服务端直接消息限制为 32,768 字符，上传路径为有摘要校验的 16 KiB 分块。本轮只补充边界测试，不调高预算、不改上传限制。
@@ -1627,6 +1633,12 @@ Tokenizer 与 token 统计来源：
 - **环境：**为验证持久化路径，另启一次性 PostgreSQL 16 容器，端口仅绑定 `127.0.0.1`、无数据卷；没有连接现有 `morde-m09-verify-postgres`、`morde-local-postgres` 或其他会话容器。
 - **回归：**`CH_TEST_DATABASE_URL=<该容器 DSN> go test ./internal/store/postgres -run '^(TestConversationRoutePersistsAndRevalidatesLongMessagePageManifest|TestConversationRouteSnapshotBoundsCandidateSetsWithoutBlockingRouting|TestConversationRouteCreatesOneHostlessTaskAndRecordsRevisionIntent|TestConversationRouteStatusReadsTaskWithoutCreatingOrStopping|TestConversationMessageUploadPreservesLongTextAndIdempotency|TestConversationMessageReceiptIsAtomicAndScoped)$' -count=1 -timeout 10m` 通过，6/6；随后 `TestConversationMessageUploadHTTPProtocolPersistsAndReplays`、`TestReadCurrentConversationMessageChunkReconstructs200KiBSource`、`TestConversationMessageReceiptRollsBackWhenRouteReceiptFails` 定向组通过，3/3。
 - **边界：**覆盖持久化路由快照、长消息页清单、上传重放幂等、分块读回与收件回滚；不覆盖分类模型语义、真实 DSH、实际 PC 交互或全包 `make it`，不据此关闭 T45、T49 或 R00A。该容器会在本轮测试结束后停止并删除。
+
+### R00 实际源码 PC 登录隔离核对（2026-11-25）
+
+- **环境与结果：**运行 `MORDE_TEST_USER_DATA=/tmp/morde-pc-codex-muse-20261125 make pc`，Portal 与 Workbench 源码构建完成，Electron 使用当前工作树 `resources/morde.html` 启动；用户提供的测试服务/管理员登录成功，进入本地 PC 承载的 `/assistant`。
+- **阻塞与止损：**登录后服务端返回账号已有主会话及历史消息，证明临时客户端 userData 不隔离账号级远端对话。为避免混入或读取更多用户历史，本轮未发测试消息、未新建 Task、未上传文件；未操作或修改数据库/密码。停止了本轮源码 PC 进程并清理由本轮创建的临时 profile。需要独立测试账号或干净测试服务端数据，才能安全继续 PC 对话/任务验收。
+- **状态：**只确认当前源码客户端可启动并能登录；R19/R20/R21/R23 的 PC 交互与真实 DSH/模型验收仍阻塞。不能将此登录核对记为 Muse 体验通过。
 
 ### PCUX-04 原对话停止请求安全边界与 R20 服务端事务审计（2026-11-24）
 
@@ -1646,7 +1658,7 @@ Tokenizer 与 token 统计来源：
 
 - **R02 依赖审计：**跨 Task `dependency_task_ids` 已有 worker 领取门控，前置 Task 必须完成且具有当前 revision 与非空结果，依赖 Task 才能领取；本地 PostgreSQL 原测试 `TestConversationRouteTaskDependencyWaitsForAndReceivesExactResult` 验证了前置未完成时不领取、完成后收到准确结果。本轮又发现创建依赖时没有 Project ID 对齐检查。修复后候选读取限于当前 Project，事务插入前再次核对同一 Project。以一次性数据库重新运行 `CH_TEST_DATABASE_URL=<本机一次性 PostgreSQL DSN> go test ./internal/store/postgres -run '^(TestConversationRouteTaskDependencyWaitsForAndReceivesExactResult|TestConversationRouteRejectsDependencyOutsideProjectScope)$' -count=1` 通过，2/2；新测试使用两个合法 Project 会话，确认跨范围 Task 不进入当前候选、依赖请求冲突且不创建 Task。
 - **R02 未完成部分：**`PlanStep.depends_on` 目前只有结构验证和持久化，尚未绑定实际工具/子 Agent 调用身份与应用确认的完成证据，因此没有安全的派发门控；模型填写的 `PlanStep.Status` 不能当完成凭据。失败/取消/unknown 的前置 Task 会阻止领取，但依赖 Task 可能保持 queued，没有持久阻塞原因或用户可见恢复路径。单范围依赖门控通过不代表 T07 完整通过，PC/真实 DSH 仍未验收。
-- **R05 静态边界：**文件同步已有目录设备号/inode、授权和范围复核、固定默认 Host、点击触发、applied 回执基线及未知状态恢复。代码审计确认 Linux 路径原子操作不能阻止持有旧 inode 文件描述符的非协作 Host 写入；应用完成与 live baseline 采集也不是原子操作，预检后并发修改可能留下部分应用或错误基线。扩展属性、ACL、符号链接时间戳也未全部纳入比较。
+- **R05 静态边界：**文件同步已有目录设备号/inode、授权和范围复核、固定默认 Host、点击触发、applied 回执基线及未知状态恢复。代码审计确认 Linux 路径原子操作不能阻止持有旧 inode 文件描述符的非协作 Host 写入；Morde 自身同项目上传会话现由 PostgreSQL 锁串行化；Host 外部并发修改仍可能留下部分应用。后续 CAS 冲突不会推进 baseline。初始“错误基线”是风险假设，后续没有错误 baseline 的测试证据。扩展属性、ACL、符号链接时间戳也未全部纳入比较。
 - **R05 本轮本地回归：**`go test ./internal/app -run 'TestApplyLiveProjectUpload(PreservesConcurrentChanges|WritesSharedDirectory|MovesUnchangedRenamedFileInSharedDirectory)|TestProjectUpload(BaselineComesFromHostConfirmedSourceNotWorkspaceRevision|DestinationConflictAllowsEmptyRegisteredRoot)' -count=1` 通过，5 项；另在临时 PostgreSQL 上执行 `TestAgentWorkspaceProjectUploadCommitsDirectlyWithoutMaterialization`，1/1 通过。R02/R05 联合 PostgreSQL 定向组（下方列出）共 16/16 通过，其中包含 6 项项目上传/冲突用例。它们使用合成数据库、临时目录和本地测试替身；不是完整 T16–T18，不能证明实际 PC 或真实云端同步。实际文件传输受本轮本地数据限制继续阻塞。
 - **本轮实际数据库命令：**`CH_TEST_DATABASE_URL=<本机一次性 PostgreSQL DSN> go test ./internal/store/postgres -run '^(TestPostgresTaskSubmissionAndMessageReceiptReplay|TestPostgresConcurrentMessageReceiptReplaySurvivesTaskStateChange|TestConversationRouteTaskDependencyWaitsForAndReceivesExactResult|TestConversationRouteRejectsDependencyOutsideProjectScope|TestConversationRouteSteersOnlySafeRunningTaskSupplement|TestConversationResultAggregationConcurrentRevisionCannotPublishOldResult|TestConversationResultAggregationQueuesSingleAndPreservesStream|TestPostgresTaskStopSettlesToolActivitiesWithoutAssumingUnknownResults|TestPostgresTaskLeaseFencesOperationAndRecoversUnknown|TestPostgresTaskValidationEvidenceIsRevisionBoundAndTransactional|TestWorkspaceProjectUploadUsesInstallationCredentialWithoutSyncthingBinding|TestWorkspaceProjectUploadPreservesRemotelyModifiedFileWhenLocalSnapshotDeletes|TestWorkspaceProjectUploadReceiptRejectsConcurrentBaselineAdvance|TestProjectUploadConflictDoesNotApplyNonconflictingMutations|TestWorkspaceProjectUploadConflictsWhenBindingVersionChanges|TestFirstProjectUploadConflictsWithExistingDestinationWithoutTransfer)$' -count=1 -timeout=10m`：通过，16/16；另单独重跑 `TestConversationRouteRejectsDependencyOutsideProjectScope` 和 `TestAgentWorkspaceProjectUploadCommitsDirectlyWithoutMaterialization`，各 1/1 通过。
 - **方案状态同步：**一体化 TODO 将 R02/R05 改为“部分实现/待验收”，T07、T16–T18 记录本轮覆盖范围；02 与 04 分步 TODO、总大纲及流程图同步列出依赖证据、竞态和缺口。未改 schema、迁移或远端服务。
@@ -1749,4 +1761,257 @@ Tokenizer 与 token 统计来源：
 - **实现：**停止/停止全部由路由 Agent 的结构化决策确定。新增 `ValidConversationRouteStopDecision`，在 Worker 接受结果、PostgreSQL 应用动作和已保存决策重放时，要求模型原始输出与最终动作、目标和修订一致；输出缺失、不匹配、截断正文、附件、复核或不完整候选等上下文拒绝停止。分类失败不走关键词停止兜底；服务端现有用户归属、状态、修订、授权、账本栅栏、幂等与批量上限继续执行。
 - **自动化：**`go test ./internal/app ./internal/worker -run '^TestConversationRoute' -count=1` 通过；定向 Worker 回归及隔离 PostgreSQL 组（`TestPostgresConversationRouteStopAllRequiresAgentDecision`、`TestConversationRouteStopIsAuthorizedAndLeavesSiblingAlone`、`TestPostgresConversationRouteStopAfterWindowBeforeTaskCreation`、`TestPostgresConversationRouteStopRequiresControlScope`）通过。覆盖明确模型决策、模型输出缺失/不一致时拒绝停止及跨用户隔离；`gofmt -d` 和相关改动 `git diff --check` 无差异。
 - **实际 PC 观察：**通过 `make pc` 启动的源码客户端连接 loopback 合成服务，发送本地合成工作请求，再在原对话用“结束我的全部活动工作”表达停止；页面显示 Agent 回执“已向你发起的 1 个活动任务提交停止请求”，没有显示任务停止按钮。合成模型对该句返回预置 `stop_all`，所以这只验证 PC → 路由 → 服务端回执链路，不能证明真实模型语义或 Agent 已最终停止任务。
-- **未通过/阻塞：**同一浏览器验收进程因未在客户端交互后写入测试夹具要求的 `finish` 信号而在 5 分钟超时；该进程不计自动化通过。未验证 0/257 个活动任务、完整相似目标/引用/否定矩阵、实际 DSH/真实模型语义、任务最终停止状态、断线和重复提交。M02-12 与 T51 保持未验收。
+- **未通过/阻塞：**首轮浏览器验收进程因未在客户端交互后写入测试夹具要求的 `finish` 信号而在 5 分钟超时，不计自动化通过。后续重跑未能启动 PC：`make pc` 的 Portal TypeScript 检查报 `Assistant.test.tsx:2681–2682` 两处 `HTMLElement | null` 类型错误；该并行 UI 测试文件未在本任务中修改。未验证 0/257 个活动任务、完整相似目标/引用/否定矩阵、实际 DSH/真实模型语义、任务最终停止状态、断线和重复提交。M02-12 与 T51 保持未验收。
+
+### PCUX-08 实际源码 PC 的气泡与普通对话核验（2026-11-24）
+
+- **环境：**`MORDE_TEST_USER_DATA=/tmp/morde-pc-codex-20261124 make pc` 从当前工作树启动源码版 `morde-pc`，Portal/Workbench/桌面 TypeScript 构建完成。仅使用用户指定测试服务的现有测试账号；没有用会话中的模型 API key、上传文件、打开普通用户 Web、读取旧消息做测试或修改远端代码/数据库。PC 在 SIGINT 后正常退出，这是测试结束操作，不是构建失败。
+- **交互结果：**在新旁聊发送合成短消息，真实服务返回指定文本；AX 显示处理中只有一个 `Morde 正在思考`。消息气泡默认没有脚注；鼠标移入 AI 回复后，AX 新增回复时间和复制按钮，截图显示时间与复制图标；鼠标移开后截图恢复为空白脚注。该结果验证当前客户端上的普通对话和悬停表现，不代表服务端版本与本地代码一致。
+- **失败观察：**随后发送只读复杂调研请求；用户消息正常显示，思考指示曾出现并消失，之后没有助手最终答复或可见失败原因。未继续打开任务侧栏或对旧对话/任务做检查。远端服务代码版本未知，且未部署当前工作区变更，因此不能据此归因本地路由/Agent-first 代码；该实际服务体验也不能记为成功完成任务。
+- **结论：**T51 的思考指示与气泡 hover 展示局部通过；自然语言停止、任务动态无控件、审批双入口、长消息和 Agent-first 终态说明均未在本轮实际 PC 验收。T45/T49/T50/T51/T52/T55 继续按各自真实服务/本地层级分别记录，PCUX-08 不关闭任何总项。
+
+### R20-AUDIT-02 终态说明与 Agent-first 恢复合同核查（2026-11-24）
+
+- **事实来源：**`task_events` 的 `(task_id, sequence)` 可用于终态事件去重，但既有终态记录允许 `task_revision` 为空；不可默认失败事件已绑定版本。取消说明只能在 `CompleteTaskStop` 确认 Agent 已停止、未决操作对账完成并写入最终取消事件后排队。普通非终态工具错误已有 DSH `tool_result` 路径返回同一 Agent；终态失败、Agent/模型崩溃后的 durable 用户说明不存在。
+- **不可复用：**成功结果聚合和验证 outbox 都绑定 `completed` 或验证 claim；steer 投递 outbox 的方向是向 Agent 投消息。ModelGateway 当前 source 与活跃 lease/checkpoint 或成功 review claim 绑定，缺终态调用所需的幂等 call ID、预算归属和崩溃恢复合同。若需区分 Agent 说明与事实回退，消息 DTO/OpenAPI 还需纳入来源字段。
+- **结论：**`server/AGENTS.md` 指定的 `docs/实施/00-总览与公共约定.md` 在工作树与 HEAD 均缺失；当前只能准备 R20 合同和实现边界，不新增 migration、outbox、Worker、API 或内存队列。测试未运行，R20/T47–T48/T55 保持未完成；详见一体化 TODO 的 R20。
+
+### R19/M02 路由语义与 PC Portal 恢复回归（2026-11-25）
+
+- **实现：**会话路由使用 Agent 返回的结构化动作，不再用自然语言关键词列表覆写任务创建、控制、停止或续接决策。分类不可用、无效或结果不完整时安全澄清。应用与存储只保留身份、权限、候选完整性、状态/修订、项目范围、幂等和只读工具白名单等确定性校验。文件交付意图作为结构化模型字段随 `new/update` 决策存储；修订 worker 从当前 attempt 对应的已结算 route decision 读取并校验 Task/revision。未新增 migration 或公开 API/DTO。删除了不再使用的 `RoutedFileDeliveryDirective` 关键词推断函数及其测试。直接 Task、计划和 Broker 等非会话路由入口仍有 `ClassifyFileDeliveryIntent` 调用，未包含在本次语义迁移中。
+- **服务端验证：**`GOPROXY=off GOSUMDB=off go test ./... -count=1` 退出码 0，40 个含测试的 Go package 通过；`go test -race ./internal/app ./internal/worker -count=1` 通过。全包命令未设置 `CH_TEST_DATABASE_URL`，因此其中 PostgreSQL 条件集成用例未运行。另在仅 loopback 的临时 PostgreSQL 上运行 `go test -v ./internal/store/postgres -run 'TestStoredRouteFileDeliveryIntentIsLimitedToNewAndCurrentUpdate|TestConversationRouteNewTaskUsesStructuredFileDeliveryIntent|TestConversationRouteRevisionReadsStructuredFileDeliveryDecision|TestConversationRouteCreatesOneHostlessTaskAndRecordsRevisionIntent' -count=1`；4 个顶层用例、13 个子用例全部通过，没有跳过。
+- **Portal 验证：**全量测试 888/888 通过；定向测试 191/191、`npm run typecheck` 和 `npm run build:pc` 通过。构建有 Vite 大资源包提示。未在浏览器或远端服务执行交互测试。
+- **实际 PC 边界：**通过 `MORDE_TEST_USER_DATA=/tmp/morde-pc-codex-20261124-parallel make pc` 启动源码 PC，但客户端仍恢复到已有主会话；本轮未发送消息、打开任务详情或修改任务，随后停止应用。故本轮没有完成 PC 交互验收，不能证明当前本地路由代码在实际 PC/真实 DSH/模型下的体验。
+- **未完成与环境：**真实 Provider 语义、PC + 当前工作区 DSH、自然语言复杂任务/停止体验、跨端和 R20 Agent-first 终态说明均未验证；`docs/实施/00-总览与公共约定.md` 缺失仍阻塞 R20 数据/API 合同。未访问会话提供的远端站点、未使用会话中的 API 密钥、未改远端数据库或代码、未发送文件或外部消息。R19/T45–T46 保持部分通过/阻塞。
+
+### R23 对话澄清卡与消息气泡回归（2026-11-25）
+
+- **实现：**待答澄清在关联用户消息之后显示为左侧独立 Morde assistant 行，不属于任何消息气泡；复用 `answerTaskInput` 现有接口字段 `clarification_id`、`clarification_version`、`answer` 和 `taskActionKey` 幂等键。提交成功后显示等待任务状态更新，403/404 撤权在卡片中显示并清除任务缓存。任务动态只保留只读澄清问题。附件链接留在用户气泡中；消息版本和恢复控件折叠在输入框上方；思考指示聚合为当前对话底部一个；AI 回复时间/复制仅 hover/focus 可见，所有消息气泡下默认无按钮或状态提示。
+- **验证：**`cd web/portal && npm test -- --run src/routes/Assistant.test.tsx` 通过（237/237）；审批组件 `npm test -- --run src/components/TaskApprovalCard.test.tsx src/components/TaskApprovalMcpApp.integration.test.ts` 通过（2 files / 8 tests）；`npm run typecheck` 与 `npm run build:pc` 通过；Assistant、审批卡及 MCP App integration 三文件联合回归为 245/245；Worker `GOPROXY=off GOSUMDB=off go test ./internal/worker -run 'TestCloudDSHExecutorReturnsDefinitiveToolFailureToSameAgent|TestCloudDSHExecutorRunsAuthorizedToolAndReturnsDurableResultToNextModelCall|TestCloudDSHExecutorStopsAfterDurableTerminalToolAttempt' -count=1` 通过（3/3），加入回归后完整 `go test ./internal/app ./internal/worker -count=1` 两包均通过；`git diff --check` 通过。PC build 有现存大资源包提示。
+- **Lint 与边界：**对 Assistant、相关测试和审批 MCP App integration 执行定向 ESLint，退出码 1；只报告 `Assistant.tsx` 未改动布局代码里的 5 项 render 阶段 ref 读取错误和 1 项 Hook 依赖警告，新增测试文件无诊断。没有启动或操作实际 `morde-pc`，也没有连本地隔离 Portal/DSH 服务；mock 仅证明 UI/API 请求合同和状态，不证明真实服务端审批/澄清效果、真实模型语义或最终停止状态。R23/T51 保持未完成。
+
+### R21 长初始消息投递源码审计（2026-11-25）
+
+- **源码路径：**Portal 与服务端收件支持最大 8 MiB 上传，按 16 KiB 分块；Postgres `PendingMessages` 仍返回完整原始消息。`cloud_dsh_session_tree.go` 首轮将其作为 `initial_message`，Worker 与 Runtime 都限制单条输入不超过 128 KiB。因此 128 KiB–8 MiB 的可上传消息即使已上传并生成 route source manifest，Task 首轮仍会失败；T50 的 1 MiB 正向场景受影响。普通 revision/steer 也有 128 KiB 帧边界。
+- **修复约束：**不能直接把 Worker/Runtime 上限提高到 8 MiB，否则会将全文塞进模型上下文并违背已有长文 source manifest、按需读取和预算边界。修复需设计 manifest/hash 绑定的短指针帧，并一并校验 message identity、delivery applied ledger、checkpoint 内容匹配和重启恢复去重；本轮未改跨层协议代码。
+- **验证状态：**只完成源码审计，没有可用 PC + DSH 隔离服务，未端到端复现，也未运行真实模型。已有 200 KiB 上传、1 MiB source manifest/工具读取和 36 KiB Runtime 受控正文测试分别覆盖局部层，不能证明 1 MiB 初始 Task 投递。R21/T50 继续阻塞。
+
+### R24 工作项失败摘要优先级回归（2026-11-25）
+
+- **复现与修复：**当工作项 `status=failed` 且 `failure_reason` 已含可核实原因时，`summary` 若只是通用 “The task failed …” 文本，旧逻辑会先按 summary 映射为“详细原因暂不可用”，把结构化原因隐藏。现在已知失败原因优先展示；`failure_reason` 缺失时仍使用既有模型错误摘要映射，不把模型不可用误报为其他具体失败。
+- **验证：**Assistant 定向回归 237/237，新增冲突场景断言结构化原因优先；Assistant、审批卡及 MCP App integration 三文件联合回归 245/245；Portal typecheck、`npm run build:pc` 通过，构建仍提示有大资源包。实际 PC/DSH 工作项来源、真实工具账本一致性和端到端任务结果仍未验收。
+
+
+### R19/R20 Worker 安全恢复与意图分类边界复核（2026-11-25）
+
+- **Worker 回归：**新增 `TestCloudDSHExecutorLetsSameAgentRecoverFromDefinitiveReadFailure` 与 `TestCloudDSHExecutorKeepsUnknownReadOutcomeDistinctFromDefinitiveFailure`。固定模型 fixture 让同一 DSH Session 收到确定的只读失败，再选择一个授权只读搜索动作，Task 完成且原失败项保留；unknown 返回结构化 `operation_outcome_unknown` 诊断并停止，不转换成普通失败、不重派。
+- **验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app ./internal/worker -count=1` 通过；app 22.250 秒，worker 61.936 秒。`gofmt -d internal/worker/cloud_dsh_executor_error_recovery_test.go` 无差异；全仓 `git diff --check` 本轮结束前复跑。另定向 Portal 3 文件 245/245、typecheck、PC build 先前通过；本条没有重跑 Portal 或实际 PC。
+- **语义决策边界：**代码写死的关键词/正则不适合作为自然语言意图的最终裁决；当前会话路由已由 Agent/模型输出结构化动作与文件意图。身份、授权、项目/Host/Workspace 范围、预算、状态/修订、幂等、工具白名单和 unknown 对账必须继续由确定性代码执行。审计发现直接 Task/批次、澄清回答、hostless schedule、Broker 的无效意图回退、Postgres 对缺失/非法字段的默认值仍使用文本分类器；已登记为 R19-A/M02-13，明确不改变 R19 会话路由新 Task 缺省 `none`、update 缺省继承规则，暂不改跨层接口，因为权威合同文件 `docs/实施/00-总览与公共约定.md` 缺失。conversation route 的两条兜底日志已由“heuristic fallback”更名为“requesting safe clarification”，行为未改。
+- **R19-A 接口边界补充（2026-11-25）：**`SubmitTaskCommand`、HTTP `submitTaskRequest` 与 OpenAPI `SubmitTaskRequest` 没有 `file_delivery_intent` 字段，`TaskService.Submit` 当前按 Task/批次正文推断，用户对澄清的短回答由 `clarifiedFileDeliveryIntent` 推断；对应请求哈希也未绑定结构化意图。hostless schedule 和 Postgres 的缺失字段归一化是另外的文本判断入口。删掉分类器而不补跨层字段可能改变交付和能力判定，故未做生产改动。合同恢复前仅保留路由语义由 Agent 结构化给出，并要求代码继续硬校验权限、授权、作用域、预算、幂等和结果对账。
+- **限制：**固定模型 fixture 不证明真实模型能做合适的修复选择；没有实际 PC、隔离 DSH/真实模型或跨端验收。T55/M09-07 仍不通过；R19-A 未实施。
+- **Agent-first 边界补充：**当前新增回归让 Broker 以明确的 `AgentToolResult.Status=failed` 返回确定只读失败，因此该事实进入同一 DSH Session 的下一轮模型请求。`cloud_dsh_session_tree.go` 对 `Tools.Execute` 返回 Go `error` 的分支仍生成 `tool_executor_error`（dispatch 为 unknown）并终止执行，未将其发给 Agent；接口尚不能证明这些错误均未产生副作用。后续需结构化区分可恢复的确定失败与结果未知：前者交给 Agent 安全尝试，后者先按原调用身份对账，不得换工具重试。本轮未改该生产边界或增加运行逻辑。
+- **普通执行错误回归（2026-11-25）：**新增独立 Worker 测试 `TestCloudDSHExecutorKeepsRawToolErrorUnknownWithoutRetry`，用普通 Go `error` 触发 `Tools.Execute` 返回分支，核对诊断仍为 `tool_executor_error` / `dispatch=unknown`，只发起一次模型请求和一次工具调用，Worker 停止且不完成 Task。`GOPROXY=off GOSUMDB=off go test ./internal/worker -run '^TestCloudDSHExecutorKeepsRawToolErrorUnknownWithoutRetry$' -count=1` 通过；`gofmt -d`、该文件的 `git diff --check` 通过。该测试确认 unknown 不会因补 Agent-first 需求而被误降级/重放；普通 Go error 尚未发送给 Agent，确定失败分类与 R20 持久自然语言终态仍未实现。
+- **包级回归：**集成新增测试后执行 `GOPROXY=off GOSUMDB=off go test ./internal/worker ./internal/app -count=1`，worker（63.3 秒）与 app（22.0 秒）均通过。未设置 `CH_TEST_DATABASE_URL`，该结果不包含条件 PostgreSQL 集成验收。
+
+### R02 PlanStep 与 R21 长初始消息跨层合同审计（2026-11-25）
+
+- **R02 现状证据：**`domain/task/plan.go:Plan.Validate` 检查计划结构、ID、状态值和循环依赖；`app/cloud_dsh_task_plan.go:executeTaskPlan` 保存模型提供的计划并记录计划更新事件；Postgres 校验身份、授权、修订、调用及请求摘要，但没有将 `plan_step_id` 绑定到实际工具调用/子 Agent 派发及最终结算。因此模型填写 `PlanStep.Status=completed` 不是执行证据，当前不可用作解锁门禁。可靠实现须持久关联 `(plan_revision, plan_step_id)`、调用身份和应用确认的最终成功结算；失败、取消、unknown、过期修订或缺证据一律不解锁，独立兄弟步骤仍可运行。
+- **R21 现状证据：**Portal/上传链路最大 8 MiB、16 KiB 分块；Postgres `PendingMessages` 返回完整正文，`cloud_dsh_session_tree.go` 将其作为 `initial_message`；Worker 和 Runtime 的单消息明文上限均为 128 KiB。已有 source manifest 支持运行后的授权原文搜索/分页读取，不代表可作为首轮投递指针。delivery ledger 记录消息身份、mode、enqueue/claim；checkpoint 对同一 message identity 仍精确比较原文、附件和 mode，Worker 去重指纹也含正文。因此不能用短提示覆盖同一 message ID 后假定恢复幂等；必须分别绑定原文哈希和 manifest 指针指纹，并校验 checkpoint、delivery applied 和重启/unknown 对账。
+- **开发阻塞：**`server/AGENTS.md` 要求跨服务端状态/接口合同改动同步权威公共合同文件；`docs/实施/00-总览与公共约定.md` 在工作树与 HEAD 均缺失，现有约束不允许恢复已删除文档。本审计未改 schema、API、Worker/Runtime frame 或迁移，也未运行新的端到端测试。R02/M02-14 与 R21/T50 均保持未完成；具体实施验收已同步至步骤 02、10 TODO。
+- **验证边界：**只读源码核查与本轮文档 diff 检查，不是运行测试。已有 Worker error-recovery 单测、36 KiB Runtime 受控模型、200 KiB 上传和 1 MiB manifest/工具读取各自只覆盖局部层；不能替代计划步骤证据门控、128 KiB 以上首轮投递、真实 PC + DSH/模型或首/中/尾语义验收。
+
+### R23 Assistant 布局 lint 修复（2026-11-25）
+
+- **修改：**render 期不再读取 layout DOM ref；侧栏/工作区分隔条 ARIA 测量值由 `useLayoutEffect`、`ResizeObserver` 与 window resize 更新为 React state，鼠标/键盘拖动仍在事件处理时读取实际几何。Escape 关闭任务面板的 effect 依赖补齐。
+- **验证：**`cd web/portal && npx eslint src/routes/Assistant.tsx` 通过；`npm run typecheck` 通过；`npx vitest run src/routes/Assistant.test.tsx` 通过（237/237）；`npm run build:pc` 通过（Vite 提示现有大 chunk）；针对组件与测试文件的 `git diff --check` 通过。未启动实际 PC；因当前本地隔离 Portal/DSH 服务不可用且禁止连接外部服务，布局交互没有在实际 `morde-pc` 中复验。
+
+### R12 DSH 重复工具调用提醒接入（2026-11-25）
+
+- **实现：**`runtime/morde-cloud-runtime/src/engine.mjs` 挂载锁定版本的 `@deepseek-ai/dsh-repeat-tool-reminder` advisory 插件，阈值为 3、5、8 次完全相同调用，参数预览上限 500 字；插件将提醒作为来源标记的 Agent 会话消息送入下一轮。它不拦截工具执行，当前工具仍需通过既有模型工具 allowlist 与 Morde Broker/审批/授权路径。许可证为锁文件记录的 MIT，版本固定为 `0.2.2-rc.1`。
+- **验证：**`cd runtime/morde-cloud-runtime && node --test --test-name-pattern='nudges the Agent after three identical tool calls' test/runtime.test.mjs` 通过（1/1）。`npm test` 通过（242 项通过，0 失败，0 跳过；包含 `build:dsh-compaction`）。新回归确认第三次重复调用后模型请求收到提醒，三次授权工具调用都仍到 Broker，checkpoint 保存带来源提醒且 Task 正常完成候选。`git diff --check` 通过。
+- **边界：**提醒来自本地 DSH 插件，并非 Muse 未公开算法证据；重复计数不跨 Runtime 进程持久化，不保证 Agent 一定改变计划，也不强制停止重复调用。通用超时/取消、无界工具集选择/恢复及 PC + 真实 DSH/模型体验仍未验收；R12/T42 保持部分通过。
+
+### R12 DSH 工具超时插件安全边界审计（2026-11-25）
+
+- **复用检查：**本地上游 `project/deepseek-harness/packages/guard/timeout-policy`（`@deepseek-ai/dsh-tool-call-timeout-policy`）为合作式超时策略，执行工具须声明 `timeoutMs` 并遵守 AbortSignal；没有全局默认，也不能 hard-kill 不配合工具。Morde 当前 DSH 工具定义未暴露该字段，实际 MCP 操作经 IPC 到 Worker/Broker。
+- **现有时限含义：**Runtime `ipc.mjs` 的 tool/child 6 分钟 timer 仅在 IPC 结果未返回时发出 `agent_request_timeout` 并启动服务端 reconciliation。`Tools.Execute` 可能已派发副作用；Runtime 本地 abandon/abort 不代表服务端操作已 quiesce，迟到结果仍按账本对账。不能把 timer 到期写成“操作已取消”或普通可重试失败。
+- **决定与限制：**本轮不将合作式插件接到无 `timeoutMs` 的 Morde 工具，也不设置硬默认。真正可取消的执行时限需要跨层传递按 operation ID 绑定的取消请求并等待 Broker 确认停止；无法确认则保留 unknown、先对账且禁止重复执行。只读源码审计，未改代码、未跑测试或访问远端；R12/T42 强制工具超时/取消仍未完成。
+
+### R21 初始 Task 消息 128 KiB 边界回归（2026-11-25）
+
+- **Worker→Runtime 正例：**新增 Worker 回归经本地 DSH Runtime 子进程与 fake model stub 实际完成 start frame。UTF-8 正文正好 128 KiB，含不同的 HEAD/MIDDLE/TAIL 锚点；最终模型请求恰好保留同一初始消息 ID 与完整内容，没有执行工具。128 KiB+1 正文以 UTF-8 `中` 跨界，Worker 明确拒绝，模型和工具调用均为 0。
+- **Runtime start frame：**新增两条子进程测试，精确 128 KiB 正文保留全部锚点并进入合成模型请求；128 KiB+1 的多字节正文在模型/工具调用前拒绝。
+- **验证命令：**`cd server && go test ./internal/worker -run '^TestCloudDSHInitialMessage' -count=1 -v`（2/2 通过）；`cd runtime/morde-cloud-runtime && node --test --test-name-pattern='starts an initial Task message with the complete 128 KiB UTF-8 body|rejects an initial Task message above 128 KiB UTF-8 before model or tool calls' test/runtime.test.mjs`（2/2 通过）。
+- **限制：**只验证当前 128 KiB 全文帧可用的精确边界和安全拒绝；没有提高限制，也没有覆盖 128 KiB–8 MiB 短指针投递、PC、真实模型首中尾语义或 checkpoint/ledger 指针恢复。T49/T50 仍未通过。
+
+
+### 2026-11-25 较早工作树整合回归快照（后续计数见当前验证补充）
+
+- **Server Worker/App：**在 server/ 执行 GOPROXY=off GOSUMDB=off go test ./internal/worker ./internal/app -count=1，两个完整包通过（worker 68.603 秒、app 22.167 秒）。Worker 包包含 raw Go error 保持 unknown/不重试及 128 KiB 初始 Task 消息边界回归。本次未设置 CH_TEST_DATABASE_URL，不含条件 PostgreSQL 集成。
+- **DSH Runtime：**执行 npm test（含 build:dsh-compaction），244/244 通过，0 失败、0 跳过，90.5 秒；包含 128 KiB/128 KiB+1 UTF-8 start-frame 回归。
+- **Portal/PC 资源（该次快照）：**Assistant、TaskApprovalCard、MCP App integration 三文件 Vitest 联合回归 245/245；npx eslint src/routes/Assistant.tsx、npm run typecheck、npm run build:pc 全部通过。构建仍报告既存大 chunk。后续 Portal 总数增加，不能将本条联合数作为当前合并计数。
+- **PC 验收边界（该次快照）：**本次记录时没有启动或操作 PC。只读环境审查发现没有明确可用的 loopback Portal/API/DSH 合成服务夹具，且有一个配置不明的 morde-pc 进程；未复用或关闭。后续另有源码 PC 登录记录与当前启动记录，见本文件末尾；本条只描述当时状态。不能以组件/构建测试替代实际 PC。未外发文件或修改远端。
+
+
+### R24 tool_execution_failed 前端合同回归（2026-11-25）
+
+- **根因与修复：**服务端 Broker/Host 已持久化确定失败码 tool_execution_failed，Task API 返回该值，但 OpenAPI TaskStep.failure_reason 枚举、生成 Portal 类型和 Assistant 中文映射缺少此值。现已同步 OpenAPI 并运行 npm run generate:api；Assistant 对该值显示确定失败说明。unknown 仍保留独立原因和无重试约束。
+- **回归（该次历史快照）：**新增用例把 tool_execution_failed 与通用 The task failed 摘要组合，确认结构化原因优先显示；详情中能看到已记录原因，且没有重试按钮。当时 Assistant 组件 238/238、三文件联合回归 246/246、Portal 全量 68 files/892 tests 通过。后续 Assistant 239/239、Portal 全量 893/893 已复跑；不同测试集合的联合总数不从全量数推算，最新复验见本文件末尾。
+- **检查：**目标 ESLint、Portal typecheck、PC build 和 git diff --check 通过。PC build 有既存大 chunk 提示。
+- **边界：**本地自动化覆盖 API/前端合同；未启动实际 PC 或真实 DSH/Broker。R24/T54 仍需核验实际工具事件、账本和用户可见状态一致。
+
+### R02 路由决策持久结算校验补充（2026-11-25）
+
+- **根因与修复：**合法结构化只读 `tool` 路由在解析后进入 PostgreSQL 用量结算时，被 `validStoredRouteDecision` 因缺少 `tool` 分支拒绝。存储校验现接受两个既有只读工具，并复用上下文、参数及字段组合门禁；结算路径复核确认 `ExplicitNew` 仍只取结构化路由字段，存储层不再用正文词表否决该决定。
+- **验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run 'TestValidStoredRouteDecision|TestStoredRouteFileDeliveryIntent' -count=1`、`go test ./internal/app ./internal/worker -run ConversationRoute -count=1` 通过；`gofmt -d`、`git diff --check` 通过。新增 `TestConversationRouteModelToolDecisionSettlesAndAppliesDirectTool` 使用独立 loopback 临时 PostgreSQL：`CH_TEST_DATABASE_URL=<loopback DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^TestConversationRouteModelToolDecisionSettlesAndAppliesDirectTool$' -count=1 -v`，1/1 通过；确认模型调用结算、route routed、用户消息 applied，以及隐藏 Broker 工具调用和参数持久化。临时容器已移除。
+- **限制：**集成用例的模型回复是 fixture，不代表真实 DSH/模型语义或 PC 交互；真实网页工具未执行。R02/T45–T46 保持未完成。
+
+### R23 对话界面源码规则复核（2026-11-25）
+
+- **结果：**只读核对 Assistant、Reviews、TaskApprovalCard 与 MCP App integration；单个思考状态在消息列表末尾渲染一次、没有 Task 停止按钮、助手回复元数据默认隐藏并仅 hover/focus 显示、审批卡为左侧 Morde 行、任务动态没有审批/验证/停止/Workbench 控件。未发现可复现源码缺陷。
+- **验证：**`cd web/portal && npm test -- --run src/routes/Assistant.test.tsx src/routes/Reviews.test.tsx src/components/TaskApprovalCard.test.tsx src/components/TaskApprovalMcpApp.integration.test.ts`：4 个测试文件、256/256 通过。2026-11-24 的 266/266 是历史版本的不同测试集合，本记录不以测试数差异推断回归。
+- **限制：**本次仅源码/组件审查，没有实际 PC 交互、浏览器键盘/鼠标或本地服务联验；R23/T51/R22 仍未完成。
+
+### R00 较早全仓本地验证快照（2026-11-25，后续状态见本文件末尾）
+
+- **Server：**env GOPROXY=off GOSUMDB=off make test race cover 通过；内部覆盖率 45.1%。make generate 通过，sqlcgen 生成目录无差异。CH_TEST_DATABASE_URL 未设置，因此条件 PostgreSQL 集成未覆盖。
+- **Portal（该次快照）：**`npm test -- --run` 通过，68 个测试文件、892/892；Portal typecheck 与 PC build 通过。当前 Portal 全量为 893/893，见本文件末尾。
+- **Server lint（该次快照）：**`make lint` 未通过，共 32 项；诊断分布在 23 个 Go 文件。唯一位于当时有改动文件的诊断是 `cloud_dsh_session_tree.go` 的既存 SA4006 行，未出现在当时 diff；其余诊断文件不在当时变更集中。这是 Server `make lint` 结果，与后续 Portal `npm run lint` 不是同一命令。
+- **客户端环境（该次快照）：**当时只读检查发现没有明确可用的 loopback Portal/API/DSH/Guardian 合成服务；存在使用默认用户数据目录的打包版 morde-pc 进程，未复用、停止或启动新实例。之后另有源码 PC 登录与当前启动记录，见本文件末尾；本条不代表当前客户端状态。真实 DSH/模型、工具和跨端验收仍阻塞。
+
+
+### R24 工作区搜索工作项展示（2026-11-25）
+
+- **缺陷与修复：**真实步骤名 `morde_workspace_search` 之前使用通用“使用工具”标题，不能直观看出 Agent 搜索了工作区文件。现在显示为“搜索工作区文件”；展开详情展示 API 中的实际搜索查询和结果摘要，不推测 URL、命中数或其他工具事实。
+- **验证：**`cd web/portal && npx vitest run src/routes/Assistant.test.tsx` 通过，239/239；`npx eslint src/routes/Assistant.tsx src/routes/Assistant.test.tsx --max-warnings=0` 通过；`npm run typecheck` 通过；`npm run build` 的 PC 与 Admin 构建通过（仍有既存大 chunk 提示）；`npm test -- --run` 全量通过，68 个测试文件、893/893。
+- **全量 lint：**`npm run lint` 未通过，诊断位于 `HostControlPanel.test.tsx`、`PersonalData.tsx`、`Reviews.tsx` 等其他文件；Assistant 两个本次目标文件的定向 ESLint 通过。
+- **限制：**以上是本地 Portal 自动化与构建结果，未操作实际 PC、未连接真实 DSH/模型，未验证运行时搜索调用与账本事实。R24/T54 保持部分完成。
+
+
+### R07 审批历史事实完整性审计（2026-11-25）
+
+- **发现：**现有 `task_pending_requests` 只能证明已记录审批请求的决定；部分 execution ledger 没有统一 approval binding，且没有持久操作分类声明哪些副作用必须审批。仅遍历已有批准行无法区分只读操作和漏记审批。
+- **安全状态：**没有修改代码或迁移。未证明完整审批覆盖时，`ApprovalHistoryVerified` 不得置 true，验证状态保持 `pending/unknown`。
+- **解除条件：**定义统一操作分类，并让每个需审批副作用将 Task revision、call/operation identity、approval ID/version/hash 与最终账本状态持久绑定；缺失或歧义保持 pending。不得只加审核表扫描来产生 PASS。
+
+
+### R05 多项文件应用竞态复核（2026-11-25）
+
+- **实现核查：**单文件 write/delete 的期望 SHA CAS 会阻止冲突项被覆盖；冲突退出不提交新 live baseline。全套操作成功后重新读目标快照，只有和源 manifest 完全相等时才写 baseline。目录级锁未跨越 Host 外部并发写入下的整组 snapshot、mutations 与 baseline 提交，因此冲突仍可能留下前序文件已修改的部分结果；PostgreSQL 锁已串行化 Morde 自身同项目上传 session，当前没有错误 baseline 的证据。
+- **验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestApplyLiveProjectUpload(PreservesConcurrentChanges|WritesSharedDirectory|MovesUnchangedRenamedFileInSharedDirectory)|TestProjectLiveBaselineIncludesImplicitAndEmptyDirectories)$' -count=1` 通过。
+- **后续条件：**若要减少 Host 外部并发对多项操作的影响，需 Host/storage 提供版本或事务合同；路径锁或数据库行锁不能约束持有旧 inode 的非协作写者。Host 外部冲突下的部分应用恢复和 baseline 行为仍待验。未修改代码；真实 PC/Host 同步未验，持有旧 inode 的非协作写入仍不可绝对阻止。R05/T16–T18 保持未完成。
+
+
+### R02 PlanStep 依赖执行绑定审计（2026-11-25）
+
+- **源码核对：**`domain/task/plan.go:Plan.Validate` 只检查依赖引用、重复项、环和状态枚举；`cloud_dsh_task_plan.go` 将模型计划持久化为 `task.plan` 事件，PostgreSQL 校验调用身份与 plan revision，但没有把 `plan_step_id` 绑定到真实工具/子 Agent 调用及最终成功结算。模型声明 `PlanStep.Status=completed` 不是执行证据。
+- **边界：**已有 `task_dependencies` 只门控 Task 与 Task 的依赖，不能替代同一 Task 内的 PlanStep 门禁。
+- **解除条件：**持久绑定 `(task_id, task_revision, plan_revision, plan_step_id)` 与真实调用身份和成功证据，派发前在事务中核对所有前置步骤；失败、取消、unknown、旧 revision、缺证据不解锁。该工作需要新状态/存储合同。按 `server/AGENTS.md`，缺少的权威公共合同 `docs/实施/00-总览与公共约定.md` 未恢复前，不加本地迁移或另造字段。
+- **验证状态：**本次只读源码审计，未改代码、未运行测试；M02-14/R02 保持未完成。
+
+
+### R01 ModelGateway 结算写入失败时保留预算（2026-11-25）
+
+- **修复：**Task 模型调用在 Provider 已返回响应、已知用量结算失败后，会使用相同调用身份 best-effort 持久化 `unknown`。若该补偿写入也失败，dispatched reservation 保留，交由现有对账/恢复处理；不会返回响应继续 Agent 循环、释放预算或再次派发 Provider 请求。Project 调用路径不在此次改动范围。
+- **验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestTaskModelGatewaySettlementFailurePreservesUsageAndDoesNotRedispatch|TestModelGateway)' -count=1` 通过；完整 `GOPROXY=off GOSUMDB=off go test ./internal/app -count=1` 通过，21.319 秒。新增测试包含 3 个子场景：unknown fallback 成功并保留全部 reservation；fallback 失败时仍保留 dispatched hold；known settlement 已提交但 ACK 丢失时补偿 unknown 不覆盖 settled，重试读回已存响应且 Provider 调用次数为 1。`gofmt -d`、`git diff --check` 通过。
+- **限制：**上述测试使用 App/store fixture；没有运行 PostgreSQL settlement integration、真实 Provider、实际 PC 或跨步骤长文任务。该变更只覆盖预算账本恢复边界，真实 `task_budget_exhausted` 根因与 8K token 首/中/尾语义仍未验证，R01/T49–T50 不关闭。
+
+
+### R03 父子 Agent 失败与未知结果复核（2026-11-25）
+
+- **结论：**只读审查 `cloud_dsh_session_tree.go` 的子 Agent dispatch/result/settle 及现有 nested-session 测试。成功需有可对账 checkpoint；失败摘要和 failed/cancelled/unknown 状态回到父 Agent；后台输出续读校验终态和连续游标；恢复时 unknown 子任务不重启。未发现安全、局部的生产代码修复点，没有修改代码。
+- **验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/worker -run '^(TestCloudDSHChildSuccessRequiresReconciledHistory|TestCloudDSHChildToolResultExposesOnlySafeActionReferences|TestCloudDSHExecutorRunsAndSettlesPersistedChildSession|TestCloudDSHBackgroundOutputContinuationRequiresMatchingTerminalStatusAndCursor|TestCloudDSHBackgroundOutputContinuationRequiresContiguousOutput|TestCloudDSHPersonalRecoveryRejectsUnknownCancelledOrRunningChildren|TestCloudDSHNestedWorkerFailureReachesCoordinator)$' -count=1 -v` 中 6 个普通 worker 顶层用例通过；nested failure PostgreSQL 用例另在一次性 loopback PostgreSQL 16 上运行，3/3 子用例通过（确认 context limit、确认 provider error、未分类错误保持 uncertain）。一次性容器已停止并删除。
+- **限制：**本次 PostgreSQL 用例使用合成模型/工具，不验证真实模型语义或实际 PC；协调 Agent 对失败的最终自然语言总结仍待真实 DSH/模型验收，R03/M03-PC 未关闭。
+
+
+### R23 停止意图与对话界面定向复跑（2026-11-25）
+
+- **Server:** `cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run 'ConversationRoute.*Stop|StopAll.*ConversationRoute' -count=1` 通过，12 项；cd server && GOPROXY=off GOSUMDB=off go test ./internal/worker -run 'ConversationRoute.*Stop|StopAll.*ConversationRoute' -count=1 通过，14 项。停止语义由结构化 Agent 决策表达，拒绝用正文关键词触发；本轮未设置 `CH_TEST_DATABASE_URL`，未跑 PostgreSQL 集成。
+- **Portal:** `cd web/portal && npm test -- --run src/routes/Assistant.test.tsx` 通过，239/239；`npx eslint src/routes/Assistant.tsx src/routes/Assistant.test.tsx src/components/TaskApprovalCard.test.tsx` 通过。
+- **边界（该次停止意图定向复跑）：**当时未启动或操作实际 PC，也未连接远端或数据库。上述测试证明本地路由/API/UI 合同，不证明真实模型意图理解、取消最终态、审批 iframe 操作或 PC 视觉验收；后续实际 PC 记录见本文件末尾，R23/T51 保持部分完成。
+
+### R24 工作项明细数据源与状态映射复核（2026-11-25）
+
+- **结论：**只读复核当前 Assistant 工作项列表与展开详情。只有授权读取到 `TaskStepDetail` 且状态可用时才展示明细；查询、目标、命令和输出取自服务端已有字段，错误原因/等待/失败/取消/unknown 使用明确状态分支；权限错误会清除旧详情，MCP 参数与结果按服务端脱敏边界省略。没有发现可仅靠现有字段安全补齐的缺项，未改代码。
+- **验证：**Portal `Assistant.test.tsx` 239/239 通过，Assistant 定向 ESLint 通过。结果与原 R24 测试记录一致。
+- **限制：**未启动实际 morde-pc；真实 DSH 工作项字段与工具账本一致、屏幕上的展开交互仍待 PC/真实 DSH 验收，R24/T54 不关闭。
+
+### R01/R03/R11 本轮复验补充（2026-11-25）
+
+- **R01 PostgreSQL settlement 单调性：**`cd server && CH_TEST_DATABASE_URL=<仅 loopback 的一次性 PostgreSQL DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^TestPostgresUnknownSettlementCannotOverwriteSettledModelCall$' -count=1 -v` 通过。该用例用 `ModelCallTask` 绑定真实 Task fixture，验证后续 `Unknown` 被拒绝，账本保持 settled，Task 用量与账户预算不变；临时容器已删除。
+- **R03 nested failure：**一次性 loopback PostgreSQL 上 `TestCloudDSHNestedWorkerFailureReachesCoordinator` 的 context limit、provider error、unclassified uncertain 三个子场景通过。仍是合成模型/工具；真实 coordinator 自然语言汇总与 PC 未验。
+- **R11/T49 真实模型：**运行 `TestDeepSeekFlashDialogueThroughMordeModelGateway/long_input_usage_and_history_follow-up_routing`，仅向真实 Provider 提交本机生成的 51,842 字节合成档案。首轮报告 18,502 tokens 并正确回答总数及首/中/尾锚点；完整历史续问报告 18,575 tokens 并正确回答记录 0400。截断历史追问首次错误请求用户重发；强化路由提示后，同一真实 Gateway 场景通过并选择 `new`；历史仍不完整时，自包含 1+1 问题返回有正文的 `reply`。提示只做模型策略，不含关键词强制路由。离线 H09 回归通过，但它断言提示合同，不等同真实模型行为。
+- **未覆盖：**没有验证 Task Agent 实际执行授权历史搜索工具、原对话最终交付、真实 `task_budget_exhausted` 第二轮原因、128 KiB 以上初始消息投递或 PC UI；未连接测试服务器、未外发文件。
+- **最小窗口回归与最终复跑：**首版历史规则使 `TestConversationRouteActiveTaskControlEvidenceFitsMinimumWindow` 失败（提示 8,682 字节）；压缩为 443 字节规则后该用例通过，且完整 `go test ./internal/app ./internal/worker -count=1` 通过（App 21.217 秒、Worker 65.025 秒）。随后用最新提示重跑 DeepSeek 单一合成长文子用例，依赖缺失历史选择 `new`、自包含问题仍直接 `reply`，Provider 用量为 18,502/18,575 tokens。该回归证明提示加入后未挤掉 4,096-token 路由窗口中的安全控制上下文。
+- **新增自包含问题模型正例回归：**在 `HistoryIncomplete=true` 的路由上下文中，真实 DeepSeek 对自包含的 `1+1` 仍返回有正文的 `reply`；包含该断言的 live 长历史子用例通过。`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -count=1` 通过（21.626 秒）。
+
+### R10/S09-45 Workspace commit/write unknown 防重放回归（2026-11-25）
+
+- **根因与修复：**Hostless 与 live Workspace publish 错误路径过去会把部分提交后不确定状态返回 AgentToolFailed。live 路径进一步确认 WriteRegularFile 可能在 rename 生效后因目录 fsync 返回错误，写后 manifest/snapshot 读取也可能失败。现以 durable receipt 和实际 live snapshot 对账；回执读取失败、pending、写 adapter error、写后快照错误均返回 unknown，由当前 Broker 暂停并沿原调用恢复；确定业务拒绝/终态冲突回到同一 DSH Agent。
+- **验证：**cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestCloudDSHWorkspaceWriteCommitResponseAndReceiptLookupFailureStaysUnknown|TestCloudDSHWorkspaceWriteCommitErrorRequiresReceiptOrKnownPreWriteRejection|TestCloudDSHLiveWorkspaceWrite)' -count=1 -v 通过，7 个顶层测试及 8 个子测试。断言包括副作用发生后仍 unknown，回执/快照恢复后同一 pinned call 成功且 WriteRegularFile/commit 次数不再增加；配额/冲突的确认拒绝交回 Agent。针对同一 Workspace 回归的 go test -race 通过，go vet ./internal/app、gofmt -d、git diff --check 通过。
+- **Agent-first 边界：**此修复不通过硬编码词句判断用户意图；用户语义由 Agent 判断，稳定业务拒绝使用类型化错误/回执交给 Agent 选择下一步。无法确认的副作用不让 Agent 猜或重试，先对账；R20 的持久自然语言终态解释仍缺合同。
+- **限制：**仅本地合成 Store/文件系统测试，未运行 PostgreSQL 集成、实际 PC、真实 DSH/模型或远端服务；R10、T55 和 M11-01–04 不能关闭。
+
+
+### 2026-11-25 当前工作树验证与 PC 状态更正
+
+- **Portal 自动化：**`cd web/portal && npm test -- --run` 通过，68 个测试文件、893/893；`npm run typecheck` 通过。Assistant 定向测试最近记录为 239/239；Assistant/TaskApprovalCard/MCP App 三文件联合回归最近记录为 246/246，但这两个定向计数来自单独测试集合，不能从 893 全量数推算或相加。此前 237/237、238/238、892/892、245/245、240/240、247/247 均为各自运行时的历史快照，已被后续相应测试复跑取代或只保留作历史证据。
+- **Portal lint：**本轮 `cd web/portal && npm run lint` 失败，当前诊断为未修改的 `PersonalData.tsx` 与 `Reviews.tsx` lint error、`FloatingError.tsx` Hook dependency warning；此前 `HostControlPanel.test.tsx` 中未使用的 callback 参数已修正，不再出现在本轮输出。本记录不把 Portal lint 失败与 Server `make lint` 的历史 32 项混为一谈。
+- **路由提示与 Assistant 消息 UI 回归（2026-11-25）：**路由提示规定 `explicit_new` 只表示用户明确要求重新开始/重跑；重复文本或重发默认走现有幂等处理，不自动新建 Task。提示只指导 Agent 结构化判断，没有增加关键词/正则解析；路由 Agent 验证 App 全量与路由定向测试通过。Assistant 回归覆盖消息气泡仅在 hover/focus 显示时间与复制、对话底部单个思考指示、由自然语言进入停止路由且无任务停止按钮，以及左侧 Morde 审批卡。Assistant 239/239、Portal 全量 893/893、typecheck、目标 ESLint 与全工作树 `git diff --check` 通过。此轮 UI/路由回归未启动实际 `morde-pc`；此前隔离 PC 登录状态不明并已中止，因此不计 PC 端到端验收。
+- **Runtime 与 Server：**`cd runtime/morde-cloud-runtime && npm test` 通过 244/244；step04 曾记录的 242/242 是此前快照。`cd server && GOPROXY=off GOSUMDB=off make test` 与 `GOPROXY=off GOSUMDB=off make race` 本轮均通过；未设置 `CH_TEST_DATABASE_URL`，条件 PostgreSQL 集成被跳过。首次隔离 PostgreSQL `make it` 曾失败于 checkpoint 初始工具定义不匹配；修复后及路由测试夹具校正后的最终复验结果见本节末尾。先前 `make test race cover` 及覆盖率数据属于历史运行，不能代替本轮命令或失败的 `make it`。
+- **真实 DeepSeek ModelGateway 定向复跑：**在本机授权环境中使用 `MORDE_TEST_DEEPSEEK_KEY`（密钥值未写入记录），执行 `cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^TestDeepSeekFlashDialogueThroughMordeModelGateway/long_input_usage_and_history_follow-up_routing$' -count=1 -v -timeout=4m`，通过。测试仅发送测试内生成的 51,842 字节合成档案；首轮 Provider 报告 18,502 tokens，完整历史续问报告 18,575 tokens。该结果是 ModelGateway/路由真实模型证据，不是 PC、Task/DSH 或任意长文完整 E2E。
+- **实际 PC：**此前另一次源码 PC 记录为登录测试服务后显示账号已有主会话，当时只查看既有内容，没有发消息、创建 Task、打开任务详情或上传文件，也未修改远端数据库/密码；本机隔离 userData 不隔离服务端账号数据。本轮隔离 `make pc` 完成 Portal 与 Workbench 构建并启动源码 Electron 登录 UI。登录交互后界面显示既有会话内容，但 Electron 主日志同时报告用户名/密码错误，认证状态不可靠；已中止应用并删除本地隔离 profile。没有发送新消息、创建 Task、上传文件或修改远端数据库/密码。此次是中止且含糊的尝试，不证明登录成功，也不计 PC 验收。没有用普通用户 Web 或 iOS 代测，PC 登录尝试本身未使用模型 API key，也未上传文件或发送新对话；本记录相邻上一条单独记载了经授权的 DeepSeek 合成文本测试。
+- **状态判断：**本节只更新验证快照，不改变分步 TODO 的完成状态。自动化、构建和历史登录记录均不能替代实际 PC + 合成服务/真实 DSH 的要求；R20、M07-05、M04-06、M10-06 及相关 T 场景仍按各自 TODO 中的验收状态执行。首次全量 `make it` 曾未通过；最终复验结果见下文。此处只更新证据，不改变分步 TODO 的完成状态。
+
+### 首次服务端全量复验与 checkpoint 恢复问题（2026-11-25）
+
+- **全量 Go 测试：**`cd server && GOPROXY=off GOSUMDB=off make test` 通过，`go test ./...` 全包成功。首次复跑发现一条旧 Worker 提示合同断言仍期待 `authorized originals`；当前提示明确要求 `search authorized history`。测试断言已同步当前文本合同，未改变运行逻辑；修正后全量复跑通过。
+- **竞态测试：**`cd server && GOPROXY=off GOSUMDB=off make race` 通过，`go test -race ./...` 全包成功。上述两项未设置 `CH_TEST_DATABASE_URL`，因此不能覆盖条件 PostgreSQL 集成。
+- **PostgreSQL 集成：**使用仅绑定 loopback、无持久数据卷的一次性 PostgreSQL 执行完整 `make it`，Worker 包失败于 `TestCloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView`。测试诊断显示 checkpoint 恢复要求的初始定义为 `morde_workspace_list`（`source=base`），当前重建的 Task 工具集合没有该定义，因而报 `dsh checkpoint tool definition is no longer authorized`。后续 `agent task authorization is unavailable` 是 Task 进入 `waiting_user` 且 lease 释放后的次级诊断，不证明授权被撤销。执行层仍 fail-closed，未降低权限、重放工具或修改远端服务。
+- **结论与后续：**完整 `make it` 仍未通过，R09/R18/A05 保持未完成。恢复合同需兼容经过完整性校验的历史工具定义，同时每次实际执行仍核验当前 Task/Host/Workspace 授权；不能为通过测试放宽授权。此 checkpoint 阻塞也使“错误先交给 Agent 自我处理”的恢复体验无法在该场景验收。
+- **静态检查：**`git diff --check`、对当前已修改/新增 Go 文件执行 `gofmt -d` 均无差异；`cd server && GOPROXY=off GOSUMDB=off golangci-lint run --new-from-rev=HEAD ./cmd/... ./internal/... ./migrations` 通过，0 issues。隔离 PostgreSQL 容器已清理。
+
+
+### 修复后完整服务端复验（2026-11-25）
+
+- **checkpoint 修复：**Host-target Task 不再把 Hostless Workspace 工具定义加入恢复时的工具集合，保持 checkpoint 的 Host 工具身份稳定；伪造的 Hostless Workspace 调用由现有 HostID 栅栏拒绝。权限与 Broker 当前授权检查未放宽，未知结果仍按原账本对账。
+- **路由测试修正：**首次全量重跑发现 6 条 PostgreSQL 测试失败。显式文件交付意图测试已改为通过测试 ModelGateway 完成结构化分类、结算、路由和修订；直接调用存储层但没有 settled 模型决策的测试只验证不发生语义推断。H01 提示词断言更新到当前历史检索合同；重复路由用例改为沿实际 schema 追溯原 Task。相应 8 个定向 PostgreSQL 顶层测试、15 个子场景通过。
+- **完整集成：**`cd server && CH_TEST_DATABASE_URL=<仅 loopback 的一次性 PostgreSQL> GOPROXY=off GOSUMDB=off make it` 全仓通过，PostgreSQL 包耗时 1166.815 秒。OpenSandbox 集成因未配置 `CH_OSB_URL` 与 `CH_OSB_API_KEY` 跳过；未访问远端。该结果覆盖条件 PostgreSQL 集成，但不替代 PC/真实 DSH 验收。
+- **竞态与静态检查：**`cd server && GOPROXY=off GOSUMDB=off make test` 与 `make race` 全仓通过；两者均未配置 `CH_TEST_DATABASE_URL`，各自跳过条件 PostgreSQL 测试。完整 PostgreSQL 覆盖见上一条 `make it`。`golangci-lint run --new-from-rev=HEAD ./cmd/... ./internal/... ./migrations` 为 0 issues；`git diff --check` 与当前改动 Go 文件 `gofmt -d` 无差异。一次性 PostgreSQL 容器已清理。
+- **PC/Runtime 分层（截至该快照）：**DSH Runtime `npm test` 244/244，Portal 全量 68 文件/893/893、Assistant 239/239、类型检查及目标 ESLint 通过；实际 `morde-pc` 未做本轮交互验收，先前登录状态不可靠的尝试继续不计通过。该快照的 Portal 全量 lint 仍报告 `PersonalData.tsx`/`Reviews.tsx` 错误及 `FloatingError.tsx` Hook warning；后续修复见本记录末尾。R20 durable 终态说明、R21 128 KiB 以上首轮投递合同、真实 PC/DSH 与跨端验收仍阻塞。
+
+### Portal lint 修复复验（2026-11-25）
+
+- **改动：**`PersonalData.tsx` 按对象 ID、版本和正文签名派生记忆编辑草稿，避免 effect 中同步 setState；`Reviews.tsx` 在当前 render 中受条件保护地收敛越界页码；`FloatingError.tsx` 将通知方法作为稳定依赖。修改保持原有页面结果和交互，不涉及 API 或 PC 专属逻辑。
+- **验证：**`cd web/portal && npm run lint`、`npm run typecheck` 通过；`npm test -- --run src/routes/PersonalData.test.tsx src/routes/Reviews.test.tsx src/components/FloatingError.test.tsx` 通过，3 个测试文件、48/48。复核 `git diff --check` 通过。
+- **边界：**本轮未通过实际 `morde-pc` 操作上述页面；这是 lint 与受影响 Portal 回归，不计 PC 交互验收。历史 lint 失败记录保留为当时快照，当前全量 Portal lint 状态为通过。
+
+### R05 同项目并发上传创建 fence 复验（2026-11-25）
+
+- **并发场景：**新增 PostgreSQL 集成回归 `TestWorkspaceProjectUploadConcurrentCreatesSerializeSameProjectBaseline`。测试用屏障确保两个上传请求都先读取同一个 source baseline，再并发创建；断言只有一个同步 session 创建成功，另一个返回 `workspace busy`，数据库只留一个 session。
+- **验证：**在一次性 loopback PostgreSQL 上，以 `go test -race ./internal/store/postgres -run '^(TestWorkspaceProjectUploadConcurrentCreatesSerializeSameProjectBaseline|TestWorkspaceProjectUploadReceiptRejectsConcurrentBaselineAdvance|TestWorkspaceProjectUploadUsesInstallationCredentialWithoutSyncthingBinding|TestAgentWorkspaceProjectUploadCommitsDirectlyWithoutMaterialization)$' -count=1 -v -timeout=6m` 通过，4/4 顶层用例；明确设置 `CH_TEST_DATABASE_URL`，未跳过 PostgreSQL。`gofmt` 与 `git diff --check` 通过，临时容器已停止并自动移除。
+- **边界：**生产 Store 已用 Workspace、项目目录和 source baseline 行锁、未决 application 检查及基线版本复核串行化 Morde 自身同项目上传；此用例证明服务端 session 创建 fence，不证明 Host 多文件 mutation 对外部非协作 writer 原子化。外部旧 inode 写入仍可能导致前序文件已应用而 baseline 不前进。未在实际 PC、真实 Host 云端或 Agent Workspace 读取中验收；M04-05/R05/T16–T18 保持未完成。
+
+### 2026-11-25 实际 PC 本地合成审批卡与参数 schema 错误回送复验
+
+- **合成服务：**`TestConversationBrowserAcceptance` 的 `approval` 场景首次未进入目标 Task，因为固定模型 fixture 仍匹配旧分类提示词 `Classify the user's new message`；当前提示词已改为 `Classify the latest request`。只修正测试 fixture 匹配，没有改生产路由规则或放宽校验。
+- **PostgreSQL/服务端：**使用一次性 loopback PostgreSQL（`127.0.0.1:59517`）运行 `CH_TEST_DATABASE_URL='postgres://postgres:local-only@127.0.0.1:59517/postgres?sslmode=disable' MORDE_BROWSER_ACCEPTANCE=1 MORDE_BROWSER_ACTIVITY=1 MORDE_BROWSER_ACTIVITY_SCENARIOS=approval MORDE_BROWSER_ACCEPTANCE_LISTEN_ADDR=127.0.0.1:61004 MORDE_BROWSER_ACCEPTANCE_TIMEOUT=4m GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^TestConversationBrowserAcceptance$' -count=1 -v -timeout=5m`，通过，测试耗时 106.75 秒。服务端 fixture `/__morde_fixture/verify/approval` 返回 `verified`、`agent_acknowledged=true`、`task_status=waiting_user`、`waiting_reason=approval_required`、`pending_request_status=pending`。
+- **实际 PC：**以源码 `MORDE_TEST_USER_DATA=/tmp/morde-muse-pc-approval-20261125-rerun make pc` 启动，不使用普通用户 Web 或 iOS。对话可访问性树在 Morde 助手消息下找到待批 MCP App；进入 PC“审核”页可见同一条待处理 `确认合成测试操作` 审批，证明两处读到了同一 pending 请求。未点击允许或拒绝。源码使用 `.chat-message-row-assistant`（flex 默认起始对齐，用户行显式右对齐），因此布局合同指向左侧；截图 API 受系统录屏权限阻止，未目视确认运行时像素位置。此结果只验证本机合成服务与 PC 客户端入口，不含真实 DSH/模型或副作用。
+- **视觉限制与清理：**Electron 截图接口返回系统 Screen Recording 权限错误；因此可确认组件在助手消息树中，但本轮不能目视确认具体 x/y/左对齐。先关闭 PC 释放 SSE 后测试正常退出；一次性 PostgreSQL 容器和两个本地隔离 profile 已清理。
+
+### S09-46 已知运行时工具参数 schema 错误安全回送（2026-11-25）
+
+- **验证命令：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestCloudDSHToolBrokerReturnsArgumentSchemaFailureToAgentBeforeOperationCreation|TestCloudDSHToolBrokerKeepsAuthorizationFailureOnOriginalPreparePath|TestRuntimeToolExecutorPrepareMarksOnlyScopedArgumentSchemaErrors)$' -count=1` 通过，3/3；`cd server && GOPROXY=off GOSUMDB=off go test ./internal/worker -run '^TestCloudDSHExecutorReturnsDefinitiveToolFailureToSameAgent$' -count=1` 通过，1/1。实现会话另报告 `go test -race ./internal/app -count=1` 通过。`gofmt -d` 和 `git diff --check` 通过。
+- **结论：**只有已知工具、scope 正确且本地 schema 可确定参数错误、操作尚未派发时，才记录 `invalid_tool_arguments` 并把脱敏修正提示交回 Agent；缺失/类型错误/无效 `workspace_id` 不创建操作账本、不调用 handler。授权错误保持原 fail-closed 行为。Worker handoff 测试与新 schema 分支尚未在同一测试中端到端联接，真实模型是否会纠正参数未验；其他普通错误与 unknown 不因此进入 Agent 可重试分支，unknown 仍需先对账。R10/M09-07/T55 未关闭。
+
+
+### S09-46 最新安全边界复验（2026-11-25）
+
+- **测试：**`cd server && GOPROXY=off GOSUMDB=off go test -json ./internal/app -run '^(TestCloudDSHToolBrokerReturnsArgumentSchemaFailureToAgentBeforeOperationCreation|TestCloudDSHToolBrokerReturnsMalformedRuntimeArgumentsIdempotently|TestCloudDSHToolBrokerFailsClosedForMalformedRuntimeArguments|TestCloudDSHToolBrokerKeepsAuthorizationFailureOnOriginalPreparePath|TestRuntimeToolExecutorPrepareMarksOnlyScopedArgumentSchemaErrors|TestRuntimeToolExecutorPrepareDoesNotClassifyInvalidSchemaAfterOperateRevocation)$' -count=1`：6 个测试入口含父/子结果共 21 pass、0 fail、0 skip；完整 `go test -json ./internal/app -count=1`：1995 pass、0 fail、5 skip。`go test -json ./internal/store/postgres -run '^TestValidTaskToolCallFailureEvidence$' -count=1`：14 pass、0 fail、0 skip。Worker `TestCloudDSHExecutorReturnsDefinitiveToolFailureToSameAgent`：1 pass。`gofmt -d` 与 `git diff --check` 无差异。
+- **新增边界：**Executor 先核当前 Task 与对应工具 scope 授权，之后才把对象 schema 错误分成 Agent 可修复的预派发结果。malformed object/array/null 走同样的定义、scope、fence 与 operation NotFound 门禁。已有 operation、查询错误、授权拒绝和 checkpoint 不匹配不进入 Agent 重试路径；事件只保存分类，Step 不暴露用户重试，也不泄漏原始参数。
+- **限制：**Worker handoff 用例验证的是现有确定失败回到同一 Session，并未与新 schema 分支端到端联测；未运行新分支的 PostgreSQL 集成、PC + Agent 或真实模型语义测试。R10/M09-07/T55 不关闭。语义由 Agent 结构化判断，代码硬约束只处理 schema、授权、身份和副作用安全。
+
+### 2026-11-25 T51 与 R03 本地 targeted recheck
+
+- **PC 对话结构回归：**新增两项 `Assistant.test.tsx` 断言：用户/助手气泡内无默认 meta、按钮或 status；运行中只在消息列表末尾保留一个 thinking row/dots。命令 `cd web/portal && npm test -- --run src/routes/Assistant.test.tsx -t 'associates user and assistant messages with hover metadata and keyboard access|keeps the animated thinking bubble during active work after an assistant reply starts'` 通过，2 项通过、237 项跳过。`npm run typecheck` 与 `npx eslint src/routes/Assistant.tsx src/routes/Assistant.test.tsx` 通过。只动测试，没有生产 UI 改动；本轮没用实际 PC 手工验这些交互，T51 仍不通过。
+- **Child Agent 失败交接复核：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/worker -run '^(TestCloudDSHExecutorLetsSameAgentRecoverFromDefinitiveReadFailure|TestCloudDSHExecutorKeepsUnknownReadOutcomeDistinctFromDefinitiveFailure|TestCloudDSHExecutorKeepsRawToolErrorUnknownWithoutRetry|TestCloudDSHExecutorReturnsDefinitiveToolFailureToSameAgent|TestCloudDSHExecutorRunsAndSettlesPersistedChildSession|TestCloudDSHBackgroundOutputContinuationRequiresMatchingTerminalStatusAndCursor|TestCloudDSHBackgroundOutputContinuationRequiresContiguousOutput|TestCloudDSHPersonalRecoveryRejectsUnknownCancelledOrRunningChildren)$' -count=1` 通过，8 项。源代码审查未发现可明确修复的缺陷；本次 `TestCloudDSHNestedWorkerFailureReachesCoordinator` 的 PostgreSQL 子场景因未设置 `CH_TEST_DATABASE_URL` 跳过。早先一次性 loopback PostgreSQL 的三项 child failure 子场景通过是独立历史证据，不与本次混记。无代码变更；真实 PC/模型 handoff 仍待验。

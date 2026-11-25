@@ -12728,7 +12728,7 @@ components:
         status: { $ref: '#/components/schemas/TaskStepStatus' }
         title: { type: string }
         summary: { type: string }
-        failure_reason: { type: [string, 'null'], enum: [not_dispatched, tool_failed_after_dispatch, side_effect_unknown, authorization_changed, resource_changed, connector_rate_limited, null] }
+        failure_reason: { type: [string, 'null'], enum: [not_dispatched, tool_failed_after_dispatch, tool_execution_failed, side_effect_unknown, authorization_changed, resource_changed, connector_rate_limited, null] }
         retryable: { type: boolean, description: True only when persisted evidence confirms this exact failed operation is safe to retry and any connector retry-after window has elapsed. }
         retry_after_at: { type: string, format: date-time, description: Earliest user-triggered retry time derived from a verified connector rate-limit result. }
         agent_id: { type: string, maxLength: 128, description: Opaque Agent session ID that actually emitted this step. }

@@ -31,7 +31,7 @@ describe('Codex', () => {
     expect(screen.getByRole('status')).toHaveTextContent('Codex 会话同步需要 morde-pc');
   });
 
-  it('shows a popup for network event-read failures and preserves the Codex page', async () => {
+  it('shows the event-read retry inside the Codex page and preserves the page', async () => {
     Object.defineProperty(window, 'morde', { configurable: true, value: {
       codexState: vi.fn().mockResolvedValue(state),
       codexListThreads: vi.fn().mockResolvedValue({ items: [{ id: 'thread-1', title: '本机对话', cwdLabel: '~/repo',
@@ -44,12 +44,12 @@ describe('Codex', () => {
     renderPage();
     await user.click(await screen.findByRole('button', { name: /本机对话/ }));
 
-    const notice = await screen.findByRole('alert');
-    expect(notice).toHaveTextContent('Codex 会话事件暂时无法读取。');
-    expect(notice.closest('.codex-route')).toBeNull();
+    const notice = await screen.findByText(/无法读取会话事件：/);
+    expect(document.querySelector('.error-notice-overlay .toast-notice')).toHaveTextContent('Codex 会话事件暂时无法读取。');
+    expect(notice.closest('.codex-route')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'Codex 会话' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: /本机对话/ })).toBeInTheDocument();
-    expect(screen.queryByText(/无法读取会话事件：/)).not.toBeInTheDocument();
+    expect(within(notice.closest('[role="alert"]')!).getByRole('button', { name: '重试' })).toBeInTheDocument();
 
     await user.click(within(notice).getByRole('button', { name: '重试' }));
     expect(await screen.findByText('该会话当前没有可显示的同步事件。')).toBeInTheDocument();

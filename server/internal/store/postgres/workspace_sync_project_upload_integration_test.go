@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,6 +18,109 @@ import (
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 )
+
+type projectUploadBaselineBarrierStore struct {
+	*Store
+	baselineReads chan struct{}
+	releaseReads  chan struct{}
+}
+
+func (s *projectUploadBaselineBarrierStore) GetWorkspaceSyncProjectUploadBaseline(ctx context.Context, principal identity.Principal,
+	workspaceID, folderID, sourceBindingID string) (*workspace.SyncSession, error) {
+	baseline, err := s.Store.GetWorkspaceSyncProjectUploadBaseline(ctx, principal, workspaceID, folderID, sourceBindingID)
+	if err != nil {
+		return nil, err
+	}
+	s.baselineReads <- struct{}{}
+	select {
+	case <-s.releaseReads:
+		return baseline, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func TestWorkspaceProjectUploadConcurrentCreatesSerializeSameProjectBaseline(t *testing.T) {
+	store, pool := newTemporaryStore(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "project-upload-concurrent-create")
+	hostValue := workspaceSyncHostForFolderTest(t, ctx, store, owner.ID, workspaceValue.ID)
+	folderService, err := app.NewWorkspaceSyncDeviceService(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	folder, err := folderService.CreateFolder(ctx, workspaceSyncPortalPrincipal(t, store, owner.ID), hostValue.ID,
+		"demo", "project-upload-concurrent-create-folder")
+	if err != nil {
+		t.Fatalf("register project folder: %v", err)
+	}
+	installationID := createTestClientInstallation(t, pool, owner.ID, nil)
+	syncToken := clientTestToken(t, owner.ID, installationID, identity.KindDevice, nil)
+	if _, err := store.CreateToken(ctx, syncToken); err != nil {
+		t.Fatal(err)
+	}
+	device := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindDevice, TokenID: syncToken.ID,
+		ClientInstallationID: installationID, Scopes: []identity.Scope{identity.ScopeWorkspaceSync}}
+	barrierStore := &projectUploadBaselineBarrierStore{Store: store, baselineReads: make(chan struct{}, 2), releaseReads: make(chan struct{})}
+	syncService, err := app.NewWorkspaceSyncServiceWithOptions(barrierStore, workspaceTransferTestBlocks{},
+		workspace.MaxSyncManifestBytes, 1<<30, app.WorkspaceSyncOptions{ProjectUploadEnabled: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := []workspace.CreateSyncSession{
+		{FolderID: folder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abc",
+			Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge, EmptyDirectories: []string{"first"}},
+		{FolderID: folder.FolderID, SourceBindingID: "12345678-1234-4234-8234-123456789abc",
+			Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge, EmptyDirectories: []string{"second"}},
+	}
+	type createResult struct {
+		err error
+	}
+	results := make(chan createResult, len(requests))
+	for index, request := range requests {
+		go func(index int, request workspace.CreateSyncSession) {
+			_, err := syncService.CreateSyncSession(ctx, device, workspaceValue.ID, request,
+				fmt.Sprintf("project-upload-concurrent-create-%d", index))
+			results <- createResult{err: err}
+		}(index, request)
+	}
+	for range requests {
+		select {
+		case <-barrierStore.baselineReads:
+		case <-ctx.Done():
+			t.Fatalf("concurrent requests did not read their common baseline: %v", ctx.Err())
+		}
+	}
+	close(barrierStore.releaseReads)
+
+	created, busy := 0, 0
+	for range requests {
+		select {
+		case result := <-results:
+			if result.err == nil {
+				created++
+				continue
+			}
+			if domain.CodeOf(result.err) == domain.CodeWorkspaceBusy {
+				busy++
+				continue
+			}
+			t.Fatalf("concurrent project upload creation failed unexpectedly: %v", result.err)
+		case <-ctx.Done():
+			t.Fatalf("concurrent project upload creation did not settle: %v", ctx.Err())
+		}
+	}
+	if created != 1 || busy != 1 {
+		t.Fatalf("concurrent creates = %d accepted, %d fenced; want exactly one accepted and one workspace-busy", created, busy)
+	}
+	var sessionCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM workspace_sync_sessions WHERE workspace_id=$1 AND folder_id=$2`,
+		workspaceValue.ID, folder.FolderID).Scan(&sessionCount); err != nil || sessionCount != 1 {
+		t.Fatalf("same-project sessions after concurrent create = %d, err=%v; want exactly one", sessionCount, err)
+	}
+}
 
 func TestWorkspaceProjectUploadUsesInstallationCredentialWithoutSyncthingBinding(t *testing.T) {
 	store, pool := newTemporaryStore(t)
