@@ -3,22 +3,37 @@
 #
 # Runs the ten P0 smoke cases (T01, T04, T06, T10, T13, T19, T22, T26,
 # T36, T43) as one controlled batch, writes a JSON record, and exits
-# non-zero when any runnable case fails. A deploy that does not run this
-# gate is blocked: update.sh runs it before building, and refuses to
-# deploy when it fails.
+# non-zero when any case fails. A deploy that does not run this gate is
+# blocked: update.sh runs it before building, and refuses to deploy
+# when it fails.
 #
-# Case results:
-#   pass    — at least one mapped test passed, none failed or missing.
-#   fail    — a mapped test failed, a mapped test was not found (the
-#             mapping went stale), or `go test` itself failed.
-#   blocked — no mapped test could run. T10/T43 are blocked by design
-#             (they need a real PC + real model/DSH and cannot run
-#             headless); a PostgreSQL-backed test is blocked when
-#             CH_TEST_DATABASE_URL is not set (those tests skip by repo
-#             rule). Blocked is reported, never passed and never failed.
+# Case results — fail-closed. There is no "blocked" outcome any more;
+# every case ends pass, fail, or exception:
+#   pass      — at least one mapped test passed, none failed or missing.
+#   fail      — a mapped test failed, a mapped test was not found (the
+#               mapping went stale), `go test` itself failed, or no
+#               mapped test ran although the case should have produced
+#               evidence (all skipped, subtests all skipped, no mapped
+#               tests for a case that is not excepted below). Missing
+#               evidence is a failure: the gate never passes on absent
+#               evidence.
+#   exception — the case cannot run in this environment, detected
+#               automatically; an exception-gate notice is printed and
+#               recorded, and it is NOT a failure. Two detections exist:
+#               (1) T10/T43 need a real PC + real model/DSH and cannot
+#               run headless (static table below); (2) a case whose
+#               mapped tests are all PostgreSQL-backed and all skipped
+#               while CH_TEST_DATABASE_URL is not set — the missing test
+#               database fully explains the skip. Anything else that
+#               does not run is a fail, not an exception.
 #
-# The gate blocks on fail only. A blocked case is visible in the record
-# and in the summary, so a deploy never silently claims full coverage.
+# Environment-down is detected one level up, in update.sh's preflight:
+# a dead cloud DSH daemon or a missing /srv/morde-acceptance mount
+# aborts the deploy with the cause named before this gate ever runs.
+# That is the deploy-level exception gate; this script's exception
+# status is the gate-level one (the environment lacks a capability
+# the case needs, the code is not blamed, the deploy proceeds with
+# the reduced evidence on record).
 #
 # Usage:
 #   smoke.sh [--src <repo-root>] [--record <path>] [--timeout <seconds>]
@@ -32,7 +47,9 @@
 # Environment:
 #   CH_TEST_DATABASE_URL — when set, the PostgreSQL-backed smoke tests
 #     run against it (they create and drop their own temporary
-#     databases); when unset they skip and are recorded as blocked.
+#     databases); when unset they skip, and a case whose mapped tests
+#     are all PostgreSQL-backed is recorded as an exception (see the
+#     exception rule above), not as a failure.
 #   TMPDIR — honoured by `go test` for its temporary files.
 
 set -uo pipefail
@@ -54,7 +71,7 @@ while (($# > 0)); do
     --timeout) TIMEOUT="$2"; shift 2 ;;
     --commit) COMMIT="$2"; shift 2 ;;
     --list) LIST_ONLY=1; shift ;;
-    -h | --help) sed -n '2,30p' "$0"; exit 0 ;;
+    -h | --help) sed -n '2,53p' "$0"; exit 0 ;;
     *) echo "smoke: unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -62,10 +79,15 @@ done
 [[ -f "$CASES_FILE" ]] || { echo "smoke: missing case table: $CASES_FILE" >&2; exit 2; }
 [[ -d "$SERVER_DIR" ]] || { echo "smoke: server dir not found: $SERVER_DIR" >&2; exit 2; }
 
-# The ten cases, in order. T10/T43 have no rows in the table: blocked.
+# The ten cases, in order. T10/T43 have no rows in the table: they are
+# exceptions by design (see exception_reason).
 CASES=(T01 T04 T06 T10 T13 T19 T22 T26 T36 T43)
 
-blocked_reason() {
+# exception_reason <case-id>: non-empty only for the by-design exceptions
+# (a real PC + real model/DSH; this environment can never run them).
+# Any other case that produces no evidence is a gate failure, not an
+# exception.
+exception_reason() {
   case "$1" in
     T10) echo "needs a real PC + real model; cannot run headless" ;;
     T43) echo "needs a real PC + DSH + isolated environment; cannot run headless" ;;
@@ -75,9 +97,9 @@ blocked_reason() {
 
 if [[ "$LIST_ONLY" == "1" ]]; then
   for case_id in "${CASES[@]}"; do
-    reason="$(blocked_reason "$case_id")"
+    reason="$(exception_reason "$case_id")"
     if [[ -n "$reason" ]]; then
-      echo "$case_id blocked: $reason"
+      echo "$case_id exception: $reason"
       continue
     fi
     while IFS=$'\t' read -r c pkg test_name; do
@@ -97,7 +119,7 @@ if [[ -n "${CH_TEST_DATABASE_URL:-}" ]]; then
   TEST_DB="set"
 else
   TEST_DB="unset"
-  echo "smoke: CH_TEST_DATABASE_URL is not set; PostgreSQL-backed tests will skip and be recorded as blocked"
+  echo "smoke: CH_TEST_DATABASE_URL is not set; PostgreSQL-backed tests will skip and are recorded as exceptions when a case has no other runnable test"
 fi
 
 STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -109,7 +131,7 @@ RESULTS_DIR="$TMPDIR_SMOKE/results"
 mkdir -p "$RESULTS_DIR"
 pass_count=0
 fail_count=0
-blocked_count=0
+exception_count=0
 
 # run_case <case-id>: runs the case's tests, writes one line per test
 # (name, package, status) to $RESULTS_DIR/<case-id>.tsv and prints the
@@ -117,10 +139,10 @@ blocked_count=0
 run_case() {
   local case_id="$1"
   local reason=""
-  reason="$(blocked_reason "$case_id")"
+  reason="$(exception_reason "$case_id")"
   if [[ -n "$reason" ]]; then
-    printf 'blocked\t%s\n' "$reason" >"$RESULTS_DIR/$case_id.status"
-    echo "$case_id: BLOCKED ($reason)"
+    printf 'exception\t%s\n' "$reason" >"$RESULTS_DIR/$case_id.status"
+    echo "$case_id: EXCEPTION-GATE NOTICE ($reason)"
     return 0
   fi
   # Group the case's tests by package: one `go test` per package.
@@ -128,8 +150,10 @@ run_case() {
   local -a pkgs
   mapfile -t pkgs < <(awk -F'\t' -v c="$case_id" '$1 == c {print $2}' "$CASES_FILE" | sort -u)
   if [[ "${#pkgs[@]}" == "0" ]]; then
-    printf 'blocked\t%s\n' "no mapped tests" >"$RESULTS_DIR/$case_id.status"
-    echo "$case_id: BLOCKED (no mapped tests)"
+    # No mapped tests and no by-design reason: the mapping went stale.
+    # Missing evidence is a failure.
+    printf 'fail\t%s\n' "no mapped tests" >"$RESULTS_DIR/$case_id.status"
+    echo "$case_id: FAIL (no mapped tests)"
     return 0
   fi
   local case_failed=0
@@ -181,13 +205,29 @@ run_case() {
     fi
   done
   if [[ "$case_failed" == "1" ]]; then
-    echo "fail" >"$RESULTS_DIR/$case_id.status"
+    printf 'fail\t%s\n' "a mapped test failed or was not found" >"$RESULTS_DIR/$case_id.status"
     echo "$case_id: FAIL"
   elif [[ "$case_ran" == "0" ]]; then
-    local why="no mapped test ran"
-    [[ "$case_skipped" == "1" ]] && why="all mapped tests skipped (no test database?)"
-    printf 'blocked\t%s\n' "$why" >"$RESULTS_DIR/$case_id.status"
-    echo "$case_id: BLOCKED ($why)"
+    # Fail-closed: no evidence is a failure, unless the missing test
+    # database fully explains the skip — every mapped test is
+    # PostgreSQL-backed and CH_TEST_DATABASE_URL is not set. The
+    # script already warns about the missing test database above, so
+    # this is a detected environment limitation, not missing evidence
+    # the environment should have produced.
+    local all_pg=1
+    local _tname tpkg _tstatus
+    while IFS=$'\t' read -r _tname tpkg _tstatus; do
+      [[ "$tpkg" == "internal/store/postgres" ]] || all_pg=0
+    done <"$RESULTS_DIR/$case_id.tsv"
+    if [[ -z "${CH_TEST_DATABASE_URL:-}" && "$all_pg" == "1" ]]; then
+      printf 'exception\t%s\n' "all mapped tests skipped: no test database (CH_TEST_DATABASE_URL is not set)" >"$RESULTS_DIR/$case_id.status"
+      echo "$case_id: EXCEPTION-GATE NOTICE (all mapped tests skipped: no test database)"
+    else
+      local why="no mapped test ran"
+      [[ "$case_skipped" == "1" ]] && why="all mapped tests skipped"
+      printf 'fail\t%s\n' "$why" >"$RESULTS_DIR/$case_id.status"
+      echo "$case_id: FAIL ($why)"
+    fi
   else
     echo "pass" >"$RESULTS_DIR/$case_id.status"
     if [[ "$case_skipped" == "1" ]]; then
@@ -214,6 +254,7 @@ FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   echo "  \"test_database\": \"$TEST_DB\","
   echo "  \"cases\": ["
   first_case=1
+  exception_ids=""
   for case_id in "${CASES[@]}"; do
     [[ "$first_case" == "1" ]] || echo ","
     first_case=0
@@ -222,7 +263,12 @@ FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     case "$status" in
       pass) pass_count=$((pass_count + 1)) ;;
       fail) fail_count=$((fail_count + 1)) ;;
-      *) blocked_count=$((blocked_count + 1)) ;;
+      exception)
+        exception_count=$((exception_count + 1))
+        exception_ids="$exception_ids $case_id"
+        ;;
+      # An unreadable status file is missing evidence: fail closed.
+      *) fail_count=$((fail_count + 1)) ;;
     esac
     printf '    {"id": "%s", "status": "%s", "reason": "%s", "tests": [' "$case_id" "$status" "$reason"
     first_test=1
@@ -237,11 +283,14 @@ FINISHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   done
   echo ""
   echo "  ],"
-  echo "  \"summary\": {\"pass\": $pass_count, \"fail\": $fail_count, \"blocked\": $blocked_count}"
+  echo "  \"summary\": {\"pass\": $pass_count, \"fail\": $fail_count, \"exception\": $exception_count}"
   echo "}"
 } >"$RECORD"
 
-echo "smoke: pass=$pass_count fail=$fail_count blocked=$blocked_count (record: $RECORD)"
+echo "smoke: pass=$pass_count fail=$fail_count exception=$exception_count (record: $RECORD)"
+if [[ "$exception_count" != "0" ]]; then
+  echo "smoke: EXCEPTION-GATE NOTICE —$exception_ids could not run in this environment and were not counted as failures; the deploy proceeds with the reduced evidence on record (see the record for the reasons)"
+fi
 if [[ "$fail_count" != "0" ]]; then
   echo "smoke: FAILED — see the record for the failing tests; the deploy is blocked"
   exit 1

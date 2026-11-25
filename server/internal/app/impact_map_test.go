@@ -1,6 +1,8 @@
 package app
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"reflect"
@@ -9,6 +11,7 @@ import (
 
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 // memoryImpactFileIndex is the in-memory FileIndex fake for impact tests: no
@@ -434,5 +437,55 @@ func TestExecuteImpactMapRequiresWorkspaceTools(t *testing.T) {
 		Arguments: `{"expected_revision":3,"component":"internal/core/engine.go"}`}
 	if _, err := broker.executeImpactMap(t.Context(), task.Task{}, call, false, nil); err == nil {
 		t.Fatal("impact map executed without workspace tools")
+	}
+}
+
+func TestExecuteImpactMapPersistsMapForRegressionGate(t *testing.T) {
+	const componentContent = "package auth\n\nfunc Session() string { return \"session\" }\n"
+	const callerContent = "package auth\n\nfunc Login() string { return Session() }\n"
+	const coveringContent = "package auth\n\nfunc TestSession() {}\n"
+	component := syncServiceFile("auth/session.go", []byte(componentContent))
+	caller := syncServiceFile("auth/login.go", []byte(callerContent))
+	covering := syncServiceFile("auth/session_test.go", []byte(coveringContent))
+	tools, _, blocks, current := newCloudDSHT08WorkspaceTools(t, []workspace.File{component, caller, covering}, nil, nil)
+	blocks.data[component.SHA256] = []byte(componentContent)
+	blocks.data[caller.SHA256] = []byte(callerContent)
+	blocks.data[covering.SHA256] = []byte(coveringContent)
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-workspace", 1, "session-root"
+	current.CurrentRevision = int64PointerForWorkspaceTools(0)
+	current.Authorization.Version = 1
+	fixture.store.details.Task = current
+	fixture.executor.workspaces = tools.workspaces
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealer, err := NewSealer(bytes.Repeat([]byte{9}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "impact-call", Name: cloudDSHImpactMapToolName,
+		Arguments: `{"expected_revision":0,"component":"auth/session.go"}`,
+		TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+			AuthorizationVersion: current.Authorization.Version}}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, sealer)
+	result, err := broker.executeImpactMap(ctx, current, call, false, nil)
+	if err != nil || result.Status != AgentToolSucceeded {
+		t.Fatalf("impact map result = %#v, err = %v", result, err)
+	}
+	impact, ok := impactMapFromEvents(store.events)
+	if !ok {
+		t.Fatalf("no impact map recorded in events: %d events", len(store.events))
+	}
+	if impact.Component != "auth/session.go" || len(impact.Callers) != 1 || impact.Callers[0] != "auth/login.go" ||
+		len(impact.CoveringTests) != 1 || impact.CoveringTests[0] != "auth/session_test.go" {
+		t.Fatalf("recorded impact map = %#v; want the session surface", impact)
 	}
 }

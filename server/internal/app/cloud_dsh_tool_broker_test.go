@@ -33,6 +33,14 @@ type cloudDSHBrokerTaskStore struct {
 	committedTaskProgress   []TaskProgress
 }
 
+// ListTaskEvents returns the events the fake recorded, in order. The broker's
+// E02 coverage check reads the recorded impact map from them.
+func (s *cloudDSHBrokerTaskStore) ListTaskEvents(_ context.Context, _, _ string, _ int64, _ int32) ([]task.Event, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]task.Event(nil), s.events...), nil
+}
+
 func TestValidCloudDSHToolImagesAllowsBoundedTaskAttachmentImages(t *testing.T) {
 	var encoded bytes.Buffer
 	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {

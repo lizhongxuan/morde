@@ -51,8 +51,13 @@ func (s *ModelGatewayService) CompleteTaskValidationReviewDSHModel(ctx context.C
 	if err != nil {
 		return ModelResponse{}, err
 	}
-	response, err := s.Complete(ctx, ModelCall{Source: ModelCallReview, Review: &fence, ModelID: modelID,
-		CallID: callID, RawRequest: raw, Request: request})
+	// The review worker requeues a failed review after 30s, but that retries
+	// the whole review claim. The E12 ladder retries just the model call
+	// first, so a transient provider failure does not pay for a full requeue.
+	response, err := s.completeWithRetry(ctx, func(ctx context.Context) (ModelResponse, error) {
+		return s.Complete(ctx, ModelCall{Source: ModelCallReview, Review: &fence, ModelID: modelID,
+			CallID: callID, RawRequest: raw, Request: request})
+	})
 	if err == nil && response.TaskValidationReview != nil {
 		response.TaskValidationReview.SessionID = fence.SessionID
 		response.TaskValidationReview.ThroughSequence = fence.ThroughSequence

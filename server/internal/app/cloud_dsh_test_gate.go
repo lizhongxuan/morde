@@ -240,6 +240,74 @@ func evaluateTestGate(steps []task.Step) testGateResult {
 	return result
 }
 
+// impactMapFromEvents returns the latest recorded impact map for a task: the
+// most recent succeeded morde_impact_map step event carrying a map in its
+// detail. Older maps, failed maps, and events from other tools are ignored.
+// The map is written by executeImpactMap; a task whose agent never ran the
+// tool has no map, which the coverage check reports instead of assuming one.
+func impactMapFromEvents(events []task.Event) (ImpactMap, bool) {
+	var found ImpactMap
+	ok := false
+	for _, event := range events {
+		if event.Type != "task.step" {
+			continue
+		}
+		var payload struct {
+			Detail map[string]any `json:"detail"`
+		}
+		if json.Unmarshal(event.Payload, &payload) != nil {
+			continue
+		}
+		if payload.Detail["tool"] != cloudDSHImpactMapToolName ||
+			payload.Detail["operation_status"] != string(AgentToolSucceeded) {
+			continue
+		}
+		raw, present := payload.Detail["impact_map"]
+		if !present {
+			continue
+		}
+		encoded, err := json.Marshal(raw)
+		if err != nil {
+			continue
+		}
+		var impact ImpactMap
+		if json.Unmarshal(encoded, &impact) != nil {
+			continue
+		}
+		found, ok = impact, true
+	}
+	return found, ok
+}
+
+// impactCoverageMissing describes what the E02 regression对照 still lacks
+// for a fix task, or "" when the recorded impact surface is covered. It runs
+// only after both E07 halves pass (step 7 before step 8): the test halves
+// block first when the suite has not passed. A passing full-suite run counts
+// the map's covering tests as tested — a no-selection suite command runs
+// every test in the workspace, including them — so an impact file is covered
+// when it was changed by the fix or is one of those tests. Anything else in
+// the surface (an unchanged dependency or caller with no covering test)
+// blocks completion and is named, so the agent knows which file to cover.
+// The message is an instruction to the agent, never a user question.
+func impactCoverageMissing(details TaskDetails, impact ImpactMap, recorded bool) string {
+	if details.Plan == nil || details.Plan.FixPlan == nil {
+		return ""
+	}
+	if !evaluateTestGate(details.Steps).fullSuitePassed {
+		return ""
+	}
+	if !recorded {
+		return "the impact map has not been recorded for this fix; run morde_impact_map for the component before completing"
+	}
+	coverage := CheckImpactCoverage(impact, details.Plan.FixPlan.ChangedFiles, impact.CoveringTests)
+	if len(coverage.Uncovered) == 0 {
+		return ""
+	}
+	return "the regression does not cover these impact files, which were neither changed nor covered by a passing test: " +
+		strings.Join(coverage.Uncovered, ", ") +
+		"; run tests that cover them, or change them as part of the fix, before completing"
+}
+
 // testGateMissing describes what the E07 gate still lacks for a fix task, or
 // "" when the gate passes. Tasks without a fix plan are unaffected. The
 // message names the missing half so the agent knows which run to do next;

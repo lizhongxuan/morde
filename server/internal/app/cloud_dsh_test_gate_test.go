@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -300,6 +301,7 @@ func TestTestGateComplete(t *testing.T) {
 		name       string
 		plan       *task.Plan
 		steps      []task.Step
+		events     []task.Event
 		wantGate   bool
 		wantSubstr string
 	}{
@@ -340,7 +342,11 @@ func TestTestGateComplete(t *testing.T) {
 					ToolName: runtimeToolShellExec, FailureReason: taskToolTestPassedReason, RequestDigest: targeted},
 				{ID: "s3", Kind: "tool", Status: task.StepSucceeded, Sequence: 3,
 					ToolName: runtimeToolShellExec, FailureReason: taskToolTestSuitePassedReason, RequestDigest: suite},
-			}},
+			},
+			// The E02 half needs a recorded map too: this surface is
+			// covered (the changed file plus the covering test the suite ran).
+			events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded",
+				ImpactMap{Component: "auth/session.go", CoveringTests: []string{"auth/session_test.go"}})}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRuntimeToolExecutorFixture(t, nil)
@@ -354,6 +360,9 @@ func TestTestGateComplete(t *testing.T) {
 					test.steps[index].TaskID = store.details.Task.ID
 				}
 				store.details.Steps = test.steps
+			}
+			if test.events != nil {
+				store.events = append(store.events, test.events...)
 			}
 			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
 			if err != nil {
@@ -431,4 +440,194 @@ func TestTestGateHostlessCompleteExempt(t *testing.T) {
 		t.Fatalf("hostless fix task was blocked by the test gate: status=%q waiting=%q result=%q",
 			store.details.Task.Status, store.details.Task.WaitingReason, store.details.Task.Result)
 	}
+}
+
+func impactMapEventForTest(t *testing.T, tool, status string, impact any) task.Event {
+	t.Helper()
+	detail := map[string]any{"tool": tool, "operation_status": status}
+	if impact != nil {
+		detail["impact_map"] = impact
+	}
+	payload, err := json.Marshal(map[string]any{"detail": detail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return task.Event{Type: "task.step", Sequence: 1, Payload: payload}
+}
+
+func impactMapForTest() ImpactMap {
+	return ImpactMap{
+		Component:     "auth/session.go",
+		Dependencies:  []string{"auth/token.go"},
+		Callers:       []string{"auth/login.go"},
+		CoveringTests: []string{"auth/session_test.go"},
+	}
+}
+
+func TestImpactMapFromEvents(t *testing.T) {
+	impact := impactMapForTest()
+	cases := []struct {
+		name   string
+		events []task.Event
+		want   bool
+	}{
+		{name: "no events", events: nil, want: false},
+		{name: "other tool", events: []task.Event{impactMapEventForTest(t, "morde_workspace_read", "succeeded", impact)}, want: false},
+		{name: "failed map", events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "failed", impact)}, want: false},
+		{name: "succeeded without map", events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", nil)}, want: false},
+		{name: "succeeded with map", events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", impact)}, want: true},
+		{name: "non-step event", events: []task.Event{{Type: "task.status", Payload: impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", impact).Payload}}, want: false},
+		{name: "malformed payload", events: []task.Event{{Type: "task.step", Payload: []byte("{not json")}}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := impactMapFromEvents(tc.events)
+			if ok != tc.want {
+				t.Fatalf("impactMapFromEvents() ok = %v; want %v", ok, tc.want)
+			}
+			if ok && (got.Component != impact.Component || len(got.Callers) != 1 || got.Callers[0] != "auth/login.go") {
+				t.Fatalf("impactMapFromEvents() = %#v; want %#v", got, impact)
+			}
+		})
+	}
+	t.Run("latest map wins", func(t *testing.T) {
+		older := ImpactMap{Component: "auth/session.go", Callers: []string{"auth/old.go"}}
+		newer := ImpactMap{Component: "auth/session.go", Callers: []string{"auth/new.go"}}
+		got, ok := impactMapFromEvents([]task.Event{
+			impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", older),
+			impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", newer),
+		})
+		if !ok || len(got.Callers) != 1 || got.Callers[0] != "auth/new.go" {
+			t.Fatalf("latest map = %#v, ok=%v; want the newer map", got, ok)
+		}
+	})
+}
+
+func TestImpactCoverageMissing(t *testing.T) {
+	current := task.Task{ID: "q1234567"}
+	fixDetails := func(changed []string, steps []task.Step) TaskDetails {
+		return TaskDetails{Task: current,
+			Plan:  &task.Plan{FixPlan: &task.FixPlan{ChangedFiles: changed}},
+			Steps: steps}
+	}
+	impact := impactMapForTest()
+	cases := []struct {
+		name     string
+		details  TaskDetails
+		impact   ImpactMap
+		recorded bool
+		wantSub  string // "" means no missing coverage
+	}{
+		{name: "no fix plan", details: TaskDetails{Task: current, Steps: greenTestStepsForTest(current)}, impact: impact, recorded: true},
+		{name: "suite has not passed", details: fixDetails([]string{"auth/session.go"}, nil), impact: impact, recorded: true},
+		{name: "map not recorded", details: fixDetails([]string{"auth/session.go"}, greenTestStepsForTest(current)), impact: ImpactMap{}, recorded: false, wantSub: "impact map"},
+		{name: "surface fully covered", details: fixDetails([]string{"auth/session.go", "auth/token.go", "auth/login.go"}, greenTestStepsForTest(current)), impact: impact, recorded: true},
+		{name: "covering test counts as tested", details: fixDetails([]string{"auth/session.go", "auth/token.go"}, greenTestStepsForTest(current)),
+			impact: ImpactMap{Component: "auth/session.go", Dependencies: []string{"auth/token.go"}, Callers: []string{"auth/session_test.go"}, CoveringTests: []string{"auth/session_test.go"}}, recorded: true},
+		{name: "unchanged caller uncovered", details: fixDetails([]string{"auth/session.go"}, greenTestStepsForTest(current)), impact: impact, recorded: true, wantSub: "auth/login.go"},
+		{name: "unchanged dependency uncovered", details: fixDetails([]string{"auth/session.go", "auth/login.go"}, greenTestStepsForTest(current)), impact: impact, recorded: true, wantSub: "auth/token.go"},
+		{name: "empty surface", details: fixDetails([]string{"auth/session.go"}, greenTestStepsForTest(current)),
+			impact: ImpactMap{Component: "auth/session.go"}, recorded: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := impactCoverageMissing(tc.details, tc.impact, tc.recorded)
+			if tc.wantSub == "" && got != "" {
+				t.Fatalf("impactCoverageMissing() = %q; want empty", got)
+			}
+			if tc.wantSub != "" && !strings.Contains(got, tc.wantSub) {
+				t.Fatalf("impactCoverageMissing() = %q; want it to contain %q", got, tc.wantSub)
+			}
+		})
+	}
+}
+
+func TestPauseForTestGateBlocksUncoveredImpact(t *testing.T) {
+	setup := func(t *testing.T, changed []string, events []task.Event) (*CloudDSHToolBroker, *cloudDSHBrokerTaskStore, task.Task, task.Step, TaskDetails) {
+		t.Helper()
+		broker, store := newLadderTestBroker(t)
+		current := store.details.Task
+		store.mu.Lock()
+		store.details.Plan = &task.Plan{FixPlan: &task.FixPlan{ChangedFiles: changed}}
+		store.details.Steps = greenTestStepsForTest(current)
+		store.events = append(store.events, events...)
+		store.mu.Unlock()
+		step, err := newAgentStep(current.ID, maxStepSequence(store.details.Steps)+1, "result", task.StepSucceeded,
+			"Complete cloud task", "The cloud dsh session completed.")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return broker, store, current, step, store.details
+	}
+	impact := impactMapForTest()
+	impactEvent := impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", impact)
+
+	t.Run("uncovered caller blocks completion", func(t *testing.T) {
+		broker, store, current, step, details := setup(t, []string{"auth/session.go"}, []task.Event{impactEvent})
+		paused, err := broker.pauseForTestGate(context.Background(), current, step, details)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !paused {
+			t.Fatal("pauseForTestGate() did not pause for an uncovered impact file")
+		}
+		if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "test_gate_failed" {
+			t.Fatalf("task = %+v; want waiting with test_gate_failed", store.details.Task)
+		}
+		last := store.details.Steps[len(store.details.Steps)-1]
+		if !strings.Contains(last.Summary, "auth/login.go") {
+			t.Fatalf("pause summary = %q; want it to name the uncovered caller", last.Summary)
+		}
+	})
+
+	t.Run("covered surface passes", func(t *testing.T) {
+		broker, _, current, step, details := setup(t, []string{"auth/session.go", "auth/token.go", "auth/login.go"}, []task.Event{impactEvent})
+		paused, err := broker.pauseForTestGate(context.Background(), current, step, details)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if paused {
+			t.Fatal("pauseForTestGate() paused a fully covered fix")
+		}
+	})
+
+	t.Run("missing map blocks completion", func(t *testing.T) {
+		broker, store, current, step, details := setup(t, []string{"auth/session.go"}, nil)
+		paused, err := broker.pauseForTestGate(context.Background(), current, step, details)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !paused {
+			t.Fatal("pauseForTestGate() did not pause when no impact map was recorded")
+		}
+		last := store.details.Steps[len(store.details.Steps)-1]
+		if !strings.Contains(last.Summary, "impact map") {
+			t.Fatalf("pause summary = %q; want it to name the missing impact map", last.Summary)
+		}
+	})
+
+	t.Run("missing test halves block before coverage", func(t *testing.T) {
+		broker, store := newLadderTestBroker(t)
+		current := store.details.Task
+		store.mu.Lock()
+		store.details.Plan = &task.Plan{FixPlan: &task.FixPlan{ChangedFiles: []string{"auth/session.go"}}}
+		store.details.Steps = nil
+		store.events = append(store.events, impactEvent)
+		store.mu.Unlock()
+		step, err := newAgentStep(current.ID, 1, "result", task.StepSucceeded, "Complete cloud task", "The cloud dsh session completed.")
+		if err != nil {
+			t.Fatal(err)
+		}
+		paused, err := broker.pauseForTestGate(context.Background(), current, step, store.details)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !paused {
+			t.Fatal("pauseForTestGate() did not pause when the test halves are missing")
+		}
+		last := store.details.Steps[len(store.details.Steps)-1]
+		if !strings.Contains(last.Summary, "full test suite") || strings.Contains(last.Summary, "auth/login.go") {
+			t.Fatalf("pause summary = %q; want the suite message, not the coverage message", last.Summary)
+		}
+	})
 }
