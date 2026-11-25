@@ -368,6 +368,14 @@ func modelConnectionCheckError(err error) error {
 	}
 	result := domain.NewError(code, "model connection check failed")
 	result.Details["reason"] = string(clientErr.Kind)
+	if clientErr.Kind == ModelErrorRateLimited && clientErr.Stage == "provider_status" {
+		if clientErr.RetryAfter > 0 {
+			result.RetryAfter = clientErr.RetryAfter
+		}
+		if clientErr.RetryAfterExceedsDurableHorizon {
+			result.Details["retry_after_exceeds_durable_horizon"] = "true"
+		}
+	}
 	switch clientErr.Stage {
 	case "client_validation", "provider_status":
 		result.Details["stage"] = clientErr.Stage

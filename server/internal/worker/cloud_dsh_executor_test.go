@@ -51,6 +51,11 @@ func TestCloudDSHModelFailureCategoryUsesOnlySafeAllowlistedReason(t *testing.T)
 			providerCode: "context_length_exceeded", want: "provider_context_length_exceeded"},
 		{name: "empty reason requires upstream error code", code: domain.CodeInvalidState, reason: "empty_response", want: "usage_unknown"},
 		{name: "client validation", code: domain.CodeUpstreamError, stage: "client_validation", want: "client_request_invalid"},
+		{name: "provider auth without code", code: domain.CodeUpstreamError, stage: "provider_status", reason: string(app.ModelErrorAuthentication), want: "authentication_rejected"},
+		{name: "provider access without code", code: domain.CodeUpstreamError, stage: "provider_status", reason: string(app.ModelErrorAccess), want: "access_rejected"},
+		{name: "provider rate limit without code", code: domain.CodeRateLimited, stage: "provider_status", reason: string(app.ModelErrorRateLimited), want: "rate_limited"},
+		{name: "provider quota without code", code: domain.CodeUpstreamError, stage: "provider_status", reason: string(app.ModelErrorQuota), want: "quota_exhausted"},
+		{name: "unrecognized provider status", code: domain.CodeUpstreamError, stage: "provider_status", reason: "private provider detail", want: "provider_request_rejected"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			modelFailure := domain.NewError(test.code, "provider request failed")
@@ -1789,6 +1794,44 @@ func TestCloudDSHModelFailureWaitsForConfirmedStopBeforeRecovery(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCloudDSHExecutorPausesUnconfirmedModelFailures(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		failure  error
+		category string
+	}{
+		{name: "unconfirmed usage", failure: domain.NewError(domain.CodeInvalidState, "usage requires reconciliation"), category: "usage_unknown"},
+		{name: "provider rate limit", failure: domain.NewError(domain.CodeRateLimited, "synthetic limit"), category: "rate_limited"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			executor, _, _, _, models, value := cloudDSHFixture(t)
+			tools := &cloudDSHModelPauseCapture{cloudDSHTestTools: &cloudDSHTestTools{}}
+			executor.options.Tools = tools
+			models.complete = func(context.Context, app.ModelCall) (app.ModelResponse, error) {
+				return app.ModelResponse{}, test.failure
+			}
+			if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, errCloudDSHModelResultUnavailable) {
+				t.Fatalf("model failure = %v", err)
+			}
+			if len(models.calls) != 1 || tools.pauseCalls != 1 || tools.diagnostic.Category != test.category {
+				t.Fatalf("model calls=%d pauses=%d diagnostic=%+v", len(models.calls), tools.pauseCalls, tools.diagnostic)
+			}
+		})
+	}
+}
+
+type cloudDSHModelPauseCapture struct {
+	*cloudDSHTestTools
+	pauseCalls int
+	diagnostic app.AgentModelFailureDiagnostic
+}
+
+func (s *cloudDSHModelPauseCapture) PauseModelRecoveryDiagnostic(_ context.Context, _ task.Task, diagnostic app.AgentModelFailureDiagnostic) error {
+	s.pauseCalls++
+	s.diagnostic = diagnostic
+	return nil
 }
 
 func cloudDSHTestUserPrompt(t *testing.T, call app.ModelCall) string {

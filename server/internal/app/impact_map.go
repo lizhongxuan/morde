@@ -1,13 +1,12 @@
 // Impact mapping for the "fix a core component" flow (E02).
 //
 // AnalyzeImpactMap builds the impact surface of one workspace component from
-// text and import references: the files the component directly depends on,
-// the files that call into it, and the tests that cover it. The mapping is
+// text and import references: possible dependencies and callers, plus
+// candidate tests. The mapping is
 // heuristic, not an exact call graph: imports are matched textually against
 // workspace paths, callers are found by import or by the appearance of the
-// component's exported symbol names, and test coverage is by file location or
-// reference. Exact call relationships need AST parsing; that is a later step,
-// not this one.
+// component's exported symbol names, and test candidates are found by file
+// location or reference. It does not prove a test ran or covered a file.
 //
 // The analysis never touches the DSH runtime or the database. It only reads
 // through the FileIndex supplied by the caller; production callers adapt a
@@ -32,25 +31,14 @@ type FileIndex interface {
 	ReadFile(path string) (string, error)
 }
 
-// ImpactMap is the impact surface of one component: its direct dependencies,
-// its callers, and the tests covering it. Every list is sorted and
-// deduplicated; empty lists are empty, never nil.
+// ImpactMap is a heuristic impact surface. CoveringTests is retained as a
+// field name for compatibility, but it lists candidates, not proven coverage.
+// Every list is sorted and deduplicated; empty lists are empty, never nil.
 type ImpactMap struct {
 	Component     string   `json:"component"`
 	Dependencies  []string `json:"dependencies"`
 	Callers       []string `json:"callers"`
 	CoveringTests []string `json:"covering_tests"`
-}
-
-// ImpactCoverage compares an impact map against the files actually changed
-// and tested, for the regression step of the fix flow. Covered lists the
-// impact files that were changed or tested; Uncovered lists the impact files
-// that were neither changed nor tested. Files outside the impact surface are
-// not reported here; keeping a change inside the impact surface is a separate
-// gate (E06), not this comparison.
-type ImpactCoverage struct {
-	Covered   []string `json:"covered"`
-	Uncovered []string `json:"uncovered"`
 }
 
 // AnalyzeImpactMap returns the impact surface of componentPath in the
@@ -120,34 +108,6 @@ func AnalyzeImpactMap(files FileIndex, componentPath string) (ImpactMap, error) 
 	result.Callers = sortedUnique(result.Callers)
 	result.CoveringTests = sortedUnique(result.CoveringTests)
 	return result, nil
-}
-
-// CheckImpactCoverage reports which files of the impact surface were neither
-// changed nor tested. The component itself is the change under review, not
-// part of the surface, so it is never listed as uncovered. Changed or tested
-// files outside the impact surface are ignored here.
-func CheckImpactCoverage(impact ImpactMap, changedFiles []string, testedFiles []string) ImpactCoverage {
-	impacted := sortedUnique(append(append(append([]string{}, impact.Dependencies...), impact.Callers...), impact.CoveringTests...))
-	changed := make(map[string]bool, len(changedFiles))
-	for _, file := range changedFiles {
-		changed[file] = true
-	}
-	tested := make(map[string]bool, len(testedFiles))
-	for _, file := range testedFiles {
-		tested[file] = true
-	}
-	coverage := ImpactCoverage{Covered: []string{}, Uncovered: []string{}}
-	for _, file := range impacted {
-		if file == impact.Component {
-			continue
-		}
-		if changed[file] || tested[file] {
-			coverage.Covered = append(coverage.Covered, file)
-		} else {
-			coverage.Uncovered = append(coverage.Uncovered, file)
-		}
-	}
-	return coverage
 }
 
 func sortedUnique(values []string) []string {

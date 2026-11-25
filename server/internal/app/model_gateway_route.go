@@ -92,19 +92,7 @@ func conversationRouteProviderError(err error) error {
 		routeErr.Details["provider_code"] = "context_length_exceeded"
 		return routeErr
 	}
-	result := modelConnectionCheckError(err)
-	if errors.As(err, &clientErr) && clientErr.Kind == ModelErrorRateLimited && clientErr.Stage == "provider_status" {
-		var routeErr *domain.Error
-		if errors.As(result, &routeErr) && routeErr.Code == domain.CodeRateLimited {
-			if clientErr.RetryAfter > 0 {
-				routeErr.RetryAfter = clientErr.RetryAfter
-			}
-			if clientErr.RetryAfterExceedsDurableHorizon {
-				routeErr.Details["retry_after_exceeds_durable_horizon"] = "true"
-			}
-		}
-	}
-	return result
+	return modelConnectionCheckError(err)
 }
 
 func confirmedConversationRouteRejection(err error) bool {

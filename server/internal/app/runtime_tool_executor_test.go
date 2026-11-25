@@ -2582,7 +2582,7 @@ func newRuntimeToolExecutorFixture(t *testing.T, specs []runtimeToolHandlerSpec)
 		ID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", HostID: "h1234567", ModelID: "p1234567", WorkspaceID: "w1234567",
 		InputRevision: &inputRevision, WorkspaceCheckpointRevision: &inputRevision,
 		CurrentRevision: &taskRevision, DesiredRevision: &taskRevision,
-		Status: task.StatusRunning, Authorization: task.Authorization{Kind: string(identity.KindSession)},
+		Status: task.StatusRunning, FileDeliveryIntent: task.FileDeliveryNone, Authorization: task.Authorization{Kind: string(identity.KindSession)},
 		Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
 		Lease:  task.Lease{Owner: "worker-1", Version: 1, ExpiresAt: &expires},
 	}

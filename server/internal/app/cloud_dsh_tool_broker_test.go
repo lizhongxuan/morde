@@ -33,6 +33,14 @@ type cloudDSHBrokerTaskStore struct {
 	committedTaskProgress   []TaskProgress
 }
 
+// ListTaskEvents returns the events the fake recorded, in order. The broker's
+// E02 coverage check reads the recorded impact map from them.
+func (s *cloudDSHBrokerTaskStore) ListTaskEvents(_ context.Context, _, _ string, _ int64, _ int32) ([]task.Event, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]task.Event(nil), s.events...), nil
+}
+
 func TestValidCloudDSHToolImagesAllowsBoundedTaskAttachmentImages(t *testing.T) {
 	var encoded bytes.Buffer
 	if err := png.Encode(&encoded, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
@@ -2399,6 +2407,42 @@ func TestCloudDSHToolBrokerCompletesHostTaskWithoutFileOutput(t *testing.T) {
 	}
 }
 
+func TestCloudDSHCompletionRejectsInvalidPersistedFileIntent(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		intent    task.FileDeliveryIntent
+		objective string
+		stale     bool
+	}{
+		{name: "missing intent", objective: "Answer in chat."},
+		{name: "unknown intent", intent: "invalid", objective: "Save a report."},
+		{name: "stale completion", intent: "invalid", objective: "Answer in chat.", stale: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, nil)
+			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+			fixture.executor.store = store
+			store.details.Task.Objective = test.objective
+			store.details.Task.FileDeliveryIntent = test.intent
+			setCloudDSHCompletionFence(&store.details.Task)
+			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			claimed := store.details.Task
+			completion := cloudDSHCompletionFor(claimed, "Done.", nil)
+			if test.stale {
+				completion.CheckpointThroughSequence++
+			}
+			err = broker.Complete(context.Background(), claimed, completion)
+			if domain.CodeOf(err) != domain.CodeInvalidState || store.details.Task.Status != task.StatusRunning ||
+				store.details.Task.Result != "" || len(store.details.Steps) != 0 {
+				t.Fatalf("invalid intent completed or changed task: error=%v task=%+v steps=%+v", err, store.details.Task, store.details.Steps)
+			}
+		})
+	}
+}
+
 func TestCloudDSHToolBrokerDoesNotPublishUnverifiedFileClaim(t *testing.T) {
 	for _, test := range []struct {
 		name, result string
@@ -2519,6 +2563,10 @@ func TestCloudDSHToolBrokerPausesWhenTaskTextRequiresMissingFile(t *testing.T) {
 			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
 			fixture.executor.store = store
 			store.details.Task.Objective = test.objective
+			store.details.Task.FileDeliveryIntent = task.FileDeliveryRequired
+			if test.wantClarification {
+				store.details.Task.FileDeliveryIntent = task.FileDeliveryUnclear
+			}
 			if test.hostless {
 				store.details.Task.HostID = ""
 			}

@@ -42,6 +42,16 @@ type Case struct {
 	Input        string            `json:"input"`
 	Expected     string            `json:"expected_behavior"`
 	Expectations []CaseExpectation `json:"expectations"`
+	// Live-suite-only optional fields (see the live suite, §4.2 of the
+	// evaluation requirements): environment preparation, the approval
+	// operation script, and the run cost cap in micro-units (same unit
+	// as project Budget LimitMicros / PendingRequest ThisCostMicros;
+	// the currency follows the project's rate snapshot). Over budget,
+	// side_effect_control scores 0. All three are absent on synthetic
+	// cases.
+	Setup          string   `json:"setup,omitempty"`
+	ApprovalScript string   `json:"approval_script,omitempty"`
+	CostBudget     *float64 `json:"cost_budget,omitempty"`
 }
 
 type CaseExpectation struct {
@@ -125,6 +135,15 @@ func requiredCoverageTags() []string {
 		"approval", "replay", "tool_unavailable", "prompt_injection"}
 }
 
+// requiredLiveCoverageTags is the live-scripted suite's coverage bar
+// (evaluation requirements §4.2): the 24 PC-CHAT cases plus one tag per
+// specialist group (classification, error recovery, approval, cost,
+// multi-turn merge, replay).
+func requiredLiveCoverageTags() []string {
+	return []string{"pc-chat", "classification", "error_recovery", "approval",
+		"cost", "multi_turn_merge", "replay"}
+}
+
 func LoadSuite(raw []byte) (Suite, error) {
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -147,8 +166,12 @@ func LoadSuite(raw []byte) (Suite, error) {
 
 func ValidateSuite(suite Suite) error {
 	rubricIDs := requiredRubricIDs()
+	live := suite.DataClass == "live-scripted"
 	coverageTags := requiredCoverageTags()
-	if !validBoundedText(suite.Version, maxSuiteVersionBytes) || suite.DataClass != "synthetic" || len(suite.Rubric) != len(rubricIDs) || len(suite.Cases) < len(coverageTags) {
+	if live {
+		coverageTags = requiredLiveCoverageTags()
+	}
+	if !validBoundedText(suite.Version, maxSuiteVersionBytes) || (suite.DataClass != "synthetic" && !live) || len(suite.Rubric) != len(rubricIDs) || len(suite.Cases) < len(coverageTags) {
 		return errors.New("evaluation suite version, rubric, or case count is invalid")
 	}
 	rubric := make(map[string]RubricCriterion, len(suite.Rubric))
@@ -161,9 +184,13 @@ func ValidateSuite(suite Suite) error {
 	cases := make(map[string]struct{}, len(suite.Cases))
 	coverage := make(map[string]struct{}, len(coverageTags))
 	for _, testCase := range suite.Cases {
-		if !validCaseID(testCase.ID) || (testCase.Priority != "P0" && testCase.Priority != "P1") ||
+		if !validCaseID(testCase.ID) || !validPriority(testCase.Priority, live) ||
 			!validBoundedText(testCase.Input, maxCaseInputBytes) || !validBoundedText(testCase.Expected, maxExpectedBytes) ||
-			len(testCase.Expectations) != len(suite.Rubric) {
+			len(testCase.Expectations) != len(suite.Rubric) ||
+			!validOptionalCaseField(testCase.Setup, maxExpectedBytes) ||
+			!validOptionalCaseField(testCase.ApprovalScript, maxExpectedBytes) ||
+			(testCase.CostBudget != nil && *testCase.CostBudget <= 0) ||
+			(!live && (testCase.Setup != "" || testCase.ApprovalScript != "" || testCase.CostBudget != nil)) {
 			return fmt.Errorf("evaluation case %q is invalid", testCase.ID)
 		}
 		if _, duplicate := cases[testCase.ID]; duplicate {
@@ -349,16 +376,49 @@ func validJudgmentEvidenceRef(ref EvidenceReference, output string, evidence map
 
 func validCaseID(value string) bool {
 	parts := strings.Split(value, "-")
-	if len(parts) != 3 || parts[0] != "AIC" || len(parts[1]) != 1 || len(parts[2]) != 2 ||
-		(parts[1] != "H" && parts[1] != "C" && parts[1] != "E") {
-		return false
+	switch {
+	case len(parts) == 3 && parts[0] == "AIC":
+		if len(parts[1]) != 1 || len(parts[2]) != 2 ||
+			(parts[1] != "H" && parts[1] != "C" && parts[1] != "E") {
+			return false
+		}
+		return allDigits(parts[2])
+	case len(parts) == 3 && parts[0] == "PC" && parts[1] == "CHAT":
+		// Live PC-CHAT cases: PC-CHAT-001 to PC-CHAT-024.
+		return len(parts[2]) == 3 && allDigits(parts[2])
+	case len(parts) == 2:
+		// Live specialist cases: CLS/REC/APR/CST/MRG/RPL-NN.
+		switch parts[0] {
+		case "CLS", "REC", "APR", "CST", "MRG", "RPL":
+			return len(parts[1]) == 2 && allDigits(parts[1])
+		}
 	}
-	for _, char := range parts[2] {
+	return false
+}
+
+func allDigits(value string) bool {
+	for _, char := range value {
 		if char < '0' || char > '9' {
 			return false
 		}
 	}
-	return true
+	return len(value) > 0
+}
+
+// validPriority: P2 exists only in the live suite, inherited from the
+// PC-CHAT source (PC-CHAT-015 is P2); the synthetic contract layer
+// stays P0/P1.
+func validPriority(priority string, live bool) bool {
+	if priority == "P0" || priority == "P1" {
+		return true
+	}
+	return live && priority == "P2"
+}
+
+// validOptionalCaseField: an absent field is fine; a present one must
+// be trimmed bounded text (no padding, no NUL, valid UTF-8).
+func validOptionalCaseField(value string, limit int) bool {
+	return value == "" || validBoundedText(value, limit)
 }
 
 func validBoundedText(value string, limit int) bool {

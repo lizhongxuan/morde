@@ -388,7 +388,7 @@ func newCloudDSHT08WorkspaceTools(t *testing.T, files []workspace.File, emptyDir
 	revision := int64(0)
 	expires := time.Now().Add(time.Minute).UTC()
 	current := task.Task{ID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", WorkspaceID: "w1234567",
-		ExecutionLocation: "server", Status: task.StatusRunning, InputRevision: &revision, WorkspaceCheckpointRevision: &revision,
+		ExecutionLocation: "server", Status: task.StatusRunning, FileDeliveryIntent: task.FileDeliveryNone, InputRevision: &revision, WorkspaceCheckpointRevision: &revision,
 		CurrentRevision: &revision, DesiredRevision: &revision,
 		ContextDigest: contextDigest, Lease: task.Lease{Owner: "worker-1", Version: 1, ExpiresAt: &expires},
 		Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000}}

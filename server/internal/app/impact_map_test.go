@@ -1,14 +1,18 @@
 package app
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"reflect"
 	"sort"
+	"strings"
 	"testing"
 
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 // memoryImpactFileIndex is the in-memory FileIndex fake for impact tests: no
@@ -249,74 +253,13 @@ func TestAnalyzeImpactMapExternalDependenciesAreExcluded(t *testing.T) {
 	}
 }
 
-func TestCheckImpactCoverage(t *testing.T) {
-	impact := ImpactMap{Component: "internal/core/engine.go",
-		Dependencies:  []string{"internal/store/store.go", "internal/util/util.go"},
-		Callers:       []string{"internal/app/runner.go"},
-		CoveringTests: []string{"internal/core/engine_test.go"},
-	}
-	tests := []struct {
-		name    string
-		changed []string
-		tested  []string
-		want    ImpactCoverage
-	}{
-		{
-			name:    "fully covered by changes",
-			changed: []string{"internal/core/engine.go", "internal/store/store.go", "internal/util/util.go", "internal/app/runner.go", "internal/core/engine_test.go"},
-			want: ImpactCoverage{
-				Covered:   []string{"internal/app/runner.go", "internal/core/engine_test.go", "internal/store/store.go", "internal/util/util.go"},
-				Uncovered: []string{},
-			},
-		},
-		{
-			name:    "covered by tests counts as covered",
-			changed: []string{"internal/store/store.go"},
-			tested:  []string{"internal/app/runner.go", "internal/core/engine_test.go"},
-			want: ImpactCoverage{
-				Covered:   []string{"internal/app/runner.go", "internal/core/engine_test.go", "internal/store/store.go"},
-				Uncovered: []string{"internal/util/util.go"},
-			},
-		},
-		{
-			name:    "partially uncovered",
-			changed: []string{"internal/store/store.go"},
-			want: ImpactCoverage{
-				Covered:   []string{"internal/store/store.go"},
-				Uncovered: []string{"internal/app/runner.go", "internal/core/engine_test.go", "internal/util/util.go"},
-			},
-		},
-		{
-			name:    "changed file outside the impact surface is ignored",
-			changed: []string{"internal/other/other.go"},
-			want: ImpactCoverage{
-				Covered:   []string{},
-				Uncovered: []string{"internal/app/runner.go", "internal/core/engine_test.go", "internal/store/store.go", "internal/util/util.go"},
-			},
-		},
-		{
-			name:    "empty impact has nothing uncovered",
-			changed: []string{"internal/other/other.go"},
-			want:    ImpactCoverage{Covered: []string{}, Uncovered: []string{}},
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			subject := impact
-			if tc.name == "empty impact has nothing uncovered" {
-				subject = ImpactMap{Component: "internal/core/engine.go", Dependencies: []string{}, Callers: []string{}, CoveringTests: []string{}}
-			}
-			if got := CheckImpactCoverage(subject, tc.changed, tc.tested); !reflect.DeepEqual(got, tc.want) {
-				t.Fatalf("got %+v, want %+v", got, tc.want)
-			}
-		})
-	}
-}
-
 func TestCloudDSHImpactMapDefinition(t *testing.T) {
 	definition := cloudDSHImpactMapDefinition()
 	if definition.Name != "morde_impact_map" {
 		t.Fatalf("unexpected impact map tool name %q", definition.Name)
+	}
+	if !strings.Contains(definition.Description, "candidates only") || !strings.Contains(definition.Description, "does not prove") {
+		t.Fatalf("tool description does not distinguish candidate tests from coverage: %q", definition.Description)
 	}
 	if definition.RequiredScope != identity.ScopeTaskRead {
 		t.Fatalf("impact map must be read-only, got scope %q", definition.RequiredScope)
@@ -434,5 +377,103 @@ func TestExecuteImpactMapRequiresWorkspaceTools(t *testing.T) {
 		Arguments: `{"expected_revision":3,"component":"internal/core/engine.go"}`}
 	if _, err := broker.executeImpactMap(t.Context(), task.Task{}, call, false, nil); err == nil {
 		t.Fatal("impact map executed without workspace tools")
+	}
+}
+
+func TestExecuteImpactMapReturnsCandidatesToAgent(t *testing.T) {
+	const componentContent = "package auth\n\nfunc Session() string { return \"session\" }\n"
+	const callerContent = "package auth\n\nfunc Login() string { return Session() }\n"
+	const coveringContent = "package auth\n\nfunc TestSession() {}\n"
+	component := syncServiceFile("auth/session.go", []byte(componentContent))
+	caller := syncServiceFile("auth/login.go", []byte(callerContent))
+	covering := syncServiceFile("auth/session_test.go", []byte(coveringContent))
+	tools, _, blocks, current := newCloudDSHT08WorkspaceTools(t, []workspace.File{component, caller, covering}, nil, nil)
+	blocks.data[component.SHA256] = []byte(componentContent)
+	blocks.data[caller.SHA256] = []byte(callerContent)
+	blocks.data[covering.SHA256] = []byte(coveringContent)
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-workspace", 1, "session-root"
+	current.CurrentRevision = int64PointerForWorkspaceTools(0)
+	current.Authorization.Version = 1
+	fixture.store.details.Task = current
+	fixture.executor.workspaces = tools.workspaces
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealer, err := NewSealer(bytes.Repeat([]byte{9}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "impact-call", Name: cloudDSHImpactMapToolName,
+		Arguments: `{"expected_revision":0,"component":"auth/session.go"}`,
+		TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+			AuthorizationVersion: current.Authorization.Version}}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, sealer)
+	result, err := broker.executeImpactMap(ctx, current, call, false, nil)
+	if err != nil || result.Status != AgentToolSucceeded {
+		t.Fatalf("impact map result = %#v, err = %v", result, err)
+	}
+	var impact ImpactMap
+	if err := json.Unmarshal([]byte(result.Output), &impact); err != nil {
+		t.Fatalf("decode impact candidates: %v", err)
+	}
+	if impact.Component != "auth/session.go" || len(impact.Callers) != 1 || impact.Callers[0] != "auth/login.go" ||
+		len(impact.CoveringTests) != 1 || impact.CoveringTests[0] != "auth/session_test.go" {
+		t.Fatalf("impact candidates = %#v; want the session surface", impact)
+	}
+}
+
+func TestExecuteImpactMapLiveDirectoryReturnsFailureToAgent(t *testing.T) {
+	tools, _, _, current := newCloudDSHT08WorkspaceTools(t, nil, nil, nil)
+	tools.workspaces.currentDirectory = cloudDSHLiveWorkspaceDirectory{root: t.TempDir()}
+	tools.workspaces.liveDirectorySource = true
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-workspace", 1, "session-root"
+	current.CurrentRevision = int64PointerForWorkspaceTools(0)
+	current.Authorization.Version = 1
+	fixture.store.details.Task = current
+	fixture.executor.workspaces = tools.workspaces
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sealer, err := NewSealer(bytes.Repeat([]byte{9}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "impact-live", Name: cloudDSHImpactMapToolName,
+		Arguments: `{"expected_revision":0,"component":"auth/session.go"}`,
+		TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+			AuthorizationVersion: current.Authorization.Version}}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, sealer)
+	result, err := broker.executeImpactMap(ctx, current, call, false, nil)
+	if err != nil || result.Status != AgentToolFailed || !strings.Contains(result.Output, "live Workspace") ||
+		store.details.Task.Status != task.StatusRunning {
+		t.Fatalf("live Workspace result = %#v, status=%s, err=%v", result, store.details.Task.Status, err)
+	}
+	if len(store.details.Steps) == 0 || store.details.Steps[len(store.details.Steps)-1].Status != task.StepFailed {
+		t.Fatalf("live Workspace limitation not recorded: %+v", store.details.Steps)
+	}
+	checkpoint := dshToolResultText(result)
+	replayed, err := broker.executeImpactMap(ctx, current, call, true, &checkpoint)
+	if err != nil || replayed.Status != AgentToolFailed || replayed.Output != result.Output {
+		t.Fatalf("live Workspace replay = %#v, err=%v", replayed, err)
+	}
+	changed := "different checkpoint result"
+	if _, err := broker.executeImpactMap(ctx, current, call, true, &changed); err == nil {
+		t.Fatal("live Workspace replay accepted a mismatched checkpoint")
 	}
 }

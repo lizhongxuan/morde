@@ -479,6 +479,12 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		current.AgentSessionID == "" {
 		return domain.NewError(domain.CodeInvalidState, "cloud dsh completion checkpoint changed")
 	}
+	// The persisted intent comes from the task's routing or submission
+	// contract. A missing or invalid value cannot be reconstructed safely
+	// from the user's prose at completion time.
+	if !current.FileDeliveryIntent.Valid() {
+		return domain.NewError(domain.CodeInvalidState, "task file delivery intent is unavailable")
+	}
 	if current.CheckpointThroughSequence != completion.CheckpointThroughSequence || !bytes.Equal(current.CheckpointDigest, completion.CheckpointDigest) {
 		step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "result", task.StepSucceeded,
 			"Complete cloud task", "The cloud dsh completion checkpoint changed before result commit.")
@@ -504,9 +510,6 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 			map[string]any{"source": "cloud_dsh"}, "", nil, completionFence)
 	}
 	fileIntent := current.FileDeliveryIntent
-	if !fileIntent.Valid() {
-		fileIntent = ClassifyFileDeliveryIntent(current.Objective, current.WorkspaceID != "")
-	}
 	if current.HostID == "" {
 		if cloudDSHHasHostToolHistory(completion.Inputs) {
 			return domain.NewError(domain.CodeInvalidState, "hostless dsh task contains computer tool history")
@@ -563,6 +566,12 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 				return err
 			}
 			useCloudDSHStreamResultStep(&step, details, completion)
+			// A Host fix plan still requires E07 when it records no file writes.
+			if paused, err := b.pauseForTestGate(ctx, current, step, details); err != nil {
+				return err
+			} else if paused {
+				return nil
+			}
 			return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result, completion.ValidationClaims,
 				map[string]any{"source": "cloud_dsh"}, "", nil, completionFence)
 		}
@@ -987,8 +996,8 @@ func (b *CloudDSHToolBroker) pauseCompletion(ctx context.Context, current task.T
 }
 
 // pauseForTestGate pauses completion with test_gate_failed when the E07 test
-// gate fails for a fix task. It reports whether it paused: false when the
-// gate passes, when the task has no fix plan, or when the task is hostless.
+// gate fails for a fix task. It reports whether it paused: false when the gate
+// passes, when the task has no fix plan, or when the task is hostless.
 // Hostless tasks are exempt because they have no shell tool, so no test run
 // can ever be recorded; the missing hostless test gate is a known
 // limitation. The caller reuses its own result step, as the minimal-diff
@@ -997,6 +1006,8 @@ func (b *CloudDSHToolBroker) pauseForTestGate(ctx context.Context, current task.
 	if current.HostID == "" {
 		return false, nil
 	}
+	// shortcut: impact maps are heuristic and cannot prove coverage; the
+	// independent H07 review stays pending until immutable coverage exists.
 	missing := testGateMissing(details)
 	if missing == "" {
 		return false, nil
@@ -2002,9 +2013,7 @@ func (b *CloudDSHToolBroker) PauseModelRecoveryDiagnostic(ctx context.Context, c
 // retry ladder spent its budget (attempts retries on reason). The persisted
 // step carries the ladder-exhausted marker and the §4.3 user-visible text
 // for that reason; no provider text, stack trace, or raw error is stored.
-// There is no task-level caller yet: task model calls have no retry loop,
-// so the live exhaustion path is the route ladder (route_retry_ladder_exhausted).
-// This helper is the terminal the first task-level retry loop must call.
+// The route worker owns its durable retry ladder independently.
 func (b *CloudDSHToolBroker) PauseModelRecoveryAfterLadderExhaustion(ctx context.Context, claimed task.Task, reason FailoverReason, attempts int) error {
 	if _, ok := failoverReasonStrategies[reason]; !ok {
 		return domain.InvalidArgument("failover_reason", "unknown failover reason cannot end a retry ladder")
@@ -2088,6 +2097,19 @@ func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Tas
 		title = "消息超过模型输入上限"
 		summary = "消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。"
 		waitingReason = "model_context_limit"
+	}
+	if diagnostic.Category == "usage_unknown" {
+		title = "模型调用结果待核对"
+		summary = "模型调用的结果或用量尚未确认，任务已暂停；请先核对后再决定是否恢复。"
+	}
+	if diagnostic.Category == "authentication_rejected" || diagnostic.Category == "access_rejected" ||
+		diagnostic.Category == "provider_invalid_api_key" || diagnostic.Category == "provider_permission_denied" {
+		title = "模型服务认证未通过"
+		summary = "模型服务的认证或授权未通过，任务已暂停；请检查模型连接及授权。"
+	}
+	if diagnostic.Category == "rate_limited" || diagnostic.Category == "provider_rate_limited" {
+		title = "模型服务暂时限流"
+		summary = "模型服务暂时限流，任务已暂停；本次调用结果和用量如尚未确认，需先核对后再恢复。"
 	}
 	if diagnostic.Category == "attachment_reader_unavailable" {
 		title = "当前模型无法读取附件"

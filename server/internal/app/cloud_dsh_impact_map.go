@@ -30,7 +30,7 @@ type cloudDSHImpactMapInput struct {
 
 func cloudDSHImpactMapDefinition() AgentToolDefinition {
 	return AgentToolDefinition{ModelTool: ModelTool{Name: cloudDSHImpactMapToolName,
-		Description: "Map the impact surface of one workspace component before changing it: its direct dependencies, the files that call into it, and the tests that cover it. Read-only: it never writes files, changes task state, or needs approval. The mapping is heuristic text/import matching, not an exact call graph. Use expected_revision from the current task checkpoint.",
+		Description: "Map possible dependencies, callers, and candidate tests for one workspace component before changing it. Read-only: it never writes files, changes task state, or needs approval. The mapping is heuristic text/import matching, not an exact call graph. The covering_tests field lists candidates only; it does not prove that tests ran or cover a file. Use expected_revision from the current task checkpoint.",
 		Parameters:  json.RawMessage(`{"type":"object","properties":{"expected_revision":{"type":"integer","minimum":0},"component":{"type":"string","minLength":1,"maxLength":4096}},"required":["expected_revision","component"],"additionalProperties":false}`), Strict: true},
 		RequiredScope: identity.ScopeTaskRead}
 }
@@ -95,9 +95,6 @@ func (b *CloudDSHToolBroker) executeImpactMap(ctx context.Context, claimed task.
 	if err != nil {
 		return AgentToolResult{}, err
 	}
-	if liveDirectory {
-		return AgentToolResult{}, domain.NewError(domain.CodeUnsupported, "impact map does not support live Workspace directories")
-	}
 	operationKey := agentOperationKey(call.CallID)
 	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
 		"Map impact of "+input.Component, "Reading the task Workspace snapshot.")
@@ -121,15 +118,23 @@ func (b *CloudDSHToolBroker) executeImpactMap(ctx context.Context, claimed task.
 		}
 	}
 	current.Usage = usage
-	result, err := b.runImpactMap(ctx, current, input)
-	if err != nil {
-		return AgentToolResult{}, err
+	var result AgentToolResult
+	if liveDirectory {
+		// A live directory cannot provide a stable snapshot for this analysis.
+		// Return the known read-only limitation to the same agent instead of
+		// presenting it as an execution error or fabricated coverage.
+		result = AgentToolResult{Status: AgentToolFailed, Output: "Impact mapping is unavailable for a live Workspace directory. Use the authorized Workspace read and search tools to inspect relevant files; do not treat candidate tests as coverage proof."}
+	} else {
+		result, err = b.runImpactMap(ctx, current, input)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
 	}
 	if recovering && checkpointOutput != nil && *checkpointOutput != dshToolResultText(result) {
 		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed impact map result does not match the committed Workspace view")
 	}
 	if result.Status == AgentToolSucceeded {
-		step.Status, step.Summary = task.StepSucceeded, "The impact map lists the component dependencies, callers, and covering tests."
+		step.Status, step.Summary = task.StepSucceeded, "The impact map lists candidate dependencies, callers, and tests; coverage is unverified."
 	} else {
 		step.Status, step.Summary = task.StepFailed, "The impact map could not be built for the requested component."
 	}

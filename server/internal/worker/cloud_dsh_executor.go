@@ -132,6 +132,7 @@ func cloudDSHModelErrorCategory(err error) string {
 	}
 	var domainErr *domain.Error
 	if errors.As(err, &domainErr) {
+		providerStatusWithoutCode := false
 		if domainErr.Details["reason"] == "task_model_budget_exhausted" {
 			return "task_budget_exhausted"
 		}
@@ -160,7 +161,7 @@ func cloudDSHModelErrorCategory(err error) string {
 				case "server_error":
 					return "provider_server_error"
 				default:
-					return "provider_request_rejected"
+					providerStatusWithoutCode = true
 				}
 			}
 		}
@@ -171,6 +172,12 @@ func cloudDSHModelErrorCategory(err error) string {
 				app.ModelErrorInvalidResponse:
 				return reason
 			}
+		}
+		// Providers need not return a structured error code. Preserve the
+		// gateway's allowlisted failure kind before falling back to a generic
+		// rejected request, otherwise authentication is retried as a 5xx.
+		if providerStatusWithoutCode {
+			return "provider_request_rejected"
 		}
 		switch domainErr.Code {
 		case domain.CodeResultTooLarge:
@@ -732,6 +739,8 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 			}
 		}
 		if errors.Is(retErr, errCloudDSHModelResultUnavailable) && ctx.Err() == nil {
+			// shortcut: Task model calls lack a durable, ledger-bound retry
+			// schedule; pause until a safe new attempt can be admitted.
 			if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
 				pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 				retErr = errors.Join(retErr, pauseCloudDSHModelRecovery(pauseCtx, recoveryTools, value, retErr))

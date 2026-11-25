@@ -192,9 +192,9 @@ exit "$failed"
 type smokeRecord struct {
 	Commit  string `json:"commit"`
 	Summary struct {
-		Pass    int `json:"pass"`
-		Fail    int `json:"fail"`
-		Blocked int `json:"blocked"`
+		Pass      int `json:"pass"`
+		Fail      int `json:"fail"`
+		Exception int `json:"exception"`
 	} `json:"summary"`
 	Cases []struct {
 		ID     string `json:"id"`
@@ -214,7 +214,10 @@ func runSmokeGate(t *testing.T, root string, fakeGoDir string, env map[string]st
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "bash", filepath.Join(root, "deploy", "single", "smoke.sh"),
 		"--record", recordPath, "--commit", "test-commit")
-	cmd.Env = append(os.Environ(), "PATH="+fakeGoDir+":"+os.Getenv("PATH"))
+	// Each fake scenario must choose its own database and fake-go inputs;
+	// inheriting a real integration DSN changes the expected skip verdict.
+	cmd.Env = append(os.Environ(), "PATH="+fakeGoDir+":"+os.Getenv("PATH"), "CH_TEST_DATABASE_URL=",
+		"FAKE_GO_FAIL=", "FAKE_GO_SKIP=", "FAKE_GO_OMIT=", "FAKE_GO_SUBSKIP=")
 	for k, v := range env {
 		cmd.Env = append(cmd.Env, k+"="+v)
 	}
@@ -271,12 +274,12 @@ func TestSmokeGateAccounting(t *testing.T) {
 		if code != 0 {
 			t.Fatalf("exit code = %d, want 0", code)
 		}
-		if rec.Summary.Pass != 8 || rec.Summary.Fail != 0 || rec.Summary.Blocked != 2 {
-			t.Errorf("summary = %+v, want pass=8 fail=0 blocked=2", rec.Summary)
+		if rec.Summary.Pass != 8 || rec.Summary.Fail != 0 || rec.Summary.Exception != 2 {
+			t.Errorf("summary = %+v, want pass=8 fail=0 exception=2", rec.Summary)
 		}
 		for _, id := range []string{"T10", "T43"} {
-			if got := caseStatus(rec, id); got != "blocked" {
-				t.Errorf("case %s = %q, want blocked", id, got)
+			if got := caseStatus(rec, id); got != "exception" {
+				t.Errorf("case %s = %q, want exception", id, got)
 			}
 		}
 	})
@@ -318,36 +321,61 @@ func TestSmokeGateAccounting(t *testing.T) {
 		}
 	})
 
-	t.Run("all tests of a case skipped blocks the case only", func(t *testing.T) {
+	// Fail-closed: a case whose mapped tests all skip produces no
+	// evidence, so it fails the gate — unless the skip is fully
+	// explained by the missing test database (next subtest). The
+	// database URL is set here so the skip is unexplained.
+	t.Run("all tests of a case skipped fails the gate", func(t *testing.T) {
+		code, rec := runSmokeGate(t, root, fakeGoDir, map[string]string{
+			"CH_TEST_DATABASE_URL": "postgres://fake/smoke-test",
+			"FAKE_GO_SKIP":         "TestPostgresTaskSubmissionAndMessageReceiptReplay,TestPostgresConcurrentMessageReceiptReplaySurvivesTaskStateChange",
+		})
+		if code == 0 {
+			t.Fatalf("exit code = 0, want non-zero (no evidence is a failure)")
+		}
+		if got := caseStatus(rec, "T01"); got != "fail" {
+			t.Errorf("case T01 = %q, want fail", got)
+		}
+		if rec.Summary.Fail != 1 {
+			t.Errorf("summary fail = %d, want 1", rec.Summary.Fail)
+		}
+	})
+
+	// The missing test database is the one skip the gate excuses: every
+	// mapped test of the case is PostgreSQL-backed and the URL is unset,
+	// so the environment — not the code — cannot produce the evidence.
+	// It is recorded as an exception-gate notice, not a failure.
+	t.Run("missing test database is an exception not a failure", func(t *testing.T) {
 		code, rec := runSmokeGate(t, root, fakeGoDir, map[string]string{
 			"FAKE_GO_SKIP": "TestPostgresTaskSubmissionAndMessageReceiptReplay,TestPostgresConcurrentMessageReceiptReplaySurvivesTaskStateChange",
 		})
 		if code != 0 {
-			t.Fatalf("exit code = %d, want 0 (blocked is not a failure)", code)
+			t.Fatalf("exit code = %d, want 0 (environment limitation is an exception, not a failure)", code)
 		}
-		if got := caseStatus(rec, "T01"); got != "blocked" {
-			t.Errorf("case T01 = %q, want blocked", got)
+		if got := caseStatus(rec, "T01"); got != "exception" {
+			t.Errorf("case T01 = %q, want exception", got)
 		}
-		if rec.Summary.Blocked != 3 {
-			t.Errorf("summary blocked = %d, want 3", rec.Summary.Blocked)
+		if rec.Summary.Pass != 7 || rec.Summary.Fail != 0 || rec.Summary.Exception != 3 {
+			t.Errorf("summary = %+v, want pass=7 fail=0 exception=3", rec.Summary)
 		}
 	})
 
 	// A test whose body is only subtests that skip prints a parent
 	// `--- PASS:` line. The gate must not count that hollow pass as
-	// evidence: the case is blocked, not passed.
-	t.Run("subtests all skipped is blocked not passed", func(t *testing.T) {
+	// evidence: the case fails, it is not passed and not excepted.
+	t.Run("subtests all skipped fails the gate", func(t *testing.T) {
 		code, rec := runSmokeGate(t, root, fakeGoDir, map[string]string{
-			"FAKE_GO_SUBSKIP": "TestConversationResultAggregationConcurrentRevisionCannotPublishOldResult,TestConversationResultAggregationQueuesSingleAndPreservesStream",
+			"CH_TEST_DATABASE_URL": "postgres://fake/smoke-test",
+			"FAKE_GO_SUBSKIP":      "TestConversationResultAggregationConcurrentRevisionCannotPublishOldResult,TestConversationResultAggregationQueuesSingleAndPreservesStream",
 		})
-		if code != 0 {
-			t.Fatalf("exit code = %d, want 0 (blocked is not a failure)", code)
+		if code == 0 {
+			t.Fatalf("exit code = 0, want non-zero (hollow pass is not evidence)")
 		}
-		if got := caseStatus(rec, "T26"); got != "blocked" {
-			t.Errorf("case T26 = %q, want blocked (its tests only skipped inside subtests)", got)
+		if got := caseStatus(rec, "T26"); got != "fail" {
+			t.Errorf("case T26 = %q, want fail (its tests only skipped inside subtests)", got)
 		}
-		if rec.Summary.Blocked != 3 {
-			t.Errorf("summary blocked = %d, want 3", rec.Summary.Blocked)
+		if rec.Summary.Fail != 1 {
+			t.Errorf("summary fail = %d, want 1", rec.Summary.Fail)
 		}
 	})
 }

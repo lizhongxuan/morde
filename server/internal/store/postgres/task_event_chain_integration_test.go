@@ -57,8 +57,16 @@ VALUES ($1,$2,$3,$4::jsonb,0,$5)`, taskID, sequence, eventType, payload, resultS
 		t.Fatalf("chain facts before review = %+v, want empty", facts)
 	}
 	if _, err := store.pool.Exec(ctx, `INSERT INTO task_validation_reviews
-(task_id,owner_id,task_revision,result_event_sequence,result_sha256,state,validation_state)
-VALUES ($1,$2,0,5,$3,'reviewed','PASS')`, taskID, owner.ID, resultDigest[:]); err != nil {
+(task_id,owner_id,task_revision,result_event_sequence,result_sha256,state,reviewer_session_id,
+ execution_model_id,execution_connection_version,execution_endpoint,execution_configured_model,execution_reported_model,
+ execution_model_family,execution_catalog_version,reviewer_model_id,reviewer_connection_version,reviewer_endpoint,
+ reviewer_configured_model,reviewer_reported_model,reviewer_model_family,reviewer_catalog_version,review_report,
+ reviewed_at,execution_model_call_id,validation_state)
+VALUES ($1,$2,0,5,$3,'reviewed',$4,
+ 'p1234567',clock_timestamp(),'https://example.test/v1','fixture-execution','fixture-execution',
+ 'fixture-execution-family','fixture-catalog','p2234567',clock_timestamp(),'https://example.test/v1',
+ 'fixture-reviewer','fixture-reviewer','fixture-reviewer-family','fixture-catalog','{"summary":"fixture"}'::jsonb,
+ clock_timestamp(),$5,'PASS')`, taskID, owner.ID, resultDigest[:], "review_"+taskID, "execution_"+taskID); err != nil {
 		t.Fatalf("insert validation review: %v", err)
 	}
 	facts, err = store.TaskEventChainFacts(ctx, owner.ID, taskID)

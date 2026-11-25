@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -387,6 +388,7 @@ func TestTestGateComplete(t *testing.T) {
 		name       string
 		plan       *task.Plan
 		steps      []task.Step
+		events     []task.Event
 		wantGate   bool
 		wantSubstr string
 	}{
@@ -427,7 +429,10 @@ func TestTestGateComplete(t *testing.T) {
 					ToolName: runtimeToolShellExec, FailureReason: taskToolTestPassedReason, RequestDigest: targeted},
 				{ID: "s3", Kind: "tool", Status: task.StepSucceeded, Sequence: 3,
 					ToolName: runtimeToolShellExec, FailureReason: taskToolTestSuitePassedReason, RequestDigest: suite},
-			}},
+			},
+			// A legacy map event is not evidence of coverage and does not affect E07.
+			events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded",
+				ImpactMap{Component: "auth/session.go", CoveringTests: []string{"auth/session_test.go"}})}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRuntimeToolExecutorFixture(t, nil)
@@ -443,6 +448,9 @@ func TestTestGateComplete(t *testing.T) {
 					test.steps[index].Summary = directTestEvidenceSummary
 				}
 				store.details.Steps = test.steps
+			}
+			if test.events != nil {
+				store.events = append(store.events, test.events...)
 			}
 			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
 			if err != nil {
@@ -469,6 +477,29 @@ func TestTestGateComplete(t *testing.T) {
 				t.Fatalf("tested fix was blocked by the test gate: task=%#v", store.details.Task)
 			}
 		})
+	}
+}
+
+func TestTestGateAppliesToHostFixWithoutRecordedWrites(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	store.details.Task.Objective = "Fix the login bug."
+	store.details.Task.FileDeliveryIntent = task.FileDeliveryNone
+	setCloudDSHCompletionFence(&store.details.Task)
+	plan := briefPlan(1, true)
+	plan.FixPlan = fixPlanForTest()
+	store.details.Plan = plan
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current := store.details.Task
+	if err := broker.Complete(context.Background(), current, cloudDSHCompletionFor(current, "Fixed the login crash.", nil)); err != nil {
+		t.Fatal(err)
+	}
+	if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "test_gate_failed" || store.details.Task.Result != "" {
+		t.Fatalf("unverified fix without writes escaped E07: %+v", store.details.Task)
 	}
 }
 
@@ -519,5 +550,59 @@ func TestTestGateHostlessCompleteExempt(t *testing.T) {
 	if store.details.Task.Status != task.StatusCompleted || store.details.Task.Result != "Fixed the login crash." {
 		t.Fatalf("hostless fix task was blocked by the test gate: status=%q waiting=%q result=%q",
 			store.details.Task.Status, store.details.Task.WaitingReason, store.details.Task.Result)
+	}
+}
+
+func impactMapEventForTest(t *testing.T, tool, status string, impact any) task.Event {
+	t.Helper()
+	detail := map[string]any{"tool": tool, "operation_status": status}
+	if impact != nil {
+		detail["impact_map"] = impact
+	}
+	payload, err := json.Marshal(map[string]any{"detail": detail})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return task.Event{Type: "task.step", Sequence: 1, Payload: payload}
+}
+
+func TestTestGateDoesNotTreatImpactMapsAsEvidence(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		events     []task.Event
+		withTests  bool
+		wantPaused bool
+	}{
+		{name: "no map and actual tests", withTests: true},
+		{name: "legacy map with unchanged caller", withTests: true, events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", ImpactMap{Component: "auth/session.go", Callers: []string{"auth/login.go"}, Dependencies: []string{"auth/token.go"}})}},
+		{name: "unrelated map cannot supply missing tests", wantPaused: true, events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", ImpactMap{Component: "other.go"})}},
+		{name: "old map cannot supply missing tests", wantPaused: true, events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", ImpactMap{Component: "auth/session.go"})}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, nil)
+			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+			fixture.executor.store = store
+			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			current := store.details.Task
+			store.details.Plan = &task.Plan{FixPlan: &task.FixPlan{ChangedFiles: []string{"auth/session.go"}}}
+			if test.withTests {
+				store.details.Steps = greenTestStepsForTest(current)
+			}
+			store.events = append(store.events, test.events...)
+			step, err := newAgentStep(current.ID, maxStepSequence(store.details.Steps)+1, "result", task.StepSucceeded, "Complete cloud task", "The session completed.")
+			if err != nil {
+				t.Fatal(err)
+			}
+			paused, err := broker.pauseForTestGate(context.Background(), current, step, store.details)
+			if err != nil || paused != test.wantPaused {
+				t.Fatalf("paused=%t, err=%v; want paused=%t", paused, err, test.wantPaused)
+			}
+			if test.wantPaused && store.details.Task.WaitingReason != "test_gate_failed" {
+				t.Fatalf("task = %+v; missing test evidence must stay blocked", store.details.Task)
+			}
+		})
 	}
 }

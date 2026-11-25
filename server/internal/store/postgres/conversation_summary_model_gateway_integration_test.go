@@ -210,6 +210,46 @@ WHERE project_id=$1 AND source='compaction' AND call_id=$2`, claim.Input.Project
 	}
 }
 
+func TestConversationSummaryModelRateLimitKeepsUnknownAndDoesNotRedispatch(t *testing.T) {
+	for _, useProject := range []bool{false, true} {
+		name := "account"
+		if useProject {
+			name = "project"
+		}
+		t.Run(name, func(t *testing.T) {
+			client := &routeModelClientTest{err: &app.ModelClientError{
+				Kind: app.ModelErrorRateLimited, Stage: "provider_status", RetryAfter: 90 * time.Second,
+			}}
+			store, gateway, principal, claim, routeContext := routeModelFixture(t, useProject, client)
+			gateway = summaryModelGateway(t, gateway)
+			fence, callID := prepareConversationSummaryModelFence(t, store, claim)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_, err := gateway.CompleteConversationSummaryModel(ctx, fence, routeContext.ModelID, summaryModelRequest())
+			var modelErr *domain.Error
+			if !errors.As(err, &modelErr) || modelErr.Code != domain.CodeRateLimited ||
+				modelErr.RetryAfter != 90*time.Second || client.calls.Load() != 1 {
+				t.Fatalf("summary rate limit error=%v calls=%d", err, client.calls.Load())
+			}
+			var state string
+			if err := store.pool.QueryRow(context.Background(), `SELECT state FROM model_call_ledger
+WHERE owner_id=$1 AND source='compaction' AND call_id=$2`, principal.UserID, callID).Scan(&state); err != nil || state != "unknown" {
+				t.Fatalf("summary account ledger=%s err=%v", state, err)
+			}
+			if useProject {
+				if err := store.pool.QueryRow(context.Background(), `SELECT status FROM project_budget_ledger
+WHERE project_id=$1 AND source='compaction' AND call_id=$2`, claim.Input.ProjectID, callID).Scan(&state); err != nil || state != "unknown" {
+					t.Fatalf("summary project ledger=%s err=%v", state, err)
+				}
+			}
+			_, err = gateway.CompleteConversationSummaryModel(ctx, fence, routeContext.ModelID, summaryModelRequest())
+			if domain.CodeOf(err) != domain.CodeConflict || client.calls.Load() != 1 {
+				t.Fatalf("unknown summary was redispatched: calls=%d err=%v", client.calls.Load(), err)
+			}
+		})
+	}
+}
+
 func TestConversationSummaryStaleDispatchUsesSummaryReconciliation(t *testing.T) {
 	client := &routeModelClientTest{started: make(chan struct{}), release: make(chan struct{}), reply: "Recovered summary."}
 	defer releaseRouteTestClient(client)

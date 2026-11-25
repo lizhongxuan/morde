@@ -247,9 +247,10 @@ func modelConcurrencyReservationLimited(err error) bool {
 // The wait between attempts is the shared jittered backoff with this path's
 // own policy (100ms base, 1s cap): a local concurrency slot is not a provider
 // error, so the E12 provider ladder (base 5s / max 120s, 3 retries) does not
-// apply here. The retry count stays unbounded until the caller context ends,
-// as before; only the delay computation moved to the shared helper, and a
-// single wait stays bounded (base cap 1s plus at most 50% jitter).
+// apply here. Task calls wait until their context ends, as before. Summary
+// and review calls retry at most ModelRetryMaxRetries times so they cannot
+// hold a lease indefinitely. A single wait stays bounded (base cap 1s plus
+// at most 50% jitter).
 func (s *ModelGatewayService) reserveModelCall(ctx context.Context, source ModelCallSource, projectCall bool, projectID string,
 	reservation ModelCallReservation, usage project.Usage) error {
 	attempt := 0
@@ -266,7 +267,8 @@ func (s *ModelGatewayService) reserveModelCall(ctx context.Context, source Model
 		} else {
 			err = s.store.ReserveModelCall(ctx, reservation)
 		}
-		if err == nil || source != ModelCallTask || !modelConcurrencyReservationLimited(err) {
+		if err == nil || (source != ModelCallTask && source != ModelCallCompaction && source != ModelCallReview) ||
+			!modelConcurrencyReservationLimited(err) || (source != ModelCallTask && attempt >= ModelRetryMaxRetries) {
 			return err
 		}
 		attempt++

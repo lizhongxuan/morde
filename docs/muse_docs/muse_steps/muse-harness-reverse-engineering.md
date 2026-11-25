@@ -1,5 +1,7 @@
 # Muse Harness 逆向工程：完整流程推断、Bug 处理方法与 Morde 复刻方案
 
+> **历史研究材料，不是当前实施规范：**保留 2026-11-23 的观察、推断和当时 Morde 状态，用于追溯证据；实现目标、当前状态和验收分别以[最终流程与开发设计](<Morde 复刻 Muse 最终流程与开发设计.md>)、[一体化实施与验收 TODO](<Morde 复刻 Muse 一体化实施与验收 TODO.md>)及项目 `AGENTS.md` 为准。文中的固定阈值、旧路由/失败策略和当时的 128 KiB 限制不自动成为当前目标；区分 Muse 观察、推断和 Morde 自行设计，不为匹配实现改写历史证据。
+
 > 调研时间：2026-11-23。方法：4 个并行子 agent 分头做证据挖掘（数据库实证）、Muse 文档分析、hermes-agent 源码精读、Morde 映射，再由协调员整合。只读调研，未改 Morde 代码、未动 git、未部署。
 > **核心前提（用户的硬性要求）：没有 Muse 源码。** 以下所有“Muse 是这样”的结论，全部来自从外面看到的行为 + 数据库记录 + 记忆文件 + 产品文档，不是源码。推断绝不写成源码事实。
 > 底稿（分册，细节以底稿为准）：`~/workspace/muse-harness-rev/part-a-evidence.md`（行为证据，298 行，26 条 SQL 查询）／`part-b-docs.md`（文档分析，438 行，58 个 skill + 143 个 connector 清单）／`part-c-hermes.md`（hermes 精读，约 95KB，固定提交 0d49d6d9）／`part-d-morde-mapping.md`（Morde 映射，251 行）。另直接引用并行研究 `~/workspace/hermes-context-research.md`（上下文全流程 + 输入永不失败方案）。

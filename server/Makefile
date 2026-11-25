@@ -5,8 +5,10 @@ build:
 
 # smoke: P0 smoke 10 deploy/merge gate (E10). Runs the ten P0 cases
 # (T01/T04/T06/T10/T13/T19/T22/T26/T36/T43) against the current checkout
-# and writes deploy/single/smoke-record.json. Exit non-zero on any
-# failure. Run this before merging to sit and before any deploy; the
+# and writes deploy/single/smoke-record.json. Fail-closed: exit non-zero
+# on any failure, including a case that produces no evidence; cases the
+# environment cannot run are recorded as exception-gate notices, not
+# failures. Run this before merging to sit and before any deploy; the
 # deploy script runs it automatically.
 smoke:
 	@bash ../deploy/single/smoke.sh --record ../deploy/single/smoke-record.json
