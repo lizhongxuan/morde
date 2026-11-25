@@ -335,6 +335,26 @@ type cloudDSHModelRecoveryTools interface {
 	PauseModelRecovery(context.Context, task.Task, string) error
 }
 
+// cloudDSHTaskModelFailureLadder applies the E12 retry ladder to a task-level
+// model failure. It is optional: brokers without it keep the legacy pause
+// (pauseCloudDSHModelRecovery). The ladder persists a retry step and leaves
+// the task running, so lease expiry re-queues it; it pauses the task itself
+// for fallback and terminal outcomes.
+type cloudDSHTaskModelFailureLadder interface {
+	ApplyTaskModelFailureLadder(context.Context, task.Task, app.AgentModelFailureDiagnostic) (app.ModelRetryDecision, error)
+}
+
+// cloudDSHModelFailureDiagnosticOf extracts the sanitized model failure
+// diagnostic from a task error, or an empty diagnostic (unknown category)
+// when the error carries none.
+func cloudDSHModelFailureDiagnosticOf(err error) app.AgentModelFailureDiagnostic {
+	var source cloudDSHModelFailureDiagnosticSource
+	if errors.As(err, &source) {
+		return source.ModelFailureDiagnostic()
+	}
+	return app.AgentModelFailureDiagnostic{}
+}
+
 type cloudDSHDetailedModelRecoveryTools interface {
 	PauseModelRecoveryDiagnostic(context.Context, task.Task, app.AgentModelFailureDiagnostic) error
 }
@@ -732,10 +752,24 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 			}
 		}
 		if errors.Is(retErr, errCloudDSHModelResultUnavailable) && ctx.Err() == nil {
-			if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
+			// The E12 task-level ladder runs first: a transient model
+			// failure schedules a retry step and leaves the task running
+			// for lease-expiry reclaim, instead of pausing for the user.
+			// Brokers without the ladder keep the legacy pause below.
+			handled := false
+			if ladder, ok := e.options.Tools.(cloudDSHTaskModelFailureLadder); ok {
 				pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-				retErr = errors.Join(retErr, pauseCloudDSHModelRecovery(pauseCtx, recoveryTools, value, retErr))
+				if _, ladderErr := ladder.ApplyTaskModelFailureLadder(pauseCtx, value, cloudDSHModelFailureDiagnosticOf(retErr)); ladderErr == nil {
+					handled = true
+				}
 				cancelPause()
+			}
+			if !handled {
+				if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
+					pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+					retErr = errors.Join(retErr, pauseCloudDSHModelRecovery(pauseCtx, recoveryTools, value, retErr))
+					cancelPause()
+				}
 			}
 		}
 		if errors.Is(retErr, ErrCloudDSHCompletionPending) && e.options.Completion != nil {

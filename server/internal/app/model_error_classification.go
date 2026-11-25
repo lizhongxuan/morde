@@ -222,6 +222,68 @@ func ClassifyModelClientError(err error) ErrorClassification {
 	return ErrorClassification{Reason: FailoverUnknown, Strategy: FailoverStrategyFor(FailoverUnknown)}
 }
 
+// modelFailureDiagnosticCategoryReasons maps the executor's sanitized model
+// failure categories to FailoverReasons. The categories come from
+// cloudDSHModelErrorCategory / cloudDSHModelResponseFailureDiagnostic, so
+// they are already provider-text-free; an unlisted or empty category is
+// unknown and retryable, never a terminal verdict. Two choices are
+// deliberate: provider_request_rejected is server_error (transient-first,
+// the provider rejected the request without a client-side cause), and
+// task_budget_exhausted is billing (fallback: pause for the user, never
+// retry a spent budget).
+var modelFailureDiagnosticCategoryReasons = map[string]FailoverReason{
+	"rate_limited":                     FailoverRateLimit,
+	"provider_rate_limited":            FailoverRateLimit,
+	"timeout":                          FailoverTimeout,
+	"transport":                        FailoverTimeout,
+	"unavailable":                      FailoverServerError,
+	"upstream_error":                   FailoverServerError,
+	"provider_server_error":            FailoverServerError,
+	"provider_request_rejected":        FailoverServerError,
+	"quota_exhausted":                  FailoverBilling,
+	"provider_quota_exhausted":         FailoverBilling,
+	"task_budget_exhausted":            FailoverBilling,
+	"authentication_rejected":          FailoverAuth,
+	"provider_invalid_api_key":         FailoverAuth,
+	"access_rejected":                  FailoverAuthPermanent,
+	"provider_permission_denied":       FailoverAuthPermanent,
+	"invalid_request":                  FailoverFormatError,
+	"client_request_invalid":           FailoverFormatError,
+	"provider_invalid_request":         FailoverFormatError,
+	"provider_unsupported_parameter":   FailoverFormatError,
+	"invalid_response":                 FailoverIncompleteResponse,
+	"empty_response":                   FailoverIncompleteResponse,
+	"truncated_response":               FailoverIncompleteResponse,
+	"stream_result_mismatch":           FailoverIncompleteResponse,
+	"context_length_exceeded":          FailoverContextOverflow,
+	"provider_context_length_exceeded": FailoverContextOverflow,
+	"provider_model_not_found":         FailoverModelNotFound,
+	"unauthorized_tool":                FailoverGuardrailBlocked,
+	"attachment_reader_unavailable":    FailoverUnknown,
+	"usage_unknown":                    FailoverUnknown,
+	"unsupported":                      FailoverUnknown,
+}
+
+// ModelRetryLadderFailureReason is the step FailureReason marking a retry the
+// E12 task-level ladder scheduled. Trailing steps with this marker count the
+// attempts already spent for one task run; the chain breaks on any step
+// without the marker (a pause step, or a step that made progress), which
+// resets the count for the next run. The column is free text; no migration.
+const ModelRetryLadderFailureReason = "model_retry_ladder"
+
+// ClassifyModelFailureDiagnostic maps a DSH executor model failure
+// diagnostic to a FailoverReason. A diagnostic that already carries a valid
+// FailoverReason wins; otherwise its sanitized category decides.
+func ClassifyModelFailureDiagnostic(diagnostic AgentModelFailureDiagnostic) ErrorClassification {
+	if _, ok := failoverReasonStrategies[diagnostic.Reason]; ok {
+		return ErrorClassification{Reason: diagnostic.Reason, Strategy: FailoverStrategyFor(diagnostic.Reason), Known: true}
+	}
+	if reason, ok := modelFailureDiagnosticCategoryReasons[diagnostic.Category]; ok {
+		return ErrorClassification{Reason: reason, Strategy: FailoverStrategyFor(reason), Known: true}
+	}
+	return ErrorClassification{Reason: FailoverUnknown, Strategy: FailoverStrategyFor(FailoverUnknown)}
+}
+
 // Retry ladder constants (enhancement plan E12; hermes api_max_retries = 3,
 // jittered backoff base 5s / max 120s). The ladder is "3 retries, then
 // fallback, then terminal" — hermes's 5-cycle CLI auto-recovery ladder is

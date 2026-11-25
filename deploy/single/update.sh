@@ -253,6 +253,12 @@ avail_kb="$(df --output=avail -k /opt | tail -1 | tr -d ' ')"
 # workspace-sync mount (the portal requires it) are checked here, before
 # any deploy work. A failure stops the deploy with the cause named,
 # instead of deploying a release that silently cannot run tasks.
+# This is the deploy-level exception gate: when the environment is down
+# the deploy stops and says why, instead of blaming the code in the
+# smoke record. The smoke gate below has its own gate-level exception
+# (cases the environment cannot run, e.g. T10/T43 needing a real PC);
+# those are notices, not failures, and the deploy proceeds with the
+# reduced evidence on record.
 # R20's full runtime interruption-delivery chain is a separate,
 # contract-blocked piece and is not part of this preflight.
 dsh_enabled="$(sed -n '/^cloud_dsh:/,/^[^[:space:]]/p' "$CONFIG" | awk '/^[[:space:]]*enabled:/ {print $2; exit}')"
@@ -361,8 +367,13 @@ fi
 # No deploy without a passing smoke record. The gate runs the ten P0
 # smoke cases (T01/T04/T06/T10/T13/T19/T22/T26/T36/T43) against the new
 # head; any failure aborts before the build, so a broken head never
-# reaches the swap. T10/T43 cannot run headless and are recorded as
-# blocked, never as passed. The record is the deploy evidence.
+# reaches the swap. The gate is fail-closed: a case that produces no
+# evidence fails, unless the environment itself cannot run it — then
+# it is recorded as an exception-gate notice, not a failure (T10/T43
+# need a real PC; PostgreSQL cases without CH_TEST_DATABASE_URL).
+# Environment-down (dead DSH daemon, missing workspace-sync mount)
+# was already caught by the preflight above, which aborts with the
+# cause named before this gate runs. The record is the deploy evidence.
 SMOKE_RECORD="$MORDE_DIR/smoke-record.json"
 log "running P0 smoke gate for $NEW_HEAD (record: $SMOKE_RECORD)"
 if ! bash "$SRC_DIR/deploy/single/smoke.sh" --src "$SRC_DIR" --record "$SMOKE_RECORD"; then

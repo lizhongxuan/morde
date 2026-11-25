@@ -1791,6 +1791,61 @@ func TestCloudDSHModelFailureWaitsForConfirmedStopBeforeRecovery(t *testing.T) {
 	}
 }
 
+func TestCloudDSHExecutorRunsModelRetryLadderBeforeLegacyPause(t *testing.T) {
+	executor, _, _, _, models, value := cloudDSHFixture(t)
+	tools := &cloudDSHTestLadderTools{cloudDSHTestTools: &cloudDSHTestTools{}}
+	executor.options.Tools = tools
+	models.complete = func(context.Context, app.ModelCall) (app.ModelResponse, error) {
+		return app.ModelResponse{}, errors.New("model request failed")
+	}
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, errCloudDSHModelResultUnavailable) {
+		t.Fatalf("model failure = %v", err)
+	}
+	if tools.ladderCalls != 1 {
+		t.Fatalf("ladder calls = %d; want 1", tools.ladderCalls)
+	}
+	if tools.pauseRecoveryCall != 0 {
+		t.Fatalf("legacy pause calls = %d; want 0", tools.pauseRecoveryCall)
+	}
+	if tools.ladderDiagnostic.Category == "" {
+		t.Fatalf("ladder diagnostic lost the failure category: %#v", tools.ladderDiagnostic)
+	}
+}
+
+func TestCloudDSHExecutorFallsBackToLegacyPauseWhenLadderFails(t *testing.T) {
+	executor, _, _, _, models, value := cloudDSHFixture(t)
+	tools := &cloudDSHTestLadderTools{cloudDSHTestTools: &cloudDSHTestTools{}, ladderErr: errors.New("ladder store unavailable")}
+	executor.options.Tools = tools
+	models.complete = func(context.Context, app.ModelCall) (app.ModelResponse, error) {
+		return app.ModelResponse{}, errors.New("model request failed")
+	}
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, errCloudDSHModelResultUnavailable) {
+		t.Fatalf("model failure = %v", err)
+	}
+	if tools.ladderCalls != 1 || tools.pauseRecoveryCall != 1 {
+		t.Fatalf("ladder calls = %d, legacy pause calls = %d; want 1 and 1", tools.ladderCalls, tools.pauseRecoveryCall)
+	}
+}
+
+// cloudDSHTestLadderTools is the executor fixture tools plus the E12 ladder.
+// It is a separate type (not a method on cloudDSHTestTools) so the existing
+// model-failure tests keep exercising the legacy pause.
+type cloudDSHTestLadderTools struct {
+	*cloudDSHTestTools
+	ladderCalls      int
+	ladderDiagnostic app.AgentModelFailureDiagnostic
+	ladderErr        error
+}
+
+func (s *cloudDSHTestLadderTools) ApplyTaskModelFailureLadder(ctx context.Context, value task.Task, diagnostic app.AgentModelFailureDiagnostic) (app.ModelRetryDecision, error) {
+	s.ladderCalls++
+	s.ladderDiagnostic = diagnostic
+	if s.ladderErr != nil {
+		return app.ModelRetryDecision{}, s.ladderErr
+	}
+	return app.ModelRetryDecision{Action: app.ModelRetryActionRetry}, nil
+}
+
 func cloudDSHTestUserPrompt(t *testing.T, call app.ModelCall) string {
 	t.Helper()
 	var request struct {

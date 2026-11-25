@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -987,8 +988,9 @@ func (b *CloudDSHToolBroker) pauseCompletion(ctx context.Context, current task.T
 }
 
 // pauseForTestGate pauses completion with test_gate_failed when the E07 test
-// gate fails for a fix task. It reports whether it paused: false when the
-// gate passes, when the task has no fix plan, or when the task is hostless.
+// gate fails for a fix task, or when the E02 regression对照 fails after the
+// test halves pass. It reports whether it paused: false when the gate passes,
+// when the task has no fix plan, or when the task is hostless.
 // Hostless tasks are exempt because they have no shell tool, so no test run
 // can ever be recorded; the missing hostless test gate is a known
 // limitation. The caller reuses its own result step, as the minimal-diff
@@ -999,9 +1001,46 @@ func (b *CloudDSHToolBroker) pauseForTestGate(ctx context.Context, current task.
 	}
 	missing := testGateMissing(details)
 	if missing == "" {
+		// E02 regression对照 (flow step 8): once both test halves pass,
+		// the recorded impact map must be covered by the fix's changed
+		// files and the tests the passing full suite ran. A missing map,
+		// or an uncovered impact file, blocks completion the same way.
+		// A store error fails closed: completion errors instead of
+		// passing a fix whose regression cannot be checked.
+		impact, recorded, err := b.latestRecordedImpactMap(ctx, current)
+		if err != nil {
+			return false, err
+		}
+		missing = impactCoverageMissing(details, impact, recorded)
+	}
+	if missing == "" {
 		return false, nil
 	}
 	return true, b.pauseCompletion(ctx, current, step, "test_gate_failed", "The fix cannot complete: "+missing)
+}
+
+// latestRecordedImpactMap returns the task's latest recorded impact map, or
+// false when no succeeded morde_impact_map step event carries one. It pages
+// the event list the same way the chain replay does.
+func (b *CloudDSHToolBroker) latestRecordedImpactMap(ctx context.Context, current task.Task) (ImpactMap, bool, error) {
+	var events []task.Event
+	var after int64
+	for {
+		page, err := b.store.ListTaskEvents(ctx, current.OwnerID, current.ID, after, taskEventChainPageSize)
+		if err != nil {
+			return ImpactMap{}, false, err
+		}
+		if len(page) == 0 {
+			break
+		}
+		events = append(events, page...)
+		after = page[len(page)-1].Sequence
+		if len(page) < int(taskEventChainPageSize) {
+			break
+		}
+	}
+	impact, ok := impactMapFromEvents(events)
+	return impact, ok, nil
 }
 
 func (b *CloudDSHToolBroker) Execute(ctx context.Context, claimed task.Task, call ModelToolCall) (AgentToolResult, error) {
@@ -2002,9 +2041,8 @@ func (b *CloudDSHToolBroker) PauseModelRecoveryDiagnostic(ctx context.Context, c
 // retry ladder spent its budget (attempts retries on reason). The persisted
 // step carries the ladder-exhausted marker and the §4.3 user-visible text
 // for that reason; no provider text, stack trace, or raw error is stored.
-// There is no task-level caller yet: task model calls have no retry loop,
-// so the live exhaustion path is the route ladder (route_retry_ladder_exhausted).
-// This helper is the terminal the first task-level retry loop must call.
+// Its task-level caller is ApplyTaskModelFailureLadder; the live exhaustion
+// path for routes is the route ladder (route_retry_ladder_exhausted).
 func (b *CloudDSHToolBroker) PauseModelRecoveryAfterLadderExhaustion(ctx context.Context, claimed task.Task, reason FailoverReason, attempts int) error {
 	if _, ok := failoverReasonStrategies[reason]; !ok {
 		return domain.InvalidArgument("failover_reason", "unknown failover reason cannot end a retry ladder")
@@ -2012,6 +2050,123 @@ func (b *CloudDSHToolBroker) PauseModelRecoveryAfterLadderExhaustion(ctx context
 	return b.PauseModelRecoveryDiagnostic(ctx, claimed, AgentModelFailureDiagnostic{
 		Category: "model_retry_ladder_exhausted", LadderExhausted: true, Attempts: attempts, Reason: reason,
 	})
+}
+
+// ApplyTaskModelFailureLadder is the task-level caller of the E12 retry
+// ladder. The executor calls it when a DSH task turn fails on a model call
+// (cloudDSHModelResultError). It classifies the sanitized diagnostic, spends
+// one ladder run against the trailing retry steps already recorded for this
+// task, and returns what the executor must do next:
+//
+//   - retry: a retry step is persisted (kind "verification", FailureReason
+//     "model_retry_ladder") and the task stays running; the executor returns
+//     without pausing, so lease expiry re-queues the task and it resumes
+//     from its checkpoint. No sleep happens here: the executor's lease
+//     renewal stops once the run returns, so a sleep could not delay the
+//     reclaim; the earliest-retry time is recorded on the step instead.
+//   - fallback: the task is paused for the user (PauseModelRecoveryDiagnostic),
+//     because the reason cannot be retried (auth, billing, policy).
+//   - terminal: the task is paused with the ladder-exhausted terminal text.
+//
+// The ladder delay is jittered backoff only: diagnostics carry no provider
+// Retry-After. A task that is no longer running, or whose lease moved on,
+// returns a terminal decision without persisting anything; the executor's
+// legacy pause is a no-op in that state too.
+func (b *CloudDSHToolBroker) ApplyTaskModelFailureLadder(ctx context.Context, claimed task.Task, diagnostic AgentModelFailureDiagnostic) (ModelRetryDecision, error) {
+	if ctx == nil {
+		return ModelRetryDecision{}, domain.InvalidArgument("context", "recovery context is required")
+	}
+	classification := ClassifyModelFailureDiagnostic(diagnostic)
+	terminal := func() ModelRetryDecision {
+		return ModelRetryDecision{Action: ModelRetryActionTerminal, Exhausted: true, Reason: classification.Reason, UserVisibleCase: classification.Strategy.UserVisibleCase}
+	}
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), agentPersistenceTimeout)
+	defer cancel()
+	details, err := b.store.GetTask(persistCtx, claimed.ID, claimed.OwnerID)
+	if err != nil {
+		return ModelRetryDecision{}, err
+	}
+	current := details.Task
+	if current.Status != task.StatusRunning || current.Lease.Owner != claimed.Lease.Owner || current.Lease.Version != claimed.Lease.Version ||
+		current.Lease.ExpiresAt == nil || !current.Lease.ExpiresAt.After(time.Now()) {
+		return terminal(), nil
+	}
+	if diagnostic.LadderExhausted || diagnostic.Category == "model_retry_ladder_exhausted" {
+		reason := diagnostic.Reason
+		if _, ok := failoverReasonStrategies[reason]; !ok {
+			reason = FailoverUnknown
+		}
+		attempts := max(diagnostic.Attempts, 0)
+		if err := b.PauseModelRecoveryAfterLadderExhaustion(ctx, claimed, reason, attempts); err != nil {
+			return ModelRetryDecision{}, err
+		}
+		return ModelRetryDecision{Action: ModelRetryActionTerminal, Exhausted: true, Reason: reason}, nil
+	}
+	attemptsUsed := countTrailingModelRetryLadderAttempts(details.Steps)
+	if attemptsUsed >= ModelRetryMaxRetries {
+		// Budget spent: terminal, even for reasons whose strategy offers a
+		// fallback. The route ladder records the same outcome
+		// (route_retry_ladder_exhausted); the task has no other method to
+		// fall back to, so the fallback branch below is only for reasons
+		// that cannot be retried at all.
+		if err := b.PauseModelRecoveryAfterLadderExhaustion(ctx, claimed, classification.Reason, attemptsUsed); err != nil {
+			return ModelRetryDecision{}, err
+		}
+		return ModelRetryDecision{Action: ModelRetryActionTerminal, Exhausted: true, Reason: classification.Reason, UserVisibleCase: classification.Strategy.UserVisibleCase}, nil
+	}
+	decision := DecideModelRetry(classification, attemptsUsed, 0, ModelRetryMaxRetryAfter, rand.Float64)
+	switch decision.Action {
+	case ModelRetryActionRetry:
+		step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "verification", task.StepFailed,
+			"模型重试已安排",
+			fmt.Sprintf("模型调用失败，已安排第 %d 次重试，约 %s 后由任务认领继续；重试 %d 次后仍失败将暂停任务。",
+				attemptsUsed+1, decision.Delay.Round(time.Second), ModelRetryMaxRetries))
+		if err != nil {
+			return ModelRetryDecision{}, err
+		}
+		step.FailureReason = ModelRetryLadderFailureReason
+		step.Retryable = true
+		step.Attempt = int64(attemptsUsed + 1)
+		metadata := map[string]any{
+			"phase":           "recovery",
+			"source":          "cloud_dsh",
+			"ladder_retry":    true,
+			"failover_reason": string(classification.Reason),
+			"retry_attempt":   attemptsUsed + 1,
+			"retry_delay_ms":  decision.Delay.Milliseconds(),
+			"retry_after":     time.Now().Add(decision.Delay).UTC().Format(time.RFC3339),
+		}
+		if err := b.commitProgress(persistCtx, current, step, current.Usage, task.StatusRunning, "", "task.step", metadata); err != nil {
+			return ModelRetryDecision{}, err
+		}
+		return decision, nil
+	case ModelRetryActionFallback:
+		if err := b.PauseModelRecoveryDiagnostic(ctx, claimed, diagnostic); err != nil {
+			return ModelRetryDecision{}, err
+		}
+		return decision, nil
+	default:
+		if err := b.PauseModelRecoveryAfterLadderExhaustion(ctx, claimed, classification.Reason, attemptsUsed); err != nil {
+			return ModelRetryDecision{}, err
+		}
+		return decision, nil
+	}
+}
+
+// countTrailingModelRetryLadderAttempts counts the consecutive retry steps
+// recorded at the end of a task's step chain. The chain breaks on any step
+// without the ladder marker (a pause step, or a step that made progress),
+// which resets the count for the next run; a persistently failing model
+// therefore gets at most ModelRetryMaxRetries extra retries per run.
+func countTrailingModelRetryLadderAttempts(steps []task.Step) int {
+	attempts := 0
+	for i := len(steps) - 1; i >= 0; i-- {
+		if steps[i].FailureReason != ModelRetryLadderFailureReason {
+			break
+		}
+		attempts++
+	}
+	return attempts
 }
 
 func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentModelFailureDiagnostic {

@@ -2,6 +2,7 @@ package evaluation
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"reflect"
 	"strings"
@@ -195,12 +196,12 @@ func TestComparisonKeyFreezesConfiguration(t *testing.T) {
 }
 
 func TestValidationPrimitives(t *testing.T) {
-	for _, id := range []string{"AIC-H-01", "AIC-C-42", "AIC-E-07"} {
+	for _, id := range []string{"AIC-H-01", "AIC-C-42", "AIC-E-07", "PC-CHAT-001", "PC-CHAT-024", "CLS-01", "RPL-02"} {
 		if !validCaseID(id) {
 			t.Errorf("valid case id rejected: %q", id)
 		}
 	}
-	for _, id := range []string{"AIC-X-01", "AIC-H-1", "AIC-H-001", "AIC-H-aa"} {
+	for _, id := range []string{"AIC-X-01", "AIC-H-1", "AIC-H-001", "AIC-H-aa", "PC-CHAT-1", "PC-CHAT-0011", "CLS-001", "XYZ-01"} {
 		if validCaseID(id) {
 			t.Errorf("invalid case id accepted: %q", id)
 		}
@@ -216,6 +217,115 @@ func TestValidationPrimitives(t *testing.T) {
 	}
 	if !reflect.DeepEqual(requiredCoverageTags(), []string{"ordinary_reply", "evidence", "independent_review", "clarification", "approval", "replay", "tool_unavailable", "prompt_injection"}) {
 		t.Fatal("required suite coverage changed unexpectedly")
+	}
+	if !reflect.DeepEqual(requiredLiveCoverageTags(), []string{"pc-chat", "classification", "error_recovery", "approval", "cost", "multi_turn_merge", "replay"}) {
+		t.Fatal("required live suite coverage changed unexpectedly")
+	}
+}
+
+// TestLoadLiveSuiteInventory pins the weekly live suite (evaluation
+// requirements §4.2): 44 cases = PC-CHAT 001-024 + 20 specialist cases,
+// version morde-ai-conversation-live-v1.1.0, data_class live-scripted,
+// scored separately from the 8 synthetic contract cases. The inventory
+// is exact: dropping or renaming a case must fail here, not silently
+// shrink the weekly run.
+func TestLoadLiveSuiteInventory(t *testing.T) {
+	raw, err := os.ReadFile("testdata/suite-live-v1.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	suite, err := LoadSuite(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if suite.Version != "morde-ai-conversation-live-v1.1.0" || suite.DataClass != "live-scripted" || len(suite.Cases) != 44 || len(suite.Rubric) != 7 {
+		t.Fatalf("unexpected live suite shape: version=%q data_class=%q cases=%d rubric=%d", suite.Version, suite.DataClass, len(suite.Cases), len(suite.Rubric))
+	}
+
+	wantIDs := map[string]bool{}
+	for n := 1; n <= 24; n++ {
+		wantIDs[fmt.Sprintf("PC-CHAT-%03d", n)] = true
+	}
+	for _, id := range []string{"CLS-01", "CLS-02", "CLS-03", "CLS-04", "CLS-05",
+		"REC-01", "REC-02", "REC-03", "REC-04",
+		"APR-01", "APR-02", "APR-03", "APR-04",
+		"CST-01", "CST-02", "MRG-01", "MRG-02", "MRG-03", "RPL-01", "RPL-02"} {
+		wantIDs[id] = true
+	}
+	// P0 per the evaluation plan (§4.3 smoke set + P0-1/P0-2 acceptance):
+	// PC-001/002/008/012/016/017/018, CLS-01, REC-01-03, APR-01-03, MRG-01.
+	wantP0 := map[string]bool{
+		"PC-CHAT-001": true, "PC-CHAT-002": true, "PC-CHAT-008": true, "PC-CHAT-012": true,
+		"PC-CHAT-016": true, "PC-CHAT-017": true, "PC-CHAT-018": true,
+		"CLS-01": true, "REC-01": true, "REC-02": true, "REC-03": true,
+		"APR-01": true, "APR-02": true, "APR-03": true, "MRG-01": true,
+	}
+	// The approval operation script exists exactly on the six approval
+	// cases that click approve/reject; the cost cap exists exactly on
+	// the two cost cases (micro-units, same unit as LimitMicros).
+	wantApprovalScript := map[string]bool{
+		"PC-CHAT-017": true, "PC-CHAT-018": true,
+		"APR-01": true, "APR-02": true, "APR-03": true, "APR-04": true,
+	}
+	wantCostBudget := map[string]bool{"CST-01": true, "CST-02": true}
+	// Environment preparation is recorded on the cases whose source
+	// states a precondition or which need fault injection.
+	wantSetup := map[string]bool{
+		"PC-CHAT-005": true, "PC-CHAT-007": true, "PC-CHAT-009": true, "PC-CHAT-010": true,
+		"PC-CHAT-011": true, "PC-CHAT-012": true, "PC-CHAT-016": true, "PC-CHAT-017": true,
+		"PC-CHAT-018": true, "PC-CHAT-019": true, "PC-CHAT-022": true, "PC-CHAT-024": true,
+		"CLS-01": true, "CLS-02": true, "CLS-03": true,
+		"REC-01": true, "REC-02": true, "REC-03": true, "REC-04": true,
+		"APR-01": true, "APR-02": true, "APR-03": true, "APR-04": true,
+		"CST-01": true, "CST-02": true,
+	}
+
+	seen := map[string]bool{}
+	for _, testCase := range suite.Cases {
+		if !wantIDs[testCase.ID] {
+			t.Errorf("unexpected live case id %q", testCase.ID)
+		}
+		if seen[testCase.ID] {
+			t.Errorf("duplicate live case id %q", testCase.ID)
+		}
+		seen[testCase.ID] = true
+		if wantP0[testCase.ID] != (testCase.Priority == "P0") {
+			t.Errorf("case %s priority = %q, want P0=%t", testCase.ID, testCase.Priority, wantP0[testCase.ID])
+		}
+		if testCase.ID == "PC-CHAT-015" && testCase.Priority != "P2" {
+			t.Errorf("case PC-CHAT-015 priority = %q, want P2 (inherited from the PC-CHAT source)", testCase.Priority)
+		}
+		if wantApprovalScript[testCase.ID] != (testCase.ApprovalScript != "") {
+			t.Errorf("case %s approval_script present=%t, want %t", testCase.ID, testCase.ApprovalScript != "", wantApprovalScript[testCase.ID])
+		}
+		if wantCostBudget[testCase.ID] != (testCase.CostBudget != nil) {
+			t.Errorf("case %s cost_budget present=%t, want %t", testCase.ID, testCase.CostBudget != nil, wantCostBudget[testCase.ID])
+		}
+		if testCase.CostBudget != nil && *testCase.CostBudget != 100000 {
+			t.Errorf("case %s cost_budget = %v, want 100000 micro-units", testCase.ID, *testCase.CostBudget)
+		}
+		if wantSetup[testCase.ID] != (testCase.Setup != "") {
+			t.Errorf("case %s setup present=%t, want %t", testCase.ID, testCase.Setup != "", wantSetup[testCase.ID])
+		}
+	}
+	for id := range wantIDs {
+		if !seen[id] {
+			t.Errorf("live suite is missing case %q", id)
+		}
+	}
+
+	// Live-only rules: P2 is accepted here but rejected on the synthetic
+	// fixture; a zero cost budget fails; a live suite relabelled as
+	// synthetic fails (its IDs and tags do not belong to the contract layer).
+	live := cloneSuite(t, suite)
+	live.Cases[0].CostBudget = new(float64)
+	if err := ValidateSuite(live); err == nil {
+		t.Fatal("zero cost budget must fail validation")
+	}
+	asSynthetic := cloneSuite(t, suite)
+	asSynthetic.DataClass = "synthetic"
+	if err := ValidateSuite(asSynthetic); err == nil {
+		t.Fatal("live suite relabelled as synthetic must fail validation")
 	}
 }
 

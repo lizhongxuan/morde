@@ -216,8 +216,10 @@ func (s *ModelGatewayService) CompleteConversationSummaryModel(ctx context.Conte
 	for _, scope := range claim.Authorization.Scopes {
 		principal.Scopes = append(principal.Scopes, identity.Scope(scope))
 	}
-	return s.Complete(ctx, ModelCall{Source: ModelCallCompaction, Principal: principal, Summary: &fence,
-		ModelID: modelID, CallID: callID, RawRequest: encoded, Request: request})
+	return s.completeWithRetry(ctx, func(ctx context.Context) (ModelResponse, error) {
+		return s.Complete(ctx, ModelCall{Source: ModelCallCompaction, Principal: principal, Summary: &fence,
+			ModelID: modelID, CallID: callID, RawRequest: encoded, Request: request})
+	})
 }
 
 func (s *ModelGatewayService) ResolveConversationSummaryModel(ctx context.Context, claim ConversationRouteClaim) (string, int, error) {

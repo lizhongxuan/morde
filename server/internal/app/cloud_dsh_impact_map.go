@@ -121,7 +121,7 @@ func (b *CloudDSHToolBroker) executeImpactMap(ctx context.Context, claimed task.
 		}
 	}
 	current.Usage = usage
-	result, err := b.runImpactMap(ctx, current, input)
+	impact, result, err := b.runImpactMap(ctx, current, input)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
@@ -134,6 +134,14 @@ func (b *CloudDSHToolBroker) executeImpactMap(ctx context.Context, claimed task.
 		step.Status, step.Summary = task.StepFailed, "The impact map could not be built for the requested component."
 	}
 	detail := map[string]any{"tool": call.Name, "operation_key": operationKey, "operation_status": result.Status, "component": input.Component}
+	if result.Status == AgentToolSucceeded {
+		// E02: the map is the durable regression surface. The completion
+		// gate reads it back from this event (impactMapFromEvents) and
+		// compares it against the fix's changed files and the tests the
+		// passing full suite ran. It is already bounded: runImpactMap
+		// refuses maps over maxAgentToolOutputBytes.
+		detail["impact_map"] = impact
+	}
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", detail); err != nil {
 		return AgentToolResult{}, err
 	}
@@ -142,24 +150,26 @@ func (b *CloudDSHToolBroker) executeImpactMap(ctx context.Context, claimed task.
 }
 
 // runImpactMap reads the task Workspace snapshot at the requested revision
-// and runs the pure impact analysis over it. It never writes.
-func (b *CloudDSHToolBroker) runImpactMap(ctx context.Context, current task.Task, input cloudDSHImpactMapInput) (AgentToolResult, error) {
+// and runs the pure impact analysis over it. It never writes. The map is
+// returned alongside the tool result so the caller can persist it as the
+// durable regression surface; on a failure result the map is zero.
+func (b *CloudDSHToolBroker) runImpactMap(ctx context.Context, current task.Task, input cloudDSHImpactMapInput) (ImpactMap, AgentToolResult, error) {
 	snapshot, err := b.workspaceTools.readSnapshot(ctx, current, input.ExpectedRevision)
 	if err != nil {
-		return cloudDSHWorkspaceFailure(err), nil
+		return ImpactMap{}, cloudDSHWorkspaceFailure(err), nil
 	}
 	impact, err := AnalyzeImpactMap(newWorkspaceSnapshotFileIndex(b.workspaceTools, snapshot), input.Component)
 	if err != nil {
-		return cloudDSHWorkspaceFailure(err), nil
+		return ImpactMap{}, cloudDSHWorkspaceFailure(err), nil
 	}
 	encoded, err := json.Marshal(impact)
 	if err != nil {
-		return AgentToolResult{}, fmt.Errorf("encode impact map result: %w", err)
+		return ImpactMap{}, AgentToolResult{}, fmt.Errorf("encode impact map result: %w", err)
 	}
 	if len(encoded) > maxAgentToolOutputBytes {
-		return AgentToolResult{}, domain.NewError(domain.CodeResultTooLarge, "impact map output exceeds the task limit")
+		return ImpactMap{}, AgentToolResult{}, domain.NewError(domain.CodeResultTooLarge, "impact map output exceeds the task limit")
 	}
-	return AgentToolResult{Status: AgentToolSucceeded, Output: string(encoded)}, nil
+	return impact, AgentToolResult{Status: AgentToolSucceeded, Output: string(encoded)}, nil
 }
 
 // workspaceSnapshotFileIndex adapts a workspace snapshot to the FileIndex
