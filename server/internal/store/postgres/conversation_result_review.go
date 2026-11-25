@@ -324,6 +324,9 @@ func conversationTaskResultReceiptWithDeliveryFacts(reply string, sources []app.
 			state = states[index]
 		}
 		fmt.Fprintf(&footer, "\n- %s r%d：%s", source.TaskID, source.TaskRevision, state)
+		if state == app.TaskValidationFail {
+			footer.WriteString("（验证未通过，请核对失败原因后再继续）")
+		}
 	}
 	var deliveryLines []string
 	for index, source := range sources {
@@ -442,10 +445,7 @@ WHERE message_id=$1 AND state='processing'`, replyMessageID); err != nil {
 		}
 		deliveryFacts = append(deliveryFacts, facts)
 	}
-	// E11 delivery-authenticity fence: a result that failed independent
-	// verification is never published. The gate runs before the receipt is
-	// built and before any publish write, so the refusal is atomic and the
-	// route failure leaves the batch failed and retryable.
+	// Every result is paired with its current verification state before publish.
 	if err := app.ValidateConversationResultDelivery(review.Sources, validationStates); err != nil {
 		return err
 	}

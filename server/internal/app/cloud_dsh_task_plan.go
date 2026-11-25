@@ -103,6 +103,9 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 	if err := b.authorizeSkillTask(ctx, current); err != nil {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "task authorization does not allow plan updates")
 	}
+	if result, handled, err := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput, ""); handled {
+		return result, err
+	}
 	plan := task.Plan{TaskRevision: *current.CurrentRevision, Goal: input.Goal, Scope: input.Scope,
 		VerificationMethod: input.VerificationMethod, CostEstimateState: "unknown", Steps: input.Steps, FixPlan: input.FixPlan}
 	if recovering && checkpointOutput != nil {
@@ -118,12 +121,20 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 		plan.Revision = 1
 	}
 	if plan.Revision < 1 || plan.Validate() != nil {
+		if result, handled, err := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput,
+			"Task plan is invalid; no action was executed."); handled {
+			return result, err
+		}
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh task plan is invalid or has a dependency cycle")
 	}
 	// Plan submission gate (E01): once a plan is submitted it must carry a
 	// complete brief. The rejection names the missing piece so the agent can
 	// complete it from context and resubmit; it never asks the user.
 	if _, err := task.BriefFromPlan(plan); err != nil {
+		if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput,
+			"Task plan brief is incomplete; no action was executed."); handled {
+			return result, gateErr
+		}
 		return AgentToolResult{}, domain.InvalidArgument("task_plan.brief", err.Error())
 	}
 	output, err := json.Marshal(plan)

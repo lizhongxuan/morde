@@ -41,14 +41,23 @@ func briefPlanCall(current task.Task, callID, arguments string) ModelToolCall {
 			AuthorizationVersion: current.Authorization.Version}}
 }
 
+func (s *cloudDSHBrokerTaskStore) GetCloudDSHTaskPlanReceipt(_ context.Context, _, _, sessionID, callID string) (task.Plan, error) {
+	for _, progress := range s.committedTaskProgress {
+		if commit := progress.CloudDSHTaskPlan; commit != nil && commit.AgentSessionID == sessionID && commit.CallID == callID {
+			return commit.Plan, nil
+		}
+	}
+	return task.Plan{}, domain.NewError(domain.CodeNotFound, "task plan receipt not found")
+}
+
 func TestTaskPlanSubmissionRequiresCompleteBrief(t *testing.T) {
 	store, broker, current := newBriefPlanBroker(t)
 	steps := `[{"id":"repro","title":"Reproduce","status":"pending","completion_criteria":["crash reproduces"]}]`
 	missingScope := `{"goal":"Fix the login crash","steps":` + steps + `}`
 
-	if _, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-brief-1", missingScope)); err == nil ||
-		domain.CodeOf(err) != domain.CodeInvalidArgument || !strings.Contains(err.Error(), "scope") {
-		t.Fatalf("plan without scope was not rejected with the missing field: err=%v", err)
+	if result, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-brief-1", missingScope)); err != nil ||
+		result.Status != AgentToolFailed || !strings.Contains(result.Output, "scope") {
+		t.Fatalf("plan without scope was not returned to the Agent: result=%#v, err=%v", result, err)
 	}
 	for _, progress := range store.committedTaskProgress {
 		if progress.CloudDSHTaskPlan != nil {
@@ -80,9 +89,9 @@ func TestTaskPlanSubmissionRequiresCompleteBrief(t *testing.T) {
 	// the committed revision the way the PostgreSQL store would return it.
 	store.details.Plan = &submitted
 	current = store.details.Task
-	if _, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-brief-3", missingScope)); err == nil ||
-		domain.CodeOf(err) != domain.CodeInvalidArgument || !strings.Contains(err.Error(), "scope") {
-		t.Fatalf("revised plan without scope was not rejected: err=%v", err)
+	if result, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-brief-3", missingScope)); err != nil ||
+		result.Status != AgentToolFailed || !strings.Contains(result.Output, "scope") {
+		t.Fatalf("revised plan without scope was not returned to the Agent: result=%#v, err=%v", result, err)
 	}
 	revised := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test and the auth suite","steps":` + steps + `}`
 	result, err = broker.Execute(context.Background(), current, briefPlanCall(current, "plan-brief-4", revised))
@@ -92,6 +101,69 @@ func TestTaskPlanSubmissionRequiresCompleteBrief(t *testing.T) {
 	var resubmitted task.Plan
 	if err := json.Unmarshal([]byte(result.Output), &resubmitted); err != nil || resubmitted.Revision != 2 {
 		t.Fatalf("revised plan output = %s, err=%v; want revision 2", result.Output, err)
+	}
+}
+
+func TestAdvisoryPlanRejectionReplaysWithoutExecuting(t *testing.T) {
+	store, broker, current := newBriefPlanBroker(t)
+	call := briefPlanCall(current, "plan-brief-replay", `{"goal":"Fix the bug","steps":[{"id":"a","title":"Reproduce","status":"pending"}]}`)
+	first, err := broker.Execute(context.Background(), current, call)
+	if err != nil || first.Status != AgentToolFailed || len(store.details.Steps) != 1 || store.details.Steps[0].Retryable {
+		t.Fatalf("first rejection = %#v, %v; steps=%#v", first, err, store.details.Steps)
+	}
+	checkpoint := dshToolResultText(first)
+	usage := store.details.Task.Usage.ToolCalls
+	store.details.Plan = briefPlan(1, true)
+	replayed, err := broker.Reconcile(context.Background(), store.details.Task, call, &checkpoint)
+	if err != nil || replayed.Status != first.Status || replayed.Output != first.Output || store.details.Task.Usage.ToolCalls != usage || len(store.details.Steps) != 1 {
+		t.Fatalf("replayed rejection = %#v, %v; first=%#v usage=%d", replayed, err, first, store.details.Task.Usage.ToolCalls)
+	}
+	changed := "Tool failed: a different result"
+	if _, err := broker.Reconcile(context.Background(), store.details.Task, call, &changed); err == nil {
+		t.Fatal("changed checkpoint was accepted")
+	}
+}
+
+func TestAdvisoryWorkspaceWriteRejectionDoesNotPublish(t *testing.T) {
+	_, store, broker, workspaceStore, current := newCloudDSHT08WorkspaceBroker(t)
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-brief", 1, "session-brief"
+	expires := time.Now().Add(time.Hour).UTC()
+	current.Authorization = task.Authorization{Kind: string(identity.KindSession), TokenID: "t1234567", Version: 1, ExpiresAt: &expires,
+		Scopes: []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit)}}
+	store.details.Task, store.details.Plan = current, briefPlan(1, false)
+	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "workspace-brief-replay", cloudDSHWorkspaceWriteArguments{
+		ExpectedRevision: 0, Path: "reports/summary.txt", Content: "synthetic",
+	})
+	call.TaskFence = briefPlanCall(current, call.CallID, call.Arguments).TaskFence
+	first, err := broker.Execute(context.Background(), current, call)
+	if err != nil || first.Status != AgentToolFailed || workspaceStore.commits != 0 || store.details.PendingRequest != nil {
+		t.Fatalf("Workspace rejection = %#v, %v; commits=%d", first, err, workspaceStore.commits)
+	}
+	checkpoint := dshToolResultText(first)
+	usage := store.details.Task.Usage.ToolCalls
+	store.details.Plan = briefPlan(1, true)
+	replayed, err := broker.Reconcile(context.Background(), store.details.Task, call, &checkpoint)
+	if err != nil || replayed.Status != first.Status || replayed.Output != first.Output || store.details.Task.Usage.ToolCalls != usage || workspaceStore.commits != 0 {
+		t.Fatalf("Workspace rejection replay = %#v, %v; first=%#v commits=%d", replayed, err, first, workspaceStore.commits)
+	}
+}
+
+func TestAdvisoryHostWriteRejectsRevokedAuthorization(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	current := store.details.Task
+	current.ExecutionLocation = "server"
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-brief", 1, "session-brief"
+	store.details.Task, store.details.Plan = current, briefPlan(1, false)
+	fixture.authorizer.errors[identity.ScopeComputerOperate] = domain.NewError(domain.CodeForbidden, "operate scope revoked")
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := minimalDiffHostWriteCall(current, "revoked-advisory-write", "auth/session.go")
+	if result, err := broker.Execute(context.Background(), current, call); domain.CodeOf(err) != domain.CodeForbidden || result.Status != "" || len(store.details.Steps) != 0 {
+		t.Fatalf("revoked authorization returned a retryable gate result: result=%#v err=%v", result, err)
 	}
 }
 
@@ -158,8 +230,8 @@ func TestHostFileWriteGateRequiresCompleteBrief(t *testing.T) {
 			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
 			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
 			AuthorizationVersion: current.Authorization.Version}}
-	if _, err := broker.Execute(context.Background(), current, call); err == nil ||
-		domain.CodeOf(err) != domain.CodeInvalidArgument || !strings.Contains(err.Error(), "brief") {
-		t.Fatalf("host file write with an incomplete brief was not rejected: err=%v", err)
+	if result, err := broker.Execute(context.Background(), current, call); err != nil ||
+		result.Status != AgentToolFailed || !strings.Contains(result.Output, "brief") {
+		t.Fatalf("host file write rejection was not returned to the Agent: result=%#v, err=%v", result, err)
 	}
 }

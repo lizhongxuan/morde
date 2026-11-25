@@ -211,6 +211,12 @@
     </div></div></details>
   </section>
 
+  <section id="merge-review-20261125" class="section"><h2>合并后偏离修复与待验</h2><div class="boundary">
+    <p>本地实现已恢复两层子 Agent 委派、收紧测试与审批回执核对、移除摘要正文日志，并让含验证失败的结果批次继续进入原对话。规划或写入在确认未派发且授权有效时，可将门禁拒绝交回同一 Agent；不确定的操作仍需对账。</p>
+    <p>仍需完成：让主 Agent 收到并解释具体验证失败原因；完成阶段门禁及失败/取消终态的耐久交付；补齐所有操作类型、工作区版本与测试覆盖证明；处理 R19-A 文件意图和 R21 超过 128 KiB 的 Task 初始消息。实际 PC、真实 DSH/模型与跨端验收尚未通过，流程图仍描述目标而非完成状态。</p>
+    <p><a href="../../验证记录/Morde_Harness_最终流程测试用例.md#merge-route-correction-20261125">查看本轮验证记录</a> · <a href="Morde%20复刻%20Muse%20一体化实施与验收%20TODO.md">查看未完成任务</a></p>
+  </div></section>
+
   <section id="boundaries" class="section"><h2>实施边界与次序</h2><div class="boundary">
     <ol>
       <li><strong>先闭环基础体验：</strong>核对收件与路由，补齐工具工作项和审批，再完成可恢复的两层子 Agent 协作、真实证据验证及原会话交付。</li>

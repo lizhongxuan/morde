@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"strings"
 	"testing"
-	"unicode/utf8"
 )
 
 func TestValidateConversationSummaryModelResponseNamesFirstFailure(t *testing.T) {
@@ -39,13 +38,24 @@ func TestValidateConversationSummaryModelResponseNamesFirstFailure(t *testing.T)
 			if failure.TextBytes != len(tc.response.Text) {
 				t.Fatalf("failure text bytes = %d, want %d", failure.TextBytes, len(tc.response.Text))
 			}
-			if utf8.RuneCountInString(failure.Preview) > MaxConversationSummaryFailurePreviewRunes {
-				t.Fatalf("failure preview exceeds %d runes", MaxConversationSummaryFailurePreviewRunes)
-			}
 			if !strings.Contains(failure.Error(), tc.wantReason) {
 				t.Fatalf("failure error does not name the reason: %v", failure)
 			}
 		})
+	}
+}
+
+func TestConversationSummaryFailureDoesNotExposeContent(t *testing.T) {
+	const privateText = "private-summary-secret"
+	for _, response := range []ModelResponse{
+		{StopReason: "length", Text: privateText},
+		{StopReason: privateText, Text: privateText},
+		{StopReason: "stop", Text: privateText + "\x00"},
+	} {
+		failure := ValidateConversationSummaryModelResponse(response)
+		if failure == nil || strings.Contains(failure.Error(), privateText) {
+			t.Fatalf("summary failure exposed content: %v", failure)
+		}
 	}
 }
 

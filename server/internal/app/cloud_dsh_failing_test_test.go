@@ -13,7 +13,7 @@ import (
 
 func failingTestStepForTest(current task.Task, id string) task.Step {
 	return task.Step{ID: id, TaskID: current.ID, Kind: "tool", Status: task.StepFailed,
-		ToolName: runtimeToolShellExec, FailureReason: taskToolTestFailureReason}
+		ToolName: runtimeToolShellExec, FailureReason: taskToolTestFailureReason, TaskRevision: current.CurrentRevision, Summary: directTestEvidenceSummary}
 }
 
 func TestFailingTestRecord(t *testing.T) {
@@ -264,9 +264,9 @@ func TestFailingTestHostFileWriteGate(t *testing.T) {
 					LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
 					AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
 					AuthorizationVersion: current.Authorization.Version}}
-			if _, err := broker.Execute(context.Background(), current, call); err == nil ||
-				domain.CodeOf(err) != domain.CodeInvalidArgument || !strings.Contains(err.Error(), test.wantSubstr) {
-				t.Fatalf("host file write was not rejected with %q: err=%v", test.wantSubstr, err)
+			if result, err := broker.Execute(context.Background(), current, call); err != nil ||
+				result.Status != AgentToolFailed || !strings.Contains(result.Output, test.wantSubstr) {
+				t.Fatalf("host file write was not returned to the Agent with %q: result=%#v, err=%v", test.wantSubstr, result, err)
 			}
 		})
 	}
@@ -341,15 +341,15 @@ func TestTaskPlanFixPlanSubmission(t *testing.T) {
 
 	tooMany := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps +
 		`,"fix_plan":{"changed_files":["a","b","c","d","e","f","g","h","i"]}}`
-	if _, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-fix-4", tooMany)); err == nil ||
-		domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("plan with too many fix plan files was not rejected: err=%v", err)
+	if result, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-fix-4", tooMany)); err != nil ||
+		result.Status != AgentToolFailed {
+		t.Fatalf("plan with too many fix plan files was not returned to the Agent: result=%#v, err=%v", result, err)
 	}
 	tooLong := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps +
 		`,"fix_plan":{"risks":["` + strings.Repeat("x", 513) + `"]}}`
-	if _, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-fix-5", tooLong)); err == nil ||
-		domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("plan with an overlong fix plan risk was not rejected: err=%v", err)
+	if result, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-fix-5", tooLong)); err != nil ||
+		result.Status != AgentToolFailed {
+		t.Fatalf("plan with an overlong fix plan risk was not returned to the Agent: result=%#v, err=%v", result, err)
 	}
 	unknownField := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps +
 		`,"fix_plan":{"changed_files":[],"unknown":1}}`

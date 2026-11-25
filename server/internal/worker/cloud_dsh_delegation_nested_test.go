@@ -11,8 +11,8 @@ import (
 )
 
 func TestCloudDSHChildDelegateExceedsDepthLimit(t *testing.T) {
-	// E12: the default subagent depth is 1 layer (direct children of the
-	// root only). A child agent asking for its own child is rejected with
+	// An explicitly restricted depth of 1 permits direct children of the
+	// root only. A child agent asking for its own child is rejected with
 	// an explicit depth error and no child is created, even though the
 	// child's stored state still carries canDelegate from before the limit.
 	const arguments = `{"title":"Inspect","objective":"Read the project","tool_names":["file_read"]}`
@@ -26,7 +26,7 @@ func TestCloudDSHChildDelegateExceedsDepthLimit(t *testing.T) {
 	frame.cloudDSHIdentity = identity
 	children := &cloudDSHTestChildSessions{}
 	tools := &cloudDSHTestTools{admissionStatus: app.AgentToolCallAdmitted}
-	executor := &CloudDSHExecutor{options: CloudDSHExecutorOptions{Tools: tools, Children: children}}
+	executor := &CloudDSHExecutor{options: CloudDSHExecutorOptions{Tools: tools, Children: children, MaxSubagentDepth: 1}}
 	states := map[string]*cloudDSHSessionState{identity.SessionID: parent}
 	writer := &cloudDSHFrameBuffer{}
 
@@ -42,10 +42,9 @@ func TestCloudDSHChildDelegateExceedsDepthLimit(t *testing.T) {
 		t.Fatalf("depth-limited delegation reached admission: %+v", tools.admissionCalls)
 	}
 
-	// The limit is configurable: with MaxSubagentDepth 2 the same nested
-	// delegation is admitted again, and the grandchild itself cannot
-	// delegate further.
-	executor = &CloudDSHExecutor{options: CloudDSHExecutorOptions{Tools: tools, Children: children, MaxSubagentDepth: 2}}
+	// The default permits the same nested delegation, while the grandchild
+	// itself cannot delegate further.
+	executor = &CloudDSHExecutor{options: CloudDSHExecutorOptions{Tools: tools, Children: children}}
 	superseded, err = executor.createCloudDSHChildSession(context.Background(), value, fence, frame, states,
 		[]app.AgentToolDefinition{cloudDSHReadTool()}, writer, nil, nil)
 	if err != nil || superseded {

@@ -537,9 +537,9 @@ func TestTaskValidationReviewInputSetsReplayForFixTask(t *testing.T) {
 	// must match the E03/E07 stamps in internal/app.
 	fixSteps := []task.Step{
 		{ID: "s1111111", TaskID: claim.TaskID, Sequence: 1, Kind: "tool", Status: task.StepFailed,
-			ToolName: "shell_exec", FailureReason: "test_failed", RequestDigest: digest[:]},
+			ToolName: "shell_exec", FailureReason: "test_failed", RequestDigest: digest[:], TaskRevision: &revision, Summary: "The test command ran; its exit status was recorded."},
 		{ID: "s2222222", TaskID: claim.TaskID, Sequence: 2, Kind: "tool", Status: task.StepSucceeded,
-			ToolName: "shell_exec", FailureReason: "test_suite_passed", RequestDigest: digest[:]},
+			ToolName: "shell_exec", FailureReason: "test_suite_passed", RequestDigest: digest[:], TaskRevision: &revision, Summary: "The test command ran; its exit status was recorded."},
 	}
 	plan := &task.Plan{TaskRevision: revision, Revision: 1, FixPlan: &task.FixPlan{}}
 	snapshots := taskValidationReviewSnapshotStub{details: app.TaskDetails{

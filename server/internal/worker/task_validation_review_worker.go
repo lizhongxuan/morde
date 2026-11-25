@@ -244,7 +244,7 @@ func (w *TaskValidationReviewWorker) reviewInput(ctx context.Context, claim app.
 	// reviewer can judge H07 on ledger fact, not on exit codes alone.
 	// It is set even when there is no evidence record: a fix task with
 	// no evidence still has a replay to report.
-	input.Replay = app.ReplayEvidenceForSteps(details.Steps, details.Plan != nil && details.Plan.FixPlan != nil)
+	input.Replay = app.ReplayEvidenceForSteps(details.Steps, details.Task.CurrentRevision, details.Plan != nil && details.Plan.FixPlan != nil)
 	if input.Objective == "" || len(input.Objective) > app.MaxAssistantMessageBytes || !utf8.ValidString(input.Objective) ||
 		strings.ContainsRune(input.Objective, '\x00') || input.Result == "" || len(input.Result) > app.MaxAssistantMessageBytes ||
 		!utf8.ValidString(input.Result) || strings.ContainsRune(input.Result, '\x00') ||

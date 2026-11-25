@@ -175,13 +175,14 @@ func TestEvaluateTaskValidationReplay(t *testing.T) {
 
 func TestReplayEvidenceForSteps(t *testing.T) {
 	suite := testGateDigest("go test ./...")
+	revision := int64(1)
 	steps := []task.Step{
 		{ID: "red", Kind: "tool", Status: task.StepFailed, Sequence: 1, ToolName: runtimeToolShellExec,
-			FailureReason: taskToolTestFailureReason, RequestDigest: suite},
+			FailureReason: taskToolTestFailureReason, RequestDigest: suite, TaskRevision: &revision, Summary: directTestEvidenceSummary},
 		{ID: "green", Kind: "tool", Status: task.StepSucceeded, Sequence: 2, ToolName: runtimeToolShellExec,
-			FailureReason: taskToolTestSuitePassedReason, RequestDigest: suite},
+			FailureReason: taskToolTestSuitePassedReason, RequestDigest: suite, TaskRevision: &revision, Summary: directTestEvidenceSummary},
 	}
-	got := ReplayEvidenceForSteps(steps, true)
+	got := ReplayEvidenceForSteps(steps, &revision, true)
 	if got == nil {
 		t.Fatal("ReplayEvidenceForSteps(fix task) = nil, want a replay section")
 	}
@@ -190,12 +191,12 @@ func TestReplayEvidenceForSteps(t *testing.T) {
 	if *got != *want {
 		t.Fatalf("ReplayEvidenceForSteps() = %+v, want %+v", got, want)
 	}
-	if got := ReplayEvidenceForSteps(steps, false); got != nil {
+	if got := ReplayEvidenceForSteps(steps, &revision, false); got != nil {
 		t.Fatalf("ReplayEvidenceForSteps(non-fix task) = %+v, want nil", got)
 	}
 	// The section is included even when the gate fails, so the model can
 	// see the re-run did not happen.
-	if got := ReplayEvidenceForSteps(nil, true); got == nil || got.NewTestPassed || got.FullSuitePassed {
+	if got := ReplayEvidenceForSteps(nil, &revision, true); got == nil || got.NewTestPassed || got.FullSuitePassed {
 		t.Fatalf("ReplayEvidenceForSteps(fix task, no runs) = %+v, want an all-false section", got)
 	}
 }
@@ -210,9 +211,9 @@ func TestIndependentVerifierResolvesFixTaskVerdict(t *testing.T) {
 	rev := e09Revision(1)
 	steps := []task.Step{
 		{ID: "red", Kind: "tool", Status: task.StepFailed, Sequence: 1, ToolName: runtimeToolShellExec,
-			FailureReason: taskToolTestFailureReason, RequestDigest: suite},
+			FailureReason: taskToolTestFailureReason, RequestDigest: suite, TaskRevision: rev, Summary: directTestEvidenceSummary},
 		{ID: "green", Kind: "tool", Status: task.StepSucceeded, Sequence: 2, ToolName: runtimeToolShellExec,
-			FailureReason: taskToolTestSuitePassedReason, RequestDigest: suite},
+			FailureReason: taskToolTestSuitePassedReason, RequestDigest: suite, TaskRevision: rev, Summary: directTestEvidenceSummary},
 		{ID: "read", Kind: "tool", Status: task.StepSucceeded, Sequence: 3, ToolName: runtimeToolFileRead},
 	}
 	approvalFact, approvalVerified := EvaluateTaskApprovalCoverage(
@@ -228,7 +229,7 @@ func TestIndependentVerifierResolvesFixTaskVerdict(t *testing.T) {
 		CorrectionRecordVerified:  correctionVerified,
 		EvidenceContentVerified:   true,
 		ClarificationHistoryKnown: true,
-		ReplayVerified:            EvaluateTaskValidationReplay(true, EvaluateTestGate(steps), true),
+		ReplayVerified:            EvaluateTaskValidationReplay(true, EvaluateTestGate(steps, rev), true),
 	}
 	evaluations := EvaluateTaskValidationReview(validTaskValidationReviewReport(), facts)
 	if got := SummarizeTaskValidationEvaluations(evaluations); got.State != TaskValidationPass {
@@ -237,7 +238,7 @@ func TestIndependentVerifierResolvesFixTaskVerdict(t *testing.T) {
 
 	// The same task with the test gate unproven stays pending: the
 	// verifier must not pass what it could not re-derive.
-	unproven := EvaluateTestGate(steps[:1])
+	unproven := EvaluateTestGate(steps[:1], rev)
 	facts.ReplayVerified = EvaluateTaskValidationReplay(true, unproven, true)
 	if got := SummarizeTaskValidationEvaluations(EvaluateTaskValidationReview(validTaskValidationReviewReport(), facts)); got.State != TaskValidationPending {
 		t.Fatalf("fix task without a replay verdict = %q, want pending", got.State)

@@ -111,7 +111,7 @@ func TestMinimalDiffHostFileWriteGate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = broker.Execute(context.Background(), current, minimalDiffHostWriteCall(current, "file-write-minimal-1", test.path))
+			result, err := broker.Execute(context.Background(), current, minimalDiffHostWriteCall(current, "file-write-minimal-1", test.path))
 			if test.wantAllow {
 				// The fixture has no file-write handler, so the call fails at
 				// a later stage; the assertion is that neither the
@@ -121,11 +121,11 @@ func TestMinimalDiffHostFileWriteGate(t *testing.T) {
 				}
 				return
 			}
-			if err == nil || domain.CodeOf(err) != domain.CodeInvalidArgument || !strings.Contains(err.Error(), test.wantSubstr) {
-				t.Fatalf("host file write was not rejected with %q: err=%v", test.wantSubstr, err)
+			if err != nil || result.Status != AgentToolFailed || !strings.Contains(result.Output, test.wantSubstr) {
+				t.Fatalf("host file write was not returned to the Agent with %q: result=%#v, err=%v", test.wantSubstr, result, err)
 			}
-			if test.wantSubstr == "failing reproduction test" && strings.Contains(err.Error(), "fix_plan.changed_files") {
-				t.Fatalf("host file write error mixed the gates: err=%v", err)
+			if test.wantSubstr == "failing reproduction test" && strings.Contains(result.Output, "fix_plan.changed_files") {
+				t.Fatalf("host file write result mixed the gates: result=%#v", result)
 			}
 		})
 	}

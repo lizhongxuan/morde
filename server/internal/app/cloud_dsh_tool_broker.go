@@ -1201,6 +1201,11 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if err != nil {
 		return AgentToolResult{}, err
 	}
+	if call.Name == runtimeToolFileWrite {
+		if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput, ""); handled {
+			return result, gateErr
+		}
+	}
 	// Write gates (E01, E03, E06): a host file write is refused while the task has
 	// a submitted plan with an incomplete brief, while no failing reproduction
 	// test has run on a fix task, and while the written file is outside the
@@ -1208,9 +1213,17 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	// failing test, then the minimal diff. Read-only calls are unaffected.
 	if call.Name == runtimeToolFileWrite {
 		if err := requireCompleteTaskPlanBrief(details); err != nil {
+			if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput,
+				"Task plan brief is incomplete; no action was executed."); handled {
+				return result, gateErr
+			}
 			return AgentToolResult{}, err
 		}
 		if err := requireFailingTestRecord(details); err != nil {
+			if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput,
+				"Reproduction test is missing; no action was executed."); handled {
+				return result, gateErr
+			}
 			return AgentToolResult{}, err
 		}
 		var writeArguments struct {
@@ -1222,6 +1235,10 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
 		}
 		if err := requireMinimalDiffWrite(details, writeArguments.Path); err != nil {
+			if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput,
+				"File is outside the fix plan; no action was executed."); handled {
+				return result, gateErr
+			}
 			return AgentToolResult{}, err
 		}
 	}
@@ -2525,6 +2542,10 @@ func (b *CloudDSHToolBroker) prepareTaskToolStep(ctx context.Context, current ta
 	call, err := taskToolCallProgress(activity, step)
 	if err != nil || call == nil {
 		return step, call, err
+	}
+	if call.FailureReason == taskToolTestFailureReason || call.FailureReason == taskToolTestPassedReason ||
+		call.FailureReason == taskToolTestSuitePassedReason {
+		step.Summary = directTestEvidenceSummary
 	}
 	step.AgentSessionID, step.TaskRevision = call.AgentSessionID, &call.TaskRevision
 	step.ToolCallKey, step.ToolName = call.CallKey, call.ToolName

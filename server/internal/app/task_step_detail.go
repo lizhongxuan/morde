@@ -93,6 +93,7 @@ const maxTaskStepContentEvidencePreviewBytes = 4096
 
 const taskToolExecutionFailureReason = "tool_execution_failed"
 const taskToolInvalidArgumentsFailureReason = "invalid_tool_arguments"
+const taskToolAdvisoryGateFailureReason = "advisory_gate_rejected"
 
 func validCloudDSHToolActivityFence(ctx context.Context, current task.Task, call ModelToolCall) bool {
 	return ctx != nil && call.TaskFence != nil && call.TaskFence.TaskID == current.ID && call.TaskFence.OwnerID == current.OwnerID &&
@@ -293,9 +294,10 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 		}
 		progress.ContentEvidenceSHA256 = contentDigest
 	}
-	if step.Status == task.StepFailed && activity.failureReason == taskToolInvalidArgumentsFailureReason && phase == "prepare" {
-		// Invalid arguments are reported in the event detail. Keep the durable
-		// Task failure evidence non-retryable and within the Store's allowlist.
+	if step.Status == task.StepFailed && phase == "prepare" &&
+		(activity.failureReason == taskToolInvalidArgumentsFailureReason || activity.failureReason == taskToolAdvisoryGateFailureReason) {
+		// The same Agent can correct the call. Do not expose a separate
+		// user-triggered step retry for this pre-dispatch result.
 	} else if step.Status == task.StepFailed && activity.failureReason == "connector_rate_limited" {
 		progress.FailureReason, progress.Retryable = activity.failureReason, true
 	} else if step.Status == task.StepFailed && activity.failureReason == taskToolExecutionFailureReason && phase == "execute" {

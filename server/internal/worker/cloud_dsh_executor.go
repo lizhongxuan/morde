@@ -381,7 +381,7 @@ type CloudDSHExecutorOptions struct {
 	Children         CloudDSHChildSessions
 	Completion       CloudDSHCompleter
 	// MaxSubagentDepth bounds delegation hops from the root session (0
-	// keeps the app.DefaultMaxSubagentDepth of 1). It is the single
+	// keeps the app.DefaultMaxSubagentDepth of 2). It is the single
 	// configurable for the E12 subagent depth limit.
 	MaxSubagentDepth int
 }
@@ -406,7 +406,7 @@ func NewCloudDSHExecutor(options CloudDSHExecutorOptions) (*CloudDSHExecutor, er
 }
 
 // maxSubagentDepth is the configured E12 delegation limit (0 keeps the
-// app.DefaultMaxSubagentDepth of 1 direct-child layer).
+// app.DefaultMaxSubagentDepth of two delegation hops).
 func (e *CloudDSHExecutor) maxSubagentDepth() int {
 	if e != nil && e.options.MaxSubagentDepth > 0 {
 		return e.options.MaxSubagentDepth

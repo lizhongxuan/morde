@@ -3142,8 +3142,8 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		return false, errors.New("dsh child Agent request identity is invalid")
 	}
 	// E12 subagent depth limit: a new child may only be spawned while the
-	// delegation depth stays within MaxSubagentDepth (default 1: direct
-	// children of the root only). A deeper spawn is rejected with an
+	// delegation depth stays within MaxSubagentDepth (default 2). A deeper
+	// spawn is rejected with an
 	// explicit error, never silently dropped, so the model learns the
 	// delegation is unavailable instead of retrying it. A recovery replay
 	// of an already-checkpointed delegate call is exempt: it finishes a

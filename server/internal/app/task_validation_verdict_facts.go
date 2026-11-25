@@ -231,11 +231,11 @@ type TaskValidationReplayEvidence struct {
 // for a fix task, or nil for any other task (its read-back is already in
 // the packet as artifact content proofs). The section is included even
 // when the gate fails, so the model can see the re-run did not happen.
-func ReplayEvidenceForSteps(steps []task.Step, hasFixPlan bool) *TaskValidationReplayEvidence {
+func ReplayEvidenceForSteps(steps []task.Step, currentRevision *int64, hasFixPlan bool) *TaskValidationReplayEvidence {
 	if !hasFixPlan {
 		return nil
 	}
-	gate := EvaluateTestGate(steps)
+	gate := EvaluateTestGate(steps, currentRevision)
 	return &TaskValidationReplayEvidence{
 		NewTestPassed:           gate.NewTestPassed,
 		FullSuitePassed:         gate.FullSuitePassed,

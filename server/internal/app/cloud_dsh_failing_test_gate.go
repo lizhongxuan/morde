@@ -39,7 +39,7 @@ func requireFailingTestRecord(details TaskDetails) error {
 	if details.Plan == nil || details.Plan.FixPlan == nil {
 		return nil
 	}
-	if hasFailingTestRecord(details.Steps) {
+	if hasFailingTestRecord(currentRevisionTestSteps(details.Steps, details.Task.CurrentRevision)) {
 		return nil
 	}
 	return domain.InvalidArgument("task_plan.failing_test", "run a failing reproduction test before changing code")
@@ -58,10 +58,37 @@ func failingTestFailureReason(activity cloudDSHToolActivity) string {
 	var arguments struct {
 		Command string `json:"command"`
 	}
-	if json.Unmarshal([]byte(activity.call.Arguments), &arguments) != nil || !isTestCommand(arguments.Command) {
+	if json.Unmarshal([]byte(activity.call.Arguments), &arguments) != nil || !isDirectTestCommand(arguments.Command) {
 		return ""
 	}
 	return taskToolTestFailureReason
+}
+
+// isDirectTestCommand accepts only a single, unwrapped command for test
+// evidence. An exit code for a shell expression cannot prove which of its
+// branches actually ran, and an environment override can change test
+// selection. More complicated invocations remain ordinary tool activity.
+func isDirectTestCommand(command string) bool {
+	if strings.ContainsAny(command, "&|;\n\r<>$`\\\"'()#!") {
+		return false
+	}
+	tokens := strings.Fields(command)
+	if len(tokens) == 0 || tokens[0] == "env" || tokens[0] == "sudo" ||
+		strings.Contains(tokens[0], "=") {
+		return false
+	}
+	for _, token := range tokens[1:] {
+		token = strings.ToLower(token)
+		if strings.HasPrefix(token, "-list=") || strings.HasPrefix(token, "--list=") ||
+			strings.HasPrefix(token, "--collect-only=") || strings.HasPrefix(token, "--dry-run=") {
+			return false
+		}
+		switch token {
+		case "-h", "--help", "--version", "--collect-only", "--collectonly", "--dry-run", "-list", "--list", "--listtests":
+			return false
+		}
+	}
+	return testCommandSegment(tokens)
 }
 
 // isTestCommand reports whether a shell command runs a test suite. It is a

@@ -42,6 +42,9 @@ func testPassReason(activity cloudDSHToolActivity) string {
 	if json.Unmarshal([]byte(activity.call.Arguments), &arguments) != nil {
 		return ""
 	}
+	if !isDirectTestCommand(arguments.Command) {
+		return ""
+	}
 	if isFullSuiteTestCommand(arguments.Command) {
 		return taskToolTestSuitePassedReason
 	}
@@ -52,19 +55,10 @@ func testPassReason(activity cloudDSHToolActivity) string {
 }
 
 // isFullSuiteTestCommand reports whether a shell command runs a full test
-// suite: at least one `&&`/`||`/`;`-separated segment is a test command with
-// no test selection. A command that only runs a selected test (a -run
-// filter, a :: selector, a single test file) is not a full suite, even when
-// it passes.
+// suite as a single direct command with no test selection. A compound shell
+// expression cannot prove that a particular segment ran.
 func isFullSuiteTestCommand(command string) bool {
-	for _, segment := range strings.FieldsFunc(command, func(r rune) bool {
-		return r == '&' || r == '|' || r == ';' || r == '\n'
-	}) {
-		if fullSuiteTestCommandSegment(strings.Fields(segment)) {
-			return true
-		}
-	}
-	return false
+	return isDirectTestCommand(command) && fullSuiteTestCommandSegment(strings.Fields(command))
 }
 
 func fullSuiteTestCommandSegment(tokens []string) bool {
@@ -175,12 +169,17 @@ type TestGateResult struct {
 	FullSuitePassedSequence int64
 }
 
+// Older test stamps could have been produced by compound shell expressions.
+// Only the summary committed with the stricter direct-command check identifies
+// new evidence; older steps need a fresh, directly executed test.
+const directTestEvidenceSummary = "The test command ran; its exit status was recorded."
+
 // EvaluateTestGate re-derives the E07 test gate from the recorded steps.
 // It is the same derivation the execution broker runs at completion time,
 // exposed so the independent verifier can re-run it from the ledger instead
 // of trusting the broker's gate or the model's claim.
-func EvaluateTestGate(steps []task.Step) TestGateResult {
-	result := evaluateTestGate(steps)
+func EvaluateTestGate(steps []task.Step, currentRevision *int64) TestGateResult {
+	result := evaluateTestGate(currentRevisionTestSteps(steps, currentRevision))
 	return TestGateResult{
 		NewTestPassed:           result.newTestPassed,
 		FullSuitePassed:         result.fullSuitePassed,
@@ -188,6 +187,52 @@ func EvaluateTestGate(steps []task.Step) TestGateResult {
 		NewTestPassedSequence:   result.newTestPassedSequence,
 		FullSuitePassedSequence: result.fullSuitePassedSequence,
 	}
+}
+
+// currentRevisionTestSteps discards evidence from other or unknown Task
+// revisions. A passing test predating the latest potentially mutating tool
+// call is not evidence for the current workspace. Failed tests remain so a
+// subsequent pass can still be paired with the original reproduction.
+func currentRevisionTestSteps(steps []task.Step, currentRevision *int64) []task.Step {
+	if currentRevision == nil {
+		return nil
+	}
+	var latestMutation, latestTestFailure int64
+	for _, step := range steps {
+		if step.TaskRevision == nil || *step.TaskRevision != *currentRevision {
+			continue
+		}
+		verifiedTest := step.Summary == directTestEvidenceSummary && (step.FailureReason == taskToolTestFailureReason ||
+			step.FailureReason == taskToolTestPassedReason || step.FailureReason == taskToolTestSuitePassedReason)
+		if verifiedTest && step.Status == task.StepFailed && step.FailureReason == taskToolTestFailureReason && step.Sequence > latestTestFailure {
+			latestTestFailure = step.Sequence
+		}
+		mutating := step.ToolName == runtimeToolFileWrite || step.ToolName == cloudDSHWorkspaceWriteToolName ||
+			(step.ToolName == runtimeToolShellExec && !verifiedTest)
+		if mutating && step.Sequence > latestMutation {
+			latestMutation = step.Sequence
+		}
+	}
+	filtered := make([]task.Step, 0, len(steps))
+	for _, step := range steps {
+		if step.TaskRevision == nil || *step.TaskRevision != *currentRevision {
+			continue
+		}
+		if step.ToolName == runtimeToolShellExec && step.Summary != directTestEvidenceSummary &&
+			(step.FailureReason == taskToolTestFailureReason || step.FailureReason == taskToolTestPassedReason ||
+				step.FailureReason == taskToolTestSuitePassedReason) {
+			continue
+		}
+		if step.Status == task.StepSucceeded && step.Sequence <= latestMutation &&
+			(step.FailureReason == taskToolTestPassedReason || step.FailureReason == taskToolTestSuitePassedReason) {
+			continue
+		}
+		if step.Status == task.StepSucceeded && step.FailureReason == taskToolTestSuitePassedReason && step.Sequence <= latestTestFailure {
+			continue
+		}
+		filtered = append(filtered, step)
+	}
+	return filtered
 }
 
 // evaluateTestGate reads the durable test-run records off the task steps. A
@@ -205,7 +250,7 @@ func evaluateTestGate(steps []task.Step) testGateResult {
 			continue
 		}
 		digest := string(step.RequestDigest)
-		if sequence, ok := failed[digest]; !ok || step.Sequence < sequence {
+		if sequence, ok := failed[digest]; !ok || step.Sequence > sequence {
 			failed[digest] = step.Sequence
 		}
 	}
@@ -248,7 +293,7 @@ func testGateMissing(details TaskDetails) string {
 	if details.Plan == nil || details.Plan.FixPlan == nil {
 		return ""
 	}
-	result := evaluateTestGate(details.Steps)
+	result := evaluateTestGate(currentRevisionTestSteps(details.Steps, details.Task.CurrentRevision))
 	var missing []string
 	if !result.newTestPassed {
 		missing = append(missing, "the failing reproduction test has not passed yet; re-run the same test command that failed, after the fix, and confirm it passes")

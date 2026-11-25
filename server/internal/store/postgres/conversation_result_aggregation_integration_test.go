@@ -385,27 +385,26 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE id=$1 AND role='assistant'`, messageID).Scan(&receiptCount); err != nil || receiptCount != 1 {
 		t.Fatalf("receipt count=%d err=%v; want one persisted receipt", receiptCount, err)
 	}
-	// E11: the failed task completes into its own batch; its FAIL review must
-	// refuse the publish instead of landing as a labelled receipt line.
+	// A failed review must be reported in the conversation rather than hidden.
 	if !f.complete(t, &failed, "current result with fail evidence") {
 		t.Fatalf("result was not queued for task %s", failed.ID)
 	}
 	failedDigest := sha256.Sum256([]byte(failed.Content))
 	seedConversationResultValidationReview(t, f, failed, failed.TaskRevision, failed.EventSequence, failedDigest[:], app.TaskValidationFail)
 	f.runNextReview(t)
-	var failedBatchState string
-	if err := f.store.pool.QueryRow(ctx, `SELECT state FROM conversation_result_batches WHERE state='failed'`).Scan(&failedBatchState); err != nil {
-		t.Fatalf("failed result batch was not recorded: %v", err)
+	var failedContent string
+	if err := f.store.pool.QueryRow(ctx, `SELECT message.content FROM conversation_result_batches batch
+JOIN conversation_messages message ON message.id=batch.published_message_id
+JOIN conversation_result_sources source ON source.batch_message_id=batch.message_id
+WHERE source.task_id=$1 AND batch.state='published'`, failed.ID).Scan(&failedContent); err != nil {
+		t.Fatalf("failed validation was not delivered: %v", err)
 	}
-	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_result_batches WHERE state='published'`).Scan(&receiptCount); err != nil || receiptCount != 1 {
-		t.Fatalf("published batch count=%d err=%v; want the first batch only", receiptCount, err)
-	}
-	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE role='assistant'`).Scan(&receiptCount); err != nil || receiptCount != 1 {
-		t.Fatalf("assistant message count=%d err=%v; want the first receipt only", receiptCount, err)
+	if !strings.Contains(failedContent, "FAIL（验证未通过") {
+		t.Fatalf("failed validation was not explained: %q", failedContent)
 	}
 }
 
-func TestConversationResultReviewRefusesFailedValidation(t *testing.T) {
+func TestConversationResultReviewDeliversMixedValidationStates(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	ctx := context.Background()
 	passed := f.createTask(t, f.ownerID, "passing result")
@@ -422,43 +421,16 @@ func TestConversationResultReviewRefusesFailedValidation(t *testing.T) {
 	seedConversationResultValidationReview(t, f, failed, failed.TaskRevision, failed.EventSequence, failedDigest[:], app.TaskValidationFail)
 	f.runNextReview(t)
 
-	// The whole batch is refused atomically: the passing source must not
-	// publish alongside the failed one.
-	var batchState, triggerID, failureReason string
-	if err := f.store.pool.QueryRow(ctx, `SELECT b.state,b.trigger_message_id,r.failure_reason
-FROM conversation_result_batches b JOIN conversation_message_routes r ON r.message_id=b.trigger_message_id
-WHERE b.state='failed'`).Scan(&batchState, &triggerID, &failureReason); err != nil {
-		t.Fatalf("failed result batch was not recorded: %v", err)
+	var content string
+	if err := f.store.pool.QueryRow(ctx, `SELECT message.content FROM conversation_result_batches batch
+JOIN conversation_messages message ON message.id=batch.published_message_id
+WHERE batch.state='published'`).Scan(&content); err != nil {
+		t.Fatalf("mixed result batch was not delivered: %v", err)
 	}
-	if failureReason != "routing_action_unavailable" {
-		t.Errorf("route failure reason = %q; want routing_action_unavailable", failureReason)
-	}
-	var published, assistantMessages int
-	if err := f.store.pool.QueryRow(ctx, `SELECT (SELECT count(*) FROM conversation_result_batches WHERE state='published'),
-(SELECT count(*) FROM conversation_messages WHERE role='assistant')`).Scan(&published, &assistantMessages); err != nil {
-		t.Fatal(err)
-	}
-	if published != 0 || assistantMessages != 0 {
-		t.Fatalf("refused batch published=%d assistant messages=%d; want 0 and 0", published, assistantMessages)
-	}
-
-	// The refusal is recoverable: once the review passes, an authorized
-	// retry re-runs the publish and the batch is delivered.
-	if _, err := f.store.pool.Exec(ctx, `UPDATE task_validation_reviews SET validation_state='PASS'
-WHERE task_id=$1 AND task_revision=$2`, failed.ID, failed.TaskRevision); err != nil {
-		t.Fatalf("flip failed review to pass: %v", err)
-	}
-	instanceID, err := f.store.ServiceInstanceID(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	principal := identity.Principal{UserID: f.ownerID, Kind: identity.KindSession, TokenID: testSessionTokenID(f.ownerID)}
-	if err := f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, triggerID, instanceID, "refused-review-retry-key-001"); err != nil {
-		t.Fatalf("retry refused result review: %v", err)
-	}
-	f.runNextReview(t)
-	if err := f.store.pool.QueryRow(ctx, `SELECT state FROM conversation_result_batches WHERE trigger_message_id=$1`, triggerID).Scan(&batchState); err != nil || batchState != "published" {
-		t.Fatalf("retried result review batch state = %q err=%v", batchState, err)
+	for _, expected := range []string{passed.ID, failed.ID, "PASS", "FAIL（验证未通过"} {
+		if !strings.Contains(content, expected) {
+			t.Fatalf("mixed result receipt missing %q: %q", expected, content)
+		}
 	}
 }
 

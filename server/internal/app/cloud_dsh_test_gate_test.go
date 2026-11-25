@@ -17,9 +17,9 @@ func greenTestStepsForTest(current task.Task) []task.Step {
 	digest := sha256.Sum256([]byte("go test ./..."))
 	return []task.Step{
 		{ID: "s1", TaskID: current.ID, Kind: "tool", Status: task.StepFailed, Sequence: 1,
-			ToolName: runtimeToolShellExec, FailureReason: taskToolTestFailureReason, RequestDigest: digest[:]},
+			ToolName: runtimeToolShellExec, FailureReason: taskToolTestFailureReason, RequestDigest: digest[:], TaskRevision: current.CurrentRevision, Summary: directTestEvidenceSummary},
 		{ID: "s2", TaskID: current.ID, Kind: "tool", Status: task.StepSucceeded, Sequence: 2,
-			ToolName: runtimeToolShellExec, FailureReason: taskToolTestSuitePassedReason, RequestDigest: digest[:]},
+			ToolName: runtimeToolShellExec, FailureReason: taskToolTestSuitePassedReason, RequestDigest: digest[:], TaskRevision: current.CurrentRevision, Summary: directTestEvidenceSummary},
 	}
 }
 
@@ -82,7 +82,8 @@ func TestFullSuiteTestCommand(t *testing.T) {
 		{command: "rspec -e login", want: false},
 		{command: "ctest", want: true},
 		{command: "ctest -R login", want: false},
-		{command: "go test -run TestLogin ./... && go test ./...", want: true},
+		{command: "go test -run TestLogin ./... && go test ./...", want: false},
+		{command: "false && go test ./... || true", want: false},
 		{command: "go vet ./...", want: false},
 		{command: "go build ./...", want: false},
 		{command: "npm run lint", want: false},
@@ -111,7 +112,11 @@ func TestPassingTestProgressStamp(t *testing.T) {
 		{name: "passing npm suite", command: "npm test", status: task.StepSucceeded, want: taskToolTestSuitePassedReason},
 		{name: "passing pytest file", command: "pytest tests/test_login.py", status: task.StepSucceeded, want: taskToolTestPassedReason},
 		{name: "passing pytest dir", command: "pytest tests/", status: task.StepSucceeded, want: taskToolTestSuitePassedReason},
-		{name: "passing compound with a suite segment", command: "go test -run TestLogin ./... && go test ./...", status: task.StepSucceeded, want: taskToolTestSuitePassedReason},
+		{name: "compound command does not prove suite execution", command: "go test -run TestLogin ./... && go test ./...", status: task.StepSucceeded, want: ""},
+		{name: "skipped suite is not stamped", command: "false && go test ./... || true", status: task.StepSucceeded, want: ""},
+		{name: "test listing is not a test run", command: "go test -list TestLogin ./...", status: task.StepSucceeded, want: ""},
+		{name: "test listing with equals is not a test run", command: "go test -list=TestLogin ./...", status: task.StepSucceeded, want: ""},
+		{name: "test collection is not a test run", command: "pytest --collect-only", status: task.StepSucceeded, want: ""},
 		{name: "passing non-test command is not stamped", command: "go build ./...", status: task.StepSucceeded, want: ""},
 		{name: "passing go vet is not stamped", command: "go vet ./...", status: task.StepSucceeded, want: ""},
 		{name: "failed test is not stamped as passed", command: "go test ./...", exitCode: 1, status: task.StepFailed, want: taskToolTestFailureReason},
@@ -142,6 +147,43 @@ func TestPassingTestProgressStamp(t *testing.T) {
 			t.Fatalf("taskToolCallProgress() = %#v, err=%v; want a progress record with no stamp", progress, err)
 		}
 	})
+}
+
+func TestDirectTestEvidenceSurvivesTaskProgress(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		command string
+		marked  bool
+	}{
+		{name: "direct suite", command: "go test ./...", marked: true},
+		{name: "skipped suite", command: "false && go test ./... || true"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRuntimeToolExecutorFixture(t, nil)
+			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+			fixture.executor.store = store
+			current := configureInvalidRuntimeToolTask(&store.details.Task)
+			broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			call := invalidRuntimeToolCall(current, "test-evidence", runtimeToolShellExec,
+				`{"workspace_id":"w1234567","command":`+jsonQuote(test.command)+`}`)
+			ctx := broker.toolActivityContext(context.Background(), current, call)
+			ctx = withTaskToolShellExecutionEvidence(ctx, call.Name, AgentToolResult{Status: AgentToolSucceeded,
+				Output: `{"exit_code":0,"stdout":"","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`})
+			step, err := newAgentStep(current.ID, 1, "tool", task.StepSucceeded, "Run test", "Tool completed.")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := broker.commitProgress(ctx, current, step, current.Usage, task.StatusRunning, "", "task.step", nil); err != nil {
+				t.Fatal(err)
+			}
+			if len(store.details.Steps) != 1 || (store.details.Steps[0].Summary == directTestEvidenceSummary) != test.marked {
+				t.Fatalf("stored steps = %+v; direct test marker=%v", store.details.Steps, test.marked)
+			}
+		})
+	}
 }
 
 func TestEvaluateTestGate(t *testing.T) {
@@ -218,19 +260,58 @@ func TestEvaluateTestGate(t *testing.T) {
 // sequences it sends to the review model in the replay section.
 func TestEvaluateTestGateExported(t *testing.T) {
 	suite := testGateDigest("go test ./...")
+	revision := int64(1)
 	steps := []task.Step{
 		{ID: "red", Kind: "tool", Status: task.StepFailed, Sequence: 1, ToolName: runtimeToolShellExec,
-			FailureReason: taskToolTestFailureReason, RequestDigest: suite},
+			FailureReason: taskToolTestFailureReason, RequestDigest: suite, TaskRevision: &revision, Summary: directTestEvidenceSummary},
 		{ID: "green", Kind: "tool", Status: task.StepSucceeded, Sequence: 2, ToolName: runtimeToolShellExec,
-			FailureReason: taskToolTestSuitePassedReason, RequestDigest: suite},
+			FailureReason: taskToolTestSuitePassedReason, RequestDigest: suite, TaskRevision: &revision, Summary: directTestEvidenceSummary},
 	}
 	want := TestGateResult{NewTestPassed: true, FullSuitePassed: true,
 		NewTestFailedSequence: 1, NewTestPassedSequence: 2, FullSuitePassedSequence: 2}
-	if got := EvaluateTestGate(steps); got != want {
+	if got := EvaluateTestGate(steps, &revision); got != want {
 		t.Fatalf("EvaluateTestGate() = %+v, want %+v", got, want)
 	}
-	if got := EvaluateTestGate(nil); got != (TestGateResult{}) {
+	if got := EvaluateTestGate(nil, &revision); got != (TestGateResult{}) {
 		t.Fatalf("EvaluateTestGate(nil) = %+v, want zero value", got)
+	}
+}
+
+func TestEvaluateTestGateRejectsStaleEvidence(t *testing.T) {
+	oldRevision, currentRevision := int64(1), int64(2)
+	digest := testGateDigest("go test ./...")
+	steps := []task.Step{
+		{Sequence: 1, TaskRevision: &oldRevision, ToolName: runtimeToolShellExec, Status: task.StepFailed, FailureReason: taskToolTestFailureReason, RequestDigest: digest, Summary: directTestEvidenceSummary},
+		{Sequence: 2, TaskRevision: &oldRevision, ToolName: runtimeToolShellExec, Status: task.StepSucceeded, FailureReason: taskToolTestSuitePassedReason, RequestDigest: digest, Summary: directTestEvidenceSummary},
+		{Sequence: 3, TaskRevision: &currentRevision, ToolName: runtimeToolFileWrite, Status: task.StepSucceeded},
+	}
+	if got := EvaluateTestGate(steps, &currentRevision); got.NewTestPassed || got.FullSuitePassed {
+		t.Fatalf("old revision proved current test gate: %+v", got)
+	}
+	steps = append(steps,
+		task.Step{Sequence: 4, TaskRevision: &currentRevision, ToolName: runtimeToolShellExec, Status: task.StepFailed, FailureReason: taskToolTestFailureReason, RequestDigest: digest, Summary: directTestEvidenceSummary},
+		task.Step{Sequence: 5, TaskRevision: &currentRevision, ToolName: runtimeToolShellExec, Status: task.StepSucceeded, FailureReason: taskToolTestSuitePassedReason, RequestDigest: digest, Summary: directTestEvidenceSummary},
+		task.Step{Sequence: 6, TaskRevision: &currentRevision, ToolName: runtimeToolFileWrite, Status: task.StepSucceeded})
+	if got := EvaluateTestGate(steps, &currentRevision); got.NewTestPassed || got.FullSuitePassed {
+		t.Fatalf("test predating a write proved current test gate: %+v", got)
+	}
+	steps = append(steps, task.Step{Sequence: 7, TaskRevision: &currentRevision, ToolName: runtimeToolShellExec, Status: task.StepSucceeded, FailureReason: taskToolTestSuitePassedReason, RequestDigest: digest, Summary: directTestEvidenceSummary})
+	if got := EvaluateTestGate(steps, &currentRevision); !got.NewTestPassed || !got.FullSuitePassed {
+		t.Fatalf("fresh test did not prove current test gate: %+v", got)
+	}
+	if got := EvaluateTestGate(steps, nil); got.NewTestPassed || got.FullSuitePassed {
+		t.Fatalf("missing revision proved test gate: %+v", got)
+	}
+	steps = append(steps, task.Step{Sequence: 8, TaskRevision: &currentRevision, ToolName: runtimeToolShellExec, Status: task.StepFailed,
+		FailureReason: taskToolTestFailureReason, RequestDigest: testGateDigest("another test"), Summary: directTestEvidenceSummary})
+	if got := EvaluateTestGate(steps, &currentRevision); got.FullSuitePassed {
+		t.Fatalf("suite run predating a later test failure proved the gate: %+v", got)
+	}
+	for index := range steps {
+		steps[index].Summary = "The cloud dsh tool completed and its result was saved."
+	}
+	if got := EvaluateTestGate(steps, &currentRevision); got.NewTestPassed || got.FullSuitePassed {
+		t.Fatalf("legacy stamps without direct-command evidence proved test gate: %+v", got)
 	}
 }
 
@@ -272,6 +353,12 @@ func TestTestGateMissing(t *testing.T) {
 			wantEmpty: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
+			revision := int64(1)
+			test.details.Task.CurrentRevision = &revision
+			for index := range test.details.Steps {
+				test.details.Steps[index].TaskRevision = &revision
+				test.details.Steps[index].Summary = directTestEvidenceSummary
+			}
 			got := testGateMissing(test.details)
 			if test.wantEmpty && got != "" {
 				t.Fatalf("testGateMissing() = %q, want empty", got)
@@ -352,6 +439,8 @@ func TestTestGateComplete(t *testing.T) {
 			if test.steps != nil {
 				for index := range test.steps {
 					test.steps[index].TaskID = store.details.Task.ID
+					test.steps[index].TaskRevision = store.details.Task.CurrentRevision
+					test.steps[index].Summary = directTestEvidenceSummary
 				}
 				store.details.Steps = test.steps
 			}

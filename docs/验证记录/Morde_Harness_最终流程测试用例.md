@@ -1,5 +1,15 @@
 # Morde Harness 最终流程测试用例
 
+<a id="merge-route-correction-20261125"></a>
+## 合并后 Muse 路线偏离修复（2026-11-25）
+
+- **基线与范围：**`release` 的 `53fe1461`，开始时工作树干净。仅修改本地代码、测试和文档；未连接远端、发送消息或上传文件。DSH 仍为唯一 Agent Runtime。
+- **本地自动化：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -count=1` 通过；`go test ./internal/worker -count=1` 通过。此前 macOS 自带 Bash 缺少 `mapfile` 导致 smoke 记账测试失败，已改为兼容 Bash 3 的逐行读取，并单独复验 `TestSmokeGateAccounting` 通过。App 定向测试覆盖门禁结果回送、重放、撤权、复合命令不计通过、旧修订和写入后的测试失效；Worker 固定模型 fixture 覆盖失败工具结果回同一 Session 与两层委派。固定模型不证明真实模型恢复能力。
+- **隔离 PostgreSQL：**一次性 loopback PostgreSQL 16 上结果批次与 E09 账本定向用例通过，命令和补充结果见本条下方。混合 PASS/FAIL 结果均能发布，FAIL 明示未通过；E09 测试修复了旧夹具的 session、摘要和事件序号，并核对审批绑定缺失/错误时不算验证通过。此 E09 夹具没有独立内容证据，修复任务的独立 H07 也因缺少工作区版本/覆盖证明而保持 pending，不是完整 PASS 证明。
+  `CH_TEST_DATABASE_URL=<loopback DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^(TestPostgresTaskValidationApprovalBindingsAcrossLedgers|TestPostgresTaskValidationFactsResolveWithE09Ledger|TestPostgresTaskValidationFactsTreatHubOperationAsExecution|TestPostgresTaskValidationFactsTreatPendingRequestReconciliationAsExecution|TestConversationResultReceiptSeparatesCompletionFromCurrentValidation|TestConversationResultReviewDeliversMixedValidationStates)$' -count=1 -v`：6 个测试入口通过；其中 MCP 与 Workspace 分别覆盖匹配、缺步骤及摘要不匹配，已派发 Hub 命令与未决工具对账保持审批事实 unknown。
+- **实际 PC：未通过。**用独立 `MORDE_TEST_USER_DATA` 和本地合成 fixture 运行 `make pc`，构建成功并出现登录界面；填写时目标窗口的可访问树消失，无法核实登录或继续交互。fixture 最终超时；没有执行用户业务消息、Task、上传或远端操作。本项不能代替实际 PC 的失败交付和恢复验收。
+- **仍待修复/验收：**FAIL 原因尚未作为事实进入主 Agent；完成阶段门禁仍可能直接等待用户；R20 失败/取消终态耐久投递、R19-A 非路由文件意图、R21 超过 128 KiB 的 Task 初始消息未完成。测试命令识别不能单凭退出码证明实际测试数量、完整覆盖或不可变工作区版本，因此修复任务的独立 H07 暂保持 pending；其他工具写入、工作区并发变化及 Hub/沙箱等操作的完整独立核验仍不足。真实 DSH/模型、跨端、真实云端与视觉规范符合性均未验；`docs/实施/00-总览与公共约定.md` 和 UI 规范文件仍缺失，不恢复旧文件。
+
 > **文档性质：** 本文是《[Morde Harness 最终流程与实现规格](../Morde_Harness_最终流程与实现规格.md)》的测试用例和执行记录模板；实施顺序与任务状态以《[Morde Harness 实施任务 TODO](../Morde_Harness_实施任务_TODO.md)》为准。用例定义目标行为，不代表当前功能已通过。
 >
 > **数据边界：** 只使用本地隔离环境、测试账号和合成文本；测试数据与产物留在本地，不上传或发送文件。不连接生产数据库、生产电脑或生产发布环境。真实模型用例只发送合成文本，并记录实际模型和用量，不记录密钥。

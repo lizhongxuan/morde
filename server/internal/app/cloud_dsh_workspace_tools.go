@@ -963,7 +963,14 @@ func (b *CloudDSHToolBroker) executeWorkspaceTool(ctx context.Context, claimed t
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Workspace tools are not authorized for this task")
 	}
 	if call.Name == cloudDSHWorkspaceWriteToolName {
+		if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput, ""); handled {
+			return result, gateErr
+		}
 		if err := requireCompleteTaskPlanBrief(details); err != nil {
+			if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput,
+				"Task plan brief is incomplete; no action was executed."); handled {
+				return result, gateErr
+			}
 			return AgentToolResult{}, err
 		}
 		// The minimal-diff gate (E06) does run here, unlike the failing-test
@@ -975,6 +982,10 @@ func (b *CloudDSHToolBroker) executeWorkspaceTool(ctx context.Context, claimed t
 			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "Workspace write arguments are invalid")
 		}
 		if err := requireMinimalDiffWrite(details, writeArguments.Path); err != nil {
+			if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput,
+				"File is outside the fix plan; no action was executed."); handled {
+				return result, gateErr
+			}
 			return AgentToolResult{}, err
 		}
 		// The failing-test gate (E03) deliberately does not run here: this

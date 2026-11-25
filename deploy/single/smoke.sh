@@ -125,8 +125,10 @@ run_case() {
   fi
   # Group the case's tests by package: one `go test` per package.
   local pkg
-  local -a pkgs
-  mapfile -t pkgs < <(awk -F'\t' -v c="$case_id" '$1 == c {print $2}' "$CASES_FILE" | sort -u)
+  local -a pkgs=()
+  while IFS= read -r pkg; do
+    pkgs+=("$pkg")
+  done < <(awk -F'\t' -v c="$case_id" '$1 == c {print $2}' "$CASES_FILE" | sort -u)
   if [[ "${#pkgs[@]}" == "0" ]]; then
     printf 'blocked\t%s\n' "no mapped tests" >"$RESULTS_DIR/$case_id.status"
     echo "$case_id: BLOCKED (no mapped tests)"
@@ -137,8 +139,11 @@ run_case() {
   local case_skipped=0
   : >"$RESULTS_DIR/$case_id.tsv"
   for pkg in "${pkgs[@]}"; do
-    local -a names
-    mapfile -t names < <(awk -F'\t' -v c="$case_id" -v p="$pkg" '$1 == c && $2 == p {print $3}' "$CASES_FILE")
+    local -a names=()
+    local mapped_name
+    while IFS= read -r mapped_name; do
+      names+=("$mapped_name")
+    done < <(awk -F'\t' -v c="$case_id" -v p="$pkg" '$1 == c && $2 == p {print $3}' "$CASES_FILE")
     local regex="^($(IFS='|'; echo "${names[*]}"))$"
     local out="$TMPDIR_SMOKE/$case_id.$(echo "$pkg" | tr '/' '_').log"
     local go_rc=0
