@@ -2007,9 +2007,9 @@ Tokenizer 与 token 统计来源：
 
 ### S09-46 最新安全边界复验（2026-11-25）
 
-- **测试：**`cd server && GOPROXY=off GOSUMDB=off go test -json ./internal/app -run '^(TestCloudDSHToolBrokerReturnsArgumentSchemaFailureToAgentBeforeOperationCreation|TestCloudDSHToolBrokerReturnsMalformedRuntimeArgumentsIdempotently|TestCloudDSHToolBrokerFailsClosedForMalformedRuntimeArguments|TestCloudDSHToolBrokerKeepsAuthorizationFailureOnOriginalPreparePath|TestRuntimeToolExecutorPrepareMarksOnlyScopedArgumentSchemaErrors|TestRuntimeToolExecutorPrepareDoesNotClassifyInvalidSchemaAfterOperateRevocation)$' -count=1`：6 个测试入口含父/子结果共 21 pass、0 fail、0 skip；完整 `go test -json ./internal/app -count=1`：1995 pass、0 fail、5 skip。`go test -json ./internal/store/postgres -run '^TestValidTaskToolCallFailureEvidence$' -count=1`：14 pass、0 fail、0 skip。Worker `TestCloudDSHExecutorReturnsDefinitiveToolFailureToSameAgent`：1 pass。`gofmt -d` 与 `git diff --check` 无差异。
-- **新增边界：**Executor 先核当前 Task 与对应工具 scope 授权，之后才把对象 schema 错误分成 Agent 可修复的预派发结果。malformed object/array/null 走同样的定义、scope、fence 与 operation NotFound 门禁。已有 operation、查询错误、授权拒绝和 checkpoint 不匹配不进入 Agent 重试路径；事件只保存分类，Step 不暴露用户重试，也不泄漏原始参数。
-- **限制：**Worker handoff 用例验证的是现有确定失败回到同一 Session，并未与新 schema 分支端到端联测；未运行新分支的 PostgreSQL 集成、PC + Agent 或真实模型语义测试。R10/M09-07/T55 不关闭。语义由 Agent 结构化判断，代码硬约束只处理 schema、授权、身份和副作用安全。
+- **Broker/Executor：**`GOPROXY=off GOSUMDB=off go test -json ./internal/app -run '^TestCloudDSHToolBroker(ReturnsArgumentSchemaFailureToAgentBeforeOperationCreation|ReturnsInvalidRuntimeArgumentsIdempotently|FailsClosedForInvalidRuntimeArguments|KeepsAuthorizationFailureOnOriginalPreparePath)$' -count=1` 通过。完整 `go test -json ./internal/app -count=1`：1996 pass、0 fail、5 skip。新增覆盖合法 JSON schema 错误的 checkpoint 精确回放、输出不符转 unknown、权限撤销、账本已存在/查询失败、缺失 fence 与同 CallID 不同参数。
+- **Worker/Store：**`TestCloudDSHExecutorLetsSameAgentCorrectInvalidRuntimeArguments` 通过 1/1：固定模型 fixture 在同一 Session 收到脱敏 schema 错误后选择合法只读修正，原失败项保留。使用本轮专属一次性 loopback PostgreSQL 执行 `TestPostgresTaskToolInvalidArgumentsPersistsSanitizedPrepareEvidence`，通过 1/1；另有 `TestValidTaskToolCallFailureEvidence` 14/14。数据库测试验证稳定分类、精确身份、无原始参数泄漏及重放冲突不产生重复持久状态。
+- **边界：**Broker 定向、Worker 协议 fixture 与 Store 持久化分层验证，尚未由一条测试串成 Broker→Worker 全链路；固定 fixture 不证明真实模型会选择安全修复。未在实际 PC 或真实 DSH/模型验收。自然语言语义由 Agent 判断，代码只硬约束 schema、授权、身份和副作用账本。普通错误、授权/范围失败及已派发 unknown 不转为可重试结果；R10/M09-07/T55 不关闭。`gofmt -d` 与 `git diff --check` 无差异。
 
 ### 2026-11-25 T51 与 R03 本地 targeted recheck
 
