@@ -18,16 +18,16 @@ type ConversationMessageRetryEligibility struct {
 }
 
 const (
-	ConversationMessageRetryReasonAvailable                 = "retry_available"
-	ConversationMessageRetryReasonNotFailed                 = "route_not_failed"
-	ConversationMessageRetryReasonTaskAttached              = "task_already_created"
-	ConversationMessageRetryReasonMessageTooLong             = "message_too_long"
-	ConversationMessageRetryReasonReconciliationRequired     = "reconciliation_required"
-	ConversationMessageRetryReasonProcessing                 = "route_processing"
-	ConversationMessageRetryReasonReviewNotRetryable         = "result_review_not_retryable"
-	ConversationMessageRetryReasonReviewOutcomeUnknown       = "result_review_outcome_unknown"
-	ConversationMessageRetryReasonLimitReached               = "retry_limit_reached"
-	ConversationMessageRetryWarningPersonalOutcomeUnknown    = "previous_personal_model_call_outcome_unknown"
+	ConversationMessageRetryReasonAvailable               = "retry_available"
+	ConversationMessageRetryReasonNotFailed               = "route_not_failed"
+	ConversationMessageRetryReasonTaskAttached            = "task_already_created"
+	ConversationMessageRetryReasonMessageTooLong          = "message_too_long"
+	ConversationMessageRetryReasonReconciliationRequired  = "reconciliation_required"
+	ConversationMessageRetryReasonProcessing              = "route_processing"
+	ConversationMessageRetryReasonReviewNotRetryable      = "result_review_not_retryable"
+	ConversationMessageRetryReasonReviewOutcomeUnknown    = "result_review_outcome_unknown"
+	ConversationMessageRetryReasonLimitReached            = "retry_limit_reached"
+	ConversationMessageRetryWarningPersonalOutcomeUnknown = "previous_personal_model_call_outcome_unknown"
 )
 
 type ConversationMessageRetryStore interface {

@@ -293,8 +293,10 @@ func replayCheckFactFromBinding(claim app.TaskValidationReviewClaim, plan task.P
 	if decoder.Decode(&shell) != nil || shell.ExitCode < 0 || shell.ExitCode > 255 || shell.VerificationCheck == nil ||
 		shell.TaskID != claim.TaskID || shell.WorkspaceID != current.workspaceID || shell.BindingVersion != row.operationBindingVersion ||
 		shell.WorkspaceCheckpointRevision == nil || *shell.WorkspaceCheckpointRevision != row.operationCheckpoint ||
-		!validReplayWorkspaceViewID(shell.WorkspaceViewID) || !validReplayDigest(shell.WorkspaceManifestSHA256Before) ||
-		!validReplayDigest(shell.WorkspaceManifestSHA256After) || !validReplayDigest(shell.WorkspaceSnapshotSHA256Before) ||
+		!validReplayWorkspaceViewID(shell.WorkspaceViewID) ||
+		(shell.WorkspaceManifestSHA256Before != "" && !validReplayDigest(shell.WorkspaceManifestSHA256Before)) ||
+		(shell.WorkspaceManifestSHA256After != "" && !validReplayDigest(shell.WorkspaceManifestSHA256After)) ||
+		!validReplayDigest(shell.WorkspaceSnapshotSHA256Before) ||
 		!validReplayDigest(shell.WorkspaceSnapshotSHA256After) {
 		return fact
 	}

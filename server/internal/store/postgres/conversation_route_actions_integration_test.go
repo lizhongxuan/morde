@@ -1468,6 +1468,10 @@ func TestConversationRouteRetryRejectsUnchangedOversizedMessage(t *testing.T) {
 	}
 	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID,
 		Scopes: []identity.Scope{identity.ScopeTaskSubmit}}
+	eligibility, err := f.store.GetConversationMessageRetryEligibility(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID)
+	if err != nil || eligibility.Eligible || eligibility.Reason != app.ConversationMessageRetryReasonMessageTooLong {
+		t.Fatalf("oversized retry eligibility = %+v, %v; want message_too_long", eligibility, err)
+	}
 	if err := f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID,
 		"route-retry-oversized-key-001"); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("unchanged oversized message retry = %v, want invalid state", err)
@@ -1478,6 +1482,40 @@ func TestConversationRouteRetryRejectsUnchangedOversizedMessage(t *testing.T) {
 		claim.Message.ID).Scan(&state, &failureReason, &attempt); err != nil || state != "failed" || failureReason != "message_too_long" || attempt != claim.RouteAttempt {
 		t.Fatalf("rejected oversized retry changed route: state=%q reason=%q attempt=%d err=%v", state, failureReason, attempt, err)
 	}
+}
+
+func TestConversationRouteRetryEligibilityMatchesWriteGateAndAuthorization(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	claim := f.receive(t, "route-retry-eligibility-001", "Retry this saved message", app.ConversationRoutingInput{})
+	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID,
+		Scopes: []identity.Scope{identity.ScopeTaskSubmit}}
+	check := func(wantEligible bool, wantReason string) {
+		t.Helper()
+		eligibility, err := f.store.GetConversationMessageRetryEligibility(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID)
+		if err != nil || eligibility.Eligible != wantEligible || eligibility.Reason != wantReason {
+			t.Fatalf("retry eligibility = %+v, %v; want eligible=%t reason=%q", eligibility, err, wantEligible, wantReason)
+		}
+	}
+	check(false, app.ConversationMessageRetryReasonNotFailed)
+	if err := f.store.FailConversationRoute(ctx, claim, "model_unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	check(true, app.ConversationMessageRetryReasonAvailable)
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tokens SET revoked_at=clock_timestamp() WHERE id=$1`, principal.TokenID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.GetConversationMessageRetryEligibility(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("revoked token retry eligibility error = %v, want unauthenticated", err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tokens SET revoked_at=NULL WHERE id=$1`, principal.TokenID); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID,
+		"route-retry-eligibility-key-001"); err != nil {
+		t.Fatalf("retry after eligible preflight: %v", err)
+	}
+	check(false, app.ConversationMessageRetryReasonNotFailed)
 }
 
 func TestConcurrentConversationRouteRetryWithSameKeyCreatesOneAttempt(t *testing.T) {

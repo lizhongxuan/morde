@@ -1028,6 +1028,11 @@ func TestUnknownPersonalRouteCallCanRetryWithIndependentAttempt(t *testing.T) {
 	if err := store.FailConversationRoute(ctx, claim, "model_unavailable"); err != nil {
 		t.Fatal(err)
 	}
+	eligibility, err := store.GetConversationMessageRetryEligibility(ctx, principal, "", claim.Message.ConversationID,
+		claim.Message.ID, claim.ServiceInstanceID)
+	if err != nil || !eligibility.Eligible || eligibility.Warning != app.ConversationMessageRetryWarningPersonalOutcomeUnknown {
+		t.Fatalf("unknown personal route retry eligibility = %+v, %v; want eligible with unknown-outcome warning", eligibility, err)
+	}
 	var oldCallID, oldRouteState, oldLedgerState string
 	var oldPersonal bool
 	if err := store.pool.QueryRow(ctx, `SELECT c.call_id,c.state,l.state,l.personal_model FROM conversation_route_model_calls c
@@ -1173,6 +1178,11 @@ func TestUnknownSharedProjectRouteRetryIsRejectedUntilReconciled(t *testing.T) {
 	instanceID, err := store.ServiceInstanceID(ctx)
 	if err != nil {
 		t.Fatal(err)
+	}
+	eligibility, err := store.GetConversationMessageRetryEligibility(ctx, principal, claim.Input.ProjectID, claim.Message.ConversationID,
+		claim.Message.ID, instanceID)
+	if err != nil || eligibility.Eligible || eligibility.Reason != app.ConversationMessageRetryReasonReconciliationRequired {
+		t.Fatalf("unknown shared project route retry eligibility = %+v, %v; want reconciliation_required", eligibility, err)
 	}
 	if err := store.RetryConversationRoute(ctx, principal, claim.Input.ProjectID, claim.Message.ConversationID, claim.Message.ID,
 		instanceID, "route-unknown-shared-retry-001"); domain.CodeOf(err) != domain.CodeInvalidState {

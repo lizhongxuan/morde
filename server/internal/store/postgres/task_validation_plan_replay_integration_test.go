@@ -108,7 +108,6 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.Task.ID).Sc
 		"exit_code": 0, "timed_out": false, "stdout": "", "stderr": "", "stdout_truncated": false, "stderr_truncated": false,
 		"task_id": current.Task.ID, "workspace_id": workspaceValue.ID, "binding_version": bindingVersion,
 		"workspace_view_id": viewID, "workspace_checkpoint_revision": checkpointRevision,
-		"workspace_manifest_sha256_before": manifestDigest, "workspace_manifest_sha256_after": manifestDigest,
 		"workspace_snapshot_sha256_before": manifestDigest, "workspace_snapshot_sha256_after": manifestDigest,
 		"verification_check": receipt,
 	})
@@ -155,7 +154,6 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.Task.ID).Sc
 		"exit_code": 0, "timed_out": false, "stdout": "", "stderr": "", "stdout_truncated": false, "stderr_truncated": false,
 		"task_id": current.Task.ID, "workspace_id": workspaceValue.ID, "binding_version": bindingVersion,
 		"workspace_view_id": viewID, "workspace_checkpoint_revision": checkpointRevision,
-		"workspace_manifest_sha256_before": manifestDigest, "workspace_manifest_sha256_after": manifestDigest,
 		"verification_check": legacyReceipt,
 	})
 	if err != nil {

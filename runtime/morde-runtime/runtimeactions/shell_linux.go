@@ -269,13 +269,8 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 	if operationContext.Err() != nil {
 		return shellResultIfTimedOut(operationContext)
 	}
-	workspaceManifestBefore := ""
 	workspaceSnapshotBefore := ""
 	if request.WorkspaceViewID != "" {
-		workspaceManifestBefore, err = taskWorkspaceManifestSHA256(operationContext, workspaceRoot)
-		if err != nil {
-			return nil, fmt.Errorf("hash Task Workspace before shell execution: %w", err)
-		}
 		workspaceSnapshotBefore, err = taskWorkspaceSnapshotSHA256(operationContext, workspaceRoot)
 		if err != nil {
 			return nil, fmt.Errorf("scan Task Workspace snapshot before shell execution: %w", err)
@@ -367,10 +362,6 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 	}
 	var encoded []byte
 	if request.WorkspaceViewID != "" {
-		workspaceManifestAfter, hashErr := taskWorkspaceManifestSHA256(ctx, workspaceRoot)
-		if hashErr != nil {
-			return nil, fmt.Errorf("hash Task Workspace after shell execution: %w", hashErr)
-		}
 		workspaceSnapshotAfter, snapshotErr := taskWorkspaceSnapshotSHA256(ctx, workspaceRoot)
 		if snapshotErr != nil {
 			return nil, fmt.Errorf("scan Task Workspace snapshot after shell execution: %w", snapshotErr)
@@ -382,7 +373,6 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 			TimedOut: result.TimedOut, TaskID: request.TaskID, WorkspaceID: request.WorkspaceID,
 			BindingVersion: request.BindingVersion, WorkspaceViewID: request.WorkspaceViewID,
 			WorkspaceCheckpointRevision:   &revision,
-			WorkspaceManifestSHA256Before: workspaceManifestBefore, WorkspaceManifestSHA256After: workspaceManifestAfter,
 			WorkspaceSnapshotSHA256Before: workspaceSnapshotBefore, WorkspaceSnapshotSHA256After: workspaceSnapshotAfter,
 		})
 	} else {
@@ -392,28 +382,6 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 		return nil, ErrProcessDomainUnavailable
 	}
 	return encoded, nil
-}
-
-// shellTaskWorkspaceResult carries a safe digest of the exact Task-private
-// Workspace view around shell execution. It intentionally contains no file
-// names or contents; the server can bind the two digests to this operation
-// and fail closed if the Workspace changed while the command ran.
-type shellTaskWorkspaceResult struct {
-	ExitCode                      int    `json:"exit_code"`
-	Stdout                        string `json:"stdout"`
-	Stderr                        string `json:"stderr"`
-	StdoutTruncated               bool   `json:"stdout_truncated"`
-	StderrTruncated               bool   `json:"stderr_truncated"`
-	TimedOut                      bool   `json:"timed_out"`
-	TaskID                        string `json:"task_id"`
-	WorkspaceID                   string `json:"workspace_id"`
-	BindingVersion                int64  `json:"binding_version"`
-	WorkspaceViewID               string `json:"workspace_view_id"`
-	WorkspaceCheckpointRevision   *int64 `json:"workspace_checkpoint_revision"`
-	WorkspaceManifestSHA256Before string `json:"workspace_manifest_sha256_before"`
-	WorkspaceManifestSHA256After  string `json:"workspace_manifest_sha256_after"`
-	WorkspaceSnapshotSHA256Before string `json:"workspace_snapshot_sha256_before"`
-	WorkspaceSnapshotSHA256After  string `json:"workspace_snapshot_sha256_after"`
 }
 
 const taskWorkspaceManifestDomain = "morde-task-workspace-manifest-v1"

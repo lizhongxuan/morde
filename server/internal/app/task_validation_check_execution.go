@@ -63,7 +63,8 @@ func attestTaskValidationShellResult(current task.Task, planRevision int64, chec
 		shell.TaskID != current.ID || shell.WorkspaceID != current.WorkspaceID || shell.BindingVersion != bindingVersion ||
 		shell.WorkspaceViewID == "" || !taskWorkspaceViewIDPattern.MatchString(shell.WorkspaceViewID) ||
 		shell.WorkspaceCheckpointRevision == nil || *shell.WorkspaceCheckpointRevision != *current.WorkspaceCheckpointRevision ||
-		!validSyncDigest(shell.WorkspaceManifestSHA256Before) || !validSyncDigest(shell.WorkspaceManifestSHA256After) ||
+		(shell.WorkspaceManifestSHA256Before != "" && !validSyncDigest(shell.WorkspaceManifestSHA256Before)) ||
+		(shell.WorkspaceManifestSHA256After != "" && !validSyncDigest(shell.WorkspaceManifestSHA256After)) ||
 		!validSyncDigest(shell.WorkspaceSnapshotSHA256Before) || !validSyncDigest(shell.WorkspaceSnapshotSHA256After) {
 		return output, false
 	}

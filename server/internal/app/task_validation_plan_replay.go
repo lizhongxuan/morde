@@ -181,7 +181,8 @@ func validTaskValidationReplayCheckIdentity(plan task.Plan, checkID string, chec
 		fact.RequestSHA256 != "" && validSyncDigest(fact.RequestSHA256) &&
 		fact.WorkspaceID != "" && validRuntimeWorkspaceID(fact.WorkspaceID) && fact.WorkspaceBindingVersion > 0 &&
 		fact.WorkspaceCheckpointRevision >= 0 && taskWorkspaceViewIDPattern.MatchString(fact.WorkspaceViewID) &&
-		validSyncDigest(fact.WorkspaceManifestSHA256Before) && validSyncDigest(fact.WorkspaceManifestSHA256After) &&
+		(fact.WorkspaceManifestSHA256Before == "" || validSyncDigest(fact.WorkspaceManifestSHA256Before)) &&
+		(fact.WorkspaceManifestSHA256After == "" || validSyncDigest(fact.WorkspaceManifestSHA256After)) &&
 		validSyncDigest(fact.WorkspaceSnapshotSHA256Before) && validSyncDigest(fact.WorkspaceSnapshotSHA256After) &&
 		domain.ValidHostID(fact.HostID) && fact.HostRuntimeGeneration > 0 && validReplayRuntimeInstanceID(fact.HostRuntimeInstanceID) &&
 		fact.HostControlVersion >= 0 && fact.InputRevision >= 0 && fact.WorkspaceCheckpointRevision >= fact.InputRevision &&

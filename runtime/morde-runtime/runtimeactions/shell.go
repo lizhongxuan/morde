@@ -35,7 +35,17 @@ var (
 )
 
 func taskWorkspaceSnapshotSHA256(ctx context.Context, root *os.Root) (string, error) {
-	manifest, err := mordesync.ScanOpenedRoot(ctx, root, nil)
+	return taskWorkspaceSnapshotSHA256WithScanner(ctx, root, func(ctx context.Context, root *os.Root) (mordesync.Manifest, error) {
+		return mordesync.ScanOpenedRoot(ctx, root, nil)
+	})
+}
+
+func taskWorkspaceSnapshotSHA256WithScanner(ctx context.Context, root *os.Root,
+	scan func(context.Context, *os.Root) (mordesync.Manifest, error)) (string, error) {
+	if scan == nil {
+		return "", errors.New("Task Workspace snapshot scanner is required")
+	}
+	manifest, err := scan(ctx, root)
 	if err != nil {
 		return "", err
 	}
@@ -44,6 +54,28 @@ func taskWorkspaceSnapshotSHA256(ctx context.Context, root *os.Root) (string, er
 		return "", err
 	}
 	return digest, nil
+}
+
+// shellTaskWorkspaceResult carries the shared v2 digest of the exact private
+// Task Workspace before and after shell execution. It intentionally contains
+// no file names or contents. Legacy manifest fields remain decodable below,
+// but new results leave them empty so they are omitted from JSON.
+type shellTaskWorkspaceResult struct {
+	ExitCode                      int    `json:"exit_code"`
+	Stdout                        string `json:"stdout"`
+	Stderr                        string `json:"stderr"`
+	StdoutTruncated               bool   `json:"stdout_truncated"`
+	StderrTruncated               bool   `json:"stderr_truncated"`
+	TimedOut                      bool   `json:"timed_out"`
+	TaskID                        string `json:"task_id"`
+	WorkspaceID                   string `json:"workspace_id"`
+	BindingVersion                int64  `json:"binding_version"`
+	WorkspaceViewID               string `json:"workspace_view_id"`
+	WorkspaceCheckpointRevision   *int64 `json:"workspace_checkpoint_revision"`
+	WorkspaceManifestSHA256Before string `json:"workspace_manifest_sha256_before,omitempty"`
+	WorkspaceManifestSHA256After  string `json:"workspace_manifest_sha256_after,omitempty"`
+	WorkspaceSnapshotSHA256Before string `json:"workspace_snapshot_sha256_before"`
+	WorkspaceSnapshotSHA256After  string `json:"workspace_snapshot_sha256_after"`
 }
 
 type ShellFailureCategory string

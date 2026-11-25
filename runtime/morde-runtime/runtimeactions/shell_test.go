@@ -11,6 +11,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	mordesync "morde-sync"
 )
 
 func TestTaskWorkspaceSnapshotSHA256IsStableAndTracksExecutionMutation(t *testing.T) {
@@ -42,19 +44,27 @@ func TestTaskWorkspaceSnapshotSHA256IsStableAndTracksExecutionMutation(t *testin
 	}
 	defer root.Close()
 
-	before, err := taskWorkspaceSnapshotSHA256(context.Background(), root)
+	scans := 0
+	scan := func(ctx context.Context, root *os.Root) (mordesync.Manifest, error) {
+		scans++
+		return mordesync.ScanOpenedRoot(ctx, root, nil)
+	}
+	before, err := taskWorkspaceSnapshotSHA256WithScanner(context.Background(), root, scan)
 	if err != nil {
 		t.Fatalf("snapshot digest before execution: %v", err)
 	}
-	again, err := taskWorkspaceSnapshotSHA256(context.Background(), root)
-	if err != nil || before == "" || again != before {
+	if scans != 1 {
+		t.Fatalf("before boundary performed %d opened-root scans; want 1", scans)
+	}
+	again, err := taskWorkspaceSnapshotSHA256WithScanner(context.Background(), root, scan)
+	if err != nil || before == "" || again != before || scans != 2 {
 		t.Fatalf("unchanged snapshot digests = %q, %q, %v", before, again, err)
 	}
 	if err := os.WriteFile(filePath, []byte("package main\nfunc main() {}\n"), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	after, err := taskWorkspaceSnapshotSHA256(context.Background(), root)
-	if err != nil {
+	after, err := taskWorkspaceSnapshotSHA256WithScanner(context.Background(), root, scan)
+	if err != nil || scans != 3 {
 		t.Fatalf("snapshot digest after execution: %v", err)
 	}
 	if after == before {
@@ -63,9 +73,41 @@ func TestTaskWorkspaceSnapshotSHA256IsStableAndTracksExecutionMutation(t *testin
 	if err := os.Chmod(filePath, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	metadataAfter, err := taskWorkspaceSnapshotSHA256(context.Background(), root)
-	if err != nil || metadataAfter == after {
+	metadataAfter, err := taskWorkspaceSnapshotSHA256WithScanner(context.Background(), root, scan)
+	if err != nil || metadataAfter == after || scans != 4 {
 		t.Fatalf("mode mutation digest = %q, %v; want a changed digest", metadataAfter, err)
+	}
+}
+
+func TestShellTaskWorkspaceResultV2OmitsLegacyDigestAndStillDecodesV1(t *testing.T) {
+	v2 := shellTaskWorkspaceResult{
+		TaskID: "q1234567", WorkspaceID: "w1234567", WorkspaceViewID: "v" + strings.Repeat("a", 64),
+		WorkspaceSnapshotSHA256Before: strings.Repeat("b", 64), WorkspaceSnapshotSHA256After: strings.Repeat("c", 64),
+	}
+	encoded, err := json.Marshal(v2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["workspace_snapshot_sha256_before"] != strings.Repeat("b", 64) || got["workspace_snapshot_sha256_after"] != strings.Repeat("c", 64) {
+		t.Fatalf("v2 output lacks common snapshot digests: %s", encoded)
+	}
+	for _, field := range []string{"workspace_manifest_sha256_before", "workspace_manifest_sha256_after"} {
+		if _, ok := got[field]; ok {
+			t.Errorf("v2 output unexpectedly includes legacy field %q: %s", field, encoded)
+		}
+	}
+
+	legacyJSON := []byte(`{"workspace_manifest_sha256_before":"` + strings.Repeat("d", 64) + `","workspace_manifest_sha256_after":"` + strings.Repeat("e", 64) + `"}`)
+	var legacy shellTaskWorkspaceResult
+	if err := json.Unmarshal(legacyJSON, &legacy); err != nil {
+		t.Fatalf("decode v1 shell result: %v", err)
+	}
+	if legacy.WorkspaceManifestSHA256Before != strings.Repeat("d", 64) || legacy.WorkspaceManifestSHA256After != strings.Repeat("e", 64) {
+		t.Fatalf("v1 fields were not decoded: %+v", legacy)
 	}
 }
 

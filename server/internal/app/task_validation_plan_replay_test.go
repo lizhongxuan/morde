@@ -233,7 +233,6 @@ func TestAttestTaskValidationShellResultBindsExactWorkspaceAndRequest(t *testing
 	requestDigest := sha256.Sum256([]byte("typed test request"))
 	result, err := json.Marshal(taskStepShellOutput{ExitCode: 1, TaskID: current.ID, WorkspaceID: current.WorkspaceID,
 		BindingVersion: 3, WorkspaceViewID: "v" + strings.Repeat("a", 64), WorkspaceCheckpointRevision: &checkpoint,
-		WorkspaceManifestSHA256Before: strings.Repeat("b", 64), WorkspaceManifestSHA256After: strings.Repeat("b", 64),
 		WorkspaceSnapshotSHA256Before: strings.Repeat("c", 64), WorkspaceSnapshotSHA256After: strings.Repeat("c", 64)})
 	if err != nil {
 		t.Fatal(err)
