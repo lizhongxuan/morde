@@ -462,6 +462,24 @@ describe('Workspaces', () => {
     expect(selectProjectDirectory).not.toHaveBeenCalled();
   });
 
+  it('keeps project selection closed when a failed default Host conflicts with a cached running target', async () => {
+    const failedHost = { ...defaultProjectHost, state: 'failed' as const };
+    const projectUploadTargets = vi.fn().mockResolvedValue([projectTarget]);
+    const selectProjectDirectory = vi.fn();
+    const uploadProject = vi.fn();
+    setProjectBridge({ projectUploadTargets, selectProjectDirectory, uploadProject });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost(failedHost);
+    renderWorkspaces([], [failedHost]);
+
+    expect(await screen.findByText(/默认云端电脑当前失败/)).toBeInTheDocument();
+    const target = await screen.findByRole('group', { name: '同步目标电脑' });
+    expect(target).toHaveTextContent('失败');
+    expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
+    expect(selectProjectDirectory).not.toHaveBeenCalled();
+    expect(uploadProject).not.toHaveBeenCalled();
+  });
+
   it('routes new cloud-file creation through cloud-computer creation', async () => {
     renderWorkspaces();
 

@@ -660,6 +660,53 @@ func validateCloudDSHPlanStepSelection(details TaskDetails, metadata cloudDSHPla
 	return 0, domain.NewError(domain.CodeConflict, operationKind+" references an unknown plan step")
 }
 
+func cloudDSHVerificationCheckForCall(details TaskDetails, metadata cloudDSHPlanStepArguments, call ModelToolCall) (*task.PlanVerificationCheck, error) {
+	if details.Plan == nil || !metadata.HasStepID {
+		return nil, nil
+	}
+	var selected *task.PlanStep
+	for index := range details.Plan.Steps {
+		if details.Plan.Steps[index].ID == metadata.StepID {
+			selected = &details.Plan.Steps[index]
+			break
+		}
+	}
+	if selected == nil || selected.VerificationCheck == nil {
+		return nil, nil
+	}
+	check := selected.VerificationCheck
+	if call.Name != runtimeToolShellExec || !validTaskPlanVerificationCommand(*check) ||
+		!domain.ValidWorkspaceID(details.Task.WorkspaceID) || details.Task.WorkspaceCheckpointRevision == nil {
+		return nil, domain.NewError(domain.CodeConflict, "verification check selection is incomplete")
+	}
+	var arguments map[string]json.RawMessage
+	if decodeStrictRuntimeResult([]byte(call.Arguments), &arguments) != nil {
+		return nil, domain.InvalidArgument("tool_call.arguments", "verification check arguments are invalid")
+	}
+	if _, hasCWD := arguments["cwd"]; hasCWD {
+		return nil, domain.NewError(domain.CodeConflict, "verification check must use the Task Workspace root")
+	}
+	var shellArguments struct {
+		WorkspaceID string `json:"workspace_id"`
+		Command     string `json:"command"`
+	}
+	if decodeStrictRuntimeResult([]byte(call.Arguments), &shellArguments) != nil ||
+		shellArguments.WorkspaceID != details.Task.WorkspaceID || shellArguments.Command != check.Command {
+		return nil, domain.NewError(domain.CodeConflict, "verification check command does not match the current plan")
+	}
+	copy := *check
+	copy.CoveragePaths = append([]string(nil), check.CoveragePaths...)
+	if check.RequirementSource != nil {
+		source := *check.RequirementSource
+		if source.WorkspaceRevision != nil {
+			revision := *source.WorkspaceRevision
+			source.WorkspaceRevision = &revision
+		}
+		copy.RequirementSource = &source
+	}
+	return &copy, nil
+}
+
 // Complete only commits a dsh result after the worker has confirmed its
 // process tree stopped. Host tasks must also prove file writes through the
 // operation ledger, Host runtime, and committed Morde Workspace.
@@ -1124,24 +1171,12 @@ func (b *CloudDSHToolBroker) pauseCompletion(ctx context.Context, current task.T
 	})
 }
 
-// pauseForTestGate pauses completion with test_gate_failed when the E07 test
-// gate fails for a fix task. It reports whether it paused: false when the gate
-// passes, when the task has no fix plan, or when the task is hostless.
-// Hostless tasks are exempt because they have no shell tool, so no test run
-// can ever be recorded; the missing hostless test gate is a known
-// limitation. The caller reuses its own result step, as the minimal-diff
-// recheck does, and returns nil when paused.
+// pauseForTestGate preserves the old completion hook while H07 is derived by
+// the independent review from typed plan checks and durable execution receipts.
+// Missing or failed checks are recorded as pending/FAIL validation facts; a
+// blanket full-suite gate would hide those outcomes by preventing review.
 func (b *CloudDSHToolBroker) pauseForTestGate(ctx context.Context, current task.Task, step task.Step, details TaskDetails) (bool, error) {
-	if current.HostID == "" {
-		return false, nil
-	}
-	// shortcut: impact maps are heuristic and cannot prove coverage; the
-	// independent H07 review stays pending until immutable coverage exists.
-	missing := testGateMissing(details)
-	if missing == "" {
-		return false, nil
-	}
-	return true, b.pauseCompletion(ctx, current, step, "test_gate_failed", "The fix cannot complete: "+missing)
+	return false, nil
 }
 
 func (b *CloudDSHToolBroker) Execute(ctx context.Context, claimed task.Task, call ModelToolCall) (AgentToolResult, error) {
@@ -1383,6 +1418,13 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	planRevision, err := validateCloudDSHPlanStepSelection(details, planStepMetadata, "Host operation")
 	if err != nil {
 		return AgentToolResult{}, err
+	}
+	verificationCheck, err := cloudDSHVerificationCheckForCall(details, planStepMetadata, call)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	if verificationCheck != nil {
+		ctx = withTaskValidationPlanCheck(ctx, planRevision, planStepMetadata.StepID, verificationCheck)
 	}
 	if call.Name == runtimeToolFileWrite {
 		if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput, ""); handled {
@@ -1683,6 +1725,10 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 			return AgentToolResult{}, errors.Join(executeErr, err)
 		}
 		return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "The tool result is unknown; the action will not be replayed.")
+	}
+	if verificationCheck != nil && (result.Status == AgentToolSucceeded || result.Status == AgentToolFailed) {
+		result.Output, _ = attestTaskValidationShellResult(current, planRevision, planStepMetadata.StepID, *verificationCheck,
+			preparation.BindingVersion, hash[:], result.Output)
 	}
 	if result.Status == AgentToolNeedsUser {
 		if _, err := b.store.UpdateOperation(ctx, OperationUpdate{
@@ -2412,6 +2458,10 @@ func safeCloudDSHToolFailureResult(name string, result AgentToolResult) AgentToo
 				ExitCode: shell.ExitCode, TimedOut: shell.TimedOut,
 				StdoutTruncated: shell.StdoutTruncated || shell.Stdout != "",
 				StderrTruncated: shell.StderrTruncated || shell.Stderr != "",
+				TaskID: shell.TaskID, WorkspaceID: shell.WorkspaceID, BindingVersion: shell.BindingVersion,
+				WorkspaceViewID: shell.WorkspaceViewID, WorkspaceCheckpointRevision: shell.WorkspaceCheckpointRevision,
+				WorkspaceManifestSHA256Before: shell.WorkspaceManifestSHA256Before,
+				WorkspaceManifestSHA256After: shell.WorkspaceManifestSHA256After, VerificationCheck: shell.VerificationCheck,
 			})
 			if err == nil {
 				result.Output = string(canonical)

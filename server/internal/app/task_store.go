@@ -127,6 +127,7 @@ type TaskDetails struct {
 	StopRequest            *task.StopRequest
 	StopOperationIDs       []string
 	Plan                   *task.Plan
+	ValidationReplayEvidence *TaskValidationReplayEvidence `json:"-"`
 	Billing                *TaskBilling
 }
 

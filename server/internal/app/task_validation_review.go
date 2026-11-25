@@ -279,6 +279,13 @@ type TaskValidationReviewSnapshotReader interface {
 	OpenTaskValidationReviewArtifactContent(context.Context, TaskValidationReviewClaim, string) (TaskArtifactContent, error)
 }
 
+// TaskValidationReplayEvidenceReader returns the durable typed-check view for
+// an active review claim. Verdict completion independently reads the ledger
+// again and does not trust this model-input snapshot.
+type TaskValidationReplayEvidenceReader interface {
+	ReadTaskValidationReplayEvidence(context.Context, TaskValidationReviewClaim) (*TaskValidationReplayEvidence, error)
+}
+
 // TaskValidationReviewClaimVerifier checks that an internal review claim still
 // owns the active database lease before any evidence is exposed.
 type TaskValidationReviewClaimVerifier interface {

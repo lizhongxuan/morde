@@ -729,6 +729,15 @@ func (s *TaskService) GetTaskValidationReviewSnapshot(ctx context.Context, claim
 		}
 	}
 	details.ValidationEvidence = restrictTaskValidationEvidence(details.ValidationEvidence, details.Steps, !workspaceVisible, artifactsHidden)
+	if details.Plan != nil && details.Plan.FixPlan != nil && workspaceVisible {
+		if reader, ok := s.store.(TaskValidationReplayEvidenceReader); ok {
+			replay, replayErr := reader.ReadTaskValidationReplayEvidence(ctx, claim)
+			if replayErr != nil {
+				return TaskDetails{}, replayErr
+			}
+			details.ValidationReplayEvidence = replay
+		}
+	}
 	return details, nil
 }
 

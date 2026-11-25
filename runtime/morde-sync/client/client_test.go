@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -33,8 +34,12 @@ func TestLocalManifestThrottlesScanProgress(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	canonical, rootIdentity, rootDevice, rootInode, err := selectSyncRoot(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var scanEvents int
-	manifest, _, err := (&Client{}).localManifest(context.Background(), SyncOptions{WorkspaceID: testWorkspace}, directory, func(value Progress) {
+	manifest, _, err := (&Client{}).localManifest(context.Background(), SyncOptions{WorkspaceID: testWorkspace}, canonical, rootIdentity, rootDevice, rootInode, func(value Progress) {
 		if value.Stage == string(mordesync.PhaseInventory) || value.Stage == string(mordesync.PhaseHash) {
 			scanEvents++
 		}
@@ -44,6 +49,61 @@ func TestLocalManifestThrottlesScanProgress(t *testing.T) {
 	}
 	if manifest.FileCount != 200 || scanEvents >= int(manifest.FileCount) {
 		t.Fatalf("manifest=%d files, scan notifications=%d; progress should be throttled", manifest.FileCount, scanEvents)
+	}
+}
+
+func TestSyncRejectsRootReplacementAfterManifestCoverageBeforeSessionCreate(t *testing.T) {
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "project")
+	replacedDirectory := filepath.Join(parent, "project-original")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	var creates atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		if r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/sync-sessions") {
+			creates.Add(1)
+		}
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "local-metadata-only-test-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRevision := int64(0)
+	replaced := false
+	result, err := client.Sync(context.Background(), SyncOptions{
+		WorkspaceID: testWorkspace, FolderID: "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		SourceBindingID: "12345678-1234-4234-8234-123456789abc", Directory: directory,
+		Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{},
+		Progress: func(progress Progress) {
+			if progress.Stage != "planning" || replaced {
+				return
+			}
+			replaced = true
+			if err := os.Rename(directory, replacedDirectory); err != nil {
+				t.Errorf("move scanned root aside: %v", err)
+				return
+			}
+			if err := os.Mkdir(directory, 0o700); err != nil {
+				t.Errorf("replace scanned root: %v", err)
+			}
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "local workspace root disappeared or changed") {
+		t.Fatalf("sync after root replacement = %+v, err=%v; want a local root identity error", result, err)
+	}
+	if !replaced {
+		t.Fatal("test did not replace the root after manifest coverage")
+	}
+	if creates.Load() != 0 || requests.Load() != 0 {
+		t.Fatalf("root replacement reached Portal: create requests=%d, total requests=%d", creates.Load(), requests.Load())
+	}
+	if result.Session.ID != "" {
+		t.Fatalf("root replacement returned a created session %q", result.Session.ID)
 	}
 }
 

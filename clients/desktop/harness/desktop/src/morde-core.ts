@@ -644,7 +644,9 @@ export class MordeAPI {
     if (typeof projectName !== "string" || !validProjectFolderName(projectName) || typeof idempotencyKey !== "string" || !/^[A-Za-z0-9._~-]{1,128}$/.test(idempotencyKey)) {
       throw new Error("Invalid Morde project folder registration request");
     }
-    const value = await this.portalRequest(`/api/hosts/${host}/sync-folders`, session, "POST", { project_name: projectName }, idempotencyKey);
+    const origin = this.credentials()?.origin;
+    if (!origin) throw new Error("Log in to Morde again");
+    const value = await this.portalRequest(`/api/hosts/${host}/sync-folders`, session, "POST", { project_name: projectName }, idempotencyKey, origin);
     return parseProjectSyncFolder(value);
   }
 

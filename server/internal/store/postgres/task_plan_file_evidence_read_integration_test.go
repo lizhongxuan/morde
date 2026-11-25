@@ -202,6 +202,10 @@ WHERE task_id=$1 AND execution_id=$2`, current.ID, settledSource.ID, current.Aut
 
 	modelCall, modelOperation := taskPlanStepOperationFixture(t, fixture, current, "call_model_without_plan_selector",
 		"terminal_exec", taskPlanStepTestDigest("model call arguments"))
+	modelOperation.WorkspaceID = workspaceValue.ID
+	modelOperation.BindingVersion = binding.BindingVersion
+	modelOperation.InputRevision = current.InputRevision
+	modelOperation.WorkspaceCheckpointRevision = current.WorkspaceCheckpointRevision
 	if _, _, err := fixture.route.store.CreateOperation(ctx, modelOperation, current.Lease.Owner); err != nil {
 		t.Fatalf("create ordinary model operation: %v", err)
 	}

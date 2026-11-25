@@ -36,10 +36,17 @@ func testPassReason(activity cloudDSHToolActivity) string {
 		activity.shellExecution.TimedOut || activity.shellExecution.ExitCode != 0 {
 		return ""
 	}
+	if activity.verificationCheck == nil || activity.verificationCheck.Kind != task.PlanVerificationCheckTest ||
+		activity.verificationStepID == "" || activity.verificationPlanRevision < 1 {
+		return ""
+	}
 	var arguments struct {
 		Command string `json:"command"`
 	}
 	if json.Unmarshal([]byte(activity.call.Arguments), &arguments) != nil {
+		return ""
+	}
+	if arguments.Command != activity.verificationCheck.Command || !validTaskPlanVerificationCommand(*activity.verificationCheck) {
 		return ""
 	}
 	if !isDirectTestCommand(arguments.Command) {

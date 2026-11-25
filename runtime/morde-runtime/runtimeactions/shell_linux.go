@@ -7,15 +7,18 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -266,6 +269,13 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 	if operationContext.Err() != nil {
 		return shellResultIfTimedOut(operationContext)
 	}
+	workspaceManifestBefore := ""
+	if request.WorkspaceViewID != "" {
+		workspaceManifestBefore, err = taskWorkspaceManifestSHA256(operationContext, workspaceRoot)
+		if err != nil {
+			return nil, fmt.Errorf("hash Task Workspace before shell execution: %w", err)
+		}
+	}
 
 	operationID := request.OperationID
 	groupPath := h.groupPath(operationID)
@@ -350,11 +360,236 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 		StdoutTruncated: stdout.truncated, StderrTruncated: stderr.truncated,
 		TimedOut: timedOut,
 	}
-	encoded, err := json.Marshal(result)
+	var encoded []byte
+	if request.WorkspaceViewID != "" {
+		workspaceManifestAfter, hashErr := taskWorkspaceManifestSHA256(ctx, workspaceRoot)
+		if hashErr != nil {
+			return nil, fmt.Errorf("hash Task Workspace after shell execution: %w", hashErr)
+		}
+		revision := request.WorkspaceCheckpointRevision
+		encoded, err = json.Marshal(shellTaskWorkspaceResult{
+			ExitCode: result.ExitCode, Stdout: result.Stdout, Stderr: result.Stderr,
+			StdoutTruncated: result.StdoutTruncated, StderrTruncated: result.StderrTruncated,
+			TimedOut: result.TimedOut, TaskID: request.TaskID, WorkspaceID: request.WorkspaceID,
+			BindingVersion: request.BindingVersion, WorkspaceViewID: request.WorkspaceViewID,
+			WorkspaceCheckpointRevision:   &revision,
+			WorkspaceManifestSHA256Before: workspaceManifestBefore, WorkspaceManifestSHA256After: workspaceManifestAfter,
+		})
+	} else {
+		encoded, err = json.Marshal(result)
+	}
 	if err != nil {
 		return nil, ErrProcessDomainUnavailable
 	}
 	return encoded, nil
+}
+
+// shellTaskWorkspaceResult carries a safe digest of the exact Task-private
+// Workspace view around shell execution. It intentionally contains no file
+// names or contents; the server can bind the two digests to this operation
+// and fail closed if the Workspace changed while the command ran.
+type shellTaskWorkspaceResult struct {
+	ExitCode                      int    `json:"exit_code"`
+	Stdout                        string `json:"stdout"`
+	Stderr                        string `json:"stderr"`
+	StdoutTruncated               bool   `json:"stdout_truncated"`
+	StderrTruncated               bool   `json:"stderr_truncated"`
+	TimedOut                      bool   `json:"timed_out"`
+	TaskID                        string `json:"task_id"`
+	WorkspaceID                   string `json:"workspace_id"`
+	BindingVersion                int64  `json:"binding_version"`
+	WorkspaceViewID               string `json:"workspace_view_id"`
+	WorkspaceCheckpointRevision   *int64 `json:"workspace_checkpoint_revision"`
+	WorkspaceManifestSHA256Before string `json:"workspace_manifest_sha256_before"`
+	WorkspaceManifestSHA256After  string `json:"workspace_manifest_sha256_after"`
+}
+
+const taskWorkspaceManifestDomain = "morde-task-workspace-manifest-v1"
+
+// taskWorkspaceManifestSHA256 hashes a canonical, content-addressed manifest
+// through the already-opened Workspace root. It never follows symlinks while
+// walking: targets are included as data. Unsupported filesystem objects or
+// concurrent changes fail closed so they cannot become an empty/partial proof.
+func taskWorkspaceManifestSHA256(ctx context.Context, root *os.Root) (string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if root == nil {
+		return "", ErrInvalidShellRequest
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	rootInfo, err := root.Stat(".")
+	if err != nil || !rootInfo.IsDir() {
+		return "", ErrInvalidShellRequest
+	}
+	manifest := sha256.New()
+	writeTaskWorkspaceManifestField(manifest, 'v', []byte(taskWorkspaceManifestDomain))
+	if err := writeTaskWorkspaceManifestEntry(manifest, '.', ".", rootInfo); err != nil {
+		return "", err
+	}
+	var walk func(string) error
+	walk = func(directory string) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		directoryHandle, err := root.Open(directory)
+		if err != nil {
+			return err
+		}
+		entries, readErr := directoryHandle.ReadDir(-1)
+		closeErr := directoryHandle.Close()
+		if readErr != nil {
+			return readErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+		for _, entry := range entries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			name := entry.Name()
+			relative := name
+			if directory != "." {
+				relative = filepath.Join(directory, name)
+			}
+			info, err := root.Lstat(relative)
+			if err != nil {
+				return err
+			}
+			switch {
+			case info.IsDir():
+				if err := writeTaskWorkspaceManifestEntry(manifest, 'd', relative, info); err != nil {
+					return err
+				}
+				if err := walk(relative); err != nil {
+					return err
+				}
+				current, err := root.Lstat(relative)
+				if err != nil || !sameTaskWorkspaceManifestStat(info, current) {
+					return ErrInvalidShellRequest
+				}
+			case info.Mode()&os.ModeSymlink != 0:
+				target, err := root.Readlink(relative)
+				if err != nil {
+					return err
+				}
+				current, err := root.Lstat(relative)
+				if err != nil || !sameTaskWorkspaceManifestStat(info, current) {
+					return ErrInvalidShellRequest
+				}
+				if err := writeTaskWorkspaceManifestEntry(manifest, 'l', relative, info); err != nil {
+					return err
+				}
+				writeTaskWorkspaceManifestField(manifest, 't', []byte(target))
+			case info.Mode().IsRegular():
+				file, err := root.Open(relative)
+				if err != nil {
+					return err
+				}
+				openedInfo, err := file.Stat()
+				if err != nil || !os.SameFile(info, openedInfo) || !sameTaskWorkspaceManifestStat(info, openedInfo) {
+					_ = file.Close()
+					return ErrInvalidShellRequest
+				}
+				contentDigest, hashErr := taskWorkspaceFileSHA256(ctx, file)
+				finalInfo, statErr := file.Stat()
+				closeErr := file.Close()
+				current, currentErr := root.Lstat(relative)
+				if hashErr != nil {
+					return hashErr
+				}
+				if statErr != nil || closeErr != nil || currentErr != nil ||
+					!sameTaskWorkspaceManifestStat(openedInfo, finalInfo) || !sameTaskWorkspaceManifestStat(openedInfo, current) {
+					return ErrInvalidShellRequest
+				}
+				if err := writeTaskWorkspaceManifestEntry(manifest, 'f', relative, info); err != nil {
+					return err
+				}
+				writeTaskWorkspaceManifestField(manifest, 'c', contentDigest)
+			default:
+				return ErrInvalidShellRequest
+			}
+		}
+		return nil
+	}
+	if err := walk("."); err != nil {
+		return "", err
+	}
+	finalRootInfo, err := root.Stat(".")
+	if err != nil || !sameTaskWorkspaceManifestStat(rootInfo, finalRootInfo) {
+		return "", ErrInvalidShellRequest
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(manifest.Sum(nil)), nil
+}
+
+func taskWorkspaceFileSHA256(ctx context.Context, file *os.File) ([]byte, error) {
+	if file == nil {
+		return nil, ErrInvalidShellRequest
+	}
+	digest := sha256.New()
+	buffer := make([]byte, 128<<10)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		count, err := file.Read(buffer)
+		if count > 0 {
+			_, _ = digest.Write(buffer[:count])
+		}
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if count == 0 {
+			return nil, io.ErrNoProgress
+		}
+	}
+	return digest.Sum(nil), nil
+}
+
+func writeTaskWorkspaceManifestEntry(manifest hash.Hash, kind byte, relative string, info os.FileInfo) error {
+	if info == nil {
+		return ErrInvalidShellRequest
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return ErrInvalidShellRequest
+	}
+	writeTaskWorkspaceManifestField(manifest, 'k', []byte{kind})
+	writeTaskWorkspaceManifestField(manifest, 'p', []byte(relative))
+	writeTaskWorkspaceManifestField(manifest, 'm', []byte(strconv.FormatUint(uint64(info.Mode()), 10)))
+	writeTaskWorkspaceManifestField(manifest, 's', []byte(strconv.FormatInt(info.Size(), 10)))
+	writeTaskWorkspaceManifestField(manifest, 't', []byte(strconv.FormatInt(info.ModTime().UnixNano(), 10)))
+	writeTaskWorkspaceManifestField(manifest, 'u', []byte(strconv.FormatUint(uint64(stat.Uid), 10)))
+	writeTaskWorkspaceManifestField(manifest, 'g', []byte(strconv.FormatUint(uint64(stat.Gid), 10)))
+	return nil
+}
+
+func writeTaskWorkspaceManifestField(manifest hash.Hash, field byte, value []byte) {
+	_, _ = manifest.Write([]byte{field})
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(value)))
+	_, _ = manifest.Write(size[:])
+	_, _ = manifest.Write(value)
+}
+
+func sameTaskWorkspaceManifestStat(left, right os.FileInfo) bool {
+	if left == nil || right == nil || !os.SameFile(left, right) || left.Mode() != right.Mode() ||
+		left.Size() != right.Size() || !left.ModTime().Equal(right.ModTime()) {
+		return false
+	}
+	leftStat, leftOK := left.Sys().(*syscall.Stat_t)
+	rightStat, rightOK := right.Sys().(*syscall.Stat_t)
+	return leftOK && rightOK && leftStat.Uid == rightStat.Uid && leftStat.Gid == rightStat.Gid
 }
 
 func validWorkspaceDirectory(value string) bool {

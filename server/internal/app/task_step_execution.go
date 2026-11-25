@@ -17,12 +17,37 @@ const (
 )
 
 type taskStepShellOutput struct {
-	ExitCode        int    `json:"exit_code"`
-	TimedOut        bool   `json:"timed_out"`
-	Stdout          string `json:"stdout"`
-	Stderr          string `json:"stderr"`
-	StdoutTruncated bool   `json:"stdout_truncated"`
-	StderrTruncated bool   `json:"stderr_truncated"`
+	ExitCode                      int                                  `json:"exit_code"`
+	TimedOut                      bool                                 `json:"timed_out"`
+	Stdout                        string                               `json:"stdout"`
+	Stderr                        string                               `json:"stderr"`
+	StdoutTruncated               bool                                 `json:"stdout_truncated"`
+	StderrTruncated               bool                                 `json:"stderr_truncated"`
+	TaskID                        string                               `json:"task_id,omitempty"`
+	WorkspaceID                   string                               `json:"workspace_id,omitempty"`
+	BindingVersion                int64                                `json:"binding_version,omitempty"`
+	WorkspaceViewID               string                               `json:"workspace_view_id,omitempty"`
+	WorkspaceCheckpointRevision   *int64                               `json:"workspace_checkpoint_revision,omitempty"`
+	WorkspaceManifestSHA256Before string                               `json:"workspace_manifest_sha256_before,omitempty"`
+	WorkspaceManifestSHA256After  string                               `json:"workspace_manifest_sha256_after,omitempty"`
+	VerificationCheck             *TaskValidationCheckExecutionReceipt `json:"verification_check,omitempty"`
+}
+
+// TaskValidationCheckExecutionReceipt is written by the server-side tool
+// broker into the durable operation result after it matches a typed plan
+// check to the exact shell command and validates the Runtime Workspace facts.
+// It contains identifiers and digests only, never command output or file data.
+type TaskValidationCheckExecutionReceipt struct {
+	Version          int    `json:"version"`
+	TaskRevision     int64  `json:"task_revision"`
+	PlanRevision     int64  `json:"plan_revision"`
+	CheckID          string `json:"check_id"`
+	Kind             string `json:"kind"`
+	Basis            string `json:"basis"`
+	CommandSHA256    string `json:"command_sha256"`
+	CheckSHA256      string `json:"check_sha256"`
+	CoverageSHA256   string `json:"coverage_sha256"`
+	RequestSHA256    string `json:"request_sha256"`
 }
 
 var taskStepSecretAssignment = regexp.MustCompile("(?i)((?:--)?(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|authorization|credential|client[_-]?secret|private[_-]?key|access[_-]?key|refresh[_-]?token)[\"']?\\s*(?:=|:|\\s)\\s*)(?:\"[^\"]*\"|'[^']*'|[^\\s,;}&]+)")

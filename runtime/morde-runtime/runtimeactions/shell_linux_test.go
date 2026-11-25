@@ -4,11 +4,13 @@ package runtimeactions
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"testing"
@@ -40,6 +42,116 @@ func TestCgroupPopulated(t *testing.T) {
 				t.Fatalf("cgroupPopulated()=(%v,%v), want (%v,error=%v)", got, err, test.populated, test.wantErr)
 			}
 		})
+	}
+}
+
+func TestTaskWorkspaceManifestSHA256IsStableAndTracksMutation(t *testing.T) {
+	rootPath := t.TempDir()
+	if err := os.Mkdir(filepath.Join(rootPath, "src"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rootPath, "src", "main.go"), []byte("package main\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	first, err := taskWorkspaceManifestSHA256(context.Background(), root)
+	if err != nil {
+		t.Fatalf("first manifest digest: %v", err)
+	}
+	second, err := taskWorkspaceManifestSHA256(context.Background(), root)
+	if err != nil {
+		t.Fatalf("second manifest digest: %v", err)
+	}
+	if first == "" || first != second {
+		t.Fatalf("stable Workspace digests differ: %q != %q", first, second)
+	}
+	if err := os.WriteFile(filepath.Join(rootPath, "src", "main.go"), []byte("package main\nfunc main() {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	changed, err := taskWorkspaceManifestSHA256(context.Background(), root)
+	if err != nil {
+		t.Fatalf("changed manifest digest: %v", err)
+	}
+	if changed == first {
+		t.Fatal("Workspace content mutation did not change the manifest digest")
+	}
+}
+
+func TestTaskWorkspaceManifestSHA256FailsClosedOnSpecialFile(t *testing.T) {
+	rootPath := t.TempDir()
+	if err := syscall.Mkfifo(filepath.Join(rootPath, "pipe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	if digest, err := taskWorkspaceManifestSHA256(context.Background(), root); err == nil || digest != "" {
+		t.Fatalf("special file produced a manifest proof: digest=%q err=%v", digest, err)
+	}
+}
+
+func TestTaskWorkspaceManifestSHA256FailsClosedOnScanError(t *testing.T) {
+	root, err := os.OpenRoot(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := root.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if digest, err := taskWorkspaceManifestSHA256(context.Background(), root); err == nil || digest != "" {
+		t.Fatalf("closed root produced a manifest proof: digest=%q err=%v", digest, err)
+	}
+}
+
+func TestShellTaskWorkspaceResultPreservesOutputAndSnapshotIdentity(t *testing.T) {
+	revision := int64(0)
+	result := shellTaskWorkspaceResult{
+		ExitCode: 7, Stdout: "stdout", Stderr: "stderr", StdoutTruncated: true, StderrTruncated: false, TimedOut: true,
+		TaskID: "q1234567", WorkspaceID: "w1234567", BindingVersion: 3, WorkspaceViewID: "v" + strings.Repeat("a", 64),
+		WorkspaceCheckpointRevision:   &revision,
+		WorkspaceManifestSHA256Before: strings.Repeat("b", 64), WorkspaceManifestSHA256After: strings.Repeat("c", 64),
+	}
+	encoded, err := json.Marshal(result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[string]any{
+		"exit_code": float64(7), "stdout": "stdout", "stderr": "stderr", "stdout_truncated": true,
+		"stderr_truncated": false, "timed_out": true, "task_id": "q1234567", "workspace_id": "w1234567",
+		"binding_version": float64(3), "workspace_view_id": "v" + strings.Repeat("a", 64),
+		"workspace_checkpoint_revision": float64(0), "workspace_manifest_sha256_before": strings.Repeat("b", 64),
+		"workspace_manifest_sha256_after": strings.Repeat("c", 64),
+	} {
+		if got[key] != want {
+			t.Errorf("result field %q = %#v, want %#v", key, got[key], want)
+		}
+	}
+	legacyEncoded, err := json.Marshal(shellResult{ExitCode: 0, Stdout: "legacy"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var legacy map[string]any
+	if err := json.Unmarshal(legacyEncoded, &legacy); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{
+		"task_id", "workspace_id", "binding_version", "workspace_view_id", "workspace_checkpoint_revision",
+		"workspace_manifest_sha256_before", "workspace_manifest_sha256_after",
+	} {
+		if _, ok := legacy[key]; ok {
+			t.Errorf("non-Task shell result unexpectedly includes %q", key)
+		}
 	}
 }
 

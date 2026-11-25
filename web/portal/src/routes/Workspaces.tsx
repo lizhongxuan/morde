@@ -416,7 +416,8 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
     : undefined;
   const projectTargetRouteMismatch = projectPreferences.isSuccess && Boolean(computerID && computerID !== defaultHostID);
   const selectedProjectTarget = projectTargetRouteMismatch ? undefined : configuredDefaultProjectTarget;
-  const selectedProjectTargetUnavailable = !selectedProjectTarget || selectedProjectTarget.hostState !== 'running'
+  const selectedProjectTargetUnavailable = !selectedProjectTarget || configuredDefaultHost?.state !== 'running'
+    || selectedProjectTarget.hostState !== 'running'
     || configuredDefaultHost?.workspace_runtime_online !== true || !configuredDefaultWorkspaceReady
     || projectPreferences.isFetching || projectTargets.isFetching || projectTargets.isError || Boolean(selectedProjectTarget.blockedMessage);
   const scopedProjectState = localProjectState;
@@ -848,7 +849,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
           && <p className="notice notice-warning" role="status">默认云端电脑当前不可用于项目同步（目录未就绪、授权变化或仍有旧版同步）。文件同步已暂停，不会切换到其他电脑。</p>}
         {configuredDefaultProjectTarget && <article className="schedule-card" role="group" aria-label="同步目标电脑" style={{ padding: '8px 10px' }}>
           <div className="schedule-card-heading">
-            <div><strong>{configuredDefaultProjectTarget.hostName} · 默认电脑</strong><span>{configuredDefaultProjectTarget.hostState === 'running' ? '运行中' : '已停止'} · 已有项目 {configuredDefaultProjectTarget.folders.length} 个</span></div>
+            <div><strong>{configuredDefaultProjectTarget.hostName} · 默认电脑</strong><span>{hostStateLabel[configuredDefaultHost?.state ?? configuredDefaultProjectTarget.hostState] || configuredDefaultProjectTarget.hostState} · 已有项目 {configuredDefaultProjectTarget.folders.length} 个</span></div>
           </div>
           <p className="muted">目标目录：~/workspace/project/&lt;项目名&gt;/</p>
           {configuredDefaultProjectTarget.blockedMessage && <small className="table-sub">{configuredDefaultProjectTarget.blockedMessage}</small>}

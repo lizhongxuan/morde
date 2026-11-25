@@ -273,6 +273,7 @@ test('project folder registration uses a Portal cookie and sends metadata only',
     assert.equal(registered.relativePath, 'project/demo');
     assert.equal(calls[0].options.headers.cookie, 'ch_portal=portal-cookie-secret');
     assert.equal(calls[0].options.headers.authorization, undefined);
+    assert.equal(calls[1].options.headers.origin, credentials.origin);
     assert.equal(calls[1].options.headers['Idempotency-Key'], 'registration-key');
     assert.deepEqual(JSON.parse(calls[1].options.body), { project_name: 'demo' });
     assert.equal(JSON.stringify(calls).includes('file'), false);

@@ -39,10 +39,26 @@ func requireFailingTestRecord(details TaskDetails) error {
 	if details.Plan == nil || details.Plan.FixPlan == nil {
 		return nil
 	}
+	if !taskPlanHasTypedTestCheck(details.Plan) {
+		return domain.InvalidArgument("task_plan.verification_check", "a fix plan requires an explicit typed test check")
+	}
 	if hasFailingTestRecord(currentRevisionTestSteps(details.Steps, details.Task.CurrentRevision)) {
 		return nil
 	}
 	return domain.InvalidArgument("task_plan.failing_test", "run a failing reproduction test before changing code")
+}
+
+func taskPlanHasTypedTestCheck(plan *task.Plan) bool {
+	if plan == nil {
+		return false
+	}
+	for _, step := range plan.Steps {
+		if step.VerificationCheck != nil && step.VerificationCheck.Kind == task.PlanVerificationCheckTest &&
+			validTaskPlanVerificationCommand(*step.VerificationCheck) {
+			return true
+		}
+	}
+	return false
 }
 
 // failingTestFailureReason returns taskToolTestFailureReason when the tool
@@ -55,10 +71,17 @@ func failingTestFailureReason(activity cloudDSHToolActivity) string {
 		(!activity.shellExecution.TimedOut && activity.shellExecution.ExitCode == 0) {
 		return ""
 	}
+	if activity.verificationCheck == nil || activity.verificationCheck.Kind != task.PlanVerificationCheckTest ||
+		activity.verificationStepID == "" || activity.verificationPlanRevision < 1 {
+		return ""
+	}
 	var arguments struct {
 		Command string `json:"command"`
 	}
 	if json.Unmarshal([]byte(activity.call.Arguments), &arguments) != nil || !isDirectTestCommand(arguments.Command) {
+		return ""
+	}
+	if arguments.Command != activity.verificationCheck.Command {
 		return ""
 	}
 	return taskToolTestFailureReason

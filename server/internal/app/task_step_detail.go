@@ -87,6 +87,9 @@ type cloudDSHToolActivity struct {
 	contentEvidence *TaskStepContentEvidence
 	phaseOverride   string
 	failureReason   string
+	verificationCheck *task.PlanVerificationCheck
+	verificationPlanRevision int64
+	verificationStepID string
 }
 
 const maxTaskStepContentEvidencePreviewBytes = 4096

@@ -217,17 +217,57 @@ func EvaluateTaskValidationReplay(hasFixPlan bool, gate TestGateResult, evidence
 	return evidenceContentVerified
 }
 
-// TaskValidationReplayEvidence is the server-attested test re-run, sent to
-// the review model inside the review packet so it can judge H07 on ledger
-// fact instead of on shell exit codes alone (which the review prompt
-// correctly says cannot prove test assertions). Sequences are 0 when that
-// half has no proving step.
+// TaskValidationReplayEvidence is the server-attested set of typed plan
+// checks sent to the review model. Legacy heuristic fields remain local to
+// older unit helpers and are never serialized into the review prompt.
 type TaskValidationReplayEvidence struct {
-	NewTestPassed           bool  `json:"new_test_passed"`
-	FullSuitePassed         bool  `json:"full_suite_passed"`
-	NewTestFailedSequence   int64 `json:"new_test_failed_sequence"`
-	NewTestPassedSequence   int64 `json:"new_test_passed_sequence"`
-	FullSuitePassedSequence int64 `json:"full_suite_passed_sequence"`
+	State                   TaskValidationReplayState            `json:"state"`
+	PlanRevision            int64                                 `json:"plan_revision"`
+	Checks                  []TaskValidationReplayCheckEvidence   `json:"checks"`
+	NewTestPassed           bool                                  `json:"-"`
+	FullSuitePassed         bool                                  `json:"-"`
+	NewTestFailedSequence   int64                                 `json:"-"`
+	NewTestPassedSequence   int64                                 `json:"-"`
+	FullSuitePassedSequence int64                                 `json:"-"`
+}
+
+type TaskValidationReplayState string
+
+const (
+	TaskValidationReplayPending TaskValidationReplayState = "pending"
+	TaskValidationReplayPass    TaskValidationReplayState = "pass"
+	TaskValidationReplayFail    TaskValidationReplayState = "fail"
+)
+
+// TaskValidationReplayCheckEvidence is a bounded, server-read view of the
+// latest real operation bound to one typed plan check. It omits shell output
+// and file contents while preserving the identities needed to assess H07.
+type TaskValidationReplayCheckEvidence struct {
+	CheckID                        string                                  `json:"check_id"`
+	TaskID                         string                                  `json:"task_id,omitempty"`
+	Kind                           task.PlanVerificationCheckKind         `json:"kind,omitempty"`
+	Basis                          task.PlanVerificationCheckBasis        `json:"basis,omitempty"`
+	CoveragePaths                  []string                                `json:"coverage_paths,omitempty"`
+	RequirementSource              *task.PlanVerificationRequirementSource `json:"requirement_source,omitempty"`
+	RequirementSourceVerified      bool                                    `json:"requirement_source_verified"`
+	Status                         TaskValidationReplayState              `json:"status"`
+	TaskRevision                   int64                                   `json:"task_revision,omitempty"`
+	PlanRevision                   int64                                   `json:"plan_revision,omitempty"`
+	OperationID                    string                                  `json:"operation_id,omitempty"`
+	CallID                         string                                  `json:"call_id,omitempty"`
+	RequestSHA256                  string                                  `json:"request_sha256,omitempty"`
+	CommandSHA256                  string                                  `json:"command_sha256,omitempty"`
+	CheckSHA256                    string                                  `json:"check_sha256,omitempty"`
+	CoverageSHA256                 string                                  `json:"coverage_sha256,omitempty"`
+	RunSequence                    int64                                   `json:"run_sequence,omitempty"`
+	ExitCode                       int                                     `json:"exit_code,omitempty"`
+	TimedOut                       bool                                    `json:"timed_out,omitempty"`
+	WorkspaceID                    string                                  `json:"workspace_id,omitempty"`
+	WorkspaceBindingVersion        int64                                   `json:"workspace_binding_version,omitempty"`
+	WorkspaceCheckpointRevision    int64                                   `json:"workspace_checkpoint_revision,omitempty"`
+	WorkspaceViewID                string                                  `json:"workspace_view_id,omitempty"`
+	WorkspaceManifestSHA256Before  string                                  `json:"workspace_manifest_sha256_before,omitempty"`
+	WorkspaceManifestSHA256After   string                                  `json:"workspace_manifest_sha256_after,omitempty"`
 }
 
 // ReplayEvidenceForSteps builds the replay section of the review packet

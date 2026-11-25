@@ -2386,14 +2386,7 @@ func mapRuntimeToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 			return mapDesktopToolResult(mapping, operation, arguments)
 		}
 		if mapping.capability == "shell.exec" {
-			var shell struct {
-				ExitCode        int    `json:"exit_code"`
-				TimedOut        bool   `json:"timed_out"`
-				Stdout          string `json:"stdout"`
-				Stderr          string `json:"stderr"`
-				StdoutTruncated bool   `json:"stdout_truncated"`
-				StderrTruncated bool   `json:"stderr_truncated"`
-			}
+			var shell taskStepShellOutput
 			if err := decodeStrictRuntimeResult(operation.Result, &shell); err != nil || shell.ExitCode < 0 || shell.ExitCode > 255 {
 				return AgentToolResult{Status: AgentToolFailed, ExternalID: operation.OperationID, Output: `{"error":"invalid_shell_result"}`}, nil
 			}
