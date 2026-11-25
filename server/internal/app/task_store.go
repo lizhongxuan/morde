@@ -470,6 +470,15 @@ type TaskProgress struct {
 	CloudDSHTaskPlan            *CloudDSHTaskPlanCommit
 }
 
+// CloudDSHPlanStepReadStore brackets a direct read-only tool call with a
+// persisted-plan admission and result settlement. Admission runs before the
+// tool reads data; settlement records the digest only after the successful
+// TaskStep call identity has been committed.
+type CloudDSHPlanStepReadStore interface {
+	AdmitCloudDSHTaskPlanStepRead(context.Context, task.Task, int64, string, TaskToolCallProgress) error
+	SettleCloudDSHTaskPlanStepRead(context.Context, task.Task, int64, string, TaskToolCallProgress, []byte) error
+}
+
 // CloudDSHPersonalHistoryReadCommit binds a personal-history tool result to
 // the consent revision and personal-data change watermark that authorized the
 // search. PostgreSQL rechecks both in the same transaction that records the

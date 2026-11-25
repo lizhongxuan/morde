@@ -8,7 +8,7 @@ MORDE HARNESS · MUSE 对照设计
 
 原目标图核对基线：Morde 本地 HEAD `a616e01a`；本地 DSH 源码 `fcc0ad4621`，包版本与 Morde 锁文件均为 `0.2.2-rc.1`。2026-11-25 新增现状对照使用的基线见下文；线上运行版本需另查。
 
-**2026-11-25 SIT 再合并修正：**影响图仅提供候选信息，不证明测试覆盖；不再以不可达或旧影响图阻塞完成，Host 任务的 E07 与独立 H07 继续保留，Hostless 的 E07 例外待解决，修复任务缺少覆盖证据时 H07 为 pending。模型摘要、复核与任务不再对已派发 unknown 作同 ID 伪重试；明确未派发的本地并发预留限制可有界重试，Provider 的 Retry-After 保留。Provider 安全自动恢复、验证 FAIL 原因交给主 Agent、失败/取消终态 outbox、R19-A 与 128 KiB 以上 Task 首轮输入仍未完成。源码 PC + 本地合成服务的 unknown 场景仅确认任务等待核对，原对话仍缺中断说明；真实 DSH 与跨端未验。
+**2026-11-25 SIT 再合并修正：**影响图仅提供候选信息，不证明测试覆盖；不再以不可达或旧影响图阻塞完成，Host 任务的 E07 与独立 H07 继续保留，Hostless 的 E07 例外待解决，修复任务缺少覆盖证据时 H07 为 pending。模型摘要、复核与任务不再对已派发 unknown 作同 ID 伪重试；明确未派发的本地并发预留限制可有界重试，Provider 的 Retry-After 保留。Provider 安全自动恢复、验证 FAIL 原因交给主 Agent、失败/取消终态 outbox 与 R19-A 尚未完成；C-01 已在本地接通超过 128 KiB 的 receipt-backed 初始及运行中长消息引用投递，PC/当前服务/真实 DSH 与模型语义验收仍待完成。源码 PC + 本地合成服务的 unknown 场景仅确认任务等待核对，原对话仍缺中断说明；真实 DSH 与跨端未验。
 
 **这是基于 Muse 资料的目标设计，不是上线或验收结论。**原目标设计参考本目录的逆向材料与 `project/` 下的开源源码；本次现状对照另参考用户提供的两份方案，并用 Morde 当前源码判断已有能力和需要改动的入口。蓝色表示代码中已有基础，橙色表示需对照完善，红色表示源码核对出的具体差距；代码存在不等于端到端通过。
 
@@ -20,7 +20,9 @@ MORDE HARNESS · MUSE 对照设计
 
 **R12 Runtime 提醒与超时边界（2026-11-25）：**现已接入 DSH 上游锁定版本的 `repeat-tool-reminder` advisory guard；连续三次完全相同的调用后向 Agent 注入来源可追溯提醒，但不拦截已授权工具。Runtime 全量测试 244/244 通过。本地 `timeout-policy` 插件要求工具合作处理 AbortSignal，现有 Morde IPC 工具没有声明时限；tool/child 6 分钟只限制 IPC 等待并触发结果对账，不表示已派发操作停止。因此不接入通用“硬超时”，真正取消须跨层确认，未知结果不重放。一般 65+ Morde 工具集选择/恢复、强制超时/取消和实际 PC/真实模型验证仍未完成。
 
-**R21 长输入代码边界：**8 MiB 上传不等于 8 MiB 可投递给 DSH。源码审计发现 Task 首轮将完整 pending message 作为 `initial_message`，Worker 与 Runtime 都限制 128 KiB；128 KiB–8 MiB 输入会在 Task 首轮失败。现有 source manifest 只支持 Task 启动后的授权读取；delivery ledger 记录消息身份和投递阶段，checkpoint 仍按原文/附件/模式精确匹配。复用 message ID 换成短 prompt 可能令恢复校验失败或结果变为 unknown。公共合同 v1 §4 已定义原文哈希、manifest 指针、表示摘要、delivery applied 与 checkpoint 恢复身份。2026-11-25 C-01 已在本地接入初始消息、followup、steer 与 revision batch 的 receipt-backed 有界引用，并验证 1 MiB+1 原文经 PostgreSQL Store receipt 和 Broker 连续分页读回；实际 PC 成功提交、真实 DSH/模型首中尾语义和预算边界仍待验收。
+**R21 长输入现状与历史只读审计：**C-01 已在本地为 initial message、followup、steer 与 revision batch 接入 receipt-backed 有界 source reference；Worker 按连续前缀有界分批，Runtime 校验 marker，delivery-applied 回执和 checkpoint 沿用原文身份，授权 Broker 按页读取来源。loopback PostgreSQL 集成以 1 MiB+1 字节合成原文验证 Store receipt 与 `CloudDSHToolBroker.Execute` 连续分页重建并核对首/中/尾锚点；R21 PostgreSQL 定向组 4/4、app 定向组和 DSH Runtime 249/249 通过。这些是本地自动化/fixture 证据，不代表真实 PC/当前服务/DSH 链路或真实模型语义已通过。
+
+**C-01 集成前历史只读审计（2026-11-25）：**当时源码审计发现 Task 首轮将完整 pending message 作为 `initial_message`，Worker 与 Runtime 的全文帧均限制 128 KiB；128 KiB–8 MiB 输入会在首轮失败。旧 delivery ledger 记录消息身份和投递阶段，checkpoint 按原文/附件/模式精确匹配，直接将同 message ID 换成短 prompt 可能导致恢复校验失败或结果 unknown。公共合同 v1 §4 已定义原文哈希、manifest 指针、表示摘要、delivery applied 与 checkpoint 恢复身份；上述“receipt/checkpoint 实现缺失”只描述 C-01 集成前状态。旧全文帧的 128 KiB+1 边界测试仍会拒绝原样传入的大正文，但当前系统通过 receipt-backed 引用投递长消息，不再受该旧边界等同限制。8 MiB 上传也不表示模型可处理 8 MiB；预算及模型窗口约束仍然有效。实际 PC 成功提交、真实 DSH/模型首中尾/全文语义及预算边界仍待验收。
 
 **R21 初始消息边界回归：**Worker 与 Runtime 子进程两层回归验证 128 KiB UTF-8 正文的首/中/尾锚点进入合成模型请求，128 KiB+1 的多字节正文在模型/工具调用前拒绝。该组只验证旧全文帧边界，不单独证明 128 KiB 以上可用或真实模型理解；当前长文可用性由 C-01 receipt-backed 引用及分页读取实现，真实 PC/DSH 语义仍待验证。
 
@@ -34,7 +36,7 @@ MORDE HARNESS · MUSE 对照设计
 
 **R01 结算异常预算保护（2026-11-25）：**Task 模型响应已收到、已知用量结算写入失败时，ModelGateway 现在尽力按原调用身份保存 `unknown`；补偿写入也失败则保留原 dispatched reservation。另有 Task 绑定 PostgreSQL 回归证明 settled ledger、Task 用量和账户预算不被后续 unknown 覆盖。真实 DeepSeek Gateway 长输入与历史路由语义也已通过，但真实 Task 预算耗尽根因、PC 和完整 DSH Task 闭环仍未验收，R01 不关闭。
 
-**R19/R11 真实模型路由修正（2026-11-25）：**首次真实 DeepSeek 测试显示：完整 51,842 字节档案首轮可正确回答首/中/尾锚点，但针对被省略中段记录的追问错误要求用户重发。修复仅强化路由模型提示：在历史不完整且答案依赖缺失消息时选择授权历史检索 Task，不增加文本关键词或 parser 强制分支；修复后 Gateway live test 处理首轮 18,502 tokens 和完整历史续问 18,575 tokens，返回锚点/中段内容正确，截断历史追问选择 `new`；历史仍不完整时，自包含的 1+1 问题仍选择有正文的 `reply`。这不证明 Task Agent 真正调用历史工具、PC 或超 128 KiB 初始投递已通过。
+**R19/R11 真实模型路由修正（2026-11-25）：**首次真实 DeepSeek 测试显示：完整 51,842 字节档案首轮可正确回答首/中/尾锚点，但针对被省略中段记录的追问错误要求用户重发。修复仅强化路由模型提示：在历史不完整且答案依赖缺失消息时选择授权历史检索 Task，不增加文本关键词或 parser 强制分支；修复后 Gateway live test 处理首轮 18,502 tokens 和完整历史续问 18,575 tokens，返回锚点/中段内容正确，截断历史追问选择 `new`；历史仍不完整时，自包含的 1+1 问题仍选择有正文的 `reply`。这组 Gateway 结果不证明 Task Agent 实际调用历史工具或 PC 对话交付；长初始消息的 receipt-backed 投递另有 C-01 本地自动化证据，真实 PC/DSH/模型语义仍待验。
 
 **2026-11-25 当前复验状态：**Portal Assistant UI 自动化 239/239、Portal 全量 68 个测试文件 893/893，TypeScript 检查和全量 lint 通过；PersonalData、Reviews、FloatingError 三组受影响测试 48/48 通过。DSH Runtime 最新全量 249/249。DB 定向组 8 个顶层测试、15 个子场景通过。`make test` 与 `make race` 均通过，但均未设置 `CH_TEST_DATABASE_URL`，其中的条件 PostgreSQL 测试均跳过；完整隔离 loopback `make it` 通过，PostgreSQL 包耗时 1166.815 秒，OpenSandbox 因未配置专用环境而跳过。C-01 app 定向组及 R21 receipt-backed Broker + PostgreSQL 连续读取集成组本轮通过（PostgreSQL 4/4）；完整 app 包仍有非 C01 Task Plan 元数据及审批断言失败。隔离源码 `morde-pc` 已显示 131,073 字节合成消息持久化，但助手只返回有界预览；测试机 Portal 未部署本地 C01 代码，因此实际 PC + 本轮服务端/DSH 仍未验收。R20 durable 终态合同仍阻塞，R21 本地实现已落地但产品端验收未完成。以上是本地自动化与隔离环境证据，不代表 Muse 内部机制已知，也不代表端到端目标已完成。
 
@@ -62,7 +64,7 @@ MORDE HARNESS · MUSE 对照设计
 
 ```mermaid
 flowchart TD
-    P["PC / iOS · 用户消息"] --> A["01 / 10 收件、会话与上下文<br/>持久收件 · 授权历史 · 幂等与恢复<br/>明确缺口：Task 初始消息超过 128 KiB 会被拒"]
+    P["PC / iOS · 用户消息"] --> A["01 / 10 收件、会话与上下文<br/>持久收件 · 授权历史 · 幂等与恢复<br/>C-01 长输入引用已本地实现；PC + 当前服务 + 真实 DSH/模型语义待验"]
     A --> R{"02 意图路由<br/>无效结果安全澄清"}
     R -->|直接响应| Q["问答 / 任务查询 / 停止<br/>目标不明先澄清；停止指定任务<br/>普通文字问答无需云端电脑"]
     R -->|新建 / 续跑| T["新建 / 续跑任务<br/>校验会话、任务归属和授权<br/>关系不清时不擅自合并"]
@@ -120,7 +122,7 @@ Muse 栏只概括逆向资料中的观察或文档要求；意图分类、合并
 
 ### 建议实施顺序
 
-1. 先核对运行基线及缺失的权威公共契约，再处理会话恢复、路由与计划依赖、超长初始消息和失败终态（R00 / R00A、R19-A、M02-14、R21、R20）。涉及跨层接口的修改依赖契约明确。
+1. 先核对运行基线及缺失的权威公共契约，再处理会话恢复、路由与计划依赖、超长初始消息的端到端验收和失败终态（R00 / R00A、R19-A、M02-14、R21、R20）。涉及跨层接口的修改依赖契约明确。
 2. 接通多 Agent、工具工作项、审批和证据复核，并保留未知结果的对账边界（R03 / R04 / R06 / R07 / R22 / R24）。R25 修复门禁及 R26 来源/交付与相关合同并行推进；授权记忆、PC 文件夹同步及跨端能力继续按既有任务实施。
 3. 按[一体化实施与验收 TODO](<Morde 复刻 Muse 一体化实施与验收 TODO.md>)的分层用例，在实际 `morde-pc` 与真实 DSH 中贯通一次，再分别验证异常、长文、恢复和跨端；局部 fixture 不能代替真实链路。
 
