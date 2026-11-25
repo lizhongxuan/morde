@@ -2206,6 +2206,11 @@ type TaskPendingRequest struct {
 	ExpiresAt               pgtype.Timestamptz `json:"expires_at"`
 	TaskRevision            pgtype.Int8        `json:"task_revision"`
 	RespondedByUserID       pgtype.Text        `json:"responded_by_user_id"`
+	EvidencePointer         pgtype.Text        `json:"evidence_pointer"`
+	ThisCostMicros          pgtype.Int8        `json:"this_cost_micros"`
+	TotalCostMicros         pgtype.Int8        `json:"total_cost_micros"`
+	TriggerRule             pgtype.Text        `json:"trigger_rule"`
+	RejectionConsequence    pgtype.Text        `json:"rejection_consequence"`
 }
 
 type TaskRevisionIntent struct {

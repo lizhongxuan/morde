@@ -71,6 +71,20 @@ func (request cloudDSHAgentRequest) key() string {
 	return request.phase + "\x00" + request.kind + "\x00" + request.activityID + "\x00" + request.digest
 }
 
+// cloudDSHSessionDepth counts delegation hops from the root session: the
+// root is 0, its direct children are 1. The identity guard in
+// createCloudDSHChildSession already rejects parents deeper than a direct
+// child, so only 0, 1, or 2 occur here.
+func cloudDSHSessionDepth(state *cloudDSHSessionState, rootSessionID string) int {
+	if state == nil || state.identity.SessionID == rootSessionID {
+		return 0
+	}
+	if state.parentSessionID == rootSessionID {
+		return 1
+	}
+	return 2
+}
+
 func (state *cloudDSHSessionState) beginAgentRequest(request cloudDSHAgentRequest) error {
 	if state == nil || request.phase == "" || request.kind == "" || request.activityID == "" ||
 		!cloudDSHID.MatchString(request.activityID) {
@@ -1783,7 +1797,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if err != nil {
 				return errors.New("dsh background job authorization is unavailable")
 			}
-			childCanDelegate := canDelegate && len(definitions) > 0
+			childCanDelegate := canDelegate && len(definitions) > 0 && 1 < e.maxSubagentDepth()
 			definitions, err = cloudDSHChildDelegationTools(definitions, childCanDelegate)
 			if err != nil {
 				return err
@@ -3127,12 +3141,23 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 		frame.cloudDSHIdentity != parent.identity || frame.Through == nil || *frame.Through != parent.through || !cloudDSHID.MatchString(frame.CallID) {
 		return false, errors.New("dsh child Agent request identity is invalid")
 	}
+	// E12 subagent depth limit: a new child may only be spawned while the
+	// delegation depth stays within MaxSubagentDepth (default 1: direct
+	// children of the root only). A deeper spawn is rejected with an
+	// explicit error, never silently dropped, so the model learns the
+	// delegation is unavailable instead of retrying it. A recovery replay
+	// of an already-checkpointed delegate call is exempt: it finishes a
+	// spawn admitted before this limit, it does not create a new level.
+	parentDepth := cloudDSHSessionDepth(parent, fence.AgentSessionID)
+	recoveryCall := parent.resume && parent.history.isRecoveryCall(frame.CallID)
+	if !recoveryCall && parentDepth+1 > e.maxSubagentDepth() {
+		return false, errors.New("dsh child Agent delegation exceeds the subagent depth limit")
+	}
 	if parent.identity.SessionID != fence.AgentSessionID {
 		parentDefinitions = parent.definitions
 	}
 	arguments, definitions, err := validateCloudDSHDelegateArguments(frame.Arguments, parentDefinitions)
 	canonical, canonicalOK := canonicalCloudDSHJSON(frame.Arguments)
-	recoveryCall := parent.resume && parent.history.isRecoveryCall(frame.CallID)
 	if err != nil || !canonicalOK || (recoveryCall && (parent.readThrough != parent.restoreThrough ||
 		parent.history.validateRecoveryToolCall(frame.CallID, cloudDSHDelegateToolName, canonical) != nil)) ||
 		(!recoveryCall && (!parent.history.allHistoricalCallsReconciled() ||
@@ -3294,7 +3319,8 @@ func (e *CloudDSHExecutor) createCloudDSHChildSession(ctx context.Context, value
 	}
 	identity := parent.identity
 	identity.SessionID = child.SessionID
-	childCanDelegate := parent.identity.SessionID == fence.AgentSessionID && len(definitions) > 0
+	childDepth := parentDepth + 1
+	childCanDelegate := childDepth < e.maxSubagentDepth() && len(definitions) > 0
 	childDefinitions, err := cloudDSHChildDelegationTools(definitions, childCanDelegate)
 	if err != nil {
 		return false, err

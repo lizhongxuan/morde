@@ -98,10 +98,17 @@ type AgentApprovalRequest struct {
 	Object  string `json:"object"`
 	Content string `json:"content"`
 	Impact  string `json:"impact"`
+	// RejectionConsequence states in plain text what happens if the user
+	// rejects the action. It may be blank for approvals created before E05.
+	RejectionConsequence string `json:"rejection_consequence,omitempty"`
 }
 
 type AgentToolPreparation struct {
-	Status         AgentToolPreparationStatus
+	Status AgentToolPreparationStatus
+	// TriggerRule names the action-matrix category that required approval
+	// (task.ApprovalTrigger*). Empty when the preparation does not require
+	// approval or the rule is unknown.
+	TriggerRule    string
 	Approval       AgentApprovalRequest
 	Fence          AgentHostFence
 	WorkspaceID    string
@@ -140,6 +147,15 @@ type AgentModelFailureDiagnostic struct {
 	ReasonCode string
 	ToolName   string
 	ToolCallID string
+	// LadderExhausted marks a terminal state where the E12 retry ladder
+	// spent its budget (Attempts retries). pauseRecovery then records the
+	// ladder-exhausted terminal instead of the generic recovery pause.
+	LadderExhausted bool
+	// Attempts is the number of retries spent before exhaustion.
+	Attempts int
+	// Reason is the FailoverReason the ladder exhausted on; it selects the
+	// §4.3 user-visible case for the terminal text.
+	Reason FailoverReason
 }
 
 // AgentToolTerminalAttemptFinisher durably closes a Task after the worker has

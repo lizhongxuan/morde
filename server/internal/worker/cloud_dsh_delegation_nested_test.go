@@ -10,7 +10,11 @@ import (
 	"morde/server/internal/domain"
 )
 
-func TestCloudDSHNestedDelegateUsesImmediateParentAuthorization(t *testing.T) {
+func TestCloudDSHChildDelegateExceedsDepthLimit(t *testing.T) {
+	// E12: the default subagent depth is 1 layer (direct children of the
+	// root only). A child agent asking for its own child is rejected with
+	// an explicit depth error and no child is created, even though the
+	// child's stored state still carries canDelegate from before the limit.
 	const arguments = `{"title":"Inspect","objective":"Read the project","tool_names":["file_read"]}`
 	fence, root, frame, value := cloudDSHChildCreateFixture(t, arguments, false)
 	identity := root.identity
@@ -28,8 +32,24 @@ func TestCloudDSHNestedDelegateUsesImmediateParentAuthorization(t *testing.T) {
 
 	superseded, err := executor.createCloudDSHChildSession(context.Background(), value, fence, frame, states,
 		[]app.AgentToolDefinition{cloudDSHReadTool()}, writer, nil, nil)
+	if err == nil || superseded || !strings.Contains(err.Error(), "depth limit") {
+		t.Fatalf("nested delegate = superseded %t, err %v, want an explicit depth-limit error", superseded, err)
+	}
+	if children.creates != 0 {
+		t.Fatalf("depth-limited child was created: %d", children.creates)
+	}
+	if len(tools.admissionCalls) != 0 {
+		t.Fatalf("depth-limited delegation reached admission: %+v", tools.admissionCalls)
+	}
+
+	// The limit is configurable: with MaxSubagentDepth 2 the same nested
+	// delegation is admitted again, and the grandchild itself cannot
+	// delegate further.
+	executor = &CloudDSHExecutor{options: CloudDSHExecutorOptions{Tools: tools, Children: children, MaxSubagentDepth: 2}}
+	superseded, err = executor.createCloudDSHChildSession(context.Background(), value, fence, frame, states,
+		[]app.AgentToolDefinition{cloudDSHReadTool()}, writer, nil, nil)
 	if err != nil || superseded {
-		t.Fatalf("nested delegate = superseded %t, err %v", superseded, err)
+		t.Fatalf("nested delegate at depth 2 = superseded %t, err %v", superseded, err)
 	}
 	if children.createCommand.ParentSessionID != identity.SessionID || children.createCommand.SpawnKey != frame.CallID ||
 		children.createCommand.RootCheckpointThroughSequence != 1 {

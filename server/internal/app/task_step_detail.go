@@ -102,6 +102,24 @@ func validCloudDSHToolActivityFence(ctx context.Context, current task.Task, call
 		call.TaskFence.LeaseOwner == current.Lease.Owner && call.TaskFence.LeaseVersion == current.Lease.Version
 }
 
+// taskToolTestFailureReason marks a shell step that ran a test command which
+// failed (non-zero exit or timeout). It is the durable failing-test record
+// the E03 write gate reads; see hasFailingTestRecord.
+const taskToolTestFailureReason = "test_failed"
+
+// taskToolTestPassedReason marks a shell step that ran a test command which
+// passed (exit code 0, no timeout). Together with taskToolTestFailureReason
+// it is the durable test-run record the E07 completion gate reads: a failing
+// run and a later passing run of the same tool call (same request digest)
+// prove the new test turned green. The field name is historical: since E03
+// it doubles as the test-run record, not only as a failure reason.
+const taskToolTestPassedReason = "test_passed"
+
+// taskToolTestSuitePassedReason marks a shell step whose passing run included
+// a full-suite test command (no test-name filter), the second half of the
+// E07 gate. A run that only passes a selected test is stamped test_passed.
+const taskToolTestSuitePassedReason = "test_suite_passed"
+
 func withCloudDSHToolActivity(ctx context.Context, current task.Task, call ModelToolCall, sealer *Sealer) context.Context {
 	if !validCloudDSHToolActivityFence(ctx, current, call) {
 		return ctx
@@ -282,8 +300,18 @@ func taskToolCallProgress(activity cloudDSHToolActivity, step task.Step) (*TaskT
 		progress.FailureReason, progress.Retryable = activity.failureReason, true
 	} else if step.Status == task.StepFailed && activity.failureReason == taskToolExecutionFailureReason && phase == "execute" {
 		progress.FailureReason = activity.failureReason
+		if reason := failingTestFailureReason(activity); reason != "" {
+			progress.FailureReason = reason
+		}
 	} else if step.Status == task.StepFailed && phase == "prepare" {
 		progress.FailureReason, progress.Retryable = "not_dispatched", true
+	} else if step.Status == task.StepSucceeded {
+		// Passing-test record (E07): a succeeded shell run of a test command
+		// is stamped so Complete() can prove the failing reproduction test
+		// turned green and the full suite passed from real shell runs, not
+		// from a model claim. An unparsable run stamps nothing and the gate
+		// fails closed.
+		progress.FailureReason = testPassReason(activity)
 	}
 	if activity.sealer != nil {
 		ciphertext, digest, size, err := sealTaskStepDetail(activity.sealer, activity.current.OwnerID, activity.current.ID, step.ID,

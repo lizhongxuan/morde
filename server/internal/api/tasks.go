@@ -113,6 +113,12 @@ type taskApprovalSnapshotResponse struct {
 	RespondedAt             *time.Time                      `json:"responded_at"`
 	CreatedAt               time.Time                       `json:"created_at"`
 	MediaPreviewOperationID string                          `json:"media_preview_operation_id,omitempty"`
+	// E05 evidence fields; cost pointers are null when unknown, never 0.
+	EvidencePointer      string `json:"evidence_pointer,omitempty"`
+	ThisCostMicros       *int64 `json:"this_cost_micros"`
+	TotalCostMicros      *int64 `json:"total_cost_micros"`
+	TriggerRule          string `json:"trigger_rule,omitempty"`
+	RejectionConsequence string `json:"rejection_consequence,omitempty"`
 }
 
 type taskSummaryResponse struct {
@@ -275,6 +281,13 @@ type taskPendingRequestResponse struct {
 	Disclosures             taskApprovalDisclosuresResponse `json:"disclosures"`
 	ExpiresAt               *time.Time                      `json:"expires_at"`
 	MediaPreviewOperationID string                          `json:"media_preview_operation_id,omitempty"`
+	// E05 evidence fields. EvidencePointer is "step:<step-id>"; cost
+	// pointers are null when no trusted source exists (unknown, never 0).
+	EvidencePointer      string `json:"evidence_pointer,omitempty"`
+	ThisCostMicros       *int64 `json:"this_cost_micros"`
+	TotalCostMicros      *int64 `json:"total_cost_micros"`
+	TriggerRule          string `json:"trigger_rule,omitempty"`
+	RejectionConsequence string `json:"rejection_consequence,omitempty"`
 }
 
 type taskApprovalDisclosureResponse struct {
@@ -408,6 +421,26 @@ func pendingRequestResponseStatus(pending *task.PendingRequest) string {
 		return "expired"
 	}
 	return ""
+}
+
+func validTaskApprovalEvidenceFields(pending *task.PendingRequest) bool {
+	if pending.EvidencePointer != "" {
+		stepID, ok := strings.CutPrefix(pending.EvidencePointer, "step:")
+		if !ok || !domain.ValidStepID(stepID) {
+			return false
+		}
+	}
+	if !task.ValidApprovalTriggerRule(pending.TriggerRule) {
+		return false
+	}
+	if pending.RejectionConsequence != "" && !validTaskText(pending.RejectionConsequence, 512) {
+		return false
+	}
+	if (pending.ThisCostMicros != nil && *pending.ThisCostMicros < 0) ||
+		(pending.TotalCostMicros != nil && *pending.TotalCostMicros < 0) {
+		return false
+	}
+	return true
 }
 
 func validTaskAgentID(value string) bool {
@@ -1094,6 +1127,7 @@ func toTaskApprovalResponse(value app.TaskApproval) (taskApprovalResponse, error
 		value.TaskUpdatedAt.IsZero() || !domain.ValidPendingRequestID(request.ID) || request.TaskID != value.TaskID || request.Version < 1 ||
 		request.Kind != "approval" || (status != "pending" && status != "approved" && status != "rejected" && status != "cancelled" && status != "expired") ||
 		!validTaskText(request.Title, 512) || !validTaskText(request.Object, 512) || !validTaskText(request.Content, 512) || !validTaskText(request.Impact, 512) ||
+		!validTaskApprovalEvidenceFields(&request) ||
 		(request.ExpiresAt != nil && request.ExpiresAt.IsZero()) || (request.RespondedAt != nil && request.RespondedAt.IsZero()) ||
 		(request.MediaPreviewOperationID != "" && !domain.ValidOperationID(request.MediaPreviewOperationID)) {
 		return taskApprovalResponse{}, domain.NewError(domain.CodeInternal, "task approval query returned an invalid request")
@@ -1113,7 +1147,10 @@ func toTaskApprovalResponse(value app.TaskApproval) (taskApprovalResponse, error
 		Approval: taskApprovalSnapshotResponse{ID: request.ID, Version: request.Version, Status: status, Decision: request.Decision,
 			Kind: request.Kind, Title: request.Title, Object: request.Object, Content: request.Content, Impact: request.Impact,
 			Disclosures: unknownTaskApprovalDisclosures(), ExpiresAt: request.ExpiresAt, RespondedAt: request.RespondedAt,
-			CreatedAt: request.CreatedAt, MediaPreviewOperationID: request.MediaPreviewOperationID},
+			CreatedAt: request.CreatedAt, MediaPreviewOperationID: request.MediaPreviewOperationID,
+			EvidencePointer: request.EvidencePointer, ThisCostMicros: request.ThisCostMicros,
+			TotalCostMicros: request.TotalCostMicros, TriggerRule: request.TriggerRule,
+			RejectionConsequence: request.RejectionConsequence},
 	}, nil
 }
 
@@ -1422,6 +1459,7 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 				(pending.ExpiresAt != nil && pending.ExpiresAt.IsZero()) ||
 				(pending.MediaPreviewOperationID != "" && !domain.ValidOperationID(pending.MediaPreviewOperationID)) ||
 				!validTaskText(pending.Title, 512) || !validTaskText(pending.Object, 512) || !validTaskText(pending.Content, 512) || !validTaskText(pending.Impact, 512) ||
+				!validTaskApprovalEvidenceFields(pending) ||
 				!validTaskApprovalDisclosures(disclosures) {
 				return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 			}
@@ -1429,6 +1467,9 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 				ID: pending.ID, Version: pending.Version, Status: pendingStatus, Kind: pending.Kind, Title: pending.Title,
 				Object: pending.Object, Content: pending.Content, Impact: pending.Impact,
 				Disclosures: disclosures, ExpiresAt: pending.ExpiresAt, MediaPreviewOperationID: pending.MediaPreviewOperationID,
+				EvidencePointer: pending.EvidencePointer, ThisCostMicros: pending.ThisCostMicros,
+				TotalCostMicros: pending.TotalCostMicros, TriggerRule: pending.TriggerRule,
+				RejectionConsequence: pending.RejectionConsequence,
 			}
 		}
 	}

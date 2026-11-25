@@ -240,8 +240,9 @@ VALUES ($1,$2,'call:hub-command','morde_hub_command',$3,'command',1,1,1,$4,'prep
 	if err != nil {
 		t.Fatalf("load Task validation facts: %v", err)
 	}
-	if facts.TaskExecution != app.TaskValidationFactPresent || facts.IrreversibleAction != app.TaskValidationFactUnknown {
-		t.Fatalf("Hub operation facts = %+v; want execution present and action unknown", facts)
+	if facts.TaskExecution != app.TaskValidationFactPresent || facts.IrreversibleAction != app.TaskValidationFactAbsent ||
+		facts.RepeatedError != app.TaskValidationFactAbsent {
+		t.Fatalf("Hub operation facts = %+v; want execution present and no irreversible action or repeated error (E09: Hub actions are task-scope governed, not per-call approval actions)", facts)
 	}
 }
 
@@ -283,8 +284,9 @@ func TestPostgresTaskValidationFactsTreatPendingRequestReconciliationAsExecution
 	if err != nil {
 		t.Fatalf("load Task validation facts: %v", err)
 	}
-	if facts.TaskExecution != app.TaskValidationFactPresent || facts.IrreversibleAction != app.TaskValidationFactUnknown {
-		t.Fatalf("pending request reconciliation facts = %+v; want execution present and action unknown", facts)
+	if facts.TaskExecution != app.TaskValidationFactPresent || facts.IrreversibleAction != app.TaskValidationFactAbsent ||
+		facts.RepeatedError != app.TaskValidationFactAbsent {
+		t.Fatalf("pending request reconciliation facts = %+v; want execution present and no irreversible action or repeated error (E09: a reconciliation is not a per-call approval action)", facts)
 	}
 }
 
@@ -1101,5 +1103,119 @@ WHERE workspace_id=$1 AND file_path=$2`, workspaceValue.ID, path); err != nil {
 	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)
 	if err != nil || details.Validation.State != app.TaskValidationPending {
 		t.Fatalf("changed current Workspace file validation = %#v err=%v; want pending", details.Validation, err)
+	}
+}
+
+// TestPostgresTaskValidationFactsResolveWithE09Ledger is the E09
+// acceptance against a real database: a fix task whose ledger holds a
+// failing reproduction test that later passes, a full-suite pass, a
+// repeated error that is corrected, approved shell actions and an
+// answered clarification resolves every server fact, so a supporting
+// review reaches PASS instead of staying pending.
+//
+// It also pins migration 00239: the test stamps (test_failed,
+// test_passed, test_suite_passed) are inserted into
+// task_steps.failure_reason, which migration 00237's check forbade.
+func TestPostgresTaskValidationFactsResolveWithE09Ledger(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 3, 10_000, 20_000)
+	submission := newTestTaskSubmission(t, owner.ID, "", "validation-e09-ledger", "fix the login bug")
+	submission.Task.ExecutionLocation = "server"
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit Task: %v", err)
+	}
+	details, err := store.GetTask(ctx, created.Task.ID, owner.ID)
+	if err != nil || details.Task.CurrentRevision == nil {
+		t.Fatalf("load created Task: %+v err=%v", details.Task, err)
+	}
+	revision := *details.Task.CurrentRevision
+
+	suiteDigest := sha256.Sum256([]byte("shell_exec go test ./..."))
+	targetedDigest := sha256.Sum256([]byte("shell_exec go test -run TestLogin ./..."))
+	insertStep := func(sequence int64, status, toolName, callID, reason string, digest []byte) string {
+		stepID := mustID(t, domain.NewStepID)
+		phase := "execute"
+		if status == string(task.StepSucceeded) {
+			phase = "succeeded"
+		}
+		if _, err := store.pool.Exec(ctx, `INSERT INTO task_steps
+(id,task_id,sequence,kind,status,title,summary,task_revision,tool_call_key,tool_name,request_digest,phase,detail_state,attempt_no,failure_reason,retryable)
+VALUES ($1,$2,$3,'tool',$4,'test step','test step',$5,$6,$7,$8,$9,'available',1,NULLIF($10,''),false)`,
+			stepID, created.Task.ID, sequence, status, revision, callID, toolName, digest, phase, reason); err != nil {
+			t.Fatalf("insert Task step %d: %v", sequence, err)
+		}
+		return stepID
+	}
+	insertStep(1, string(task.StepFailed), "shell_exec", "call-suite-fail", "test_failed", suiteDigest[:])
+	insertStep(2, string(task.StepSucceeded), "shell_exec", "call-suite-pass", "test_suite_passed", suiteDigest[:])
+	insertStep(3, string(task.StepFailed), "shell_exec", "call-targeted-1", "test_failed", targetedDigest[:])
+	insertStep(4, string(task.StepFailed), "shell_exec", "call-targeted-2", "test_failed", targetedDigest[:])
+	insertStep(5, string(task.StepSucceeded), "shell_exec", "call-targeted-pass", "test_passed", targetedDigest[:])
+	readStepID := insertStep(6, string(task.StepSucceeded), "file_read", "call-read", "", nil)
+
+	insertApproval := func(version int64, callID string, digest []byte) {
+		if _, err := store.pool.Exec(ctx, `INSERT INTO task_pending_requests
+(id,task_id,version,kind,title,object,content,impact,call_id,tool_name,request_hash,task_revision,
+ runtime_generation,runtime_instance_id,control_version,status,decision,responded_by_user_id,responded_at)
+VALUES ($1,$2,$3,'approval','Approve shell test','Host shell','Run the test command','The command can change Workspace files',$4,'shell_exec',$5,$6,
+ 0,'test-runtime',0,'approved','approve',$7,clock_timestamp())`,
+			mustID(t, domain.NewPendingRequestID), created.Task.ID, version, callID, digest, revision, owner.ID); err != nil {
+			t.Fatalf("insert approved pending request %s: %v", callID, err)
+		}
+	}
+	insertApproval(1, "call-suite-pass", suiteDigest[:])
+	insertApproval(2, "call-targeted-pass", targetedDigest[:])
+
+	planPayload, err := json.Marshal(appTaskPlanEvent{TaskRevision: revision, PlanRevision: 1,
+		Plan: task.Plan{TaskRevision: revision, Revision: 1, Goal: "Fix the login bug", CostEstimateState: "unknown",
+			Steps:   []task.PlanStep{{ID: "step-1", Title: "Reproduce the bug", Status: task.PlanStepPending}},
+			FixPlan: &task.FixPlan{ChangedFiles: []string{"auth.go"}, Risks: []string{"regression"}, Alternatives: []string{"revert"}}},
+		Detail: struct {
+			CallID         string `json:"call_id"`
+			AgentSessionID string `json:"agent_session_id"`
+		}{CallID: "call-plan-1"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_events (task_id,sequence,event_type,payload)
+VALUES ($1,1,'task.plan',$2)`, created.Task.ID, planPayload); err != nil {
+		t.Fatalf("insert Task plan event: %v", err)
+	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO task_clarification_requests
+(id,task_id,version,model_step_id,call_id,question,status,answer,responded_at)
+VALUES ($1,$2,1,$3,'call-clarify-1','Which login flow is broken?','answered','The password flow.',clock_timestamp())`,
+		mustID(t, domain.NewPendingRequestID), created.Task.ID, readStepID); err != nil {
+		t.Fatalf("insert answered clarification: %v", err)
+	}
+
+	tx, err := store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	facts, err := loadTaskValidationVerdictFacts(ctx, tx,
+		app.TaskValidationReviewClaim{TaskID: created.Task.ID, TaskRevision: revision}, "", nil, app.TaskValidationReviewReport{}, nil)
+	if err != nil {
+		t.Fatalf("load Task validation facts: %v", err)
+	}
+	if facts.TaskExecution != app.TaskValidationFactPresent ||
+		facts.IrreversibleAction != app.TaskValidationFactPresent || !facts.ApprovalHistoryVerified ||
+		facts.RepeatedError != app.TaskValidationFactPresent || !facts.CorrectionRecordVerified ||
+		!facts.ReplayVerified || !facts.ClarificationHistoryKnown {
+		t.Fatalf("E09 ledger facts = %+v; want execution present, approval present+verified, repeated error present+verified, replay verified, clarifications known", facts)
+	}
+
+	// With every server fact resolved, a supporting review reaches PASS.
+	findings := make([]app.TaskValidationReviewFinding, 0, 7)
+	for _, id := range []app.TaskHardCheckID{app.TaskHardCheckConclusionFirst, app.TaskHardCheckEvidence,
+		app.TaskHardCheckIndependent, app.TaskHardCheckClarification, app.TaskHardCheckApproval,
+		app.TaskHardCheckCorrection, app.TaskHardCheckReplay} {
+		findings = append(findings, app.TaskValidationReviewFinding{ID: id, Assessment: app.TaskValidationReviewSupports})
+	}
+	report := app.TaskValidationReviewReport{Recommendation: app.TaskValidationPass, Findings: findings}
+	if got := app.SummarizeTaskValidationEvaluations(app.EvaluateTaskValidationReview(report, facts)); got.State != app.TaskValidationPass {
+		t.Fatalf("E09 ledger verdict = %q, want PASS", got.State)
 	}
 }

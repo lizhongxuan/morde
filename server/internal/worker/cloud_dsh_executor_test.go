@@ -2337,7 +2337,9 @@ func TestCloudDSHExecutorRunsAndSettlesPersistedChildSession(t *testing.T) {
 		len(children.settleCommand.CheckpointDigest) != sha256.Size || children.settleCommand.Summary != "Child result" {
 		t.Fatalf("child lifecycle create=%#v settle=%#v counts=%d/%d", children.createCommand, children.settleCommand, children.creates, children.settles)
 	}
-	expectedChildDefinitions, err := cloudDSHChildDelegationTools([]app.AgentToolDefinition{tool}, true)
+	// E12: the default subagent depth is 1, so a direct child of the root
+	// may not delegate further and its definitions carry no delegate tool.
+	expectedChildDefinitions, err := cloudDSHChildDelegationTools([]app.AgentToolDefinition{tool}, false)
 	if err != nil {
 		t.Fatalf("child coordinator tool definitions: %v", err)
 	}

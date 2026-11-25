@@ -17,8 +17,12 @@ import (
 const cloudDSHTaskPlanToolName = "morde_task_plan_update"
 
 type cloudDSHTaskPlanInput struct {
-	Goal  string          `json:"goal"`
-	Steps []task.PlanStep `json:"steps"`
+	Goal               string          `json:"goal"`
+	Scope              string          `json:"scope,omitempty"`
+	VerificationMethod string          `json:"verification_method,omitempty"`
+	Steps              []task.PlanStep `json:"steps"`
+	// FixPlan is optional: when present it marks the task as a bug fix.
+	FixPlan *task.FixPlan `json:"fix_plan,omitempty"`
 }
 
 type cloudDSHTaskPlanEvent struct {
@@ -42,8 +46,23 @@ type CloudDSHTaskPlanReceiptReader interface {
 
 func cloudDSHTaskPlanDefinition() AgentToolDefinition {
 	return AgentToolDefinition{ModelTool: ModelTool{Name: cloudDSHTaskPlanToolName,
-		Description: "When a complex task has multiple dependent steps, the main Agent should save a plan before doing the work and revise it when the approach changes. Do not call for simple questions. A plan never requests confirmation or expands permissions; cost is always marked unknown unless separately verified by the application.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string","minLength":1,"maxLength":2048},"steps":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":40},"title":{"type":"string","minLength":1,"maxLength":160},"description":{"type":"string","maxLength":1024},"depends_on":{"type":"array","maxItems":8,"items":{"type":"string"}},"outputs":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"completion_criteria":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]}},"required":["id","title","status"],"additionalProperties":false}}},"required":["goal","steps"],"additionalProperties":false}`)}, RequiredScope: identity.ScopeTaskRead}
+		Description: "When a complex task has multiple dependent steps, the main Agent should save a plan before doing the work and revise it when the approach changes. Do not call for simple questions. A plan never requests confirmation or expands permissions; cost is always marked unknown unless separately verified by the application. A submitted plan must carry a complete brief: scope and verification_method are required, and the step completion_criteria together form the acceptance criteria. A plan without them is rejected; complete the missing fields from the task context and resubmit instead of asking the user. An optional fix_plan marks the task as a bug fix: it lists the minimal changed files, risks and alternatives, each at most 8 items of at most 512 characters. A fix_plan may carry an optional root_cause: the located root cause summary with the failing reproduction output (at most 4096 characters) and the code lines it points at (at most 8 workspace-relative path:line references); a root cause without any of the three pieces is rejected. A fix task may only change files after a failing reproduction test has run.",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string","minLength":1,"maxLength":2048},"scope":{"type":"string","maxLength":2048},"verification_method":{"type":"string","maxLength":1024},"fix_plan":{"type":"object","properties":{"changed_files":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"risks":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"alternatives":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"root_cause":{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":1024},"repro_output":{"type":"string","minLength":1,"maxLength":4096},"code_lines":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":512}}},"required":["summary","repro_output","code_lines"],"additionalProperties":false}},"additionalProperties":false},"steps":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":40},"title":{"type":"string","minLength":1,"maxLength":160},"description":{"type":"string","maxLength":1024},"depends_on":{"type":"array","maxItems":8,"items":{"type":"string"}},"outputs":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"completion_criteria":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]}},"required":["id","title","status"],"additionalProperties":false}}},"required":["goal","steps"],"additionalProperties":false}`)}, RequiredScope: identity.ScopeTaskRead}
+}
+
+// requireCompleteTaskPlanBrief is the write gate (E01): a task that already
+// has a submitted plan (revision >= 1) may only mutate the workspace once its
+// brief is complete. Tasks without a plan are unaffected, so simple tasks
+// that never build a plan are never blocked by this gate. The error names the
+// missing brief piece for the agent; it must not surface as a user question.
+func requireCompleteTaskPlanBrief(details TaskDetails) error {
+	if details.Plan == nil || details.Plan.Revision < 1 {
+		return nil
+	}
+	if _, err := task.BriefFromPlan(*details.Plan); err != nil {
+		return domain.InvalidArgument("task_plan.brief", err.Error())
+	}
+	return nil
 }
 
 func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.Task, call ModelToolCall, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
@@ -84,11 +103,12 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 	if err := b.authorizeSkillTask(ctx, current); err != nil {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "task authorization does not allow plan updates")
 	}
-	plan := task.Plan{TaskRevision: *current.CurrentRevision, Goal: input.Goal, CostEstimateState: "unknown", Steps: input.Steps}
+	plan := task.Plan{TaskRevision: *current.CurrentRevision, Goal: input.Goal, Scope: input.Scope,
+		VerificationMethod: input.VerificationMethod, CostEstimateState: "unknown", Steps: input.Steps, FixPlan: input.FixPlan}
 	if recovering && checkpointOutput != nil {
 		var replay task.Plan
 		if decodeStrictRuntimeResult([]byte(*checkpointOutput), &replay) != nil || replay.TaskRevision != plan.TaskRevision || replay.Validate() != nil ||
-			replay.Goal != input.Goal || !reflect.DeepEqual(replay.Steps, input.Steps) {
+			replay.Goal != input.Goal || replay.Scope != input.Scope || replay.VerificationMethod != input.VerificationMethod || !reflect.DeepEqual(replay.Steps, input.Steps) || !reflect.DeepEqual(replay.FixPlan, input.FixPlan) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed task plan does not match its original call")
 		}
 		plan = replay
@@ -99,6 +119,12 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 	}
 	if plan.Revision < 1 || plan.Validate() != nil {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh task plan is invalid or has a dependency cycle")
+	}
+	// Plan submission gate (E01): once a plan is submitted it must carry a
+	// complete brief. The rejection names the missing piece so the agent can
+	// complete it from context and resubmit; it never asks the user.
+	if _, err := task.BriefFromPlan(plan); err != nil {
+		return AgentToolResult{}, domain.InvalidArgument("task_plan.brief", err.Error())
 	}
 	output, err := json.Marshal(plan)
 	if err != nil || len(output) > 48<<10 {
@@ -119,7 +145,8 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 		if err != nil && domain.CodeOf(err) != domain.CodeNotFound {
 			return AgentToolResult{}, err
 		}
-		if err == nil && (stored.Validate() != nil || stored.TaskRevision != plan.TaskRevision || stored.Goal != input.Goal || !reflect.DeepEqual(stored.Steps, input.Steps)) {
+		if err == nil && (stored.Validate() != nil || stored.TaskRevision != plan.TaskRevision || stored.Goal != input.Goal ||
+			stored.Scope != input.Scope || stored.VerificationMethod != input.VerificationMethod || !reflect.DeepEqual(stored.Steps, input.Steps) || !reflect.DeepEqual(stored.FixPlan, input.FixPlan)) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "stored task plan replay receipt is invalid")
 		}
 		if err == nil {

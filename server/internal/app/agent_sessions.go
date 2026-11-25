@@ -14,6 +14,15 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+// DefaultMaxSubagentDepth bounds subagent delegation: the root agent may
+// spawn direct children, but a child may not spawn its own child (depth is
+// counted in delegation hops from the root; the root is 0). This is the E12
+// default of 1 layer. Raise it only through CloudDSHExecutorOptions
+// (MaxSubagentDepth); the limit is enforced at the single child-creation
+// point and a deeper delegation is rejected with an explicit error, never
+// silently dropped.
+const DefaultMaxSubagentDepth = 1
+
 type AgentChildSession struct {
 	TaskID                        string
 	SessionID                     string

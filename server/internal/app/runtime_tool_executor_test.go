@@ -2805,7 +2805,7 @@ func (f *runtimeToolExecutorFixture) prepared(name, arguments string, scope iden
 		if hashErr != nil {
 			panic(hashErr)
 		}
-		pending, pendingErr := newPendingApproval(request.Task, request.Call, hash[:], preparation.Approval, preparation.Fence, 1)
+		pending, pendingErr := newPendingApproval(request.Task, request.Call, hash[:], preparation, 1)
 		if pendingErr != nil {
 			panic(pendingErr)
 		}
@@ -2841,9 +2841,12 @@ func TestRuntimeToolExecutorRejectsExpiredApprovalFromCurrentTaskSnapshot(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	pending, err := newPendingApproval(request.Task, request.Call, hash[:], AgentApprovalRequest{
-		Object: "reports/result.txt", Content: "Write this file?", Impact: "The authorized Workspace will change.",
-	}, request.Fence, 1)
+	pending, err := newPendingApproval(request.Task, request.Call, hash[:], AgentToolPreparation{
+		Approval: AgentApprovalRequest{
+			Object: "reports/result.txt", Content: "Write this file?", Impact: "The authorized Workspace will change.",
+		},
+		Fence: request.Fence,
+	}, 1)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -1388,12 +1388,14 @@ func TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits(t *testing
 		name                string
 		err                 error
 		wantDelay           time.Duration
+		wantDelayLow        time.Duration
+		wantDelayHigh       time.Duration
 		wantHandler         bool
 		cancelAfterClassify bool
 	}{
 		{name: "provider retry after", err: providerRateLimit(1500 * time.Millisecond), wantDelay: 2 * time.Second, wantHandler: true},
 		{name: "worker context cancelled after confirmed rejection", err: providerRateLimit(1500 * time.Millisecond), wantDelay: 2 * time.Second, wantHandler: true, cancelAfterClassify: true},
-		{name: "bounded fallback", err: providerRateLimit(0), wantDelay: time.Second, wantHandler: true},
+		{name: "bounded fallback", err: providerRateLimit(0), wantDelayLow: 5 * time.Second, wantDelayHigh: 8 * time.Second, wantHandler: true},
 		{name: "long provider retry after", err: providerRateLimit(5 * time.Minute), wantDelay: 5 * time.Minute, wantHandler: true},
 		{name: "provider retry after at durable horizon", err: providerRateLimit(24 * time.Hour), wantDelay: 24 * time.Hour, wantHandler: true},
 		{name: "provider retry after beyond durable horizon ends route", err: providerRateLimit(48 * time.Hour), wantDelay: 0, wantHandler: true},
@@ -1414,7 +1416,11 @@ func TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits(t *testing
 				t.Fatalf("rate-limited route processing: found=%t err=%v", found, err)
 			}
 			if test.wantHandler {
-				if stub.rateLimitHandleCalls != 1 || stub.rateLimitRetryDelay != test.wantDelay || len(stub.failures) != 0 || stub.rateLimitContextErr != nil {
+				delayOK := stub.rateLimitRetryDelay == test.wantDelay
+				if test.wantDelayLow != 0 {
+					delayOK = stub.rateLimitRetryDelay >= test.wantDelayLow && stub.rateLimitRetryDelay <= test.wantDelayHigh
+				}
+				if stub.rateLimitHandleCalls != 1 || !delayOK || len(stub.failures) != 0 || stub.rateLimitContextErr != nil {
 					t.Fatalf("rate-limit handling calls=%d delay=%s recovery_ctx_err=%v failures=%v, want one handling with delay %s and a live recovery context",
 						stub.rateLimitHandleCalls, stub.rateLimitRetryDelay, stub.rateLimitContextErr, stub.failures, test.wantDelay)
 				}
@@ -1422,6 +1428,54 @@ func TestConversationRouteWorkerHandlesOnlyConfirmedBoundedRateLimits(t *testing
 				t.Fatalf("unconfirmed rate limit was not clarified: calls=%d failures=%v applied=%+v", stub.rateLimitHandleCalls, stub.failures, stub.applied)
 			}
 		})
+	}
+}
+
+func TestConversationRouteRateLimitDelayUsesRetryLadder(t *testing.T) {
+	providerRateLimit := func(delay time.Duration) *domain.Error {
+		err := domain.NewError(domain.CodeRateLimited, "provider rate limited")
+		err.Details["reason"] = string(app.ModelErrorRateLimited)
+		err.Details["stage"] = "provider_status"
+		err.RetryAfter = delay
+		if delay > 24*time.Hour {
+			err.Details["retry_after_exceeds_durable_horizon"] = "true"
+		}
+		return err
+	}
+	claim := func(attempt int64) app.ConversationRouteClaim {
+		return app.ConversationRouteClaim{RouteAttempt: attempt}
+	}
+	if delay, ok := conversationRouteRateLimitDelay(claim(0), providerRateLimit(90*time.Second)); !ok || delay != 90*time.Second {
+		t.Fatalf("Retry-After 90s delay = %v, %t, want 90s", delay, ok)
+	}
+	if delay, ok := conversationRouteRateLimitDelay(claim(0), providerRateLimit(1500*time.Millisecond)); !ok || delay != 2*time.Second {
+		t.Fatalf("Retry-After 1500ms delay = %v, %t, want 2s (rounded up)", delay, ok)
+	}
+	if delay, ok := conversationRouteRateLimitDelay(claim(0), providerRateLimit(48*time.Hour)); !ok || delay != 0 {
+		t.Fatalf("over-horizon Retry-After delay = %v, %t, want (0, true) to end the attempt", delay, ok)
+	}
+	// No Retry-After: first ladder step is the jittered 5s base (5-8s after
+	// whole-second rounding), not the old fixed 1s.
+	if delay, ok := conversationRouteRateLimitDelay(claim(0), providerRateLimit(0)); !ok || delay < 5*time.Second || delay > 8*time.Second {
+		t.Fatalf("first ladder delay = %v, %t, want 5s-8s", delay, ok)
+	}
+	// Second step doubles the base (10-15s, rounded up to 10-16s).
+	if delay, ok := conversationRouteRateLimitDelay(claim(1), providerRateLimit(0)); !ok || delay < 10*time.Second || delay > 16*time.Second {
+		t.Fatalf("second ladder delay = %v, %t, want 10s-16s", delay, ok)
+	}
+	// Past the three-retry budget the route ends instead of requeueing.
+	if delay, ok := conversationRouteRateLimitDelay(claim(3), providerRateLimit(0)); !ok || delay != 0 {
+		t.Fatalf("spent ladder delay = %v, %t, want (0, true)", delay, ok)
+	}
+	// Anything but a confirmed provider 429 is not a ladder retry.
+	if _, ok := conversationRouteRateLimitDelay(claim(0), domain.NewError(domain.CodeRateLimited, "rate limited")); ok {
+		t.Fatal("unconfirmed rate limit was treated as a ladder retry")
+	}
+	timeout := domain.NewError(domain.CodeUpstreamTimeout, "model connection check failed")
+	timeout.Details["reason"] = string(app.ModelErrorTimeout)
+	timeout.Details["stage"] = "provider_status"
+	if _, ok := conversationRouteRateLimitDelay(claim(0), timeout); ok {
+		t.Fatal("provider timeout was treated as a rate-limit ladder retry")
 	}
 }
 

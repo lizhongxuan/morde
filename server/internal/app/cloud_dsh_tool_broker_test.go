@@ -2189,6 +2189,36 @@ func TestCloudDSHToolBrokerExplainsInterruptedStream(t *testing.T) {
 	}
 }
 
+func TestCloudDSHToolBrokerLadderExhaustionPausesWithTerminalText(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.PauseModelRecoveryAfterLadderExhaustion(context.Background(), store.details.Task, FailoverTimeout, ModelRetryMaxRetries); err != nil {
+		t.Fatal(err)
+	}
+	if len(store.details.Steps) != 1 || !strings.Contains(store.details.Steps[0].Summary, "已重试 3 次") ||
+		strings.Contains(store.details.Steps[0].Summary, "timeout") || store.details.Task.Status != task.StatusWaitingUser ||
+		store.details.Task.WaitingReason != "model_retry_ladder_exhausted" {
+		t.Fatalf("missing ladder-exhausted terminal: task=%+v steps=%+v", store.details.Task, store.details.Steps)
+	}
+	var terminalEvent struct {
+		Detail map[string]any `json:"detail"`
+	}
+	if err := json.Unmarshal(store.events[0].Payload, &terminalEvent); err != nil || terminalEvent.Detail["ladder_exhausted"] != true ||
+		terminalEvent.Detail["retry_attempts"] != float64(ModelRetryMaxRetries) || terminalEvent.Detail["failover_reason"] != string(FailoverTimeout) {
+		t.Fatalf("ladder-exhausted event detail = %+v, err=%v", terminalEvent, err)
+	}
+	// A policy refusal ends the ladder with the §4.3 case-3 text, and an
+	// unknown reason cannot end a ladder at all.
+	if err := broker.PauseModelRecoveryAfterLadderExhaustion(context.Background(), store.details.Task, FailoverReason("not_a_reason"), 1); err == nil {
+		t.Fatal("unknown failover reason was accepted as a ladder terminal")
+	}
+}
+
 func TestCloudDSHToolBrokerCompletesHostlessTaskWithMatchingCheckpoint(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}

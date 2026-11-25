@@ -78,6 +78,10 @@ GROUP BY tasks.host_id;
 SELECT pending.id, pending.task_id, pending.version, pending.kind, pending.title, pending.object,
        pending.content, pending.impact, COALESCE(pending.media_preview_operation_id, '') AS media_preview_operation_id,
        pending.status, pending.decision, pending.created_at, pending.expires_at, pending.responded_at,
+       COALESCE(pending.evidence_pointer, '') AS evidence_pointer,
+       pending.this_cost_micros, pending.total_cost_micros,
+       COALESCE(pending.trigger_rule, '') AS trigger_rule,
+       COALESCE(pending.rejection_consequence, '') AS rejection_consequence,
        tasks.conversation_id, COALESCE(tasks.project_id, '') AS project_id, COALESCE(tasks.host_id, '') AS host_id,
        tasks.status AS task_status, tasks.event_seq AS task_event_seq, tasks.updated_at AS task_updated_at
 FROM task_pending_requests pending

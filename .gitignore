@@ -1,4 +1,6 @@
 .local/
+# P0 smoke gate run record (E10): evidence of the last local run, not source.
+deploy/single/smoke-record.json
 web/portal/public/downloads/
 .idea
 /runtime/morde-runtime/.tmp-t21-shell/

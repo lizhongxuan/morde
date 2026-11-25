@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"math"
 	"time"
 
 	"morde/server/internal/domain/conversation"
@@ -132,6 +133,27 @@ type TaskDetails struct {
 type TaskBilling struct {
 	ModelCalls int64
 	Costs      []TaskCostSummary
+}
+
+// TaskBillingTotalActualMicros sums the settled actual cost of a task in
+// micro-units. It returns nil when the total is not trustworthy: no billing,
+// no cost entries, any entry without a settled actual amount, a negative
+// amount, or an overflowing sum. Callers render nil as unknown, never as 0.
+func TaskBillingTotalActualMicros(billing *TaskBilling) *int64 {
+	if billing == nil || len(billing.Costs) == 0 {
+		return nil
+	}
+	var total int64
+	for _, cost := range billing.Costs {
+		if cost.ActualMicros == nil || *cost.ActualMicros < 0 {
+			return nil
+		}
+		if total > math.MaxInt64-*cost.ActualMicros {
+			return nil
+		}
+		total += *cost.ActualMicros
+	}
+	return &total
 }
 
 type TaskCostSummary struct {

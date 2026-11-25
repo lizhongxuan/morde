@@ -3,6 +3,8 @@ package task
 import (
 	"errors"
 	"time"
+
+	"morde/server/internal/domain"
 )
 
 type Status string
@@ -476,6 +478,13 @@ type ClarificationRequest struct {
 // PendingRequest is an immutable, versioned user approval bound to one exact
 // Agent tool call and Host control fence. RequestHash is internal and omitted
 // from API responses.
+//
+// Evidence fields (E05): EvidencePointer names the in-task step whose
+// command and output justify the action ("step:<step-id>"); ThisCostMicros
+// and TotalCostMicros are micro-units of the task's cost, nil when no trusted
+// source exists (never 0 as a fabricated placeholder); TriggerRule names the
+// action-matrix category that required approval; RejectionConsequence states
+// in plain text what happens if the user rejects.
 type PendingRequest struct {
 	ID      string
 	TaskID  string
@@ -500,6 +509,61 @@ type PendingRequest struct {
 	CreatedAt               time.Time
 	ExpiresAt               *time.Time
 	RespondedAt             *time.Time
+	// EvidencePointer is "step:<step-id>" of the step whose evidence justifies
+	// the action, or "" when no step is attached (legacy rows).
+	EvidencePointer string
+	// ThisCostMicros is the trusted cost of this exact action in micro-units,
+	// or nil when no trusted per-action cost source exists. There is no such
+	// source today: tool calls carry no price declaration, so this is nil at
+	// creation and the API renders it unknown.
+	ThisCostMicros *int64
+	// TotalCostMicros is the trusted cumulative cost of the task in
+	// micro-units at the moment the card was created, or nil when any cost
+	// component is unknown. It is a snapshot, not a live total.
+	TotalCostMicros *int64
+	// TriggerRule names the action-matrix category that required approval,
+	// or "" for legacy rows. See ApprovalTrigger* constants.
+	TriggerRule string
+	// RejectionConsequence states what happens if the user rejects, or ""
+	// when the approval text did not state one (legacy rows).
+	RejectionConsequence string
+}
+
+// Approval trigger rules: the action-matrix categories (TODO 05 M05-05)
+// that require a per-action approval card.
+const (
+	// ApprovalTriggerHostSensitiveTool is a sensitive Host tool: shell,
+	// browser/desktop input, Enter/Backspace/Delete, or an unknown tool.
+	ApprovalTriggerHostSensitiveTool = "host_sensitive_tool"
+	// ApprovalTriggerExternalMCPTool is an external MCP tool call.
+	ApprovalTriggerExternalMCPTool = "external_mcp_tool"
+	// ApprovalTriggerWorkspaceLiveWrite is a live Workspace file write.
+	ApprovalTriggerWorkspaceLiveWrite = "workspace_live_write"
+	// ApprovalTriggerMediaPublish is a media publish action. Reserved for
+	// the publish path when it mints its own card; no creation site uses it
+	// yet (publish approvals currently reuse the Workspace write path).
+	ApprovalTriggerMediaPublish = "media_publish"
+)
+
+// ValidApprovalTriggerRule reports whether value is an empty (legacy) or a
+// known approval trigger rule.
+func ValidApprovalTriggerRule(value string) bool {
+	switch value {
+	case "", ApprovalTriggerHostSensitiveTool, ApprovalTriggerExternalMCPTool,
+		ApprovalTriggerWorkspaceLiveWrite, ApprovalTriggerMediaPublish:
+		return true
+	default:
+		return false
+	}
+}
+
+// EvidencePointerForStep returns the evidence pointer for a step, or "" when
+// the step ID is invalid. The second result reports validity.
+func EvidencePointerForStep(stepID string) (string, bool) {
+	if !domain.ValidStepID(stepID) {
+		return "", false
+	}
+	return "step:" + stepID, true
 }
 
 // StopRequest is the durable task-level request that prevents new operations
