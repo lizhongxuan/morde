@@ -3,7 +3,7 @@ import { once } from 'node:events'
 import { LlmError, textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import {
   coordinatorCompactionModelCallID, coordinatorModelCallID, MODEL_FAILURE_SUMMARIES, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS,
-  taskValidationReviewModelCallID, validLateChildTools, validMessageDelivery,
+  taskValidationReviewModelCallID, validDelegateSelection, validLateChildTools, validMessageDelivery,
 } from './engine.mjs'
 
 export const MAX_FRAME_BYTES = 4 * 1024 * 1024
@@ -765,10 +765,10 @@ export class WorkerIPC {
     if (this.cancelled) throw abortError()
     const key = childPendingKey('child_session', identity?.session_id, callID)
     if (!Number.isSafeInteger(through) || through < 0 || typeof callID !== 'string' || !callID ||
-        Buffer.byteLength(callID) > 256 || !isObject(args) ||
-        !['objective,title,tool_names', 'objective,run_in_background,title,tool_names'].includes(Object.keys(args).sort().join(',')) ||
+        Buffer.byteLength(callID) > 256 || !validDelegateSelection(args) ||
         typeof args.title !== 'string' || !args.title.trim() || Buffer.byteLength(args.title) > MAX_DELEGATE_TITLE_BYTES ||
         typeof args.objective !== 'string' || !args.objective.trim() || Buffer.byteLength(args.objective) > MAX_DELEGATE_OBJECTIVE_BYTES ||
+        (Object.hasOwn(args, 'run_in_background') && typeof args.run_in_background !== 'boolean') ||
         !Array.isArray(args.tool_names) || args.tool_names.length > 64 ||
         args.tool_names.some(name => typeof name !== 'string' || !TOOL_NAME.test(name)) ||
         new Set(args.tool_names).size !== args.tool_names.length || this.childPending.has(key)) {

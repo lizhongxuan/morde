@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import {
-  ENGINE_VERSION, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, validLateChildTools, validMessageDelivery, validStart,
+  ENGINE_VERSION, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, validDelegateSelection, validLateChildTools, validMessageDelivery, validStart,
 } from './engine.mjs'
 import { decodeToolImages, MAX_FRAME_BYTES } from './ipc.mjs'
 
@@ -182,8 +182,7 @@ function pendingTaskResponse(frame, task) {
     pending.from = frame.from_seq
   } else if (frame.type === 'child_create') {
     const args = frame.arguments
-    if (!args || typeof args !== 'object' || Array.isArray(args) ||
-        !['objective,title,tool_names', 'objective,run_in_background,title,tool_names'].includes(Object.keys(args).sort().join(',')) ||
+    if (!validDelegateSelection(args) ||
         typeof args.title !== 'string' || !args.title.trim() || Buffer.byteLength(args.title) > 256 ||
         typeof args.objective !== 'string' || !args.objective.trim() || Buffer.byteLength(args.objective) > MAX_DELEGATE_OBJECTIVE_BYTES ||
         (Object.hasOwn(args, 'run_in_background') && typeof args.run_in_background !== 'boolean') ||

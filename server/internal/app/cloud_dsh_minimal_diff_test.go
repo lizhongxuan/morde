@@ -111,12 +111,14 @@ func TestMinimalDiffHostFileWriteGate(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			result, err := broker.Execute(context.Background(), current, minimalDiffHostWriteCall(current, "file-write-minimal-1", test.path))
+			call := minimalDiffHostWriteCall(current, "file-write-minimal-1", test.path)
+			call = setCloudDSHPlanStepMetadataForTest(t, call, "repro", &test.plan.Revision)
+			result, err := broker.Execute(context.Background(), current, call)
 			if test.wantAllow {
 				// The fixture has no file-write handler, so the call fails at
 				// a later stage; the assertion is that neither the
 				// failing-test gate nor the minimal-diff gate fired.
-				if err != nil && (strings.Contains(err.Error(), "failing reproduction test") || strings.Contains(err.Error(), "fix_plan.changed_files")) {
+				if err != nil && (strings.Contains(err.Error(), "failing reproduction test") || strings.Contains(err.Error(), "fix_plan.changed_files") || strings.Contains(err.Error(), "plan step metadata")) {
 					t.Fatalf("in-scope host file write was rejected by a write gate: err=%v", err)
 				}
 				return

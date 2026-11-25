@@ -13,6 +13,26 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+func TestCloudDSHMCPApprovalCarriesEvidenceFields(t *testing.T) {
+	_, store, _, broker, claimed, _ := newCloudDSHMCPApprovalFixture(t)
+	arguments := `{"to":"demo@example.test","body":"synthetic approval test","api_token":"synthetic-test-token"}`
+	call := selectedMCPCallForTest(t, "mcp-approval-evidence", "k1234567", "send_email", arguments)
+	result, err := broker.Execute(context.Background(), claimed, call)
+	pending := store.details.PendingRequest
+	if err != nil || result.Status != AgentToolNeedsUser || pending == nil {
+		t.Fatalf("external call before approval = %#v err=%v pending=%#v", result, err, pending)
+	}
+	if pending.TriggerRule != task.ApprovalTriggerExternalMCPTool || pending.RejectionConsequence == "" {
+		t.Fatalf("MCP approval trigger or rejection consequence missing: %#v", pending)
+	}
+	if !strings.HasPrefix(pending.EvidencePointer, "step:") {
+		t.Fatalf("MCP approval evidence pointer = %q, want a step: pointer", pending.EvidencePointer)
+	}
+	if pending.ThisCostMicros != nil || pending.TotalCostMicros != nil {
+		t.Fatalf("MCP approval costs must stay unknown (nil), got current=%+v total=%+v", pending.ThisCostMicros, pending.TotalCostMicros)
+	}
+}
+
 func TestCloudDSHMCPExternalCallWaitsForExactApproval(t *testing.T) {
 	_, store, client, broker, claimed, aliases := newCloudDSHMCPApprovalFixture(t)
 	arguments := `{"to":"demo@example.test","body":"synthetic approval test","api_token":"synthetic-test-token"}`

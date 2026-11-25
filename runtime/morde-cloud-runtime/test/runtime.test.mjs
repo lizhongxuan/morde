@@ -10,7 +10,7 @@ import test from 'node:test'
 import { AccountRuntime, workspaceWorkingDirectory } from '../src/account-runtime.mjs'
 import {
   coordinatorCompactionModelCallID, coordinatorModelCallID, DurableSession, ENGINE_VERSION, modelCallID,
-  TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, runAgent, taskValidationReviewModelCallID, validMessageDelivery, validStart,
+  TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, runAgent, taskValidationReviewModelCallID, validDelegateSelection, validMessageDelivery, validStart,
 } from '../src/engine.mjs'
 import { WorkerIPC } from '../src/ipc.mjs'
 
@@ -372,6 +372,40 @@ const delegateTool = {
     additionalProperties: false,
   },
 }
+const planDelegateTool = {
+  ...delegateTool,
+  parameters: {
+    ...delegateTool.parameters,
+    properties: {
+      ...delegateTool.parameters.properties,
+      morde_plan_step_id: { type: 'string', minLength: 1, maxLength: 40 },
+      morde_plan_revision: { type: 'integer', minimum: 1 },
+    },
+  },
+}
+
+test('task start accepts only paired delegate plan selector schemas', () => {
+  assert.equal(validStart({ ...start, tools: [delegateTool, fileReadTool] }), true)
+  assert.equal(validStart({ ...start, tools: [planDelegateTool, fileReadTool] }), true)
+  const partial = structuredClone(planDelegateTool)
+  delete partial.parameters.properties.morde_plan_revision
+  assert.equal(validStart({ ...start, tools: [partial, fileReadTool] }), false)
+  const invalid = structuredClone(planDelegateTool)
+  invalid.parameters.properties.morde_plan_revision.minimum = 0
+  assert.equal(validStart({ ...start, tools: [invalid, fileReadTool] }), false)
+})
+
+test('delegate plan selector values must be a valid pair', () => {
+  const args = { title: 'Read', objective: 'Read source', tool_names: ['file_read'] }
+  assert.equal(validDelegateSelection(args), true)
+  assert.equal(validDelegateSelection({ ...args, morde_plan_step_id: 'step_1', morde_plan_revision: 3 }), true)
+  assert.equal(validDelegateSelection({ ...args, morde_plan_step_id: 'step_1' }), false)
+  assert.equal(validDelegateSelection({ ...args, morde_plan_revision: 3 }), false)
+  assert.equal(validDelegateSelection({ ...args, morde_plan_step_id: '../bad', morde_plan_revision: 3 }), false)
+  assert.equal(validDelegateSelection({ ...args, morde_plan_step_id: 'step_1', morde_plan_revision: 0 }), false)
+  assert.equal(validDelegateSelection({ ...args, morde_plan_step_id: 'step_1', morde_plan_revision: 1.5 }), false)
+  assert.equal(validDelegateSelection({ ...args, unexpected: true }), false)
+})
 const jobListTool = {
   name: 'dsh_job_list', description: 'List this task\'s delegated background jobs.',
   parameters: { type: 'object', properties: {}, required: [], additionalProperties: false },
@@ -3548,9 +3582,10 @@ test('rejects a tool call attempted by a zero-tool child session', async () => {
   assert.equal(frames.filter(frame => frame.type === 'settled').at(-1)?.state, 'completed_candidate')
 })
 
-test('runs dsh_delegate in an isolated child session and waits for settlement before resuming the parent', async () => {
+for (const withPlanSelectors of [false, true]) test(`runs dsh_delegate in an isolated child session and waits for settlement before resuming the parent (plan selectors: ${withPlanSelectors})`, async () => {
   const fileRead = fileReadTool
-  const delegate = delegateTool
+  const delegate = withPlanSelectors ? planDelegateTool : delegateTool
+  const selection = withPlanSelectors ? { morde_plan_step_id: 'repro', morde_plan_revision: 2 } : {}
   const childIdentity = {
     task_id: start.task_id, owner_id: start.owner_id, agent_id: start.agent_id,
     generation: start.generation, authorization_version: start.authorization_version,
@@ -3582,7 +3617,7 @@ test('runs dsh_delegate in an isolated child session and waits for settlement be
         if (parentModels === 1) {
           const chunks = [
             { type: 'tool-call-delta', index: 0, id: 'call_delegate_1', name: delegate.name,
-              argumentsDelta: '{"title":"Inspect notes","objective":"Read notes.txt and summarize it.","tool_names":["file_read"]}' },
+              argumentsDelta: JSON.stringify({ title: 'Inspect notes', objective: 'Read notes.txt and summarize it.', tool_names: ['file_read'], ...selection }) },
             { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
             { type: 'finish', reason: { kind: 'tool-calls' } },
           ]
@@ -3632,7 +3667,7 @@ test('runs dsh_delegate in an isolated child session and waits for settlement be
       assert.equal(frame.session_id, start.session_id)
       assert.equal(frame.call_id, 'call_delegate_1')
       assert.equal(frame.through_seq, throughBySession.get(start.session_id))
-      assert.deepEqual(frame.arguments, { title: 'Inspect notes', objective: 'Read notes.txt and summarize it.', tool_names: ['file_read'] })
+      assert.deepEqual(frame.arguments, { title: 'Inspect notes', objective: 'Read notes.txt and summarize it.', tool_names: ['file_read'], ...selection })
       send(proc, {
         type: 'child_session', call_id: frame.call_id, ...childIdentity,
         parent_session_id: frame.session_id, objective: frame.arguments.objective,

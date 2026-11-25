@@ -1,5 +1,13 @@
 # Morde Harness 最终流程测试用例
 
+## release-muse 合并冲突与跨层回归（2026-11-25）
+
+- **合并取舍：**以 `release` 的 `47c5da30` 及 Muse 目标设计为基线，处理 `release-muse` 的 `5fedbcd9`。保留目标分支已经实施的 E01–E12/P3 后续修正；旧分支的失败验证整批不交付、未知已派发调用直接重放等与目标不符的行为不引入。历史分支记录仅供追溯，不作为当前合同。
+- **本次修复：**服务端下发的 `dsh_delegate` 带计划步骤和修订字段时，Runtime 原来会拒绝启动。现覆盖旧无 selector 格式及新格式的模型、IPC 和账户 Runtime 链路；成对且有效的 selector 交由服务端继续校验授权和依赖。按锁定的 `sqlc` 版本更新原本过期的生成结果，并调整批量查询列顺序以保持现有映射类型。
+- **自动化：**Runtime `npm test` 252 项通过；隔离暂存快照的服务端 `make test` 通过（在更新 sqlc 生成文件前），随后最终 SQL 方案的 `go test ./... -run '^$'` 编译通过；本地 PostgreSQL 的计划步骤、子任务、事件链、验证、交付与批量任务定向回归通过。离线使用本地缓存完成 `make generate`，再次生成结果一致。测试均未上传或发送文件。
+- **其他检查与限制：**`make cover` 通过，总语句覆盖率 45.0%（未包含完整 PostgreSQL 集成覆盖）；首轮隔离副本缺资源的用例在补齐后通过。全量 `make race` 首轮有两项模型启动等待超时，降载后这两项和完整 `make race` 均通过。`make lint` 按 v2.15.0 报 38 项，所涉文件在暂存合并相对 `47c5da30` 均无修改。全量 PostgreSQL `make it` 因测试规模及耗时中止，定向通过不代表全量通过。
+- **验收边界：**上述测试使用本地隔离数据及模型 fixture；未运行真实 PC + 真实模型端到端验收，不能据此宣称整体 Muse 体验已完成。
+
 > **D-01 当前复验（2026-11-25）：**安全失败回送、R20 source consumer、budgeted ModelGateway、持久 facts/fallback 和原会话原子发布已实现，App/Worker 与 loopback PostgreSQL 定向回归通过。源码 `morde-pc` 可见提交的合成失败恢复消息，但未显示 Agent 回复或进度，因此真实 PC/DSH 验收未通过；D01-5 H07 仍 pending。详细证据见本文件末尾[当前 D-01 实现与验收记录](#d01-implementation-validation-20261125)。
 
 <a id="merge-route-correction-20261125"></a>

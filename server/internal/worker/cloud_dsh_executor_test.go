@@ -2385,10 +2385,11 @@ func TestCloudDSHExecutorRunsAndSettlesPersistedChildSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("child coordinator tool definitions: %v", err)
 	}
+	expectedChildDefinitions = cloudDSHAddPlanSelectorsToDelegate(expectedChildDefinitions)
 	if len(models.calls) != 4 || models.calls[1].Task == nil || models.calls[1].Task.AgentSessionID != "child_test" ||
 		models.calls[1].Task.AgentRootSessionID != rootSessionID || models.calls[1].Task.TaskID != value.ID ||
 		!validCloudDSHModelRequest(models.calls[1].RawRequest, value.ModelID, expectedChildDefinitions) {
-		t.Fatalf("child model call was not scoped to its persisted Session: %#v", models.calls)
+		t.Fatalf("child model call was not scoped to its persisted Session; model calls=%d", len(models.calls))
 	}
 	if len(tools.calls) != 1 || !strings.HasPrefix(tools.calls[0].CallID, "dsh_") {
 		t.Fatalf("child tool call was not namespaced to its Session: %#v", tools.calls)
@@ -2414,6 +2415,28 @@ func TestCloudDSHExecutorRunsAndSettlesPersistedChildSession(t *testing.T) {
 	}
 	if !foundChildCheckpoint {
 		t.Fatal("child checkpoint was not bound to its root Agent Session")
+	}
+}
+
+func TestCloudDSHExecutorPreservesDelegatedPlanSelection(t *testing.T) {
+	executor, _, _, _, models, value := cloudDSHFixture(t)
+	tool := cloudDSHReadTool()
+	children := &cloudDSHTestChildSessions{}
+	executor.options.Tools = &cloudDSHTestTools{definitions: []app.AgentToolDefinition{tool}}
+	executor.options.Children = children
+	models.responses = []app.ModelResponse{
+		{ToolCalls: []app.ModelToolCall{{CallID: "delegate_plan_1", Name: cloudDSHDelegateToolName,
+			Arguments: `{"title":"Inspect","objective":"Read the source.","tool_names":["file_read"],"morde_plan_step_id":"inspect","morde_plan_revision":3}`}},
+			StopReason: "tool_calls", Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 2}},
+		{Text: "Child result", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 1}},
+		{Text: "Parent result", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 4, OutputTokens: 1}},
+	}
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("child Agent result = %v", err)
+	}
+	if children.creates != 1 || children.settles != 1 || children.createCommand.PlanStepID != "inspect" ||
+		children.createCommand.PlanRevision != 3 || bytes.Contains(children.createCommand.Arguments, []byte("morde_plan_")) {
+		t.Fatalf("delegated plan selection was not preserved separately: %#v", children.createCommand)
 	}
 }
 

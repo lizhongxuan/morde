@@ -576,18 +576,37 @@ function validDelegateTool(tool) {
   if (!tool || tool.name !== DELEGATE_TOOL || !validToolDefinition(tool)) return false
   const schema = tool.parameters
   const properties = schema.properties
+  const keys = Object.keys(properties).sort().join(',')
+  const legacy = keys === 'objective,run_in_background,title,tool_names'
+  const withPlan = keys === 'morde_plan_revision,morde_plan_step_id,objective,run_in_background,title,tool_names' &&
+    properties.morde_plan_step_id?.type === 'string' && properties.morde_plan_step_id.minLength === 1 &&
+    properties.morde_plan_step_id.maxLength === 40 && properties.morde_plan_revision?.type === 'integer' &&
+    properties.morde_plan_revision.minimum === 1
   return schema.additionalProperties === false &&
     Array.isArray(schema.required) && schema.required.length === 3 &&
     ['title', 'objective', 'tool_names'].every(name => schema.required.includes(name)) &&
-    Object.keys(properties).sort().join(',') === 'objective,run_in_background,title,tool_names' &&
+    (legacy || withPlan) &&
     properties.title?.type === 'string' && properties.objective?.type === 'string' &&
     properties.run_in_background?.type === 'boolean' &&
     properties.tool_names?.type === 'array' && properties.tool_names.items?.type === 'string' &&
     properties.tool_names.items.enum?.every(name => typeof name === 'string' && TOOL_NAME.test(name)) === true
 }
 
+export function validDelegateSelection(args) {
+  if (!isObject(args)) return false
+  const hasStep = Object.hasOwn(args, 'morde_plan_step_id')
+  const hasRevision = Object.hasOwn(args, 'morde_plan_revision')
+  const allowedKeys = new Set(['title', 'objective', 'tool_names', 'run_in_background', 'morde_plan_step_id', 'morde_plan_revision'])
+  return Object.keys(args).every(key => allowedKeys.has(key)) && hasStep === hasRevision &&
+    (!hasStep || typeof args.morde_plan_step_id === 'string' && /^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$/.test(args.morde_plan_step_id) &&
+      Number.isSafeInteger(args.morde_plan_revision) && args.morde_plan_revision > 0)
+}
+
 function validDelegateArguments(args, appTools) {
-  if (!isObject(args) || !['objective,title,tool_names', 'objective,run_in_background,title,tool_names'].includes(Object.keys(args).sort().join(',')) ||
+  if (!validDelegateSelection(args)) return false
+  const hasStep = Object.hasOwn(args, 'morde_plan_step_id')
+  const delegate = appTools.find(tool => tool.name === DELEGATE_TOOL)
+  if ((hasStep && (!delegate?.parameters?.properties?.morde_plan_step_id || !delegate.parameters.properties.morde_plan_revision)) ||
       typeof args.title !== 'string' || !args.title.trim() || Buffer.byteLength(args.title) > MAX_DELEGATE_TITLE_BYTES ||
       typeof args.objective !== 'string' || !args.objective.trim() || Buffer.byteLength(args.objective) > MAX_DELEGATE_OBJECTIVE_BYTES ||
       (Object.hasOwn(args, 'run_in_background') && typeof args.run_in_background !== 'boolean') ||

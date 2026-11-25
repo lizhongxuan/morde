@@ -264,6 +264,7 @@ func TestFailingTestHostFileWriteGate(t *testing.T) {
 					LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
 					AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
 					AuthorizationVersion: current.Authorization.Version}}
+			call = setCloudDSHPlanStepMetadataForTest(t, call, "repro", &complete.Revision)
 			if result, err := broker.Execute(context.Background(), current, call); err != nil ||
 				result.Status != AgentToolFailed || !strings.Contains(result.Output, test.wantSubstr) {
 				t.Fatalf("host file write was not returned to the Agent with %q: result=%#v, err=%v", test.wantSubstr, result, err)
@@ -290,13 +291,14 @@ func TestFailingTestHostFileWriteGate(t *testing.T) {
 				LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
 				AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
 				AuthorizationVersion: current.Authorization.Version}}
+		call = setCloudDSHPlanStepMetadataForTest(t, call, "repro", &complete.Revision)
 		// The fixture has no file-write handler, so the call fails at a later
 		// stage; the assertion is that the failing-test gate did not fire.
 		// The blocked twin above proves the same call is rejected when the
 		// red-test step is absent. The written file is inside the fix plan
 		// allow set, so the minimal-diff gate does not fire either.
 		_, err = broker.Execute(context.Background(), current, call)
-		if err != nil && strings.Contains(err.Error(), "failing reproduction test") {
+		if err != nil && (strings.Contains(err.Error(), "failing reproduction test") || strings.Contains(err.Error(), "plan step metadata")) {
 			t.Fatalf("host file write was rejected by the failing-test gate after a red test: err=%v", err)
 		}
 	})

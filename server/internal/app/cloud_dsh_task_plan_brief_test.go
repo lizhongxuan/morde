@@ -162,6 +162,7 @@ func TestAdvisoryHostWriteRejectsRevokedAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	call := minimalDiffHostWriteCall(current, "revoked-advisory-write", "auth/session.go")
+	call = setCloudDSHPlanStepMetadataForTest(t, call, "repro", &store.details.Plan.Revision)
 	if result, err := broker.Execute(context.Background(), current, call); domain.CodeOf(err) != domain.CodeForbidden || result.Status != "" || len(store.details.Steps) != 0 {
 		t.Fatalf("revoked authorization returned a retryable gate result: result=%#v err=%v", result, err)
 	}
@@ -230,6 +231,7 @@ func TestHostFileWriteGateRequiresCompleteBrief(t *testing.T) {
 			LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
 			AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
 			AuthorizationVersion: current.Authorization.Version}}
+	call = setCloudDSHPlanStepMetadataForTest(t, call, "repro", &store.details.Plan.Revision)
 	if result, err := broker.Execute(context.Background(), current, call); err != nil ||
 		result.Status != AgentToolFailed || !strings.Contains(result.Output, "brief") {
 		t.Fatalf("host file write rejection was not returned to the Agent: result=%#v, err=%v", result, err)

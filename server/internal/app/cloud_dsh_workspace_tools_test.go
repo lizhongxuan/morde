@@ -987,6 +987,27 @@ func TestCloudDSHWorkspaceWriteExpiredApprovalDoesNotCommit(t *testing.T) {
 	}
 }
 
+func TestCloudDSHWorkspaceWriteApprovalCarriesEvidenceFields(t *testing.T) {
+	_, store, broker, _, current := newCloudDSHT08WorkspaceBroker(t)
+	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-evidence", cloudDSHWorkspaceWriteArguments{
+		ExpectedRevision: 0, Path: "reports/evidence.txt", Content: "evidence content",
+	})
+	result, err := broker.Execute(context.Background(), current, call)
+	pending := store.details.PendingRequest
+	if err != nil || result.Status != AgentToolNeedsUser || pending == nil {
+		t.Fatalf("Workspace write before approval = %#v, err=%v; pending=%#v", result, err, pending)
+	}
+	if pending.TriggerRule != task.ApprovalTriggerWorkspaceLiveWrite || pending.RejectionConsequence == "" {
+		t.Fatalf("Workspace approval trigger or rejection consequence missing: %#v", pending)
+	}
+	if !strings.HasPrefix(pending.EvidencePointer, "step:") {
+		t.Fatalf("Workspace write approval evidence pointer = %q, want a step: pointer", pending.EvidencePointer)
+	}
+	if pending.ThisCostMicros != nil || pending.TotalCostMicros != nil {
+		t.Fatalf("Workspace write approval costs must stay unknown (nil), got current=%+v total=%+v", pending.ThisCostMicros, pending.TotalCostMicros)
+	}
+}
+
 func TestCloudDSHWorkspaceWriteApprovalCannotAuthorizeChangedContent(t *testing.T) {
 	_, store, broker, workspaceStore, current := newCloudDSHT08WorkspaceBroker(t)
 	original := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-changed", cloudDSHWorkspaceWriteArguments{
