@@ -98,7 +98,7 @@ flowchart TD
 - 不要照搬固定三次重试、换 Agent 及“只有四种情况才告知用户”等策略。已派发且结果未知的操作先对账；审批、撤权、预算和用户停止都必须保留真实状态。
 - 合并、部署和对外发送不是所有任务的默认步骤，须有对应授权；不将第三方项目的数值阈值当作已证实的 Muse 内部规则。
 
-**代码修复门禁的目标与现状：**用户已确认按需验证，用户或项目明确要求的检查必须执行，无法执行时说明并保持未满足。当前带 `FixPlan` 的 Host 流程仍强制写前失败测试及完成前同命令重跑、全量测试；Hostless 存在豁免，H07 缺覆盖/版本证据时 pending。上述现状与目标不一致，须按 R25 / T58 统一改造计划、写入、完成及独立复核合同；合同未同步前保留现有门禁，不以跳过验证获得虚假 PASS。
+**代码修复门禁的目标与现状：**用户已选择按需验证，用户或项目明确要求的检查仍必须执行；无法执行时说明并保持未满足。E03 通用写入失败测试门已移除，E07 的旧 completion hook 不再阻止结果交付。新修复计划逐步声明 `check` / `not_applicable`，typed receipt 绑定来源、Task/plan revision、实际 operation/request、命令、覆盖声明及 Runtime Workspace view/manifest；review settled 后独立读取 final Workspace snapshot，并在 Store 完成事务期间持有 Runtime 发布围栏。Runtime export、shell receipt v2 与 final proof 已使用共同 `morde-task-workspace-snapshot-v1` 摘要并通过本地组件回归。当前没有可信的完整要求清单写入路径，也不能证明实际测试覆盖与声明一致，因此 `requirement_set_verified` 未产生，H07 即使所有已声明 check 通过仍保持 `pending`。Hostless 或其他缺少不可变 Workspace/覆盖证据的修复也保持 pending。真实 DSH Host→Portal 对账与真实 PC 用户流程尚未验收；明确要求的检查不得被定向测试替代，也不得以跳过旧门禁获得虚假 PASS。
 
 <a id="muse-gap-table"></a>
 

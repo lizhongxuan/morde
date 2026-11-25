@@ -916,7 +916,8 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 				return err
 			}
 			useCloudDSHStreamResultStep(&step, details, completion)
-			// A Host fix plan still requires E07 when it records no file writes.
+			// A result without file writes still reaches the independent review;
+			// missing typed checks remain pending instead of adding a blanket gate.
 			if paused, err := b.pauseForTestGate(ctx, current, step, details); err != nil {
 				return err
 			} else if paused {
@@ -943,8 +944,9 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 			return b.pauseCompletion(ctx, current, step, "minimal_diff_violation", "The task changed files outside fix_plan.changed_files: "+strings.Join(violations, ", "))
 		}
 	}
-	// Test gate (E07): after the minimal-diff recheck and before regression
-	// verification, an untested fix never reaches Verify or delivery.
+	// Keep the compatibility hook here, but do not block result delivery on
+	// historical E07 stamps. H07 independently evaluates durable typed checks
+	// and leaves missing verification evidence pending.
 	if paused, err := b.pauseForTestGate(ctx, current, step, details); err != nil {
 		return err
 	} else if paused {

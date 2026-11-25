@@ -49,23 +49,27 @@ type ModelTool struct {
 }
 
 type ModelRequest struct {
-	Endpoint        ModelEndpoint
-	Instructions    string
-	Input           []ModelInput
-	Tools           []ModelTool
-	RequiredTool    string
-	MaxOutputTokens int
-	Temperature     *float64
-	ReasoningEffort string
-	DisableThinking bool
-	JSONMode        bool
-	OnTextDelta     func(string) error
+	Endpoint     ModelEndpoint
+	Instructions string
+	Input        []ModelInput
+	Tools        []ModelTool
+	// CurrentTaskTurnMessageID is trusted DSH request metadata. It is never sent to a model provider.
+	CurrentTaskTurnMessageID string `json:"-"`
+	RequiredTool             string
+	MaxOutputTokens          int
+	Temperature              *float64
+	ReasoningEffort          string
+	DisableThinking          bool
+	JSONMode                 bool
+	OnTextDelta              func(string) error `json:"-"`
 }
 
 type ModelToolCall struct {
 	CallID    string
 	Name      string
 	Arguments string
+	// CurrentTaskTurnMessageID is attached by the Task ModelGateway and consumed by the tool broker.
+	CurrentTaskTurnMessageID string `json:"-"`
 	// TaskFence is attached at broker dispatch; its checkpoint head may advance past the model request.
 	TaskFence *ModelTaskFence `json:"-"`
 }

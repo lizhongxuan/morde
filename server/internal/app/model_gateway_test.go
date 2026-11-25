@@ -710,6 +710,90 @@ func TestTaskModelGatewayPreservesSoulAndUntrustedContextAcrossTurns(t *testing.
 	}
 }
 
+func TestParseDSHModelRequestUsesOnlyFinalDirectUserMessageIdentity(t *testing.T) {
+	text := func(value string) []dshModelBlock { return []dshModelBlock{{Type: "text", Text: value}} }
+	userSource := json.RawMessage(`{"kind":"user"}`)
+	pluginSource := json.RawMessage(`{"kind":"plugin","plugin":"morde-context"}`)
+	tests := []struct {
+		name     string
+		messages []dshModelMessage
+		want     string
+	}{
+		{name: "final direct user", messages: []dshModelMessage{{ID: "m1234567", Role: "user", Source: userSource, Content: text("follow-up")}}, want: "m1234567"},
+		{name: "final synthetic user", messages: []dshModelMessage{
+			{ID: "m1234567", Role: "user", Source: userSource, Content: text("earlier")},
+			{ID: "m2345678", Role: "user", Source: pluginSource, Content: text("synthetic")},
+		}},
+		{name: "invalid final ID does not fall back", messages: []dshModelMessage{
+			{ID: "m1234567", Role: "user", Source: userSource, Content: text("earlier")},
+			{ID: "invalid", Role: "user", Source: userSource, Content: text("latest")},
+		}},
+		{name: "duplicate final ID", messages: []dshModelMessage{
+			{ID: "m1234567", Role: "user", Source: userSource, Content: text("follow-up")},
+			{ID: "m1234567", Role: "assistant", Content: text("duplicate identity")},
+		}},
+		{name: "missing final ID", messages: []dshModelMessage{{Role: "user", Source: userSource, Content: text("follow-up")}}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			frame := dshModelRequest{Provider: "morde", Model: "p1234567", Messages: test.messages, Tools: []dshModelTool{}}
+			raw, err := json.Marshal(frame)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request, err := parseDSHModelRequest(context.Background(), ModelTaskFence{}, frame.Model, raw, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if request.CurrentTaskTurnMessageID != test.want {
+				t.Fatalf("current Task turn message ID = %q, want %q", request.CurrentTaskTurnMessageID, test.want)
+			}
+			for _, input := range request.Input {
+				if strings.Contains(input.Text, "m1234567") || strings.Contains(input.Text, "m2345678") {
+					t.Fatalf("message identity leaked into provider content: %+v", input)
+				}
+			}
+		})
+	}
+}
+
+func TestTaskModelGatewayCarriesTrustedTurnIdentityAcrossRecoveryOnlyAsToolMetadata(t *testing.T) {
+	frame := dshModelRequest{Provider: "morde", Model: "p1234567", MaxTokens: func() *int { value := 16; return &value }(),
+		Messages: []dshModelMessage{{ID: "m7654321", Role: "user", Source: json.RawMessage(`{"kind":"user"}`),
+			Content: []dshModelBlock{{Type: "text", Text: "Use the latest follow-up."}}}},
+		Tools: []dshModelTool{{Name: "lookup", Description: "Look up a value", Parameters: json.RawMessage(`{"type":"object"}`)}}}
+	raw, err := json.Marshal(frame)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service, store, client, call := taskGatewayFixture(t, raw, ModelResponse{ToolCalls: []ModelToolCall{{CallID: "call-source-1", Name: "lookup", Arguments: `{}`}},
+		StopReason: "tool_calls", Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}})
+	response, err := service.Complete(context.Background(), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(response.ToolCalls) != 1 || response.ToolCalls[0].CurrentTaskTurnMessageID != "m7654321" {
+		t.Fatalf("Task tool call source metadata = %+v", response.ToolCalls)
+	}
+	if client.request.CurrentTaskTurnMessageID != "" {
+		t.Fatalf("trusted source metadata reached the provider adapter: %+v", client.request)
+	}
+	providerRequest, err := json.Marshal(client.request)
+	if err != nil {
+		t.Fatalf("marshal provider-visible request: %v", err)
+	}
+	if bytes.Contains(providerRequest, []byte("m7654321")) {
+		t.Fatal("trusted source metadata leaked into provider-visible fields")
+	}
+	recovered, err := service.Complete(context.Background(), call)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recovered.ToolCalls) != 1 || recovered.ToolCalls[0].CurrentTaskTurnMessageID != "m7654321" || client.calls != 1 || store.recoverN != 2 {
+		t.Fatalf("recovered Task tool call source metadata = %+v; provider calls=%d recoveries=%d", recovered.ToolCalls, client.calls, store.recoverN)
+	}
+}
+
 func TestCoordinatorGatewayPreservesTextOnlyClassificationAndSettledOutput(t *testing.T) {
 	claim, value := routeGatewayFixture()
 	claim.Message.Sequence = 2
