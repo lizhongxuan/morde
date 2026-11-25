@@ -28,7 +28,7 @@ MORDE HARNESS · MUSE 对照设计
 
 **R07 审批历史事实审计（2026-11-25）：**现有审批表可证明已记录请求的决定，但不能证明所有需要审批的副作用都生成了请求；部分副作用账本也没有审批绑定。缺少可核对的操作分类和逐调用绑定前，验证状态必须保持 pending/unknown，不能通过只扫描已有批准记录推断完整覆盖。
 
-**D-01 定向复验（2026-11-25）：**同 Session 确定失败回传、可修复只读失败、unknown 不重派、terminal 结束当前尝试及长证据不足时 pending 的本地 Worker/App 回归通过；一次性 loopback PostgreSQL 上验证 claim/revision、审批绑定、验证队列、晚到验证来源原子写入、内容来源、child failure 和 Worker 持久化定向用例通过。未运行真实 DSH/模型或 PC。R20 合同 v1 已定义；A 已落地终态失败/取消来源表和事务写入，D 已在结果已发布时同事务写入晚到验证结论来源，并验证失败回滚与两种已发布结果路径。source consumer/交付编排 Worker 仍待 D 实现，依赖 A 的 claim/lease、ModelGateway 预算与发布接口；Agent/PC 实际投递仍未验。失败正文须在 Broker 账本与 checkpoint 共用边界脱敏，以维持精确重放一致性。详见[D-01 交接与验证](<五会话并发实施/会话D-01-失败恢复与验证事实.md>)及[验证记录](../../验证记录/Morde_Harness_最终流程测试用例.md)。
+**D-01 当前状态（2026-11-25）：**安全失败回送、R20 source consumer/预算 ModelGateway/原会话发布和 typed H07 check receipt 已有本地实现及定向 App/Worker/PostgreSQL 回归。H07 evaluator 还要求可信的完整要求集证明；当前 Store 不能证明来源清单完整，也不能重读最终 Workspace snapshot，所以修复任务 verdict 继续 pending。真实 PC/DSH 没有通过交付验收。详见[D-01 交接与验证](<五会话并发实施/会话D-01-失败恢复与验证事实.md>)及[验证记录](../../验证记录/Morde_Harness_最终流程测试用例.md)。
 
 **R24 工作区搜索展示补充（2026-11-25）：**`morde_workspace_search` 工作项现在以“搜索工作区文件”呈现，展开显示实际记录的查询与结果摘要，不编造来源 URL 或命中数量。Assistant 239/239、Portal 全量 68 个测试文件 893/893、目标 ESLint、类型检查和 PC build 通过；当时全量 lint 仍有其他组件/路由诊断，随后已修复并通过全量 lint。该证据仅证明 Portal 字段呈现，尚未在实际 PC + 真实 DSH 验证搜索调用与账本一致性。
 
@@ -68,12 +68,12 @@ flowchart TD
     A --> R{"02 意图路由<br/>无效结果安全澄清"}
     R -->|直接响应| Q["问答 / 任务查询 / 停止<br/>目标不明先澄清；停止指定任务<br/>普通文字问答无需云端电脑"]
     R -->|新建 / 续跑| T["新建 / 续跑任务<br/>校验会话、任务归属和授权<br/>关系不清时不擅自合并"]
-    T --> D["02 / 03 DSH 主 Agent · 按需协作<br/>计划、协调子 Agent、汇总真实结果<br/>计划步骤与执行证据的依赖绑定待补齐"]
+    T --> D["02 / 03 DSH 主 Agent · 按需协作<br/>计划、协调子 Agent、汇总真实结果<br/>Host/MCP/child 与 direct-read 结果 binding 已接入；真实 DSH 全链路仍待验"]
     R -->|有界只读工具| B
     D --> B["04 / 05 Broker · 授权与工具执行<br/>搜索 / 文件 / 命令 / 电脑 · 工作项和账本<br/>需审批：原对话 + 审核区共享 MCP Apps 卡片<br/>结果未知先对账、暂停；不得盲目重放"]
     B -->|结果 / 部分确定失败| D
     B -->|只读结果回会话| Q
-    B -->|任务完成后| V["06 证据复核与实际状态<br/>版本 / 授权 / 证据绑定；不足时保持待确认<br/>真实 PC、长证据和审批覆盖仍需验证"]
+    B -->|任务完成后| V["06 证据复核与实际状态<br/>检查/operation/Workspace 绑定；要求集或最终快照不明则 pending<br/>真实 PC、DSH、长证据和审批覆盖仍需验证"]
     V --> O["07 / 09 原会话交付与继续对话<br/>如实说明完成、失败、等待或结果未知<br/>明确缺口：失败 / 取消终态自然说明尚未贯通"]
     classDef gap fill:#fee2e2,stroke:#b91c1c,color:#7f1d1d;
     classDef pending fill:#fef3c7,stroke:#b45309,color:#78350f;
@@ -109,11 +109,11 @@ Muse 栏只概括逆向资料中的观察或文档要求；意图分类、合并
 | 逻辑模块 | Muse 对照 | Morde 当前与欠缺 | 对应任务 |
 | --- | --- | --- | --- |
 | 01 收件与会话 | 会话消息与任务、工作项可追溯。 | 已有发件箱、持久化和幂等基础；实际 PC 断线恢复、跨端接续及不重复执行仍须贯通。 | [R00A](<实施任务TODO/01-收件与会话.md>) |
-| 02 意图与依赖 | 能延续工作、处理多条消息；具体分类与合并算法未知。 | 路由、直接 Task、batch 与 schedule 使用结构化意图；新建缺省不按正文猜测。个人 route receipt Workspace input snapshot 已接入；route update `unclear` 澄清、计划步骤与真实工具 / 子 Agent 结算绑定仍未收口；代码修复计划与按需验证目标待对齐。 | [R19-A / M02-14 / R25](<实施任务TODO/02-意图路由与任务拆分.md>) |
+| 02 意图与依赖 | 能延续工作、处理多条消息；具体分类与合并算法未知。 | 路由、直接 Task、batch 与 schedule 使用结构化意图；新建缺省不按正文猜测。个人 route receipt Workspace input snapshot 与 route update `unclear` 版本化澄清已接入；Host/MCP/child 和内部 direct-read 已按真实成功证据门控依赖。D-01 已本地绑定 H07 typed check/operation/Workspace receipt，但检查要求集完整性与最终 Workspace snapshot 尚无可信 Store 事实，R25 修复验证保持 pending；项目 Workspace snapshot、Hub command 等副作用工具计划绑定和真实 DSH 完整计划执行仍待完成。 | [R19-A / M02-14 / R25](<实施任务TODO/02-意图路由与任务拆分.md>) |
 | 03 多 Agent 协作 | 资料观察到主 Agent 与多层子 Agent 协作，结果由上层汇总。 | DSH 委派及两层深度有实现和局部回归；Runtime 兼容带计划步骤/修订的委派并保留旧检查点，服务端仍负责校验；实际 PC + 真实模型的两个独立子任务、失败回传与最终汇总尚未验收。 | [R03](<实施任务TODO/03-并发派发与协调.md>) |
 | 04 工具与工作项 | 任务动态记录搜索、浏览、文件及命令等操作，可展开实际结果；失败项保留。 | 有工作项、账本与工作区搜索摘要；全类事件投影、命令 / 查询 / 输出详情与真实账本一致性仍需 PC + DSH 验证。外部资料信任边界及真实来源定位需补充分层验收；65 项 MCP 目录局部回归不等于所有工具选择问题已解决。 | [R04 / R12 / R24 / R26](<实施任务TODO/04-工具执行与工作项.md>) |
 | 05 审批 | 资料描述敏感操作的卡片和范围授权；不能据此推断 Muse 审批内部实现。 | 对话与审核区已有共享审批的内置 MCP Apps view；真实批准、拒绝、刷新、授权变化和副作用闭环未验，任务动态不承载审批操作。 | [R06 / R22](<实施任务TODO/05-审批.md>) |
-| 06 证据与验证 | 资料中有读回、证据绑定及特定文档任务的 checking worker；并非所有任务内部机制均已知。 | 已有独立复核 Worker 和版本栅栏；大于 4 KiB 的当前验证预览受限，审批覆盖不足时须 pending。修复任务按需验证与旧门禁待统一，资料结论定位待验；FAIL 的具体原因尚未完整进入主 Agent。 | [R07 / R20 / R25 / R26](<实施任务TODO/06-验证.md>) |
+| 06 证据与验证 | 资料中有读回、证据绑定及特定文档任务的 checking worker；并非所有任务内部机制均已知。 | 已有独立复核 Worker 和版本栅栏；D-01 本地接入 typed check/operation/Workspace receipt。要求来源 hash 只证明已声明来源身份，不能证明完整检查要求；Store 当前无 `requirement_set_verified` 可信事实且不能重读最终 Workspace snapshot，H07 保持 pending。大于 4 KiB 的当前验证预览受限，审批覆盖不足也须 pending；真实 PC/DSH 和资料结论定位待验。 | [R07 / R20 / R25 / R26](<实施任务TODO/06-验证.md>) |
 | 07 交付与提问 | 资料要求结果回到原对话，用户可继续交流。 | 成功结果整理已有基础；失败、取消和验证失败原因尚未形成完整、耐久的自然说明；文件交付的关键要点和来源定位待验。合并到其他任务属于接续运行，不能误报失败。 | [R08 / R20 / R23 / R26](<实施任务TODO/07-交付与提问.md>) |
 | 08 记忆与纠正 | 资料描述授权记忆、纠正与遗忘，具体实现不可完全推断。 | 已有个人数据与记忆基础；授权读取、纠正 / 撤销 / 遗忘和跨端体验尚未形成完整验收证据。 | [R09](<实施任务TODO/08-记忆与纠正沉淀.md>) |
 | 09 失败与恢复 | 观察到失败工作项留痕，部分失败后可继续；具体重试策略未知。 | 已有部分受控重试和 unknown 对账；自动恢复、用户停止、预算耗尽和重启后的终态解释仍需贯通，未知副作用不得重派。 | [R10 / R20](<实施任务TODO/09-失败限流与恢复.md>) |
@@ -253,17 +253,17 @@ flowchart TD
 
 #### 现状与要修改的地方
 
-路由模型返回结构化动作，服务端解析后按当前会话和 Task 快照执行。R19 已移除用请求中的关键词推断或改写 `new`、`update`、`stop`、`stop_all`、`tool` 等语义动作的兜底；分类输出非法时先尝试一次有界修复，仍失败或模型不可用则安全澄清，不猜测任务动作。应用与存储继续校验身份、目标、候选完整性、状态、revision、Project/执行范围、授权、操作账本和只读工具白名单。文件交付意图由结构化字段表达：Task、batch 和 schedule 的 API/OpenAPI、服务与持久化路径已接入；新建 Task/schedule 缺省为 `none`，update 省略时继承现值，幂等身份包含显式意图；batch item 意图保持不可变。schedule occurrence 创建 Task 时复制意图，个人 schedule snapshot 和 DSH schedule 工具保留字段。schedule 当前没有 Workspace 绑定，服务/API 仅接受 `none`，显式 `required` / `unclear` 提前拒绝。通用 `normalizeNewTask` 空值归一为 `none`，不再从 Objective 分类。个人 route `new/required` 已在 receipt 捕获并校验 Workspace input revision/context digest 后绑定 Task；个人 route update 的版本化 `unclear` 澄清与 Host/MCP/child 计划准入已有本地接线和定向回归；项目 Workspace、一般 direct-read 结果绑定及真实 PC + DSH/模型验收仍待完成。自然语言意图由 Agent/路由模型结构化判断；代码继续强制身份、授权、范围、预算、状态、幂等与未知副作用对账。当前自动化验证详见[统一验证记录](<../../验证记录/Morde_Harness_最终流程测试用例.md>)；本轮未对当前工作区 PC + 真实 DSH/模型做语义验收。跨 Task `dependency_task_ids` 已有 Project 范围过滤及事务复核；Task Plan 的 `PlanStep.depends_on` 与 M02-14 execution binding 的真实结算/准入接线仍需完成。Muse 的分类、合并算法未知；固定 Planner 文件、60 秒合并窗和“缺验收标准就必问”均不是已证实规则。
+路由模型返回结构化动作，服务端解析后按当前会话和 Task 快照执行。R19 已移除用请求中的关键词推断或改写 `new`、`update`、`stop`、`stop_all`、`tool` 等语义动作的兜底；分类输出非法时先尝试一次有界修复，仍失败或模型不可用则安全澄清，不猜测任务动作。应用与存储继续校验身份、目标、候选完整性、状态、revision、Project/执行范围、授权、操作账本和只读工具白名单。文件交付意图由结构化字段表达：Task、batch 和 schedule 的 API/OpenAPI、服务与持久化路径已接入；新建 Task/schedule 缺省为 `none`，update 省略时继承现值，幂等身份包含显式意图；batch item 意图保持不可变。schedule occurrence 创建 Task 时复制意图，个人 schedule snapshot 和 DSH schedule 工具保留字段。schedule 当前没有 Workspace 绑定，服务/API 仅接受 `none`，显式 `required` / `unclear` 提前拒绝。通用 `normalizeNewTask` 空值归一为 `none`，不再从 Objective 分类。个人 route `new/required` 已在 receipt 捕获并校验 Workspace input revision/context digest 后绑定 Task；个人 route update 的版本化 `unclear` 澄清已接入。Host/MCP/child 计划门和 Skill、附件、会话历史、Workspace/impact map、Hub 只读动作、Goal/Schedule 只读工具的 direct-read PlanStep admission、成功 TaskStep 身份与结果 digest/readiness 已接入本地实现和定向回归；项目 Workspace route snapshot、Hub command 等副作用工具的计划绑定及真实 PC + DSH/模型验收仍待完成。自然语言意图由 Agent/路由模型结构化判断；代码继续强制身份、授权、范围、预算、状态、幂等与未知副作用对账。当前自动化验证详见[统一验证记录](<../../验证记录/Morde_Harness_最终流程测试用例.md>)；本轮未对当前工作区 PC + 真实 DSH/模型做语义验收。跨 Task `dependency_task_ids` 已有 Project 范围过滤及事务复核；Host/MCP/child 与上述 direct-read 的 plan-step binding 已接入，跨场景/重启及真实 DSH 计划执行仍需验。Muse 的分类、合并算法未知；固定 Planner 文件、60 秒合并窗和“缺验收标准就必问”均不是已证实规则。
 
-> **2026-11-25 最新覆盖：**下方步骤 02 的部分现状文字包含历史记录；Broker 对缺失或非法的持久文件意图直接拒绝。Task、batch、schedule 结构化字段及 schedule persistence 已接入；route Workspace snapshot/update-unclear、计划与 Broker/admission 原子调用方仍按 R19-A/M02-14 跟踪。
+> **2026-11-25 最新覆盖：**下方步骤 02 的部分现状文字包含历史记录；Broker 对缺失或非法的持久文件意图直接拒绝。Task、batch、schedule 结构化字段及 schedule persistence 已接入；route Workspace snapshot/update-unclear、Host/MCP/child 和 direct-read PlanStep admission/result digest 已接入。项目 Workspace route snapshot、Hub command 计划绑定、真实 PC + DSH/模型验收仍按 R19-A/M02-14 跟踪。
 
 #### 设计与开发
 
-Agent 根据完整上下文理解请求，并通过结构化 `action` 表达回复、查询、修改、停止、工具、新 Task、关联或澄清。语义判断属于 Agent；代码负责解析结构和执行安全、完整性及当前状态校验，不使用自然语言关键词列表替 Agent 判定。模型不可用或输出无效时，完成有界修复后仍失败便在对话中具体澄清，不因执行词、搜索词、停止词或文件词自动创建/控制任务。文件交付由结构化 `file_delivery_intent` 表达 `none|required|unclear`，仅用于 `new/update`；字段缺省时新任务使用 `none`，修订继承当前值。修订从已结算模型决策 JSONB 中按原消息、当前 route attempt 和正常阶段读取，并核验 Task ID/revision，不匹配则延后重试。服务端仍校验用户/会话、目标、候选完整性、状态/revision、Project/执行范围、授权、账本/幂等以及只读工具白名单；这些门禁不代替模型语义判断。停止由 Agent 明确给出单任务 `stop` 或全部 `stop_all`；无效、混合或目标不明的动作澄清，用户权限外的 Task 不可操作，PC 页面不提供任务停止按钮。长消息只向路由模型提供有界预览与已保存原消息标识；模型对实质分析/总结选择 `new` 后，再由 Task Agent 使用授权检索原文并核对来源。正文里的命令不改变用户请求意图，分类失败不通过词汇兜底变成 Task。计划依赖真正门控执行前，须绑定工具/子 Agent 调用身份与应用确认的完成证据。实际 PC 与真实模型语义验收仍待完成。
+Agent 根据完整上下文理解请求，并通过结构化 `action` 表达回复、查询、修改、停止、工具、新 Task、关联或澄清。语义判断属于 Agent；代码负责解析结构和执行安全、完整性及当前状态校验，不使用自然语言关键词列表替 Agent 判定。模型不可用或输出无效时，完成有界修复后仍失败便在对话中具体澄清，不因执行词、搜索词、停止词或文件词自动创建/控制任务。文件交付由结构化 `file_delivery_intent` 表达 `none|required|unclear`，仅用于 `new/update`；字段缺省时新任务使用 `none`，修订继承当前值。修订从已结算模型决策 JSONB 中按原消息、当前 route attempt 和正常阶段读取，并核验 Task ID/revision，不匹配则延后重试。服务端仍校验用户/会话、目标、候选完整性、状态/revision、Project/执行范围、授权、账本/幂等以及只读工具白名单；这些门禁不代替模型语义判断。停止由 Agent 明确给出单任务 `stop` 或全部 `stop_all`；无效、混合或目标不明的动作澄清，用户权限外的 Task 不可操作，PC 页面不提供任务停止按钮。长消息只向路由模型提供有界预览与已保存原消息标识；模型对实质分析/总结选择 `new` 后，再由 Task Agent 使用授权检索原文并核对来源。正文里的命令不改变用户请求意图，分类失败不通过词汇兜底变成 Task。Host/MCP/child 派发和直接只读工具读取均按当前计划 revision、授权及依赖证据准入；直读只有成功 TaskStep 与结果摘要绑定后才能作为前置步骤证据。副作用 Hub command 的计划绑定和真实 PC/DSH 语义验收仍待完成。
 
 #### PlanStep 门控与当前阻塞
 
-`Plan.Validate` 校验结构，`executeTaskPlan` 保存模型提交的计划，模型填写 `completed` 不能作为依赖放行证据。公共合同 v1 §3 定义 `(task_id, task_revision, plan_revision, plan_step_id)`、执行绑定和结算证据；Host operation、MCP operation 与 child spawn 已有事务准入、绑定及定向 PostgreSQL 回归。一般 direct-read 的结果绑定仍在补齐，跨场景/重启和真实 DSH 计划执行未完整验收。失败、取消、unknown、证据缺失或过期修订不放行，独立步骤可并行；详细进度以 M02-14 最新验证记录为准。
+`Plan.Validate` 校验结构，`executeTaskPlan` 保存模型提交的计划，模型填写 `completed` 不能作为依赖放行证据。公共合同 v1 §3 定义 `(task_id, task_revision, plan_revision, plan_step_id)`、执行绑定和结算证据；Host operation、MCP operation、child spawn 与 direct-read 工具已有准入/绑定和定向 App/PostgreSQL 回归。direct-read 必须同时有当前成功 `task_steps` 调用身份和 32-byte 结果摘要才可解锁依赖；失败、取消、unknown、缺证据、旧授权或过期修订不放行，独立步骤可并行。Hub command 等副作用工具绑定、跨场景/重启及真实 DSH 计划执行仍未完整验收；详细进度以 M02-14 最新验证记录为准。
 
 #### Morde 落点
 

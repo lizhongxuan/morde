@@ -46,11 +46,22 @@ type PlanStep struct {
 	Outputs            []string       `json:"outputs"`
 	CompletionCriteria []string       `json:"completion_criteria"`
 	Status             PlanStepStatus `json:"status"`
+	// VerificationApplicability identifies whether this step declares an
+	// H07 check or has no step-specific check. The empty value is retained for
+	// legacy plans and is treated as unknown by validation review.
+	VerificationApplicability PlanVerificationApplicability `json:"verification_applicability,omitempty"`
 	// VerificationCheck is optional for compatibility with plans saved before
 	// H07 check identities were introduced. A missing value means unknown to
 	// verification; it does not mean that no checks apply.
 	VerificationCheck *PlanVerificationCheck `json:"verification_check,omitempty"`
 }
+
+type PlanVerificationApplicability string
+
+const (
+	PlanVerificationApplicabilityCheck         PlanVerificationApplicability = "check"
+	PlanVerificationApplicabilityNotApplicable PlanVerificationApplicability = "not_applicable"
+)
 
 type PlanVerificationCheckKind string
 
@@ -132,6 +143,21 @@ func (p Plan) Validate() error {
 		if !validPlanTextList(step.Outputs, 256) || !validPlanTextList(step.CompletionCriteria, 512) {
 			return errors.New("task plan step lists are invalid")
 		}
+		switch step.VerificationApplicability {
+		case "":
+			// Historical plans omit applicability. Keep them readable, but do
+			// not infer that no verification applies.
+		case PlanVerificationApplicabilityCheck:
+			if step.VerificationCheck == nil {
+				return errors.New("task plan verification applicability requires a check")
+			}
+		case PlanVerificationApplicabilityNotApplicable:
+			if step.VerificationCheck != nil {
+				return errors.New("task plan not-applicable step cannot carry a check")
+			}
+		default:
+			return errors.New("task plan verification applicability is invalid")
+		}
 		if step.VerificationCheck != nil && !step.VerificationCheck.valid() {
 			return errors.New("task plan verification check is invalid")
 		}
@@ -170,6 +196,26 @@ func (p Plan) Validate() error {
 	for id := range steps {
 		if !visit(id) {
 			return errors.New("task plan dependencies contain a cycle")
+		}
+	}
+	return nil
+}
+
+// ValidateSubmission applies the stricter contract for newly submitted
+// plans while Validate keeps historical persisted plans readable. Every
+// step of a new fix plan must classify its verification applicability so an
+// unchecked subset cannot be mistaken for a complete check list.
+func (p Plan) ValidateSubmission() error {
+	if err := p.Validate(); err != nil {
+		return err
+	}
+	if p.FixPlan == nil {
+		return nil
+	}
+	for _, step := range p.Steps {
+		if step.VerificationApplicability != PlanVerificationApplicabilityCheck &&
+			step.VerificationApplicability != PlanVerificationApplicabilityNotApplicable {
+			return errors.New("fix plan step verification applicability is required")
 		}
 	}
 	return nil

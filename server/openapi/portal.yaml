@@ -12759,6 +12759,27 @@ components:
         outputs: { type: array, maxItems: 8, items: { type: string, minLength: 1, maxLength: 256 } }
         completion_criteria: { type: array, maxItems: 8, items: { type: string, minLength: 1, maxLength: 512 } }
         status: { type: string, enum: [pending, in_progress, completed, blocked] }
+        verification_applicability: { type: string, enum: [check, not_applicable], description: Omitted on legacy plans means verification applicability is unknown and H07 must remain pending. New fix plan submissions classify every step. }
+        verification_check:
+          type: object
+          additionalProperties: false
+          required: [kind, basis, command, coverage_paths]
+          description: Typed check identity for H07. A declared coverage path is plan scope, not proof of actual test coverage.
+          properties:
+            kind: { type: string, enum: [test, build, lint, typecheck, other] }
+            basis: { type: string, enum: [required, risk_selected], description: Required checks cite an explicit user message or project file; risk_selected checks are chosen for this task. }
+            command: { type: string, minLength: 1, maxLength: 1024 }
+            coverage_paths: { type: array, minItems: 1, maxItems: 8, items: { type: string, minLength: 1, maxLength: 512 } }
+            requirement_source:
+              type: object
+              additionalProperties: false
+              required: [kind, content_sha256]
+              properties:
+                kind: { type: string, enum: [user_message, project_file] }
+                message_id: { type: string, pattern: '^m[a-z0-9]{7}$' }
+                workspace_path: { type: string, maxLength: 512 }
+                workspace_revision: { type: integer, format: int64, minimum: 0 }
+                content_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
     TaskPlan:
       type: object
       additionalProperties: false

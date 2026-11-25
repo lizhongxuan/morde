@@ -2802,7 +2802,7 @@ func TestCloudDSHToolBrokerCompletesHostlessTaskWithMatchingCheckpoint(t *testin
 	}
 }
 
-func TestCloudDSHToolBrokerCompletePreservesAppliedSteerOnCheckpointMismatch(t *testing.T) {
+func TestCloudDSHToolBrokerDoesNotPublishStaleCompletionWhenSteerChangesCheckpoint(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
 	fixture.executor.store = store
@@ -2829,13 +2829,12 @@ func TestCloudDSHToolBrokerCompletePreservesAppliedSteerOnCheckpointMismatch(t *
 		t.Fatalf("Complete() checkpoint mismatch error = %v pending=%+v; want typed steer snapshot", err, pendingError)
 	}
 	if len(store.committedTaskProgress) != 1 {
-		t.Fatalf("completion progress commits = %d; want exactly one final fenced commit", len(store.committedTaskProgress))
+		t.Fatalf("stale completion progress attempts = %d; want exactly one paused attempt", len(store.committedTaskProgress))
 	}
 	progress := store.committedTaskProgress[0]
-	if progress.Status != task.StatusCompleted || progress.Result != completion.Result || progress.AgentCompletionFence == nil ||
-		progress.AgentCompletionFence.CheckpointThroughSequence != completion.CheckpointThroughSequence ||
-		!bytes.Equal(progress.AgentCompletionFence.CheckpointDigest, completion.CheckpointDigest) {
-		t.Fatalf("final completion progress did not preserve candidate fence: %+v", progress)
+	if progress.Status != task.StatusWaitingUser || progress.Result != "" || progress.AgentCompletionFence != nil ||
+		progress.WaitingReason != "output_verification_pending" {
+		t.Fatalf("stale completion was not converted to a pending state: %+v", progress)
 	}
 	if store.details.Task.Status != task.StatusRunning || store.details.Task.Result != "" {
 		t.Fatalf("stale completion changed task state: status=%s result=%q", store.details.Task.Status, store.details.Task.Result)

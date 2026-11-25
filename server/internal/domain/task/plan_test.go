@@ -31,6 +31,53 @@ func TestPlanValidate(t *testing.T) {
 	}
 }
 
+func TestPlanVerificationApplicabilityKeepsLegacyPlansReadable(t *testing.T) {
+	check := &PlanVerificationCheck{Kind: PlanVerificationCheckTest, Basis: PlanVerificationCheckRiskSelected,
+		Command: "go test ./server/internal/app", CoveragePaths: []string{"server/internal/app"}}
+	fix := Plan{TaskRevision: 1, Revision: 1, Goal: "Fix behavior", CostEstimateState: "unknown",
+		FixPlan: &FixPlan{}, Steps: []PlanStep{
+			{ID: "implement", Title: "Implement fix", Status: PlanStepPending,
+				VerificationApplicability: PlanVerificationApplicabilityNotApplicable},
+			{ID: "verify", Title: "Run check", Status: PlanStepPending,
+				VerificationApplicability: PlanVerificationApplicabilityCheck, VerificationCheck: check},
+		}}
+	if err := fix.ValidateSubmission(); err != nil {
+		t.Fatalf("explicitly classified fix plan rejected: %v", err)
+	}
+
+	legacy := fix
+	legacy.Steps = append([]PlanStep(nil), fix.Steps...)
+	legacy.Steps[0].VerificationApplicability = ""
+	legacy.Steps[1].VerificationApplicability = ""
+	if err := legacy.Validate(); err != nil {
+		t.Fatalf("legacy fix plan was not readable: %v", err)
+	}
+	if err := legacy.ValidateSubmission(); err == nil {
+		t.Fatal("new fix plan submission accepted steps with unknown verification applicability")
+	}
+}
+
+func TestPlanVerificationApplicabilityMatchesCheckDeclaration(t *testing.T) {
+	check := &PlanVerificationCheck{Kind: PlanVerificationCheckTest, Basis: PlanVerificationCheckRiskSelected,
+		Command: "go test ./server/internal/app", CoveragePaths: []string{"server/internal/app"}}
+	for name, step := range map[string]PlanStep{
+		"check requires typed check": {ID: "verify", Title: "Run check", Status: PlanStepPending,
+			VerificationApplicability: PlanVerificationApplicabilityCheck},
+		"not applicable cannot carry check": {ID: "verify", Title: "Run check", Status: PlanStepPending,
+			VerificationApplicability: PlanVerificationApplicabilityNotApplicable, VerificationCheck: check},
+		"unknown applicability is invalid": {ID: "verify", Title: "Run check", Status: PlanStepPending,
+			VerificationApplicability: "maybe"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			plan := Plan{TaskRevision: 1, Revision: 1, Goal: "Fix behavior", CostEstimateState: "unknown",
+				Steps: []PlanStep{step}}
+			if err := plan.Validate(); err == nil {
+				t.Fatal("inconsistent verification applicability was accepted")
+			}
+		})
+	}
+}
+
 func TestPlanVerificationCheckValidation(t *testing.T) {
 	workspaceRevision := int64(7)
 	validRequired := &PlanVerificationCheck{

@@ -75,21 +75,21 @@ func sealTaskStepDetail(sealer *Sealer, ownerID, taskID, stepID string, revision
 type cloudDSHToolActivityKey struct{}
 
 type cloudDSHToolActivity struct {
-	call            ModelToolCall
-	current         task.Task
-	digest          []byte
-	sealer          *Sealer
-	displayObject   string
-	shellExecution  *TaskStepShellExecutionEvidence
-	shellOutput     *taskStepShellOutput
-	executionStart  time.Time
-	executionMS     *int64
-	contentEvidence *TaskStepContentEvidence
-	phaseOverride   string
-	failureReason   string
-	verificationCheck *task.PlanVerificationCheck
+	call                     ModelToolCall
+	current                  task.Task
+	digest                   []byte
+	sealer                   *Sealer
+	displayObject            string
+	shellExecution           *TaskStepShellExecutionEvidence
+	shellOutput              *taskStepShellOutput
+	executionStart           time.Time
+	executionMS              *int64
+	contentEvidence          *TaskStepContentEvidence
+	phaseOverride            string
+	failureReason            string
+	verificationCheck        *task.PlanVerificationCheck
 	verificationPlanRevision int64
-	verificationStepID string
+	verificationStepID       string
 }
 
 const maxTaskStepContentEvidencePreviewBytes = 4096
@@ -108,7 +108,7 @@ func validCloudDSHToolActivityFence(ctx context.Context, current task.Task, call
 
 // taskToolTestFailureReason marks a shell step that ran a test command which
 // failed (non-zero exit or timeout). It is the durable failing-test record
-// the E03 write gate reads; see hasFailingTestRecord.
+// legacy E03 step marker. It is not used as a write or completion gate.
 const taskToolTestFailureReason = "test_failed"
 
 // taskToolTestPassedReason marks a shell step that ran a test command which

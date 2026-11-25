@@ -688,8 +688,9 @@ FROM task_plan_step_execution_bindings WHERE task_id=$1 AND execution_kind='read
 		args      []any
 		reason    string
 	}{
-		{name: "agent session changed", statement: `UPDATE task_steps SET agent_session_id=$3 WHERE task_id=$1 AND id=$2`,
-			args: []any{current.ID, reportStepID, "other-session"}, reason: planStepReadinessEvidenceMissing},
+		{name: "agent session changed", statement: `UPDATE task_plan_step_execution_bindings SET agent_session_id=$3
+WHERE task_id=$1 AND execution_kind='read_tool' AND call_id=$2`,
+			args: []any{current.ID, reportCall.CallKey, "other-session"}, reason: planStepReadinessEvidenceMissing},
 		{name: "call id changed", statement: `UPDATE task_steps SET tool_call_key=$3 WHERE task_id=$1 AND id=$2`,
 			args: []any{current.ID, reportStepID, "call_read_report_changed"}, reason: planStepReadinessEvidenceMissing},
 		{name: "request digest changed", statement: `UPDATE task_steps SET request_digest=$3 WHERE task_id=$1 AND id=$2`,
@@ -711,8 +712,9 @@ FROM task_plan_step_execution_bindings WHERE task_id=$1 AND execution_kind='read
 			var restore string
 			switch test.name {
 			case "agent session changed":
-				restore = `UPDATE task_steps SET agent_session_id=$3 WHERE task_id=$1 AND id=$2`
-				_, err := fixture.route.store.pool.Exec(ctx, restore, current.ID, reportStepID, reportCall.AgentSessionID)
+				restore = `UPDATE task_plan_step_execution_bindings SET agent_session_id=$3
+WHERE task_id=$1 AND execution_kind='read_tool' AND call_id=$2`
+				_, err := fixture.route.store.pool.Exec(ctx, restore, current.ID, reportCall.CallKey, reportCall.AgentSessionID)
 				if err != nil {
 					t.Fatalf("restore agent session: %v", err)
 				}

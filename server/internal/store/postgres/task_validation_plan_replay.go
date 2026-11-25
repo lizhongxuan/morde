@@ -25,35 +25,35 @@ type taskValidationReplayTask struct {
 }
 
 type taskValidationReplayBinding struct {
-	planStepID, executionKind, executionID, agentSessionID, callID, toolName string
-	taskRevision, planRevision, authorizationVersion                         int64
-	requestDigest                                                            []byte
-	createdAt                                                                time.Time
-	operationTaskRevision                                                   int64
+	planStepID, executionKind, executionID, agentSessionID, callID, toolName  string
+	taskRevision, planRevision, authorizationVersion                          int64
+	requestDigest                                                             []byte
+	createdAt                                                                 time.Time
+	operationTaskRevision                                                     int64
 	operationCallID, operationToolName, operationStatus, operationWorkspaceID string
-	operationRequestHash                                                    []byte
-	operationBindingVersion, operationInputRevision, operationCheckpoint    int64
-	operationResult                                                         string
-	stepTaskRevision, stepSequence                                           int64
-	stepStatus, stepToolName, stepCallID, stepAgentSessionID                 string
-	stepRequestDigest                                                       []byte
+	operationRequestHash                                                      []byte
+	operationBindingVersion, operationInputRevision, operationCheckpoint      int64
+	operationResult                                                           string
+	stepTaskRevision, stepSequence                                            int64
+	stepStatus, stepToolName, stepCallID, stepAgentSessionID                  string
+	stepRequestDigest                                                         []byte
 }
 
 type taskValidationReplayShellResult struct {
-	ExitCode                      int                                        `json:"exit_code"`
-	TimedOut                      bool                                       `json:"timed_out"`
-	Stdout                        string                                     `json:"stdout"`
-	Stderr                        string                                     `json:"stderr"`
-	StdoutTruncated               bool                                       `json:"stdout_truncated"`
-	StderrTruncated               bool                                       `json:"stderr_truncated"`
-	TaskID                        string                                     `json:"task_id"`
-	WorkspaceID                   string                                     `json:"workspace_id"`
-	BindingVersion                int64                                      `json:"binding_version"`
-	WorkspaceViewID               string                                     `json:"workspace_view_id"`
-	WorkspaceCheckpointRevision   *int64                                     `json:"workspace_checkpoint_revision"`
-	WorkspaceManifestSHA256Before string                                     `json:"workspace_manifest_sha256_before"`
-	WorkspaceManifestSHA256After  string                                     `json:"workspace_manifest_sha256_after"`
-	VerificationCheck             *app.TaskValidationCheckExecutionReceipt   `json:"verification_check,omitempty"`
+	ExitCode                      int                                      `json:"exit_code"`
+	TimedOut                      bool                                     `json:"timed_out"`
+	Stdout                        string                                   `json:"stdout"`
+	Stderr                        string                                   `json:"stderr"`
+	StdoutTruncated               bool                                     `json:"stdout_truncated"`
+	StderrTruncated               bool                                     `json:"stderr_truncated"`
+	TaskID                        string                                   `json:"task_id"`
+	WorkspaceID                   string                                   `json:"workspace_id"`
+	BindingVersion                int64                                    `json:"binding_version"`
+	WorkspaceViewID               string                                   `json:"workspace_view_id"`
+	WorkspaceCheckpointRevision   *int64                                   `json:"workspace_checkpoint_revision"`
+	WorkspaceManifestSHA256Before string                                   `json:"workspace_manifest_sha256_before"`
+	WorkspaceManifestSHA256After  string                                   `json:"workspace_manifest_sha256_after"`
+	VerificationCheck             *app.TaskValidationCheckExecutionReceipt `json:"verification_check,omitempty"`
 }
 
 // ReadTaskValidationReplayEvidence returns the typed-check facts for the
@@ -201,6 +201,13 @@ ORDER BY b.created_at,COALESCE(step.sequence,0)`, claim.OwnerID, claim.TaskID, c
 		evidence.Checks[index].RequirementSourceVerified = verified
 	}
 	evidence.State = app.EvaluateTaskValidationPlanReplay(plan, evidence)
+	if evidence.State == app.TaskValidationReplayPass {
+		// The durable ledger contains the manifest captured during each check,
+		// but this Store has no independent read of the current Task Workspace
+		// manifest at review time. A passing run therefore cannot prove that
+		// the final delivered view still matches its post-check snapshot.
+		evidence.State = app.TaskValidationReplayPending
+	}
 	return evidence, nil
 }
 

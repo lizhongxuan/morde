@@ -170,7 +170,10 @@ func TestDirectTestEvidenceSurvivesTaskProgress(t *testing.T) {
 			}
 			call := invalidRuntimeToolCall(current, "test-evidence", runtimeToolShellExec,
 				`{"workspace_id":"w1234567","command":`+jsonQuote(test.command)+`}`)
+			check := task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest,
+				Basis: task.PlanVerificationCheckRiskSelected, Command: test.command, CoveragePaths: []string{"server"}}
 			ctx := broker.toolActivityContext(context.Background(), current, call)
+			ctx = withTaskValidationPlanCheck(ctx, 1, "verify", &check)
 			ctx = withTaskToolShellExecutionEvidence(ctx, call.Name, AgentToolResult{Status: AgentToolSucceeded,
 				Output: `{"exit_code":0,"stdout":"","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`})
 			step, err := newAgentStep(current.ID, 1, "tool", task.StepSucceeded, "Run test", "Tool completed.")
@@ -379,28 +382,25 @@ func TestTestGateMissing(t *testing.T) {
 	})
 }
 
-func TestTestGateComplete(t *testing.T) {
+func TestFixCompletionDoesNotUseE07AsBlanketGate(t *testing.T) {
 	fix := briefPlan(1, true)
 	fix.FixPlan = fixPlanForTest()
 	suite := testGateDigest("go test ./...")
 	targeted := testGateDigest("go test -run TestLogin ./auth")
 	for _, test := range []struct {
-		name       string
-		plan       *task.Plan
-		steps      []task.Step
-		events     []task.Event
-		wantGate   bool
-		wantSubstr string
+		name   string
+		plan   *task.Plan
+		steps  []task.Step
+		events []task.Event
 	}{
 		{name: "no fix plan is unaffected", plan: briefPlan(1, true)},
-		{name: "fix plan with no test records is blocked",
-			plan: fix, wantGate: true, wantSubstr: "failing reproduction test"},
-		{name: "fix plan with only a failing test is blocked",
+		{name: "fix plan with no test records proceeds to independent review", plan: fix},
+		{name: "fix plan with only a failing test proceeds to independent review",
 			plan: fix,
 			steps: []task.Step{{ID: "s1", Kind: "tool", Status: task.StepFailed, Sequence: 1,
 				ToolName: runtimeToolShellExec, FailureReason: taskToolTestFailureReason, RequestDigest: suite}},
-			wantGate: true, wantSubstr: "failing reproduction test"},
-		{name: "fix plan with a new test pass but no suite pass is blocked",
+		},
+		{name: "fix plan with a focused pass proceeds to independent review",
 			plan: fix,
 			steps: []task.Step{
 				{ID: "s1", Kind: "tool", Status: task.StepFailed, Sequence: 1,
@@ -408,8 +408,8 @@ func TestTestGateComplete(t *testing.T) {
 				{ID: "s2", Kind: "tool", Status: task.StepSucceeded, Sequence: 2,
 					ToolName: runtimeToolShellExec, FailureReason: taskToolTestPassedReason, RequestDigest: targeted},
 			},
-			wantGate: true, wantSubstr: "full test suite"},
-		{name: "fix plan with a different passing test is blocked",
+		},
+		{name: "a different passing test proceeds to independent review",
 			plan: fix,
 			steps: []task.Step{
 				{ID: "s1", Kind: "tool", Status: task.StepFailed, Sequence: 1,
@@ -419,8 +419,8 @@ func TestTestGateComplete(t *testing.T) {
 				{ID: "s3", Kind: "tool", Status: task.StepSucceeded, Sequence: 3,
 					ToolName: runtimeToolShellExec, FailureReason: taskToolTestSuitePassedReason, RequestDigest: suite},
 			},
-			wantGate: true, wantSubstr: "failing reproduction test"},
-		{name: "fix plan with both halves passes the gate",
+		},
+		{name: "legacy passing stamps do not change review handoff",
 			plan: fix,
 			steps: []task.Step{
 				{ID: "s1", Kind: "tool", Status: task.StepFailed, Sequence: 1,
@@ -430,7 +430,7 @@ func TestTestGateComplete(t *testing.T) {
 				{ID: "s3", Kind: "tool", Status: task.StepSucceeded, Sequence: 3,
 					ToolName: runtimeToolShellExec, FailureReason: taskToolTestSuitePassedReason, RequestDigest: suite},
 			},
-			// A legacy map event is not evidence of coverage and does not affect E07.
+			// A legacy map event is not evidence of coverage and does not block H07 review.
 			events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded",
 				ImpactMap{Component: "auth/session.go", CoveringTests: []string{"auth/session_test.go"}})}},
 	} {
@@ -461,26 +461,14 @@ func TestTestGateComplete(t *testing.T) {
 				cloudDSHCompletionFor(claimed, "Fixed the login crash.", minimalDiffFileWriteInputs("file-write-test-gate-1", "auth/session.go"))); err != nil {
 				t.Fatalf("Complete() error = %v", err)
 			}
-			if test.wantGate {
-				if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "test_gate_failed" ||
-					store.details.Task.Result == "Fixed the login crash." {
-					t.Fatalf("untested fix was not blocked: status=%q waiting=%q result=%q",
-						store.details.Task.Status, store.details.Task.WaitingReason, store.details.Task.Result)
-				}
-				paused := store.details.Steps[len(store.details.Steps)-1]
-				if !strings.Contains(paused.Summary, test.wantSubstr) {
-					t.Fatalf("paused step summary = %q, want it to name %q", paused.Summary, test.wantSubstr)
-				}
-				return
-			}
 			if store.details.Task.WaitingReason == "test_gate_failed" {
-				t.Fatalf("tested fix was blocked by the test gate: task=%#v", store.details.Task)
+				t.Fatalf("H07 handoff was blocked by the legacy E07 gate: task=%#v", store.details.Task)
 			}
 		})
 	}
 }
 
-func TestTestGateAppliesToHostFixWithoutRecordedWrites(t *testing.T) {
+func TestHostFixWithoutRecordedWritesCanReachIndependentReview(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
 	fixture.executor.store = store
@@ -498,12 +486,13 @@ func TestTestGateAppliesToHostFixWithoutRecordedWrites(t *testing.T) {
 	if err := broker.Complete(context.Background(), current, cloudDSHCompletionFor(current, "Fixed the login crash.", nil)); err != nil {
 		t.Fatal(err)
 	}
-	if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "test_gate_failed" || store.details.Task.Result != "" {
-		t.Fatalf("unverified fix without writes escaped E07: %+v", store.details.Task)
+	if store.details.Task.Status != task.StatusCompleted || store.details.Task.Result != "Fixed the login crash." ||
+		store.details.Task.WaitingReason != "" {
+		t.Fatalf("fix without recorded writes did not reach independent review: %+v", store.details.Task)
 	}
 }
 
-func TestTestGateCompleteOnCheckpointMismatch(t *testing.T) {
+func TestCheckpointMismatchNeverPublishesStaleCompletion(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
 	fixture.executor.store = store
@@ -518,16 +507,15 @@ func TestTestGateCompleteOnCheckpointMismatch(t *testing.T) {
 	}
 	claimed := store.details.Task
 	completion := cloudDSHCompletionFor(claimed, "Fixed the login crash.", minimalDiffFileWriteInputs("file-write-test-gate-1", "auth/session.go"))
-	// The checkpoint changed, but the stale completion still may not deliver
-	// an untested fix.
+	// The checkpoint changed, so this completion belongs to an older DSH state.
 	staleDigest := sha256.Sum256([]byte("stale checkpoint"))
 	store.details.Task.CheckpointDigest = staleDigest[:]
 	if err := broker.Complete(context.Background(), claimed, completion); err != nil {
 		t.Fatalf("Complete() error = %v", err)
 	}
-	if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "test_gate_failed" ||
-		store.details.Task.Result == "Fixed the login crash." {
-		t.Fatalf("stale completion with an untested fix was not blocked: status=%q waiting=%q result=%q",
+	if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "output_verification_pending" ||
+		store.details.Task.Result != "" {
+		t.Fatalf("stale completion was published or not paused: status=%q waiting=%q result=%q",
 			store.details.Task.Status, store.details.Task.WaitingReason, store.details.Task.Result)
 	}
 }
@@ -566,17 +554,16 @@ func impactMapEventForTest(t *testing.T, tool, status string, impact any) task.E
 	return task.Event{Type: "task.step", Sequence: 1, Payload: payload}
 }
 
-func TestTestGateDoesNotTreatImpactMapsAsEvidence(t *testing.T) {
+func TestLegacyTestGateHookDoesNotBlockH07Review(t *testing.T) {
 	for _, test := range []struct {
-		name       string
-		events     []task.Event
-		withTests  bool
-		wantPaused bool
+		name      string
+		events    []task.Event
+		withTests bool
 	}{
 		{name: "no map and actual tests", withTests: true},
 		{name: "legacy map with unchanged caller", withTests: true, events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", ImpactMap{Component: "auth/session.go", Callers: []string{"auth/login.go"}, Dependencies: []string{"auth/token.go"}})}},
-		{name: "unrelated map cannot supply missing tests", wantPaused: true, events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", ImpactMap{Component: "other.go"})}},
-		{name: "old map cannot supply missing tests", wantPaused: true, events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", ImpactMap{Component: "auth/session.go"})}},
+		{name: "unrelated map does not affect review", events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", ImpactMap{Component: "other.go"})}},
+		{name: "old map does not affect review", events: []task.Event{impactMapEventForTest(t, cloudDSHImpactMapToolName, "succeeded", ImpactMap{Component: "auth/session.go"})}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRuntimeToolExecutorFixture(t, nil)
@@ -597,11 +584,8 @@ func TestTestGateDoesNotTreatImpactMapsAsEvidence(t *testing.T) {
 				t.Fatal(err)
 			}
 			paused, err := broker.pauseForTestGate(context.Background(), current, step, store.details)
-			if err != nil || paused != test.wantPaused {
-				t.Fatalf("paused=%t, err=%v; want paused=%t", paused, err, test.wantPaused)
-			}
-			if test.wantPaused && store.details.Task.WaitingReason != "test_gate_failed" {
-				t.Fatalf("task = %+v; missing test evidence must stay blocked", store.details.Task)
+			if err != nil || paused {
+				t.Fatalf("legacy E07 hook paused the H07 handoff: paused=%t err=%v", paused, err)
 			}
 		})
 	}

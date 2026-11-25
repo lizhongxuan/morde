@@ -538,7 +538,21 @@ func (c *Client) localManifest(ctx context.Context, options SyncOptions, directo
 	if report != nil {
 		report(Progress{Stage: string(mordesync.PhaseInventory)})
 	}
-	manifest, err := mordesync.ScanMatchingIdentity(ctx, directory, rootDevice, rootInode)
+	var lastScanReport time.Time
+	lastScanPhase := mordesync.ScanPhase("")
+	manifest, err := mordesync.ScanMatchingIdentityWithProgress(ctx, directory, rootDevice, rootInode, func(scan mordesync.ScanProgress) {
+		if report == nil {
+			return
+		}
+		now := time.Now()
+		if scan.Phase == lastScanPhase && now.Sub(lastScanReport) < 100*time.Millisecond {
+			return
+		}
+		lastScanPhase = scan.Phase
+		lastScanReport = now
+		report(Progress{Stage: string(scan.Phase), FileCount: scan.FilesFound, FilesProcessed: scan.FilesHashed,
+			TotalBytes: scan.BytesFound, BytesProcessed: scan.BytesHashed, CurrentPath: scan.CurrentPath})
+	})
 	if err != nil {
 		return mordesync.Manifest{}, nil, fmt.Errorf("scan local workspace: %w", err)
 	}

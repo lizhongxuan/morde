@@ -9,7 +9,9 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -59,6 +61,92 @@ func TestScanCountsAndHashesFixedBlocks(t *testing.T) {
 	if err := ValidateManifest(manifest); err != nil {
 		t.Fatalf("ValidateManifest() error = %v", err)
 	}
+}
+
+func TestScanMatchingIdentityWithProgressRejectsMismatchedRoot(t *testing.T) {
+	root := t.TempDir()
+	device, inode := selectedRootIdentityForTest(t, root)
+	wrongInode := "0"
+	if inode == wrongInode {
+		wrongInode = "1"
+	}
+	var reports []ScanProgress
+	if _, err := ScanMatchingIdentityWithProgress(context.Background(), root, device, wrongInode, func(value ScanProgress) {
+		reports = append(reports, value)
+	}); err == nil || !strings.Contains(err.Error(), "selected workspace root identity changed") {
+		t.Fatalf("ScanMatchingIdentityWithProgress() error = %v, want root identity mismatch", err)
+	}
+	if len(reports) != 0 {
+		t.Fatalf("identity mismatch reported scan progress before verification: %+v", reports)
+	}
+}
+
+func TestScanMatchingIdentityWithProgressReportsInventoryAndHash(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("identity-checked scan")
+	if err := os.WriteFile(filepath.Join(root, "note.txt"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	device, inode := selectedRootIdentityForTest(t, root)
+	var reports []ScanProgress
+	manifest, err := ScanMatchingIdentityWithProgress(context.Background(), root, device, inode, func(value ScanProgress) {
+		reports = append(reports, value)
+	})
+	if err != nil {
+		t.Fatalf("ScanMatchingIdentityWithProgress() error = %v", err)
+	}
+	if manifest.FileCount != 1 || manifest.TotalBytes != int64(len(content)) {
+		t.Fatalf("identity-matched manifest totals = files:%d bytes:%d", manifest.FileCount, manifest.TotalBytes)
+	}
+	var sawInventory, sawHash bool
+	for _, value := range reports {
+		if value.Phase == PhaseInventory && value.FilesFound == 1 && value.BytesFound == int64(len(content)) {
+			sawInventory = true
+		}
+		if value.Phase == PhaseHash && value.FilesHashed == 1 && value.BytesHashed == int64(len(content)) {
+			sawHash = true
+		}
+	}
+	if !sawInventory || !sawHash {
+		t.Fatalf("identity-matched scan progress omitted inventory/hash totals: %+v", reports)
+	}
+}
+
+func selectedRootIdentityForTest(t *testing.T, directory string) (string, string) {
+	t.Helper()
+	switch runtime.GOOS {
+	case "darwin", "linux", "windows":
+	default:
+		t.Skipf("root identity matching is unsupported on %s", runtime.GOOS)
+	}
+	info, err := os.Stat(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := statValue(info)
+	if !value.IsValid() {
+		t.Skip("filesystem root identity is unavailable")
+	}
+	if device, ok := numericField(value.FieldByName("Dev")); ok {
+		if inode, ok := numericField(value.FieldByName("Ino")); ok {
+			return device, inode
+		}
+	}
+	volume, hasVolume := numericField(value.FieldByName("vol"))
+	high, hasHigh := numericField(value.FieldByName("idxhi"))
+	low, hasLow := numericField(value.FieldByName("idxlo"))
+	if !hasVolume || !hasHigh || !hasLow {
+		t.Skip("filesystem root identity fields are unavailable")
+	}
+	highValue, err := strconv.ParseUint(high, 10, 32)
+	if err != nil {
+		t.Fatalf("parse root file index high bits: %v", err)
+	}
+	lowValue, err := strconv.ParseUint(low, 10, 32)
+	if err != nil {
+		t.Fatalf("parse root file index low bits: %v", err)
+	}
+	return volume, strconv.FormatUint(highValue<<32|lowValue, 10)
 }
 
 func TestScanRecordsHardlinksWithStableCanonicalAnchor(t *testing.T) {

@@ -16,35 +16,6 @@ func failingTestStepForTest(current task.Task, id string) task.Step {
 		ToolName: runtimeToolShellExec, FailureReason: taskToolTestFailureReason, TaskRevision: current.CurrentRevision, Summary: directTestEvidenceSummary}
 }
 
-func TestFailingTestRecord(t *testing.T) {
-	passedTest := task.Step{ID: "s1", Kind: "tool", Status: task.StepSucceeded,
-		ToolName: runtimeToolShellExec, FailureReason: ""}
-	failedNonTest := task.Step{ID: "s2", Kind: "tool", Status: task.StepFailed,
-		ToolName: runtimeToolShellExec, FailureReason: taskToolExecutionFailureReason}
-	failedTest := task.Step{ID: "s3", Kind: "tool", Status: task.StepFailed,
-		ToolName: runtimeToolShellExec, FailureReason: taskToolTestFailureReason}
-	wrongTool := task.Step{ID: "s4", Kind: "tool", Status: task.StepFailed,
-		ToolName: runtimeToolFileWrite, FailureReason: taskToolTestFailureReason}
-	for _, test := range []struct {
-		name  string
-		steps []task.Step
-		want  bool
-	}{
-		{name: "no steps", steps: nil},
-		{name: "only a passing test", steps: []task.Step{passedTest}},
-		{name: "only a failed non-test command", steps: []task.Step{failedNonTest}},
-		{name: "a failed test", steps: []task.Step{failedTest}, want: true},
-		{name: "failed test among other steps", steps: []task.Step{passedTest, failedNonTest, failedTest}, want: true},
-		{name: "marker on the wrong tool does not count", steps: []task.Step{wrongTool}},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := hasFailingTestRecord(test.steps); got != test.want {
-				t.Fatalf("hasFailingTestRecord() = %t, want %t", got, test.want)
-			}
-		})
-	}
-}
-
 func TestFailingTestCommand(t *testing.T) {
 	for _, test := range []struct {
 		command string
@@ -108,8 +79,8 @@ func testFailingActivity(t *testing.T, command string, exitCode int, timedOut bo
 			Command: command, CoveragePaths: []string{"auth"}},
 		verificationPlanRevision: 1,
 		verificationStepID:       "repro",
-		phaseOverride:  "execute",
-		failureReason:  taskToolExecutionFailureReason,
+		phaseOverride:            "execute",
+		failureReason:            taskToolExecutionFailureReason,
 	}
 	step := task.Step{ID: "s1234567", TaskID: "q1234567", Kind: "tool", Status: status}
 	return taskToolCallProgress(activity, step)
@@ -157,12 +128,9 @@ func fixPlanForTest() *task.FixPlan {
 		Alternatives: []string{"restart the service daily"}}
 }
 
-func TestFailingTestWorkspaceWriteGateExemptsHostless(t *testing.T) {
-	// The hostless workspace path has no shell tool, so a failing test can
-	// never be recorded there: the E03 gate is exempt on this path (see
-	// executeWorkspaceTool) and only the E01 brief gate applies. The written
-	// file is inside the fix plan allow set, so the E06 minimal-diff gate
-	// does not fire either.
+func TestFixPlanWorkspaceWriteDoesNotRequireRedTest(t *testing.T) {
+	// Verification is independent from writes. Both hostless and Host-backed
+	// writes remain subject to plan, authorization, approval, and scope gates.
 	complete := briefPlan(1, true)
 	complete.FixPlan = fixPlanForTest()
 	incomplete := briefPlan(1, false)
@@ -226,25 +194,24 @@ func TestFailingTestWorkspaceWriteGateExemptsHostless(t *testing.T) {
 	}
 }
 
-func TestFailingTestHostFileWriteGate(t *testing.T) {
+func TestFixPlanHostFileWriteDoesNotRequireRedTest(t *testing.T) {
 	complete := briefPlan(1, true)
 	complete.FixPlan = fixPlanForTest()
 	for _, test := range []struct {
-		name       string
-		steps      func(task.Task) []task.Step
-		wantSubstr string
+		name  string
+		steps func(task.Task) []task.Step
 	}{
-		{name: "fix plan without any test is rejected", wantSubstr: "failing reproduction test"},
-		{name: "fix plan with only a passing test is rejected",
+		{name: "fix plan without test evidence proceeds to later gates"},
+		{name: "fix plan with only a passing test proceeds to later gates",
 			steps: func(current task.Task) []task.Step {
 				return []task.Step{{ID: "s1", TaskID: current.ID, Kind: "tool", Status: task.StepSucceeded,
 					ToolName: runtimeToolShellExec}}
-			}, wantSubstr: "failing reproduction test"},
-		{name: "fix plan with only a failed non-test command is rejected",
+			}},
+		{name: "fix plan with only a failed non-test command proceeds to later gates",
 			steps: func(current task.Task) []task.Step {
 				return []task.Step{{ID: "s1", TaskID: current.ID, Kind: "tool", Status: task.StepFailed,
 					ToolName: runtimeToolShellExec, FailureReason: taskToolExecutionFailureReason}}
-			}, wantSubstr: "failing reproduction test"},
+			}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRuntimeToolExecutorFixture(t, nil)
@@ -263,19 +230,20 @@ func TestFailingTestHostFileWriteGate(t *testing.T) {
 				t.Fatal(err)
 			}
 			call := ModelToolCall{CallID: "file-write-failing-1", Name: runtimeToolFileWrite,
-				Arguments: `{"workspace_id":"w1234567","path":"reports/result.txt","content":"synthetic"}`,
+				Arguments: `{"workspace_id":"w1234567","path":"auth/session.go","content":"synthetic"}`,
 				TaskFence: &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
 					LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
 					AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
 					AuthorizationVersion: current.Authorization.Version}}
 			call = setCloudDSHPlanStepMetadataForTest(t, call, "repro", &complete.Revision)
-			if result, err := broker.Execute(context.Background(), current, call); err != nil ||
-				result.Status != AgentToolFailed || !strings.Contains(result.Output, test.wantSubstr) {
-				t.Fatalf("host file write was not returned to the Agent with %q: result=%#v, err=%v", test.wantSubstr, result, err)
+			result, err := broker.Execute(context.Background(), current, call)
+			if (err != nil && strings.Contains(err.Error(), "failing reproduction test")) ||
+				strings.Contains(result.Output, "failing reproduction test") {
+				t.Fatalf("host file write was blocked by a universal red-test gate: result=%#v, err=%v", result, err)
 			}
 		})
 	}
-	t.Run("fix plan with a failed test passes the gate", func(t *testing.T) {
+	t.Run("a failed test remains ordinary H07 evidence", func(t *testing.T) {
 		fixture := newRuntimeToolExecutorFixture(t, nil)
 		store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
 		fixture.executor.store = store
@@ -296,21 +264,19 @@ func TestFailingTestHostFileWriteGate(t *testing.T) {
 				AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
 				AuthorizationVersion: current.Authorization.Version}}
 		call = setCloudDSHPlanStepMetadataForTest(t, call, "repro", &complete.Revision)
-		// The fixture has no file-write handler, so the call fails at a later
-		// stage; the assertion is that the failing-test gate did not fire.
-		// The blocked twin above proves the same call is rejected when the
-		// red-test step is absent. The written file is inside the fix plan
-		// allow set, so the minimal-diff gate does not fire either.
+		// The assertion is that the same scoped write path is used regardless
+		// of whether a red-test step exists. The fixture may fail at a later
+		// execution boundary, but no red-test prerequisite may block it.
 		_, err = broker.Execute(context.Background(), current, call)
-		if err != nil && (strings.Contains(err.Error(), "failing reproduction test") || strings.Contains(err.Error(), "plan step metadata")) {
-			t.Fatalf("host file write was rejected by the failing-test gate after a red test: err=%v", err)
+		if err != nil && strings.Contains(err.Error(), "failing reproduction test") {
+			t.Fatalf("host file write was blocked by a universal red-test gate: err=%v", err)
 		}
 	})
 }
 
 func TestTaskPlanFixPlanSubmission(t *testing.T) {
 	store, broker, current := newBriefPlanBroker(t)
-	steps := `[{"id":"repro","title":"Reproduce","status":"pending","completion_criteria":["crash reproduces"]}]`
+	steps := `[{"id":"repro","title":"Reproduce","status":"pending","completion_criteria":["crash reproduces"],"verification_applicability":"check","verification_check":{"kind":"test","basis":"risk_selected","command":"go test ./...","coverage_paths":["auth"]}}]`
 	base := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps
 	fixPlan := `,"fix_plan":{"changed_files":["auth/session.go"],"risks":["session expiry shifts"],"alternatives":["restart daily"]}}`
 

@@ -501,19 +501,20 @@ func TestTaskValidationReviewInputIncludesOnlyStructuredShellExecutionEvidence(t
 	}
 }
 
-// TestTaskValidationReviewPromptIncludesReplaySection covers the E09
-// packet change: the server-attested test re-run rides with the review
-// packet for a fix task, and is omitted for any other task.
+// TestTaskValidationReviewPromptIncludesReplaySection covers the typed H07
+// packet: applicable check identities and their state ride with the review
+// packet, while tasks without a fix plan omit the section.
 func TestTaskValidationReviewPromptIncludesReplaySection(t *testing.T) {
-	replay := &app.TaskValidationReplayEvidence{NewTestPassed: true, FullSuitePassed: true,
-		NewTestFailedSequence: 1, NewTestPassedSequence: 2, FullSuitePassedSequence: 2}
+	replay := &app.TaskValidationReplayEvidence{State: app.TaskValidationReplayPending, PlanRevision: 1,
+		Checks: []app.TaskValidationReplayCheckEvidence{{CheckID: "verify", Kind: task.PlanVerificationCheckTest,
+			Basis: task.PlanVerificationCheckRiskSelected, CoveragePaths: []string{"server"}, Status: app.TaskValidationReplayPending}}}
 	prompt, err := taskValidationReviewPrompt(app.TaskValidationReviewInput{
 		Objective: "Fix the bug", Result: "Fixed", Replay: replay})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(prompt, `"replay":{"new_test_passed":true,"full_suite_passed":true,"new_test_failed_sequence":1,"new_test_passed_sequence":2,"full_suite_passed_sequence":2}`) {
-		t.Fatalf("review prompt without replay section = %s", prompt)
+	if !strings.Contains(prompt, `"replay":{"state":"pending","requirement_set_verified":false,"final_workspace_snapshot_verified":false,"plan_revision":1,"checks":[{"check_id":"verify","kind":"test","basis":"risk_selected","coverage_paths":["server"],"requirement_source_verified":false,"status":"pending"}]}`) {
+		t.Fatalf("review prompt missing typed replay facts = %s", prompt)
 	}
 	prompt, err = taskValidationReviewPrompt(app.TaskValidationReviewInput{Objective: "Fix the bug", Result: "Fixed"})
 	if err != nil {
@@ -524,9 +525,9 @@ func TestTaskValidationReviewPromptIncludesReplaySection(t *testing.T) {
 	}
 }
 
-// TestTaskValidationReviewInputSetsReplayForFixTask covers the E09 wiring
-// in reviewInput: a fix task's snapshot steps re-derive the test gate
-// into the replay section; a task without a fix plan gets none.
+// TestTaskValidationReviewInputSetsReplayForFixTask covers the H07 wiring
+// in reviewInput: it forwards server-read typed evidence, and missing facts
+// stay explicitly pending regardless of legacy step stamps.
 func TestTaskValidationReviewInputSetsReplayForFixTask(t *testing.T) {
 	result := "Fixed the login bug and the suite passes."
 	digest := sha256.Sum256([]byte(result))
@@ -552,12 +553,30 @@ func TestTaskValidationReviewInputSetsReplayForFixTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Replay == nil || !got.Replay.NewTestPassed || !got.Replay.FullSuitePassed ||
-		got.Replay.NewTestFailedSequence != 1 || got.Replay.NewTestPassedSequence != 2 || got.Replay.FullSuitePassedSequence != 2 {
-		t.Fatalf("review input replay = %+v, want the passing gate with sequences 1/2/2", got.Replay)
+	if got.Replay == nil || got.Replay.State != app.TaskValidationReplayPending || got.Replay.PlanRevision != 1 ||
+		len(got.Replay.Checks) != 0 || len(got.Replay.PlanStepsWithoutChecks) != 0 {
+		t.Fatalf("review input replay = %+v, want explicit pending evidence for an undeclared check", got.Replay)
+	}
+
+	snapshots.details.ValidationReplayEvidence = &app.TaskValidationReplayEvidence{State: app.TaskValidationReplayPass,
+		RequirementSetVerified: true, FinalWorkspaceSnapshotVerified: true,
+		PlanRevision: 1, Checks: []app.TaskValidationReplayCheckEvidence{{CheckID: "verify", Status: app.TaskValidationReplayPass}}}
+	worker = TaskValidationReviewWorker{options: TaskValidationReviewWorkerOptions{Snapshots: snapshots}}
+	got, err = worker.reviewInput(context.Background(), claim)
+	if err != nil || got.Replay == nil || got.Replay.State != app.TaskValidationReplayPass ||
+		len(got.Replay.Checks) != 1 || got.Replay.Checks[0].CheckID != "verify" {
+		t.Fatalf("review input did not preserve the server replay snapshot: replay=%+v err=%v", got.Replay, err)
+	}
+
+	snapshots.details.ValidationReplayEvidence.RequirementSetVerified = false
+	worker = TaskValidationReviewWorker{options: TaskValidationReviewWorkerOptions{Snapshots: snapshots}}
+	got, err = worker.reviewInput(context.Background(), claim)
+	if err != nil || got.Replay == nil || got.Replay.State != app.TaskValidationReplayPending {
+		t.Fatalf("review input exposed pass without a verified complete requirement set: replay=%+v err=%v", got.Replay, err)
 	}
 
 	snapshots.details.Plan = nil
+	snapshots.details.ValidationReplayEvidence = nil
 	worker = TaskValidationReviewWorker{options: TaskValidationReviewWorkerOptions{Snapshots: snapshots}}
 	got, err = worker.reviewInput(context.Background(), claim)
 	if err != nil {

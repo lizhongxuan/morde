@@ -17,7 +17,9 @@ func PendingTaskValidationReplayEvidence(plan *task.Plan) *TaskValidationReplayE
 	evidence := &TaskValidationReplayEvidence{State: TaskValidationReplayPending, PlanRevision: plan.Revision, Checks: make([]TaskValidationReplayCheckEvidence, 0)}
 	for _, step := range plan.Steps {
 		if step.VerificationCheck == nil {
-			evidence.PlanStepsWithoutChecks = append(evidence.PlanStepsWithoutChecks, step.ID)
+			if step.VerificationApplicability != task.PlanVerificationApplicabilityNotApplicable {
+				evidence.PlanStepsWithoutChecks = append(evidence.PlanStepsWithoutChecks, step.ID)
+			}
 			continue
 		}
 		check := TaskValidationReplayCheckEvidence{CheckID: step.ID, Status: TaskValidationReplayPending,
@@ -51,9 +53,16 @@ func EvaluateTaskValidationPlanReplay(plan task.Plan, evidence *TaskValidationRe
 	}
 	expected := make([]expectedCheck, 0, len(plan.Steps))
 	expectedByID := make(map[string]task.PlanVerificationCheck, len(plan.Steps))
+	unresolvedApplicability := make([]string, 0)
 	for _, step := range plan.Steps {
 		if step.VerificationCheck == nil {
+			if step.VerificationApplicability != task.PlanVerificationApplicabilityNotApplicable {
+				unresolvedApplicability = append(unresolvedApplicability, step.ID)
+			}
 			continue
+		}
+		if step.VerificationApplicability == task.PlanVerificationApplicabilityNotApplicable {
+			return TaskValidationReplayPending
 		}
 		expected = append(expected, expectedCheck{stepID: step.ID, check: *step.VerificationCheck})
 		expectedByID[step.ID] = *step.VerificationCheck
@@ -61,9 +70,10 @@ func EvaluateTaskValidationPlanReplay(plan task.Plan, evidence *TaskValidationRe
 	if len(expected) == 0 {
 		return TaskValidationReplayPending
 	}
-	// A fix plan whose steps predate or omit typed check declarations has not
-	// established which checks apply. A passing subset cannot close H07.
-	if len(evidence.PlanStepsWithoutChecks) != 0 {
+	// An implementation-only step must be explicitly marked not_applicable.
+	// Missing applicability remains unknown for legacy plans and cannot close
+	// H07. The evidence projection must name the same unresolved steps.
+	if !equalReplayStepIDs(unresolvedApplicability, evidence.PlanStepsWithoutChecks) || len(unresolvedApplicability) != 0 {
 		return TaskValidationReplayPending
 	}
 	provided := make(map[string]TaskValidationReplayCheckEvidence, len(evidence.Checks))
@@ -92,7 +102,7 @@ func EvaluateTaskValidationPlanReplay(plan task.Plan, evidence *TaskValidationRe
 		}
 		switch fact.Status {
 		case TaskValidationReplayFail:
-			if fact.ExitCode != 0 || fact.TimedOut {
+			if (fact.ExitCode != 0 || fact.TimedOut) && fact.WorkspaceManifestSHA256Before == fact.WorkspaceManifestSHA256After {
 				hasFailure = true
 			} else {
 				hasUnknown = true
@@ -120,7 +130,25 @@ func EvaluateTaskValidationPlanReplay(plan task.Plan, evidence *TaskValidationRe
 	if hasUnknown {
 		return TaskValidationReplayPending
 	}
+	// Matching receipts prove only that the plan's declared checks ran. They
+	// do not prove that the plan captured every explicit user/project
+	// requirement (for example, a requested full suite omitted by the plan).
+	if !evidence.RequirementSetVerified || !evidence.FinalWorkspaceSnapshotVerified {
+		return TaskValidationReplayPending
+	}
 	return TaskValidationReplayPass
+}
+
+func equalReplayStepIDs(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func validTaskValidationReplayCheckIdentity(plan task.Plan, checkID string, check task.PlanVerificationCheck,

@@ -85,11 +85,15 @@ func attestTaskValidationShellResult(current task.Task, planRevision int64, chec
 func attestReconciledTaskValidationShellResult(ctx context.Context, request AgentToolRequest, operation task.Operation,
 	result AgentToolResult) AgentToolResult {
 	if result.Status != AgentToolSucceeded && result.Status != AgentToolFailed || request.Call.Name != runtimeToolShellExec ||
-		request.Task.ID == "" || request.OperationID != operation.ID || !bytes.Equal(request.OperationRequestHash, operation.RequestHash) {
+		request.Task.ID == "" || request.Task.CurrentRevision == nil || request.OperationID != operation.ID ||
+		operation.TaskID != request.Task.ID || operation.TaskRevision == nil || *operation.TaskRevision != *request.Task.CurrentRevision ||
+		operation.CallID != request.Call.CallID || operation.ToolName != runtimeToolShellExec || operation.BindingVersion < 1 ||
+		len(request.OperationRequestHash) != sha256.Size || !bytes.Equal(request.OperationRequestHash, operation.RequestHash) {
 		return result
 	}
 	activity, ok := cloudDSHToolActivityFromContext(ctx)
-	if !ok || activity.current.ID != request.Task.ID || activity.verificationCheck == nil ||
+	if !ok || activity.current.ID != request.Task.ID || activity.call.CallID != request.Call.CallID ||
+		activity.verificationCheck == nil ||
 		activity.verificationPlanRevision < 1 || activity.verificationStepID == "" {
 		return result
 	}

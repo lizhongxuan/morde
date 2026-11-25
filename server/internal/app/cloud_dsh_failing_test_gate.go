@@ -4,65 +4,13 @@ import (
 	"encoding/json"
 	"strings"
 
-	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 )
 
-// hasFailingTestRecord reports whether the task steps contain a failed typed
-// test check. A step counts only when the broker matched the plan's exact
-// check command and the run failed with a non-zero exit or a timeout. That record is
-// stamped on the step when the shell result is committed, because a stored
-// step carries no command text or exit code of its own: the command and exit
-// code live only in the sealed step detail. A passing test does not count,
-// and neither does a failed non-test command.
-func hasFailingTestRecord(steps []task.Step) bool {
-	for _, step := range steps {
-		if step.ToolName == runtimeToolShellExec && step.Status == task.StepFailed &&
-			step.FailureReason == taskToolTestFailureReason {
-			return true
-		}
-	}
-	return false
-}
-
-// requireFailingTestRecord is the write gate (E03): a task whose plan carries
-// a fix plan may only mutate the workspace after a failing reproduction test
-// has run in this task. It applies only on paths where the task can run a
-// shell test: the host file_write path. Hostless workspace writes are exempt
-// because that path has no shell tool, so a failing test could never be
-// recorded and the gate would deadlock every fix task. Tasks without a fix
-// plan are unaffected, so ordinary writes and feature work are never blocked
-// by this gate. The error tells the agent what to do next; it must not
-// surface as a user question.
-func requireFailingTestRecord(details TaskDetails) error {
-	if details.Plan == nil || details.Plan.FixPlan == nil {
-		return nil
-	}
-	if !taskPlanHasTypedTestCheck(details.Plan) {
-		return domain.InvalidArgument("task_plan.verification_check", "a fix plan requires an explicit typed test check")
-	}
-	if hasFailingTestRecord(currentRevisionTestSteps(details.Steps, details.Task.CurrentRevision)) {
-		return nil
-	}
-	return domain.InvalidArgument("task_plan.failing_test", "run a failing reproduction test before changing code")
-}
-
-func taskPlanHasTypedTestCheck(plan *task.Plan) bool {
-	if plan == nil {
-		return false
-	}
-	for _, step := range plan.Steps {
-		if step.VerificationCheck != nil && step.VerificationCheck.Kind == task.PlanVerificationCheckTest &&
-			validTaskPlanVerificationCommand(*step.VerificationCheck) {
-			return true
-		}
-	}
-	return false
-}
-
 // failingTestFailureReason returns taskToolTestFailureReason only for a
 // failed execution of the exact typed test check selected in the current
-// plan. Other shell failures and heuristic test stamps never unlock a fix.
+// plan. This is historical step metadata; it is not a write or completion
+// gate. H07 derives its verdict from the durable typed-check receipt.
 func failingTestFailureReason(activity cloudDSHToolActivity) string {
 	if activity.call.Name != runtimeToolShellExec || activity.shellExecution == nil ||
 		(!activity.shellExecution.TimedOut && activity.shellExecution.ExitCode == 0) {

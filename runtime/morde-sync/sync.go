@@ -195,10 +195,17 @@ func Scan(ctx context.Context, directory string, report func(ScanProgress)) (Man
 // ScanMatchingIdentity reads only the selected directory after confirming that
 // the opened root still has the device and inode recorded by the PC client.
 func ScanMatchingIdentity(ctx context.Context, directory, device, inode string) (Manifest, error) {
+	return ScanMatchingIdentityWithProgress(ctx, directory, device, inode, nil)
+}
+
+// ScanMatchingIdentityWithProgress scans only the selected directory after
+// confirming that the opened root still has the device and inode recorded by
+// the PC client, reporting the same inventory and hash progress as Scan.
+func ScanMatchingIdentityWithProgress(ctx context.Context, directory, device, inode string, report func(ScanProgress)) (Manifest, error) {
 	if device == "" || inode == "" {
 		return Manifest{}, errors.New("selected workspace identity is required")
 	}
-	return scanWithIdentity(ctx, directory, device, inode, nil)
+	return scanWithIdentity(ctx, directory, device, inode, report)
 }
 
 func scanWithIdentity(ctx context.Context, directory, device, inode string, report func(ScanProgress)) (Manifest, error) {

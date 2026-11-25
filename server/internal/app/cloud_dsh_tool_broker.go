@@ -1552,22 +1552,14 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 			return result, gateErr
 		}
 	}
-	// Write gates (E01, E03, E06): a host file write is refused while the task has
-	// a submitted plan with an incomplete brief, while no failing reproduction
-	// test has run on a fix task, and while the written file is outside the
-	// fix plan's changed_files allow set. The brief is checked first, then the
-	// failing test, then the minimal diff. Read-only calls are unaffected.
+	// Write gates (E01, E06): a host file write is refused while the task has a
+	// submitted plan with an incomplete brief or while the written file is
+	// outside the fix plan's changed_files allow set. Verification is evaluated
+	// independently by H07; a red test is not a universal pre-write condition.
 	if call.Name == runtimeToolFileWrite {
 		if err := requireCompleteTaskPlanBrief(details); err != nil {
 			if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput,
 				"Task plan brief is incomplete; no action was executed."); handled {
-				return result, gateErr
-			}
-			return AgentToolResult{}, err
-		}
-		if err := requireFailingTestRecord(details); err != nil {
-			if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput,
-				"Reproduction test is missing; no action was executed."); handled {
 				return result, gateErr
 			}
 			return AgentToolResult{}, err

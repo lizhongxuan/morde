@@ -279,13 +279,14 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 					}
 				}
 			}
-			// Classification failed after every model-side recovery. Use
-			// bounded fallbacks only where they do not execute task-control
-			// actions; ambiguous requests are clarified without execution.
-			w.options.Logger.Warn("conversation route classification failed; requesting safe clarification",
+			// Classification failure is an infrastructure outcome, not evidence
+			// that the user's goal is ambiguous. Keep the accepted source message
+			// retryable; the route ledger decides whether an unknown call must be
+			// reconciled before a new attempt can be dispatched.
+			w.options.Logger.Warn("conversation route classification failed; preserving source for retry",
 				zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
 				zap.String("failure_code", string(domain.CodeOf(err))))
-			decision = conversationRouteClassifyFallback(classifyContext)
+			return true, w.failRoute(ctx, claim, "model_unavailable", err)
 		}
 	}
 	if decision.InvalidOutput {
@@ -306,7 +307,8 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 			zap.String("failure_code", "invalid_model_output"),
 			zap.Int("invalid_output_length_bytes", decision.InvalidOutputLengthBytes),
 			zap.Bool("invalid_output_utf8_valid", decision.InvalidOutputUTF8Valid))
-		decision = conversationRouteClassifyFallback(classifyContext)
+		return true, w.failRoute(ctx, claim, "routing_action_unavailable",
+			errors.New("conversation route model output remained invalid after repair"))
 	}
 	decision = safeConversationRouteDecision(classifyContext, decision)
 	if decision.InvalidOutput {

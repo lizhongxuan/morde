@@ -533,7 +533,16 @@ func loadTaskValidationExecutionFacts(ctx context.Context, tx pgx.Tx, claim app.
 		return fmt.Errorf("read Task validation plan: %w", err)
 	}
 	hasFixPlan := plan != nil && plan.FixPlan != nil
+	hasTypedCheck := false
 	if hasFixPlan {
+		for _, step := range plan.Steps {
+			if step.VerificationCheck != nil {
+				hasTypedCheck = true
+				break
+			}
+		}
+	}
+	if hasFixPlan && hasTypedCheck {
 		current, err := readTaskValidationReplayTask(ctx, tx, claim)
 		if err != nil {
 			return err

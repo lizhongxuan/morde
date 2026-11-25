@@ -93,7 +93,7 @@ func TestMinimalDiffHostFileWriteGate(t *testing.T) {
 		{name: "out-of-scope file is rejected", plan: fix, path: "other/file.go", withRedTest: true, wantSubstr: "fix_plan.changed_files"},
 		{name: "empty allow set rejects any write", plan: empty, path: "auth/session.go", withRedTest: true, wantSubstr: "fix_plan.changed_files"},
 		{name: "no fix plan is unaffected", plan: briefPlan(1, true), path: "other/file.go", wantAllow: true},
-		{name: "failing-test gate runs before the minimal-diff gate", plan: fix, path: "other/file.go", wantSubstr: "failing reproduction test"},
+		{name: "H07 evidence does not preempt the scoped-write gate", plan: fix, path: "other/file.go", wantSubstr: "fix_plan.changed_files"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRuntimeToolExecutorFixture(t, nil)
