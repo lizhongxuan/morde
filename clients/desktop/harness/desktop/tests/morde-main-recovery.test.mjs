@@ -1876,6 +1876,17 @@ test('project sync exposes only the default computer and pauses selection when i
     assert.match(targets[0].blockedMessage, /默认云端电脑未运行/);
     await assert.rejects(h.invoke('morde:project-select-directory', 'h7654321', 'w7654321'), /默认云端电脑已更改/);
     await assert.rejects(h.invoke('morde:project-select-directory', 'h1234567', 'w1234567'), /默认云端电脑未运行/);
+    defaultHost.state_reason = 'restore_failed';
+    const failedRecoveryTargets = await h.invoke('morde:project-upload-targets');
+    assert.match(failedRecoveryTargets[0].blockedMessage, /电脑恢复失败/);
+    assert.match(failedRecoveryTargets[0].blockedMessage, /不会自动重试或切换/);
+    await assert.rejects(h.invoke('morde:project-select-directory', 'h1234567', 'w1234567'), /电脑恢复失败/);
+    defaultHost.state_reason = 'restore_unknown';
+    const unknownRecoveryTargets = await h.invoke('morde:project-upload-targets');
+    assert.match(unknownRecoveryTargets[0].blockedMessage, /恢复结果待核对/);
+    assert.match(unknownRecoveryTargets[0].blockedMessage, /确认前不要重试/);
+    await assert.rejects(h.invoke('morde:project-select-directory', 'h1234567', 'w1234567'), /确认前不要重试/);
+    defaultHost.state_reason = '';
     defaultHost.state = 'running';
     defaultHost.workspace_runtime_online = false;
     const offlineTargets = await h.invoke('morde:project-upload-targets');

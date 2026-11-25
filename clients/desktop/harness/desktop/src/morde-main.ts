@@ -1589,6 +1589,16 @@ function closeHostWindows(): void { void closeNativeWorkbenchEmbed().catch(() =>
 
 type HostProjectUploadContext = { host: Record<string, unknown>; workspaceBinding: Record<string, unknown> };
 
+function projectHostUnavailableMessage(host: Record<string, unknown>): string {
+  if (host.state_reason === "restore_failed") {
+    return "默认云端电脑恢复失败，项目同步已暂停。请联系管理员检查失败原因；不会自动重试或切换到其他电脑。";
+  }
+  if (host.state_reason === "restore_unknown") {
+    return "默认云端电脑恢复结果待核对，项目同步已暂停。请先核实当前运行状态；确认前不要重试，也不会切换到其他电脑。";
+  }
+  return "默认云端电脑未运行，项目同步已暂停；启动后可重试，不会切换到其他电脑。";
+}
+
 async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown, workspaceIDInput: unknown, requireRunning = false): Promise<HostProjectUploadContext> {
   const hostID = checkedId("host", hostIDInput);
   const workspaceID = checkedId("workspace", workspaceIDInput);
@@ -1599,7 +1609,7 @@ async function checkedOwnedHostWorkspace(auth: Credentials, hostIDInput: unknown
     !["running", "stopped"].includes(String(hostValue.state)) || !Array.isArray(workspaces) || workspaces.length !== 1) {
     throw new Error("请选择自己拥有且文件目录已就绪的云端电脑");
   }
-  if (requireRunning && hostValue.state !== "running") throw new Error("默认云端电脑未运行，项目同步已暂停；启动后可重试。");
+  if (requireRunning && hostValue.state !== "running") throw new Error(projectHostUnavailableMessage(hostValue));
   if (requireRunning && hostValue.workspace_runtime_online !== true) throw new Error("默认云端电脑的文件服务未确认在线，项目同步已暂停。");
   const binding = workspaces[0] as Record<string, unknown> | null;
   const workspace = binding?.workspace as Record<string, unknown> | null;
@@ -1643,7 +1653,7 @@ async function listProjectUploadTargets(): Promise<ProjectTarget[]> {
       folderID: folder.folderID, projectName: folder.projectName!, relativePath: folder.relativePath, state: folder.state,
     }));
     const blockedMessages = [
-      ...(host.state === "running" ? [] : ["默认云端电脑未运行，当前已暂停项目同步。启动后可重试；不会切换到其他电脑。"]),
+      ...(host.state === "running" ? [] : [projectHostUnavailableMessage(host)]),
       ...(host.state !== "running" || host.workspace_runtime_online === true ? [] : ["默认云端电脑的文件服务未确认在线，当前已暂停项目同步。"]),
       ...(rootFolder ? ["此电脑仍有旧版整目录同步，不能同时启用项目同步。"] : []),
     ];
