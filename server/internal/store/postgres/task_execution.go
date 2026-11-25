@@ -31,6 +31,50 @@ func validPendingText(value string) bool {
 	return strings.TrimSpace(value) != "" && utf8.ValidString(value) && utf8.RuneCountInString(value) <= 512
 }
 
+// validPendingOptionalText reports whether an approval body text field is
+// absent (a pre-migration row) or within bounds. Absence is allowed here:
+// the app layer requires the fields on new sensitive-modification approvals,
+// but the store must keep accepting legacy rows and media-save commits whose
+// builder does not set them.
+func validPendingOptionalText(value string) bool {
+	return value == "" || validPendingText(value)
+}
+
+// validPendingApprovalCost reports whether a stored approval cost is absent
+// (unknown) or well formed.
+func validPendingApprovalCost(cost *task.ApprovalCost) bool {
+	return cost == nil || cost.Validate() == nil
+}
+
+// pendingApprovalCostColumns converts an approval cost to its three nullable
+// stored columns. A nil cost (unknown) stores all three as NULL.
+func pendingApprovalCostColumns(cost *task.ApprovalCost) (pgtype.Int8, pgtype.Text, pgtype.Text) {
+	if cost == nil {
+		return pgtype.Int8{}, pgtype.Text{}, pgtype.Text{}
+	}
+	return pgtype.Int8{Int64: cost.AmountMicros, Valid: true},
+		pgtype.Text{String: cost.Currency, Valid: true},
+		pgtype.Text{String: cost.Basis, Valid: true}
+}
+
+// scanPendingApprovalCost rebuilds an approval cost from its three nullable
+// stored columns. A NULL amount means the cost is unknown.
+func scanPendingApprovalCost(micros pgtype.Int8, currency, basis pgtype.Text) *task.ApprovalCost {
+	if !micros.Valid || !currency.Valid || !basis.Valid {
+		return nil
+	}
+	return &task.ApprovalCost{AmountMicros: micros.Int64, Currency: currency.String, Basis: basis.String}
+}
+
+// nullablePendingText converts an approval body text field to its nullable
+// stored column. An empty field stores as NULL (a pre-migration value).
+func nullablePendingText(value string) pgtype.Text {
+	if value == "" {
+		return pgtype.Text{}
+	}
+	return pgtype.Text{String: value, Valid: true}
+}
+
 func validClarificationText(value string) bool {
 	return strings.TrimSpace(value) != "" && !strings.ContainsRune(value, '\x00') && utf8.ValidString(value) && utf8.RuneCountInString(value) <= 16384
 }
@@ -167,11 +211,19 @@ func (s *Store) GetTask(ctx context.Context, id, ownerID string) (app.TaskDetail
 		var requestHash []byte
 		var pendingRevision pgtype.Int8
 		var expiresAt, respondedAt pgtype.Timestamptz
-		err = tx.QueryRow(ctx, `SELECT id, task_id, version, kind, title, object, content, impact, call_id, COALESCE(media_preview_operation_id,''), tool_name,
+		var evidencePointer, triggerRule, rejectionConsequence pgtype.Text
+		var currentCostMicros, totalCostMicros pgtype.Int8
+		var currentCostCurrency, currentCostBasis, totalCostCurrency, totalCostBasis pgtype.Text
+		err = tx.QueryRow(ctx, `SELECT id, task_id, version, kind, title, object, content, impact,
+evidence_pointer, current_cost_micros, current_cost_currency, current_cost_basis,
+total_cost_micros, total_cost_currency, total_cost_basis, trigger_rule, rejection_consequence,
+call_id, COALESCE(media_preview_operation_id,''), tool_name,
 task_revision, request_hash, runtime_generation, runtime_instance_id, control_version, status, decision, created_at, expires_at, responded_at
 FROM task_pending_requests WHERE task_id=$1 ORDER BY version DESC LIMIT 1`, id).Scan(
 			&pending.ID, &pending.TaskID, &pending.Version, &pending.Kind, &pending.Title, &pending.Object, &pending.Content,
-			&pending.Impact, &pending.CallID, &pending.MediaPreviewOperationID, &pending.ToolName, &pendingRevision, &requestHash, &pending.RuntimeGeneration,
+			&pending.Impact, &evidencePointer, &currentCostMicros, &currentCostCurrency, &currentCostBasis,
+			&totalCostMicros, &totalCostCurrency, &totalCostBasis, &triggerRule, &rejectionConsequence,
+			&pending.CallID, &pending.MediaPreviewOperationID, &pending.ToolName, &pendingRevision, &requestHash, &pending.RuntimeGeneration,
 			&pending.RuntimeInstanceID, &pending.ControlVersion, &pending.Status, &pending.Decision, &pending.CreatedAt, &expiresAt, &respondedAt)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read latest task pending request: %w", err)
@@ -179,6 +231,17 @@ FROM task_pending_requests WHERE task_id=$1 ORDER BY version DESC LIMIT 1`, id).
 		var pendingRequest *task.PendingRequest
 		if err == nil {
 			pending.RequestHash = append([]byte(nil), requestHash...)
+			if evidencePointer.Valid {
+				pending.EvidencePointer = evidencePointer.String
+			}
+			pending.CurrentCost = scanPendingApprovalCost(currentCostMicros, currentCostCurrency, currentCostBasis)
+			pending.TotalCost = scanPendingApprovalCost(totalCostMicros, totalCostCurrency, totalCostBasis)
+			if triggerRule.Valid {
+				pending.TriggerRule = triggerRule.String
+			}
+			if rejectionConsequence.Valid {
+				pending.RejectionConsequence = rejectionConsequence.String
+			}
 			if pendingRevision.Valid {
 				revision := pendingRevision.Int64
 				pending.TaskRevision = &revision
@@ -1658,7 +1721,10 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 			(pending.TaskRevision != nil && *pending.TaskRevision < 0) ||
 			pending.RuntimeGeneration < 0 || (!hostlessWorkspaceApproval && pending.RuntimeInstanceID == "") || pending.ControlVersion < 0 || pending.CallID == "" || len(pending.CallID) > 256 ||
 			pending.ToolName == "" || len(pending.ToolName) > 128 || !validPendingText(pending.Title) || !validPendingText(pending.Object) ||
-			!validPendingText(pending.Content) || !validPendingText(pending.Impact) || progress.Status != task.StatusWaitingUser || progress.WaitingReason != "approval_required" {
+			!validPendingText(pending.Content) || !validPendingText(pending.Impact) ||
+			!validPendingOptionalText(pending.EvidencePointer) || !validPendingOptionalText(pending.TriggerRule) ||
+			!validPendingOptionalText(pending.RejectionConsequence) || !validPendingApprovalCost(pending.CurrentCost) ||
+			!validPendingApprovalCost(pending.TotalCost) || progress.Status != task.StatusWaitingUser || progress.WaitingReason != "approval_required" {
 			return task.Event{}, domain.InvalidArgument("pending_request", "pending approval request fields are invalid")
 		}
 	}
@@ -2341,11 +2407,20 @@ RETURNING event_seq`,
 			if pending.MediaPreviewOperationID != "" {
 				mediaOperationID = pgtype.Text{String: pending.MediaPreviewOperationID, Valid: true}
 			}
+			currentCostMicros, currentCostCurrency, currentCostBasis := pendingApprovalCostColumns(pending.CurrentCost)
+			totalCostMicros, totalCostCurrency, totalCostBasis := pendingApprovalCostColumns(pending.TotalCost)
 			_, err = tx.Exec(ctx, `INSERT INTO task_pending_requests
-(id, task_id, version, task_revision, kind, title, object, content, impact, call_id, media_preview_operation_id, tool_name, request_hash,
+(id, task_id, version, task_revision, kind, title, object, content, impact, evidence_pointer,
+ current_cost_micros, current_cost_currency, current_cost_basis,
+ total_cost_micros, total_cost_currency, total_cost_basis, trigger_rule, rejection_consequence,
+ call_id, media_preview_operation_id, tool_name, request_hash,
  runtime_generation, runtime_instance_id, control_version, status, expires_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17)`,
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,'pending',$26)`,
 				pending.ID, pending.TaskID, pending.Version, pending.TaskRevision, pending.Kind, pending.Title, pending.Object, pending.Content, pending.Impact,
+				nullablePendingText(pending.EvidencePointer),
+				currentCostMicros, currentCostCurrency, currentCostBasis,
+				totalCostMicros, totalCostCurrency, totalCostBasis,
+				nullablePendingText(pending.TriggerRule), nullablePendingText(pending.RejectionConsequence),
 				pending.CallID, mediaOperationID, pending.ToolName, pending.RequestHash, pending.RuntimeGeneration, pending.RuntimeInstanceID, pending.ControlVersion, pending.ExpiresAt)
 			if err != nil {
 				return fmt.Errorf("persist task pending request: %w", err)

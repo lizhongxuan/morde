@@ -962,6 +962,21 @@ func (b *CloudDSHToolBroker) executeWorkspaceTool(ctx context.Context, claimed t
 	current.Usage = usage
 	var approvedWrite *task.PendingRequest
 	if call.Name == cloudDSHWorkspaceWriteToolName {
+		// E03: the failing-test gate runs here too. Workspace writes are
+		// hostless by construction, so the gate exempts them (known design
+		// gap, kept deliberately); the call still documents the exemption
+		// point and is where the E06 minimal-diff check also runs.
+		if err := CheckFailingTestGate(details.Plan, true); err != nil {
+			return AgentToolResult{}, err
+		}
+		// E06: the written file must be inside the recorded impact map. An
+		// unreadable path is left to the normal validation below.
+		var writeArgs cloudDSHWorkspaceWriteArguments
+		if decodeStrictRuntimeResult([]byte(call.Arguments), &writeArgs) == nil && writeArgs.Path != "" {
+			if err := CheckMinimalDiffGate(details.Plan, []string{writeArgs.Path}); err != nil {
+				return AgentToolResult{}, err
+			}
+		}
 		approval, handled, err := b.authorizeWorkspaceWrite(ctx, details, current, step, usage, call, checkpointOutput)
 		if err != nil || handled {
 			return approval, err
@@ -1068,6 +1083,7 @@ func (b *CloudDSHToolBroker) authorizeWorkspaceWrite(ctx context.Context, detail
 		version = pending.Version + 1
 	}
 	approval := cloudDSHWorkspaceWriteApproval(write, current.WorkspaceID)
+	approval = withStepEvidencePointer(approval, step)
 	newPending, err := newHostlessWorkspaceApproval(current, call, requestHash[:], approval, version)
 	if err != nil {
 		return AgentToolResult{}, true, err
@@ -1085,7 +1101,7 @@ func (b *CloudDSHToolBroker) pauseForExistingWorkspaceApproval(ctx context.Conte
 		return AgentToolResult{}, true, domain.NewError(domain.CodeInvalidState, "pending Workspace approval is invalid")
 	}
 	step.Status, step.Title, step.Summary = task.StepWaitingUser, "Approval required: "+pending.ToolName, pending.Content
-	approval := AgentApprovalRequest{Object: pending.Object, Content: pending.Content, Impact: pending.Impact}
+	approval := approvalRequestFromPending(pending)
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusWaitingUser, "approval_required", "task.waiting_user", approval); err != nil {
 		return AgentToolResult{}, true, err
 	}
@@ -1106,9 +1122,18 @@ func newHostlessWorkspaceApproval(current task.Task, call ModelToolCall, request
 		return nil, fmt.Errorf("generate Workspace approval ID: %w", err)
 	}
 	revision := *current.CurrentRevision
-	return &task.PendingRequest{ID: id, TaskID: current.ID, Version: version, TaskRevision: &revision, Kind: "approval",
+	pending := &task.PendingRequest{ID: id, TaskID: current.ID, Version: version, TaskRevision: &revision, Kind: "approval",
 		Title: "Approve Workspace file save", Object: approval.Object, Content: approval.Content, Impact: approval.Impact,
-		CallID: call.CallID, ToolName: call.Name, RequestHash: append([]byte(nil), requestHash...), Status: task.PendingRequestPending}, nil
+		EvidencePointer: approval.EvidencePointer, CurrentCost: approval.CurrentCost, TotalCost: approval.TotalCost,
+		TriggerRule: approval.TriggerRule, RejectionConsequence: approval.RejectionConsequence,
+		CallID: call.CallID, ToolName: call.Name, RequestHash: append([]byte(nil), requestHash...), Status: task.PendingRequestPending}
+	// E05: a sensitive modification must not produce a card without its five
+	// body fields. Costs may stay unknown (nil), but the evidence pointer,
+	// the trigger rule, and the rejection consequence must be present.
+	if missing := pending.MissingEvidenceFields(); len(missing) > 0 {
+		return nil, domain.NewError(domain.CodeInvalidState, "approval request is missing evidence fields: "+strings.Join(missing, ", "))
+	}
+	return pending, nil
 }
 
 func cloudDSHWorkspaceWriteApproval(write cloudDSHWorkspaceWriteArguments, workspaceID string) AgentApprovalRequest {
@@ -1127,7 +1152,9 @@ func cloudDSHWorkspaceWriteApproval(write cloudDSHWorkspaceWriteArguments, works
 		Object: "Save a file to your Workspace",
 		Content: fmt.Sprintf("Path: %s\nWorkspace: %s · revision %d\nSize: %d bytes · SHA-256: %x\nPreview: %s",
 			pathPreview, workspaceID, write.ExpectedRevision, len(write.Content), contentHash, preview),
-		Impact: "This writes the shown file into your saved Workspace only after you approve. It does not run shell commands or send data externally.",
+		Impact:               "This writes the shown file into your saved Workspace only after you approve. It does not run shell commands or send data externally.",
+		TriggerRule:          ApprovalTriggerWorkspaceWrite,
+		RejectionConsequence: ApprovalRejectionConsequenceWorkspaceWrite,
 	}
 }
 

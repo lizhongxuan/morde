@@ -542,6 +542,29 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 	}); err != nil {
 		return err
 	}
+	// E06: completion recheck. Writes were already gated one by one; this
+	// catches anything that slipped through (for example a write recorded
+	// before the plan). A violation pauses completion instead of delivering.
+	if err := CheckMinimalDiffGate(details.Plan, agentFileEvidencePaths(evidence)); err != nil {
+		return b.pauseCompletion(ctx, current, step, "minimal_diff_violation", err.Error())
+	}
+	// E07: test gate. Only declared fix tasks are bound: the new test for
+	// the fix and the full existing suite must both have run and passed, and
+	// every covering test in the recorded impact map must have run. Any
+	// failure stops the task at step 7 instead of entering regression.
+	if details.Plan != nil && details.Plan.Fix != nil {
+		report := TestReportFromInputs(completion.Inputs, testGateNewTestName(details.Plan), details.Plan.Impact)
+		if decision := EvaluateTestGate(report); !decision.Allowed {
+			return b.pauseCompletion(ctx, current, step, "test_gate_pending", decision.Reason)
+		}
+		// P3-2: per-file impact coverage. The flat covering-tests check
+		// above cannot name an uncovered file; this gate can, and it
+		// runs against the tests the scope-aware report actually saw
+		// run, not against the suite command's assumed scope.
+		if err := CheckImpactCoverageGate(details.Plan, report.CoveringTestsRan); err != nil {
+			return b.pauseCompletion(ctx, current, step, "test_gate_pending", err.Error())
+		}
+	}
 	if evidenceErr != nil || cloudDSHHasUnverifiedFileWrite(completion.Inputs, evidence) ||
 		(len(evidence) == 0 && fileIntent != task.FileDeliveryRequired) {
 		return b.pauseCompletion(ctx, current, step, "output_verification_pending", "The task output has no verifiable successful Workspace file write.")
@@ -1194,9 +1217,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	if approvalCall && pendingApproval.Status == task.PendingRequestPending {
 		step.Status, step.Title, step.Summary = task.StepWaitingUser, "Approval required: "+call.Name, pendingApproval.Content
-		if err := b.commitProgress(ctx, current, step, usage, task.StatusWaitingUser, "approval_required", "task.waiting_user", AgentApprovalRequest{
-			Object: pendingApproval.Object, Content: pendingApproval.Content, Impact: pendingApproval.Impact,
-		}); err != nil {
+		if err := b.commitProgress(ctx, current, step, usage, task.StatusWaitingUser, "approval_required", "task.waiting_user", approvalRequestFromPending(pendingApproval)); err != nil {
 			return AgentToolResult{}, err
 		}
 		return AgentToolResult{Status: AgentToolNeedsUser}, nil
@@ -1218,6 +1239,29 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	current.Usage = usage
 	request.Task = current
+	// E03: a declared fix task must have recorded its failing test before a
+	// host file write. The gate error is returned to the agent as structured
+	// information (it names the missing record); it never becomes a
+	// user-visible question.
+	if call.Name == runtimeToolFileWrite {
+		if err := CheckFailingTestGate(details.Plan, false); err != nil {
+			return AgentToolResult{}, err
+		}
+		// E06: the written file must be inside the recorded impact map. An
+		// unreadable path is left to the normal validation below. The struct
+		// lists every declared file_write argument: strict decoding rejects
+		// unknown fields, so a partial struct would never decode.
+		var writeArgs struct {
+			WorkspaceID string `json:"workspace_id"`
+			Path        string `json:"path"`
+			Content     string `json:"content"`
+		}
+		if decodeStrictRuntimeResult(arguments, &writeArgs) == nil && writeArgs.Path != "" {
+			if err := CheckMinimalDiffGate(details.Plan, []string{writeArgs.Path}); err != nil {
+				return AgentToolResult{}, err
+			}
+		}
+	}
 	preparation, err := b.runtime.Prepare(ctx, request)
 	if err != nil {
 		if recoveryOperation {
@@ -1855,6 +1899,23 @@ func (b *CloudDSHToolBroker) PauseModelRecoveryDiagnostic(ctx context.Context, c
 	return b.pauseRecovery(ctx, claimed, diagnostic)
 }
 
+// PauseModelRecoveryAfterLadderExhaustion persists the terminal record for a
+// model failure whose retry ladder is spent: the task is paused with the
+// terminal message for the reason, and the record carries the
+// route_retry_ladder_exhausted category so the exhaustion can be counted
+// later. It reuses the existing pause path (no new table); the message
+// carries no stack trace and no raw error text.
+func (b *CloudDSHToolBroker) PauseModelRecoveryAfterLadderExhaustion(ctx context.Context, claimed task.Task, reason FailoverReason) error {
+	strategy := FailoverStrategyFor(reason)
+	attempts := int64(0)
+	if strategy.Retryable {
+		attempts = ModelRetryMaxRetries
+	}
+	return b.PauseModelRecoveryDiagnostic(ctx, claimed, AgentModelFailureDiagnostic{
+		Category: "route_retry_ladder_exhausted", LadderReason: string(reason), LadderAttempts: attempts,
+	})
+}
+
 func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentModelFailureDiagnostic {
 	if value.Stage != "model_response_validation" {
 		value.Stage = ""
@@ -1864,9 +1925,21 @@ func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentMod
 		"unavailable", "timeout", "transport", "invalid_response", "empty_response", "truncated_response", "upstream_error", "usage_unknown", "unsupported",
 		"client_request_invalid", "context_length_exceeded", "provider_invalid_request", "provider_unsupported_parameter", "provider_context_length_exceeded",
 		"provider_model_not_found", "provider_permission_denied", "provider_invalid_api_key", "provider_rate_limited",
-		"provider_quota_exhausted", "provider_server_error", "provider_request_rejected", "attachment_reader_unavailable", "stream_result_mismatch", "unauthorized_tool":
+		"provider_quota_exhausted", "provider_server_error", "provider_request_rejected", "attachment_reader_unavailable", "stream_result_mismatch", "unauthorized_tool",
+		"route_retry_ladder_exhausted":
 	default:
 		value.Category = "unknown"
+	}
+	if value.LadderReason != "" {
+		if _, ok := failoverStrategyTable()[FailoverReason(value.LadderReason)]; !ok {
+			value.LadderReason = ""
+		}
+	}
+	if value.LadderAttempts < 0 {
+		value.LadderAttempts = 0
+	}
+	if value.LadderAttempts > ModelRetryMaxRetries {
+		value.LadderAttempts = ModelRetryMaxRetries
 	}
 	switch value.ReasonCode {
 	case "response_shape_invalid", "tool_call_metadata_invalid", "task_has_no_authorized_tools", "tool_not_in_task_allowlist", "tool_arguments_not_object":
@@ -1922,6 +1995,13 @@ func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Tas
 		title = "消息超过模型输入上限"
 		summary = "消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。"
 		waitingReason = "model_context_limit"
+	}
+	// E12: the retry ladder is spent. The terminal message names the cause
+	// and the retries spent; it carries no stack trace and no raw error.
+	if diagnostic.Category == "route_retry_ladder_exhausted" {
+		title = "模型请求多次重试后仍未成功"
+		summary = LadderExhaustedMessage(FailoverReason(diagnostic.LadderReason), diagnostic.LadderAttempts)
+		waitingReason = "model_retry_ladder_exhausted"
 	}
 	if diagnostic.Category == "attachment_reader_unavailable" {
 		title = "当前模型无法读取附件"
@@ -2068,6 +2148,9 @@ func (b *CloudDSHToolBroker) pauseForApproval(ctx context.Context, current task.
 	if previous != nil {
 		version = previous.Version + 1
 	}
+	// E05: the evidence pointer names the step that requested the approval,
+	// so the card can be opened to its evidence.
+	preparation.Approval = withStepEvidencePointer(preparation.Approval, step)
 	pending, err := newPendingApproval(current, request.Call, hash, preparation.Approval, preparation.Fence, version)
 	if err != nil {
 		return AgentToolResult{}, err

@@ -840,6 +840,30 @@ func TestCloudDSHWorkspaceWriteExpiredApprovalDoesNotCommit(t *testing.T) {
 	}
 }
 
+func TestCloudDSHWorkspaceWriteApprovalCarriesEvidenceFields(t *testing.T) {
+	_, store, broker, _, current := newCloudDSHT08WorkspaceBroker(t)
+	call := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-evidence", cloudDSHWorkspaceWriteArguments{
+		ExpectedRevision: 0, Path: "reports/evidence.txt", Content: "evidence content",
+	})
+	result, err := broker.Execute(context.Background(), current, call)
+	pending := store.details.PendingRequest
+	if err != nil || result.Status != AgentToolNeedsUser || pending == nil {
+		t.Fatalf("Workspace write before approval = %#v, err=%v; pending=%#v", result, err, pending)
+	}
+	if !pending.EvidenceComplete() {
+		t.Fatalf("Workspace write approval is missing evidence fields: %v (pending=%#v)", pending.MissingEvidenceFields(), pending)
+	}
+	if pending.TriggerRule != ApprovalTriggerWorkspaceWrite {
+		t.Fatalf("Workspace write approval trigger rule = %q, want %q", pending.TriggerRule, ApprovalTriggerWorkspaceWrite)
+	}
+	if !strings.HasPrefix(pending.EvidencePointer, "task_step:") {
+		t.Fatalf("Workspace write approval evidence pointer = %q, want a task_step: pointer", pending.EvidencePointer)
+	}
+	if pending.CurrentCost != nil || pending.TotalCost != nil {
+		t.Fatalf("Workspace write approval costs must stay unknown (nil), got current=%+v total=%+v", pending.CurrentCost, pending.TotalCost)
+	}
+}
+
 func TestCloudDSHWorkspaceWriteApprovalCannotAuthorizeChangedContent(t *testing.T) {
 	_, store, broker, workspaceStore, current := newCloudDSHT08WorkspaceBroker(t)
 	original := workspaceToolCall(t, cloudDSHWorkspaceWriteToolName, "write-changed", cloudDSHWorkspaceWriteArguments{

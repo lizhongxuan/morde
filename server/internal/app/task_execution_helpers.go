@@ -114,12 +114,24 @@ func newPendingApproval(current task.Task, call ModelToolCall, requestHash []byt
 	if err != nil {
 		return nil, fmt.Errorf("generate pending request ID: %w", err)
 	}
-	return &task.PendingRequest{
+	pending := &task.PendingRequest{
 		ID: id, TaskID: current.ID, Version: version, Kind: "approval", Title: "Approve tool action: " + call.Name,
-		Object: approval.Object, Content: approval.Content, Impact: approval.Impact, CallID: call.CallID, ToolName: call.Name,
+		Object: approval.Object, Content: approval.Content, Impact: approval.Impact,
+		EvidencePointer: approval.EvidencePointer, CurrentCost: approval.CurrentCost, TotalCost: approval.TotalCost,
+		TriggerRule: approval.TriggerRule, RejectionConsequence: approval.RejectionConsequence,
+		CallID: call.CallID, ToolName: call.Name,
 		RequestHash: append([]byte(nil), requestHash...), RuntimeGeneration: fence.RuntimeGeneration,
 		RuntimeInstanceID: fence.RuntimeInstanceID, ControlVersion: fence.ControlVersion, Status: task.PendingRequestPending,
-	}, nil
+	}
+	// E05: a sensitive modification must not produce a card without its five
+	// body fields. Costs may stay unknown (nil), but the evidence pointer,
+	// the trigger rule, and the rejection consequence must be present. An
+	// invalid cost is reported here by field name; boundedApproval above
+	// only bounds the text fields.
+	if missing := pending.MissingEvidenceFields(); len(missing) > 0 {
+		return nil, domain.NewError(domain.CodeInvalidState, "approval request is missing evidence fields: "+strings.Join(missing, ", "))
+	}
+	return pending, nil
 }
 
 func samePendingApprovalFence(pending *task.PendingRequest, fence AgentHostFence) bool {
@@ -211,7 +223,41 @@ func boundedApproval(value AgentApprovalRequest) (AgentApprovalRequest, bool) {
 			return AgentApprovalRequest{}, false
 		}
 	}
+	for _, field := range []string{value.EvidencePointer, value.TriggerRule, value.RejectionConsequence} {
+		if field != "" && (!utf8.ValidString(field) || strings.ContainsRune(field, '\x00') || utf8.RuneCountInString(field) > agentApprovalFieldMaxRunes) {
+			return AgentApprovalRequest{}, false
+		}
+	}
+	// Costs are not bounded here: their validity is part of evidence
+	// completeness, and the constructors report an invalid cost by field
+	// name (current_cost / total_cost) instead of a generic display-text
+	// error.
 	return value, true
+}
+
+// approvalRequestFromPending rebuilds the display approval request from a
+// stored pending request, carrying all five body fields so a re-paused card
+// shows the same evidence as the card that was first issued.
+func approvalRequestFromPending(pending *task.PendingRequest) AgentApprovalRequest {
+	if pending == nil {
+		return AgentApprovalRequest{}
+	}
+	return AgentApprovalRequest{
+		Object: pending.Object, Content: pending.Content, Impact: pending.Impact,
+		EvidencePointer: pending.EvidencePointer, CurrentCost: pending.CurrentCost, TotalCost: pending.TotalCost,
+		TriggerRule: pending.TriggerRule, RejectionConsequence: pending.RejectionConsequence,
+	}
+}
+
+// withStepEvidencePointer fills the evidence pointer of an approval request
+// from the step that requested the approval, when the request does not
+// already carry one. The pointer names the step the user can open to see the
+// tool call and its evidence.
+func withStepEvidencePointer(value AgentApprovalRequest, step task.Step) AgentApprovalRequest {
+	if value.EvidencePointer == "" && step.ID != "" {
+		value.EvidencePointer = "task_step:" + step.ID
+	}
+	return value
 }
 
 func safeStepSummary(value, fallback string) string {

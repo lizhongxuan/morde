@@ -161,15 +161,22 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 	}
 	if first.Summary != nil {
 		document, err := app.OpenConversationSummary(sealer, *first.Summary)
-		if err != nil || document.Identity != first.Identity || document.Version != first.Head.Version ||
-			!bytes.Equal(first.Head.Digest, first.Summary.SummarySHA256) || first.Head.Version < 1 {
-			return input, false, domain.NewError(domain.CodeInvalidState, "stored conversation summary cannot be restored")
+		// E04: the restore check used to collapse six conditions into one
+		// generic "cannot be restored" error. Each condition now fails by
+		// name, with its reason, byte counts, and a bounded preview, so a
+		// task stopped by a summary failure can be located from the record.
+		var documentPtr *app.ConversationSummaryDocument
+		if err == nil {
+			documentPtr = &document
+		}
+		if failure := app.CheckConversationSummaryRestore(first.Identity, first.Head, first.Summary, documentPtr, err); failure != nil {
+			return input, false, failure.ToError()
 		}
 		input.previousText, input.previousVersion = document.Text, document.Version
 		input.previousProofs = append([]app.ConversationSummarySource(nil), document.Sources...)
 		input.previousDigest = append([]byte(nil), first.Summary.SummarySHA256...)
-	} else if first.Head.Version != 0 {
-		return input, false, domain.NewError(domain.CodeInvalidState, "conversation summary head has no stored version")
+	} else if failure := app.CheckConversationSummaryRestore(first.Identity, first.Head, nil, nil, nil); failure != nil {
+		return input, false, failure.ToError()
 	}
 	tokenBudget := conversationSummaryMaintenanceTokenBudget(contextWindow)
 	if tokenBudget <= 0 {
@@ -206,9 +213,17 @@ func collectConversationSummaryMaintenanceInput(ctx context.Context, pages app.C
 		return nil
 	}
 	for pageIndex := 0; pageIndex < conversationSummaryMaintenanceMaxPages; pageIndex++ {
-		if page.Identity != input.identity || page.Head.Version != input.head.Version ||
-			!bytes.Equal(page.Head.Digest, input.head.Digest) || page.BoundarySequence != first.BoundarySequence {
-			return input, false, domain.NewError(domain.CodeConflict, "conversation summary input changed while paging")
+		// E04: the paging identity check used to collapse four conditions
+		// into one generic error; each now fails by name.
+		switch {
+		case page.Identity != input.identity:
+			return input, false, domain.NewError(domain.CodeConflict, "conversation summary input identity changed while paging")
+		case page.Head.Version != input.head.Version:
+			return input, false, domain.NewError(domain.CodeConflict, "conversation summary input head version changed while paging")
+		case !bytes.Equal(page.Head.Digest, input.head.Digest):
+			return input, false, domain.NewError(domain.CodeConflict, "conversation summary input head digest changed while paging")
+		case page.BoundarySequence != first.BoundarySequence:
+			return input, false, domain.NewError(domain.CodeConflict, "conversation summary input boundary changed while paging")
 		}
 		if len(page.Sources) == 0 && page.Next != nil {
 			return input, false, domain.NewError(domain.CodeInvalidState, "conversation summary input cursor made no progress")

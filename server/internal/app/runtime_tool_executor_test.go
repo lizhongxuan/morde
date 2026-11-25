@@ -2736,7 +2736,8 @@ func (f *runtimeToolExecutorFixture) prepared(name, arguments string, scope iden
 		if hashErr != nil {
 			panic(hashErr)
 		}
-		pending, pendingErr := newPendingApproval(request.Task, request.Call, hash[:], preparation.Approval, preparation.Fence, 1)
+		approval := withStepEvidencePointer(preparation.Approval, task.Step{ID: "s1234567"})
+		pending, pendingErr := newPendingApproval(request.Task, request.Call, hash[:], approval, preparation.Fence, 1)
 		if pendingErr != nil {
 			panic(pendingErr)
 		}
@@ -2763,6 +2764,24 @@ func (f *runtimeToolExecutorFixture) prepared(name, arguments string, scope iden
 	return request, preparation
 }
 
+func TestRuntimeToolApprovalRequestCarriesEvidenceFields(t *testing.T) {
+	request := runtimeToolApprovalRequest(runtimeToolMapping{name: runtimeToolShellExec}, json.RawMessage(`{"command":"ls"}`))
+	if request.TriggerRule != ApprovalTriggerSensitiveHostTool {
+		t.Fatalf("host tool approval trigger rule = %q, want %q", request.TriggerRule, ApprovalTriggerSensitiveHostTool)
+	}
+	if request.RejectionConsequence != ApprovalRejectionConsequenceHostTool {
+		t.Fatalf("host tool approval rejection consequence = %q, want %q", request.RejectionConsequence, ApprovalRejectionConsequenceHostTool)
+	}
+	if request.CurrentCost != nil || request.TotalCost != nil {
+		t.Fatalf("host tool approval costs must stay unknown (nil), got current=%+v total=%+v", request.CurrentCost, request.TotalCost)
+	}
+	// The evidence pointer is filled by the pause function that owns the
+	// step; the executor only supplies the rule and the consequence.
+	if request.EvidencePointer != "" {
+		t.Fatalf("host tool approval evidence pointer must be empty before the pause fills it, got %q", request.EvidencePointer)
+	}
+}
+
 func TestRuntimeToolExecutorRejectsExpiredApprovalFromCurrentTaskSnapshot(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, nil)
 	fixture.fence.RuntimeInstanceID = "runtime-instance-1"
@@ -2774,6 +2793,8 @@ func TestRuntimeToolExecutorRejectsExpiredApprovalFromCurrentTaskSnapshot(t *tes
 	}
 	pending, err := newPendingApproval(request.Task, request.Call, hash[:], AgentApprovalRequest{
 		Object: "reports/result.txt", Content: "Write this file?", Impact: "The authorized Workspace will change.",
+		EvidencePointer: "task_step:s1234567", TriggerRule: ApprovalTriggerSensitiveHostTool,
+		RejectionConsequence: ApprovalRejectionConsequenceHostTool,
 	}, request.Fence, 1)
 	if err != nil {
 		t.Fatal(err)

@@ -81,6 +81,18 @@ usage() {
   exit "${1:-0}"
 }
 
+# Read one key out of the top-level `cloud_dsh:` block of the live portal.yaml
+# (2-space indented keys; that block has no nested maps). Used by the
+# environment-down preflight check below.
+# 用法：config_cloud_dsh_value <key>
+config_cloud_dsh_value() {
+  awk -v key="$1" '
+    /^cloud_dsh:/ { inblock = 1; next }
+    /^[^ \t]/ { inblock = 0 }
+    inblock && $1 == key ":" { print $2; exit }
+  ' "$CONFIG"
+}
+
 # 以 morde 用户、带 EnvironmentFile 跑一次 portal 子命令（只读/迁移都用它，
 # 绝不在 bash 里 source cloudhost.env——里面有多行 Caddy 配置）。
 # 用法：portal_once <binary> <args...>
@@ -236,7 +248,7 @@ exec 9>"$LOCK_FILE" || die "cannot open lock file $LOCK_FILE"
 flock -n 9 || die "another morde-update is running (lock: $LOCK_FILE)"
 log "=== morde-update start: branch=$BRANCH dry-run=$DRY_RUN skip-migrate=$SKIP_MIGRATE ==="
 
-for cmd in git curl systemctl python3 flock sha256sum; do
+for cmd in git curl systemctl python3 flock sha256sum mountpoint; do
   command -v "$cmd" >/dev/null 2>&1 || die "missing required command: $cmd"
 done
 systemctl is-active --quiet docker.service || die "docker.service is not active"
@@ -255,6 +267,23 @@ if systemctl is-active --quiet "$SERVICE"; then
 else
   die "service $SERVICE is not active; refusing to update a stopped service"
 fi
+
+# Environment-down detection: the DSH daemon (per live cloud_dsh.docker_host)
+# and the workspace-sync mount must be up before anything is built or
+# swapped. A missing part stops the deploy here with the reason, so a deploy
+# never starts against a dead environment and fails later in a confusing place.
+if [[ "$(config_cloud_dsh_value enabled)" != "false" ]]; then
+  dsh_host="$(config_cloud_dsh_value docker_host)"
+  [[ -n "$dsh_host" ]] || die "environment down: cloud_dsh.docker_host is not set in $CONFIG"
+  docker -H "$dsh_host" info >/dev/null 2>&1 \
+    || die "environment down: DSH daemon unreachable at $dsh_host (cloud_dsh.docker_host from $CONFIG)"
+  log "DSH daemon is reachable at $dsh_host"
+else
+  log "cloud_dsh is disabled in $CONFIG; skipping DSH daemon check"
+fi
+mountpoint -q /srv/morde-acceptance \
+  || die "environment down: /srv/morde-acceptance is not a mounted filesystem (workspace-sync data root required)"
+log "workspace-sync mount is present at /srv/morde-acceptance"
 
 log "baseline migrate status (current binary, read-only):"
 run_migrate "$BIN" status
@@ -333,6 +362,25 @@ if [[ -n "${OLD_SRC_HEAD:-}" ]]; then
     log "WARNING: web/portal or web/workbench changed in this update; web assets are NOT rebuilt by this script — rebuild and redeploy them separately"
   fi
 fi
+
+# ---------------- P0 smoke gate ----------------
+# Design §16.3: run the 10 smoke cases against the new source before building
+# anything. Any failure aborts the deploy here, while the running binary is
+# untouched. The gate is fail-closed (P3-3): a case with no evidence is a
+# failure, and only the two auto-detected environment limits in smoke.sh
+# (no CH_TEST_DATABASE_URL, no real PC) are exceptions, recorded and
+# printed as a notice, never counted as pass.
+# Two exception layers, different jobs: the preflight above aborts the
+# whole deploy when the live environment itself is down (DSH daemon
+# unreachable, workspace-sync mount missing) — that is an environment
+# failure, not a test result. The smoke gate's exceptions are narrower:
+# the deploy environment is up, but a case's check cannot run here at all
+# (its test database is not configured, or it needs a real PC). Preflight
+# runs first and never lets the gate excuse a dead environment; the gate
+# runs second and never lets a missing test database excuse a code failure.
+log "running P0 smoke gate ($SRC_DIR/deploy/single/smoke.sh)"
+"$SRC_DIR/deploy/single/smoke.sh" \
+  || die "P0 smoke gate failed; deploy aborted before build (record: $SRC_DIR/deploy/single/smoke-record.json)"
 
 # ---------------- build ----------------
 RELEASE_NAME="${TIMESTAMP}-${NEW_HEAD:0:8}"

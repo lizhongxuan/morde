@@ -571,6 +571,9 @@ type TaskStore interface {
 	ListConversationTasks(context.Context, string, string, string, []string, ConversationTaskView, PageRequest) (TaskPage, error)
 	ListTaskEvents(context.Context, string, string, int64, int32) ([]task.Event, error)
 	GetTaskEventPage(context.Context, string, string, int64, int32) (TaskEventPage, error)
+	// GetTaskEventChain projects the full stored event list of one task into
+	// its nine-kind replayable chain (E08, read-side only; no HTTP/SSE yet).
+	GetTaskEventChain(context.Context, string, string) (TaskEventChain, error)
 	ClaimNextTask(context.Context, string, time.Duration) (task.Task, bool, error)
 	RenewTaskLease(context.Context, string, string, int64, time.Duration) (task.Task, error)
 	AppendAssistantTextDelta(context.Context, AssistantTextDelta) (task.Event, error)

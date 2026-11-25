@@ -2,6 +2,7 @@ package task
 
 import (
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -473,6 +474,49 @@ type ClarificationRequest struct {
 	RespondedAt *time.Time
 }
 
+// ApprovalCostBasisEstimate marks a cost figure that is a pre-execution
+// estimate; ApprovalCostBasisSettled marks a charge already settled in the
+// cost ledger.
+const (
+	ApprovalCostBasisEstimate = "estimate"
+	ApprovalCostBasisSettled  = "settled"
+)
+
+// ApprovalCost is one cost figure on an approval card: the amount in micros
+// of the named currency, and whether it is an estimate or a settled charge.
+// A nil *ApprovalCost means the cost is unknown: no trusted cost number
+// exists before the action runs, and unknown is never rendered as 0.
+type ApprovalCost struct {
+	AmountMicros int64  `json:"amount_micros"`
+	Currency     string `json:"currency"`
+	Basis        string `json:"basis"`
+}
+
+// Validate reports whether the cost figure is well formed. A nil cost is
+// valid: unknown is a legitimate state, not a missing field.
+func (c *ApprovalCost) Validate() error {
+	if c == nil {
+		return nil
+	}
+	if c.AmountMicros < 0 || !validApprovalCostCurrency(c.Currency) ||
+		(c.Basis != ApprovalCostBasisEstimate && c.Basis != ApprovalCostBasisSettled) {
+		return errors.New("task approval cost is invalid")
+	}
+	return nil
+}
+
+func validApprovalCostCurrency(value string) bool {
+	if len(value) != 3 {
+		return false
+	}
+	for _, r := range value {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
+}
+
 // PendingRequest is an immutable, versioned user approval bound to one exact
 // Agent tool call and Host control fence. RequestHash is internal and omitted
 // from API responses.
@@ -482,12 +526,28 @@ type PendingRequest struct {
 	Version int64
 	// TaskRevision is the Task revision whose exact tool call this approval
 	// covers. A nil value is retained only for legacy rows or non-bound paths.
-	TaskRevision            *int64
-	Kind                    string
-	Title                   string
-	Object                  string
-	Content                 string
-	Impact                  string
+	TaskRevision *int64
+	Kind         string
+	Title        string
+	Object       string
+	Content      string
+	Impact       string
+	// EvidencePointer names the evidence this approval rests on, in a form
+	// the user can open: "task_step:<step id>" for the step that requested
+	// the approval. It is empty only on rows created before migration 00238.
+	EvidencePointer string
+	// CurrentCost is the cost of the single action awaiting approval, and
+	// TotalCost is the cumulative cost of the task so far. A nil cost means
+	// the cost is unknown and is rendered as unknown, never as 0.
+	CurrentCost *ApprovalCost
+	TotalCost   *ApprovalCost
+	// TriggerRule names the rule that required this approval, for example
+	// "sensitive_host_tool", "workspace_write", or "mcp_tool".
+	TriggerRule string
+	// RejectionConsequence states what happens when the user rejects: the
+	// exact action is not executed and the task pauses for the next
+	// instruction.
+	RejectionConsequence    string
 	CallID                  string
 	MediaPreviewOperationID string
 	ToolName                string
@@ -500,6 +560,36 @@ type PendingRequest struct {
 	CreatedAt               time.Time
 	ExpiresAt               *time.Time
 	RespondedAt             *time.Time
+}
+
+// MissingEvidenceFields names the approval-card body fields this request
+// lacks, in fixed order. Costs are never missing: a nil cost is the explicit
+// unknown state, and an invalid cost is reported as its field name.
+func (p PendingRequest) MissingEvidenceFields() []string {
+	var missing []string
+	if strings.TrimSpace(p.EvidencePointer) == "" {
+		missing = append(missing, "evidence_pointer")
+	}
+	if err := p.CurrentCost.Validate(); err != nil {
+		missing = append(missing, "current_cost")
+	}
+	if err := p.TotalCost.Validate(); err != nil {
+		missing = append(missing, "total_cost")
+	}
+	if strings.TrimSpace(p.TriggerRule) == "" {
+		missing = append(missing, "trigger_rule")
+	}
+	if strings.TrimSpace(p.RejectionConsequence) == "" {
+		missing = append(missing, "rejection_consequence")
+	}
+	return missing
+}
+
+// EvidenceComplete reports whether the request carries all five approval-card
+// body fields. A nil cost counts as complete: unknown is a carried value,
+// not an absent one.
+func (p PendingRequest) EvidenceComplete() bool {
+	return len(p.MissingEvidenceFields()) == 0
 }
 
 // StopRequest is the durable task-level request that prevents new operations

@@ -328,7 +328,7 @@ func (b *CloudDSHToolBroker) pauseForExistingMCPApproval(ctx context.Context, de
 		return AgentToolResult{}, err
 	}
 	if err := b.commitProgress(ctx, current, step, cloneTaskUsage(current.Usage), task.StatusWaitingUser,
-		"approval_required", "task.waiting_user", AgentApprovalRequest{Object: pending.Object, Content: pending.Content, Impact: pending.Impact}); err != nil {
+		"approval_required", "task.waiting_user", approvalRequestFromPending(pending)); err != nil {
 		return AgentToolResult{}, err
 	}
 	return AgentToolResult{Status: AgentToolNeedsUser}, nil
@@ -385,9 +385,11 @@ func cloudDSHMCPApprovalFence(source cloudDSHMCPExecutionSource) AgentHostFence 
 func cloudDSHMCPApprovalRequest(source cloudDSHMCPExecutionSource, arguments json.RawMessage, requestHash []byte) AgentApprovalRequest {
 	argumentPreview := cloudDSHMCPApprovalArgumentPreview(arguments)
 	return AgentApprovalRequest{
-		Object:  fmt.Sprintf("External MCP connector %s (%s)", source.connectorName, source.connectorID),
-		Content: fmt.Sprintf("Run tool %q with arguments %s? Request fingerprint: %s", source.remoteTool, argumentPreview, hex.EncodeToString(requestHash)),
-		Impact:  "This may read or change data in the connected external service. Approval is limited to this task, connector version, tool, and exact arguments.",
+		Object:               fmt.Sprintf("External MCP connector %s (%s)", source.connectorName, source.connectorID),
+		Content:              fmt.Sprintf("Run tool %q with arguments %s? Request fingerprint: %s", source.remoteTool, argumentPreview, hex.EncodeToString(requestHash)),
+		Impact:               "This may read or change data in the connected external service. Approval is limited to this task, connector version, tool, and exact arguments.",
+		TriggerRule:          ApprovalTriggerMCPTool,
+		RejectionConsequence: ApprovalRejectionConsequenceMCPTool,
 	}
 }
 

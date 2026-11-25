@@ -17,8 +17,12 @@ import (
 const cloudDSHTaskPlanToolName = "morde_task_plan_update"
 
 type cloudDSHTaskPlanInput struct {
-	Goal  string          `json:"goal"`
-	Steps []task.PlanStep `json:"steps"`
+	Goal        string                  `json:"goal"`
+	Steps       []task.PlanStep         `json:"steps"`
+	Brief       *task.Brief             `json:"brief,omitempty"`
+	Fix         *task.FixProposal       `json:"fix,omitempty"`
+	Impact      *task.ImpactMap         `json:"impact,omitempty"`
+	FailingTest *task.FailingTestRecord `json:"failing_test,omitempty"`
 }
 
 type cloudDSHTaskPlanEvent struct {
@@ -42,8 +46,8 @@ type CloudDSHTaskPlanReceiptReader interface {
 
 func cloudDSHTaskPlanDefinition() AgentToolDefinition {
 	return AgentToolDefinition{ModelTool: ModelTool{Name: cloudDSHTaskPlanToolName,
-		Description: "When a complex task has multiple dependent steps, the main Agent should save a plan before doing the work and revise it when the approach changes. Do not call for simple questions. A plan never requests confirmation or expands permissions; cost is always marked unknown unless separately verified by the application.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string","minLength":1,"maxLength":2048},"steps":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":40},"title":{"type":"string","minLength":1,"maxLength":160},"description":{"type":"string","maxLength":1024},"depends_on":{"type":"array","maxItems":8,"items":{"type":"string"}},"outputs":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"completion_criteria":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]}},"required":["id","title","status"],"additionalProperties":false}}},"required":["goal","steps"],"additionalProperties":false}`)}, RequiredScope: identity.ScopeTaskRead}
+		Description: "When a complex task has multiple dependent steps, the main Agent should save a plan before doing the work and revise it when the approach changes. Do not call for simple questions. A plan never requests confirmation or expands permissions; cost is always marked unknown unless separately verified by the application. A complex plan (more than one step) must include the brief (scope, acceptance, verification method); without it the plan is rejected. A bug-fix plan should also record the structured fix proposal, the impact map, and the failing test that reproduces the bug. The impact map should also record per-file coverage (coverage: each changed or caller file mapped to the tests covering that file) when known, so the regression gate can check each changed file against the tests that actually ran; without it the gate can only check the flat covering-tests list. A fix proposal must carry its root-cause conclusion with evidence: a statement, the reproduction output, and at least one quoted code line (file, line range, excerpt).",
+		Parameters:  json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string","minLength":1,"maxLength":2048},"steps":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":40},"title":{"type":"string","minLength":1,"maxLength":160},"description":{"type":"string","maxLength":1024},"depends_on":{"type":"array","maxItems":8,"items":{"type":"string"}},"outputs":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"completion_criteria":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]}},"required":["id","title","status"],"additionalProperties":false}},"brief":{"type":"object","properties":{"scope":{"type":"string","maxLength":2048},"acceptance":{"type":"string","maxLength":2048},"verification_method":{"type":"string","maxLength":2048}},"additionalProperties":false},"fix":{"type":"object","properties":{"minimal_change":{"type":"string","maxLength":2048},"risks":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"alternatives":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"root_cause":{"type":"object","properties":{"statement":{"type":"string","maxLength":2048},"reproduction_output":{"type":"string","maxLength":2048},"code_lines":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{"file":{"type":"string","maxLength":512},"start_line":{"type":"integer","minimum":1},"end_line":{"type":"integer","minimum":1},"excerpt":{"type":"string","maxLength":1024}},"required":["file","start_line","end_line","excerpt"],"additionalProperties":false}}},"required":["statement","reproduction_output","code_lines"],"additionalProperties":false}},"additionalProperties":false},"impact":{"type":"object","properties":{"changed_files":{"type":"array","maxItems":64,"items":{"type":"string","maxLength":512}},"callers":{"type":"array","maxItems":128,"items":{"type":"string","maxLength":512}},"covering_tests":{"type":"array","maxItems":128,"items":{"type":"string","maxLength":256}},"coverage":{"type":"object","additionalProperties":{"type":"array","maxItems":128,"items":{"type":"string","maxLength":256}}}},"additionalProperties":false},"failing_test":{"type":"object","properties":{"test_name":{"type":"string","maxLength":256},"failure_excerpt":{"type":"string","maxLength":2048}},"additionalProperties":false}},"required":["goal","steps"],"additionalProperties":false}`)}, RequiredScope: identity.ScopeTaskRead}
 }
 
 func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.Task, call ModelToolCall, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
@@ -84,11 +88,17 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 	if err := b.authorizeSkillTask(ctx, current); err != nil {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "task authorization does not allow plan updates")
 	}
-	plan := task.Plan{TaskRevision: *current.CurrentRevision, Goal: input.Goal, CostEstimateState: "unknown", Steps: input.Steps}
+	plan := task.Plan{TaskRevision: *current.CurrentRevision, Goal: input.Goal, CostEstimateState: "unknown", Steps: input.Steps,
+		Brief: input.Brief, Fix: input.Fix, Impact: input.Impact, FailingTest: input.FailingTest}
+	// E02: normalize the recorded impact map so regression comparisons are
+	// deterministic (sorted, deduplicated lists).
+	plan.Impact = plan.Impact.Normalized()
 	if recovering && checkpointOutput != nil {
 		var replay task.Plan
 		if decodeStrictRuntimeResult([]byte(*checkpointOutput), &replay) != nil || replay.TaskRevision != plan.TaskRevision || replay.Validate() != nil ||
-			replay.Goal != input.Goal || !reflect.DeepEqual(replay.Steps, input.Steps) {
+			replay.Goal != input.Goal || !reflect.DeepEqual(replay.Steps, input.Steps) ||
+			!reflect.DeepEqual(replay.Brief, plan.Brief) || !reflect.DeepEqual(replay.Fix, plan.Fix) ||
+			!reflect.DeepEqual(replay.Impact, plan.Impact) || !reflect.DeepEqual(replay.FailingTest, plan.FailingTest) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed task plan does not match its original call")
 		}
 		plan = replay
@@ -99,6 +109,18 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 	}
 	if plan.Revision < 1 || plan.Validate() != nil {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh task plan is invalid or has a dependency cycle")
+	}
+	// E01: a complex plan without a complete brief is rejected here, as
+	// structured information for the agent. No user-visible question is
+	// produced; the agent repairs the plan and resubmits it.
+	if err := CheckBriefGate(plan); err != nil {
+		return AgentToolResult{}, err
+	}
+	// E04: a fix plan without an evidence-backed root cause is rejected
+	// here, for the same reason: a conclusion without reproduction output
+	// and quoted code lines cannot be opened and checked.
+	if err := CheckRootCauseGate(plan); err != nil {
+		return AgentToolResult{}, err
 	}
 	output, err := json.Marshal(plan)
 	if err != nil || len(output) > 48<<10 {
@@ -119,7 +141,9 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 		if err != nil && domain.CodeOf(err) != domain.CodeNotFound {
 			return AgentToolResult{}, err
 		}
-		if err == nil && (stored.Validate() != nil || stored.TaskRevision != plan.TaskRevision || stored.Goal != input.Goal || !reflect.DeepEqual(stored.Steps, input.Steps)) {
+		if err == nil && (stored.Validate() != nil || stored.TaskRevision != plan.TaskRevision || stored.Goal != input.Goal || !reflect.DeepEqual(stored.Steps, input.Steps) ||
+			!reflect.DeepEqual(stored.Brief, plan.Brief) || !reflect.DeepEqual(stored.Fix, plan.Fix) ||
+			!reflect.DeepEqual(stored.Impact, plan.Impact) || !reflect.DeepEqual(stored.FailingTest, plan.FailingTest)) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "stored task plan replay receipt is invalid")
 		}
 		if err == nil {

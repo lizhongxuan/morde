@@ -442,6 +442,13 @@ WHERE message_id=$1 AND state='processing'`, replyMessageID); err != nil {
 		}
 		deliveryFacts = append(deliveryFacts, facts)
 	}
+	// E11: the result validation gate runs before any publish write. A
+	// refused batch leaves nothing behind: the publish transaction rolls
+	// back, the route worker then fails the route with
+	// routing_action_unavailable, and the whole batch is marked failed.
+	if err := app.ValidateConversationResultDelivery(review.Sources, validationStates); err != nil {
+		return err
+	}
 	receipt := conversationTaskResultReceiptWithDeliveryFacts(reply, review.Sources, validationStates, deliveryFacts)
 	if !app.ValidConversationRouteReply(receipt) {
 		return domain.InvalidArgument("result_review", "task result review receipt is invalid")

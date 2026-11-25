@@ -98,7 +98,41 @@ type AgentApprovalRequest struct {
 	Object  string `json:"object"`
 	Content string `json:"content"`
 	Impact  string `json:"impact"`
+	// EvidencePointer names the evidence this approval rests on, in a form
+	// the user can open ("task_step:<step id>"). It is filled by the pause
+	// function that owns the step when the request does not carry one.
+	EvidencePointer string `json:"evidence_pointer"`
+	// CurrentCost is the cost of the single action awaiting approval, and
+	// TotalCost is the cumulative cost of the task so far. A nil cost means
+	// the cost is unknown: no trusted cost number exists before the action
+	// runs, and unknown is never rendered as 0.
+	CurrentCost *task.ApprovalCost `json:"current_cost"`
+	TotalCost   *task.ApprovalCost `json:"total_cost"`
+	// TriggerRule names the rule that required this approval.
+	TriggerRule string `json:"trigger_rule"`
+	// RejectionConsequence states what happens when the user rejects.
+	RejectionConsequence string `json:"rejection_consequence"`
 }
+
+// Approval trigger rules: the rule that required an approval card. The rule
+// is recorded on the pending request so the card can say why it exists.
+const (
+	// ApprovalTriggerSensitiveHostTool is a sensitive Host tool action that
+	// requires exact per-call approval (Step 05 authorization matrix).
+	ApprovalTriggerSensitiveHostTool = "sensitive_host_tool"
+	// ApprovalTriggerWorkspaceWrite is a hostless Workspace file write.
+	ApprovalTriggerWorkspaceWrite = "workspace_write"
+	// ApprovalTriggerMCPTool is an external MCP connector tool call.
+	ApprovalTriggerMCPTool = "mcp_tool"
+)
+
+// Approval rejection consequences: what happens when the user rejects, one
+// sentence per trigger. Rejecting never executes the action.
+const (
+	ApprovalRejectionConsequenceHostTool       = "If rejected, this exact tool call is not executed and the task pauses for your next instruction."
+	ApprovalRejectionConsequenceWorkspaceWrite = "If rejected, the file is not written to your Workspace and the task pauses for your next instruction."
+	ApprovalRejectionConsequenceMCPTool        = "If rejected, the external tool is not run and the task pauses for your next instruction."
+)
 
 type AgentToolPreparation struct {
 	Status         AgentToolPreparationStatus
@@ -140,6 +174,11 @@ type AgentModelFailureDiagnostic struct {
 	ReasonCode string
 	ToolName   string
 	ToolCallID string
+	// LadderReason and LadderAttempts carry the spent retry ladder for the
+	// route_retry_ladder_exhausted category (E12): which failure the ladder
+	// gave up on, and how many retries were spent on it.
+	LadderReason   string
+	LadderAttempts int64
 }
 
 // AgentToolTerminalAttemptFinisher durably closes a Task after the worker has

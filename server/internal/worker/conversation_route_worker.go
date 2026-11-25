@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -261,6 +262,14 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 				return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
 			}
 			if claim.Input.ResultReviewID == "" {
+				// E12: when the retry ladder is spent, log the exhaustion
+				// and fall through to the heuristic fallback (the method
+				// switch). The user is never asked to act.
+				if conversationRouteRetryLadderExhausted(claim, err) {
+					w.options.Logger.Warn("conversation route retry ladder exhausted; applying heuristic fallback",
+						zap.String("job", "conversation_route"), zap.String("message_id", claim.Message.ID),
+						zap.String("failure_code", "rate_limited"))
+				}
 				if delay, confirmed := conversationRouteRateLimitDelay(claim, err); confirmed {
 					if recovery, ok := w.options.Actions.(app.ConversationRouteRateLimitRecovery); ok {
 						recoveryCtx := ctx
@@ -359,16 +368,29 @@ func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error
 		// The durable route queue supports at most 24 hours; do not retry earlier than the provider requested.
 		return 0, true
 	}
-	if routeErr.RetryAfter > 0 {
-		retryAfter := routeErr.RetryAfter
-		delay := retryAfter / time.Second
-		if retryAfter%time.Second != 0 {
-			delay++
-		}
-		return delay * time.Second, true
+	// E12: the retry ladder decides the delay. A provider Retry-After wins
+	// over the computed backoff; after ModelRetryMaxRetries the ladder is
+	// spent and this returns unconfirmed, so the caller falls through to the
+	// heuristic fallback (the method switch). RouteAttempt is the durable
+	// attempt counter; no new table is introduced.
+	decision := app.DecideModelRetry(app.FailoverReasonRateLimited, max(claim.RouteAttempt-1, int64(0)), routeErr.RetryAfter, rand.Float64())
+	if decision.Exhausted {
+		return 0, false
 	}
-	shift := min(max(claim.RouteAttempt-1, int64(0)), int64(2))
-	return time.Second << shift, true
+	return decision.Delay, true
+}
+
+// conversationRouteRetryLadderExhausted reports whether a rate-limited route
+// failure has spent its retry ladder. The caller logs the exhaustion and
+// falls through to the heuristic fallback; the user is never involved.
+func conversationRouteRetryLadderExhausted(claim app.ConversationRouteClaim, err error) bool {
+	var routeErr *domain.Error
+	if !errors.As(err, &routeErr) || routeErr.Code != domain.CodeRateLimited ||
+		routeErr.Details["reason"] != string(app.ModelErrorRateLimited) || routeErr.Details["stage"] != "provider_status" {
+		return false
+	}
+	decision := app.DecideModelRetry(app.FailoverReasonRateLimited, max(claim.RouteAttempt-1, int64(0)), routeErr.RetryAfter, 0)
+	return decision.Exhausted
 }
 
 // conversationRouteHistoryPreviewBytes bounds one history entry when the

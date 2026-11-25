@@ -1,4 +1,4 @@
-.PHONY: build lint test race cover generate it
+.PHONY: build lint test race cover generate it smoke
 
 build:
 	go build ./...
@@ -27,3 +27,6 @@ it:
 	@if [ -z "$${CH_TEST_DATABASE_URL:-}" ]; then echo 'skipping PostgreSQL integration tests: CH_TEST_DATABASE_URL is not set'; fi
 	@if [ -z "$${CH_OSB_URL:-}" ] || [ -z "$${CH_OSB_API_KEY:-}" ]; then echo 'skipping OpenSandbox integration tests: CH_OSB_URL and CH_OSB_API_KEY are not both set'; fi
 	go test -timeout=45m ./...
+
+smoke:
+	../deploy/single/smoke.sh

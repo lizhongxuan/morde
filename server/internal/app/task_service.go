@@ -1235,6 +1235,37 @@ func (s *TaskService) ListEvents(ctx context.Context, principal identity.Princip
 	return page, nil
 }
 
+// GetTaskEventChain returns the nine-kind replayable chain of one task
+// (E08, read-side projection only). It follows the same guards as
+// ListEvents: the caller must be allowed to read the task, and internal
+// tool tasks are hidden as not-found. On revoked access it returns
+// not-found instead of a degraded chain: unlike the event page, an empty
+// chain is not a valid projection (a chain must start with created), so
+// there is no safe degraded shape to return, and not-found leaks nothing.
+func (s *TaskService) GetTaskEventChain(ctx context.Context, principal identity.Principal, id string) (TaskEventChain, error) {
+	if err := validateTaskReadPrincipal(principal); err != nil {
+		return TaskEventChain{}, err
+	}
+	if !domain.ValidTaskID(id) {
+		return TaskEventChain{}, domain.NewError(domain.CodeNotFound, "task not found")
+	}
+	details, err := s.store.GetTask(ctx, id, principal.UserID)
+	if err != nil {
+		return TaskEventChain{}, err
+	}
+	if details.Task.InternalTool {
+		return TaskEventChain{}, domain.NewError(domain.CodeNotFound, "task not found")
+	}
+	revokedAccess, err := s.authorizeTaskRead(ctx, principal, details.Task)
+	if err != nil {
+		return TaskEventChain{}, err
+	}
+	if revokedAccess {
+		return TaskEventChain{}, domain.NewError(domain.CodeNotFound, "task not found")
+	}
+	return s.store.GetTaskEventChain(ctx, principal.UserID, id)
+}
+
 func hasArtifactEvent(events []task.Event) bool {
 	for _, event := range events {
 		if event.Type == "task.artifact" {

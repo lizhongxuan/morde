@@ -1,0 +1,5 @@
+# Fixture table for TestSmokeGateAccounting (P3-3): only exceptions, no
+# evidence at all. The gate must exit 0 — exceptions are not failures —
+# while still recording them as exceptions, never as passes.
+FIX-EXCEPTION-DB	S+P	postgres test without a test database	go-test:internal/store/postgres:TestConversationMessageReceiptIsAtomicAndScoped	CH_TEST_DATABASE_URL
+FIX-EXCEPTION-PC	P+D	manual real-PC check	manual:needs real PC + real model/DSH	real-pc

@@ -278,7 +278,6 @@ func TestConversationResultReceiptSeparatesCompletionFromCurrentValidation(t *te
 	staleDigest := f.createTask(t, f.ownerID, "stale result digest")
 	oldRevision := f.createTask(t, f.ownerID, "old validation revision")
 	passed := f.createTask(t, f.ownerID, "current passing review")
-	failed := f.createTask(t, f.ownerID, "current failing review")
 	instanceID, err := f.store.ServiceInstanceID(ctx)
 	if err != nil {
 		t.Fatal(err)
@@ -321,7 +320,6 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f
 		{&staleDigest, "review bound to different bytes"},
 		{&oldRevision, "current revision one result"},
 		{&passed, "current result with pass evidence"},
-		{&failed, "current result with fail evidence"},
 	} {
 		if !f.complete(t, item.task, item.content) {
 			t.Fatalf("result was not queued for task %s", item.task.ID)
@@ -334,8 +332,9 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f
 	seedConversationResultValidationReview(t, f, oldRevision, 0, oldRevision.EventSequence+100, oldDigest[:], app.TaskValidationPass)
 	passedDigest := sha256.Sum256([]byte(passed.Content))
 	seedConversationResultValidationReview(t, f, passed, passed.TaskRevision, passed.EventSequence, passedDigest[:], app.TaskValidationPass)
-	failedDigest := sha256.Sum256([]byte(failed.Content))
-	seedConversationResultValidationReview(t, f, failed, failed.TaskRevision, failed.EventSequence, failedDigest[:], app.TaskValidationFail)
+	// A currently failing review is not part of this batch: the E11 delivery
+	// gate refuses any batch with a FAIL source whole, so its refusal is
+	// covered by TestPostgresTaskResultDeliveryRefusesFailedValidation.
 	f.runNextReview(t)
 
 	var messageID, content string
@@ -353,7 +352,6 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f
 		{staleDigest, app.TaskValidationPending},
 		{oldRevision, app.TaskValidationPending},
 		{passed, app.TaskValidationPass},
-		{failed, app.TaskValidationFail},
 	} {
 		want := fmt.Sprintf("- %s r%d：%s", check.task.ID, check.task.TaskRevision, check.state)
 		if !strings.Contains(content, want) {

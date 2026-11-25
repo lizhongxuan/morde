@@ -13,9 +13,183 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 )
+
+// getTaskEventChain serves the E08 nine-kind replayable chain of one task
+// as JSON (GET /tasks/:id/event-chain). It is a read-side projection only:
+// the write side keeps its eleven `task.*` event types, and this handler
+// never invents a node — a FAIL verdict returns a chain with a
+// verification node and no delivery node. Collections are always arrays,
+// never null.
+func (h *api) getTaskEventChain(service TaskService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.RawQuery != "" || c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0 {
+			writeError(c, domain.InvalidArgument("request", "task event chain does not accept a query string or body"))
+			return
+		}
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		id, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		chain, err := service.GetTaskEventChain(c.Request.Context(), principal, id)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, taskEventChainResponseFrom(chain))
+	}
+}
+
+// streamTaskEventChain streams the E08 chain over SSE
+// (GET /tasks/:id/event-chain/stream). The first frame is always the full
+// chain (`event: task.event_chain`); while the task is not terminal the
+// handler re-projects once a second and sends a fresh full snapshot only
+// when the chain changed, so a verification or delivery node that lands on
+// an old sequence still reaches the client. A reconnect re-sends the full
+// chain: there is no cursor, the snapshot is the resync. The stream ends
+// when the task reaches a terminal status, when re-projection fails, or
+// when the client disconnects.
+func (h *api) streamTaskEventChain(service TaskService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.RawQuery != "" || c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0 {
+			writeError(c, domain.InvalidArgument("request", "task event chain stream does not accept a query string or body"))
+			return
+		}
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		id, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		chain, err := service.GetTaskEventChain(c.Request.Context(), principal, id)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		details, err := service.Get(c.Request.Context(), principal, id)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		flusher, err := beginTaskEventStream(c)
+		if err != nil {
+			writeError(c, domain.NewError(domain.CodeInternal, "internal error"))
+			return
+		}
+		last, err := writeTaskEventChain(c.Writer, chain)
+		if err != nil {
+			return
+		}
+		flusher.Flush()
+		if isTerminalTaskStatus(details.Task.Status) {
+			return
+		}
+		poll := time.NewTicker(time.Second)
+		keepalive := time.NewTicker(15 * time.Second)
+		defer poll.Stop()
+		defer keepalive.Stop()
+		for {
+			select {
+			case <-c.Request.Context().Done():
+				return
+			case <-keepalive.C:
+				if _, err := fmt.Fprint(c.Writer, ": keep-alive\n\n"); err != nil {
+					return
+				}
+				flusher.Flush()
+			case <-poll.C:
+				next, err := service.GetTaskEventChain(c.Request.Context(), principal, id)
+				if err != nil {
+					return
+				}
+				nextDetails, err := service.Get(c.Request.Context(), principal, id)
+				if err != nil {
+					return
+				}
+				encoded, err := writeTaskEventChainIfChanged(c.Writer, next, last)
+				if err != nil {
+					return
+				}
+				if encoded != "" {
+					last = encoded
+					flusher.Flush()
+				}
+				if isTerminalTaskStatus(nextDetails.Task.Status) {
+					return
+				}
+			}
+		}
+	}
+}
+
+// taskEventChainResponse is the read-side chain shape. Nodes keep their
+// source sequence so the client can trace every node back to the stored
+// event (or, for verification/delivery, to the fact that produced it).
+type taskEventChainResponse struct {
+	TaskID            string                       `json:"task_id"`
+	Nodes             []taskEventChainNodeResponse `json:"nodes"`
+	UnmappedSequences []int64                      `json:"unmapped_sequences"`
+}
+
+type taskEventChainNodeResponse struct {
+	Kind           string    `json:"kind"`
+	SourceSequence int64     `json:"source_sequence"`
+	SourceType     string    `json:"source_type"`
+	Detail         string    `json:"detail"`
+	CreatedAt      time.Time `json:"created_at"`
+}
+
+func taskEventChainResponseFrom(chain app.TaskEventChain) taskEventChainResponse {
+	nodes := make([]taskEventChainNodeResponse, 0, len(chain.Nodes))
+	for _, node := range chain.Nodes {
+		nodes = append(nodes, taskEventChainNodeResponse{
+			Kind: string(node.Kind), SourceSequence: node.SourceSequence,
+			SourceType: node.SourceType, Detail: node.Detail, CreatedAt: node.CreatedAt,
+		})
+	}
+	unmapped := make([]int64, 0, len(chain.UnmappedSequences))
+	unmapped = append(unmapped, chain.UnmappedSequences...)
+	return taskEventChainResponse{TaskID: chain.TaskID, Nodes: nodes, UnmappedSequences: unmapped}
+}
+
+func writeTaskEventChain(writer io.Writer, chain app.TaskEventChain) (string, error) {
+	data, err := json.Marshal(taskEventChainResponseFrom(chain))
+	if err != nil {
+		return "", fmt.Errorf("encode task event chain: %w", err)
+	}
+	if _, err := fmt.Fprintf(writer, "event: task.event_chain\ndata: %s\n\n", data); err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+// writeTaskEventChainIfChanged writes a fresh snapshot only when the chain
+// differs from the last sent one. It returns the encoded snapshot when one
+// was written, or "" when nothing changed.
+func writeTaskEventChainIfChanged(writer io.Writer, chain app.TaskEventChain, last string) (string, error) {
+	data, err := json.Marshal(taskEventChainResponseFrom(chain))
+	if err != nil {
+		return "", fmt.Errorf("encode task event chain: %w", err)
+	}
+	if string(data) == last {
+		return "", nil
+	}
+	if _, err := fmt.Fprintf(writer, "event: task.event_chain\ndata: %s\n\n", data); err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
 
 func (h *api) streamTaskEvents(service TaskService) gin.HandlerFunc {
 	return func(c *gin.Context) {

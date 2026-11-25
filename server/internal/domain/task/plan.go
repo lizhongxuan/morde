@@ -21,12 +21,21 @@ const (
 )
 
 // Plan is an advisory, revisioned execution outline. It never grants tool access.
+// The optional Brief, Fix, Impact and FailingTest records are the Planner
+// declarations for a fix task: the brief four-piece set, the structured fix
+// proposal, the impact surface, and the reproducing failing test. They are
+// recorded with the plan so the write gates and the completion gate can check
+// them without a second store.
 type Plan struct {
-	TaskRevision      int64      `json:"task_revision"`
-	Revision          int64      `json:"revision"`
-	Goal              string     `json:"goal"`
-	CostEstimateState string     `json:"cost_estimate_state"`
-	Steps             []PlanStep `json:"steps"`
+	TaskRevision      int64              `json:"task_revision"`
+	Revision          int64              `json:"revision"`
+	Goal              string             `json:"goal"`
+	CostEstimateState string             `json:"cost_estimate_state"`
+	Steps             []PlanStep         `json:"steps"`
+	Brief             *Brief             `json:"brief,omitempty"`
+	Fix               *FixProposal       `json:"fix,omitempty"`
+	Impact            *ImpactMap         `json:"impact,omitempty"`
+	FailingTest       *FailingTestRecord `json:"failing_test,omitempty"`
 }
 
 type PlanStep struct {
@@ -42,6 +51,18 @@ type PlanStep struct {
 func (p Plan) Validate() error {
 	if p.TaskRevision < 0 || p.Revision < 1 || !planText(p.Goal, 1, 2048) || p.CostEstimateState != "unknown" || len(p.Steps) == 0 || len(p.Steps) > MaxPlanSteps {
 		return errors.New("task plan fields are invalid")
+	}
+	if err := p.Brief.Validate(); err != nil {
+		return err
+	}
+	if err := p.Fix.Validate(); err != nil {
+		return err
+	}
+	if err := p.Impact.Validate(); err != nil {
+		return err
+	}
+	if err := p.FailingTest.Validate(); err != nil {
+		return err
 	}
 	steps := make(map[string]PlanStep, len(p.Steps))
 	for _, step := range p.Steps {

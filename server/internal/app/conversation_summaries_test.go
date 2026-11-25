@@ -3,8 +3,11 @@ package app
 import (
 	"bytes"
 	"crypto/sha256"
+	"errors"
+	"strings"
 	"testing"
 
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/task"
 )
@@ -153,6 +156,91 @@ func TestConversationSummaryPromptDigestBindsTextAndProof(t *testing.T) {
 	}
 	if page, err := ConversationSummaryInputPageBudget(32_768); err != nil || page != MaxConversationSummaryInputPageBytes {
 		t.Fatalf("standard-window page budget = %d, %v", page, err)
+	}
+}
+
+func TestCheckConversationSummaryRestoreNamesEachCondition(t *testing.T) {
+	identity := ConversationSummaryIdentity{
+		ServiceInstanceID: "00000000-0000-4000-8000-000000000001", OwnerID: "u1234567", ActorID: "u1234567",
+		ConversationID: "c1234567", ScopeKind: ConversationSummaryPersonalScope, AuthorizationVersion: 1,
+	}
+	textDigest := sha256.Sum256([]byte("summary text"))
+	otherDigest := sha256.Sum256([]byte("other text"))
+	baseHead := ConversationSummaryHead{Identity: identity, Version: 2, Digest: textDigest[:]}
+	baseStored := &StoredConversationSummary{Identity: identity, Version: 2, SummarySHA256: textDigest[:], Ciphertext: []byte("sealed-bytes")}
+	baseDocument := &ConversationSummaryDocument{Identity: identity, Version: 2, Text: "summary text"}
+	if failure := CheckConversationSummaryRestore(identity, baseHead, baseStored, baseDocument, nil); failure != nil {
+		t.Fatalf("matching stored summary must restore cleanly, got %v", failure)
+	}
+	if failure := CheckConversationSummaryRestore(identity, ConversationSummaryHead{Identity: identity}, nil, nil, nil); failure != nil {
+		t.Fatalf("head without a version and without a stored summary must restore cleanly, got %v", failure)
+	}
+	cases := []struct {
+		name      string
+		head      ConversationSummaryHead
+		stored    *StoredConversationSummary
+		document  *ConversationSummaryDocument
+		openErr   error
+		condition string
+	}{
+		{name: "open failed", head: baseHead, stored: baseStored, openErr: errors.New("seal open failed"), condition: ConversationSummaryRestoreOpenFailed},
+		{name: "head without stored version", head: baseHead, stored: nil, condition: ConversationSummaryRestoreHeadWithoutStored},
+		{name: "head version invalid", head: ConversationSummaryHead{Identity: identity, Version: 0, Digest: textDigest[:]}, stored: baseStored, document: baseDocument, condition: ConversationSummaryRestoreHeadVersionInvalid},
+		{name: "identity mismatch", head: baseHead, stored: baseStored, document: &ConversationSummaryDocument{Identity: ConversationSummaryIdentity{
+			ServiceInstanceID: identity.ServiceInstanceID, OwnerID: identity.OwnerID, ActorID: "u7654321",
+			ConversationID: identity.ConversationID, ScopeKind: identity.ScopeKind, AuthorizationVersion: 1},
+			Version: 2, Text: "summary text"}, condition: ConversationSummaryRestoreIdentityMismatch},
+		{name: "version mismatch", head: baseHead, stored: baseStored, document: &ConversationSummaryDocument{Identity: identity, Version: 3, Text: "summary text"}, condition: ConversationSummaryRestoreVersionMismatch},
+		{name: "digest mismatch", head: ConversationSummaryHead{Identity: identity, Version: 2, Digest: otherDigest[:]}, stored: baseStored, document: baseDocument, condition: ConversationSummaryRestoreDigestMismatch},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			failure := CheckConversationSummaryRestore(identity, tc.head, tc.stored, tc.document, tc.openErr)
+			if failure == nil {
+				t.Fatal("restore check must fail")
+			}
+			if failure.Condition != tc.condition {
+				t.Fatalf("restore condition = %q, want %q (failure: %v)", failure.Condition, tc.condition, failure)
+			}
+			if failure.Reason == "" {
+				t.Fatal("restore failure must carry a reason")
+			}
+			if tc.stored != nil && failure.StoredBytes != int64(len(tc.stored.Ciphertext)) {
+				t.Fatalf("stored bytes = %d, want %d", failure.StoredBytes, len(tc.stored.Ciphertext))
+			}
+			if len([]rune(failure.Preview)) > ConversationSummaryRestorePreviewMaxRunes {
+				t.Fatalf("preview is %d runes, over the 1024 limit", len([]rune(failure.Preview)))
+			}
+			err := failure.ToError()
+			if domain.CodeOf(err) != domain.CodeInvalidState || err.Details["condition"] != tc.condition {
+				t.Fatalf("restore domain error = %+v, want invalid_state with condition %q", err, tc.condition)
+			}
+			if !strings.Contains(err.Error(), tc.condition) {
+				t.Fatalf("restore error %q does not name its condition", err.Error())
+			}
+		})
+	}
+}
+
+func TestCheckConversationSummaryRestorePreviewIsBounded(t *testing.T) {
+	identity := ConversationSummaryIdentity{
+		ServiceInstanceID: "00000000-0000-4000-8000-000000000001", OwnerID: "u1234567", ActorID: "u1234567",
+		ConversationID: "c1234567", ScopeKind: ConversationSummaryPersonalScope, AuthorizationVersion: 1,
+	}
+	textDigest := sha256.Sum256([]byte("summary text"))
+	head := ConversationSummaryHead{Identity: identity, Version: 2, Digest: textDigest[:]}
+	stored := &StoredConversationSummary{Identity: identity, Version: 2, SummarySHA256: textDigest[:], Ciphertext: []byte("sealed-bytes")}
+	longText := strings.Repeat("字", 2000)
+	document := &ConversationSummaryDocument{Identity: identity, Version: 3, Text: longText}
+	failure := CheckConversationSummaryRestore(identity, head, stored, document, nil)
+	if failure == nil || failure.Condition != ConversationSummaryRestoreVersionMismatch {
+		t.Fatalf("long-text version mismatch must fail by name, got %v", failure)
+	}
+	if got := len([]rune(failure.Preview)); got != ConversationSummaryRestorePreviewMaxRunes {
+		t.Fatalf("preview is %d runes, want exactly 1024", got)
+	}
+	if failure.RestoredBytes != int64(len(longText)) {
+		t.Fatalf("restored bytes = %d, want %d", failure.RestoredBytes, len(longText))
 	}
 }
 

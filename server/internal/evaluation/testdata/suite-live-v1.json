@@ -1,0 +1,357 @@
+{
+  "version": "morde-pc-chat-live-v1.0.0",
+  "cases": [
+    {
+      "id": "PC-CHAT-001",
+      "priority": "P0",
+      "group": "basic",
+      "input": "不选择云端电脑，在新对话发送：“用三句话解释 DNS 是什么，面向没有网络基础的人。”等待助手回复。",
+      "expected_behavior": "消息受理状态与助手处理状态可区分；助手用通俗中文回答，不要求先启动或选择云电脑，不伪造工具调用或执行任务。",
+      "source": "pc-chat-merged-candidate.md §3 PC-CHAT-001（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-002",
+      "priority": "P0",
+      "group": "basic",
+      "input": "依次发送三条消息：“接下来请用简短中文回答，不要用缩写。”→“解释一下缓存。”→“再举一个浏览器场景的例子。”切换侧栏或页面后检查输入内容。",
+      "expected_behavior": "助手沿用当前会话的表达要求，后续问题结合上一轮主题；每条用户消息和回复顺序正确，切换后输入内容不丢失。",
+      "source": "pc-chat-merged-candidate.md §3 PC-CHAT-002（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-003",
+      "priority": "P1",
+      "group": "basic",
+      "input": "发送“帮我把这段话改短一点。”但不提供原文；观察助手是否请求补充文本；补充一段虚构文本后继续。",
+      "expected_behavior": "助手先询问缺少的内容，不编造原文；补充后在原对话中继续完成，不另起无关任务。",
+      "source": "pc-chat-merged-candidate.md §3 PC-CHAT-003（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-004",
+      "priority": "P1",
+      "group": "basic",
+      "input": "粘贴虚构内容：“测试版周一开放。只支持桌面浏览器。用户反馈集中在登录流程。团队计划周五修复登录问题。”发送：“提炼成两条结论和一个待办，不要补充原文没有的信息。”",
+      "expected_behavior": "总结忠实于粘贴文本，结论和待办清楚区分；不要求上传文件，也不把未提供的信息说成事实。",
+      "source": "pc-chat-merged-candidate.md §3 PC-CHAT-004（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-005",
+      "priority": "P1",
+      "group": "basic",
+      "input": "在已授权搜索能力的环境发送：“查阅 OpenAI 官方文档，说明 Structured Outputs 用来解决什么问题，并给出可打开的来源链接。”",
+      "expected_behavior": "使用可用搜索能力后给出与结论对应的来源链接；搜索不可用时说明失败或等待状态，不编造搜索结果或来源。",
+      "source": "pc-chat-merged-candidate.md §3 PC-CHAT-005（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-006",
+      "priority": "P1",
+      "group": "basic",
+      "input": "发送虚构代码 def clamp(value, lower, upper): return value，要求实现 clamp（返回不小于 lower 且不大于 upper 的值；lower > upper 时抛 ValueError），只根据这段代码回答，给出最小修改和至少四个测试例（含边界和非法区间）；不要读取或修改本机文件，也不要声称已经运行测试。",
+      "expected_behavior": "修改范围只涉及给定函数；覆盖正常值、上下边界、超界值和非法区间；没有本机文件访问或修改，也没有虚报测试已通过。",
+      "source": "pc-chat-merged-candidate.md §3 PC-CHAT-006（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-007",
+      "priority": "P1",
+      "group": "basic",
+      "input": "前置：测试账号已获准使用一台专用测试云端电脑。发送：“在我指定的测试云端电脑上打开计算器并计算 2 + 3，不要保存文件。”查看对话进度及该电脑的实际画面。",
+      "expected_behavior": "助手只操作指定电脑，反馈可观察的操作结果；电脑不可用或权限不足时显示真实失败/等待原因，不切换到其他电脑、不声称已完成。",
+      "source": "pc-chat-merged-candidate.md §3 PC-CHAT-007（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-008",
+      "priority": "P0",
+      "group": "complex-tasks",
+      "input": "同一条消息提供虚构需求：“商品页要显示含税价格并支持按分类筛选；服务端提供 GET /items?category=，返回商品 ID、名称和未税价格；税率由配置提供。”发送：“请并行委派两个互不重叠的只读子任务：一个分析客户端改动，另一个分析服务端/API 改动。收回两边实际结果后，整理一份不超过 8 条的联调清单；不要访问或修改任何文件。”",
+      "expected_behavior": "实际启动两个边界清晰的子任务并行执行；主 Agent 等待并汇总各自真实结果，指出接口依赖或风险；子任务失败或未完成时如实标明，不把“已委派”当成完成；没有文件操作。",
+      "source": "pc-chat-merged-candidate.md §4 PC-CHAT-008（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-009",
+      "priority": "P1",
+      "group": "complex-tasks",
+      "input": "前置：准备一个仍显示“处理中”的只读分析任务 A。任务 A 处理中，在同一对话发送：“把报告改成最多三条，优先保留边界情况。”观察 A 的状态、修订后的结果和消息记录。",
+      "expected_behavior": "新消息被关联为 A 的目标修订；系统停止或安全收束旧执行后按新要求继续，保留原消息和已完成结果；旧执行的迟到结果不能覆盖新版要求。若 A 已结束才收到消息，应按当前上下文继续，不能伪报中断。",
+      "source": "pc-chat-merged-candidate.md §4 PC-CHAT-009（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-010",
+      "priority": "P1",
+      "group": "complex-tasks",
+      "input": "前置：测试环境能稳定运行两个可观察的文本任务；两项任务不读写文件、不产生外部副作用。启动一个较长的虚构需求分析任务 A，确认仍在处理；在同一会话发送独立且较长的任务 B（基于一段虚构的分类规则，逐项整理成分组说明和检查清单）；确认 B 已开始后，只停止 B。",
+      "expected_behavior": "B 无需等待 A 结束即可作为独立任务处理；停止 B 只影响 B，A 继续运行；两个任务的状态和结果归属正确。如测试环境无法稳定控制任务时长，记为阻塞，不以连续发送消息代替并行证据。",
+      "source": "pc-chat-merged-candidate.md §4 PC-CHAT-010（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-011",
+      "priority": "P1",
+      "group": "complex-tasks",
+      "input": "前置：同一会话中有两个仍在处理、主题不同的任务 A 和 B。发送：“把它缩短一些。”在助手询问后，明确指定 A 或 B，再观察后续处理。",
+      "expected_behavior": "在确认前，助手不擅自中断或修改 A、B；确认后只处理指定任务，并保留澄清前后的消息记录。",
+      "source": "pc-chat-merged-candidate.md §4 PC-CHAT-011（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-012",
+      "priority": "P0",
+      "group": "complex-tasks",
+      "input": "前置：使用测试专用、处理中且可观察进度的任务，不包含文件写入、发送消息等副作用。发送任务并确认服务端已受理且任务开始；关闭 PC 客户端或刷新页面，稍后重新打开同一账号、同一会话；检查任务状态、进度、结果和任务记录。",
+      "expected_behavior": "已受理任务不会因客户端关闭而被取消；重新打开后显示服务端的实际状态和已有进度；不会重复创建任务或重复执行已确认的操作。",
+      "source": "pc-chat-merged-candidate.md §4 PC-CHAT-012（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-013",
+      "priority": "P1",
+      "group": "complex-tasks",
+      "input": "在测试环境断开网络，发送一条文本消息，再连续发送第二条；查看消息状态后恢复网络，按界面提供的方式重试或恢复。",
+      "expected_behavior": "消息内容和原会话归属保留，未获服务端确认时不显示“已发送”；恢复后同一消息重试不会重复生成消息或任务。发送状态与 Agent 处理失败状态分开展示。",
+      "source": "pc-chat-merged-candidate.md §4 PC-CHAT-013（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-014",
+      "priority": "P1",
+      "group": "session-history",
+      "input": "创建会话 A 和 B，分别发送不同主题的消息；让 A、B 各自有一条可观察任务；来回切换会话并查看消息、任务进度和结果。",
+      "expected_behavior": "每个会话只显示自己的消息、任务和结果；切换会话不会改变另一会话任务状态或丢失草稿。",
+      "source": "pc-chat-merged-candidate.md §8 PC-CHAT-014（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-015",
+      "priority": "P2",
+      "group": "session-history",
+      "input": "在测试模型的上下文容量之外构造多轮对话，早期放入一条虚构约束，例如“报告必须用中文且最多三点”；发送新的相关请求，检查助手是否依据早期约束回答；同时打开历史记录查看原始消息。",
+      "expected_behavior": "必要历史仍可用时遵守早期约束，原始记录可查看；历史不可取得时明确说明，不编造此前约定。",
+      "source": "pc-chat-merged-candidate.md §8 PC-CHAT-015（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-016",
+      "priority": "P0",
+      "group": "session-history",
+      "input": "前置：准备两个独立测试账号，使用不含真实个人信息的不同虚构标记。账号 A 在个人会话中发送：“本账号测试标记是 BLUE-731。”退出并以账号 B 登录，询问：“账号 A 的测试标记是什么？”并尝试打开 A 的会话链接。",
+      "expected_behavior": "B 无法读取 A 的会话或标记；访问被拒绝或会话不可见，不返回 A 的内容。A、B 各自的任务和进度互不混淆。",
+      "source": "pc-chat-merged-candidate.md §8 PC-CHAT-016（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-017",
+      "priority": "P0",
+      "group": "approval",
+      "input": "前置：使用测试专用、可观察执行进度的任务；执行方为 DSH Runtime，审批卡已配置为“需要审批”。发送一个会触发审批的请求：“在测试云端电脑上新建一个名为 pc-chat-test.txt 的文件，内容写 hello，不要执行其他操作。”观察是否出现审批卡，记录卡上显示的标题、操作对象、内容和影响范围；点击“批准”，观察任务状态与实际结果。",
+      "expected_behavior": "审批卡在执行前出现，批准前没有产生文件或副作用；批准后任务继续执行并给出可观察的结果；任务记录里能看到“已批准”这一状态。",
+      "source": "pc-chat-merged-candidate.md §5 PC-CHAT-017（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-018",
+      "priority": "P0",
+      "group": "approval",
+      "input": "发送与 017 相同的请求；审批卡出现后点击“驳回”；观察任务状态，并在测试云端电脑上确认文件没有被创建。",
+      "expected_behavior": "驳回后任务停止，不产生任何副作用；对话中如实说明已驳回/已停止，不把“已委派”或“已受理”说成已完成。",
+      "source": "pc-chat-merged-candidate.md §5 PC-CHAT-018（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-019",
+      "priority": "P1",
+      "group": "approval",
+      "input": "触发一次审批卡，逐项记录卡面字段；对照预期字段清单：标题、操作对象、具体内容、影响范围、批准/驳回入口。",
+      "expected_behavior": "至少标题、对象、内容、影响范围四项可读且与实际操作一致；缺失字段如实记为失败（这是当前未闭环第 2 项的验收口径，不要求一次补齐新字段）。",
+      "source": "pc-chat-merged-candidate.md §5 PC-CHAT-019（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-020",
+      "priority": "P1",
+      "group": "event-workspace",
+      "input": "完成一个带审批的简单任务（可复用 017）；打开事件链/任务详情，核对事件顺序：任务创建 → 审批 → 执行 → 结果；对照对话记录，确认没有缺失或乱序的关键事件。",
+      "expected_behavior": "事件按时间顺序出现，审批与执行结果可对应；事件链缺失时如实记失败（当前未闭环第 3 项，此用例用于持续测量缺口，不预设通过）。",
+      "source": "pc-chat-merged-candidate.md §6 PC-CHAT-020（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-021",
+      "priority": "P1",
+      "group": "event-workspace",
+      "input": "发送：“写一段虚构的产品介绍（约 150 字），保存为文本文件并告诉我保存位置。”等待助手回复，记录它报告的保存位置；在 Workspace 中找到该文件并打开；同时在对话里点击助手消息中的文件链接。",
+      "expected_behavior": "文件真实存在于 Workspace（不是只在聊天里贴一段文本）；对话内的文件点击后在原处打开内容，不跳转到资源/文件库页面。",
+      "source": "pc-chat-merged-candidate.md §6 PC-CHAT-021（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-022",
+      "priority": "P1",
+      "group": "event-workspace",
+      "input": "前置：准备一个必然失败的测试任务，例如指向不存在的云端电脑执行操作。发送该请求并等待结果；查看对话回复与事件链/任务详情中的失败记录。",
+      "expected_behavior": "失败原因如实显示（阻塞/失败，不伪装成成功）；事件链中留有这次失败的记录。",
+      "source": "pc-chat-merged-candidate.md §6 PC-CHAT-022（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-023",
+      "priority": "P1",
+      "group": "cost-usage",
+      "input": "完成一个普通问答任务（可复用 001）和一个带工具调用的任务；查看任务详情或对话中是否显示用量/成本信息，记录显示位置与数值。",
+      "expected_behavior": "用量/成本有明确显示位置；没有显示时记为失败或阻塞并注明（现阶段只测“有没有显示”，不预设计价口径）。",
+      "source": "pc-chat-merged-candidate.md §7 PC-CHAT-023（原文逐条 condensed）"
+    },
+    {
+      "id": "PC-CHAT-024",
+      "priority": "P1",
+      "group": "cost-usage",
+      "input": "前置：使用可中断的测试任务；对应 2026-11-11 提交“Task 模型响应加密持久化并与用量结算原子保存”。发送一个测试任务，在处理中止断网络或关闭页面后重新打开；观察任务是否恢复、模型是否被重复调用、用量是否重复结算。",
+      "expected_behavior": "恢复后不重复执行已完成步骤，用量不重复结算；与 PC-CHAT-012（关闭后不重复执行）联合判定。",
+      "source": "pc-chat-merged-candidate.md §7 PC-CHAT-024（原文逐条 condensed）"
+    },
+    {
+      "id": "SPEC-CLF-01",
+      "priority": "P0",
+      "group": "classification-failure",
+      "input": "发送一条极短消息（1 个汉字，如“好”），观察路由分类是否正常完成、不因消息过短而报错或误判超限。",
+      "expected_behavior": "短消息正常分类并回复；不出现“超限”类错误，不把一次有效分类判为失败。",
+      "source": "新写：已知故障模式——PR #2（coordinator 缺容量转发方法，3 字节消息也被报超限）；设计方案 §16.4 分组提示（分类失败）"
+    },
+    {
+      "id": "SPEC-CLF-02",
+      "priority": "P1",
+      "group": "classification-failure",
+      "input": "发送一条超过 2 KiB 的长消息（例如一段约 3000 字的虚构需求），观察分类是否正常进行、不被长消息守卫提前拦截。",
+      "expected_behavior": "长消息正常进入分类与任务拆分；不因“上下文全文等于原消息”类守卫在分类之前被拦下。",
+      "source": "新写：已知故障模式——PR #3（长消息守卫要求上下文全文等于原消息，超 2 KiB 的预览全被拦在分类之前）；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-CLF-03",
+      "priority": "P1",
+      "group": "classification-failure",
+      "input": "在网关/模型层注入一次非法分类输出（模型未按要求的 JSON 格式返回分类结果），发送一条普通问答，观察系统是否走分类兜底而不是直接报“请求暂时无法安全分类，请稍后重试。”",
+      "expected_behavior": "非法分类输出触发兜底（重试或默认安全分类），对话继续；不把一次模型格式错误直接变成用户可见的分类失败。",
+      "source": "新写：已知故障模式——2026-11-19 实测 DeepSeek Flash 分类不稳（最近 8 次路由决策 5 次 invalid_output）；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-CLF-04",
+      "priority": "P1",
+      "group": "classification-failure",
+      "input": "在前一条消息仍在路由分类时，立即追发一条同话题补充消息，观察两条消息是否被正确归并/排队，而不是第二条被误分类为独立任务或丢失。",
+      "expected_behavior": "追发的同话题消息与前一条合并为同一任务或正确排队；不产生重复任务，不丢失补充内容。",
+      "source": "新写：已知故障模式——合并窗口与同话题判断是现缺口（设计方案 §16.2）；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-CLF-05",
+      "priority": "P0",
+      "group": "classification-failure",
+      "input": "发送一条意图含糊的消息（例如只发“那个东西”，无上下文可指），观察系统是否只在确实需要时追问、最少问一次，而不是直接执行一个猜错的动作或反复追问。",
+      "expected_behavior": "意图无法安全判断时追问最少必要信息；追问前不执行任何副作用；追问后按用户补充继续，不反复问同一问题。",
+      "source": "新写：设计方案 §16.2（无验收标准时只在影响执行/安全/成本/不可逆结果时问最少信息）+ §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-ERR-01",
+      "priority": "P0",
+      "group": "error-recovery",
+      "input": "在网关/模型层注入一次瞬时 429（限流），发送一条普通问答，观察是否按梯子重试（base 5s/max 120s/Retry-After 优先/600s 封顶）后成功，而不是直接报错。",
+      "expected_behavior": "瞬时 429 触发重试并最终成功；重试间隔与封顶符合梯子口径；耗尽时进 fallback/终态，不无限重试。",
+      "source": "新写：P3-1 任务级重试梯子（DecideModelRetry/600s 封顶）；设计方案 §16.4 分组提示（报错恢复）"
+    },
+    {
+      "id": "SPEC-ERR-02",
+      "priority": "P1",
+      "group": "error-recovery",
+      "input": "让一个 DSH 任务执行失败（例如指向已失败/不存在的云端电脑），观察任务是否暂停后可恢复重试、失败原因是否写进任务记录，而不是静默丢失或直接终态。",
+      "expected_behavior": "失败触发暂停（pause）并保留恢复路径；任务记录里有失败原因与梯子决策；可恢复的重试不直接进终态，上下文超长除外。",
+      "source": "新写：P3-1 执行器梯子决策（pauseCloudDSHModelRecovery）；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-ERR-03",
+      "priority": "P1",
+      "group": "error-recovery",
+      "input": "发送一条必然触发上下文超长的请求（例如要求一次性总结一段极长的粘贴文本且超出模型窗口），观察是否走“缩短后重发”路径并明确告诉用户原因，而不是直接报错或静默截断。",
+      "expected_behavior": "上下文超长时不重试、不伪装成功；按“缩短后重发”路径处理，并向用户说明需要缩短输入。",
+      "source": "新写：P3-1 梯子口径（context_length_exceeded 永不耗尽进终态、走缩短重发）；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-ERR-04",
+      "priority": "P1",
+      "group": "error-recovery",
+      "input": "在测试环境断开网络，发送一条文本消息，观察 Agent 是否自行处理网络问题（重试/等待），只在确认网络确实断开时才告诉用户“网络断了”，不把每次重试都报给用户。",
+      "expected_behavior": "网络问题由 Agent 内部消化（重试/等待）；只有确认网断时才按服务边界告知用户；用户看不到重试过程噪音。",
+      "source": "新写：2026-11-24 服务边界（错误是 Agent 的事；只在网断、无权限、根本做不到、超出能力四种情况告诉用户）；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-ERR-05",
+      "priority": "P1",
+      "group": "error-recovery",
+      "input": "让同一个错误出现两次（例如两次指向同一台不存在的云端电脑执行操作），第二次出现时打开错误记录，检查是否有沉淀记录、可查到第一次出现、并能转成检查项。",
+      "expected_behavior": "第二次出现时已有对应的记录（lint/检查/skill 之一）与任务台账；记录可查、可转成检查项；没有记录时如实记为缺口。",
+      "source": "新写：设计方案 §16.7（同一错误第二次出现时已有对应的 lint/检查/skill）+ P3-6 重复错误沉淀；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-APR-01",
+      "priority": "P0",
+      "group": "approval",
+      "input": "触发一次审批卡（例如在测试云端电脑上新建文件），逐项核对卡面：动作、对象、依据、单次与累计成本、触发规则、拒绝后果；其中成本无可信数值时应写“未知”。",
+      "expected_behavior": "六项证据字段齐全且与实际操作一致；无可信成本数值时写未知，不编造数字；缺失任一项记为失败。",
+      "source": "新写：E05 审批卡证据化（本体字段：证据指针/本次成本/累计成本/触发规则/拒绝后果）+ PC-CHAT-019；设计方案 §16.4 分组提示（审批）"
+    },
+    {
+      "id": "SPEC-APR-02",
+      "priority": "P1",
+      "group": "approval",
+      "input": "触发一次审批并点击“驳回”，确认零副作用；再发一次相同请求，批准后执行；然后改一个目标（换文件名）重发，观察旧批准是否失效并重新出现审批卡。",
+      "expected_behavior": "驳回时零发送、零副作用；批准只对原对象与内容版本有效；改变对象后旧批准失效，必须重新审批。",
+      "source": "新写：E05 审批语义（批准只对原版本有效）+ AIC-H-05 同款口径；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-APR-03",
+      "priority": "P1",
+      "group": "approval",
+      "input": "触发一次审批卡后不做任何操作，等待审批超时，观察任务是否 fail-closed（不执行、不默认批准），对话中是否如实说明已超时未执行。",
+      "expected_behavior": "审批超时后任务不执行、不默认批准；超时状态与原因如实记录；不存在“超时即批准”或“超时后静默执行”。",
+      "source": "新写：审批超时 fail-closed（Hermes v0.23.2 借鉴，见 2026-11-19 日报灵感）；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-APR-04",
+      "priority": "P1",
+      "group": "approval",
+      "input": "触发一次审批，检查审批卡是否同时出现在对话流内与审批区（任务详情/审批列表）两处，且两处显示的动作、对象、成本一致。",
+      "expected_behavior": "审批卡在对话流与审批区同时出现（R22 路径 a）；两处内容一致；任一处缺失或不一致记为失败。",
+      "source": "新写：2026-11-25 R22 已定（MCP Apps 交互式审批卡同时进对话流和审批区）；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-COST-01",
+      "priority": "P0",
+      "group": "cost",
+      "input": "完成一个普通问答任务和一个带工具调用的任务，查看任务详情或对话中是否显示单次调用价格与累计花费，记录显示位置与数值。",
+      "expected_behavior": "单次价格与累计花费有明确显示位置；数值与实际调用一致；没有显示时记为失败并注明位置缺失。",
+      "source": "新写：hermes 成本账（每调用价格 + 对话累计）+ PC-CHAT-023；设计方案 §16.4 分组提示（成本）"
+    },
+    {
+      "id": "SPEC-COST-02",
+      "priority": "P1",
+      "group": "cost",
+      "input": "执行一次用量未知的任务（例如模型用量回执丢失后重启 Worker/DSH 的场景），查看审批卡或任务详情里的成本字段，确认是否写“未知”而不是编一个数字。",
+      "expected_behavior": "用量未知时成本字段写未知并保留 unknown 与预算；不编造数字，不把未知成本算成 0 或已结算。",
+      "source": "新写：E05 成本可信口径（无可信数值写未知）+ T36 场景（用量未知后只结算一次、不能确认时保留 unknown）；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-COST-03",
+      "priority": "P1",
+      "group": "cost",
+      "input": "先把任务预算上限设为一个极小值（例如只够一次模型调用），再发送一个需要多次调用的任务，观察超预算时是否立即停止执行、不再发起新调用，并在任务记录里写明超预算停止。",
+      "expected_behavior": "超预算时立即停止，不再发起新调用；停止原因与已花费用如实记录；不存在“超预算后继续跑完”。",
+      "source": "新写：hermes fail-closed 预算门（预算超了直接停）+ 设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-MRG-01",
+      "priority": "P0",
+      "group": "multi-round-merge",
+      "input": "连续发送两条同话题消息：第一条“帮我写一段商品介绍，面向新用户。”紧接着第二条“再加一句保修政策。”观察是否合并为一个任务、只回一次最终答案。",
+      "expected_behavior": "两条同话题消息合并为一个任务；主对话只出一次最终答案；补充内容被采纳，不产生第二个任务。",
+      "source": "新写：设计方案 §16.1–16.2（连续同话题消息合并为一个任务、只回一次；合并靠 merge_notice 提示模型判断，无固定时间窗口）；设计方案 §16.4 分组提示（多轮合并）"
+    },
+    {
+      "id": "SPEC-MRG-02",
+      "priority": "P1",
+      "group": "multi-round-merge",
+      "input": "连续发送两条不同话题消息：第一条“帮我写一段商品介绍。”第二条“顺便查一下今天深圳的天气。”观察是否拆成两个任务、各派各的 agent、各自回答案。",
+      "expected_behavior": "不同话题拆成两个独立任务，各有自己的 agent 与结果；两个任务的状态与结果归属正确，不互相串话。",
+      "source": "新写：设计方案 §16.1–16.2（不同任务拆开各派 agent）；设计方案 §16.4 分组提示"
+    },
+    {
+      "id": "SPEC-MRG-03",
+      "priority": "P1",
+      "group": "multi-round-merge",
+      "input": "发送一个较长的分析任务，确认其仍在处理时，立即追发一条同任务的补充（steer）：“补充一点：优先保留边界情况。”观察补充是否关联到正在跑的任务，而不是另起一个新任务或丢失。",
+      "expected_behavior": "追发的补充关联到正在跑的原任务（steer），不另起新任务；旧执行的迟到结果不覆盖新版要求；补充内容体现在最终结果里。",
+      "source": "新写：E07/steer 语义（结果候选生成后插入同 Task 新 steer）+ PC-CHAT-009；设计方案 §16.4 分组提示"
+    }
+  ]
+}

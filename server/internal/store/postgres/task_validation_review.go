@@ -288,7 +288,25 @@ WHERE review.task_id=$1 AND review.task_revision=$3 AND review.owner_id=$2
 		if err != nil {
 			return fmt.Errorf("complete Task validation review: %w", err)
 		}
-		completed = updated.RowsAffected() == 1
+		if updated.RowsAffected() != 1 {
+			completed = false
+			return nil
+		}
+		// Read-back comparison: the persisted verdict must equal the verdict
+		// re-derived from the same report and facts. A mismatch fails the
+		// completion (the transaction rolls back and the review stays
+		// processing for a later retry) instead of reporting a verdict the
+		// store does not hold.
+		var storedState, storedValidationState string
+		if err := tx.QueryRow(ctx, `SELECT state,validation_state FROM task_validation_reviews
+WHERE task_id=$1 AND task_revision=$2 AND owner_id=$3`, claim.TaskID, claim.TaskRevision, claim.OwnerID).
+			Scan(&storedState, &storedValidationState); err != nil {
+			return fmt.Errorf("read back Task validation review verdict: %w", err)
+		}
+		if storedState != "reviewed" || !app.VerifyTaskValidationVerdictReplay(completion.Report, facts, app.TaskValidationState(storedValidationState)) {
+			return domain.NewError(domain.CodeConflict, "Task validation review verdict does not match its stored record")
+		}
+		completed = true
 		return nil
 	})
 	return completed, err
@@ -359,14 +377,84 @@ WHERE st.task_id=$1 AND st.task_revision=$2 AND st.status='succeeded' AND st.det
 	}
 	if hasExecution {
 		facts.TaskExecution = app.TaskValidationFactPresent
-		facts.IrreversibleAction = app.TaskValidationFactUnknown
-		facts.RepeatedError = app.TaskValidationFactUnknown
+		approvals, operations, steps, err := loadTaskValidationReplayRecords(ctx, tx, claim.TaskID)
+		if err != nil {
+			return app.TaskValidationVerdictFacts{}, err
+		}
+		facts.IrreversibleAction, facts.ApprovalHistoryVerified = app.DeriveTaskValidationApprovalFacts(approvals, operations)
+		facts.RepeatedError, facts.CorrectionRecordVerified = app.DeriveTaskValidationCorrectionFacts(steps)
+		facts.ReplayVerified = app.DeriveTaskValidationReplayVerified(steps, approvals, operations)
 	} else {
 		facts.TaskExecution = app.TaskValidationFactAbsent
 		facts.IrreversibleAction = app.TaskValidationFactAbsent
 		facts.RepeatedError = app.TaskValidationFactAbsent
 	}
 	return facts, nil
+}
+
+// loadTaskValidationReplayRecords reads the stored records a verdict is
+// re-derived from: approval-gated actions, tool steps and the operation
+// ledger. The derivation itself is pure (app.DeriveTaskValidation*), so the
+// same stored records always yield the same facts.
+func loadTaskValidationReplayRecords(ctx context.Context, tx pgx.Tx, taskID string) ([]app.TaskValidationApprovalRecord, map[string]string, []app.TaskValidationStepRecord, error) {
+	approvalRows, err := tx.Query(ctx, `SELECT COALESCE(call_id,''),status FROM task_pending_requests WHERE task_id=$1`, taskID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read Task validation approval records: %w", err)
+	}
+	approvals := make([]app.TaskValidationApprovalRecord, 0)
+	for approvalRows.Next() {
+		var approval app.TaskValidationApprovalRecord
+		if err := approvalRows.Scan(&approval.CallID, &approval.Status); err != nil {
+			approvalRows.Close()
+			return nil, nil, nil, fmt.Errorf("scan Task validation approval record: %w", err)
+		}
+		approvals = append(approvals, approval)
+	}
+	if err := approvalRows.Err(); err != nil {
+		approvalRows.Close()
+		return nil, nil, nil, fmt.Errorf("iterate Task validation approval records: %w", err)
+	}
+	approvalRows.Close()
+	operationRows, err := tx.Query(ctx, `SELECT operation_key,status FROM task_operations WHERE task_id=$1`, taskID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read Task validation operation ledger: %w", err)
+	}
+	operations := make(map[string]string)
+	for operationRows.Next() {
+		var key, status string
+		if err := operationRows.Scan(&key, &status); err != nil {
+			operationRows.Close()
+			return nil, nil, nil, fmt.Errorf("scan Task validation operation record: %w", err)
+		}
+		if key != "" {
+			operations[key] = status
+		}
+	}
+	if err := operationRows.Err(); err != nil {
+		operationRows.Close()
+		return nil, nil, nil, fmt.Errorf("iterate Task validation operation ledger: %w", err)
+	}
+	operationRows.Close()
+	stepRows, err := tx.Query(ctx, `SELECT COALESCE(tool_name,''),COALESCE(failure_reason,''),status,sequence,COALESCE(tool_call_key,'')
+FROM task_steps WHERE task_id=$1 AND (kind='tool' OR tool_name IS NOT NULL) ORDER BY sequence`, taskID)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("read Task validation tool steps: %w", err)
+	}
+	steps := make([]app.TaskValidationStepRecord, 0)
+	for stepRows.Next() {
+		var step app.TaskValidationStepRecord
+		if err := stepRows.Scan(&step.ToolName, &step.FailureReason, &step.Status, &step.Sequence, &step.ToolCallKey); err != nil {
+			stepRows.Close()
+			return nil, nil, nil, fmt.Errorf("scan Task validation tool step: %w", err)
+		}
+		steps = append(steps, step)
+	}
+	if err := stepRows.Err(); err != nil {
+		stepRows.Close()
+		return nil, nil, nil, fmt.Errorf("iterate Task validation tool steps: %w", err)
+	}
+	stepRows.Close()
+	return approvals, operations, steps, nil
 }
 
 func currentTaskValidationReviewArtifactContentRefsInTx(ctx context.Context, tx pgx.Tx,

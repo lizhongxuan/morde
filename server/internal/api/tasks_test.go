@@ -92,6 +92,11 @@ type taskServiceStub struct {
 	eventAfter             int64
 	eventErrorAfterCall    int
 	eventPages             []app.TaskEventPage
+	chain                  app.TaskEventChain
+	chains                 []app.TaskEventChain
+	chainCalls             int
+	chainErr               error
+	chainErrAfterCall      int
 	revokeTaskID           string
 	revokeConnectorID      string
 	revokeVersion          int64
@@ -313,6 +318,26 @@ func (s *taskServiceStub) ListEvents(_ context.Context, principal identity.Princ
 		err = nil
 	}
 	return app.TaskEventPage{HostID: "h1234567", Status: status, CurrentSequence: current, Items: s.events}, err
+}
+
+func (s *taskServiceStub) GetTaskEventChain(_ context.Context, _ identity.Principal, _ string) (app.TaskEventChain, error) {
+	s.chainCalls++
+	if len(s.chains) > 0 {
+		index := s.chainCalls - 1
+		if index >= len(s.chains) {
+			index = len(s.chains) - 1
+		}
+		err := s.chainErr
+		if s.chainErrAfterCall > 0 && s.chainCalls < s.chainErrAfterCall {
+			err = nil
+		}
+		return s.chains[index], err
+	}
+	err := s.chainErr
+	if s.chainErrAfterCall > 0 && s.chainCalls < s.chainErrAfterCall {
+		err = nil
+	}
+	return s.chain, err
 }
 
 func (s *taskServiceStub) RevokeMCPConnectorGrant(_ context.Context, _ identity.Principal, taskID, connectorID string, expectedVersion int64) (app.TaskMCPConnectorGrant, error) {
@@ -1644,6 +1669,68 @@ func TestTaskApprovalSnapshotReturnsExpiredStatusForPastPendingRequest(t *testin
 	response, err := toTaskApprovalResponse(value)
 	if err != nil || response.Approval.Status != string(task.PendingRequestExpired) || response.Approval.Decision != "" {
 		t.Fatalf("expired pending snapshot = %#v err=%v", response, err)
+	}
+}
+
+func TestTaskApprovalResponseCarriesEvidenceFields(t *testing.T) {
+	now := time.Now().UTC()
+	value := app.TaskApproval{
+		TaskID: "q1234567", ConversationID: "c1234567", TaskStatus: task.StatusWaitingUser, TaskEventSeq: 2, TaskUpdatedAt: now,
+		Request: task.PendingRequest{ID: "r1234567", TaskID: "q1234567", Version: 1, Kind: "approval", Title: "Confirm access",
+			Object: "Workspace", Content: "Read selected file", Impact: "File content may be disclosed", Status: task.PendingRequestPending,
+			EvidencePointer: "task_step:s1234567",
+			CurrentCost:     &task.ApprovalCost{AmountMicros: 1200, Currency: "USD", Basis: task.ApprovalCostBasisEstimate},
+			TotalCost:       nil,
+			TriggerRule:     "sensitive_host_tool", RejectionConsequence: "If rejected, this exact tool call is not executed.",
+			CreatedAt: now},
+	}
+	response, err := toTaskApprovalResponse(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval := response.Approval
+	if approval.EvidencePointer != "task_step:s1234567" || approval.TriggerRule != "sensitive_host_tool" ||
+		approval.RejectionConsequence != "If rejected, this exact tool call is not executed." {
+		t.Fatalf("approval snapshot lost evidence fields: %#v", approval)
+	}
+	if approval.CurrentCost == nil || approval.CurrentCost.AmountMicros != 1200 || approval.CurrentCost.Currency != "USD" ||
+		approval.CurrentCost.Basis != task.ApprovalCostBasisEstimate {
+		t.Fatalf("approval snapshot current cost = %#v", approval.CurrentCost)
+	}
+	if approval.TotalCost != nil {
+		t.Fatalf("approval snapshot total cost must stay null when unknown, got %#v", approval.TotalCost)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(encoded), `"total_cost":null`) || strings.Contains(string(encoded), `"amount_micros":0`) {
+		t.Fatalf("approval snapshot JSON must render unknown cost as null, never 0: %s", encoded)
+	}
+	// An invalid cost figure must fail the response instead of being served.
+	value.Request.CurrentCost = &task.ApprovalCost{AmountMicros: -1, Currency: "USD", Basis: task.ApprovalCostBasisEstimate}
+	if _, err := toTaskApprovalResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("approval snapshot with a negative cost returned %v", err)
+	}
+}
+
+func TestTaskPendingRequestOpenAPIIncludesEvidenceFields(t *testing.T) {
+	openAPI, err := os.ReadFile(filepath.Join("..", "..", "openapi", "portal.yaml"))
+	if err != nil {
+		t.Fatalf("read Portal OpenAPI schema: %v", err)
+	}
+	contract := string(openAPI)
+	for _, required := range []string{
+		"    TaskApprovalCost:\n",
+		"evidence_pointer: { type: string, maxLength: 512",
+		"current_cost: { oneOf: [{ $ref: '#/components/schemas/TaskApprovalCost' }, { type: 'null' }]",
+		"total_cost: { oneOf: [{ $ref: '#/components/schemas/TaskApprovalCost' }, { type: 'null' }]",
+		"trigger_rule: { type: string, maxLength: 512",
+		"rejection_consequence: { type: string, maxLength: 512",
+	} {
+		if !strings.Contains(contract, required) {
+			t.Fatalf("Portal OpenAPI approval contract omits %q", required)
+		}
 	}
 }
 

@@ -6139,6 +6139,48 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/event-chain:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    get:
+      tags: [Tasks]
+      operationId: getTaskEventChain
+      summary: Replay a task event chain
+      description: Returns the E08 nine-kind replayable chain of one task (created, split, dispatched, approval, execution, verification, delivery, failure, recovery) as a read-side projection of the stored task.* events. The write-side TaskEvent enum is unchanged. A delivery node appears only when a reviewed PASS or PASS+NOTES verdict exists and its result receipt has been published; a FAIL verdict returns a verification node and no delivery node.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Task event chain
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskEventChain' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/event-chain/stream:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    get:
+      tags: [Tasks]
+      operationId: streamTaskEventChain
+      summary: Stream a task event chain
+      description: Server-sent event chain snapshots. The first frame is always the full chain (event task.event_chain); while the task is not terminal the server re-projects once a second and sends a fresh full snapshot only when the chain changed. A reconnect re-sends the full chain; there is no cursor. The stream ends when the task reaches a terminal status.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Server-sent task event chain snapshots
+          content:
+            text/event-stream:
+              schema: { type: string }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/clients:
     get:
       tags: [Clients]
@@ -12855,6 +12897,15 @@ components:
         batch_item_id: { oneOf: [{ $ref: '#/components/schemas/BatchItemId' }, { type: 'null' }] }
         batch_attempt: { type: integer, minimum: 0 }
         created_at: { type: string, format: date-time }
+    TaskApprovalCost:
+      type: object
+      additionalProperties: false
+      description: One cost figure on an approval card. Null when the cost is unknown; unknown is never rendered as 0.
+      required: [basis, amount_micros, currency]
+      properties:
+        basis: { type: string, enum: [estimate, settled] }
+        amount_micros: { type: integer, format: int64, minimum: 0 }
+        currency: { type: string, pattern: '^[A-Z]{3}$' }
     TaskPendingRequest:
       type: object
       description: Exact, versioned approval context. The latest expired request remains a read-only snapshot; approved, rejected, or cancelled requests keep the existing hidden behavior. expires_at is null unless a trusted service policy explicitly sets an expiry.
@@ -12868,6 +12919,11 @@ components:
         object: { type: string }
         content: { type: string }
         impact: { type: string }
+        evidence_pointer: { type: string, maxLength: 512, description: 'Pointer to the evidence this approval rests on, for example task_step:<step id>. Empty on approvals created before migration 00238.' }
+        current_cost: { oneOf: [{ $ref: '#/components/schemas/TaskApprovalCost' }, { type: 'null' }], description: 'Cost of the single action awaiting approval. Null when unknown; unknown is never rendered as 0.' }
+        total_cost: { oneOf: [{ $ref: '#/components/schemas/TaskApprovalCost' }, { type: 'null' }], description: 'Cumulative cost of the task so far. Null when unknown; unknown is never rendered as 0.' }
+        trigger_rule: { type: string, maxLength: 512, description: 'Rule that required this approval, for example sensitive_host_tool, workspace_write, or mcp_tool. Empty on approvals created before migration 00238.' }
+        rejection_consequence: { type: string, maxLength: 512, description: 'What happens when the user rejects. Empty on approvals created before migration 00238.' }
         disclosures: { $ref: '#/components/schemas/TaskApprovalDisclosures' }
         expires_at: { type: [string, 'null'], format: date-time, description: Null unless a trusted service policy explicitly sets an expiry. }
         media_preview_operation_id: { $ref: '#/components/schemas/OperationId', description: Present only while an image, video or speech output awaits the Task owner's save decision; use it with the Task media preview route. }
@@ -13130,6 +13186,11 @@ components:
         object: { type: string, maxLength: 512 }
         content: { type: string, maxLength: 512 }
         impact: { type: string, maxLength: 512 }
+        evidence_pointer: { type: string, maxLength: 512, description: 'Pointer to the evidence this approval rests on, for example task_step:<step id>. Empty on approvals created before migration 00238.' }
+        current_cost: { oneOf: [{ $ref: '#/components/schemas/TaskApprovalCost' }, { type: 'null' }], description: 'Cost of the single action awaiting approval. Null when unknown; unknown is never rendered as 0.' }
+        total_cost: { oneOf: [{ $ref: '#/components/schemas/TaskApprovalCost' }, { type: 'null' }], description: 'Cumulative cost of the task so far. Null when unknown; unknown is never rendered as 0.' }
+        trigger_rule: { type: string, maxLength: 512, description: 'Rule that required this approval, for example sensitive_host_tool, workspace_write, or mcp_tool. Empty on approvals created before migration 00238.' }
+        rejection_consequence: { type: string, maxLength: 512, description: 'What happens when the user rejects. Empty on approvals created before migration 00238.' }
         disclosures: { $ref: '#/components/schemas/TaskApprovalDisclosures' }
         expires_at: { type: [string, 'null'], format: date-time }
         responded_at: { type: [string, 'null'], format: date-time }
@@ -13250,6 +13311,26 @@ components:
         type: { type: string, enum: [task.status, task.step, task.operation, task.message, task.batch_item, task.artifact, task.waiting_user, task.response, task.result, task.plan, task.priority] }
         created_at: { type: string, format: date-time }
         payload: {}
+    TaskEventChain:
+      type: object
+      description: >-
+        The E08 nine-kind replayable chain of one task, a read-side projection of the stored task.* events. Nodes are ordered by source sequence; unmapped_sequences lists every stored event sequence that mapped to no kind, in ascending order. Delivery appears only when a reviewed PASS or PASS+NOTES verdict exists and its result receipt has been published.
+      required: [task_id, nodes, unmapped_sequences]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        nodes: { type: array, items: { $ref: '#/components/schemas/TaskEventChainNode' } }
+        unmapped_sequences: { type: array, items: { type: integer, format: int64 } }
+    TaskEventChainNode:
+      type: object
+      description: >-
+        One replayable step of a task event chain. source_type is the write-side event type for event-derived nodes and empty for fact-derived nodes (verification, delivery). detail is a short stable label: the event payload status or reason, the verdict, or "receipt published".
+      required: [kind, source_sequence, source_type, detail, created_at]
+      properties:
+        kind: { type: string, enum: [created, split, dispatched, approval, execution, verification, delivery, failure, recovery] }
+        source_sequence: { type: integer, format: int64, minimum: 1 }
+        source_type: { type: string }
+        detail: { type: string, maxLength: 128 }
+        created_at: { type: string, format: date-time }
     Notification:
       type: object
       description: Task-backed notices have a task_id and positive event_sequence. Goal and project work-item source notices have task_id null, event_sequence 0, and source identity fields; project_id is present only for project work-item notices. source_event_id is an internal deduplication key and is not returned.

@@ -481,6 +481,117 @@ func OpenConversationSummary(sealer *Sealer, stored StoredConversationSummary) (
 	return document, nil
 }
 
+// ConversationSummaryRestoreCondition names one of the six checks a stored
+// summary must pass before it can be restored as the previous summary.
+// Each failure names exactly the check that failed, so a restore that stops
+// a task can be located without re-reading the whole validation.
+const (
+	ConversationSummaryRestoreOpenFailed         = "open_failed"
+	ConversationSummaryRestoreHeadWithoutStored  = "head_without_stored_version"
+	ConversationSummaryRestoreHeadVersionInvalid = "head_version_invalid"
+	ConversationSummaryRestoreIdentityMismatch   = "identity_mismatch"
+	ConversationSummaryRestoreVersionMismatch    = "version_mismatch"
+	ConversationSummaryRestoreDigestMismatch     = "digest_mismatch"
+	ConversationSummaryRestorePreviewMaxRunes    = 1024
+)
+
+// ConversationSummaryRestoreFailure is one named restore-check failure. It
+// carries the reason, the stored and restored byte counts, and a preview of
+// at most 1024 runes of the restored summary text (empty when the summary
+// could not be opened), so the failure can be diagnosed from the record
+// alone. It never carries ciphertext or the full summary text.
+type ConversationSummaryRestoreFailure struct {
+	Condition     string
+	Reason        string
+	StoredBytes   int64
+	RestoredBytes int64
+	Preview       string
+}
+
+func (f *ConversationSummaryRestoreFailure) Error() string {
+	if f == nil {
+		return "conversation summary restore succeeded"
+	}
+	return "conversation summary restore failed (" + f.Condition + "): " + f.Reason +
+		" (stored " + strconv.FormatInt(f.StoredBytes, 10) + " bytes, restored " +
+		strconv.FormatInt(f.RestoredBytes, 10) + " bytes)"
+}
+
+// ToError renders the failure as a domain error whose details carry the
+// condition, the byte counts, and the bounded preview.
+func (f *ConversationSummaryRestoreFailure) ToError() *domain.Error {
+	err := domain.NewError(domain.CodeInvalidState, f.Error())
+	err.Details["condition"] = f.Condition
+	err.Details["reason"] = f.Reason
+	err.Details["stored_bytes"] = f.StoredBytes
+	err.Details["restored_bytes"] = f.RestoredBytes
+	err.Details["preview"] = f.Preview
+	return err
+}
+
+func truncateConversationSummaryPreview(text string) string {
+	runes := []rune(text)
+	if len(runes) <= ConversationSummaryRestorePreviewMaxRunes {
+		return text
+	}
+	return string(runes[:ConversationSummaryRestorePreviewMaxRunes])
+}
+
+// CheckConversationSummaryRestore runs the six restore checks in order and
+// returns the first failure, or nil when the stored summary restores cleanly.
+// A nil stored summary is only valid when the head carries no version yet
+// (the first summary of a conversation). The document argument is the result
+// of opening the stored summary; openErr is that open's error, if any.
+func CheckConversationSummaryRestore(identity ConversationSummaryIdentity, head ConversationSummaryHead,
+	stored *StoredConversationSummary, document *ConversationSummaryDocument, openErr error) *ConversationSummaryRestoreFailure {
+	if stored == nil {
+		if head.Version != 0 {
+			return &ConversationSummaryRestoreFailure{
+				Condition: ConversationSummaryRestoreHeadWithoutStored,
+				Reason:    "conversation summary head has no stored version",
+			}
+		}
+		return nil
+	}
+	storedBytes := int64(len(stored.Ciphertext))
+	if openErr != nil {
+		return &ConversationSummaryRestoreFailure{
+			Condition:   ConversationSummaryRestoreOpenFailed,
+			Reason:      "stored conversation summary could not be opened",
+			StoredBytes: storedBytes,
+		}
+	}
+	if document == nil {
+		return &ConversationSummaryRestoreFailure{
+			Condition:   ConversationSummaryRestoreOpenFailed,
+			Reason:      "stored conversation summary could not be opened",
+			StoredBytes: storedBytes,
+		}
+	}
+	failure := &ConversationSummaryRestoreFailure{
+		StoredBytes:   storedBytes,
+		RestoredBytes: int64(len(document.Text)),
+		Preview:       truncateConversationSummaryPreview(document.Text),
+	}
+	switch {
+	case head.Version < 1:
+		failure.Condition = ConversationSummaryRestoreHeadVersionInvalid
+		failure.Reason = "conversation summary head version is invalid"
+	case document.Identity != identity:
+		failure.Condition = ConversationSummaryRestoreIdentityMismatch
+		failure.Reason = "stored conversation summary identity does not match its head"
+	case document.Version != head.Version:
+		failure.Condition = ConversationSummaryRestoreVersionMismatch
+		failure.Reason = "stored conversation summary version does not match its head"
+	case !bytes.Equal(head.Digest, stored.SummarySHA256):
+		failure.Condition = ConversationSummaryRestoreDigestMismatch
+		failure.Reason = "stored conversation summary digest does not match its head"
+	default:
+		return nil
+	}
+	return failure
+}
+
 func validConversationSummaryIdentity(value ConversationSummaryIdentity) bool {
 	if !domain.ValidServiceInstanceID(value.ServiceInstanceID) || !domain.ValidUserID(value.OwnerID) ||
 		!domain.ValidUserID(value.ActorID) || !domain.ValidConversationID(value.ConversationID) || value.AuthorizationVersion < 1 {

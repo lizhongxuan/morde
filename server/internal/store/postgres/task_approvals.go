@@ -74,6 +74,10 @@ func (s *Store) ListTaskApprovals(ctx context.Context, actorID string, hostIDs [
 			Request: task.PendingRequest{
 				ID: row.ID, TaskID: row.TaskID, Version: row.Version, Kind: row.Kind, Title: row.Title, Object: row.Object,
 				Content: row.Content, Impact: row.Impact, MediaPreviewOperationID: row.MediaPreviewOperationID,
+				EvidencePointer: row.EvidencePointer,
+				CurrentCost:     scanPendingApprovalCost(row.CurrentCostMicros, row.CurrentCostCurrency, row.CurrentCostBasis),
+				TotalCost:       scanPendingApprovalCost(row.TotalCostMicros, row.TotalCostCurrency, row.TotalCostBasis),
+				TriggerRule:     row.TriggerRule, RejectionConsequence: row.RejectionConsequence,
 				Status: task.PendingRequestStatus(row.Status), Decision: task.PendingDecision(row.Decision),
 				CreatedAt: row.CreatedAt.Time, ExpiresAt: expiresAt, RespondedAt: respondedAt,
 			},

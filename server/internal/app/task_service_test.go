@@ -350,6 +350,13 @@ func (s *taskStoreStub) GetTaskEventPage(_ context.Context, _ string, _ string, 
 	return TaskEventPage{HostID: s.details.Task.HostID, Status: status, CurrentSequence: current, Items: s.events}, pageErr
 }
 
+func (s *taskStoreStub) GetTaskEventChain(_ context.Context, _ string, _ string) (TaskEventChain, error) {
+	if chain, err := ProjectTaskEventChain(s.events, TaskEventChainFacts{}); err == nil {
+		return chain, s.storeErr
+	}
+	return TaskEventChain{}, s.storeErr
+}
+
 func (s *taskStoreStub) RetryFailedBatchItem(_ context.Context, record IdempotencyRecord, taskID, batchItemID string) error {
 	s.retryCalls++
 	s.retryRecord, s.retryTaskID, s.retryItemID = record, taskID, batchItemID
@@ -1137,6 +1144,83 @@ func TestTaskServiceListEventsValidatesEnvelopeAndAllowsUnknownType(t *testing.T
 	_, err = service.ListEvents(context.Background(), taskTestPrincipal(), "q1234567", 0, 50)
 	if domain.CodeOf(err) != domain.CodeInternal {
 		t.Fatalf("unsafe unknown event type returned %v", err)
+	}
+}
+
+func TestTaskServiceGetTaskEventChainReplaysThroughService(t *testing.T) {
+	now := time.Now()
+	store := &taskStoreStub{
+		details: TaskDetails{Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567"}},
+		events: []task.Event{
+			{TaskID: "q1234567", Sequence: 1, Type: "task.status", Payload: []byte(`{"status":"queued"}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 2, Type: "task.plan", Payload: []byte(`{"step_id":"s0000001","sequence":1,"task_revision":0,"plan_revision":1}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 3, Type: "task.message", Payload: []byte(`{"role":"user","message_id":"m0000001","turn_id":"s0000001","done":true}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 4, Type: "task.operation", Payload: []byte(`{"operation_id":"op000001","status":"dispatched"}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 5, Type: "task.step", Payload: []byte(`{"step_id":"s0000002","status":"running","kind":"tool","tool":"go_test"}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 6, Type: "task.step", Payload: []byte(`{"step_id":"s0000002","status":"failed","kind":"tool","tool":"go_test"}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 7, Type: "task.operation", Payload: []byte(`{"operation_id":"op000001","status":"unknown","requires_reconciliation":true}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 8, Type: "task.step", Payload: []byte(`{"step_id":"s0000003","status":"succeeded","kind":"tool","tool":"go_test"}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 9, Type: "task.waiting_user", Payload: []byte(`{"status":"waiting_user","reason":"approval_required"}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 10, Type: "task.response", Payload: []byte(`{"pending_id":"p0000001","decision":"approve","status":"approved"}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 11, Type: "task.artifact", Payload: []byte(`{"artifact_id":"a0000001","step_id":"s0000003"}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 12, Type: "task.priority", Payload: []byte(`{"priority":"pinned","previous_priority":"normal"}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 13, Type: "task.status", Payload: []byte(`{"status":"completed"}`), CreatedAt: now},
+			{TaskID: "q1234567", Sequence: 14, Type: "task.result", Payload: []byte(`{"status":"completed"}`), CreatedAt: now},
+		},
+	}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := service.GetTaskEventChain(context.Background(), taskTestPrincipal(), "q1234567")
+	if err != nil {
+		t.Fatalf("get task event chain: %v", err)
+	}
+	// The stub projects with no verdict facts, so the chain has the
+	// event-derived nodes but no verification or delivery node.
+	wantKinds := []TaskEventKind{TaskEventKindCreated, TaskEventKindSplit, TaskEventKindDispatched,
+		TaskEventKindExecution, TaskEventKindFailure, TaskEventKindRecovery, TaskEventKindExecution,
+		TaskEventKindApproval, TaskEventKindApproval}
+	if chain.TaskID != "q1234567" || len(chain.Nodes) != len(wantKinds) {
+		t.Fatalf("chain = %+v, want %d nodes for task q1234567", chain, len(wantKinds))
+	}
+	for index, node := range chain.Nodes {
+		if node.Kind != wantKinds[index] {
+			t.Fatalf("chain node %d kind = %q, want %q (kinds %v)", index, node.Kind, wantKinds[index], taskEventChainKinds(chain))
+		}
+		if node.Kind == TaskEventKindDelivery || node.Kind == TaskEventKindVerification {
+			t.Fatalf("chain without verdict facts projected a %q node: %+v", node.Kind, node)
+		}
+	}
+	if len(chain.UnmappedSequences) != 5 || chain.UnmappedSequences[0] != 3 {
+		t.Fatalf("unmapped = %v, want [3 11 12 13 14]", chain.UnmappedSequences)
+	}
+	if _, err := service.GetTaskEventChain(context.Background(), identity.Principal{}, "q1234567"); err == nil {
+		t.Fatal("event chain read without a principal must fail")
+	}
+	if _, err := service.GetTaskEventChain(context.Background(), taskTestPrincipal(), "bad!"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("event chain read with an invalid task id returned %v", err)
+	}
+	store.storeErr = domain.NewError(domain.CodeNotFound, "task not found")
+	if _, err := service.GetTaskEventChain(context.Background(), taskTestPrincipal(), "q1234567"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("event chain read of a missing task returned %v", err)
+	}
+	store.storeErr = nil
+	store.details.Task.InternalTool = true
+	if _, err := service.GetTaskEventChain(context.Background(), taskTestPrincipal(), "q1234567"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("event chain read of an internal tool task returned %v", err)
+	}
+	store.details.Task.InternalTool = false
+	revoked, err := NewTaskService(store, &taskAuthorizerStub{hostErrors: map[string]error{
+		"h1234567": domain.NewError(domain.CodeForbidden, "host grant was revoked"),
+	}}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.details.Task.InitiatorID = "u1234567"
+	store.details.Task.Status = task.StatusCancelling
+	if _, err := revoked.GetTaskEventChain(context.Background(), taskTestPrincipal(), "q1234567"); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("revoked event chain read returned %v, want not-found (no safe degraded chain exists)", err)
 	}
 }
 

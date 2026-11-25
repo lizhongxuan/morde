@@ -416,6 +416,11 @@ func (q *Queries) ListConversationTasks(ctx context.Context, arg ListConversatio
 const listTaskApprovals = `-- name: ListTaskApprovals :many
 SELECT pending.id, pending.task_id, pending.version, pending.kind, pending.title, pending.object,
        pending.content, pending.impact, COALESCE(pending.media_preview_operation_id, '') AS media_preview_operation_id,
+       COALESCE(pending.evidence_pointer, '') AS evidence_pointer,
+       pending.current_cost_micros, pending.current_cost_currency, pending.current_cost_basis,
+       pending.total_cost_micros, pending.total_cost_currency, pending.total_cost_basis,
+       COALESCE(pending.trigger_rule, '') AS trigger_rule,
+       COALESCE(pending.rejection_consequence, '') AS rejection_consequence,
        pending.status, pending.decision, pending.created_at, pending.expires_at, pending.responded_at,
        tasks.conversation_id, COALESCE(tasks.project_id, '') AS project_id, COALESCE(tasks.host_id, '') AS host_id,
        tasks.status AS task_status, tasks.event_seq AS task_event_seq, tasks.updated_at AS task_updated_at
@@ -454,6 +459,15 @@ type ListTaskApprovalsRow struct {
 	Content                 string             `json:"content"`
 	Impact                  string             `json:"impact"`
 	MediaPreviewOperationID string             `json:"media_preview_operation_id"`
+	EvidencePointer         string             `json:"evidence_pointer"`
+	CurrentCostMicros       pgtype.Int8        `json:"current_cost_micros"`
+	CurrentCostCurrency     pgtype.Text        `json:"current_cost_currency"`
+	CurrentCostBasis        pgtype.Text        `json:"current_cost_basis"`
+	TotalCostMicros         pgtype.Int8        `json:"total_cost_micros"`
+	TotalCostCurrency       pgtype.Text        `json:"total_cost_currency"`
+	TotalCostBasis          pgtype.Text        `json:"total_cost_basis"`
+	TriggerRule             string             `json:"trigger_rule"`
+	RejectionConsequence    string             `json:"rejection_consequence"`
 	Status                  string             `json:"status"`
 	Decision                string             `json:"decision"`
 	CreatedAt               pgtype.Timestamptz `json:"created_at"`
@@ -493,6 +507,15 @@ func (q *Queries) ListTaskApprovals(ctx context.Context, arg ListTaskApprovalsPa
 			&i.Content,
 			&i.Impact,
 			&i.MediaPreviewOperationID,
+			&i.EvidencePointer,
+			&i.CurrentCostMicros,
+			&i.CurrentCostCurrency,
+			&i.CurrentCostBasis,
+			&i.TotalCostMicros,
+			&i.TotalCostCurrency,
+			&i.TotalCostBasis,
+			&i.TriggerRule,
+			&i.RejectionConsequence,
 			&i.Status,
 			&i.Decision,
 			&i.CreatedAt,

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -140,8 +141,13 @@ type ModelGatewayService struct {
 	projectBudget        *ProjectBudgetService
 	responseSealer       *Sealer
 	gpt6LunaMaxReasoning bool
-	usageObserverMu      sync.RWMutex
-	usageObserver        func(ModelUsageObservation)
+	// modelRetrySleep waits out one ladder backoff step for the
+	// task-level compaction/review calls (P3-1). It defaults to
+	// sleepModelRetry; same-package tests may replace it to record the
+	// delays without waiting.
+	modelRetrySleep func(context.Context, time.Duration) error
+	usageObserverMu sync.RWMutex
+	usageObserver   func(ModelUsageObservation)
 }
 
 func (s *ModelGatewayService) SetModelUsageObserver(observer func(ModelUsageObservation)) {
@@ -216,7 +222,7 @@ func NewModelGatewayService(store ModelCallStore, models ModelGatewayResolver, c
 	if store == nil || models == nil || client == nil || len(projectBudgets) > 1 || len(projectBudgets) == 1 && projectBudgets[0] == nil {
 		return nil, errors.New("model gateway dependencies are required")
 	}
-	service := &ModelGatewayService{store: store, models: models, client: client}
+	service := &ModelGatewayService{store: store, models: models, client: client, modelRetrySleep: sleepModelRetry}
 	if len(projectBudgets) == 1 {
 		service.projectBudget = projectBudgets[0]
 	}
@@ -373,6 +379,30 @@ func ValidDSHModelResponse(response ModelResponse) bool {
 }
 
 // Complete only performs model inference. Tool calls are returned to the caller.
+// completeTaskModelCall runs the provider call for one metered model call.
+// The task-level calls (compaction and review) retry transient provider
+// failures through the E12 ladder (P3-1): the same CallID is reused, so
+// the reservation, dispatch and settlement in Complete still happen
+// exactly once, and a spent ladder surfaces as a
+// *ModelRetryExhaustedError for the caller to treat as terminal. All
+// other sources keep the single provider call they had. On exhaustion the
+// compaction caller keeps the previous summary (no new version is
+// fabricated) and the review caller leaves the review uncompleted, so
+// neither failure can pass as a success.
+func (s *ModelGatewayService) completeTaskModelCall(ctx context.Context, call ModelCall, request ModelRequest) (ModelResponse, error) {
+	if call.Source != ModelCallCompaction && call.Source != ModelCallReview {
+		return s.client.Complete(ctx, request)
+	}
+	sleep := s.modelRetrySleep
+	if sleep == nil {
+		sleep = sleepModelRetry
+	}
+	return retryTaskModelCall(ctx, rand.Float64(), func(attemptCtx context.Context) (ModelResponse, error) {
+		attempt := request
+		return s.client.Complete(attemptCtx, attempt)
+	}, sleep)
+}
+
 func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (ModelResponse, error) {
 	if ctx == nil {
 		return ModelResponse{}, domain.InvalidArgument("model_call", "model call context is required")
@@ -619,7 +649,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		}
 		return ModelResponse{}, err
 	}
-	response, callErr := s.client.Complete(providerCtx, request)
+	response, callErr := s.completeTaskModelCall(providerCtx, call, request)
 	finishProvider()
 	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: call.CallID, Usage: response.Usage,
 		ProviderReportedModel: response.ProviderReportedModel,
@@ -736,6 +766,10 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		}
 	}
 	if callErr != nil {
+		var exhausted *ModelRetryExhaustedError
+		if errors.As(callErr, &exhausted) {
+			return ModelResponse{}, modelRetryExhaustedDomainError(exhausted)
+		}
 		return ModelResponse{}, modelConnectionCheckError(callErr)
 	}
 	if summaryOutputErr != nil {

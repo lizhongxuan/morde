@@ -395,6 +395,13 @@ func runtimeToolRisk(name string, arguments json.RawMessage) runtimeToolRiskTier
 }
 
 func runtimeToolApprovalRequest(mapping runtimeToolMapping, arguments json.RawMessage) AgentApprovalRequest {
+	request := runtimeToolApprovalRequestText(mapping, arguments)
+	request.TriggerRule = ApprovalTriggerSensitiveHostTool
+	request.RejectionConsequence = ApprovalRejectionConsequenceHostTool
+	return request
+}
+
+func runtimeToolApprovalRequestText(mapping runtimeToolMapping, arguments json.RawMessage) AgentApprovalRequest {
 	preview := runtimeToolApprovalArgumentPreview(arguments)
 	switch mapping.name {
 	case runtimeToolShellExec:

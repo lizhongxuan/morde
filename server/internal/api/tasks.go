@@ -37,6 +37,7 @@ type TaskService interface {
 	RespondToPendingRequest(context.Context, identity.Principal, string, string, int64, task.PendingDecision, string) error
 	AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, string) error
 	ListEvents(context.Context, identity.Principal, string, int64, int32) (app.TaskEventPage, error)
+	GetTaskEventChain(context.Context, identity.Principal, string) (app.TaskEventChain, error)
 }
 
 type TaskApprovalQueryService interface {
@@ -108,11 +109,39 @@ type taskApprovalSnapshotResponse struct {
 	Object                  string                          `json:"object"`
 	Content                 string                          `json:"content"`
 	Impact                  string                          `json:"impact"`
+	EvidencePointer         string                          `json:"evidence_pointer"`
+	CurrentCost             *taskApprovalCostResponse       `json:"current_cost"`
+	TotalCost               *taskApprovalCostResponse       `json:"total_cost"`
+	TriggerRule             string                          `json:"trigger_rule"`
+	RejectionConsequence    string                          `json:"rejection_consequence"`
 	Disclosures             taskApprovalDisclosuresResponse `json:"disclosures"`
 	ExpiresAt               *time.Time                      `json:"expires_at"`
 	RespondedAt             *time.Time                      `json:"responded_at"`
 	CreatedAt               time.Time                       `json:"created_at"`
 	MediaPreviewOperationID string                          `json:"media_preview_operation_id,omitempty"`
+}
+
+// taskApprovalCostResponse is one cost figure on an approval card. A null
+// cost means the cost is unknown; unknown is never rendered as 0.
+type taskApprovalCostResponse struct {
+	Basis        string `json:"basis"`
+	AmountMicros int64  `json:"amount_micros"`
+	Currency     string `json:"currency"`
+}
+
+func toTaskApprovalCostResponse(cost *task.ApprovalCost) *taskApprovalCostResponse {
+	if cost == nil {
+		return nil
+	}
+	return &taskApprovalCostResponse{Basis: cost.Basis, AmountMicros: cost.AmountMicros, Currency: cost.Currency}
+}
+
+func validTaskApprovalCost(cost *taskApprovalCostResponse) bool {
+	if cost == nil {
+		return true
+	}
+	return (cost.Basis == task.ApprovalCostBasisEstimate || cost.Basis == task.ApprovalCostBasisSettled) &&
+		cost.AmountMicros >= 0 && validTaskCurrency(cost.Currency)
 }
 
 type taskSummaryResponse struct {
@@ -272,6 +301,11 @@ type taskPendingRequestResponse struct {
 	Object                  string                          `json:"object"`
 	Content                 string                          `json:"content"`
 	Impact                  string                          `json:"impact"`
+	EvidencePointer         string                          `json:"evidence_pointer"`
+	CurrentCost             *taskApprovalCostResponse       `json:"current_cost"`
+	TotalCost               *taskApprovalCostResponse       `json:"total_cost"`
+	TriggerRule             string                          `json:"trigger_rule"`
+	RejectionConsequence    string                          `json:"rejection_consequence"`
 	Disclosures             taskApprovalDisclosuresResponse `json:"disclosures"`
 	ExpiresAt               *time.Time                      `json:"expires_at"`
 	MediaPreviewOperationID string                          `json:"media_preview_operation_id,omitempty"`
@@ -387,6 +421,12 @@ type taskClarificationRequestResponse struct {
 
 func validTaskText(value string, maxRunes int) bool {
 	return utf8.ValidString(value) && utf8.RuneCountInString(value) > 0 && utf8.RuneCountInString(value) <= maxRunes
+}
+
+// validTaskOptionalText reports whether an approval body text field is absent
+// (a pre-migration row) or within bounds.
+func validTaskOptionalText(value string, maxRunes int) bool {
+	return value == "" || validTaskText(value, maxRunes)
 }
 
 func optionalTaskText(value string) *string {
@@ -596,6 +636,8 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks/:id/inputs", h.addTaskInput(service))
 	group.POST("/tasks/:id/approvals/:approval_id/responses", h.respondToTaskApproval(service))
 	group.GET("/tasks/:id/events", h.streamTaskEvents(service))
+	group.GET("/tasks/:id/event-chain", h.getTaskEventChain(service))
+	group.GET("/tasks/:id/event-chain/stream", h.streamTaskEventChain(service))
 }
 
 func (h *api) getTaskStepDetail(service TaskStepDetailService) gin.HandlerFunc {
@@ -1094,6 +1136,10 @@ func toTaskApprovalResponse(value app.TaskApproval) (taskApprovalResponse, error
 		value.TaskUpdatedAt.IsZero() || !domain.ValidPendingRequestID(request.ID) || request.TaskID != value.TaskID || request.Version < 1 ||
 		request.Kind != "approval" || (status != "pending" && status != "approved" && status != "rejected" && status != "cancelled" && status != "expired") ||
 		!validTaskText(request.Title, 512) || !validTaskText(request.Object, 512) || !validTaskText(request.Content, 512) || !validTaskText(request.Impact, 512) ||
+		!validTaskOptionalText(request.EvidencePointer, 512) || !validTaskOptionalText(request.TriggerRule, 512) ||
+		!validTaskOptionalText(request.RejectionConsequence, 512) ||
+		!validTaskApprovalCost(toTaskApprovalCostResponse(request.CurrentCost)) ||
+		!validTaskApprovalCost(toTaskApprovalCostResponse(request.TotalCost)) ||
 		(request.ExpiresAt != nil && request.ExpiresAt.IsZero()) || (request.RespondedAt != nil && request.RespondedAt.IsZero()) ||
 		(request.MediaPreviewOperationID != "" && !domain.ValidOperationID(request.MediaPreviewOperationID)) {
 		return taskApprovalResponse{}, domain.NewError(domain.CodeInternal, "task approval query returned an invalid request")
@@ -1112,7 +1158,10 @@ func toTaskApprovalResponse(value app.TaskApproval) (taskApprovalResponse, error
 		TaskStatus: value.TaskStatus, TaskEventSequence: value.TaskEventSeq, TaskUpdatedAt: value.TaskUpdatedAt,
 		Approval: taskApprovalSnapshotResponse{ID: request.ID, Version: request.Version, Status: status, Decision: request.Decision,
 			Kind: request.Kind, Title: request.Title, Object: request.Object, Content: request.Content, Impact: request.Impact,
-			Disclosures: unknownTaskApprovalDisclosures(), ExpiresAt: request.ExpiresAt, RespondedAt: request.RespondedAt,
+			EvidencePointer: request.EvidencePointer, CurrentCost: toTaskApprovalCostResponse(request.CurrentCost),
+			TotalCost: toTaskApprovalCostResponse(request.TotalCost), TriggerRule: request.TriggerRule,
+			RejectionConsequence: request.RejectionConsequence,
+			Disclosures:          unknownTaskApprovalDisclosures(), ExpiresAt: request.ExpiresAt, RespondedAt: request.RespondedAt,
 			CreatedAt: request.CreatedAt, MediaPreviewOperationID: request.MediaPreviewOperationID},
 	}, nil
 }
@@ -1422,13 +1471,20 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 				(pending.ExpiresAt != nil && pending.ExpiresAt.IsZero()) ||
 				(pending.MediaPreviewOperationID != "" && !domain.ValidOperationID(pending.MediaPreviewOperationID)) ||
 				!validTaskText(pending.Title, 512) || !validTaskText(pending.Object, 512) || !validTaskText(pending.Content, 512) || !validTaskText(pending.Impact, 512) ||
+				!validTaskOptionalText(pending.EvidencePointer, 512) || !validTaskOptionalText(pending.TriggerRule, 512) ||
+				!validTaskOptionalText(pending.RejectionConsequence, 512) ||
+				!validTaskApprovalCost(toTaskApprovalCostResponse(pending.CurrentCost)) ||
+				!validTaskApprovalCost(toTaskApprovalCostResponse(pending.TotalCost)) ||
 				!validTaskApprovalDisclosures(disclosures) {
 				return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 			}
 			response.PendingRequest = &taskPendingRequestResponse{
 				ID: pending.ID, Version: pending.Version, Status: pendingStatus, Kind: pending.Kind, Title: pending.Title,
 				Object: pending.Object, Content: pending.Content, Impact: pending.Impact,
-				Disclosures: disclosures, ExpiresAt: pending.ExpiresAt, MediaPreviewOperationID: pending.MediaPreviewOperationID,
+				EvidencePointer: pending.EvidencePointer, CurrentCost: toTaskApprovalCostResponse(pending.CurrentCost),
+				TotalCost: toTaskApprovalCostResponse(pending.TotalCost), TriggerRule: pending.TriggerRule,
+				RejectionConsequence: pending.RejectionConsequence,
+				Disclosures:          disclosures, ExpiresAt: pending.ExpiresAt, MediaPreviewOperationID: pending.MediaPreviewOperationID,
 			}
 		}
 	}

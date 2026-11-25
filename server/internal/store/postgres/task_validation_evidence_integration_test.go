@@ -1103,3 +1103,85 @@ WHERE workspace_id=$1 AND file_path=$2`, workspaceValue.ID, path); err != nil {
 		t.Fatalf("changed current Workspace file validation = %#v err=%v; want pending", details.Validation, err)
 	}
 }
+
+func TestPostgresTaskValidationVerdictFactsResolveFromStoredRecords(t *testing.T) {
+	f := newAgentLifecycleFixture(t)
+	ctx := context.Background()
+	lease, _, err := f.service.Start(ctx, f.request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	current, err := f.store.GetTask(ctx, lease.Fence.TaskID, lease.Fence.OwnerID)
+	if err != nil || current.Task.CurrentRevision == nil {
+		t.Fatalf("load running Task: current=%+v err=%v", current.Task, err)
+	}
+	revision := *current.Task.CurrentRevision
+	var hostID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT COALESCE(host_id,'') FROM tasks WHERE id=$1`, current.Task.ID).Scan(&hostID); err != nil {
+		t.Fatal(err)
+	}
+	requestDigest := sha256.Sum256([]byte("fix task tool request"))
+	// Stored records a fix task leaves behind: an approved approval-gated
+	// action with a settled operation, a repeated test failure fixed by a
+	// later succeeding retry, and a settled operation ledger.
+	steps := []struct {
+		tool, reason, status, callID string
+		sequence                     int64
+	}{
+		{"go_test", "tool_failed_after_dispatch", "failed", "call-go-test-1", 10},
+		{"go_test", "tool_failed_after_dispatch", "failed", "call-go-test-2", 11},
+		{"go_test", "", "succeeded", "call-go-test-3", 12},
+		{"shell_exec", "", "succeeded", "call-fix-1", 13},
+	}
+	for _, step := range steps {
+		var reason any
+		if step.reason != "" {
+			reason = step.reason
+		}
+		if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_steps
+(id,task_id,sequence,kind,status,tool_name,failure_reason,tool_call_key,agent_session_id,task_revision,request_digest)
+VALUES ($1,$2,$3,'tool',$4,$5,$6,$7,$8,$9,$10)`,
+			mustID(t, domain.NewStepID), current.Task.ID, step.sequence, step.status, step.tool,
+			reason, step.callID, lease.Fence.AgentSessionID, revision, requestDigest[:]); err != nil {
+			t.Fatalf("insert Task validation step %q: %v", step.callID, err)
+		}
+	}
+	if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_operations
+(id,task_id,operation_key,request_hash,host_id,runtime_generation,control_version,lease_version,status)
+VALUES ($1,$2,$3,$4,$5,0,0,1,'succeeded')`,
+		"op-fix-1", current.Task.ID, app.AgentOperationKey("call-fix-1"), requestDigest[:], hostID); err != nil {
+		t.Fatalf("insert Task validation operation: %v", err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_pending_requests
+(id,task_id,version,kind,title,object,content,impact,call_id,tool_name,request_hash,runtime_generation,runtime_instance_id,control_version,status,decision,responded_at)
+VALUES ('re09fix1',$1,1,'approval','Run the fix','shell_exec','Run the fix command','The command writes files','call-fix-1','shell_exec',$2,0,'',0,'approved','approve',clock_timestamp())`,
+		current.Task.ID, requestDigest[:]); err != nil {
+		t.Fatalf("insert Task validation approval record: %v", err)
+	}
+	tx, err := f.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx)
+	facts, err := loadTaskValidationVerdictFacts(ctx, tx, app.TaskValidationReviewClaim{TaskID: current.Task.ID, TaskRevision: revision},
+		"", nil, app.TaskValidationReviewReport{}, nil)
+	if err != nil {
+		t.Fatalf("load Task validation verdict facts: %v", err)
+	}
+	if facts.TaskExecution != app.TaskValidationFactPresent || facts.IrreversibleAction != app.TaskValidationFactPresent ||
+		!facts.ApprovalHistoryVerified || facts.RepeatedError != app.TaskValidationFactPresent ||
+		!facts.CorrectionRecordVerified || !facts.ReplayVerified || !facts.ClarificationHistoryKnown {
+		t.Fatalf("loaded Task validation verdict facts = %+v, want execution/approval/repeated present and verified", facts)
+	}
+	// With verified evidence content the loaded facts resolve the verdict
+	// instead of leaving it pending.
+	facts.EvidenceContentVerified = true
+	report := app.TaskValidationReviewReport{Recommendation: app.TaskValidationPass}
+	for _, id := range []app.TaskHardCheckID{app.TaskHardCheckConclusionFirst, app.TaskHardCheckEvidence, app.TaskHardCheckIndependent,
+		app.TaskHardCheckClarification, app.TaskHardCheckApproval, app.TaskHardCheckCorrection, app.TaskHardCheckReplay} {
+		report.Findings = append(report.Findings, app.TaskValidationReviewFinding{ID: id, Assessment: app.TaskValidationReviewSupports})
+	}
+	if got := app.SummarizeTaskValidationEvaluations(app.EvaluateTaskValidationReview(report, facts)).State; got != app.TaskValidationPass {
+		t.Fatalf("verdict from loaded facts = %q, want PASS", got)
+	}
+}

@@ -1,0 +1,24 @@
+# P0 smoke cases (design proposal §16.3). One row per case, tab-separated:
+# case | level | what it checks | check | needs
+# check: go-test:<package>:<test-name-regex> runs that Go test in server/;
+#        manual:<reason> has no automated check and is recorded exception.
+# needs: none | CH_TEST_DATABASE_URL (PostgreSQL integration test)
+#        | real-pc (real PC client + real model/DSH, never available here)
+# Fail-closed (P3-3): the gate exits 0 only when fail == 0. A case with no
+# evidence (mapped test gone, every mapped test skipped, every subtest
+# skipped) is a failure, not a pass. Exceptions are only the two
+# auto-detected environment limits above (no test DB, no real PC); they are
+# recorded and printed as a notice, never counted as pass.
+# level is the §16.3 level (S = service, P = PC, D = real DSH); the smoke
+# record also stores what the mapped check actually executed, so a pass never
+# claims an unexercised layer passed.
+T01	S+P	同一 client_message_id 同内容重发两次只存一条；同 ID 不同内容返回冲突	go-test:internal/store/postgres:TestConversationMessageReceiptIsAtomicAndScoped	CH_TEST_DATABASE_URL
+T04	P	纯文字问答直接回复，不建 Task，不启动云电脑	go-test:internal/app:TestExplicitSearchFallbackAvoidsQuestionsNegationAndActiveTasks	none
+T06	S+P	同一交付物的明确补充关联原任务；不同范围/独立请求分别创建	go-test:internal/worker:TestConversationRouteWorkerClassifiesFollowUpWhilePredecessorRouting	none
+T10	P+D	实际 PC 发两个独立子任务，两个 worker 实际时间重叠并各返回真实结果，主 Agent 合并结论	manual:needs real PC + real model/DSH	real-pc
+T13	P	点开文件操作、终端、失败工作项，七项适用信息可读，不适用写明，授权及脱敏生效	go-test:internal/app:TestTaskStepDetailIsBoundToItsIdentityAndTruncatedSafely|TestTaskServiceStepDetailRequiresTaskReadAndValidatesStoredRecord|TestTaskServiceStepDetailHidesWorkspaceDataAfterProjectAccessRevocation	none
+T19	P+S	审批卡显示动作/对象、依据、单次与累计成本、规则、拒绝后果；无可信数值写未知	go-test:internal/api:TestTaskApprovalResponseCarriesEvidenceFields	none
+T22	P+D	同一 Task 写合成内容、读回、比较并生成验证	go-test:internal/app:TestRuntimeToolExecutorVerifyRequiresCommittedWorkspaceBlockReadback	none
+T26	S+P	结果候选生成后插入同 Task 新 steer 及独立请求；旧候选不发布，原 Task 和新 Task 分别处理并交付	go-test:internal/store/postgres:TestConversationRouteSteersOnlySafeRunningTaskSupplement	CH_TEST_DATABASE_URL
+T36	S+D	已派发操作回执丢失及模型用量未知后重启 Worker/DSH；原身份对账只结算一次，不能确认时保留 unknown 和预算，不重放	go-test:internal/store/postgres:TestPostgresTaskAgentRequestReconciliationPersistsUntilExactResolution	CH_TEST_DATABASE_URL
+T43	P+D	实际 PC 完成一次受控复杂任务全链路（见 16.1）	manual:needs real PC + real model/DSH	real-pc

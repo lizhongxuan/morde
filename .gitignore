@@ -8,3 +8,4 @@ docs/实施/.local-baseline
 clients/desktop/harness/desktop/dist-ui-review/mac-arm64/morde-pc.app/Contents/Frameworks/Electron Framework.framework/Versions/A/Resources
 clients/desktop/harness/desktop/dist-ui-review/mac-arm64/morde-pc.app
 project
+deploy/single/smoke-record.json

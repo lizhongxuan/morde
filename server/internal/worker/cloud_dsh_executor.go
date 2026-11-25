@@ -343,7 +343,38 @@ type cloudDSHModelFailureDiagnosticSource interface {
 	ModelFailureDiagnostic() app.AgentModelFailureDiagnostic
 }
 
+// cloudDSHLadderExhaustionTools is the optional broker capability that
+// persists the terminal record for a spent retry ladder (E12). Tools that do
+// not implement it keep the generic pause path.
+type cloudDSHLadderExhaustionTools interface {
+	PauseModelRecoveryAfterLadderExhaustion(context.Context, task.Task, app.FailoverReason) error
+}
+
 func pauseCloudDSHModelRecovery(ctx context.Context, tools CloudDSHRecoveryTools, value task.Task, cause error) error {
+	// P3-1: the pause decision goes through the E12 ladder. The reason
+	// comes from the failure diagnostic's category when the cause carries
+	// one (a DSH result error's text is generic, so ClassifyModelError
+	// alone would call it unknown); otherwise ClassifyModelError decides.
+	// A spent ladder — a reason that can never retry, or a retryable
+	// reason whose attempts are already spent — goes to the terminal
+	// record instead of the generic pause. The context-length case keeps
+	// its dedicated message in pauseRecovery ("shorten and resend"), so
+	// it stays on the existing path. A fresh retryable failure keeps the
+	// generic pause: pausing and resuming the task is the task-level
+	// retry, and the ladder's per-call retries already ran inside the
+	// gateway for the compaction/review calls. Attempts are read from
+	// the diagnostic (LadderAttempts); a DSH failure carries none, so
+	// its first pause is always a retry, never a terminal record.
+	// Per-pause attempt counting across resumes does not exist yet — that
+	// is the repeated-error record of P3-6, not guessed here.
+	if reason := cloudDSHModelFailureLadderReason(cause); reason != app.FailoverReasonContextLengthExceeded {
+		attempts, retryAfter := cloudDSHModelFailureLadderSpent(cause)
+		if decision := app.ApplyTaskModelFailureLadder(reason, attempts, retryAfter, 0, app.ModelRetryMaxAgentDepth); decision.Exhausted {
+			if ladder, ok := tools.(cloudDSHLadderExhaustionTools); ok {
+				return ladder.PauseModelRecoveryAfterLadderExhaustion(ctx, value, reason)
+			}
+		}
+	}
 	var source cloudDSHModelFailureDiagnosticSource
 	if errors.As(cause, &source) {
 		if detailed, ok := tools.(cloudDSHDetailedModelRecoveryTools); ok {
@@ -357,6 +388,91 @@ func pauseCloudDSHModelRecovery(ctx context.Context, tools CloudDSHRecoveryTools
 		}
 	}
 	return tools.PauseRecovery(ctx, value)
+}
+
+// cloudDSHModelFailureLadderReason maps a DSH model failure to its E12
+// ladder reason. A diagnostic category wins over the error text because
+// DSH result errors share one generic message; categories the table does
+// not know fall back to ClassifyModelError on the cause.
+func cloudDSHModelFailureLadderReason(cause error) app.FailoverReason {
+	var source cloudDSHModelFailureDiagnosticSource
+	if errors.As(cause, &source) {
+		if reason, ok := cloudDSHModelFailureCategoryReason(source.ModelFailureDiagnostic().Category); ok {
+			return reason
+		}
+	}
+	return app.ClassifyModelError(cause)
+}
+
+// cloudDSHModelFailureCategoryReason maps the allowlisted diagnostic
+// categories (see safeAgentModelFailureDiagnostic) to ladder reasons.
+// Unlisted categories return false so the caller falls back to
+// ClassifyModelError instead of guessing.
+func cloudDSHModelFailureCategoryReason(category string) (app.FailoverReason, bool) {
+	switch category {
+	case "rate_limited", "provider_rate_limited":
+		return app.FailoverReasonRateLimited, true
+	case "quota_exhausted", "provider_quota_exhausted":
+		return app.FailoverReasonQuotaExceeded, true
+	case "timeout":
+		return app.FailoverReasonTimeout, true
+	case "transport", "upstream_error":
+		return app.FailoverReasonUpstreamError, true
+	case "unavailable":
+		return app.FailoverReasonServiceUnavailable, true
+	case "invalid_response", "stream_result_mismatch":
+		return app.FailoverReasonInvalidResponse, true
+	case "empty_response":
+		return app.FailoverReasonEmptyResponse, true
+	case "truncated_response":
+		return app.FailoverReasonTruncatedResponse, true
+	case "context_length_exceeded", "provider_context_length_exceeded":
+		return app.FailoverReasonContextLengthExceeded, true
+	case "authentication_rejected", "provider_invalid_api_key":
+		return app.FailoverReasonAuthenticationRejected, true
+	case "access_rejected", "provider_permission_denied":
+		return app.FailoverReasonAccessRejected, true
+	case "invalid_request", "provider_invalid_request", "client_request_invalid":
+		return app.FailoverReasonInvalidRequest, true
+	case "unsupported", "provider_unsupported_parameter":
+		return app.FailoverReasonUnsupportedParameter, true
+	case "provider_model_not_found":
+		return app.FailoverReasonModelNotFound, true
+	case "provider_server_error":
+		return app.FailoverReasonServerError, true
+	case "usage_unknown":
+		return app.FailoverReasonUsageUnknown, true
+	case "task_budget_exceeded":
+		return app.FailoverReasonBudgetExceeded, true
+	default:
+		return "", false
+	}
+}
+
+// cloudDSHModelFailureLadderSpent reads the retries already spent on a
+// failure: LadderAttempts from the diagnostic when the cause carries one,
+// and the provider Retry-After from the cause itself. Both default to
+// zero, which means "first failure, nothing spent".
+func cloudDSHModelFailureLadderSpent(cause error) (int64, time.Duration) {
+	var attempts int64
+	var source cloudDSHModelFailureDiagnosticSource
+	if errors.As(cause, &source) {
+		attempts = source.ModelFailureDiagnostic().LadderAttempts
+	}
+	if attempts < 0 {
+		attempts = 0
+	}
+	var retryAfter time.Duration
+	var clientErr *app.ModelClientError
+	if errors.As(cause, &clientErr) && clientErr.RetryAfter > 0 {
+		retryAfter = clientErr.RetryAfter
+	} else {
+		var routeErr *domain.Error
+		if errors.As(cause, &routeErr) && routeErr.RetryAfter > 0 {
+			retryAfter = routeErr.RetryAfter
+		}
+	}
+	return attempts, retryAfter
 }
 
 type CloudDSHCompleter interface {
