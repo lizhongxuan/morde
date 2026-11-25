@@ -293,6 +293,66 @@ func TestCloudDSHRevisionBatchOverflowDeliversContiguousPrefixThenRemainder(t *t
 	}
 }
 
+func TestCloudDSHRevisionBatchCarriesOneMiBSourceReferenceInOrder(t *testing.T) {
+	executor, _, _, checkpoints, models, value := cloudDSHFixture(t)
+	longID, followupID := "mrevlng1", "mrevnxt1"
+	const head, middle, tail = "REVISION-START=", "REVISION-MIDDLE=", "REVISION-END="
+	contentBytes := (1 << 20) + 1
+	content := head + strings.Repeat("x", contentBytes-len(head)-len(middle)-len(tail)-32) + middle + strings.Repeat("y", 32) + tail
+	if len(content) != contentBytes {
+		t.Fatalf("long revision bytes=%d, want %d", len(content), contentBytes)
+	}
+	checkpoints.pending = []app.AgentConversationMessage{
+		{ID: longID, Content: content, Mode: app.AgentMessageDeliverySteer, RevisionUpdate: true},
+		{ID: followupID, Content: "Follow-up after the long source reference.", Mode: app.AgentMessageDeliveryFollowup, RevisionUpdate: true},
+	}
+	executor.options.Checkpoints = &cloudDSHReferenceTestCheckpoints{cloudDSHTestCheckpoints: checkpoints, task: value}
+
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("long-reference revision batch Task result = %v, want a completed model turn pending Task completion", err)
+	}
+	if len(models.calls) != 1 {
+		t.Fatalf("long-reference revision batch produced %d model calls, want one deduplicated turn", len(models.calls))
+	}
+	request := string(models.calls[0].RawRequest)
+	var decoded any
+	if err := json.Unmarshal(models.calls[0].RawRequest, &decoded); err != nil {
+		t.Fatalf("decode long-reference revision request: %v", err)
+	}
+	var modelRequest struct {
+		Messages []struct {
+			ID      string `json:"id"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(models.calls[0].RawRequest, &modelRequest); err != nil {
+		t.Fatalf("decode long-reference model messages: %v", err)
+	}
+	var deliveredIDs []string
+	for _, message := range modelRequest.Messages {
+		if message.ID == longID || message.ID == followupID {
+			deliveredIDs = append(deliveredIDs, message.ID)
+		}
+	}
+	if len(deliveredIDs) != 2 || deliveredIDs[0] != longID || deliveredIDs[1] != followupID || strings.Contains(request, content) {
+		t.Fatalf("long-reference revision batch changed order/identity, duplicated a message, or exposed source bytes: ids=%v", deliveredIDs)
+	}
+	marker, ok := findCloudDSHReferenceMarker(decoded)
+	if !ok {
+		t.Fatal("long-reference revision batch did not pass a bounded source marker")
+	}
+	reference, err := app.ParseAgentMessageReferenceEnvelope(marker)
+	if err != nil {
+		t.Fatalf("parse long-reference revision marker: %v", err)
+	}
+	if reference.MessageID != longID || reference.ContentBytes != int64(contentBytes) ||
+		reference.SourceSHA256 != hex.EncodeToString(sha256Sum(content)) || reference.Mode != app.AgentMessageDeliverySteer {
+		t.Fatalf("revision source reference lost receipt identity, digest, or delivery mode: %+v", reference)
+	}
+}
+
 func findCloudDSHReferenceMarker(value any) (string, bool) {
 	switch value := value.(type) {
 	case string:

@@ -77,6 +77,8 @@ type SyncOptions struct {
 	WorkspaceID           string
 	FolderID              string // Optional registered project folder for a manual upload.
 	SourceBindingID       string // Stable local source identity required for a project upload.
+	SourceDevice          string // Device captured when the project directory was selected.
+	SourceInode           string // Inode captured when the project directory was selected.
 	Directory             string
 	Direction             string // upload, download, or bidirectional; defaults to bidirectional.
 	Policy                string // fill_missing, compare_merge, or live; defaults to fill_missing.
@@ -212,6 +214,14 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 	if err != nil {
 		return Result{}, fmt.Errorf("select local workspace directory: %w", err)
 	}
+	if options.FolderID != "" {
+		if _, err := clientWorkspaceRootPath(directory); err != nil {
+			return Result{}, fmt.Errorf("select project workspace directory: %w", err)
+		}
+		if rootDevice != options.SourceDevice || rootInode != options.SourceInode {
+			return Result{}, errors.New("selected project directory identity changed")
+		}
+	}
 	options.Directory = directory
 	if lockDirectory {
 		releaseOperation, err := acquireOperationLock(ctx, directory)
@@ -308,6 +318,12 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 			return Result{}, previousErr
 		}
 		if previousErr == nil {
+			previousProjectPending := previous.SessionID == "" && !previous.CreateQuotaRejected ||
+				previous.SessionID != "" && !isTerminal(previous.State)
+			if options.FolderID != "" && previous.FolderID == options.FolderID && previous.SourceBindingID == options.SourceBindingID &&
+				previous.RootIdentity == "" && previousProjectPending {
+				return Result{}, errors.New("a previous project upload checkpoint has no selected directory identity; it was preserved for manual resolution")
+			}
 			if previous.SessionID == "" && !previous.CreateQuotaRejected && previous.RootIdentity != "" && previous.RootIdentity != rootIdentity {
 				return Result{}, errors.New("a previous sync create belongs to a different local workspace root; resolve it before starting another operation")
 			}
@@ -520,6 +536,9 @@ func (c *Client) localManifest(ctx context.Context, options SyncOptions, directo
 		if metadata.SessionID != options.SessionID || metadata.Directory != directory {
 			return mordesync.Manifest{}, nil, errors.New("saved sync metadata does not match the requested session and directory")
 		}
+		if options.FolderID != "" && metadata.RootIdentity == "" && !isTerminal(metadata.State) {
+			return mordesync.Manifest{}, nil, errors.New("saved project upload checkpoint has no selected directory identity; it was preserved for manual resolution")
+		}
 		if metadata.RootIdentity != "" && metadata.RootIdentity != rootIdentity {
 			return mordesync.Manifest{}, nil, errors.New("saved sync metadata belongs to a different local workspace root")
 		}
@@ -668,11 +687,12 @@ func (c *Client) validateOptions(ctx context.Context, options SyncOptions) error
 	}
 	if options.FolderID != "" && (!syncFolderIDPattern.MatchString(options.FolderID) || !sourceBindingIDPattern.MatchString(options.SourceBindingID) || options.Direction != "upload" || options.Policy != "compare_merge" ||
 		options.BaseRevision == nil || *options.BaseRevision != 0 || len(options.Scope) != 0 || len(options.DeletedPaths) != 0 ||
-		len(options.DeletedDirectories) != 0 || options.AckCursor != nil || options.TaskID != "" || options.TaskHubOperationKey != "") {
-		return errors.New("project folder sync requires a source binding and unscoped compare-merge upload from revision zero")
+		len(options.DeletedDirectories) != 0 || options.AckCursor != nil || options.TaskID != "" || options.TaskHubOperationKey != "" ||
+		!validProjectRootIdentity(options.SourceDevice, options.SourceInode)) {
+		return errors.New("project folder sync requires a source binding, selected directory identity, and unscoped compare-merge upload from revision zero")
 	}
-	if options.FolderID == "" && options.SourceBindingID != "" {
-		return errors.New("source binding ID requires a project folder")
+	if options.FolderID == "" && (options.SourceBindingID != "" || options.SourceDevice != "" || options.SourceInode != "") {
+		return errors.New("project source identity requires a project folder")
 	}
 	if err := mordesync.ValidateManifest(options.Baseline); err != nil {
 		return fmt.Errorf("sync baseline is invalid: %w", err)
@@ -720,6 +740,17 @@ func validateTaskLinkedManifest(options SyncOptions, manifest mordesync.Manifest
 		}
 	}
 	return nil
+}
+
+func validProjectRootIdentity(device, inode string) bool {
+	if device == "" || inode == "" || len(device) > 32 || len(inode) > 32 {
+		return false
+	}
+	if _, err := strconv.ParseUint(device, 10, 64); err != nil {
+		return false
+	}
+	inodeValue, err := strconv.ParseUint(inode, 10, 64)
+	return err == nil && inodeValue != 0
 }
 
 func (c *Client) latestRevision(ctx context.Context, workspaceID string) (int64, error) {
@@ -2586,22 +2617,30 @@ func sameClientFile(info os.FileInfo, digest, target string, expected mordesync.
 	return info.Mode().IsRegular() && info.Mode()&os.ModeSymlink == 0 && uint32(info.Mode().Perm()) == expected.Mode
 }
 
-func openClientWorkspaceRoot(directory string) (*os.Root, error) {
+func clientWorkspaceRootPath(directory string) (string, error) {
 	abs, err := filepath.Abs(directory)
 	if err != nil {
-		return nil, errors.New("resolve workspace root")
+		return "", errors.New("resolve workspace root")
 	}
 	abs = filepath.Clean(abs)
 	if filepath.Dir(abs) == abs {
-		return nil, errors.New("filesystem roots cannot be selected as a Workspace")
+		return "", errors.New("filesystem roots cannot be selected as a Workspace")
 	}
 	for current := abs; ; current = filepath.Dir(current) {
 		if filepath.Base(current) == preservedDirectory {
-			return nil, errors.New("recovery copies cannot be selected as a Workspace")
+			return "", errors.New("recovery copies cannot be selected as a Workspace")
 		}
 		if filepath.Dir(current) == current {
 			break
 		}
+	}
+	return abs, nil
+}
+
+func openClientWorkspaceRoot(directory string) (*os.Root, error) {
+	abs, err := clientWorkspaceRootPath(directory)
+	if err != nil {
+		return nil, err
 	}
 	info, err := os.Lstat(abs)
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {

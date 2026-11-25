@@ -98,10 +98,10 @@ export function TaskApprovalCard({ approval, submitting = false, compact = false
       revocation: textDisclosure(approval.disclosures?.revocation),
       expiresAt: approval.expires_at,
     };
-    return <article className={`chat-approval task-approval-card${reviewInbox ? ' task-approval-review-card' : ''}`}
+    return <article className={`chat-approval task-approval-card${reviewInbox ? ' task-approval-review-card task-approval-review-card--interactive' : ''}`}
       role={reviewInbox ? 'group' : 'region'} aria-label={reviewInbox ? approval.title : label}
       data-approval-id={approval.id} aria-busy={submitting || undefined}>
-      <TaskApprovalMcpApp key={`${approval.id}:${approval.version}`} approval={appApproval} onDecision={onDecision} />
+      <TaskApprovalMcpApp key={`${approval.id}:${approval.version}`} approval={appApproval} onDecision={onDecision} reviewInbox={reviewInbox} />
     </article>;
   }
 

@@ -48,6 +48,10 @@ func TestTaskWorkspaceManifestPageAndBlockExport(t *testing.T) {
 	if got, err := taskManifestSHA256(wantManifest); err != nil || got != first.ManifestSHA256 {
 		t.Fatalf("manifest digest = %q, %v; want %q", got, err, first.ManifestSHA256)
 	}
+	wantWorkspaceSnapshotSHA256, err := mordesync.TaskWorkspaceSnapshotSHA256(wantManifest)
+	if err != nil || first.WorkspaceSnapshotSHA256 != wantWorkspaceSnapshotSHA256 {
+		t.Fatalf("Workspace snapshot digest = %q, %v; want scanner digest %q", first.WorkspaceSnapshotSHA256, err, wantWorkspaceSnapshotSHA256)
+	}
 	second, err := workspace.TaskWorkspaceManifestPage(context.Background(), taskID, viewID, first.ManifestSHA256, first.NextCursor, 1)
 	if err != nil {
 		t.Fatalf("second manifest page: %v", err)
@@ -62,12 +66,52 @@ func TestTaskWorkspaceManifestPageAndBlockExport(t *testing.T) {
 		InputRevision: 4, WorkspaceCheckpointRevision: 9, InputManifestSHA256: inputDigest, ViewID: viewID,
 		ManifestSHA256: first.ManifestSHA256, Limit: 10,
 	})
-	if err != nil || len(response.Files) != 2 || response.Files[1].ModTimeNS == nil || *response.Files[1].ModTimeNS != wantModTimeNS {
+	if err != nil || len(response.Files) != 2 || response.Files[1].ModTimeNS == nil || *response.Files[1].ModTimeNS != wantModTimeNS ||
+		response.WorkspaceSnapshotSHA256 != first.WorkspaceSnapshotSHA256 {
 		t.Fatalf("contract manifest response = %#v, %v; want persisted modification time %d", response, err, wantModTimeNS)
 	}
 	block, err := workspace.ReadTaskWorkspaceBlock(context.Background(), taskID, viewID, first.ManifestSHA256, testSHA256("output-beta"))
 	if err != nil || string(block) != "output-beta" {
 		t.Fatalf("read block = %q, %v", block, err)
+	}
+}
+
+func TestTaskWorkspaceManifestSnapshotReadsLegacyWithoutWorkspaceSnapshotDigest(t *testing.T) {
+	workspace, taskID, viewID, _, viewPath := openTaskExportWorkspace(t, map[string]string{"main.go": "package main\n"})
+	snapshot, err := workspace.createTaskWorkspaceManifestSnapshot(context.Background(), taskID, viewID)
+	if err != nil {
+		t.Fatalf("create snapshot fixture: %v", err)
+	}
+	legacyManifestSHA256 := snapshot.ManifestSHA256
+	snapshot.WorkspaceSnapshotSHA256 = ""
+	taskRoot, _, _, err := workspace.openTaskWorkspaceView(taskID, viewID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeTaskWorkspaceManifestSnapshot(taskRoot, viewID, snapshot); err != nil {
+		_ = taskRoot.Close()
+		t.Fatalf("write legacy snapshot fixture: %v", err)
+	}
+	raw, err := taskRoot.ReadFile(viewID + ".manifest")
+	closeErr := taskRoot.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("read legacy snapshot fixture: %v, close %v", err, closeErr)
+	}
+	if strings.Contains(string(raw), "workspace_snapshot_sha256") {
+		t.Fatal("legacy persisted snapshot unexpectedly contains the new digest field")
+	}
+
+	page, err := workspace.TaskWorkspaceManifestPage(context.Background(), taskID, viewID, legacyManifestSHA256, "", 10)
+	if err != nil {
+		t.Fatalf("read legacy snapshot page: %v", err)
+	}
+	manifest, digest, err := scanTaskWorkspace(context.Background(), viewPath)
+	if err != nil || digest != legacyManifestSHA256 {
+		t.Fatalf("scan expected manifest: digest=%q err=%v", digest, err)
+	}
+	wantSnapshot, err := mordesync.TaskWorkspaceSnapshotSHA256(manifest)
+	if err != nil || page.WorkspaceSnapshotSHA256 == "" || page.WorkspaceSnapshotSHA256 != wantSnapshot {
+		t.Fatalf("legacy snapshot digest = %q, %v; want recomputed %q", page.WorkspaceSnapshotSHA256, err, wantSnapshot)
 	}
 }
 

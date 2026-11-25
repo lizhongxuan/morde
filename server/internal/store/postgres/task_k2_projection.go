@@ -9,8 +9,144 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/store/postgres/sqlcgen"
 )
+
+// currentTaskValidationVerdictInTx returns a reviewed verdict only when the
+// verdict is still tied to the exact persisted execution response and the
+// Task's current authorization remains valid. Read snapshots cannot take the
+// row locks used by requireCurrentTaskAuthorization, so the authorization
+// check below mirrors its read predicates without mutating state.
+func currentTaskValidationVerdictInTx(ctx context.Context, tx pgx.Tx, taskID, ownerID string, revision, eventSequence int64, resultSHA256 []byte) (app.TaskValidationState, bool, error) {
+	var state app.TaskValidationState
+	err := tx.QueryRow(ctx, `SELECT review.validation_state
+FROM task_validation_reviews review
+JOIN tasks task ON task.id=review.task_id AND task.owner_id=review.owner_id
+JOIN task_events event ON event.task_id=review.task_id AND event.sequence=review.result_event_sequence
+  AND event.task_revision=review.task_revision AND event.event_type='task.result'
+  AND event.result_content_sha256=review.result_sha256
+JOIN task_model_call_responses response ON response.owner_id=task.initiator_id
+  AND response.source='task' AND response.call_id=review.execution_model_call_id AND response.task_id=task.id
+  AND response.task_owner_id=task.owner_id AND response.initiator_id=task.initiator_id
+  AND response.project_id=COALESCE(task.project_id,'')
+  AND response.agent_instance_id=task.agent_instance_id AND response.agent_generation=task.agent_generation
+  AND response.agent_session_id=task.agent_session_id AND response.agent_root_session_id=task.agent_session_id
+  AND response.authorization_version=task.auth_version
+JOIN model_call_ledger ledger ON ledger.owner_id=response.owner_id AND ledger.source=response.source
+  AND ledger.call_id=response.call_id AND ledger.task_id=response.task_id AND ledger.state='settled'
+JOIN task_agent_instances agent ON agent.task_id=response.task_id AND agent.owner_id=response.task_owner_id
+  AND agent.agent_instance_id=response.agent_instance_id AND agent.agent_generation=response.agent_generation
+  AND agent.agent_session_id=response.agent_session_id AND agent.auth_version=response.authorization_version
+  AND agent.engine_version=response.engine_version AND agent.profile_version=response.profile_version
+WHERE review.task_id=$1 AND review.owner_id=$2 AND review.task_revision=$3 AND review.state='reviewed'
+  AND ($4::bigint=0 OR review.result_event_sequence=$4)
+  AND (COALESCE(octet_length($5::bytea),0)=0 OR review.result_sha256=$5)
+  AND task.status='completed' AND task.current_revision=review.task_revision AND task.desired_revision=review.task_revision
+  AND task.result<>'' AND sha256(convert_to(task.result,'UTF8'))=review.result_sha256
+  AND task_validation_artifact_evidence_current(review.task_id,review.owner_id,review.artifact_content_evidence)`,
+		taskID, ownerID, revision, eventSequence, resultSHA256).Scan(&state)
+	if err == pgx.ErrNoRows {
+		return app.TaskValidationPending, false, nil
+	}
+	if err != nil {
+		return app.TaskValidationPending, false, fmt.Errorf("read current Task validation verdict provenance: %w", err)
+	}
+	if !app.ValidTaskValidationState(state) {
+		return app.TaskValidationPending, false, domain.NewError(domain.CodeInvalidState, "Task validation state is invalid")
+	}
+	row, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: taskID, OwnerID: ownerID})
+	if err != nil {
+		return app.TaskValidationPending, false, fmt.Errorf("read Task authorization for validation projection: %w", err)
+	}
+	authorized, err := taskValidationAuthorizationCurrentInTx(ctx, tx, row)
+	if err != nil {
+		return app.TaskValidationPending, false, err
+	}
+	if !authorized {
+		return app.TaskValidationPending, false, nil
+	}
+	return state, true, nil
+}
+
+// This predicate mirrors the persistent facts checked by
+// requireCurrentTaskAuthorization without row locks, which are unavailable in
+// read-only Task snapshots. Schedule scope-set validation is performed in Go
+// from the same Task row after the linked ScheduleRun check succeeds.
+const taskValidationCurrentAuthorizationPredicate = `task.auth_token_id<>'' AND task.auth_version>=1
+  AND EXISTS (SELECT 1 FROM users auth_user WHERE auth_user.id=task.initiator_id AND auth_user.status='approved')
+  AND (
+    (task.project_id IS NULL AND task.initiator_id=task.owner_id)
+    OR (task.project_id IS NOT NULL AND EXISTS (
+      SELECT 1 FROM projects project
+      JOIN project_members member ON member.project_id=project.id AND member.user_id=task.initiator_id
+      JOIN users member_user ON member_user.id=member.user_id AND member_user.status='approved'
+      WHERE project.id=task.project_id AND member.role IN ('owner','member')
+    ))
+  )
+  AND (
+    (task.auth_kind='schedule_task' AND task.auth_client_installation_id IS NULL AND EXISTS (
+      SELECT 1 FROM schedule_runs run
+      JOIN schedules schedule ON schedule.id=run.schedule_id AND schedule.owner_id=run.owner_id
+      JOIN tasks run_task ON run_task.id=run.task_id AND run_task.owner_id=run.owner_id AND run_task.initiator_id=run.owner_id
+      WHERE run.id=task.auth_token_id AND run.owner_id=task.initiator_id AND run.task_id=task.id
+        AND run_task.auth_kind='schedule_task' AND run_task.auth_token_id=run.id
+        AND run_task.execution_location='server' AND schedule.host_id IS NOT DISTINCT FROM run_task.host_id
+        AND run_task.host_id IS NOT DISTINCT FROM task.host_id
+    ))
+    OR (task.auth_kind<>'schedule_task' AND EXISTS (
+      SELECT 1 FROM tokens token
+      WHERE token.id=task.auth_token_id AND token.owner_id=task.initiator_id AND token.kind=task.auth_kind
+        AND token.client_installation_id IS NOT DISTINCT FROM task.auth_client_installation_id
+        AND token.expires_at>clock_timestamp()
+        AND (task.auth_expires_at IS NULL OR task.auth_expires_at>clock_timestamp())
+        AND (token.revoked_at IS NULL OR
+          (token.client_installation_id IS NOT NULL AND task.created_at<token.revoked_at))
+        AND (token.kind<>'client' OR token.client_installation_id IS NOT NULL)
+        AND (token.client_installation_id IS NULL OR EXISTS (
+          SELECT 1 FROM client_installations installation
+          WHERE installation.id=token.client_installation_id AND installation.owner_id=token.owner_id
+            AND installation.revoked_at IS NULL AND installation.expires_at>clock_timestamp()
+        ))
+    ))
+  )`
+
+// taskValidationAuthorizationCurrentInTx mirrors requireCurrentTaskAuthorization
+// for immutable read snapshots. It intentionally does not refresh, extend, or
+// otherwise mutate credentials; any missing or malformed authorization fact
+// causes the verdict to remain pending.
+func taskValidationAuthorizationCurrentInTx(ctx context.Context, tx pgx.Tx, value sqlcgen.Task) (bool, error) {
+	if value.AuthTokenID == "" || value.AuthVersion < 1 || !domain.ValidUserID(value.InitiatorID) {
+		return false, nil
+	}
+	if value.AuthKind == string(identity.KindScheduleTask) &&
+		(!scheduleTaskScopeStringsValidForHost(value.AuthScopes, value.HostID.Valid) || !schedule.ValidRunID(value.AuthTokenID) || value.AuthClientInstallationID.Valid) {
+		return false, nil
+	}
+	var current bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (
+  SELECT 1 FROM tasks task WHERE task.id=$1 AND task.owner_id=$2 AND task.initiator_id=$3
+    AND task.auth_token_id=$4 AND task.auth_version=$5 AND `+taskValidationCurrentAuthorizationPredicate+`
+)`, value.ID, value.OwnerID, value.InitiatorID, value.AuthTokenID, value.AuthVersion).Scan(&current)
+	if err != nil {
+		return false, fmt.Errorf("check Task validation current authorization: %w", err)
+	}
+	return current, nil
+}
+
+// lockTaskValidationAuthorizationCurrentInTx is used by receipt publication,
+// which runs in a writable transaction and must serialize authorization
+// revocation with publishing a validation verdict. Detail/list/EventChain
+// snapshots remain read-only and use the predicate above instead.
+func lockTaskValidationAuthorizationCurrentInTx(ctx context.Context, tx pgx.Tx, taskID, ownerID string) (bool, error) {
+	value, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: taskID, OwnerID: ownerID})
+	if err != nil {
+		return false, fmt.Errorf("read Task authorization for result receipt: %w", err)
+	}
+	return requireCurrentTaskAuthorization(ctx, tx, value)
+}
 
 func loadTaskK2Projection(ctx context.Context, tx pgx.Tx, taskID string, revision int64) ([]app.Dependency, []app.ChildJob, *app.ResultReview, app.TaskValidationSummary, error) {
 	currentRevision := revision
@@ -173,7 +309,7 @@ ORDER BY source.task_id`, ids, revisions)
 	}
 	rows.Close()
 
-	rows, err = tx.Query(ctx, `SELECT review.task_id,review.validation_state
+	rows, err = tx.Query(ctx, `SELECT review.task_id,review.validation_state,task.auth_kind,task.auth_scopes,task.host_id IS NOT NULL
 FROM unnest($1::text[],$2::bigint[]) AS requested(task_id,task_revision)
 JOIN task_validation_reviews review ON review.task_id=requested.task_id AND review.task_revision=requested.task_revision
 JOIN tasks task ON task.id=review.task_id AND task.status='completed'
@@ -182,26 +318,45 @@ JOIN tasks task ON task.id=review.task_id AND task.status='completed'
 JOIN task_events event ON event.task_id=review.task_id AND event.sequence=review.result_event_sequence
   AND event.task_revision=review.task_revision AND event.event_type='task.result'
   AND event.result_content_sha256=review.result_sha256
+JOIN task_model_call_responses response ON response.owner_id=task.initiator_id
+  AND response.source='task' AND response.call_id=review.execution_model_call_id AND response.task_id=task.id
+  AND response.task_owner_id=task.owner_id AND response.initiator_id=task.initiator_id
+  AND response.project_id=COALESCE(task.project_id,'')
+  AND response.agent_instance_id=task.agent_instance_id AND response.agent_generation=task.agent_generation
+  AND response.agent_session_id=task.agent_session_id AND response.agent_root_session_id=task.agent_session_id
+  AND response.authorization_version=task.auth_version
+JOIN model_call_ledger ledger ON ledger.owner_id=response.owner_id AND ledger.source=response.source
+  AND ledger.call_id=response.call_id AND ledger.task_id=response.task_id AND ledger.state='settled'
+JOIN task_agent_instances agent ON agent.task_id=response.task_id AND agent.owner_id=response.task_owner_id
+  AND agent.agent_instance_id=response.agent_instance_id AND agent.agent_generation=response.agent_generation
+  AND agent.agent_session_id=response.agent_session_id AND agent.auth_version=response.authorization_version
+  AND agent.engine_version=response.engine_version AND agent.profile_version=response.profile_version
 WHERE review.state='reviewed'
-  AND task_validation_artifact_evidence_current(review.task_id,review.owner_id,review.artifact_content_evidence)`, ids, revisions)
+  AND task_validation_artifact_evidence_current(review.task_id,review.owner_id,review.artifact_content_evidence)
+  AND `+taskValidationCurrentAuthorizationPredicate, ids, revisions)
 	if err != nil {
 		return nil, fmt.Errorf("read Task validation verdicts: %w", err)
 	}
 	for rows.Next() {
-		var taskID string
+		var taskID, authKind string
 		var state app.TaskValidationState
-		if err := rows.Scan(&taskID, &state); err != nil {
+		var authScopes []string
+		var hostBound bool
+		if err := rows.Scan(&taskID, &state, &authKind, &authScopes, &hostBound); err != nil {
 			rows.Close()
 			return nil, fmt.Errorf("scan Task validation verdict: %w", err)
-		}
-		if !app.ValidTaskValidationState(state) {
-			rows.Close()
-			return nil, fmt.Errorf("Task validation verdict has unknown state %q", state)
 		}
 		projection, exists := projections[taskID]
 		if !exists {
 			rows.Close()
 			return nil, domain.NewError(domain.CodeInvalidState, "Task validation projection escaped its page")
+		}
+		if !app.ValidTaskValidationState(state) {
+			rows.Close()
+			return nil, fmt.Errorf("Task validation verdict has unknown state %q", state)
+		}
+		if authKind == string(identity.KindScheduleTask) && !scheduleTaskScopeStringsValidForHost(authScopes, hostBound) {
+			continue
 		}
 		projection.Validation.State = state
 		projections[taskID] = projection
@@ -211,6 +366,5 @@ WHERE review.state='reviewed'
 		return nil, fmt.Errorf("iterate Task validation verdicts: %w", err)
 	}
 	rows.Close()
-
 	return projections, nil
 }

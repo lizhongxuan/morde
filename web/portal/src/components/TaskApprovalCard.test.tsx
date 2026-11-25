@@ -29,6 +29,7 @@ describe('TaskApprovalCard', () => {
     expect(iframe).toHaveAttribute('referrerpolicy', 'no-referrer');
     expect(iframe.getAttribute('srcdoc')).toContain("default-src 'none'");
     expect(iframe.getAttribute('srcdoc')).toContain("connect-src 'none'");
+    expect(iframe.getAttribute('srcdoc')).toContain('data-layout="review"');
     expect(iframe.getAttribute('srcdoc')).not.toContain('allow-same-origin');
     const app = taskApprovalMcpAppDriver(iframe as HTMLIFrameElement);
 
@@ -42,6 +43,8 @@ describe('TaskApprovalCard', () => {
     expect(onDecision).not.toHaveBeenCalled();
 
     await app.initialize();
+    await app.send({ jsonrpc: '2.0', method: 'ui/notifications/size-changed', params: { height: 150 } });
+    expect(iframe).toHaveStyle({ height: '150px' });
     await app.send({ jsonrpc: '2.0', method: 'ui/notifications/size-changed', params: { height: 430 } });
     expect(iframe).toHaveStyle({ height: '430px' });
     await app.send({ jsonrpc: '2.0', method: 'ui/notifications/size-changed', params: { height: 10_000 } });

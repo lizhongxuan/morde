@@ -89,6 +89,33 @@ func TestConversationRouteNewTaskUsesStructuredFileDeliveryIntent(t *testing.T) 
 	}
 }
 
+func TestConversationRouteProjectWorkspaceFileDeliveryFailsClosed(t *testing.T) {
+	client := &routeModelClientTest{reply: `{"action":"new","task_id":"","file_delivery_intent":"required"}`}
+	store, gateway, _, claim, _ := routeModelFixtureWithMemberAndContent(t, true, false, client,
+		"请在这个项目里整理资料并交付文件。")
+	ctx := context.Background()
+	if _, err := store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, claim.Message.OwnerID); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, decision := classifyFileDeliveryRoute(t, store, gateway, claim)
+	if decision.InvalidOutput || decision.Action != app.ConversationRouteNew || decision.FileDeliveryIntent != task.FileDeliveryRequired {
+		t.Fatalf("project route decision = %+v", decision)
+	}
+	err := store.ApplyConversationRoute(ctx, claim, snapshot, decision)
+	var domainErr *domain.Error
+	if !errors.As(err, &domainErr) || domainErr.Code != domain.CodeInvalidArgument ||
+		domainErr.Details["field"] != "workspace_id" || !strings.Contains(domainErr.Message, "project Workspace") {
+		t.Fatalf("project Workspace-less file delivery = %v, want explicit fail-closed workspace error", err)
+	}
+	var taskCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE id=$1 AND task_id IS NOT NULL`, claim.Message.ID).Scan(&taskCount); err != nil {
+		t.Fatal(err)
+	}
+	if taskCount != 0 {
+		t.Fatalf("project route created %d Tasks without a supported project Workspace snapshot", taskCount)
+	}
+}
+
 func TestConversationRouteNewRequiredBindsCurrentWorkspaceInputSnapshot(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()

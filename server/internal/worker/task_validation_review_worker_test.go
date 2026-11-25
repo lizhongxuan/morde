@@ -25,6 +25,7 @@ type taskValidationReviewQueueStub struct {
 	claimed    bool
 	completion app.TaskValidationReviewCompletion
 	retried    bool
+	completed  bool
 }
 
 func (s *taskValidationReviewQueueStub) ClaimTaskValidationReviews(_ context.Context, _ string, _ time.Duration, _ int32) ([]app.TaskValidationReviewClaim, error) {
@@ -42,6 +43,7 @@ func (s *taskValidationReviewQueueStub) RetryTaskValidationReview(context.Contex
 
 func (s *taskValidationReviewQueueStub) CompleteTaskValidationReview(_ context.Context, value app.TaskValidationReviewCompletion) (bool, error) {
 	s.completion = value
+	s.completed = true
 	return true, nil
 }
 
@@ -49,6 +51,25 @@ type taskValidationReviewSnapshotStub struct {
 	details          app.TaskDetails
 	stepDetails      map[string]app.TaskStepDetail
 	artifactContents map[string]app.TaskArtifactContent
+}
+
+type taskValidationFinalWorkspaceSnapshotStub struct {
+	proof     *app.TaskValidationFinalWorkspaceSnapshotProof
+	calls     int
+	released  bool
+	completed func() bool
+}
+
+func (s *taskValidationFinalWorkspaceSnapshotStub) ReadTaskValidationFinalWorkspaceSnapshot(_ context.Context,
+	_ app.TaskValidationReviewClaim, _ task.Task, _ *app.TaskValidationReplayEvidence) (*app.TaskValidationFinalWorkspaceSnapshotProof, func(context.Context) error, error) {
+	s.calls++
+	return s.proof, func(context.Context) error {
+		if s.completed != nil && !s.completed() {
+			return fmt.Errorf("Workspace snapshot fence released before review completion")
+		}
+		s.released = true
+		return nil
+	}, nil
 }
 
 type reviewArtifactBody struct{ *bytes.Reader }
@@ -230,16 +251,39 @@ func TestTaskValidationReviewWorkerCompletesToolFreeIndependentReview(t *testing
 		Identity: deepSeek, ResponseDigest: bytes.Repeat([]byte{0x78}, 32)}
 	queue := &taskValidationReviewQueueStub{claim: claim}
 	revision, desiredRevision := int64(4), int64(4)
+	inputRevision, checkpointRevision := int64(0), int64(0)
+	replay := &app.TaskValidationReplayEvidence{State: app.TaskValidationReplayPending, PlanRevision: 1,
+		Checks: []app.TaskValidationReplayCheckEvidence{{CheckID: "verify", Status: app.TaskValidationReplayPending}}}
+	finalProofReader := &taskValidationFinalWorkspaceSnapshotStub{proof: &app.TaskValidationFinalWorkspaceSnapshotProof{
+		Claim: claim, TaskID: claim.TaskID, TaskRevision: claim.TaskRevision, HostID: "h1234567",
+		RuntimeGeneration: 1, RuntimeInstanceID: "runtime-instance", ControlVersion: 0,
+		WorkspaceID: "w1234567", BindingVersion: 1, InputRevision: inputRevision,
+		WorkspaceCheckpointRevision: checkpointRevision, InputManifestSHA256: strings.Repeat("a", 64),
+		ViewID: "v" + strings.Repeat("0", 64), SnapshotSHA256: strings.Repeat("b", 64),
+	}}
+	finalProofReader.completed = func() bool { return queue.completed }
 	worker, err := NewTaskValidationReviewWorker(TaskValidationReviewWorkerOptions{Queue: queue,
 		Snapshots: taskValidationReviewSnapshotStub{details: app.TaskDetails{Task: task.Task{ID: claim.TaskID, OwnerID: claim.OwnerID,
-			InitiatorID: claim.InitiatorID, ConversationID: claim.ConversationID, Status: task.StatusCompleted,
-			CurrentRevision: &revision, DesiredRevision: &desiredRevision, Objective: "Verify the implementation", Result: "verified result"},
-			ValidationEvidence: evidence}},
-		AccountRuntime: taskValidationReviewRuntimeStub{claim: claim, result: string(result)},
-		Models:         taskValidationReviewModelsStub{execution: execution, reviewer: reviewer, text: string(result)},
-		WorkerID:       "review-worker", LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop()})
+			InitiatorID: claim.InitiatorID, ConversationID: claim.ConversationID, HostID: "h1234567", WorkspaceID: "w1234567",
+			InputRevision: &inputRevision, WorkspaceCheckpointRevision: &checkpointRevision, ContextDigest: bytes.Repeat([]byte{0xaa}, 32),
+			Status: task.StatusCompleted, CurrentRevision: &revision, DesiredRevision: &desiredRevision,
+			Objective: "Verify the implementation", Result: "verified result"},
+			ValidationEvidence: evidence, ValidationReplayEvidence: replay}},
+		FinalWorkspaceSnapshots: finalProofReader,
+		AccountRuntime:          taskValidationReviewRuntimeStub{claim: claim, result: string(result)},
+		Models:                  taskValidationReviewModelsStub{execution: execution, reviewer: reviewer, text: string(result)},
+		WorkerID:                "review-worker", LeaseDuration: time.Minute, PollInterval: time.Millisecond, MaxConcurrent: 1, Logger: zap.NewNop()})
 	if err != nil {
 		t.Fatal(err)
+	}
+	input, err := worker.reviewInput(context.Background(), claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encodedInput, err := json.Marshal(input)
+	if err != nil || input.Replay == nil || input.Replay.FinalWorkspaceSnapshotProof != nil || finalProofReader.calls != 0 ||
+		bytes.Contains(encodedInput, []byte("final_workspace_snapshot_proof")) || bytes.Contains(encodedInput, []byte("runtime-instance")) {
+		t.Fatalf("review input replay = %+v, encoded=%s, reader_calls=%d err=%v; final Workspace proof must be read after model settlement and omitted from the model", input.Replay, encodedInput, finalProofReader.calls, err)
 	}
 	found, err := worker.RunOnce(context.Background())
 	if err != nil || !found {
@@ -250,6 +294,11 @@ func TestTaskValidationReviewWorkerCompletesToolFreeIndependentReview(t *testing
 	}
 	if queue.completion.Report.Recommendation != app.TaskValidationPass || queue.completion.ReviewerModel.ThroughSequence != 0 {
 		t.Fatalf("unexpected completion: %#v", queue.completion)
+	}
+	if queue.completion.FinalWorkspaceSnapshotProof == nil || queue.completion.FinalWorkspaceSnapshotProof.SnapshotSHA256 != strings.Repeat("b", 64) ||
+		finalProofReader.calls != 1 || !queue.completed || !finalProofReader.released {
+		t.Fatalf("review completion omitted the independently read final Workspace proof or released its Runtime fence before durable completion: completion=%+v reader_calls=%d completed=%t released=%t",
+			queue.completion, finalProofReader.calls, queue.completed, finalProofReader.released)
 	}
 }
 

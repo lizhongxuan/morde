@@ -367,7 +367,7 @@ VALUES ($1,$2,$3,$3,$4,$5,0,'applied')`, oldRevisionMessageID, oldRevision.ID, f
 		{noEvidence, app.TaskValidationPending},
 		{staleDigest, app.TaskValidationPending},
 		{oldRevision, app.TaskValidationPending},
-		{passed, app.TaskValidationPass},
+		{passed, app.TaskValidationPending},
 	} {
 		want := fmt.Sprintf("- %s r%d：%s", check.task.ID, check.task.TaskRevision, check.state)
 		if !strings.Contains(content, want) {
@@ -399,12 +399,13 @@ JOIN conversation_result_sources source ON source.batch_message_id=batch.message
 WHERE source.task_id=$1 AND batch.state='published'`, failed.ID).Scan(&failedContent); err != nil {
 		t.Fatalf("failed validation was not delivered: %v", err)
 	}
-	if !strings.Contains(failedContent, "FAIL（验证未通过") {
-		t.Fatalf("failed validation was not explained: %q", failedContent)
+	if !strings.Contains(failedContent, fmt.Sprintf("- %s r%d：pending", failed.ID, failed.TaskRevision)) ||
+		strings.Contains(failedContent, "FAIL（验证未通过") {
+		t.Fatalf("unbound failed validation should remain pending: %q", failedContent)
 	}
 }
 
-func TestConversationResultReviewDeliversMixedValidationStates(t *testing.T) {
+func TestConversationResultReviewHidesUnboundValidationStates(t *testing.T) {
 	f := newResultAggregationFixture(t)
 	ctx := context.Background()
 	passed := f.createTask(t, f.ownerID, "passing result")
@@ -427,10 +428,16 @@ JOIN conversation_messages message ON message.id=batch.published_message_id
 WHERE batch.state='published'`).Scan(&content); err != nil {
 		t.Fatalf("mixed result batch was not delivered: %v", err)
 	}
-	for _, expected := range []string{passed.ID, failed.ID, "PASS", "FAIL（验证未通过"} {
+	for _, expected := range []string{
+		fmt.Sprintf("- %s r%d：pending", passed.ID, passed.TaskRevision),
+		fmt.Sprintf("- %s r%d：pending", failed.ID, failed.TaskRevision),
+	} {
 		if !strings.Contains(content, expected) {
-			t.Fatalf("mixed result receipt missing %q: %q", expected, content)
+			t.Fatalf("result receipt missing fail-closed validation state %q: %q", expected, content)
 		}
+	}
+	if strings.Contains(content, "PASS") || strings.Contains(content, "FAIL（验证未通过") {
+		t.Fatalf("result receipt exposed an unbound validation verdict: %q", content)
 	}
 }
 
@@ -453,8 +460,8 @@ func TestConversationResultReceiptLocksValidationInputsUntilCommit(t *testing.T)
 	source := app.ConversationTaskResultSource{TaskID: value.ID, TaskRevision: value.TaskRevision,
 		EventSequence: value.EventSequence, Content: value.Content}
 	state, err := conversationTaskResultValidationStateInTx(ctx, receiptTx, f.ownerID, source)
-	if err != nil || state != app.TaskValidationPass {
-		t.Fatalf("validation state = %q err=%v; want PASS", state, err)
+	if err != nil || state != app.TaskValidationPending {
+		t.Fatalf("validation state = %q err=%v; want pending without a bound execution response", state, err)
 	}
 	receipt := conversationTaskResultReceipt("verified summary", []app.ConversationTaskResultSource{source},
 		[]app.TaskValidationState{state})

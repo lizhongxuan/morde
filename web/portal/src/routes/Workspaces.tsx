@@ -196,7 +196,11 @@ function projectUploadStatus(value: unknown): string {
         : '目标电脑已应用本次项目，但本机状态基线未确认；请重新同步后核对。';
     if (receipt.status === 'conflict') return `云端已确认，目标电脑存在冲突；恢复点已保留。${projectConflictPaths(receipt.impacts)}`;
     if (receipt.status === 'unknown' || result.hostStatus === 'unknown') return '云端已确认，目标电脑应用状态未知；恢复点已保留。';
-    return '云端已确认，等待目标电脑应用。';
+    if (receipt.status === 'applied' || result.hostStatus === 'applied') {
+      return '云端已确认，但目标电脑应用回执证据不足；状态待核验，恢复点已保留。';
+    }
+    if (receipt.status === 'pending_apply' || result.hostStatus === 'pending_apply') return '云端已确认，等待目标电脑应用。';
+    return '云端已确认，目标电脑应用状态待核验；恢复点已保留。';
   }
   const messages: Record<string, string> = { running: '同步仍在进行，恢复点已保留。', conflict: '发现冲突，本次同步未提交。',
     failed: '同步失败，云端未确认完成。', cancelled: '同步已取消，云端未确认完成。', expired: '同步会话已过期，云端未确认完成。' };
@@ -218,6 +222,14 @@ function projectConflictPaths(value: unknown): string {
     return [path];
   });
   return paths.length ? ` 受影响路径：${paths.join('、')}。` : '';
+}
+
+function completedProjectReceiptMessage(status: string | undefined): string {
+  if (status === 'conflict') return '目标电脑应用存在冲突；恢复点已保留。点击“核对电脑应用状态”查看最新回执。';
+  if (status === 'unknown') return '目标电脑应用状态未知；恢复点已保留。点击“核对电脑应用状态”重新核对。';
+  if (status === 'pending_apply') return '云端已确认，等待目标电脑应用。';
+  if (status === 'applied') return '目标电脑已报告应用；本机恢复点仍待核对。';
+  return '云端已确认，目标电脑应用状态待核对。';
 }
 
 function validateProjectName(value: string): { name: string; error: string | null } {
@@ -416,7 +428,10 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
     : undefined;
   const projectTargetRouteMismatch = projectPreferences.isSuccess && Boolean(computerID && computerID !== defaultHostID);
   const selectedProjectTarget = projectTargetRouteMismatch ? undefined : configuredDefaultProjectTarget;
-  const selectedProjectTargetUnavailable = !selectedProjectTarget || configuredDefaultHost?.state !== 'running'
+  const projectTargetStateVerified = projectPreferences.isSuccess && !projectPreferences.isError && !projectPreferences.isFetching
+    && hosts.isSuccess && !hosts.isError && !hosts.isFetching;
+  const projectReceiptCheckUnavailable = projectPreferences.isError || projectPreferences.isFetching || hosts.isError || hosts.isFetching;
+  const selectedProjectTargetUnavailable = !projectTargetStateVerified || !selectedProjectTarget || configuredDefaultHost?.state !== 'running'
     || selectedProjectTarget.hostState !== 'running'
     || configuredDefaultHost?.workspace_runtime_online !== true || !configuredDefaultWorkspaceReady
     || projectPreferences.isFetching || projectTargets.isFetching || projectTargets.isError || Boolean(selectedProjectTarget.blockedMessage);
@@ -824,9 +839,9 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
       {projectBridgeAvailable && !projectBridge?.state && <p className="muted" role="status">当前桌面客户端不支持读取本机同步状态，请更新客户端。</p>}
       {localProjectError && <p className="muted" role="status">{localProjectError} <button type="button" className="button button-secondary button-small" onClick={() => void refreshLocalProjectState()}>重试</button></p>}
       {receiptSelection && projectCheckpoint?.projectName && <div className="inline-actions">
-        <span role="status">云端已确认，目标电脑应用状态待核对。</span>
-        <button type="button" className="button button-secondary button-small" disabled={projectUploadBusy || scopedProjectState?.syncState === 'running' || !projectBridge?.uploadProject}
-          onClick={() => void startProjectUpload(receiptSelection, projectCheckpoint.projectName!, true)}>核对电脑应用状态</button>
+        <span role="status">{completedProjectReceiptMessage(projectCheckpoint.hostApplicationStatus)}</span>
+        {!projectReceiptCheckUnavailable && <button type="button" className="button button-secondary button-small" disabled={projectUploadBusy || scopedProjectState?.syncState === 'running' || !projectBridge?.uploadProject}
+          onClick={() => void startProjectUpload(receiptSelection, projectCheckpoint.projectName!, true)}>核对电脑应用状态</button>}
       </div>}
       {scopedProjectState?.syncState === 'running' && projectCheckpoint?.projectSelectionID && <button type="button" className="button button-secondary button-small"
         disabled={!projectBridge?.stopProjectSync || projectStopBusy} onClick={() => void stopProjectUpload()}>{projectStopBusy ? '正在停止…' : '停止同步'}</button>}

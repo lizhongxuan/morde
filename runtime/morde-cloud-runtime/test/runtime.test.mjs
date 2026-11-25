@@ -2199,6 +2199,222 @@ test('sends a long initial source reference as a bounded marker and restores it 
   assert.equal(restoredMessage.content.map(block => block.text ?? '').join(''), ref.content)
 })
 
+test('restores a 1 MiB+1 source reference revision batch in order without duplicate delivery', { timeout: 15_000 }, async () => {
+  const identity = { ...start, conversation_id: 'conversation_123' }
+  const longRef = sourceReference(identity, { messageID: 'mrevlng1', sequence: 2, contentBytes: 1024 * 1024 + 1, mode: 'steer' })
+  const revisionMessages = [
+    { message_id: longRef.envelope.message_id, content: longRef.content, attachment_ids: [], mode: 'steer' },
+    { message_id: 'mrevnxt1', content: 'Follow-up after the long source reference.', attachment_ids: [], mode: 'followup' },
+  ]
+  const revisionStart = { ...identity, revision_messages: revisionMessages }
+  const captured = await captureSession({ startFrame: revisionStart, interrupt: true })
+  const capturedEvents = captured.flatMap(page => JSON.parse(page.payload).events)
+  const capturedMessages = capturedEvents.filter(event => event.type === 'user/message' &&
+    revisionMessages.some(item => item.message_id === event.data.id))
+  assert.deepEqual(capturedMessages.map(event => event.data.id), revisionMessages.map(message => message.message_id),
+    'the initial revision batch must checkpoint in source order')
+  for (const message of revisionMessages) {
+    const saved = capturedEvents.filter(event => event.type === 'user/message' && event.data.id === message.message_id)
+    assert.equal(saved.length, 1, `checkpoint must persist ${message.message_id} once`)
+    assert.equal(saved[0].data.content.map(block => block.text ?? '').join(''), message.content)
+    assert.equal(saved[0].data.source?.morde_delivery_mode, message.mode)
+  }
+
+  // The durable checkpoint already contains the applied revision batch. Resume
+  // from that checkpoint without re-seeding it as a new revision batch.
+  const resumeBase = { ...identity, prompt: 'resume the checkpointed revision batch' }
+  const resumed = await resumeSession(captured, { baseStart: resumeBase })
+  assert.equal(resumed.code, 0, `resume frames: ${JSON.stringify(resumed.frames)}`)
+  assert.equal(resumed.offsets.length > 0, true, 'recovery must read the pinned checkpoint')
+  assert.equal(resumed.modelCalls, 1, 'recovery should continue in one model turn')
+  const resumedMessages = resumed.modelRequests[0].messages.filter(message => revisionMessages.some(item => item.message_id === message.id))
+  assert.deepEqual(resumedMessages.map(message => message.id), revisionMessages.map(message => message.message_id),
+    'the recovered model input must preserve revision batch order')
+  assert.equal(resumedMessages[0].content.map(block => block.text ?? '').join(''), longRef.content,
+    'the resumed input must retain the source-reference marker, not substitute the long source body')
+  assert.equal(resumedMessages[1].content.map(block => block.text ?? '').join(''), revisionMessages[1].content)
+
+  const allEvents = [...capturedEvents, ...resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)]
+  for (const message of revisionMessages) {
+    assert.equal(allEvents.filter(event => event.type === 'user/message' && event.data.id === message.message_id).length, 1,
+      `restart must not duplicate ${message.message_id}`)
+  }
+})
+
+test('restores a compacted long Task with its brief, latest message, and completed tool pair',
+  { timeout: 30_000 }, async t => {
+    const earlyConstraint = 'EARLY-ONLY-ALPHA: preserve ledger ordering in the final answer.'
+    const latestConstraint = 'LATEST-ONLY-OMEGA: include the final checkpoint count.'
+    const tool = {
+      name: 'file_write', description: 'Write a file in the task workspace.',
+      parameters: {
+        type: 'object', properties: {
+          workspace_id: { type: 'string' }, path: { type: 'string' }, content: { type: 'string' },
+        }, required: ['workspace_id', 'path', 'content'], additionalProperties: false,
+      },
+    }
+    const callID = 'call_compact_restart_1'
+    const toolOutput = '{"bytes_written":41}'
+    const toolArguments = {
+      workspace_id: 'w1234567', path: 'notes/compaction-proof.txt',
+      content: `${earlyConstraint}\n${latestConstraint}`,
+    }
+    const taskStart = {
+      ...start, task_id: 'task_compact_restart', session_id: 'session_compact_restart',
+      context_window_tokens: 4096, max_tokens: 512, tools: [tool],
+      initial_message: {
+        message_id: 'm1234567', content: `${earlyConstraint} ${'history '.repeat(275)}`, attachment_ids: [],
+      },
+    }
+    delete taskStart.prompt
+
+    const checkpointPages = []
+    let followupsQueued = false
+    let toolCallIssued = false
+    const completedCallIDs = new Set()
+    let sideEffects = 0
+    let postToolRequest
+    let firstToolCall
+    const first = launch((frame, proc) => {
+      if (frame.type === 'ready') send(proc, taskStart)
+      if (frame.type === 'checkpoint') {
+        checkpointPages.push({ from_seq: frame.from_seq, through_seq: frame.through_seq,
+          payload: frame.payload, sha256: frame.sha256 })
+        acknowledgeCheckpoint(proc, frame)
+      }
+      if (frame.type === 'model') {
+        const messagesJSON = JSON.stringify(frame.request.messages)
+        if (frame.request.max_tokens === 256) {
+          replyWithText(proc, frame, 'Compacted the prior conversation while retaining the task brief.')
+          return
+        }
+
+        if (!followupsQueued) {
+          followupsQueued = true
+          for (let index = 1; index <= 40; index++) {
+            const messageID = `m${String(7000000 + index).padStart(7, '0')}`
+            const content = index === 40
+              ? `followup-${index} ${latestConstraint} ${'history '.repeat(275)}`
+              : `followup-${index} ${'history '.repeat(275)}`
+            send(proc, messageDelivery(frame, messageID, content))
+          }
+          replyWithText(proc, frame, 'Queued the long conversation history.')
+          return
+        }
+
+        if (toolCallIssued) {
+          postToolRequest = frame.request
+          proc.kill('SIGKILL')
+          return
+        }
+
+        const savedEvents = checkpointPages.flatMap(page => JSON.parse(page.payload).events)
+        const compactionCompleted = savedEvents.some(event => event.type === 'compaction/end' && !event.data.error)
+        if (compactionCompleted && messagesJSON.includes(earlyConstraint) && messagesJSON.includes(latestConstraint)) {
+          toolCallIssued = true
+          const chunks = [
+            { type: 'tool-call-delta', index: 0, id: callID, name: tool.name,
+              argumentsDelta: JSON.stringify(toolArguments) },
+            { type: 'usage', usage: { inputTokens: 23, outputTokens: 9 } },
+            { type: 'finish', reason: { kind: 'tool-calls' } },
+          ]
+          chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+          send(proc, { type: 'model_end', id: frame.id, ok: true })
+          return
+        }
+        replyWithText(proc, frame, 'Continuing the task with the current history.')
+      }
+      if (frame.type === 'tool_call') {
+        firstToolCall = frame
+        if (!completedCallIDs.has(frame.call_id)) {
+          completedCallIDs.add(frame.call_id)
+          sideEffects += 1
+        }
+        send(proc, { type: 'tool_result', id: frame.id, ...taskFence(frame), call_id: frame.call_id,
+          status: 'succeeded', output: toolOutput })
+      }
+    })
+    t.after(() => first.child.kill())
+    const [firstCode, firstSignal] = await once(first.child, 'close')
+    assert.equal(firstCode, null)
+    assert.equal(firstSignal, 'SIGKILL')
+    assert.ok(postToolRequest, 'the first runtime reached a model request after checkpointing the tool result')
+    assert.ok(checkpointPages.length > 0, 'the first runtime wrote durable checkpoint pages')
+    assert.ok(toolCallIssued)
+    assert.equal(firstToolCall?.call_id, callID)
+    assert.equal(firstToolCall?.name, tool.name)
+    assert.deepEqual(firstToolCall?.arguments, toolArguments)
+    assert.equal(sideEffects, 1, 'the tool side effect ran once before the restart')
+    const firstPostToolJSON = JSON.stringify(postToolRequest.messages)
+    assert.ok(firstPostToolJSON.includes(earlyConstraint), 'the first post-tool request keeps the original Task brief')
+    assert.ok(firstPostToolJSON.includes(latestConstraint), 'the first post-tool request keeps the latest follow-up')
+    const firstAssistantToolCalls = postToolRequest.messages.flatMap(message => message.content ?? [])
+      .filter(block => block.type === 'tool-call' && block.id === callID)
+    const firstResultMessages = postToolRequest.messages.filter(message => message.role === 'tool' && message.toolCallId === callID)
+    assert.equal(firstAssistantToolCalls.length, 1, 'the first post-tool request has one tool call')
+    assert.equal(firstResultMessages.length, 1, 'the first post-tool request has its matching tool result')
+    assert.equal(firstResultMessages[0].content[0].text, toolOutput)
+
+    const firstEvents = checkpointPages.flatMap(page => JSON.parse(page.payload).events)
+    assert.ok(firstEvents.some(event => event.type === 'compaction/end' && !event.data.error),
+      'the completed DSH compaction is durable before the restart')
+    assert.ok(firstEvents.some(event => event.type === 'tool/call' && event.data.callId === callID))
+    assert.ok(firstEvents.some(event => event.type === 'tool/result' && event.data.message?.toolCallId === callID))
+    assert.ok(firstEvents.some(event => event.type === 'assistant/message' &&
+      event.data.message?.content?.some(block => block.type === 'tool-call' && block.id === callID)))
+
+    const resumedRequests = []
+    const reconciledToolCalls = []
+    const resumed = await resumeSession(checkpointPages, {
+      baseStart: { ...taskStart, prompt: 'resume the compacted Task from its durable checkpoint' },
+      tools: [tool],
+      onToolCall: frame => {
+        reconciledToolCalls.push(frame)
+        if (!completedCallIDs.has(frame.call_id)) {
+          completedCallIDs.add(frame.call_id)
+          sideEffects += 1
+        }
+        return { status: 'succeeded', output: toolOutput }
+      },
+      onModel(frame, proc) {
+        resumedRequests.push(frame.request)
+        replyWithText(proc, frame, 'Recovered with the original ordering and checkpoint count.')
+      },
+    })
+    assert.equal(resumed.code, 0, `resume frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
+    assert.ok(resumed.offsets.length > 0, 'restart reads the pinned durable checkpoint')
+    assert.equal(resumedRequests.length, 1)
+    assert.equal(resumed.frames.filter(frame => frame.type === 'tool_call').length, 1,
+      'recovery may reconcile the stable call ID with the parent broker')
+    assert.equal(reconciledToolCalls[0]?.call_id, callID)
+    assert.equal(reconciledToolCalls[0]?.name, tool.name)
+    assert.deepEqual(reconciledToolCalls[0]?.arguments, toolArguments)
+    assert.equal(completedCallIDs.size, 1)
+    assert.equal(resumed.sentToolResults.length, 1)
+    assert.deepEqual(resumed.sentToolResults[0], { call_id: callID, status: 'succeeded', output: toolOutput },
+      'reconciliation returns the existing result under the same stable call ID')
+    assert.equal(sideEffects, 1)
+    const resumedJSON = JSON.stringify(resumedRequests[0].messages)
+    assert.ok(resumedJSON.includes(earlyConstraint), 'recovery preserves the early unique constraint')
+    assert.ok(resumedJSON.includes(latestConstraint), 'recovery preserves the latest message')
+    const resumedAssistantToolCalls = resumedRequests[0].messages.flatMap(message => message.content ?? [])
+      .filter(block => block.type === 'tool-call' && block.id === callID)
+    const resumedResultMessages = resumedRequests[0].messages.filter(message => message.role === 'tool' && message.toolCallId === callID)
+    assert.equal(resumedAssistantToolCalls.length, 1)
+    assert.equal(resumedResultMessages.length, 1)
+    assert.equal(resumedResultMessages[0].content[0].text, toolOutput)
+
+    const events = [...checkpointPages, ...resumed.emitted].flatMap(page => JSON.parse(page.payload).events)
+    const messageIDs = ['m1234567', ...Array.from({ length: 40 }, (_, index) =>
+      `m${String(7000001 + index).padStart(7, '0')}`)]
+    for (const messageID of messageIDs) {
+      assert.equal(events.filter(event => event.type === 'user/message' && event.data.id === messageID).length, 1,
+        `restart must not duplicate already applied message ${messageID}`)
+    }
+    assert.equal(events.filter(event => event.type === 'tool/call' && event.data.callId === callID).length, 1)
+    assert.equal(events.filter(event => event.type === 'tool/result' && event.data.message?.toolCallId === callID).length, 1)
+  })
+
 test('rejects an initial Task message above 128 KiB UTF-8 before model or tool calls', async t => {
   const limit = 128 * 1024
   const content = 'a'.repeat(limit - 1) + 'é'

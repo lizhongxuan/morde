@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"morde/server/internal/domain/task"
 )
@@ -31,6 +32,7 @@ func TestEvaluateTaskValidationPlanReplayUsesTypedChecksAndWorkspaceSnapshot(t *
 	evidence := &TaskValidationReplayEvidence{RequirementSetVerified: true, FinalWorkspaceSnapshotVerified: true,
 		PlanRevision: plan.Revision,
 		Checks:       []TaskValidationReplayCheckEvidence{first, second}}
+	evidence.FinalWorkspaceSnapshotProof = taskValidationFinalWorkspaceProofFixture(first)
 	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPass {
 		t.Fatalf("same-snapshot passing checks state = %q, want pass", got)
 	}
@@ -43,12 +45,12 @@ func TestEvaluateTaskValidationPlanReplayUsesTypedChecksAndWorkspaceSnapshot(t *
 	}
 
 	evidence.Checks[1] = second
-	evidence.Checks[1].WorkspaceManifestSHA256After = strings.Repeat("d", 64)
+	evidence.Checks[1].WorkspaceSnapshotSHA256After = strings.Repeat("d", 64)
 	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPending {
 		t.Fatalf("changed workspace during check state = %q, want pending", got)
 	}
 
-	failed.WorkspaceManifestSHA256After = strings.Repeat("d", 64)
+	failed.WorkspaceSnapshotSHA256After = strings.Repeat("d", 64)
 	evidence.Checks[1] = failed
 	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPending {
 		t.Fatalf("failed check that changed the Workspace state = %q, want pending", got)
@@ -62,17 +64,49 @@ func TestEvaluateTaskValidationPlanReplayUsesTypedChecksAndWorkspaceSnapshot(t *
 }
 
 func TestEvaluateTaskValidationPlanReplayKeepsOmittedRequiredCheckPending(t *testing.T) {
-	// The task source requires the full suite, but the plan declares only a
-	// focused check. Its successful receipt cannot establish completeness.
-	check := task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest, Basis: task.PlanVerificationCheckRiskSelected,
-		Command: "go test ./internal/app", CoveragePaths: []string{"server/internal/app"}}
+	// The source identity and all declared check/Workspace facts are verified,
+	// but the plan declares only a focused check while the requirement asks for
+	// the full suite. Those facts cannot establish requirement-set completeness.
+	check := task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest, Basis: task.PlanVerificationCheckRequired,
+		Command: "go test ./internal/app", CoveragePaths: []string{"server/internal/app"},
+		RequirementSource: &task.PlanVerificationRequirementSource{Kind: task.PlanVerificationRequirementUserMessage,
+			MessageID: "m1234567", ContentSHA256: strings.Repeat("a", 64)}}
 	plan := task.Plan{TaskRevision: 4, Revision: 2, Goal: "Fix the bug", CostEstimateState: "unknown",
 		FixPlan: &task.FixPlan{}, Steps: []task.PlanStep{{ID: "verify-focused", Title: "Run focused tests", Status: task.PlanStepCompleted,
 			VerificationApplicability: task.PlanVerificationApplicabilityCheck, VerificationCheck: &check}}}
-	evidence := &TaskValidationReplayEvidence{PlanRevision: plan.Revision,
-		Checks: []TaskValidationReplayCheckEvidence{taskValidationReplayCheckFixture(plan, "verify-focused", check, 1)}}
+	fact := taskValidationReplayCheckFixture(plan, "verify-focused", check, 1)
+	fact.RequirementSourceVerified = true
+	evidence := &TaskValidationReplayEvidence{PlanRevision: plan.Revision, FinalWorkspaceSnapshotVerified: true,
+		Checks: []TaskValidationReplayCheckEvidence{fact}}
+	evidence.FinalWorkspaceSnapshotProof = taskValidationFinalWorkspaceProofFixture(fact)
 	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPending {
-		t.Fatalf("focused check passed without a verified complete requirement set: got %q, want pending", got)
+		t.Fatalf("verified focused check and source identity passed without a verified complete requirement set: got %q, want pending", got)
+	}
+}
+
+func TestEvaluateTaskValidationPlanReplayReportsVerifiedFailureWithIncompleteRequirements(t *testing.T) {
+	check := task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest, Basis: task.PlanVerificationCheckRequired,
+		Command: "go test ./internal/app", CoveragePaths: []string{"server/internal/app"},
+		RequirementSource: &task.PlanVerificationRequirementSource{Kind: task.PlanVerificationRequirementUserMessage,
+			MessageID: "m1234567", ContentSHA256: strings.Repeat("a", 64)}}
+	plan := task.Plan{TaskRevision: 4, Revision: 2, Goal: "Fix the reported issue", CostEstimateState: "unknown",
+		FixPlan: &task.FixPlan{}, Steps: []task.PlanStep{
+			{ID: "implement", Title: "Implement fix", Status: task.PlanStepCompleted},
+			{ID: "verify-focused", Title: "Run focused check", Status: task.PlanStepCompleted,
+				VerificationApplicability: task.PlanVerificationApplicabilityCheck, VerificationCheck: &check},
+		}}
+	fact := taskValidationReplayCheckFixture(plan, "verify-focused", check, 1)
+	fact.RequirementSourceVerified = true
+	fact.Status, fact.ExitCode = TaskValidationReplayFail, 1
+	evidence := &TaskValidationReplayEvidence{PlanRevision: plan.Revision,
+		PlanStepsWithoutChecks: []string{"implement"}, Checks: []TaskValidationReplayCheckEvidence{fact}}
+	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayFail {
+		t.Fatalf("verified failing check with an incomplete requirement set = %q, want fail", got)
+	}
+	fact.RequirementSourceVerified = false
+	evidence.Checks[0] = fact
+	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPending {
+		t.Fatalf("failing required check with an unverified source = %q, want pending", got)
 	}
 }
 
@@ -83,11 +117,18 @@ func TestEvaluateTaskValidationPlanReplayRequiresRequirementSetAndFinalSnapshotF
 		FixPlan: &task.FixPlan{}, Steps: []task.PlanStep{{ID: "verify", Title: "Run tests", Status: task.PlanStepCompleted,
 			VerificationApplicability: task.PlanVerificationApplicabilityCheck, VerificationCheck: &check}}}
 	fact := taskValidationReplayCheckFixture(plan, "verify", check, 1)
+	legacyFact := fact
+	legacyFact.WorkspaceSnapshotSHA256Before, legacyFact.WorkspaceSnapshotSHA256After = "", ""
 	for name, evidence := range map[string]*TaskValidationReplayEvidence{
 		"incomplete requirement set": {PlanRevision: plan.Revision, FinalWorkspaceSnapshotVerified: true,
 			Checks: []TaskValidationReplayCheckEvidence{fact}},
 		"final snapshot unknown": {PlanRevision: plan.Revision, RequirementSetVerified: true,
 			Checks: []TaskValidationReplayCheckEvidence{fact}},
+		"final snapshot boolean without proof": {PlanRevision: plan.Revision, RequirementSetVerified: true,
+			FinalWorkspaceSnapshotVerified: true, Checks: []TaskValidationReplayCheckEvidence{fact}},
+		"legacy check receipt without shared snapshot digest": {PlanRevision: plan.Revision,
+			RequirementSetVerified: true, FinalWorkspaceSnapshotVerified: true,
+			Checks: []TaskValidationReplayCheckEvidence{legacyFact}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPending {
@@ -109,8 +150,45 @@ func TestEvaluateTaskValidationPlanReplayPassesVerifiedRequiredCheckAndSources(t
 	fact.RequirementSourceVerified = true
 	evidence := &TaskValidationReplayEvidence{RequirementSetVerified: true, FinalWorkspaceSnapshotVerified: true,
 		PlanRevision: plan.Revision, Checks: []TaskValidationReplayCheckEvidence{fact}}
+	evidence.FinalWorkspaceSnapshotProof = taskValidationFinalWorkspaceProofFixture(fact)
 	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPass {
 		t.Fatalf("fully verified required check replay = %q, want pass", got)
+	}
+}
+
+func TestTaskValidationFinalWorkspaceProofRequiresExactClaimAndOperationFence(t *testing.T) {
+	check := taskValidationReplayCheckFixture(task.Plan{TaskRevision: 4, Revision: 2}, "verify",
+		task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest, Basis: task.PlanVerificationCheckRiskSelected,
+			Command: "go test ./...", CoveragePaths: []string{"server"}}, 1)
+	proof := taskValidationFinalWorkspaceProofFixture(check)
+	claim := proof.Claim
+	baseline := TaskValidationReplaySnapshotBaseline{OwnerID: claim.OwnerID, InitiatorID: claim.InitiatorID,
+		ConversationID: claim.ConversationID, TaskID: claim.TaskID, TaskRevision: claim.TaskRevision,
+		HostID: check.HostID, HostRuntimeGeneration: check.HostRuntimeGeneration,
+		HostRuntimeInstanceID: check.HostRuntimeInstanceID, HostControlVersion: check.HostControlVersion,
+		HostState: "running", HostControlState: "ai", WorkspaceID: check.WorkspaceID,
+		InputRevision: check.InputRevision, WorkspaceCheckpointRevision: check.WorkspaceCheckpointRevision,
+		InputManifestSHA256: check.InputManifestSHA256}
+	checks := []TaskValidationReplayCheckEvidence{check}
+	if !TaskValidationFinalWorkspaceSnapshotProofMatchesReplay(claim, baseline, checks, proof) {
+		t.Fatal("matching final Workspace proof was rejected")
+	}
+
+	changedClaim := claim
+	changedClaim.ClaimGeneration++
+	if TaskValidationFinalWorkspaceSnapshotProofMatchesReplay(changedClaim, baseline, checks, proof) {
+		t.Fatal("proof from a different review claim generation was accepted")
+	}
+	changedCheck := check
+	changedCheck.HostRuntimeGeneration++
+	if TaskValidationFinalWorkspaceSnapshotProofMatchesReplay(claim, baseline,
+		[]TaskValidationReplayCheckEvidence{changedCheck}, proof) {
+		t.Fatal("proof from a different operation Runtime fence was accepted")
+	}
+	changedBaseline := baseline
+	changedBaseline.WorkspaceCheckpointRevision++
+	if TaskValidationFinalWorkspaceSnapshotProofMatchesReplay(claim, changedBaseline, checks, proof) {
+		t.Fatal("proof for a stale Task checkpoint was accepted")
 	}
 }
 
@@ -155,9 +233,22 @@ func TestAttestTaskValidationShellResultBindsExactWorkspaceAndRequest(t *testing
 	requestDigest := sha256.Sum256([]byte("typed test request"))
 	result, err := json.Marshal(taskStepShellOutput{ExitCode: 1, TaskID: current.ID, WorkspaceID: current.WorkspaceID,
 		BindingVersion: 3, WorkspaceViewID: "v" + strings.Repeat("a", 64), WorkspaceCheckpointRevision: &checkpoint,
-		WorkspaceManifestSHA256Before: strings.Repeat("b", 64), WorkspaceManifestSHA256After: strings.Repeat("b", 64)})
+		WorkspaceManifestSHA256Before: strings.Repeat("b", 64), WorkspaceManifestSHA256After: strings.Repeat("b", 64),
+		WorkspaceSnapshotSHA256Before: strings.Repeat("c", 64), WorkspaceSnapshotSHA256After: strings.Repeat("c", 64)})
 	if err != nil {
 		t.Fatal(err)
+	}
+	var legacyResult taskStepShellOutput
+	if err := json.Unmarshal(result, &legacyResult); err != nil {
+		t.Fatal(err)
+	}
+	legacyResult.WorkspaceSnapshotSHA256Before, legacyResult.WorkspaceSnapshotSHA256After = "", ""
+	legacyBytes, err := json.Marshal(legacyResult)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, attested := attestTaskValidationShellResult(current, 2, "verify", check, 3, requestDigest[:], string(legacyBytes)); attested {
+		t.Fatal("legacy Runtime result without a shared snapshot digest received a typed verification receipt")
 	}
 	output, attested := attestTaskValidationShellResult(current, 2, "verify", check, 3, requestDigest[:], string(result))
 	if !attested {
@@ -168,14 +259,14 @@ func TestAttestTaskValidationShellResultBindsExactWorkspaceAndRequest(t *testing
 		t.Fatalf("attested output receipt = %+v, err=%v", got.VerificationCheck, err)
 	}
 	commandSHA, checkSHA, coverageSHA, ok := taskValidationPlanCheckDigests(check)
-	if !ok || got.VerificationCheck.Version != 1 || got.VerificationCheck.TaskRevision != revision ||
+	if !ok || got.VerificationCheck.Version != 2 || got.VerificationCheck.TaskRevision != revision ||
 		got.VerificationCheck.PlanRevision != 2 || got.VerificationCheck.CheckID != "verify" ||
 		got.VerificationCheck.CommandSHA256 != commandSHA || got.VerificationCheck.CheckSHA256 != checkSHA ||
 		got.VerificationCheck.CoverageSHA256 != coverageSHA ||
 		got.VerificationCheck.RequestSHA256 != hex.EncodeToString(requestDigest[:]) {
 		t.Fatalf("receipt does not bind the expected typed check: %+v", got.VerificationCheck)
 	}
-	got.WorkspaceManifestSHA256After = strings.Repeat("c", 64)
+	got.WorkspaceSnapshotSHA256After = strings.Repeat("d", 64)
 	changed, err := json.Marshal(got)
 	if err != nil {
 		t.Fatal(err)
@@ -184,7 +275,7 @@ func TestAttestTaskValidationShellResultBindsExactWorkspaceAndRequest(t *testing
 		t.Fatal("definitive Runtime result with a changed Workspace manifest lost its execution receipt")
 	}
 	fact := taskValidationReplayCheckFixture(task.Plan{TaskRevision: revision, Revision: 2}, "verify", check, 1)
-	fact.WorkspaceManifestSHA256After = strings.Repeat("c", 64)
+	fact.WorkspaceSnapshotSHA256After = strings.Repeat("d", 64)
 	if got := EvaluateTaskValidationPlanReplay(task.Plan{TaskRevision: revision, Revision: 2, Goal: "Fix", CostEstimateState: "unknown",
 		FixPlan: &task.FixPlan{}, Steps: []task.PlanStep{{ID: "verify", Title: "Verify", Status: task.PlanStepCompleted,
 			VerificationApplicability: task.PlanVerificationApplicabilityCheck, VerificationCheck: &check}}},
@@ -202,7 +293,8 @@ func TestAttestReconciledTaskValidationShellResultPreservesReceipt(t *testing.T)
 	requestDigest := sha256.Sum256([]byte("reconciled request"))
 	output, err := json.Marshal(taskStepShellOutput{ExitCode: 1, TaskID: current.ID, WorkspaceID: current.WorkspaceID,
 		BindingVersion: 3, WorkspaceViewID: "v" + strings.Repeat("a", 64), WorkspaceCheckpointRevision: &checkpoint,
-		WorkspaceManifestSHA256Before: strings.Repeat("b", 64), WorkspaceManifestSHA256After: strings.Repeat("b", 64)})
+		WorkspaceManifestSHA256Before: strings.Repeat("b", 64), WorkspaceManifestSHA256After: strings.Repeat("b", 64),
+		WorkspaceSnapshotSHA256Before: strings.Repeat("c", 64), WorkspaceSnapshotSHA256After: strings.Repeat("c", 64)})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -244,5 +336,29 @@ func taskValidationReplayCheckFixture(plan task.Plan, checkID string, check task
 		WorkspaceID: "w1234567", WorkspaceBindingVersion: 3, WorkspaceCheckpointRevision: 9,
 		WorkspaceViewID:               "v" + strings.Repeat("a", 64),
 		WorkspaceManifestSHA256Before: strings.Repeat("b", 64), WorkspaceManifestSHA256After: strings.Repeat("b", 64),
+		WorkspaceSnapshotSHA256Before: strings.Repeat("c", 64), WorkspaceSnapshotSHA256After: strings.Repeat("c", 64),
+		HostID: "h1234567", HostRuntimeGeneration: 2, HostRuntimeInstanceID: "runtime-instance",
+		HostControlVersion: 3, InputRevision: 4, InputManifestSHA256: strings.Repeat("c", 64),
 	}
+}
+
+func taskValidationFinalWorkspaceProofFixture(check TaskValidationReplayCheckEvidence) *TaskValidationFinalWorkspaceSnapshotProof {
+	claim := TaskValidationReviewClaim{OwnerID: "u1234567", InitiatorID: "u1234567", ConversationID: "c1234567",
+		TaskID: check.TaskID, TaskRevision: check.TaskRevision, ResultEventSequence: 9,
+		ResultSHA256: bytesRepeat(0x45, sha256.Size), ClaimGeneration: 2, LeaseOwner: "review-worker",
+		LeaseExpiresAt: time.Unix(1_800_000_000, 0).UTC()}
+	return &TaskValidationFinalWorkspaceSnapshotProof{Claim: claim, TaskID: check.TaskID, TaskRevision: check.TaskRevision,
+		HostID: check.HostID, RuntimeGeneration: check.HostRuntimeGeneration, RuntimeInstanceID: check.HostRuntimeInstanceID,
+		ControlVersion: check.HostControlVersion, WorkspaceID: check.WorkspaceID, BindingVersion: check.WorkspaceBindingVersion,
+		InputRevision: check.InputRevision, WorkspaceCheckpointRevision: check.WorkspaceCheckpointRevision,
+		InputManifestSHA256: check.InputManifestSHA256, ViewID: check.WorkspaceViewID,
+		SnapshotSHA256: check.WorkspaceSnapshotSHA256After}
+}
+
+func bytesRepeat(value byte, count int) []byte {
+	result := make([]byte, count)
+	for index := range result {
+		result[index] = value
+	}
+	return result
 }

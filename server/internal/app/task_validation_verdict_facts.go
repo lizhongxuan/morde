@@ -228,14 +228,18 @@ type TaskValidationReplayEvidence struct {
 	// FinalWorkspaceSnapshotVerified is set only when the delivered Task
 	// Workspace still matches the snapshot on which all checks ran.
 	FinalWorkspaceSnapshotVerified bool `json:"final_workspace_snapshot_verified"`
-	PlanRevision                   int64                               `json:"plan_revision"`
-	Checks                         []TaskValidationReplayCheckEvidence `json:"checks"`
-	PlanStepsWithoutChecks         []string                            `json:"plan_steps_without_checks,omitempty"`
-	NewTestPassed                  bool                                `json:"-"`
-	FullSuitePassed                bool                                `json:"-"`
-	NewTestFailedSequence          int64                               `json:"-"`
-	NewTestPassedSequence          int64                               `json:"-"`
-	FullSuitePassedSequence        int64                               `json:"-"`
+	// FinalWorkspaceSnapshotProof is internal completion input. It is never
+	// serialized to the reviewer model; the Store must compare it with the
+	// current Task claim and the durable check-operation fences.
+	FinalWorkspaceSnapshotProof *TaskValidationFinalWorkspaceSnapshotProof `json:"-"`
+	PlanRevision                int64                                      `json:"plan_revision"`
+	Checks                      []TaskValidationReplayCheckEvidence        `json:"checks"`
+	PlanStepsWithoutChecks      []string                                   `json:"plan_steps_without_checks,omitempty"`
+	NewTestPassed               bool                                       `json:"-"`
+	FullSuitePassed             bool                                       `json:"-"`
+	NewTestFailedSequence       int64                                      `json:"-"`
+	NewTestPassedSequence       int64                                      `json:"-"`
+	FullSuitePassedSequence     int64                                      `json:"-"`
 }
 
 type TaskValidationReplayState string
@@ -275,6 +279,57 @@ type TaskValidationReplayCheckEvidence struct {
 	WorkspaceViewID               string                                  `json:"workspace_view_id,omitempty"`
 	WorkspaceManifestSHA256Before string                                  `json:"workspace_manifest_sha256_before,omitempty"`
 	WorkspaceManifestSHA256After  string                                  `json:"workspace_manifest_sha256_after,omitempty"`
+	WorkspaceSnapshotSHA256Before string                                  `json:"-"`
+	WorkspaceSnapshotSHA256After  string                                  `json:"-"`
+	// Runtime and input identity fields are server-only ledger baselines. The
+	// reviewer model does not need these values to assess the declared checks.
+	HostID                string `json:"-"`
+	HostRuntimeGeneration int64  `json:"-"`
+	HostRuntimeInstanceID string `json:"-"`
+	HostControlVersion    int64  `json:"-"`
+	InputRevision         int64  `json:"-"`
+	InputManifestSHA256   string `json:"-"`
+}
+
+// TaskValidationFinalWorkspaceSnapshotProof carries a review-time read of the
+// Runtime's current Task Workspace manifest. Its identity fields are claims
+// from the trusted server-side reader; Store completion still checks each one
+// against current Task and operation rows before accepting the proof.
+type TaskValidationFinalWorkspaceSnapshotProof struct {
+	Claim                       TaskValidationReviewClaim
+	TaskID                      string
+	TaskRevision                int64
+	HostID                      string
+	RuntimeGeneration           int64
+	RuntimeInstanceID           string
+	ControlVersion              int64
+	WorkspaceID                 string
+	BindingVersion              int64
+	InputRevision               int64
+	WorkspaceCheckpointRevision int64
+	InputManifestSHA256         string
+	ViewID                      string
+	SnapshotSHA256              string
+}
+
+// TaskValidationReplaySnapshotBaseline contains the database-owned Task and
+// current Host identity used to validate a runtime snapshot proof.
+type TaskValidationReplaySnapshotBaseline struct {
+	OwnerID                     string
+	InitiatorID                 string
+	ConversationID              string
+	TaskID                      string
+	TaskRevision                int64
+	HostID                      string
+	HostRuntimeGeneration       int64
+	HostRuntimeInstanceID       string
+	HostControlVersion          int64
+	HostState                   string
+	HostControlState            string
+	WorkspaceID                 string
+	InputRevision               int64
+	WorkspaceCheckpointRevision int64
+	InputManifestSHA256         string
 }
 
 // ReplayEvidenceForSteps retains the pre-H07 heuristic projection for tests

@@ -172,3 +172,62 @@ func TestPlanVerificationCheckValidation(t *testing.T) {
 		}
 	})
 }
+
+func TestPlanSubmissionInputAllowsUnhashedRequirementLocators(t *testing.T) {
+	workspaceRevision := int64(9)
+	for name, source := range map[string]PlanVerificationRequirementSource{
+		"current task input":       {Kind: PlanVerificationRequirementUserMessage, Locator: PlanVerificationRequirementCurrentTaskInputLocator},
+		"exact user message":       {Kind: PlanVerificationRequirementUserMessage, MessageID: "m1234567"},
+		"project snapshot locator": {Kind: PlanVerificationRequirementProjectFile, WorkspacePath: "AGENTS.md", WorkspaceRevision: &workspaceRevision},
+	} {
+		t.Run(name, func(t *testing.T) {
+			check := &PlanVerificationCheck{Kind: PlanVerificationCheckTest, Basis: PlanVerificationCheckRequired,
+				Command: "go test ./...", CoveragePaths: []string{"server"}, RequirementSource: &source}
+			plan := Plan{TaskRevision: 1, Revision: 1, Goal: "Fix behavior", CostEstimateState: "unknown",
+				FixPlan: &FixPlan{}, Steps: []PlanStep{{ID: "verify", Title: "Verify behavior", Status: PlanStepPending,
+					VerificationApplicability: PlanVerificationApplicabilityCheck, VerificationCheck: check}}}
+			if err := plan.ValidateSubmissionInput(); err != nil {
+				t.Fatalf("valid locator form rejected: %v", err)
+			}
+			if err := plan.ValidateSubmission(); err == nil {
+				t.Fatal("unresolved source locator was accepted as a persisted submission")
+			}
+			if source.Locator == PlanVerificationRequirementCurrentTaskInputLocator && source.MessageID != "" {
+				t.Fatal("input validation mutated the caller's source locator")
+			}
+		})
+	}
+
+	for name, mutate := range map[string]func(*PlanVerificationRequirementSource){
+		"current locator with message ID":  func(source *PlanVerificationRequirementSource) { source.MessageID = "m1234567" },
+		"unknown locator":                  func(source *PlanVerificationRequirementSource) { source.Locator = "latest_message" },
+		"user message with Workspace path": func(source *PlanVerificationRequirementSource) { source.WorkspacePath = "AGENTS.md" },
+		"malformed optional digest":        func(source *PlanVerificationRequirementSource) { source.ContentSHA256 = "not-a-digest" },
+	} {
+		t.Run("reject "+name, func(t *testing.T) {
+			source := PlanVerificationRequirementSource{Kind: PlanVerificationRequirementUserMessage,
+				Locator: PlanVerificationRequirementCurrentTaskInputLocator}
+			mutate(&source)
+			plan := Plan{TaskRevision: 1, Revision: 1, Goal: "Fix behavior", CostEstimateState: "unknown",
+				Steps: []PlanStep{{ID: "verify", Title: "Verify behavior", Status: PlanStepPending,
+					VerificationCheck: &PlanVerificationCheck{Kind: PlanVerificationCheckTest, Basis: PlanVerificationCheckRequired,
+						Command: "go test ./...", CoveragePaths: []string{"server"}, RequirementSource: &source}}}}
+			if err := plan.ValidateSubmissionInput(); err == nil {
+				t.Fatal("invalid locator form was accepted")
+			}
+		})
+	}
+
+	t.Run("canonical server-resolved source validates", func(t *testing.T) {
+		plan := Plan{TaskRevision: 1, Revision: 1, Goal: "Fix behavior", CostEstimateState: "unknown", FixPlan: &FixPlan{},
+			Steps: []PlanStep{{ID: "verify", Title: "Verify behavior", Status: PlanStepPending,
+				VerificationApplicability: PlanVerificationApplicabilityCheck, VerificationCheck: &PlanVerificationCheck{
+					Kind: PlanVerificationCheckTest, Basis: PlanVerificationCheckRequired, Command: "go test ./...", CoveragePaths: []string{"server"},
+					RequirementSource: &PlanVerificationRequirementSource{Kind: PlanVerificationRequirementUserMessage,
+						MessageID: "m1234567", ContentSHA256: strings.Repeat("a", 64)},
+				}}}}
+		if err := plan.ValidateSubmission(); err != nil {
+			t.Fatalf("canonical server-resolved plan rejected: %v", err)
+		}
+	})
+}

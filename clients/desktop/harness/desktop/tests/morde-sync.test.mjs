@@ -61,6 +61,8 @@ process.stdin.once('data', chunk => { const req = JSON.parse(String(chunk).trim(
     const result = await sync.run({ origin: 'https://portal.example', installationId: 'inst', clientCredential: 'client-secret', clientExpiresAt: '2099-01-01T00:00:00Z', syncCredential: 'sync-secret', syncExpiresAt: '2099-01-01T00:00:00Z' }, mapping, 'upload', [], { installationId: 'inst', ...mapping, mode: 'upload', idempotencyKey: 'same-key', sessionId: 'p1234567' });
     assert.equal(result.params.idempotency_key, 'same-key');
     assert.equal(result.params.session_id, 'p1234567');
+    assert.equal('source_device' in result.params, false, 'regular uploads do not carry project source identity');
+    assert.equal('source_inode' in result.params, false, 'regular uploads do not carry project source identity');
     assert.equal(result.params.bearer_token, 'sync-secret');
     assert.ok(!JSON.stringify(result.params).includes('client-secret'));
     assert.ok(Number.isSafeInteger(childPid) && childPid > 0);
@@ -127,6 +129,8 @@ process.stdin.once('data', chunk => {
     assert.equal(result.params.policy, 'compare_merge');
     assert.equal(result.params.base_revision, 0);
     assert.deepEqual(result.params.scope, []);
+    assert.equal(result.params.source_device, mapping.dev);
+    assert.equal(result.params.source_inode, mapping.ino);
     assert.equal(result.params.idempotency_key, 'project-upload-key');
     assert.equal(result.params.session_id, 'p1234567');
     assert.equal(retried.params.idempotency_key, result.params.idempotency_key);

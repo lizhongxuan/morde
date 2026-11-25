@@ -37,8 +37,9 @@ func TestConversationRouteDoesNotStopWithoutMatchingAgentDecision(t *testing.T) 
 	worker, stub := newRouteWorkerTest(t)
 	stub.snapshot.Context = value
 	stub.classifyErr = errors.New("synthetic classifier unavailable")
-	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.applied) != 1 ||
-		stub.applied[0].Action == app.ConversationRouteStopAll || stub.applied[0].Action == app.ConversationRouteStop {
-		t.Fatalf("classifier failure caused a stop: applied=%+v err=%v", stub.applied, err)
+	if _, err := worker.RunOnce(context.Background()); err != nil || len(stub.failures) != 1 ||
+		stub.failures[0] != "model_unavailable" || len(stub.applied) != 0 {
+		t.Fatalf("classifier failure was not recorded without executing a stop: failures=%v applied=%+v err=%v",
+			stub.failures, stub.applied, err)
 	}
 }

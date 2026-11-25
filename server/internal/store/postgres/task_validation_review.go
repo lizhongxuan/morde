@@ -232,7 +232,8 @@ FOR UPDATE OF task`, claim.TaskID, claim.OwnerID, claim.TaskRevision, claim.Resu
 		if err := app.ValidateTaskValidationReviewCompletion(completion, evidence); err != nil {
 			return err
 		}
-		facts, err := loadTaskValidationVerdictFacts(ctx, tx, claim, result, evidence, completion.Report, completion.ArtifactContentProofs)
+		facts, err := loadTaskValidationVerdictFacts(ctx, tx, claim, result, evidence, completion.Report,
+			completion.ArtifactContentProofs, completion.FinalWorkspaceSnapshotProof)
 		if err != nil {
 			return err
 		}
@@ -411,7 +412,12 @@ ON CONFLICT DO NOTHING`, claim.TaskID, claim.OwnerID, claim.InitiatorID, claim.C
 
 func loadTaskValidationVerdictFacts(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim, result string,
 	evidence *app.TaskValidationEvidenceRecord, report app.TaskValidationReviewReport,
-	artifactProofs []app.TaskValidationReviewArtifactContentProof) (app.TaskValidationVerdictFacts, error) {
+	artifactProofs []app.TaskValidationReviewArtifactContentProof,
+	finalWorkspaceProofs ...*app.TaskValidationFinalWorkspaceSnapshotProof) (app.TaskValidationVerdictFacts, error) {
+	var finalWorkspaceProof *app.TaskValidationFinalWorkspaceSnapshotProof
+	if len(finalWorkspaceProofs) > 0 {
+		finalWorkspaceProof = finalWorkspaceProofs[0]
+	}
 	var hasExecution, hasPendingClarifications bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1 FROM task_steps WHERE task_id=$1 AND (kind='tool' OR tool_name IS NOT NULL)
@@ -478,7 +484,7 @@ WHERE st.task_id=$1 AND st.task_revision=$2 AND st.status='succeeded' AND st.det
 	}
 	if hasExecution {
 		facts.TaskExecution = app.TaskValidationFactPresent
-		if err := loadTaskValidationExecutionFacts(ctx, tx, claim, &facts); err != nil {
+		if err := loadTaskValidationExecutionFacts(ctx, tx, claim, &facts, finalWorkspaceProof); err != nil {
 			return app.TaskValidationVerdictFacts{}, err
 		}
 	} else {
@@ -506,7 +512,12 @@ WHERE st.task_id=$1 AND st.task_revision=$2 AND st.status='succeeded' AND st.det
 //   - H07: fix-task replay remains pending without plan-revision, immutable
 //     Workspace-version, and coverage bindings; other tasks use the verified
 //     read-back compare.
-func loadTaskValidationExecutionFacts(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim, facts *app.TaskValidationVerdictFacts) error {
+func loadTaskValidationExecutionFacts(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim,
+	facts *app.TaskValidationVerdictFacts, finalWorkspaceProofs ...*app.TaskValidationFinalWorkspaceSnapshotProof) error {
+	var finalWorkspaceProof *app.TaskValidationFinalWorkspaceSnapshotProof
+	if len(finalWorkspaceProofs) > 0 {
+		finalWorkspaceProof = finalWorkspaceProofs[0]
+	}
 	steps, err := listTaskStepsWithActivity(ctx, tx, claim.TaskID)
 	if err != nil {
 		return fmt.Errorf("read Task validation steps: %w", err)
@@ -547,7 +558,7 @@ func loadTaskValidationExecutionFacts(ctx context.Context, tx pgx.Tx, claim app.
 		if err != nil {
 			return err
 		}
-		replay, err := loadTaskValidationPlanCheckReplay(ctx, tx, claim, *plan, current)
+		replay, err := loadTaskValidationPlanCheckReplay(ctx, tx, claim, *plan, current, finalWorkspaceProof)
 		if err != nil {
 			return err
 		}

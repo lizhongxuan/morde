@@ -42,6 +42,75 @@ AND payload #>> '{detail,call_id}'=$2 ORDER BY sequence DESC LIMIT 1`, taskID, c
 	return result, err
 }
 
+// ResolveCloudDSHTaskPlanRequirementSource resolves a user-message locator
+// within the running Task's immutable conversation identity. Project-file
+// locators are rejected until this Store can re-read their immutable bytes;
+// a model-supplied file digest is not accepted as a substitute.
+func (s *Store) ResolveCloudDSHTaskPlanRequirementSource(ctx context.Context, current task.Task,
+	source task.PlanVerificationRequirementSource) (task.PlanVerificationRequirementSource, error) {
+	if source.Kind == task.PlanVerificationRequirementProjectFile {
+		return task.PlanVerificationRequirementSource{}, domain.NewError(domain.CodeUnsupported,
+			"project-file requirement source cannot be resolved from immutable Workspace bytes")
+	}
+	if ctx == nil || !domain.ValidTaskID(current.ID) || !domain.ValidUserID(current.OwnerID) ||
+		!domain.ValidConversationID(current.ConversationID) || current.CurrentRevision == nil || current.AgentSessionID == "" ||
+		source.Kind != task.PlanVerificationRequirementUserMessage {
+		return task.PlanVerificationRequirementSource{}, domain.InvalidArgument("task_plan.requirement_source", "user-message requirement source identity is invalid")
+	}
+	if source.WorkspacePath != "" || source.WorkspaceRevision != nil ||
+		(source.Locator != "" && source.Locator != task.PlanVerificationRequirementCurrentTaskInputLocator) ||
+		(source.Locator == task.PlanVerificationRequirementCurrentTaskInputLocator && source.MessageID != "") ||
+		(source.Locator == "" && !domain.ValidMessageID(source.MessageID)) {
+		return task.PlanVerificationRequirementSource{}, domain.InvalidArgument("task_plan.requirement_source", "user-message requirement source locator is invalid")
+	}
+	var resolved task.PlanVerificationRequirementSource
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		var ownerID, conversationID, status, agentSessionID string
+		var taskRevision int64
+		if err := tx.QueryRow(ctx, `SELECT owner_id,conversation_id,current_revision,status,agent_session_id
+FROM tasks WHERE id=$1 FOR SHARE`, current.ID).Scan(&ownerID, &conversationID, &taskRevision, &status, &agentSessionID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NewError(domain.CodeNotFound, "task plan requirement source Task not found")
+			}
+			return fmt.Errorf("read task plan requirement source Task: %w", err)
+		}
+		if ownerID != current.OwnerID || conversationID != current.ConversationID || taskRevision != *current.CurrentRevision ||
+			status != string(task.StatusRunning) || agentSessionID != current.AgentSessionID {
+			return domain.NewError(domain.CodeConflict, "task plan requirement source Task changed")
+		}
+		var messageID, content string
+		if source.Locator == task.PlanVerificationRequirementCurrentTaskInputLocator {
+			err := tx.QueryRow(ctx, `SELECT id,content FROM conversation_messages
+WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='user' AND delivery_status='applied'
+ORDER BY sequence ASC,id ASC LIMIT 1 FOR SHARE`, current.ID, current.OwnerID, current.ConversationID).Scan(&messageID, &content)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NewError(domain.CodeNotFound, "current Task input source is unavailable")
+			}
+			if err != nil {
+				return fmt.Errorf("resolve current Task input source: %w", err)
+			}
+		} else {
+			err := tx.QueryRow(ctx, `SELECT id,content FROM conversation_messages
+WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND conversation_id=$4 AND role='user' AND delivery_status='applied'
+FOR SHARE`, source.MessageID, current.ID, current.OwnerID, current.ConversationID).Scan(&messageID, &content)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return domain.NewError(domain.CodeNotFound, "user-message requirement source is unavailable to this Task")
+			}
+			if err != nil {
+				return fmt.Errorf("resolve user-message requirement source: %w", err)
+			}
+		}
+		digest := sha256.Sum256([]byte(content))
+		resolved = task.PlanVerificationRequirementSource{Kind: task.PlanVerificationRequirementUserMessage,
+			MessageID: messageID, ContentSHA256: fmt.Sprintf("%x", digest[:])}
+		return nil
+	})
+	if err != nil {
+		return task.PlanVerificationRequirementSource{}, err
+	}
+	return resolved, nil
+}
+
 func latestTaskPlan(ctx context.Context, tx pgx.Tx, taskID string, taskRevision int64) (*task.Plan, error) {
 	var payload []byte
 	err := tx.QueryRow(ctx, `SELECT payload FROM task_events WHERE task_id=$1 AND event_type='task.plan'

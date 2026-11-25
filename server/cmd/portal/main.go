@@ -758,8 +758,13 @@ func serve(ctx context.Context, configPath string) error {
 		if err != nil {
 			return fmt.Errorf("initialize conversation routing worker: %w", err)
 		}
+		validationWorkspaceReader, err := app.NewRuntimeTaskValidationFinalWorkspaceSnapshotReader(runtimeControl)
+		if err != nil {
+			return fmt.Errorf("initialize Task validation Workspace snapshot reader: %w", err)
+		}
 		taskValidationReviewWorker, err = worker.NewTaskValidationReviewWorker(worker.TaskValidationReviewWorkerOptions{
-			Queue: store, Snapshots: tasks, AccountRuntime: cloudDSHWorkers.accountRuntimes, Models: modelGateway,
+			Queue: store, Snapshots: tasks, FinalWorkspaceSnapshots: validationWorkspaceReader,
+			AccountRuntime: cloudDSHWorkers.accountRuntimes, Models: modelGateway,
 			WorkerID: workerSuffix + "-review", LeaseDuration: 5 * time.Minute, PollInterval: 500 * time.Millisecond,
 			MaxConcurrent: cfg.CloudDSH.MaxConcurrentRoutes, Logger: logger,
 		})

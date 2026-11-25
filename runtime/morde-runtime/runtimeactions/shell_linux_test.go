@@ -117,6 +117,7 @@ func TestShellTaskWorkspaceResultPreservesOutputAndSnapshotIdentity(t *testing.T
 		TaskID: "q1234567", WorkspaceID: "w1234567", BindingVersion: 3, WorkspaceViewID: "v" + strings.Repeat("a", 64),
 		WorkspaceCheckpointRevision:   &revision,
 		WorkspaceManifestSHA256Before: strings.Repeat("b", 64), WorkspaceManifestSHA256After: strings.Repeat("c", 64),
+		WorkspaceSnapshotSHA256Before: strings.Repeat("d", 64), WorkspaceSnapshotSHA256After: strings.Repeat("e", 64),
 	}
 	encoded, err := json.Marshal(result)
 	if err != nil {
@@ -131,7 +132,9 @@ func TestShellTaskWorkspaceResultPreservesOutputAndSnapshotIdentity(t *testing.T
 		"stderr_truncated": false, "timed_out": true, "task_id": "q1234567", "workspace_id": "w1234567",
 		"binding_version": float64(3), "workspace_view_id": "v" + strings.Repeat("a", 64),
 		"workspace_checkpoint_revision": float64(0), "workspace_manifest_sha256_before": strings.Repeat("b", 64),
-		"workspace_manifest_sha256_after": strings.Repeat("c", 64),
+		"workspace_manifest_sha256_after":  strings.Repeat("c", 64),
+		"workspace_snapshot_sha256_before": strings.Repeat("d", 64),
+		"workspace_snapshot_sha256_after":  strings.Repeat("e", 64),
 	} {
 		if got[key] != want {
 			t.Errorf("result field %q = %#v, want %#v", key, got[key], want)
@@ -148,6 +151,7 @@ func TestShellTaskWorkspaceResultPreservesOutputAndSnapshotIdentity(t *testing.T
 	for _, key := range []string{
 		"task_id", "workspace_id", "binding_version", "workspace_view_id", "workspace_checkpoint_revision",
 		"workspace_manifest_sha256_before", "workspace_manifest_sha256_after",
+		"workspace_snapshot_sha256_before", "workspace_snapshot_sha256_after",
 	} {
 		if _, ok := legacy[key]; ok {
 			t.Errorf("non-Task shell result unexpectedly includes %q", key)

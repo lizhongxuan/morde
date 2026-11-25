@@ -541,6 +541,63 @@ JOIN tasks task ON task.id=intent.task_id WHERE message.id=$1`, joined.Message.I
 	}
 }
 
+func TestConversationRouteJoinRevalidatesAuthorizationSnapshotUnderLock(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	input := app.ConversationRoutingInput{HostID: "h1234567"}
+	root := f.receive(t, "route-join-auth-root", "整理项目资料并生成设计方案", input)
+	rootSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rootSnapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, root, rootSnapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatalf("create root Task: %v", err)
+	}
+	joined := f.receive(t, "route-join-auth-addition", "补充项目的验收标准。", input)
+	joinedSnapshot, err := f.store.LoadConversationRouteSnapshot(ctx, joined)
+	if err != nil || len(joinedSnapshot.Context.RequestCandidates) != 1 ||
+		joinedSnapshot.Context.RequestCandidates[0].MessageID != root.Message.ID ||
+		!joinedSnapshot.Context.RequestCandidates[0].SameAuthorization {
+		t.Fatalf("authorized root was not offered as a join candidate: candidates=%+v err=%v",
+			joinedSnapshot.Context.RequestCandidates, err)
+	}
+	// Simulate an authorization change after semantic classification but
+	// before the join helper locks and revalidates its target row.
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_message_routes
+SET authorization_snapshot=jsonb_set(authorization_snapshot,'{Version}','2'::jsonb)
+WHERE message_id=$1`, root.Message.ID); err != nil {
+		t.Fatalf("change root authorization snapshot: %v", err)
+	}
+	tx, err := f.store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := lockConversationRouteClaim(ctx, tx, joined); err != nil {
+		t.Fatalf("lock joined route claim: %v", err)
+	}
+	if err := linkDuplicateConversationRouteInTx(ctx, tx, joined, joinedSnapshot, root.Message.ID); err != nil {
+		t.Fatalf("reclassify stale authorization instead of joining: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit stale-authorization reclassification: %v", err)
+	}
+	var state, duplicateOf string
+	var routeAttempt int64
+	var revisionIntentCount int
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,COALESCE(duplicate_of_message_id,''),route_attempt,
+(SELECT count(*) FROM task_revision_intents WHERE message_id=$1)
+FROM conversation_message_routes WHERE message_id=$1`, joined.Message.ID).
+		Scan(&state, &duplicateOf, &routeAttempt, &revisionIntentCount); err != nil {
+		t.Fatal(err)
+	}
+	if state != "pending" || duplicateOf != "" || routeAttempt != joined.RouteAttempt+1 || revisionIntentCount != 0 {
+		t.Fatalf("stale join changed target or created a Task revision: state=%q duplicate=%q attempt=%d intents=%d",
+			state, duplicateOf, routeAttempt, revisionIntentCount)
+	}
+}
+
 func TestConcurrentConversationRouteJoinsReclassifyAndPreserveBothRevisions(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()
@@ -846,6 +903,36 @@ func TestConversationRouteJoinRejectsDifferentExecutionScope(t *testing.T) {
 	if err := f.store.pool.QueryRow(ctx, `SELECT state,COALESCE(duplicate_of_message_id,'') FROM conversation_message_routes WHERE message_id=$1`,
 		duplicate.Message.ID).Scan(&state, &association); err != nil || state != "processing" || association != "" {
 		t.Fatalf("rejected join changed the message route: state=%s association=%q err=%v", state, association, err)
+	}
+}
+
+func TestConversationRouteJoinRejectsTargetFromDifferentConversation(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	otherConversation := createMainConversationForTest(t, f.store, f.ownerID)
+	foreignRoot := f.receiveInConversation(t, otherConversation.ID, "route-join-foreign-conversation-root",
+		"分析 Morde 项目", app.ConversationRoutingInput{HostID: "h1234567"})
+	current := f.receive(t, "route-join-cross-conversation", "补充项目验收标准。", app.ConversationRoutingInput{HostID: "h1234567"})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, current)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, candidate := range snapshot.Context.RequestCandidates {
+		if candidate.MessageID == foreignRoot.Message.ID {
+			t.Fatalf("route snapshot exposed another conversation's message: %+v", candidate)
+		}
+	}
+	if err := f.store.ApplyConversationRoute(ctx, current, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteJoin, TargetMessageID: foreignRoot.Message.ID,
+	}); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("cross-conversation join was accepted: %v", err)
+	}
+	var state, association string
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,COALESCE(duplicate_of_message_id,'')
+FROM conversation_message_routes WHERE message_id=$1`, current.Message.ID).Scan(&state, &association); err != nil ||
+		state != "processing" || association != "" {
+		t.Fatalf("rejected cross-conversation join changed the current route: state=%s association=%q err=%v",
+			state, association, err)
 	}
 }
 
@@ -1369,6 +1456,27 @@ func TestConversationRouteRetryReusesMessageAndFencesIdempotency(t *testing.T) {
 	var count int
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE conversation_id=$1`, f.conversation.ID).Scan(&count); err != nil || count != 1 {
 		t.Fatalf("retry duplicated message: count=%d err=%v", count, err)
+	}
+}
+
+func TestConversationRouteRetryRejectsUnchangedOversizedMessage(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	claim := f.receive(t, "route-retry-oversized-001", "Keep this oversized source unchanged", app.ConversationRoutingInput{})
+	if err := f.store.FailConversationRoute(ctx, claim, "message_too_long"); err != nil {
+		t.Fatal(err)
+	}
+	principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID,
+		Scopes: []identity.Scope{identity.ScopeTaskSubmit}}
+	if err := f.store.RetryConversationRoute(ctx, principal, "", f.conversation.ID, claim.Message.ID, f.instanceID,
+		"route-retry-oversized-key-001"); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("unchanged oversized message retry = %v, want invalid state", err)
+	}
+	var state, failureReason string
+	var attempt int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,failure_reason,route_attempt FROM conversation_message_routes WHERE message_id=$1`,
+		claim.Message.ID).Scan(&state, &failureReason, &attempt); err != nil || state != "failed" || failureReason != "message_too_long" || attempt != claim.RouteAttempt {
+		t.Fatalf("rejected oversized retry changed route: state=%q reason=%q attempt=%d err=%v", state, failureReason, attempt, err)
 	}
 }
 

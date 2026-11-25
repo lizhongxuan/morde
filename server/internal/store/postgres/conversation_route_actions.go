@@ -1854,10 +1854,15 @@ FOR UPDATE OF r,m`, claim.ServiceInstanceID, claim.Message.OwnerID, claim.Messag
 	if err != nil || !bytes.Equal(rootDigest, snapshot.Context.ExecutionScopeDigest) {
 		return domain.NewError(domain.CodeConflict, "conversation join execution scope changed")
 	}
+	var rootAuthorizationValue task.Authorization
+	if json.Unmarshal(rootAuthorization, &rootAuthorizationValue) != nil ||
+		!reflect.DeepEqual(rootAuthorizationValue, candidate.Authorization) ||
+		!reflect.DeepEqual(rootAuthorizationValue, claim.Authorization) {
+		return requeueConversationRouteForReclassification(ctx, tx, claim)
+	}
 	if rootAggregationState == "open" || rootAggregationState == "waiting" {
-		var rootAuthorizationValue task.Authorization
-		if json.Unmarshal(rootAuthorization, &rootAuthorizationValue) != nil || (!rootAggregationEligible && !sameConversationRouteContent(rootContent, claim.Message.Content)) ||
-			len(rootInput.ClientAttachmentIDs) != 0 || !reflect.DeepEqual(rootAuthorizationValue, claim.Authorization) {
+		if (!rootAggregationEligible && !sameConversationRouteContent(rootContent, claim.Message.Content)) ||
+			len(rootInput.ClientAttachmentIDs) != 0 {
 			return requeueConversationRouteForReclassification(ctx, tx, claim)
 		}
 	}
@@ -2881,39 +2886,18 @@ WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r
 		if err := lockConversationReceiptScopeInTx(ctx, tx, receipt); err != nil {
 			return err
 		}
-		var active bool
-		var expiresAt time.Time
-		var tokenScopes []string
-		err = tx.QueryRow(ctx, `SELECT u.status='approved' AND t.revoked_at IS NULL AND t.expires_at>clock_timestamp()
- AND t.kind=$3 AND COALESCE(t.client_installation_id,'')=$4,t.expires_at,t.scopes
-FROM users u JOIN tokens t ON t.owner_id=u.id WHERE u.id=$1 AND t.id=$2 FOR SHARE OF u,t`,
-			principal.UserID, principal.TokenID, string(principal.Kind), principal.ClientInstallationID).Scan(&active, &expiresAt, &tokenScopes)
-		if err != nil || !active {
-			return domain.NewError(domain.CodeUnauthenticated, "conversation route retry credential is unavailable")
-		}
-		if principal.Kind == identity.KindClient && !domain.ValidClientInstallationID(principal.ClientInstallationID) {
-			return domain.NewError(domain.CodeUnauthenticated, "conversation route retry installation is unavailable")
-		}
-		if principal.ClientInstallationID != "" {
-			if err := checkModelInstallation(ctx, tx, principal.ClientInstallationID, principal.UserID); err != nil {
-				return err
-			}
-		}
-		current := identity.Principal{Kind: principal.Kind}
-		for _, value := range tokenScopes {
-			current.Scopes = append(current.Scopes, identity.Scope(value))
-		}
-		if !current.HasScope(identity.ScopeTaskSubmit) {
-			return domain.NewError(domain.CodeForbidden, "conversation route retry is not authorized")
+		expiresAt, tokenScopes, err := authorizeConversationRouteRetryInTx(ctx, tx, principal)
+		if err != nil {
+			return err
 		}
 		var requestHash []byte
-		var state, sourceKind, resultReviewID string
+		var state, failureReason, sourceKind, resultReviewID string
 		var routeAttempt int64
 		var taskID *string
-		err = tx.QueryRow(ctx, `SELECT r.request_hash,r.state,m.task_id,m.source_kind,COALESCE(r.request_metadata->>'result_review_id',''),r.route_attempt FROM conversation_message_routes r
+		err = tx.QueryRow(ctx, `SELECT r.request_hash,r.state,r.failure_reason,m.task_id,m.source_kind,COALESCE(r.request_metadata->>'result_review_id',''),r.route_attempt FROM conversation_message_routes r
 JOIN conversation_messages m ON m.id=r.message_id AND m.actor_id=r.actor_id AND m.conversation_id=r.conversation_id AND m.owner_id=r.owner_id
 WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
-FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Scan(&requestHash, &state, &taskID, &sourceKind, &resultReviewID, &routeAttempt)
+FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Scan(&requestHash, &state, &failureReason, &taskID, &sourceKind, &resultReviewID, &routeAttempt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "conversation message not found")
 		}
@@ -2943,37 +2927,20 @@ FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Sca
 			}
 			return nil
 		}
-		var unknownSharedUsage bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls c
-JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
-WHERE c.message_id=$1 AND c.actor_id=$2 AND c.state='unknown' AND l.state='unknown' AND NOT l.personal_model)`,
-			messageID, principal.UserID).Scan(&unknownSharedUsage); err != nil {
-			return fmt.Errorf("check unknown shared model usage before retry: %w", err)
+		eligibility, err := conversationRouteRetryEligibilityInTx(ctx, tx, messageID, principal.UserID,
+			state, failureReason, taskID, sourceKind, resultReviewID, routeAttempt)
+		if err != nil {
+			return err
 		}
-		if unknownSharedUsage {
-			return domain.NewError(domain.CodeInvalidState, "shared model usage is unknown and must be reconciled before retry")
-		}
-		var unresolved bool
-		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls
-WHERE message_id=$1 AND actor_id=$2 AND (state='dispatched' OR (state='unknown' AND $3::boolean)))`,
-			messageID, principal.UserID, sourceKind == "task_result_review").Scan(&unresolved); err != nil {
-			return fmt.Errorf("check unresolved route call before retry: %w", err)
-		}
-		if unresolved {
-			return domain.NewError(domain.CodeConflict, "conversation route is still processing and cannot be retried")
-		}
-		if state != "failed" || taskID != nil {
-			return domain.NewError(domain.CodeConflict, "only a failed message without a Task can be retried")
+		if !eligibility.Eligible {
+			return conversationRouteRetryEligibilityError(eligibility.Reason)
 		}
 		auth := task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID,
 			ClientInstallationID: principal.ClientInstallationID, Version: 1, ExpiresAt: &expiresAt}
-		for _, scope := range principal.Scopes {
-			auth.Scopes = append(auth.Scopes, string(scope))
+	for _, scope := range tokenScopes {
+			auth.Scopes = append(auth.Scopes, scope)
 		}
 		if sourceKind == "task_result_review" {
-			if !domain.ValidMessageID(resultReviewID) {
-				return domain.NewError(domain.CodeConflict, "task result review route is no longer retryable")
-			}
 			var authorizationVersion int64
 			err := tx.QueryRow(ctx, `UPDATE conversation_result_batches SET state='processing',retry_attempt=retry_attempt+1,updated_at=clock_timestamp()
 WHERE message_id=$1 AND trigger_message_id=$2 AND state='failed' AND retry_attempt<9223372036854775807
@@ -2986,9 +2953,6 @@ RETURNING authorization_version`, resultReviewID, messageID).Scan(&authorization
 			}
 			auth = task.Authorization{Kind: string(identity.KindSession), Version: authorizationVersion,
 				Scopes: []string{string(identity.ScopeTaskSubmit)}}
-		}
-		if sourceKind != "task_result_review" && routeAttempt == int64(^uint64(0)>>1) {
-			return domain.NewError(domain.CodeInvalidState, "conversation route retry limit has been exhausted")
 		}
 		authorization, err := json.Marshal(auth)
 		if err != nil {
@@ -3024,4 +2988,204 @@ authorization_snapshot=$2::jsonb,available_after=clock_timestamp(),updated_at=cl
 		}
 		return nil
 	})
+}
+
+func authorizeConversationRouteRetryInTx(ctx context.Context, tx pgx.Tx, principal identity.Principal) (time.Time, []string, error) {
+	var active bool
+	var expiresAt time.Time
+	var tokenScopes []string
+	err := tx.QueryRow(ctx, `SELECT u.status='approved' AND t.revoked_at IS NULL AND t.expires_at>clock_timestamp()
+ AND t.kind=$3 AND COALESCE(t.client_installation_id,'')=$4,t.expires_at,t.scopes
+FROM users u JOIN tokens t ON t.owner_id=u.id WHERE u.id=$1 AND t.id=$2 FOR SHARE OF u,t`,
+		principal.UserID, principal.TokenID, string(principal.Kind), principal.ClientInstallationID).Scan(&active, &expiresAt, &tokenScopes)
+	if err != nil || !active {
+		return time.Time{}, nil, domain.NewError(domain.CodeUnauthenticated, "conversation route retry credential is unavailable")
+	}
+	if principal.Kind == identity.KindClient && !domain.ValidClientInstallationID(principal.ClientInstallationID) {
+		return time.Time{}, nil, domain.NewError(domain.CodeUnauthenticated, "conversation route retry installation is unavailable")
+	}
+	if principal.ClientInstallationID != "" {
+		if err := checkModelInstallation(ctx, tx, principal.ClientInstallationID, principal.UserID); err != nil {
+			return time.Time{}, nil, err
+		}
+	}
+	current := identity.Principal{Kind: principal.Kind}
+	for _, value := range tokenScopes {
+		current.Scopes = append(current.Scopes, identity.Scope(value))
+	}
+	if !current.HasScope(identity.ScopeTaskSubmit) {
+		return time.Time{}, nil, domain.NewError(domain.CodeForbidden, "conversation route retry is not authorized")
+	}
+	return expiresAt, tokenScopes, nil
+}
+
+func conversationRouteRetryEligibilityInTx(ctx context.Context, tx pgx.Tx, messageID, actorID, state, failureReason string,
+	taskID *string, sourceKind, resultReviewID string, routeAttempt int64) (app.ConversationMessageRetryEligibility, error) {
+	ineligible := func(reason string) app.ConversationMessageRetryEligibility {
+		return app.ConversationMessageRetryEligibility{Eligible: false, Reason: reason}
+	}
+	if failureReason == "message_too_long" {
+		return ineligible(app.ConversationMessageRetryReasonMessageTooLong), nil
+	}
+	var unknownSharedUsage bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls c
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+WHERE c.message_id=$1 AND c.actor_id=$2 AND c.state='unknown' AND l.state='unknown' AND NOT l.personal_model)`,
+		messageID, actorID).Scan(&unknownSharedUsage); err != nil {
+		return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check unknown shared model usage before retry: %w", err)
+	}
+	if unknownSharedUsage {
+		return ineligible(app.ConversationMessageRetryReasonReconciliationRequired), nil
+	}
+	var dispatched bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls
+WHERE message_id=$1 AND actor_id=$2 AND state='dispatched')`, messageID, actorID).Scan(&dispatched); err != nil {
+		return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check dispatched route call before retry: %w", err)
+	}
+	if dispatched {
+		return ineligible(app.ConversationMessageRetryReasonProcessing), nil
+	}
+	if sourceKind == "task_result_review" {
+		var unknownReviewCall bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls
+WHERE message_id=$1 AND actor_id=$2 AND state='unknown')`, messageID, actorID).Scan(&unknownReviewCall); err != nil {
+			return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check unknown result review call before retry: %w", err)
+		}
+		if unknownReviewCall {
+			return ineligible(app.ConversationMessageRetryReasonReconciliationRequired), nil
+		}
+	}
+	if state != "failed" {
+		return ineligible(app.ConversationMessageRetryReasonNotFailed), nil
+	}
+	if taskID != nil {
+		return ineligible(app.ConversationMessageRetryReasonTaskAttached), nil
+	}
+	if sourceKind == "task_result_review" {
+		if !domain.ValidMessageID(resultReviewID) {
+			return ineligible(app.ConversationMessageRetryReasonReviewNotRetryable), nil
+		}
+		var reviewState string
+		var retryAttempt int64
+		err := tx.QueryRow(ctx, `SELECT state,retry_attempt FROM conversation_result_batches
+WHERE message_id=$1 AND trigger_message_id=$2`, resultReviewID, messageID).Scan(&reviewState, &retryAttempt)
+		if errors.Is(err, pgx.ErrNoRows) || err == nil && reviewState != "failed" {
+			return ineligible(app.ConversationMessageRetryReasonReviewNotRetryable), nil
+		}
+		if err != nil {
+			return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check task result review retry eligibility: %w", err)
+		}
+		if retryAttempt == int64(^uint64(0)>>1) {
+			return ineligible(app.ConversationMessageRetryReasonLimitReached), nil
+		}
+	} else if routeAttempt == int64(^uint64(0)>>1) {
+		return ineligible(app.ConversationMessageRetryReasonLimitReached), nil
+	}
+	var unknownPersonalUsage bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM conversation_route_model_calls c
+JOIN model_call_ledger l ON l.owner_id=c.actor_id AND l.source=c.source AND l.call_id=c.call_id
+WHERE c.message_id=$1 AND c.actor_id=$2 AND c.state='unknown' AND l.state='unknown' AND l.personal_model)`,
+		messageID, actorID).Scan(&unknownPersonalUsage); err != nil {
+		return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check unknown personal model usage before retry: %w", err)
+	}
+	result := app.ConversationMessageRetryEligibility{Eligible: true, Reason: app.ConversationMessageRetryReasonAvailable}
+	if unknownPersonalUsage {
+		result.Warning = app.ConversationMessageRetryWarningPersonalOutcomeUnknown
+	}
+	return result, nil
+}
+
+func conversationRouteRetryEligibilityError(reason string) error {
+	switch reason {
+	case app.ConversationMessageRetryReasonMessageTooLong:
+		return domain.NewError(domain.CodeInvalidState, "conversation message exceeded processing limits and cannot be retried unchanged")
+	case app.ConversationMessageRetryReasonReconciliationRequired:
+		return domain.NewError(domain.CodeInvalidState, "model call outcome or shared usage must be reconciled before retry")
+	case app.ConversationMessageRetryReasonProcessing:
+		return domain.NewError(domain.CodeConflict, "conversation route is still processing and cannot be retried")
+	case app.ConversationMessageRetryReasonLimitReached:
+		return domain.NewError(domain.CodeInvalidState, "conversation route retry limit has been exhausted")
+	case app.ConversationMessageRetryReasonNotFailed, app.ConversationMessageRetryReasonTaskAttached,
+		app.ConversationMessageRetryReasonReviewNotRetryable:
+		return domain.NewError(domain.CodeConflict, "only a retryable failed message without a Task can be retried")
+	default:
+		return domain.NewError(domain.CodeInvalidState, "conversation route retry eligibility is unavailable")
+	}
+}
+
+// GetConversationMessageRetryEligibility reports the current retry gate for a
+// persisted message. RetryConversationRoute re-evaluates the same gate while
+// holding its write transaction, so this result is advisory under races.
+func (s *Store) GetConversationMessageRetryEligibility(ctx context.Context, principal identity.Principal,
+	projectID, conversationID, messageID, instanceID string) (app.ConversationMessageRetryEligibility, error) {
+	if ctx == nil || !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		(principal.Kind != identity.KindSession && principal.Kind != identity.KindClient) || !principal.HasScope(identity.ScopeTaskSubmit) ||
+		!domain.ValidConversationID(conversationID) || !domain.ValidMessageID(messageID) || !domain.ValidServiceInstanceID(instanceID) ||
+		(projectID != "" && !project.ValidID(projectID)) {
+		return app.ConversationMessageRetryEligibility{}, domain.InvalidArgument("route_retry", "conversation route retry identity is invalid")
+	}
+	var eligibility app.ConversationMessageRetryEligibility
+	err := s.WithTx(ctx, func(tx pgx.Tx) error {
+		if err := requireConversationServiceInstance(ctx, tx, instanceID); err != nil {
+			return err
+		}
+		requestedMessageID := messageID
+		var ownerID, duplicateOf string
+		err := tx.QueryRow(ctx, `SELECT r.owner_id,COALESCE(r.duplicate_of_message_id,'') FROM conversation_message_routes r
+JOIN conversations c ON c.id=r.conversation_id AND c.owner_id=r.owner_id
+WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
+ AND c.project_id IS NOT DISTINCT FROM NULLIF($5,'')`, instanceID, requestedMessageID, principal.UserID, conversationID, projectID).
+			Scan(&ownerID, &duplicateOf)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "conversation message not found")
+		}
+		if err != nil {
+			return fmt.Errorf("find conversation route retry eligibility: %w", err)
+		}
+		if duplicateOf != "" {
+			messageID = duplicateOf
+		}
+		receipt := app.ConversationMessageReceipt{ServiceInstanceID: instanceID,
+			Message: conversation.Message{ID: messageID, OwnerID: ownerID, ActorID: principal.UserID, ConversationID: conversationID},
+			Input:   app.ConversationRoutingInput{ProjectID: projectID}}
+		if err := lockConversationReceiptScopeInTx(ctx, tx, receipt); err != nil {
+			return err
+		}
+		if _, _, err := authorizeConversationRouteRetryInTx(ctx, tx, principal); err != nil {
+			return err
+		}
+		var requestHash []byte
+		var state, failureReason, sourceKind, resultReviewID string
+		var routeAttempt int64
+		var taskID *string
+		err = tx.QueryRow(ctx, `SELECT r.request_hash,r.state,r.failure_reason,m.task_id,m.source_kind,
+COALESCE(r.request_metadata->>'result_review_id',''),r.route_attempt
+FROM conversation_message_routes r
+JOIN conversation_messages m ON m.id=r.message_id AND m.actor_id=r.actor_id AND m.conversation_id=r.conversation_id AND m.owner_id=r.owner_id
+WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
+FOR SHARE OF r,m`, instanceID, messageID, principal.UserID, conversationID).
+			Scan(&requestHash, &state, &failureReason, &taskID, &sourceKind, &resultReviewID, &routeAttempt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "conversation message not found")
+		}
+		if err != nil {
+			return fmt.Errorf("read conversation route retry eligibility: %w", err)
+		}
+		_ = requestHash
+		eligibility, err := conversationRouteRetryEligibilityInTx(ctx, tx, messageID, principal.UserID,
+			state, failureReason, taskID, sourceKind, resultReviewID, routeAttempt)
+		if err != nil {
+			return err
+		}
+		eligibility = cloneConversationMessageRetryEligibility(eligibility)
+		return nil
+	})
+	if err != nil {
+		return app.ConversationMessageRetryEligibility{}, err
+	}
+	return eligibility, nil
+}
+
+func cloneConversationMessageRetryEligibility(value app.ConversationMessageRetryEligibility) app.ConversationMessageRetryEligibility {
+	return value
 }

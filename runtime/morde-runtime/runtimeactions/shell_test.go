@@ -1,15 +1,73 @@
 package runtimeactions
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 )
+
+func TestTaskWorkspaceSnapshotSHA256IsStableAndTracksExecutionMutation(t *testing.T) {
+	rootPath := t.TempDir()
+	nested := filepath.Join(rootPath, "src")
+	if err := os.Mkdir(nested, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(rootPath, "empty"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	filePath := filepath.Join(nested, "main.go")
+	if err := os.WriteFile(filePath, []byte("package main\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Link(filePath, filepath.Join(nested, "main-copy.go")); err != nil {
+		t.Skipf("hardlinks are unavailable: %v", err)
+	}
+	if err := os.Symlink("main.go", filepath.Join(nested, "main-link.go")); err != nil {
+		t.Skipf("symlinks are unavailable: %v", err)
+	}
+	modified := time.Unix(1_700_000_000, 123_456_789)
+	if err := os.Chtimes(filePath, modified, modified); err != nil {
+		t.Fatal(err)
+	}
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+
+	before, err := taskWorkspaceSnapshotSHA256(context.Background(), root)
+	if err != nil {
+		t.Fatalf("snapshot digest before execution: %v", err)
+	}
+	again, err := taskWorkspaceSnapshotSHA256(context.Background(), root)
+	if err != nil || before == "" || again != before {
+		t.Fatalf("unchanged snapshot digests = %q, %q, %v", before, again, err)
+	}
+	if err := os.WriteFile(filePath, []byte("package main\nfunc main() {}\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	after, err := taskWorkspaceSnapshotSHA256(context.Background(), root)
+	if err != nil {
+		t.Fatalf("snapshot digest after execution: %v", err)
+	}
+	if after == before {
+		t.Fatal("execution content mutation did not change the shared Workspace snapshot digest")
+	}
+	if err := os.Chmod(filePath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	metadataAfter, err := taskWorkspaceSnapshotSHA256(context.Background(), root)
+	if err != nil || metadataAfter == after {
+		t.Fatalf("mode mutation digest = %q, %v; want a changed digest", metadataAfter, err)
+	}
+}
 
 func TestParseShellArguments(t *testing.T) {
 	tests := []struct {

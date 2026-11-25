@@ -252,7 +252,7 @@ export class MordeSync {
     const params = { base_url: auth.origin, bearer_token: auth.syncCredential, workspace_id: mapping.workspaceId, directory: mapping.directory, scope };
     const method = mode === "live_sync" || mode === "handoff_checkpoint" ? mode : "sync";
     const data = mode === "project_upload"
-      ? { ...params, folder_id: checkpoint!.folderId, source_binding_id: checkpoint!.sourceBindingID, direction: "upload", policy: "compare_merge", base_revision: 0, scope: [], idempotency_key: checkpoint!.idempotencyKey, ...(checkpoint!.sessionId ? { session_id: checkpoint!.sessionId } : {}) }
+      ? { ...params, source_device: mapping.dev, source_inode: mapping.ino, folder_id: checkpoint!.folderId, source_binding_id: checkpoint!.sourceBindingID, direction: "upload", policy: "compare_merge", base_revision: 0, scope: [], idempotency_key: checkpoint!.idempotencyKey, ...(checkpoint!.sessionId ? { session_id: checkpoint!.sessionId } : {}) }
       : method === "sync" ? { ...params, direction: mode, idempotency_key: checkpoint?.idempotencyKey ?? randomUUID(), ...(checkpoint?.sessionId ? { session_id: checkpoint.sessionId } : {}) } : method === "handoff_checkpoint" ? { ...params, idempotency_key: checkpoint?.idempotencyKey ?? randomUUID() } : { ...params, rescan_seconds: rescanSeconds };
     let binary: string;
     try { binary = this.binary(); }

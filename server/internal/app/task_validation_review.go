@@ -63,13 +63,14 @@ type TaskValidationReviewModel struct {
 }
 
 type TaskValidationReviewCompletion struct {
-	Claim                 TaskValidationReviewClaim
-	SessionID             string
-	ResponseText          string
-	ExecutionModel        TaskValidationReviewModel
-	ReviewerModel         TaskValidationReviewModel
-	Report                TaskValidationReviewReport
-	ArtifactContentProofs []TaskValidationReviewArtifactContentProof
+	Claim                       TaskValidationReviewClaim
+	SessionID                   string
+	ResponseText                string
+	ExecutionModel              TaskValidationReviewModel
+	ReviewerModel               TaskValidationReviewModel
+	Report                      TaskValidationReviewReport
+	ArtifactContentProofs       []TaskValidationReviewArtifactContentProof
+	FinalWorkspaceSnapshotProof *TaskValidationFinalWorkspaceSnapshotProof
 }
 
 type TaskValidationReviewInput struct {

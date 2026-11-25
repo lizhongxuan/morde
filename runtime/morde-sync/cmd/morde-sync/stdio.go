@@ -10,6 +10,7 @@ import (
 	"io"
 	"io/fs"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -115,6 +116,8 @@ type syncParams struct {
 	WorkspaceID           string   `json:"workspace_id"`
 	FolderID              string   `json:"folder_id,omitempty"`
 	SourceBindingID       string   `json:"source_binding_id,omitempty"`
+	SourceDevice          string   `json:"source_device,omitempty"`
+	SourceInode           string   `json:"source_inode,omitempty"`
 	Directory             string   `json:"directory"`
 	Direction             string   `json:"direction"`
 	Policy                string   `json:"policy,omitempty"`
@@ -791,7 +794,8 @@ func (s *stdioServer) startSync(id json.RawMessage, idKey string, rawParams json
 	go func() {
 		defer s.wg.Done()
 		result, syncErr := apiClient.Sync(ctx, client.SyncOptions{
-			WorkspaceID: params.WorkspaceID, FolderID: params.FolderID, SourceBindingID: params.SourceBindingID, Directory: params.Directory, Direction: params.Direction,
+			WorkspaceID: params.WorkspaceID, FolderID: params.FolderID, SourceBindingID: params.SourceBindingID,
+			SourceDevice: params.SourceDevice, SourceInode: params.SourceInode, Directory: params.Directory, Direction: params.Direction,
 			Policy: params.Policy,
 			Scope:  params.Scope, BaseRevision: params.BaseRevision, SessionID: params.SessionID,
 			TaskID: params.TaskID, TaskHubOperationKey: params.TaskHubOperationKey,
@@ -917,11 +921,12 @@ func validateSyncParams(value syncParams) error {
 		return errors.New("base_revision is invalid")
 	}
 	if value.FolderID != "" && (!syncFolderIDRE.MatchString(value.FolderID) || !sourceBindingIDRE.MatchString(value.SourceBindingID) || value.Direction != "upload" || value.Policy != "compare_merge" ||
-		value.BaseRevision == nil || *value.BaseRevision != 0 || len(value.Scope) != 0 || value.TaskID != "" || value.TaskHubOperationKey != "") {
-		return errors.New("project folder sync requires a source binding and unscoped compare-merge upload from revision zero")
+		value.BaseRevision == nil || *value.BaseRevision != 0 || len(value.Scope) != 0 || value.TaskID != "" || value.TaskHubOperationKey != "" ||
+		!validProjectRootIdentity(value.SourceDevice, value.SourceInode)) {
+		return errors.New("project folder sync requires a source binding, selected directory identity, and unscoped compare-merge upload from revision zero")
 	}
-	if value.FolderID == "" && value.SourceBindingID != "" {
-		return errors.New("source binding ID requires a project folder")
+	if value.FolderID == "" && (value.SourceBindingID != "" || value.SourceDevice != "" || value.SourceInode != "") {
+		return errors.New("project source identity requires a project folder")
 	}
 	if value.SessionID != "" && !sessionIDRE.MatchString(value.SessionID) {
 		return errors.New("session_id is invalid")
@@ -953,6 +958,15 @@ func validateSyncParams(value syncParams) error {
 		seen[key] = struct{}{}
 	}
 	return nil
+}
+
+func validProjectRootIdentity(device, inode string) bool {
+	if !rootIdentityRE.MatchString(device) || !rootIdentityRE.MatchString(inode) {
+		return false
+	}
+	_, deviceErr := strconv.ParseUint(device, 10, 64)
+	inodeValue, inodeErr := strconv.ParseUint(inode, 10, 64)
+	return deviceErr == nil && inodeErr == nil && inodeValue != 0
 }
 
 func validateLiveSyncParams(value liveSyncParams) error {

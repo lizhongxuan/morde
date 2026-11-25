@@ -270,10 +270,15 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 		return shellResultIfTimedOut(operationContext)
 	}
 	workspaceManifestBefore := ""
+	workspaceSnapshotBefore := ""
 	if request.WorkspaceViewID != "" {
 		workspaceManifestBefore, err = taskWorkspaceManifestSHA256(operationContext, workspaceRoot)
 		if err != nil {
 			return nil, fmt.Errorf("hash Task Workspace before shell execution: %w", err)
+		}
+		workspaceSnapshotBefore, err = taskWorkspaceSnapshotSHA256(operationContext, workspaceRoot)
+		if err != nil {
+			return nil, fmt.Errorf("scan Task Workspace snapshot before shell execution: %w", err)
 		}
 	}
 
@@ -366,6 +371,10 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 		if hashErr != nil {
 			return nil, fmt.Errorf("hash Task Workspace after shell execution: %w", hashErr)
 		}
+		workspaceSnapshotAfter, snapshotErr := taskWorkspaceSnapshotSHA256(ctx, workspaceRoot)
+		if snapshotErr != nil {
+			return nil, fmt.Errorf("scan Task Workspace snapshot after shell execution: %w", snapshotErr)
+		}
 		revision := request.WorkspaceCheckpointRevision
 		encoded, err = json.Marshal(shellTaskWorkspaceResult{
 			ExitCode: result.ExitCode, Stdout: result.Stdout, Stderr: result.Stderr,
@@ -374,6 +383,7 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 			BindingVersion: request.BindingVersion, WorkspaceViewID: request.WorkspaceViewID,
 			WorkspaceCheckpointRevision:   &revision,
 			WorkspaceManifestSHA256Before: workspaceManifestBefore, WorkspaceManifestSHA256After: workspaceManifestAfter,
+			WorkspaceSnapshotSHA256Before: workspaceSnapshotBefore, WorkspaceSnapshotSHA256After: workspaceSnapshotAfter,
 		})
 	} else {
 		encoded, err = json.Marshal(result)
@@ -402,6 +412,8 @@ type shellTaskWorkspaceResult struct {
 	WorkspaceCheckpointRevision   *int64 `json:"workspace_checkpoint_revision"`
 	WorkspaceManifestSHA256Before string `json:"workspace_manifest_sha256_before"`
 	WorkspaceManifestSHA256After  string `json:"workspace_manifest_sha256_after"`
+	WorkspaceSnapshotSHA256Before string `json:"workspace_snapshot_sha256_before"`
+	WorkspaceSnapshotSHA256After  string `json:"workspace_snapshot_sha256_after"`
 }
 
 const taskWorkspaceManifestDomain = "morde-task-workspace-manifest-v1"

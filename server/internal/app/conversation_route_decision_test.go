@@ -414,7 +414,7 @@ func TestTruncatedLongMessagePreservesValidatedTaskAssociation(t *testing.T) {
 		CurrentMessageID: "m2345678", ContentBytes: int64(len(content)), ContentSHA256: make([]byte, sha256.Size),
 		ExecutionScopeDigest: digest, RequestCandidates: []ConversationRouteRequestCandidate{{
 			MessageID: "m1234567", Sequence: 1, Content: "分析这篇文章", RoutingStatus: conversation.RoutingProcessing,
-			SameExecutionScope: true, ExecutionScopeDigest: digest,
+			SameExecutionScope: true, SameAuthorization: true, ExecutionScopeDigest: digest,
 		}}}
 	joinOutput := `{"action":"join","task_id":"","target_message_id":"m1234567","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`
 	joinDecision := ParseConversationRouteDecisionForContext(joinOutput, joinValue)
@@ -670,7 +670,7 @@ func TestConversationRouteJoinRequiresAuthorizedSameScopeCandidate(t *testing.T)
 	digest := make([]byte, sha256.Size)
 	digest[0] = 1
 	candidate := ConversationRouteRequestCandidate{MessageID: "m1234567", Sequence: 3, Content: "分析 Morde 项目",
-		RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true, ExecutionScopeDigest: digest}
+		RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true, SameAuthorization: true, ExecutionScopeDigest: digest}
 	value := ConversationRouteContext{ActorID: "u1234567", RouteAttempt: 1, Content: "分析 Morde 项目", ExecutionScopeDigest: digest,
 		RequestCandidates: []ConversationRouteRequestCandidate{candidate}}
 	decision := ParseConversationRouteDecisionForContext(`{"action":"join","task_id":"","target_message_id":"m1234567","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`, value)
@@ -685,6 +685,9 @@ func TestConversationRouteJoinRequiresAuthorizedSameScopeCandidate(t *testing.T)
 			Content: "分析 Morde 项目", RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true, ExecutionScopeDigest: digest}},
 		{name: "different execution scope", candidate: ConversationRouteRequestCandidate{MessageID: "m1234567", Sequence: 3,
 			Content: "分析 Morde 项目", RoutingStatus: conversation.RoutingProcessing}},
+		{name: "different authorization", candidate: ConversationRouteRequestCandidate{MessageID: "m1234567", Sequence: 3,
+			Content: "分析 Morde 项目", RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true,
+			ExecutionScopeDigest: digest}},
 		{name: "completed task", candidate: ConversationRouteRequestCandidate{MessageID: "m1234567", Sequence: 3,
 			Content: "分析 Morde 项目", RoutingStatus: conversation.RoutingRouted, TaskID: "q1234567",
 			TaskStatus: task.StatusCompleted, SameExecutionScope: true, ExecutionScopeDigest: digest}},
@@ -704,13 +707,13 @@ func TestConversationRouteJoinRequiresAuthorizedSameScopeCandidate(t *testing.T)
 	for _, status := range []task.Status{task.StatusQueued, task.StatusRunning} {
 		candidate := ConversationRouteRequestCandidate{MessageID: "m2345678", Sequence: 4, Content: "补充同一目标的要求",
 			RoutingStatus: conversation.RoutingRouted, TaskID: "q1234567", TaskStatus: status,
-			SameExecutionScope: true, ExecutionScopeDigest: digest}
+			SameExecutionScope: true, SameAuthorization: true, ExecutionScopeDigest: digest}
 		if !ValidConversationRouteJoinTarget(candidate.MessageID, []ConversationRouteRequestCandidate{candidate}) {
 			t.Errorf("active %s Task was not a valid merge target", status)
 		}
 	}
 	directReply := ConversationRouteRequestCandidate{MessageID: "m3456789", Sequence: 5, Content: "分析 Morde 项目",
-		RoutingStatus: conversation.RoutingRouted, SameExecutionScope: true, DirectReply: true, ExecutionScopeDigest: digest}
+		RoutingStatus: conversation.RoutingRouted, SameExecutionScope: true, SameAuthorization: true, DirectReply: true, ExecutionScopeDigest: digest}
 	if !ValidConversationRouteJoinTarget(directReply.MessageID, []ConversationRouteRequestCandidate{directReply}) {
 		t.Fatal("direct-reply route was not eligible for safe reclassification and join")
 	}

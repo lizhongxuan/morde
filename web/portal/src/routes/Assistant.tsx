@@ -12,7 +12,8 @@ import { useMessageVariantOutbox } from '../app/use-message-variant-outbox';
 import type { MessageVariantOutboxEntry } from '../app/use-message-variant-outbox';
 import { buildMessageVariantTimeline, createMessageVariant, messageVariantActionLabel } from '../app/message-variants';
 import type { VersionableMessage } from '../app/message-variants';
-import { clearProcessingRetryKey } from '../app/message-processing-retry';
+import { clearProcessingRetryKey, processingRetryKey } from '../app/message-processing-retry';
+import { routingFailureText } from '../app/message-status';
 import { maxMessageBytes, needsMessageUpload, uploadMessage } from '../app/message-upload';
 import { conversationTitleFromText, firstOutboxConversationMessage, messageOutbox, outboxReceiptRequest } from '../app/message-outbox';
 import type { PendingConversationMessage, PendingMessageAttachment } from '../app/message-outbox';
@@ -103,6 +104,10 @@ function nativeWorkbenchBridge(): NativeWorkbenchBridge | undefined {
 type AssistantDisplayMessage = Omit<ConversationMessage, 'delivery_status'> & { delivery_status?: ConversationDeliveryStatus } & {
   snapshotStatus?: 'streaming' | 'completed' | 'interrupted';
 } & Pick<VersionableMessage, 'variant_group_id' | 'variant_version' | 'variant_action'>;
+type RoutingFailureMessage = Pick<ConversationMessage,
+  'id' | 'role' | 'routing_status' | 'routing_failure_reason' | 'task_id' | 'related_task_id' | 'duplicate_of_message_id'> & {
+  actor_id?: unknown;
+};
 type ComposerAttachment = { id: string; file: File; displayName?: string; objectID: string; objectKey: string; uploadKey: string; commitKey: string; attachmentID?: string; needsPreparation?: boolean; preparationCancelled?: boolean };
 type OfficePreviewState = { status: 'loading' } | { status: 'ready'; text: string };
 
@@ -116,6 +121,28 @@ function isPlaceholderConversationTitle(title?: string): boolean {
 
 function clarificationDraftKey(taskID: string, clarificationID: string, version: number): string {
   return `${taskID}:${clarificationID}:${version}`;
+}
+
+function conversationMessageActorID(message: RoutingFailureMessage): string | undefined {
+  const actorID = message.actor_id;
+  return typeof actorID === 'string' ? actorID : undefined;
+}
+
+function isUnlinkedRoutingFailure(message: RoutingFailureMessage): boolean {
+  return message.role === 'user' && message.routing_status === 'failed'
+    && !message.task_id && !message.related_task_id && !message.duplicate_of_message_id;
+}
+
+function routingFailureNextStep(message: RoutingFailureMessage, actorMatches: boolean,
+  capability: 'confirmed' | 'unsupported' | 'unknown'): string {
+  if (message.routing_failure_reason === 'message_too_long') return '原文已保留；请缩短后重新发送，不能重试这条原文。';
+  if (!actorMatches) return '只有发送这条消息的账号可以重新处理。';
+  if (capability === 'unknown') return '服务身份或消息处理能力尚未确认；请检查服务状态后再试。';
+  if (capability === 'unsupported') return '当前服务未开放安全重试；消息已保留，请稍后检查服务功能。';
+  if (message.routing_failure_reason === 'model_unavailable') return '确认模型可用性和用量后，可以重新处理这条消息。';
+  if (message.routing_failure_reason === 'routing_context_unavailable') return '可以安全重试，让系统重新读取会话上下文并处理原消息。';
+  if (message.routing_failure_reason === 'routing_action_unavailable') return '可以安全重试，让系统重新检查消息处理状态。';
+  return '原消息已保留，可以安全重试处理。';
 }
 
 const fileDeliveryIntentClarificationCallIDs = new Set([
@@ -983,6 +1010,8 @@ export function Assistant() {
   const [composerDraftError, setComposerDraftError] = useState<string | null>(null);
   const [hydratedComposerDraftKey, setHydratedComposerDraftKey] = useState<string | null>(null);
   const observedProcessingRetryStates = useRef(new Map<string, string>());
+  const processingRetryInFlight = useRef(new Set<string>());
+  const currentRetryIdentity = useRef<{ actorID?: string; serviceInstanceID?: string }>({});
   const [modelID, setModelID] = useState('');
   const [mcpConnectorIDs, setMcpConnectorIDs] = useState<string[]>([]);
   const [content, setContent] = useState(() => hasNavigationIdea ? ideaPrompt : '');
@@ -1136,6 +1165,9 @@ export function Assistant() {
   }, []);
   const [visibleSideConversationCount, setVisibleSideConversationCount] = useState(5);
   const capabilities = useQuery({ queryKey: ['service-capabilities'], queryFn: portalApi.capabilities });
+  useLayoutEffect(() => {
+    currentRetryIdentity.current = { actorID: user?.id, serviceInstanceID: capabilities.data?.service_instance_id };
+  }, [capabilities.data?.service_instance_id, user?.id]);
   const outbox = useMessageOutbox(user?.id, capabilities.data?.service_instance_id);
   const variantOutbox = useMessageVariantOutbox(user?.id, capabilities.data?.service_instance_id);
   const activeOutboxScope = useRef(outbox.currentScope);
@@ -1536,6 +1568,46 @@ export function Assistant() {
   });
   const conversationContentAccessRevoked = isResourceNoLongerAccessible(messages.error);
   const conversationMessageItems = conversationContentAccessRevoked ? [] : flattenConversationPages(messages.data);
+  const routingRetryCapabilityConfirmed = capabilities.isSuccess && !capabilities.isError && !capabilities.isFetching
+    && Boolean(capabilities.data?.service_instance_id)
+    && capabilities.data.supported_features.includes('conversation_auto_routing_v1');
+  const routingRetryCapabilityState: 'confirmed' | 'unsupported' | 'unknown' = !capabilities.isSuccess || capabilities.isError
+    || capabilities.isFetching || !capabilities.data?.service_instance_id ? 'unknown'
+      : routingRetryCapabilityConfirmed ? 'confirmed' : 'unsupported';
+  const retryConversationMessageProcessing = useMutation({
+    mutationFn: async (messageID: string): Promise<{ conversationID: string; messageID: string } | null> => {
+      if (processingRetryInFlight.current.has(messageID)) return null;
+      const target = conversationMessageItems.find((item) => item.id === messageID && item.conversation_id === conversationID);
+      const actorID = user?.id;
+      const serviceInstanceID = capabilities.data?.service_instance_id;
+      if (!target || !isUnlinkedRoutingFailure(target) || target.routing_failure_reason === 'message_too_long'
+        || !actorID || conversationMessageActorID(target) !== actorID
+        || !capabilities.isSuccess || capabilities.isError || capabilities.isFetching || !serviceInstanceID
+        || !capabilities.data.supported_features.includes('conversation_auto_routing_v1')) {
+        throw new Error('此消息、账号或服务状态尚未通过安全重试检查。');
+      }
+      processingRetryInFlight.current.add(messageID);
+      try {
+        const currentCapabilities = await portalApi.capabilities();
+        if (currentCapabilities.service_instance_id !== serviceInstanceID
+          || !currentCapabilities.supported_features.includes('conversation_auto_routing_v1')) {
+          throw new Error('服务身份已变化或尚不支持消息处理；未发送重试请求。');
+        }
+        if (currentRetryIdentity.current.actorID !== actorID || currentRetryIdentity.current.serviceInstanceID !== serviceInstanceID) {
+          throw new Error('账号或服务身份已变化；未发送重试请求。');
+        }
+        const key = processingRetryKey(serviceInstanceID, actorID, '', target.conversation_id, target.id);
+        await portalApi.retryConversationMessageProcessing(target.conversation_id, target.id, key, serviceInstanceID, actorID);
+        return { conversationID: target.conversation_id, messageID: target.id };
+      } finally {
+        processingRetryInFlight.current.delete(messageID);
+      }
+    },
+    onSuccess: (target) => {
+      if (target) void client.invalidateQueries({ queryKey: ['conversation-messages', target.conversationID] });
+    },
+    onError: (error) => notify(errorDetails(error).message, 'error'),
+  });
   const conversationTasks = useQuery({
     queryKey: ['conversation-tasks', conversationID],
     queryFn: () => portalApi.conversationTasks(conversationID!),
@@ -3443,6 +3515,13 @@ export function Assistant() {
                   const fileDeliveryClarification = isFileDeliveryIntentClarification(activeClarification?.call_id);
                   const clarificationFileDeliveryIntent = fileDeliveryClarification
                     ? clarificationFileDeliveryIntents[clarificationDraftID] : undefined;
+                  const showRoutingFailure = isUnlinkedRoutingFailure(message);
+                  const routingRetryActorMatches = conversationMessageActorID(message) === user?.id;
+                  const canRetryRoutingFailure = showRoutingFailure && message.routing_failure_reason !== 'message_too_long'
+                    && routingRetryActorMatches && routingRetryCapabilityConfirmed;
+                  const retryingRoutingFailure = retryConversationMessageProcessing.isPending
+                    && retryConversationMessageProcessing.variables === message.id;
+                  const routingFailureNextStepText = routingFailureNextStep(message, routingRetryActorMatches, routingRetryCapabilityState);
                   const showClarificationCard = message.role === 'user' && Boolean(messageTaskID) &&
                     latestUserMessageByTaskID.get(messageTaskID) === message.id && Boolean(clarificationDisplay);
                   const previous = displayMessages[index - 1];
@@ -3469,6 +3548,22 @@ export function Assistant() {
                     </div>
                     </div>
                     </div>
+                    {showRoutingFailure && <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的消息处理状态">
+                      <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
+                      <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
+                        <div className="chat-message-processing-status">
+                          <p role="status" aria-live="polite"><strong>消息已保存但尚未处理</strong></p>
+                          <p>系统报告：{routingFailureText(message.routing_failure_reason)}</p>
+                          <p>{routingFailureNextStepText}</p>
+                          {canRetryRoutingFailure && <button type="button" className="button button-secondary button-small"
+                            aria-label="重新处理这条消息" disabled={retryingRoutingFailure}
+                            onClick={() => {
+                              if (processingRetryInFlight.current.has(message.id)) return;
+                              retryConversationMessageProcessing.mutate(message.id);
+                            }}>{retryingRoutingFailure ? '正在重新处理…' : '重新处理这条消息'}</button>}
+                        </div>
+                      </div>
+                    </div>}
                     {message.role === 'user' && messageTaskID && latestUserMessageByTaskID.get(messageTaskID) === message.id &&
                       messageTask?.pending_request &&
                       (messageTask.pending_request.status !== 'pending' || messageTask.status === 'waiting_user') &&

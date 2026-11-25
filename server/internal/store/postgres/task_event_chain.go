@@ -6,10 +6,8 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"morde/server/internal/app"
-	"morde/server/internal/domain"
 )
 
 // TaskEventChainFacts returns the validation and receipt facts for one
@@ -33,26 +31,12 @@ func (s *Store) TaskEventChainFacts(ctx context.Context, ownerID, taskID string)
 			}
 			return fmt.Errorf("read task revision for event chain facts: %w", err)
 		}
-		var state pgtype.Text
-		err = tx.QueryRow(ctx, `SELECT review.validation_state
-FROM task_validation_reviews review
-JOIN tasks task ON task.id=review.task_id AND task.status='completed'
-  AND task.current_revision=review.task_revision AND task.desired_revision=review.task_revision
-  AND task.result<>'' AND sha256(convert_to(task.result,'UTF8'))=review.result_sha256
-JOIN task_events event ON event.task_id=review.task_id AND event.sequence=review.result_event_sequence
-  AND event.task_revision=review.task_revision AND event.event_type='task.result'
-  AND event.result_content_sha256=review.result_sha256
-WHERE review.task_id=$1 AND review.owner_id=$2 AND review.task_revision=$3 AND review.state='reviewed'
-  AND task_validation_artifact_evidence_current(review.task_id, review.owner_id, review.artifact_content_evidence)`,
-			taskID, taskOwnerID, revision).Scan(&state)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		state, current, err := currentTaskValidationVerdictInTx(ctx, tx, taskID, taskOwnerID, revision, 0, nil)
+		if err != nil {
 			return fmt.Errorf("read task validation state for event chain facts: %w", err)
 		}
-		if state.Valid {
-			facts.ValidationState = app.TaskValidationState(state.String)
-			if !app.ValidTaskValidationState(facts.ValidationState) {
-				return domain.NewError(domain.CodeInvalidState, "task validation state is invalid")
-			}
+		if current {
+			facts.ValidationState = state
 		}
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_result_batches batch
   JOIN conversation_result_sources source ON source.batch_message_id=batch.message_id

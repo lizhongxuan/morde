@@ -63,7 +63,8 @@ func attestTaskValidationShellResult(current task.Task, planRevision int64, chec
 		shell.TaskID != current.ID || shell.WorkspaceID != current.WorkspaceID || shell.BindingVersion != bindingVersion ||
 		shell.WorkspaceViewID == "" || !taskWorkspaceViewIDPattern.MatchString(shell.WorkspaceViewID) ||
 		shell.WorkspaceCheckpointRevision == nil || *shell.WorkspaceCheckpointRevision != *current.WorkspaceCheckpointRevision ||
-		!validSyncDigest(shell.WorkspaceManifestSHA256Before) || !validSyncDigest(shell.WorkspaceManifestSHA256After) {
+		!validSyncDigest(shell.WorkspaceManifestSHA256Before) || !validSyncDigest(shell.WorkspaceManifestSHA256After) ||
+		!validSyncDigest(shell.WorkspaceSnapshotSHA256Before) || !validSyncDigest(shell.WorkspaceSnapshotSHA256After) {
 		return output, false
 	}
 	commandDigest, checkDigest, coverageDigest, ok := taskValidationPlanCheckDigests(check)
@@ -71,7 +72,7 @@ func attestTaskValidationShellResult(current task.Task, planRevision int64, chec
 		return output, false
 	}
 	shell.VerificationCheck = &TaskValidationCheckExecutionReceipt{
-		Version: 1, TaskRevision: *current.CurrentRevision, PlanRevision: planRevision, CheckID: checkID,
+		Version: 2, TaskRevision: *current.CurrentRevision, PlanRevision: planRevision, CheckID: checkID,
 		Kind: string(check.Kind), Basis: string(check.Basis), CommandSHA256: commandDigest,
 		CheckSHA256: checkDigest, CoverageSHA256: coverageDigest, RequestSHA256: hex.EncodeToString(requestDigest),
 	}

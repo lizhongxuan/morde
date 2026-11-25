@@ -13,11 +13,13 @@ describe('task approval MCP App resource', () => {
     cleanup();
     document.getElementById('app')?.remove();
     delete document.body.dataset.nonce;
+    delete document.body.dataset.layout;
     vi.restoreAllMocks();
   });
 
-  it('initializes through JSON-RPC, renders untrusted fields as text, and calls only the approval tool', async () => {
+  it.each(['conversation', 'review'] as const)('renders the %s MCP App safely and calls only the approval tool', async (layout) => {
     document.body.dataset.nonce = 'fedcba0987654321';
+    document.body.dataset.layout = layout;
     const app = document.createElement('main');
     app.id = 'app';
     document.body.append(app);
@@ -45,17 +47,31 @@ describe('task approval MCP App resource', () => {
     send({ jsonrpc: '2.0', method: 'ui/notifications/tool-input', params: { arguments: {
       id: 'approval-1', version: 7, title: '<img src=x onerror=alert(1)>', object: 'workspace/report.md',
       content: '写入报告', impact: '新增文件', risk: '未知', thisCost: '未知', cumulativeCost: '未知',
-      alternatives: '稍后处理', revocation: '执行前可停止', expiresAt: null,
+      alternatives: '稍后处理', revocation: '执行前可停止', expiresAt: '2027-11-26T09:06:00Z',
     } } });
 
     const root = document.getElementById('app');
     expect(root?.textContent).toContain('<img src=x onerror=alert(1)>');
     expect(root?.querySelector('img')).toBeNull();
-    const approve = Array.from(root?.querySelectorAll('button') ?? []).find((button) => button.textContent === '允许本次操作');
+    if (layout === 'review') {
+      expect(root?.querySelector('.review-card')).toHaveTextContent('写入报告');
+      expect(root?.querySelector('.review-card')).toHaveTextContent('目标：workspace/report.md · 影响：新增文件');
+      expect(root?.querySelector('.review-meta')).toHaveTextContent('风险未知');
+      expect(root?.querySelector('.review-meta')).toHaveTextContent('费用未知');
+      expect(root?.querySelector('.review-meta')).toHaveTextContent('仅本次操作');
+      expect(root?.querySelector('time')).toHaveTextContent('11月26日 17:06');
+      expect(root?.querySelector('details')).toHaveTextContent('稍后处理');
+      expect(root?.querySelector('details')).not.toHaveAttribute('open');
+      expect(root?.textContent).not.toContain('审批仅适用于本次显示的操作');
+    } else {
+      expect(root?.querySelector('.review-card')).toBeNull();
+    }
+    const approveLabel = layout === 'review' ? '允许本次' : '允许本次操作';
+    const approve = Array.from(root?.querySelectorAll('button') ?? []).find((button) => button.textContent === approveLabel);
     expect(approve).toBeDefined();
     await waitFor(() => expect(Array.from(root?.querySelectorAll('button') ?? [])
-      .find((button) => button.textContent === '允许本次操作')).toBeEnabled());
-    Array.from(root?.querySelectorAll('button') ?? []).find((button) => button.textContent === '允许本次操作')?.click();
+      .find((button) => button.textContent === approveLabel)).toBeEnabled());
+    Array.from(root?.querySelectorAll('button') ?? []).find((button) => button.textContent === approveLabel)?.click();
     const call = outgoing.find((message) => message.method === 'tools/call');
     expect(call).toMatchObject({
       params: { name: 'respond_to_task_approval', arguments: { approval_id: 'approval-1', version: 7, decision: 'approve' } },
@@ -64,7 +80,7 @@ describe('task approval MCP App resource', () => {
     await waitFor(() => expect(root?.textContent).toContain('审批结果尚未确认'));
     const buttonsAfterFailure = Array.from(root?.querySelectorAll('button') ?? []);
     expect(buttonsAfterFailure.find((button) => button.textContent === '拒绝')).toBeDisabled();
-    const retry = buttonsAfterFailure.find((button) => button.textContent === '允许本次操作');
+    const retry = buttonsAfterFailure.find((button) => button.textContent === approveLabel);
     expect(retry).toBeEnabled();
     retry?.click();
     const retryCall = outgoing.filter((message) => message.method === 'tools/call').at(-1);

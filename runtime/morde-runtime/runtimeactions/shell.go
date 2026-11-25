@@ -7,11 +7,14 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	mordesync "morde-sync"
 )
 
 const (
@@ -30,6 +33,18 @@ var (
 	ErrProcessDomainUnavailable = errors.New("verified process control unavailable")
 	ErrShellOperationCancelled  = errors.New("shell operation cancelled")
 )
+
+func taskWorkspaceSnapshotSHA256(ctx context.Context, root *os.Root) (string, error) {
+	manifest, err := mordesync.ScanOpenedRoot(ctx, root, nil)
+	if err != nil {
+		return "", err
+	}
+	digest, err := mordesync.TaskWorkspaceSnapshotSHA256(manifest)
+	if err != nil {
+		return "", err
+	}
+	return digest, nil
+}
 
 type ShellFailureCategory string
 

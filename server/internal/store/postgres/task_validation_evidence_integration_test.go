@@ -1041,6 +1041,14 @@ func TestPostgresTaskValidationArtifactEvidenceTracksCurrentWorkspaceFile(t *tes
 	if err != nil || replayed {
 		t.Fatalf("start Task Agent: lease=%+v replayed=%t err=%v", started.Fence, replayed, err)
 	}
+	if _, err := store.pool.Exec(ctx, `INSERT INTO model_connections
+(id,owner_id,name,base_url,model_name,api_key_cipher,checked_at,capability_text)
+VALUES ('p1234567',NULL,'validation artifact execution model','https://api.openai.com/v1','gpt-6-luna',
+decode(repeat('00',29),'hex'),clock_timestamp(),true)
+ON CONFLICT (id) DO UPDATE SET base_url=EXCLUDED.base_url,model_name=EXCLUDED.model_name,checked_at=clock_timestamp(),capability_text=true`); err != nil {
+		t.Fatalf("seed execution model connection: %v", err)
+	}
+	executionModel := seedTaskValidationExecutionModelResponse(t, store, started.Fence)
 	stepID := mustID(t, domain.NewStepID)
 	callID := "write_result_1"
 	step := task.Step{ID: stepID, TaskID: created.Task.ID, Sequence: 1, Kind: "tool", Status: task.StepSucceeded,
@@ -1086,7 +1094,7 @@ func TestPostgresTaskValidationArtifactEvidenceTracksCurrentWorkspaceFile(t *tes
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `UPDATE task_validation_reviews
-SET state='reviewed',validation_state='PASS',execution_model_call_id='fixture-validation-call',
+SET state='reviewed',validation_state='PASS',execution_model_call_id=$5,
     reviewer_session_id='fixture_reviewer',execution_model_id='paaaaaaa',execution_connection_version=clock_timestamp(),
     execution_endpoint='http://fixture',execution_configured_model='fixture-execution',execution_reported_model='fixture-execution',
     execution_model_family='fixture-execution-family',execution_catalog_version='fixture-v1',
@@ -1094,7 +1102,7 @@ SET state='reviewed',validation_state='PASS',execution_model_call_id='fixture-va
     reviewer_configured_model='fixture-reviewer',reviewer_reported_model='fixture-reviewer',
     reviewer_model_family='fixture-reviewer-family',reviewer_catalog_version='fixture-v1',review_report='{}'::jsonb,
     reviewed_at=clock_timestamp(),artifact_content_evidence=$2::jsonb
-WHERE task_id=$1 AND task_revision=$3 AND result_event_sequence=$4`, created.Task.ID, string(encodedProofs), revision, resultEvent.Sequence); err != nil {
+	WHERE task_id=$1 AND task_revision=$3 AND result_event_sequence=$4`, created.Task.ID, string(encodedProofs), revision, resultEvent.Sequence, executionModel.CallID); err != nil {
 		t.Fatalf("seed reviewed Artifact content proof: %v", err)
 	}
 	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)

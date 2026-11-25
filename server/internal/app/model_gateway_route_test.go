@@ -157,7 +157,7 @@ func TestConversationRouteInitialAttemptIncludesJoinCandidates(t *testing.T) {
 	value.History = []ConversationRouteHistory{{MessageID: "m7654321", Sequence: 1, Role: conversation.RoleAssistant,
 		Content: "1. 继续任务 A；2. 开始新任务"}}
 	value.RequestCandidates = []ConversationRouteRequestCandidate{{MessageID: "m8765432", Sequence: 2, Content: "继续任务 A",
-		RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true, ExecutionScopeDigest: scopeDigest}}
+		RoutingStatus: conversation.RoutingProcessing, SameExecutionScope: true, SameAuthorization: true, ExecutionScopeDigest: scopeDigest}}
 	initial, err := ConversationRouteModelRequest(value)
 	if err != nil || !strings.Contains(initial.Instructions, `"target_message_id"`) ||
 		!strings.Contains(initial.Instructions, "same_execution_scope") || !strings.Contains(initial.Instructions, "joinable field is true") ||
@@ -203,7 +203,7 @@ func TestConversationRouteGatewayJoinsFollowupToSameDeliverable(t *testing.T) {
 	value.ExecutionScopeDigest = digest
 	value.RequestCandidates = []ConversationRouteRequestCandidate{{MessageID: targetMessageID, Sequence: 1,
 		Content: "为五子棋应用写一份设计方案并保存为 Markdown", RoutingStatus: conversation.RoutingRouted,
-		TaskID: "q1234567", TaskStatus: task.StatusRunning, SameExecutionScope: true, ExecutionScopeDigest: digest}}
+		TaskID: "q1234567", TaskStatus: task.StatusRunning, SameExecutionScope: true, SameAuthorization: true, ExecutionScopeDigest: digest}}
 	output := `{"action":"join","task_id":"","target_message_id":"` + targetMessageID + `","explicit_new":false,"question":"","reply":"","dependency_task_ids":[]}`
 	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
 	client := &modelGatewayClientTest{response: ModelResponse{Text: output, StopReason: "stop",

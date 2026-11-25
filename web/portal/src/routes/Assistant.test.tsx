@@ -12,6 +12,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import { ApiError } from '../api/client';
 import { portalApi } from '../app/api';
 import type { components } from '../api/schema';
+import { processingRetryKey } from '../app/message-processing-retry';
 import { messageOutbox, messageOutboxScope } from '../app/message-outbox';
 import type { PendingConversationMessage } from '../app/message-outbox';
 import { messageVariantOutbox } from '../app/message-variant-outbox';
@@ -190,6 +191,11 @@ function mockCommon(options: { conversations?: Conversation[]; messages?: Conver
   vi.spyOn(portalApi, 'sharedHosts').mockResolvedValue({ items: [] });
   vi.spyOn(portalApi, 'execution').mockResolvedValue({ owner_id: 'u1234567', state: 'enabled', epoch: 1, pending_task_count: 0,
     runtime: { state: 'running', runtime_id: 'rt1234567', runtime_generation: 1, max_concurrent_tasks: 4, active_task_count: 0 }, updated_at: timestamp });
+}
+
+function failedConversationMessage(overrides: Record<string, unknown> = {}): ConversationMessage {
+  return { ...message, id: 'm2345678', sequence: 2, task_id: undefined, related_task_id: undefined, duplicate_of_message_id: undefined,
+    actor_id: authUser.id, routing_status: 'failed', routing_failure_reason: 'model_unavailable', delivery_status: 'pending', ...overrides } as ConversationMessage;
 }
 
 describe('Assistant durable tasks', () => {
@@ -3072,15 +3078,163 @@ describe('Assistant durable tasks', () => {
   });
 
   it('keeps a failed route bubble free of status and retry controls', async () => {
-    mockCommon({ conversations: [conversation], messages: [{ ...message, task_id: undefined,
-      routing_status: 'failed', routing_failure_reason: 'model_unavailable', delivery_status: 'pending' }] });
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage()] });
     const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing');
     renderPage();
     const article = await screen.findByRole('article', { name: '你的消息' });
     expect(within(article).getByText(message.content)).toBeInTheDocument();
     expect(within(article).queryByRole('status')).not.toBeInTheDocument();
     expect(within(article).queryByRole('button')).not.toBeInTheDocument();
+    const statusRow = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    expect(within(statusRow).getByText('消息已保存但尚未处理')).toBeInTheDocument();
+    expect(await within(statusRow).findByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
     expect(retry).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['model_unavailable', '系统报告：模型暂时不可用或用量待核对', '确认模型可用性和用量后，可以重新处理这条消息。', true],
+    ['routing_context_unavailable', '系统报告：消息上下文暂时无法读取', '可以安全重试，让系统重新读取会话上下文并处理原消息。', true],
+    ['routing_action_unavailable', '系统报告：处理状态暂时无法更新', '可以安全重试，让系统重新检查消息处理状态。', true],
+    ['message_too_long', '系统报告：消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。',
+      '原文已保留；请缩短后重新发送，不能重试这条原文。', false],
+  ] as const)('shows a separate Morde status row and truthful next step for %s', async (reason, mappedReason, nextStep, retryAllowed) => {
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage({ routing_failure_reason: reason })] });
+    renderPage();
+
+    const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    expect(within(row).getByText('消息已保存但尚未处理')).toBeInTheDocument();
+    expect(within(row).getByText(mappedReason)).toBeInTheDocument();
+    expect(within(row).getByText(nextStep)).toBeInTheDocument();
+    if (retryAllowed) expect(await within(row).findByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
+    else expect(within(row).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+    const article = await screen.findByRole('article', { name: '你的消息' });
+    expect(within(article).queryByRole('status')).not.toBeInTheDocument();
+    expect(within(article).queryByRole('button')).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['actor does not match', { actor_id: 'u7654321' }, '只有发送这条消息的账号可以重新处理。'],
+    ['actor is missing', { actor_id: undefined }, '只有发送这条消息的账号可以重新处理。'],
+  ])('does not enable route retry when %s', async (_case, identity, nextStep) => {
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage(identity)] });
+    renderPage();
+
+    const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    expect(within(row).getByText(nextStep)).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+  });
+
+  it('does not offer retry when the service has not confirmed automatic message routing', async () => {
+    const baseCapabilities = clientContract.capabilities.cloud_execution;
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage()],
+      capabilities: { ...baseCapabilities,
+        supported_features: baseCapabilities.supported_features.filter((feature) => feature !== 'conversation_auto_routing_v1') } });
+    renderPage();
+
+    const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    expect(within(row).getByText('当前服务未开放安全重试；消息已保留，请稍后检查服务功能。')).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+  });
+
+  it.each(['service instance changed', 'routing capability disappeared'] as const)(
+    'rechecks %s before dispatching a failed-message retry', async (change) => {
+      const baseCapabilities = clientContract.capabilities.cloud_execution;
+      const confirmed = { ...baseCapabilities,
+        supported_features: [...baseCapabilities.supported_features, 'conversation_auto_routing_v1'] };
+      const changed = change === 'service instance changed'
+        ? { ...confirmed, service_instance_id: 'a-different-service-instance' }
+        : { ...confirmed, supported_features: confirmed.supported_features.filter((feature) => feature !== 'conversation_auto_routing_v1') };
+      mockCommon({ conversations: [conversation], messages: [failedConversationMessage()] });
+      const capabilityCheck = vi.mocked(portalApi.capabilities);
+      capabilityCheck.mockReset().mockResolvedValueOnce(confirmed).mockResolvedValueOnce(changed);
+      const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing');
+      const user = userEvent.setup();
+      renderPage();
+
+      const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+      await user.click(await within(row).findByRole('button', { name: '重新处理这条消息' }));
+      await waitFor(() => expect(capabilityCheck).toHaveBeenCalledTimes(2));
+      expect(retry).not.toHaveBeenCalled();
+      expect(localStorage.getItem(`morde:message-processing-retry:${confirmed.service_instance_id}:${authUser.id}::${conversation.id}:m2345678`)).toBeNull();
+    });
+
+  it('fails closed if the service instance changes while retry capability is being checked', async () => {
+      const failed = failedConversationMessage();
+      const confirmed = { ...clientContract.capabilities.cloud_execution,
+        supported_features: [...clientContract.capabilities.cloud_execution.supported_features, 'conversation_auto_routing_v1'] };
+      let resolveCapabilityCheck: ((value: typeof confirmed) => void) | undefined;
+      const capabilityCheckPromise = new Promise<typeof confirmed>((resolve) => { resolveCapabilityCheck = resolve; });
+      mockCommon({ conversations: [conversation], messages: [failed] });
+      const capabilityCheck = vi.mocked(portalApi.capabilities);
+      capabilityCheck.mockReset().mockResolvedValueOnce(confirmed).mockImplementationOnce(() => capabilityCheckPromise);
+      const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing');
+      const user = userEvent.setup();
+      const { client } = renderPage();
+
+      const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+      await user.click(await within(row).findByRole('button', { name: '重新处理这条消息' }));
+      await waitFor(() => expect(capabilityCheck).toHaveBeenCalledTimes(2));
+      act(() => {
+        client.setQueryData(['service-capabilities'], { ...confirmed, service_instance_id: 'a-different-service-instance',
+          supported_features: confirmed.supported_features.filter((feature) => feature !== 'conversation_auto_routing_v1') });
+      });
+      await waitFor(() => expect(within(row).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument());
+      resolveCapabilityCheck?.(confirmed);
+
+      expect(await screen.findByText('账号或服务身份已变化；未发送重试请求。')).toBeInTheDocument();
+      expect(retry).not.toHaveBeenCalled();
+      expect(localStorage.getItem(`morde:message-processing-retry:${confirmed.service_instance_id}:u1234567::${conversation.id}:${failed.id}`)).toBeNull();
+    });
+
+  it('reuses one idempotency key after an uncertain retry and clears it only when routing leaves failed', async () => {
+    const failed = failedConversationMessage();
+    const serviceInstanceID = clientContract.capabilities.cloud_execution.service_instance_id;
+    let rejectFirstAttempt: ((reason?: unknown) => void) | undefined;
+    const firstAttempt = new Promise<void>((_resolve, reject) => { rejectFirstAttempt = reject; });
+    mockCommon({ conversations: [conversation], messages: [failed] });
+    const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing')
+      .mockImplementationOnce(() => firstAttempt).mockResolvedValueOnce(undefined);
+    const user = userEvent.setup();
+    const { client } = renderPage();
+
+    const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    const retryButton = await within(row).findByRole('button', { name: '重新处理这条消息' });
+    await user.click(retryButton);
+    await waitFor(() => expect(retry).toHaveBeenCalledOnce());
+    expect(retryButton).toBeDisabled();
+    await user.click(retryButton);
+    expect(retry).toHaveBeenCalledOnce();
+
+    const key = retry.mock.calls[0]?.[2];
+    expect(key).toBeTruthy();
+    expect(retry).toHaveBeenNthCalledWith(1, conversation.id, failed.id, key, serviceInstanceID, authUser.id);
+    const storageKey = `morde:message-processing-retry:${serviceInstanceID}:${authUser.id}::${conversation.id}:${failed.id}`;
+    rejectFirstAttempt?.(new Error('connection dropped after request'));
+    await waitFor(() => expect(retryButton).toBeEnabled());
+    expect(processingRetryKey(serviceInstanceID, authUser.id, '', conversation.id, failed.id)).toBe(key);
+
+    await user.click(retryButton);
+    await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
+    expect(retry).toHaveBeenNthCalledWith(2, conversation.id, failed.id, key, serviceInstanceID, authUser.id);
+    await waitFor(() => expect(localStorage.getItem(storageKey)).toBe(key));
+
+    const queryKey = ['conversation-messages', conversation.id] as const;
+    await waitFor(() => expect(client.getQueryData(queryKey)).toBeDefined());
+    const current = client.getQueryData<{ pages: Array<{ items: ConversationMessage[] }>; pageParams: unknown[] }>(queryKey);
+    expect(current).toBeDefined();
+    act(() => client.setQueryData(queryKey, { ...current!, pages: current!.pages.map((page) => ({
+      ...page, items: page.items.map((item) => item.id === failed.id ? { ...item, routing_status: 'pending' as const } : item),
+    })) }));
+    await waitFor(() => expect(localStorage.getItem(storageKey)).toBeNull());
+  });
+
+  it('does not offer retry for a failed message linked through related_task_id', async () => {
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage({ related_task_id: task.id })] });
+    renderPage();
+
+    await screen.findByText(message.content);
+    expect(screen.queryByRole('group', { name: 'Morde 的消息处理状态' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
   });
 
   it('shows failed result review status without a task-level retry action', async () => {

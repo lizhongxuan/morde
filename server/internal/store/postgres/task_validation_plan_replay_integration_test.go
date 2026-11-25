@@ -100,7 +100,7 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.Task.ID).Sc
 	manifestDigest := hex.EncodeToString(make([]byte, sha256.Size))
 	viewDigest := hex.EncodeToString(make([]byte, sha256.Size))
 	viewID := "v" + viewDigest
-	receipt := app.TaskValidationCheckExecutionReceipt{Version: 1, TaskRevision: plan.TaskRevision, PlanRevision: plan.Revision,
+	receipt := app.TaskValidationCheckExecutionReceipt{Version: 2, TaskRevision: plan.TaskRevision, PlanRevision: plan.Revision,
 		CheckID: "verify", Kind: string(check.Kind), Basis: string(check.Basis),
 		CommandSHA256: hex.EncodeToString(commandSHA[:]), CheckSHA256: hex.EncodeToString(checkSHA[:]),
 		CoverageSHA256: hex.EncodeToString(coverageSHA[:]), RequestSHA256: hex.EncodeToString(requestDigest)}
@@ -109,6 +109,7 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.Task.ID).Sc
 		"task_id": current.Task.ID, "workspace_id": workspaceValue.ID, "binding_version": bindingVersion,
 		"workspace_view_id": viewID, "workspace_checkpoint_revision": checkpointRevision,
 		"workspace_manifest_sha256_before": manifestDigest, "workspace_manifest_sha256_after": manifestDigest,
+		"workspace_snapshot_sha256_before": manifestDigest, "workspace_snapshot_sha256_after": manifestDigest,
 		"verification_check": receipt,
 	})
 	if err != nil {
@@ -119,8 +120,9 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.Task.ID).Sc
 	}
 	claim := app.TaskValidationReviewClaim{TaskID: current.Task.ID, OwnerID: current.Task.OwnerID,
 		InitiatorID: current.Task.InitiatorID, ConversationID: current.Task.ConversationID,
-		TaskRevision: plan.TaskRevision}
-	loadReplay := func() *app.TaskValidationReplayEvidence {
+		TaskRevision: plan.TaskRevision, ResultEventSequence: 1, ResultSHA256: hashBytes("review result"),
+		ClaimGeneration: 1, LeaseOwner: "h07-review-worker"}
+	loadReplay := func(proofs ...*app.TaskValidationFinalWorkspaceSnapshotProof) *app.TaskValidationReplayEvidence {
 		t.Helper()
 		tx, err := fixture.route.store.pool.Begin(ctx)
 		if err != nil {
@@ -135,7 +137,7 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.Task.ID).Sc
 		if err != nil {
 			t.Fatalf("read current Task Workspace facts: %v", err)
 		}
-		evidence, err := loadTaskValidationPlanCheckReplay(ctx, tx, claim, *storedPlan, taskFacts)
+		evidence, err := loadTaskValidationPlanCheckReplay(ctx, tx, claim, *storedPlan, taskFacts, proofs...)
 		if err != nil {
 			t.Fatalf("read typed verification replay: %v", err)
 		}
@@ -146,6 +148,77 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.Task.ID).Sc
 		got.Checks[0].Status != app.TaskValidationReplayPass || !got.Checks[0].RequirementSourceVerified ||
 		got.Checks[0].OperationID != created.ID || got.Checks[0].RunSequence < 1 {
 		t.Fatalf("typed plan check replay = %+v; want a receipt bound to the exact message, operation, and step, with H07 pending until a current Workspace snapshot is independently verified", got)
+	}
+	legacyReceipt := receipt
+	legacyReceipt.Version = 1
+	legacyResult, err := json.Marshal(map[string]any{
+		"exit_code": 0, "timed_out": false, "stdout": "", "stderr": "", "stdout_truncated": false, "stderr_truncated": false,
+		"task_id": current.Task.ID, "workspace_id": workspaceValue.ID, "binding_version": bindingVersion,
+		"workspace_view_id": viewID, "workspace_checkpoint_revision": checkpointRevision,
+		"workspace_manifest_sha256_before": manifestDigest, "workspace_manifest_sha256_after": manifestDigest,
+		"verification_check": legacyReceipt,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_operations SET result=$2 WHERE id=$1`, created.ID, string(legacyResult)); err != nil {
+		t.Fatalf("store legacy typed test operation result: %v", err)
+	}
+	if got := loadReplay(); len(got.Checks) != 1 || got.Checks[0].Status != app.TaskValidationReplayPending || got.State != app.TaskValidationReplayPending {
+		t.Fatalf("legacy check receipt without the shared snapshot digest = %+v; want pending", got)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_operations SET result=$2 WHERE id=$1`, created.ID, string(runtimeResult)); err != nil {
+		t.Fatalf("restore shared-digest typed test operation result: %v", err)
+	}
+	for _, deliveryStatus := range []string{"pending", "unknown"} {
+		if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE conversation_messages SET delivery_status=$2 WHERE id=$1`, sourceMessageID, deliveryStatus); err != nil {
+			t.Fatalf("set required user message delivery state %q: %v", deliveryStatus, err)
+		}
+		got := loadReplay()
+		if got.RequirementSetVerified || len(got.Checks) != 1 || got.Checks[0].RequirementSourceVerified ||
+			got.State != app.TaskValidationReplayPending {
+			t.Fatalf("required message with delivery status %q verified a plan requirement: %+v; want source unverified and H07 pending",
+				deliveryStatus, got)
+		}
+		if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE conversation_messages SET delivery_status='applied' WHERE id=$1`, sourceMessageID); err != nil {
+			t.Fatalf("restore applied required user message: %v", err)
+		}
+		if got := loadReplay(); len(got.Checks) != 1 || !got.Checks[0].RequirementSourceVerified {
+			t.Fatalf("restored applied user message did not restore source identity proof: %+v", got)
+		}
+	}
+	checkFact := loadReplay().Checks[0]
+	finalProof := &app.TaskValidationFinalWorkspaceSnapshotProof{Claim: claim,
+		TaskID: claim.TaskID, TaskRevision: claim.TaskRevision,
+		HostID: checkFact.HostID, RuntimeGeneration: checkFact.HostRuntimeGeneration,
+		RuntimeInstanceID: checkFact.HostRuntimeInstanceID, ControlVersion: checkFact.HostControlVersion,
+		WorkspaceID: checkFact.WorkspaceID, BindingVersion: checkFact.WorkspaceBindingVersion,
+		InputRevision: checkFact.InputRevision, WorkspaceCheckpointRevision: checkFact.WorkspaceCheckpointRevision,
+		InputManifestSHA256: checkFact.InputManifestSHA256, ViewID: checkFact.WorkspaceViewID,
+		SnapshotSHA256: checkFact.WorkspaceSnapshotSHA256After}
+	if got := loadReplay(finalProof); got.State != app.TaskValidationReplayPending || !got.FinalWorkspaceSnapshotVerified ||
+		got.FinalWorkspaceSnapshotProof == nil {
+		t.Fatalf("matching database-fenced final snapshot proof = %+v; final snapshot should verify while source-set completeness remains pending", got)
+	}
+	changedManifest := *finalProof
+	changedManifest.SnapshotSHA256 = hex.EncodeToString(hashBytes("changed final Workspace"))
+	if got := loadReplay(&changedManifest); got.FinalWorkspaceSnapshotVerified || got.State != app.TaskValidationReplayPending {
+		t.Fatalf("mismatched final manifest proof = %+v; want unverified and pending", got)
+	}
+	changedFence := *finalProof
+	changedFence.RuntimeInstanceID = "runtime-replaced"
+	if got := loadReplay(&changedFence); got.FinalWorkspaceSnapshotVerified || got.State != app.TaskValidationReplayPending {
+		t.Fatalf("mismatched Host Runtime proof = %+v; want unverified and pending", got)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id='runtime-replaced' WHERE id=$1`, fixture.host.ID); err != nil {
+		t.Fatalf("change current Host Runtime fence: %v", err)
+	}
+	if got := loadReplay(finalProof); got.FinalWorkspaceSnapshotVerified || got.State != app.TaskValidationReplayPending {
+		t.Fatalf("proof from prior Host Runtime instance = %+v; want unverified and pending", got)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE hosts SET runtime_instance_id=$2 WHERE id=$1`,
+		fixture.host.ID, checkFact.HostRuntimeInstanceID); err != nil {
+		t.Fatalf("restore Host Runtime fence: %v", err)
 	}
 	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE conversation_messages SET content=content||' changed'
 WHERE id=$1`, sourceMessageID); err != nil {

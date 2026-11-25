@@ -34,15 +34,16 @@ type taskValidationReviewRuntimeManager interface {
 }
 
 type TaskValidationReviewWorkerOptions struct {
-	Queue          app.TaskValidationReviewQueue
-	Snapshots      app.TaskValidationReviewSnapshotReader
-	AccountRuntime taskValidationReviewRuntimeManager
-	Models         TaskValidationReviewModelGateway
-	WorkerID       string
-	LeaseDuration  time.Duration
-	PollInterval   time.Duration
-	MaxConcurrent  int
-	Logger         *zap.Logger
+	Queue                   app.TaskValidationReviewQueue
+	Snapshots               app.TaskValidationReviewSnapshotReader
+	FinalWorkspaceSnapshots app.TaskValidationFinalWorkspaceSnapshotReader
+	AccountRuntime          taskValidationReviewRuntimeManager
+	Models                  TaskValidationReviewModelGateway
+	WorkerID                string
+	LeaseDuration           time.Duration
+	PollInterval            time.Duration
+	MaxConcurrent           int
+	Logger                  *zap.Logger
 }
 
 type TaskValidationReviewWorker struct {
@@ -218,8 +219,40 @@ func (w *TaskValidationReviewWorker) review(ctx context.Context, claim app.TaskV
 			if err := app.ValidateTaskValidationReviewCompletion(completion, input.Evidence); err != nil {
 				return err
 			}
-			_, err = w.options.Queue.CompleteTaskValidationReview(ctx, completion)
-			return err
+			var releaseSnapshot func(context.Context) error
+			if input.Replay != nil && w.options.FinalWorkspaceSnapshots != nil {
+				latest, snapshotErr := w.options.Snapshots.GetTaskValidationReviewSnapshot(ctx, claim)
+				if snapshotErr == nil && taskValidationReviewTaskMatchesClaim(latest.Task, claim) && latest.ValidationReplayEvidence != nil {
+					proof, release, proofErr := w.options.FinalWorkspaceSnapshots.ReadTaskValidationFinalWorkspaceSnapshot(ctx,
+						claim, latest.Task, latest.ValidationReplayEvidence)
+					if proofErr == nil {
+						completion.FinalWorkspaceSnapshotProof = proof
+						releaseSnapshot = release
+					} else if release != nil {
+						// Readers should not transfer a fence lease on failure, but
+						// release it defensively if an implementation does.
+						releaseSnapshot = release
+					}
+				}
+			}
+			completed, completeErr := w.options.Queue.CompleteTaskValidationReview(ctx, completion)
+			var cleanupErr error
+			if releaseSnapshot != nil {
+				cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+				cleanupErr = releaseSnapshot(cleanupCtx)
+				cleanupCancel()
+			}
+			if completeErr != nil {
+				return errors.Join(completeErr, cleanupErr)
+			}
+			if !completed {
+				return errors.Join(errors.New("Task validation review completion was not applied"), cleanupErr)
+			}
+			if cleanupErr != nil {
+				w.options.Logger.Warn("Task Workspace review snapshot fence cleanup failed after completion",
+					zap.String("task_id", claim.TaskID))
+			}
+			return nil
 		case "task_validation_review_failed", "task_validation_review_cancelled", "task_validation_review_terminated":
 			return errors.New("DSH Task validation review did not complete")
 		default:
@@ -356,6 +389,13 @@ func (w *TaskValidationReviewWorker) reviewInput(ctx context.Context, claim app.
 		input.EvidenceDetails = append(input.EvidenceDetails, item)
 	}
 	return input, nil
+}
+
+func taskValidationReviewTaskMatchesClaim(current task.Task, claim app.TaskValidationReviewClaim) bool {
+	return current.ID == claim.TaskID && current.OwnerID == claim.OwnerID && current.InitiatorID == claim.InitiatorID &&
+		current.ConversationID == claim.ConversationID && current.Status == task.StatusCompleted &&
+		current.CurrentRevision != nil && *current.CurrentRevision == claim.TaskRevision &&
+		current.DesiredRevision != nil && *current.DesiredRevision == claim.TaskRevision
 }
 
 func taskValidationReviewStepMatches(step task.Step, taskID string, revision int64,

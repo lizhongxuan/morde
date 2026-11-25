@@ -247,6 +247,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 						return true, nil
 					}
 				}
+				return true, w.failRoute(ctx, claim, "routing_context_unavailable", err)
 			}
 			if !snapshot.PreviousMissing && claim.Input.ResultReviewID == "" && domain.CodeOf(err) == domain.CodeConflict && ctx.Err() == nil {
 				if recovery, ok := w.options.Actions.(app.ConversationRouteContextRecovery); ok {
@@ -847,30 +848,4 @@ func safeConversationRouteDecision(value app.ConversationRouteContext, decision 
 		}
 	}
 	return clarify
-}
-
-// conversationRouteClassifyFallback safely handles a message whose model
-// classification failed. It never derives a task action from message text.
-func conversationRouteClassifyFallback(value app.ConversationRouteContext) app.ConversationRouteDecision {
-	if value.ReferenceUnavailable {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify, Question: app.UnavailableRouteReferenceMessage}
-	}
-	if value.PreviousMissing {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "我无法确认这条消息依赖的上下文。请补充相关内容，或把请求完整重发。"}
-	}
-	if value.PreviousUnresolved {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "上一条请求还没有完成，这条消息尚未执行。请补充你希望完成的目标，以及它与上一项工作的关系。"}
-	}
-	if value.ContentTruncated || len(value.ContentSources) != 0 {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "我还不能确认这条请求的完整目标，因此尚未执行。请补充完整需求或说明希望完成的工作。"}
-	}
-	if value.ResultReview != nil {
-		return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-			Question: "我无法确认这条结果反馈的处理意图，因此尚未修改任务结果。请补充希望调整的内容。"}
-	}
-	return app.ConversationRouteDecision{Action: app.ConversationRouteClarify,
-		Question: "我还不能确认你希望完成什么，因此尚未执行任务操作。请补充具体目标。"}
 }

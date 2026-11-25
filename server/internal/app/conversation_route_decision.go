@@ -986,10 +986,7 @@ func ValidConversationRouteSteerTarget(taskID string, value ConversationRouteCon
 }
 
 func conversationRouteJoinCandidateEligible(candidate ConversationRouteRequestCandidate) bool {
-	if !candidate.SameExecutionScope {
-		return false
-	}
-	if candidate.AggregationWaiting && !candidate.SameAuthorization {
+	if !candidate.SameExecutionScope || !candidate.SameAuthorization {
 		return false
 	}
 	if candidate.AggregationClosed {

@@ -75,13 +75,15 @@ func (m coordinatorRouteGatewayTest) ClassifyConversationRoute(ctx context.Conte
 
 func TestConversationRouteRepairsOneInvalidOutputWithSeparateMeteredCall(t *testing.T) {
 	for _, test := range []struct {
-		name          string
-		secondReply   string
-		wantFinal     string
-		wantRouteDone bool
+		name              string
+		secondReply       string
+		wantFinal         string
+		wantFailureReason string
+		wantRouteDone     bool
 	}{
 		{name: "valid repair", secondReply: `{"action":"reply","task_id":"","question":"","reply":"你好。"}`, wantFinal: "routed", wantRouteDone: true},
-		{name: "second invalid output asks user to clarify", secondReply: "still not json", wantFinal: "waiting_user"},
+		{name: "second invalid output fails without asking for clarification", secondReply: "still not json",
+			wantFinal: "failed", wantFailureReason: "routing_action_unavailable"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := &routeModelClientTest{reply: "not json", secondReply: test.secondReply}
@@ -104,28 +106,101 @@ func TestConversationRouteRepairsOneInvalidOutputWithSeparateMeteredCall(t *test
 			if calls := client.calls.Load(); calls != 2 {
 				t.Fatalf("provider calls = %d, want initial plus one repair", calls)
 			}
-			var state, invalidDecision string
+			var state, failureReason, invalidDecision string
 			var attempts, settled, invalid, firstCallAttempt, lastCallAttempt int64
-			if err := store.pool.QueryRow(context.Background(), `SELECT r.state,r.route_attempt,
+			if err := store.pool.QueryRow(context.Background(), `SELECT r.state,r.route_attempt,r.failure_reason,
  (SELECT c.decision::text FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.state='settled' AND c.decision->>'invalid_output'='true' ORDER BY c.attempt LIMIT 1),
  (SELECT count(*) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.state='settled'),
  (SELECT count(*) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.state='settled' AND c.decision->>'invalid_output'='true'),
  (SELECT min(c.attempt) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.state='settled'),
  (SELECT max(c.attempt) FROM conversation_route_model_calls c WHERE c.message_id=r.message_id AND c.state='settled')
 				FROM conversation_message_routes r WHERE r.message_id=$1`, claim.Message.ID).
-				Scan(&state, &attempts, &invalidDecision, &settled, &invalid, &firstCallAttempt, &lastCallAttempt); err != nil {
+				Scan(&state, &attempts, &failureReason, &invalidDecision, &settled, &invalid, &firstCallAttempt, &lastCallAttempt); err != nil {
 				t.Fatal(err)
 			}
 			wantInvalid := 1
 			if !test.wantRouteDone {
 				wantInvalid = 2
 			}
-			if state != test.wantFinal || attempts < lastCallAttempt || settled != 2 || invalid != int64(wantInvalid) || lastCallAttempt-firstCallAttempt != 1 ||
+			if state != test.wantFinal || failureReason != test.wantFailureReason || attempts < lastCallAttempt || settled != 2 || invalid != int64(wantInvalid) || lastCallAttempt-firstCallAttempt != 1 ||
 				strings.Contains(invalidDecision, "not json") {
-				t.Fatalf("route repair state=%q route_attempt=%d settled=%d invalid=%d call_attempts=%d,%d, want %q/two distinct calls/%d invalid",
-					state, attempts, settled, invalid, firstCallAttempt, lastCallAttempt, test.wantFinal, wantInvalid)
+				t.Fatalf("route repair state=%q failure_reason=%q route_attempt=%d settled=%d invalid=%d call_attempts=%d,%d, want %q/%q/two distinct calls/%d invalid",
+					state, failureReason, attempts, settled, invalid, firstCallAttempt, lastCallAttempt, test.wantFinal, test.wantFailureReason, wantInvalid)
 			}
 		})
+	}
+}
+
+func TestConversationRouteStatusWithoutExplicitReferencePersistsAuthorizedTarget(t *testing.T) {
+	client := &routeModelClientTest{}
+	store, gateway, principal, initialClaim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+	initialSnapshot, err := store.LoadConversationRouteSnapshot(ctx, initialClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initialSnapshot.Context.ModelID = value.ModelID
+	if err := store.ApplyConversationRoute(ctx, initialClaim, initialSnapshot, app.ConversationRouteDecision{Action: app.ConversationRouteNew}); err != nil {
+		t.Fatalf("create status target Task: %v", err)
+	}
+	var targetTaskID string
+	if err := store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, initialClaim.Message.ID).Scan(&targetTaskID); err != nil {
+		t.Fatal(err)
+	}
+
+	content := "这个任务目前到哪一步？"
+	input := initialClaim.Input
+	requestHash, err := app.ConversationReceiptHash(initialClaim.Message.ConversationID, content, input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	message := conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: initialClaim.Message.OwnerID,
+		ActorID: principal.UserID, ConversationID: initialClaim.Message.ConversationID, Role: conversation.RoleUser, Content: content}
+	if _, _, err := store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{Message: message,
+		ServiceInstanceID: initialClaim.ServiceInstanceID, ClientID: "route-status-no-reference-001", Input: input,
+		RequestHash: requestHash, Authorization: initialClaim.Authorization}); err != nil {
+		t.Fatalf("accept status request without explicit Task reference: %v", err)
+	}
+	statusClaim, found, err := store.ClaimConversationRoute(ctx, "route-status-no-reference-worker", time.Minute)
+	if err != nil || !found || statusClaim.Message.ID != message.ID || statusClaim.Input.ReferenceTaskID != "" {
+		t.Fatalf("claim unreferenced status request: claim=%+v found=%t err=%v", statusClaim, found, err)
+	}
+	statusSnapshot, err := store.LoadConversationRouteSnapshot(ctx, statusClaim)
+	if err != nil || len(statusSnapshot.Context.Candidates) != 1 || statusSnapshot.Context.Candidates[0].TaskID != targetTaskID {
+		t.Fatalf("authorized status candidates=%+v err=%v", statusSnapshot.Context.Candidates, err)
+	}
+	statusSnapshot.Context.ModelID = value.ModelID
+	client.reply = fmt.Sprintf(`{"action":"status","task_id":%q,"question":""}`, targetTaskID)
+	decision, err := gateway.ClassifyConversationRoute(ctx, statusClaim, statusSnapshot.Context)
+	if err != nil || decision.Action != app.ConversationRouteStatus || decision.TaskID != targetTaskID ||
+		decision.ExpectedRevision != statusSnapshot.Context.Candidates[0].Revision {
+		t.Fatalf("status decision=%+v err=%v", decision, err)
+	}
+	if err := store.ApplyConversationRoute(ctx, statusClaim, statusSnapshot, decision); err != nil {
+		t.Fatalf("apply unreferenced status decision: %v", err)
+	}
+	var stored app.ConversationRouteDecision
+	if err := store.pool.QueryRow(ctx, `SELECT decision FROM conversation_route_model_calls
+WHERE message_id=$1 AND state='settled' AND phase='normal'`, message.ID).Scan(&stored); err != nil ||
+		stored.Action != app.ConversationRouteStatus || stored.TaskID != targetTaskID ||
+		stored.ExpectedRevision != decision.ExpectedRevision {
+		t.Fatalf("persisted status decision=%+v want=%+v err=%v", stored, decision, err)
+	}
+	var taskStatus, routeState, delivery, messageTaskID, reply string
+	var taskCount, stopCount int
+	if err := store.pool.QueryRow(ctx, `SELECT t.status,r.state,m.delivery_status,COALESCE(m.task_id,''),
+(SELECT count(*) FROM tasks WHERE conversation_id=$2),
+(SELECT count(*) FROM task_stop_requests WHERE task_id=$1),
+(SELECT content FROM conversation_messages WHERE conversation_id=$2 AND role='assistant' ORDER BY sequence DESC LIMIT 1)
+FROM tasks t JOIN conversation_message_routes r ON r.message_id=$3 JOIN conversation_messages m ON m.id=r.message_id
+WHERE t.id=$1`, targetTaskID, message.ConversationID, message.ID).
+		Scan(&taskStatus, &routeState, &delivery, &messageTaskID, &taskCount, &stopCount, &reply); err != nil {
+		t.Fatal(err)
+	}
+	if taskStatus != string(task.StatusQueued) || routeState != "routed" || delivery != string(conversation.DeliveryApplied) ||
+		messageTaskID != "" || taskCount != 1 || stopCount != 0 || reply != "该任务正在等待执行。" {
+		t.Fatalf("unreferenced status outcome task=%s route=%s delivery=%s message_task=%q tasks=%d stops=%d reply=%q",
+			taskStatus, routeState, delivery, messageTaskID, taskCount, stopCount, reply)
 	}
 }
 

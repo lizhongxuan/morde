@@ -20,3 +20,72 @@ button { padding: 8px 13px; border: 1px solid #a9c9ff; border-radius: 18px; back
 button:last-child { background: #3778ef; color: #fff; }
 button:disabled { opacity: .55; cursor: wait; }
 .status { min-height: 1.5em; color: #52657e; font-size: 12px; }
+
+body[data-layout="review"] {
+  padding: 0;
+  color: #334155;
+  font-family: "Yuanti SC", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+}
+
+.review-card, .review-card * { box-sizing: border-box; }
+.review-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 202px;
+  align-items: center;
+  gap: 20px;
+  padding: 17px 20px;
+}
+.review-content { min-width: 0; }
+.review-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; min-width: 0; }
+.review-shield {
+  display: grid;
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  place-items: center;
+  border-radius: 10px;
+  color: #2563eb;
+  background: #eff6ff;
+}
+.review-shield svg { width: 18px; height: 18px; }
+.review-heading h2 { min-width: 0; margin: 0; color: #293b55; font-size: 15px; line-height: 1.45; overflow-wrap: anywhere; }
+.review-pending { padding: 3px 7px; border-radius: 999px; color: #2563eb; background: #eff6ff; font-size: 11px; font-weight: 600; white-space: nowrap; }
+.review-operation, .review-basis { display: flex; align-items: baseline; gap: 9px; margin: 11px 0 0 42px; color: #465b76; font-size: 13px; line-height: 1.5; }
+.review-basis { margin-top: 5px; color: #64748b; }
+.review-operation > span:last-child, .review-basis > span:last-child { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.review-field-label { flex: 0 0 32px; color: #94a3b8; font-size: 11px; font-weight: 600; }
+.review-meta { display: flex; flex-wrap: wrap; gap: 7px; margin: 11px 0 0 42px; }
+.review-chip { display: inline-flex; align-items: center; gap: 5px; min-height: 23px; padding: 2px 8px; border: 1px solid #e7edf6; border-radius: 7px; color: #465b76; background: #fbfdff; font-size: 11px; font-weight: 650; overflow-wrap: anywhere; }
+.review-chip strong { color: #7b8ba1; font-weight: 500; }
+.review-risk { border-color: #f1dcaf; color: #9a6700; background: #fff7e8; }
+.review-risk strong { color: #9a6700; }
+.review-scope { border-color: #dbeafe; color: #2563eb; background: #f5f9ff; }
+.review-more { margin: 8px 0 0 42px; font-size: 11px; }
+.review-more .rows { color: #64748b; font-size: 12px; }
+.review-side { display: flex; flex-direction: column; align-items: stretch; gap: 11px; padding-left: 18px; border-left: 1px solid #edf2fa; }
+.review-expiry { display: flex; justify-content: flex-end; gap: 6px; color: #94a3b8; font-size: 11px; line-height: 1.4; white-space: nowrap; }
+.review-expiry svg { width: 13px; height: 13px; color: #8ba0bd; }
+.review-expiry time { color: #64748b; font-weight: 600; }
+.review-card .review-actions { display: flex; gap: 7px; margin: 0; }
+.review-card .review-actions button { min-height: 36px; padding: 0 12px; border: 1px solid #bfdbfe; border-radius: 10px; color: #2563eb; background: #fff; font-size: 12px; font-weight: 650; white-space: nowrap; }
+.review-card .review-actions button:first-child { flex: 0 0 65px; }
+.review-card .review-actions button:last-child { flex: 1; border-color: #3b82f6; color: #fff; background: #3b82f6; box-shadow: 0 4px 10px rgb(96 165 250 / 22%); }
+.review-card .review-actions button:focus-visible { outline: 3px solid #bfdbfe; outline-offset: 2px; }
+.review-card .review-actions button:disabled { cursor: not-allowed; }
+.review-side .status { margin: 0; min-height: 0; }
+.review-side .status:empty { display: none; }
+
+@media (max-width: 760px) {
+  .review-card { grid-template-columns: 1fr; gap: 14px; padding: 15px; }
+  .review-side { gap: 9px; padding: 12px 0 0; border-top: 1px solid #edf2fa; border-left: 0; }
+  .review-expiry { justify-content: flex-start; }
+  .review-card .review-actions { justify-content: flex-end; }
+  .review-card .review-actions button:last-child { flex: 0 0 auto; }
+}
+
+@media (max-width: 480px) {
+  .review-operation, .review-basis, .review-meta, .review-more { margin-left: 0; }
+  .review-field-label { flex-basis: 29px; }
+  .review-meta { gap: 5px; }
+  .review-chip { padding: 2px 6px; font-size: 10px; }
+}

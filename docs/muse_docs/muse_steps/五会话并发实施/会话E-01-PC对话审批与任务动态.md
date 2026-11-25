@@ -6,7 +6,9 @@
 
 **设计与交接：**按[审批卡与工作项](<01-复杂链路设计与交接.md#approval-activity>)处理双入口的一致身份、断线待确认及通用资源沙箱；终态事实见[交付设计](<01-复杂链路设计与交接.md#terminal-validation>)。
 
-- [ ] **E01-1 对话与任务控制（PC 呈现完成；语义路由集成待验）。**复用现有 `Assistant.tsx`、会话和澄清接口：普通问题自然回复，明确任务继续 / 停止经 B 的语义路由；失败 / 等待 / 合并依据实际事实呈现，不恢复机械中断状态行。本轮在实际 PC 验证了搜索请求、任务结果、等待授权和批准后完成；Assistant 定向测试覆盖失败、未知、等待、任务隔离、合并结果和停止意图呈现。T45–T48/T51 的真实语义路由仍须结合 B 的后端和真实模型做集成验收。
+- [ ] **E01-1 对话与任务控制（PC 呈现完成；语义路由集成待验，失败消息状态/安全重试本地实现及定向测试完成）。**复用现有 `Assistant.tsx`、会话和澄清接口：普通问题自然回复，明确任务继续 / 停止经 B 的语义路由；失败 / 等待 / 合并依据实际事实呈现，不恢复机械中断状态行。本轮在实际 PC 验证了搜索请求、任务结果、等待授权和批准后完成；Assistant 定向测试覆盖失败、未知、等待、任务隔离、合并结果和停止意图呈现。T45–T48/T51 的真实语义路由仍须结合 B 的后端和真实模型做集成验收。
+  - [x] C-01 本地实现与定向测试：在原对话 Morde 行说明已保存但路由失败的原因及下一步；仅对发送账号匹配、未关联 Task / 重复消息且非超长的原消息提供 `retry-processing`，复用原服务端消息 ID 和持久幂等键。`Assistant.test.tsx` 256 项通过，`npm run typecheck` 通过。
+  - [ ] C-01 实际 PC + 可用服务回归：当前本机没有可用 Portal / Guardian，按本地修改约束未连接测试机或发送重试请求；源码 `make pc` 构建并启动过隔离 profile `/tmp/morde-e01-routing-retry-20261125`，但本轮无法读取该 PC 窗口，也没有 durable route-failure 样本。真实 PC 状态行与 retry POST 仍待验；不得重放结果未知的旧请求。
   - 验收：T45–T48、T51 中目标明确 / 歧义 / 合并 / 停止不串任务；思考状态、消息气泡与键盘交互符合体验目标。后端或真实模型未就绪时按层记录待验。
 - [ ] **E01-2 双入口 MCP Apps 审批（本地呈现已验证；完整场景待验）。**复用 `TaskApprovalMcpApp.tsx`、`TaskApprovalCard.tsx` 和 `Reviews.tsx`；原对话与审核区共享后端审批 ID / revision，任务动态无审批 / 停止 / 任务验证按钮；后端通用资源能力需要时交 A。本轮通过本地合成审批检查对话和 Reviews 待处理项、在对话允许后同一任务从等待点继续并完成；真实 DSH、撤权 / 过期 / 断线和跨端恢复另行记录。
   - 验收：T19–T21、T52–T53 的允许 / 拒绝、过期、撤权、重复提交、刷新 / 重连及沙箱隔离；断线时先核对服务端决定，通用资源加载失败不自动批准。批准不等于执行成功。实际 PC 与真实 DSH 分开记录。
@@ -40,5 +42,12 @@
 - 最新定向回归：`npx vitest run --maxWorkers=1 src/routes/Assistant.test.tsx src/routes/Reviews.test.tsx src/components/TaskApprovalMcpApp.integration.test.ts src/components/TaskApprovalCard.test.tsx src/components/ChatMermaid.test.tsx src/components/ChatMermaid.integration.test.tsx`，6 个文件、263 项通过；`npm run typecheck`、`make pc` 的 Portal / Workbench / Desktop 构建与 `git diff --check` 通过。Vite 构建有既有大 chunk 提示，不影响构建完成。
 - 更新后源码 `make pc` 在隔离 profile `/tmp/morde-e01-recheck-20261125` 启动到登录页，随后退出；未连接远端账号或新增云端电脑，以免影响并发中的 E02 默认电脑验收。对话、任务动态、审批卡、Reviews 和流程图的 PC 交互证据仍以本节前一条本地 fixture 实测为准，本次没有重做这些业务操作。
 - E01-1 至 E01-5 的本地客户端实现和上述 fixture 证据保留；E01-1/2/3/5 因整项验收仍有缺口保持未勾选，E01-4 的勾选仅表示本地 fixture 的实际 PC 交互层完成。真实 DSH / 语义路由、撤权与跨端刷新后的审批恢复、线上 MCP App 页面实际脚本、后端账本字段完整性及真实模型代码分析仍未验收，继续交 A/B/D 与 E02/A02 按对应 T 项记录。批准结果仍不能当作操作执行成功。
+
+### 2026-11-25 C-01 路由失败说明与安全重试
+
+- `Assistant.tsx` 对无 Task、无重复关联的失败用户消息增加独立 Morde 状态行，说明消息已保存但尚未处理、展示后端失败原因及下一步；模型不可用按系统事实说明，`message_too_long` 指引缩短后重发且不显示原消息重试入口。用户气泡没有增加状态脚注。
+- 重试仅在原消息发送账号匹配、消息仍为 `failed`、无 `task_id` / `related_task_id` / `duplicate_of_message_id`、非超长且服务声明并复核 `conversation_auto_routing_v1` 时开放；复用原 conversation/message ID 和持久幂等键。运行中重复点击被拦截，身份 / 服务能力变化时 fail-closed，结果不确定时保留同一幂等键，路由离开 `failed` 后清除。
+- 本地验证：`npm test -- --run src/routes/Assistant.test.tsx` 为 1 个文件、256 项通过；`npm run typecheck` 通过；`npm run build:pc` 通过。源码 `make pc` 在隔离 profile `/tmp/morde-e01-routing-retry-20261125` 完成构建并启动；验收结束后通过 Ctrl-C 结束该 profile。GUI 截图读取报 Screen Recording permission denied，且本地无可用 Portal / Guardian，因此没有观察到失败状态行，没有发送或重试业务请求。实际 PC 与真实服务交互仍待验；未连接远端、部署、上传文件或修改远端数据库。
+- 用户给出的截图对应的 T57 续接场景已经在 E-02 记录：首次“1”触发澄清；再次“1”按已列选项回复原任务仍在运行、Task 总数不变，但 route 的 `reference_task_id` 为空，不能证明权威绑定。该原任务结果仍需只读对账，不重新提交。
 
 E 统一协调实际 PC 操作，供 A-02 收口。下一批：[E-02](<会话E-02-PC同步与体验验收.md>)。

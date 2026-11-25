@@ -30,6 +30,8 @@ type taskStepShellOutput struct {
 	WorkspaceCheckpointRevision   *int64                               `json:"workspace_checkpoint_revision,omitempty"`
 	WorkspaceManifestSHA256Before string                               `json:"workspace_manifest_sha256_before,omitempty"`
 	WorkspaceManifestSHA256After  string                               `json:"workspace_manifest_sha256_after,omitempty"`
+	WorkspaceSnapshotSHA256Before string                               `json:"workspace_snapshot_sha256_before,omitempty"`
+	WorkspaceSnapshotSHA256After  string                               `json:"workspace_snapshot_sha256_after,omitempty"`
 	VerificationCheck             *TaskValidationCheckExecutionReceipt `json:"verification_check,omitempty"`
 }
 
@@ -38,16 +40,16 @@ type taskStepShellOutput struct {
 // check to the exact shell command and validates the Runtime Workspace facts.
 // It contains identifiers and digests only, never command output or file data.
 type TaskValidationCheckExecutionReceipt struct {
-	Version          int    `json:"version"`
-	TaskRevision     int64  `json:"task_revision"`
-	PlanRevision     int64  `json:"plan_revision"`
-	CheckID          string `json:"check_id"`
-	Kind             string `json:"kind"`
-	Basis            string `json:"basis"`
-	CommandSHA256    string `json:"command_sha256"`
-	CheckSHA256      string `json:"check_sha256"`
-	CoverageSHA256   string `json:"coverage_sha256"`
-	RequestSHA256    string `json:"request_sha256"`
+	Version        int    `json:"version"`
+	TaskRevision   int64  `json:"task_revision"`
+	PlanRevision   int64  `json:"plan_revision"`
+	CheckID        string `json:"check_id"`
+	Kind           string `json:"kind"`
+	Basis          string `json:"basis"`
+	CommandSHA256  string `json:"command_sha256"`
+	CheckSHA256    string `json:"check_sha256"`
+	CoverageSHA256 string `json:"coverage_sha256"`
+	RequestSHA256  string `json:"request_sha256"`
 }
 
 var taskStepSecretAssignment = regexp.MustCompile("(?i)((?:--)?(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|authorization|credential|client[_-]?secret|private[_-]?key|access[_-]?key|refresh[_-]?token)[\"']?\\s*(?:=|:|\\s)\\s*)(?:\"[^\"]*\"|'[^']*'|[^\\s,;}&]+)")

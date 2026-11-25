@@ -283,25 +283,40 @@ WHERE batch.message_id=$7 FOR SHARE OF batch,message`, claim.ServiceInstanceID, 
 func conversationTaskResultValidationStateInTx(ctx context.Context, tx pgx.Tx, ownerID string, source app.ConversationTaskResultSource) (app.TaskValidationState, error) {
 	pending := app.TaskValidationPending
 	digest := sha256.Sum256([]byte(source.Content))
-	var state app.TaskValidationState
-	err := tx.QueryRow(ctx, `SELECT review.validation_state
+	var locked bool
+	err := tx.QueryRow(ctx, `SELECT true
 FROM task_validation_reviews review
 JOIN tasks task ON task.id=review.task_id AND task.owner_id=review.owner_id
 JOIN task_events event ON event.task_id=review.task_id AND event.sequence=review.result_event_sequence
 WHERE review.task_id=$1 AND review.owner_id=$2 AND review.task_revision=$3
-	  AND review.result_event_sequence=$4 AND review.result_sha256=$5
+  AND review.result_event_sequence=$4 AND review.result_sha256=$5
   AND review.state='reviewed' AND task.status='completed'
   AND task.current_revision=review.task_revision AND task.desired_revision=review.task_revision
   AND task.result=$6 AND sha256(convert_to(task.result,'UTF8'))=review.result_sha256
   AND event.task_revision=review.task_revision AND event.event_type='task.result'
   AND event.result_content_sha256=review.result_sha256
   AND task_validation_artifact_evidence_current(review.task_id,review.owner_id,review.artifact_content_evidence)
-	FOR SHARE OF review, task, event`, source.TaskID, ownerID, source.TaskRevision, source.EventSequence, digest[:], source.Content).Scan(&state)
+FOR SHARE OF review,task,event`, source.TaskID, ownerID, source.TaskRevision, source.EventSequence, digest[:], source.Content).Scan(&locked)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return pending, nil
 	}
 	if err != nil {
+		return pending, fmt.Errorf("lock Task validation facts for result receipt: %w", err)
+	}
+	state, current, err := currentTaskValidationVerdictInTx(ctx, tx, source.TaskID, ownerID,
+		source.TaskRevision, source.EventSequence, digest[:])
+	if err != nil {
 		return pending, fmt.Errorf("read current Task validation verdict for result receipt: %w", err)
+	}
+	if !current {
+		return pending, nil
+	}
+	authorized, err := lockTaskValidationAuthorizationCurrentInTx(ctx, tx, source.TaskID, ownerID)
+	if err != nil {
+		return pending, fmt.Errorf("verify Task authorization before result receipt: %w", err)
+	}
+	if !authorized {
+		return pending, nil
 	}
 	if !app.ValidTaskValidationState(state) {
 		return pending, nil

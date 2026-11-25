@@ -91,16 +91,21 @@ const (
 	PlanVerificationRequirementProjectFile PlanVerificationRequirementSourceKind = "project_file"
 )
 
+const PlanVerificationRequirementCurrentTaskInputLocator = "current_task_input"
+
 // PlanVerificationRequirementSource identifies the source that makes a
 // verification check mandatory. The server must independently resolve the
 // referenced message or file and verify its digest before treating a required
 // check as applicable.
 type PlanVerificationRequirementSource struct {
-	Kind              PlanVerificationRequirementSourceKind `json:"kind"`
-	MessageID         string                                `json:"message_id,omitempty"`
-	WorkspacePath     string                                `json:"workspace_path,omitempty"`
-	WorkspaceRevision *int64                                `json:"workspace_revision,omitempty"`
-	ContentSHA256     string                                `json:"content_sha256"`
+	Kind PlanVerificationRequirementSourceKind `json:"kind"`
+	// Locator is accepted only on a new plan-tool submission. The Store resolves
+	// it to an immutable message ID before the plan is validated or persisted.
+	Locator           string `json:"locator,omitempty"`
+	MessageID         string `json:"message_id,omitempty"`
+	WorkspacePath     string `json:"workspace_path,omitempty"`
+	WorkspaceRevision *int64 `json:"workspace_revision,omitempty"`
+	ContentSHA256     string `json:"content_sha256,omitempty"`
 }
 
 // PlanVerificationCheck describes one check whose execution may contribute
@@ -221,6 +226,38 @@ func (p Plan) ValidateSubmission() error {
 	return nil
 }
 
+// ValidateSubmissionInput validates the locator form accepted at the DSH
+// tool boundary. It allows a required source to omit its digest because the
+// Store resolves and hashes that source before ValidateSubmission is called.
+// It never makes an unresolved locator valid as a persisted Plan.
+func (p Plan) ValidateSubmissionInput() error {
+	input := p
+	input.Steps = append([]PlanStep(nil), p.Steps...)
+	for index := range input.Steps {
+		check := input.Steps[index].VerificationCheck
+		if check == nil || check.RequirementSource == nil {
+			continue
+		}
+		source := *check.RequirementSource
+		if !source.validSubmissionInput() {
+			return errors.New("task plan verification requirement source locator is invalid")
+		}
+		source.Locator = ""
+		if source.Kind == PlanVerificationRequirementUserMessage && source.MessageID == "" {
+			// This placeholder is confined to the validation copy. The submitted
+			// plan still has no message ID until the Store resolves its locator.
+			source.MessageID = "m0000000"
+		}
+		if source.ContentSHA256 == "" {
+			source.ContentSHA256 = strings.Repeat("0", 64)
+		}
+		checkCopy := *check
+		checkCopy.RequirementSource = &source
+		input.Steps[index].VerificationCheck = &checkCopy
+	}
+	return input.Validate()
+}
+
 func (check PlanVerificationCheck) valid() bool {
 	if !validPlanVerificationCheckKind(check.Kind) ||
 		(check.Basis != PlanVerificationCheckRequired && check.Basis != PlanVerificationCheckRiskSelected) ||
@@ -245,7 +282,7 @@ func validPlanVerificationCheckKind(value PlanVerificationCheckKind) bool {
 }
 
 func (source PlanVerificationRequirementSource) valid() bool {
-	if !validPlanSHA256(source.ContentSHA256) {
+	if source.Locator != "" || !validPlanSHA256(source.ContentSHA256) {
 		return false
 	}
 	switch source.Kind {
@@ -254,6 +291,27 @@ func (source PlanVerificationRequirementSource) valid() bool {
 	case PlanVerificationRequirementProjectFile:
 		return source.MessageID == "" && validPlanRelativePath(source.WorkspacePath, false) &&
 			source.WorkspaceRevision != nil && *source.WorkspaceRevision >= 0
+	default:
+		return false
+	}
+}
+
+func (source PlanVerificationRequirementSource) validSubmissionInput() bool {
+	if source.ContentSHA256 != "" && !validPlanSHA256(source.ContentSHA256) {
+		return false
+	}
+	switch source.Kind {
+	case PlanVerificationRequirementUserMessage:
+		if source.WorkspacePath != "" || source.WorkspaceRevision != nil {
+			return false
+		}
+		if source.Locator == PlanVerificationRequirementCurrentTaskInputLocator {
+			return source.MessageID == ""
+		}
+		return source.Locator == "" && domain.ValidMessageID(source.MessageID)
+	case PlanVerificationRequirementProjectFile:
+		return source.Locator == "" && source.MessageID == "" &&
+			validPlanRelativePath(source.WorkspacePath, false) && source.WorkspaceRevision != nil && *source.WorkspaceRevision >= 0
 	default:
 		return false
 	}

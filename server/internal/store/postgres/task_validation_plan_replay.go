@@ -19,9 +19,10 @@ import (
 )
 
 type taskValidationReplayTask struct {
-	ownerID, conversationID, projectID, workspaceID string
-	inputRevision, checkpointRevision               pgtype.Int8
-	currentRevision, desiredRevision, authVersion   int64
+	ownerID, initiatorID, conversationID, projectID, workspaceID, hostID string
+	inputRevision, checkpointRevision                                    pgtype.Int8
+	contextDigest                                                        []byte
+	currentRevision, desiredRevision, authVersion                        int64
 }
 
 type taskValidationReplayBinding struct {
@@ -31,8 +32,10 @@ type taskValidationReplayBinding struct {
 	createdAt                                                                 time.Time
 	operationTaskRevision                                                     int64
 	operationCallID, operationToolName, operationStatus, operationWorkspaceID string
+	operationHostID, operationRuntimeInstanceID                               string
 	operationRequestHash                                                      []byte
 	operationBindingVersion, operationInputRevision, operationCheckpoint      int64
+	operationRuntimeGeneration, operationControlVersion                       int64
 	operationResult                                                           string
 	stepTaskRevision, stepSequence                                            int64
 	stepStatus, stepToolName, stepCallID, stepAgentSessionID                  string
@@ -53,6 +56,8 @@ type taskValidationReplayShellResult struct {
 	WorkspaceCheckpointRevision   *int64                                   `json:"workspace_checkpoint_revision"`
 	WorkspaceManifestSHA256Before string                                   `json:"workspace_manifest_sha256_before"`
 	WorkspaceManifestSHA256After  string                                   `json:"workspace_manifest_sha256_after"`
+	WorkspaceSnapshotSHA256Before string                                   `json:"workspace_snapshot_sha256_before"`
+	WorkspaceSnapshotSHA256After  string                                   `json:"workspace_snapshot_sha256_after"`
 	VerificationCheck             *app.TaskValidationCheckExecutionReceipt `json:"verification_check,omitempty"`
 }
 
@@ -85,7 +90,7 @@ func (s *Store) ReadTaskValidationReplayEvidence(ctx context.Context,
 		if err != nil {
 			return err
 		}
-		evidence, err = loadTaskValidationPlanCheckReplay(ctx, tx, claim, *plan, current)
+		evidence, err = loadTaskValidationPlanCheckReplay(ctx, tx, claim, *plan, current, nil)
 		return err
 	})
 	if err != nil {
@@ -96,18 +101,19 @@ func (s *Store) ReadTaskValidationReplayEvidence(ctx context.Context,
 
 func readTaskValidationReplayTask(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim) (taskValidationReplayTask, error) {
 	var current taskValidationReplayTask
-	err := tx.QueryRow(ctx, `SELECT owner_id,conversation_id,COALESCE(project_id,''),COALESCE(workspace_id,''),
-input_revision,workspace_checkpoint_revision,current_revision,desired_revision,auth_version
-FROM tasks WHERE id=$1`, claim.TaskID).Scan(&current.ownerID, &current.conversationID, &current.projectID,
-		&current.workspaceID, &current.inputRevision, &current.checkpointRevision, &current.currentRevision,
-		&current.desiredRevision, &current.authVersion)
+	err := tx.QueryRow(ctx, `SELECT owner_id,initiator_id,conversation_id,COALESCE(project_id,''),COALESCE(workspace_id,''),
+COALESCE(host_id,''),input_revision,workspace_checkpoint_revision,COALESCE(context_digest,''::bytea),
+current_revision,desired_revision,auth_version
+FROM tasks WHERE id=$1`, claim.TaskID).Scan(&current.ownerID, &current.initiatorID, &current.conversationID,
+		&current.projectID, &current.workspaceID, &current.hostID, &current.inputRevision, &current.checkpointRevision,
+		&current.contextDigest, &current.currentRevision, &current.desiredRevision, &current.authVersion)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return taskValidationReplayTask{}, missingTaskError()
 	}
 	if err != nil {
 		return taskValidationReplayTask{}, fmt.Errorf("read Task Workspace identity for H07: %w", err)
 	}
-	if current.ownerID != claim.OwnerID || current.conversationID != claim.ConversationID ||
+	if current.ownerID != claim.OwnerID || current.initiatorID != claim.InitiatorID || current.conversationID != claim.ConversationID ||
 		current.currentRevision != claim.TaskRevision || current.desiredRevision != claim.TaskRevision {
 		return taskValidationReplayTask{}, domain.NewError(domain.CodeConflict, "Task validation review result is no longer current")
 	}
@@ -115,7 +121,11 @@ FROM tasks WHERE id=$1`, claim.TaskID).Scan(&current.ownerID, &current.conversat
 }
 
 func loadTaskValidationPlanCheckReplay(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim,
-	plan task.Plan, current taskValidationReplayTask) (*app.TaskValidationReplayEvidence, error) {
+	plan task.Plan, current taskValidationReplayTask, finalProofs ...*app.TaskValidationFinalWorkspaceSnapshotProof) (*app.TaskValidationReplayEvidence, error) {
+	var finalProof *app.TaskValidationFinalWorkspaceSnapshotProof
+	if len(finalProofs) > 0 {
+		finalProof = finalProofs[0]
+	}
 	evidence := app.PendingTaskValidationReplayEvidence(&plan)
 	if evidence == nil {
 		return nil, nil
@@ -138,7 +148,9 @@ func loadTaskValidationPlanCheckReplay(ctx context.Context, tx pgx.Tx, claim app
 	rows, err := tx.Query(ctx, `SELECT b.plan_step_id,b.execution_kind,b.execution_id,b.agent_session_id,b.call_id,b.tool_name,
 b.task_revision,b.plan_revision,b.request_digest,b.authorization_version,b.created_at,
 COALESCE(op.task_revision,-1),COALESCE(op.call_id,''),COALESCE(op.tool_name,''),COALESCE(op.status,''),
-COALESCE(op.request_hash,''::bytea),COALESCE(op.workspace_id,''),COALESCE(op.binding_version,0),
+COALESCE(op.request_hash,''::bytea),COALESCE(op.workspace_id,''),COALESCE(op.host_id,''),
+COALESCE(op.runtime_generation,0),COALESCE(op.runtime_instance_id,''),COALESCE(op.control_version,-1),
+COALESCE(op.binding_version,0),
 COALESCE(op.input_revision,-1),COALESCE(op.workspace_checkpoint_revision,-1),COALESCE(op.result,''),
 COALESCE(step.task_revision,-1),COALESCE(step.sequence,0),COALESCE(step.status,''),COALESCE(step.tool_name,''),
 COALESCE(step.tool_call_key,''),COALESCE(step.agent_session_id,''),COALESCE(step.request_digest,''::bytea)
@@ -160,7 +172,9 @@ ORDER BY b.created_at,COALESCE(step.sequence,0)`, claim.OwnerID, claim.TaskID, c
 		if err := rows.Scan(&row.planStepID, &row.executionKind, &row.executionID, &row.agentSessionID, &row.callID,
 			&row.toolName, &row.taskRevision, &row.planRevision, &row.requestDigest, &row.authorizationVersion, &row.createdAt,
 			&row.operationTaskRevision, &row.operationCallID, &row.operationToolName, &row.operationStatus,
-			&row.operationRequestHash, &row.operationWorkspaceID, &row.operationBindingVersion,
+			&row.operationRequestHash, &row.operationWorkspaceID, &row.operationHostID,
+			&row.operationRuntimeGeneration, &row.operationRuntimeInstanceID, &row.operationControlVersion,
+			&row.operationBindingVersion,
 			&row.operationInputRevision, &row.operationCheckpoint, &row.operationResult,
 			&row.stepTaskRevision, &row.stepSequence, &row.stepStatus, &row.stepToolName, &row.stepCallID,
 			&row.stepAgentSessionID, &row.stepRequestDigest); err != nil {
@@ -200,15 +214,49 @@ ORDER BY b.created_at,COALESCE(step.sequence,0)`, claim.OwnerID, claim.TaskID, c
 		}
 		evidence.Checks[index].RequirementSourceVerified = verified
 	}
-	evidence.State = app.EvaluateTaskValidationPlanReplay(plan, evidence)
-	if evidence.State == app.TaskValidationReplayPass {
-		// The durable ledger contains the manifest captured during each check,
-		// but this Store has no independent read of the current Task Workspace
-		// manifest at review time. A passing run therefore cannot prove that
-		// the final delivered view still matches its post-check snapshot.
-		evidence.State = app.TaskValidationReplayPending
+	if finalProof != nil {
+		hostFence, err := readTaskValidationReplayHostFence(ctx, tx, current.hostID)
+		if err != nil {
+			return nil, err
+		}
+		baseline := app.TaskValidationReplaySnapshotBaseline{
+			OwnerID: current.ownerID, InitiatorID: current.initiatorID, ConversationID: current.conversationID,
+			TaskID: claim.TaskID, TaskRevision: current.currentRevision, HostID: current.hostID,
+			HostRuntimeGeneration: hostFence.runtimeGeneration, HostRuntimeInstanceID: hostFence.runtimeInstanceID,
+			HostControlVersion: hostFence.controlVersion, HostState: hostFence.state, HostControlState: hostFence.controlState,
+			WorkspaceID: current.workspaceID, InputRevision: current.inputRevision.Int64,
+			WorkspaceCheckpointRevision: current.checkpointRevision.Int64,
+			InputManifestSHA256:         hex.EncodeToString(current.contextDigest),
+		}
+		if app.TaskValidationFinalWorkspaceSnapshotProofMatchesReplay(claim, baseline, evidence.Checks, finalProof) {
+			evidence.FinalWorkspaceSnapshotVerified = true
+			evidence.FinalWorkspaceSnapshotProof = finalProof
+		}
 	}
+	evidence.State = app.EvaluateTaskValidationPlanReplay(plan, evidence)
 	return evidence, nil
+}
+
+type taskValidationReplayHostFence struct {
+	state, controlState, runtimeInstanceID string
+	runtimeGeneration, controlVersion      int64
+}
+
+func readTaskValidationReplayHostFence(ctx context.Context, tx pgx.Tx, hostID string) (taskValidationReplayHostFence, error) {
+	var fence taskValidationReplayHostFence
+	if !domain.ValidHostID(hostID) {
+		return fence, nil
+	}
+	err := tx.QueryRow(ctx, `SELECT state,control_state,runtime_generation,COALESCE(runtime_instance_id,''),control_version
+FROM hosts WHERE id=$1 FOR SHARE`, hostID).Scan(&fence.state, &fence.controlState,
+		&fence.runtimeGeneration, &fence.runtimeInstanceID, &fence.controlVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return taskValidationReplayHostFence{}, nil
+	}
+	if err != nil {
+		return taskValidationReplayHostFence{}, fmt.Errorf("read current Host fence for H07 proof: %w", err)
+	}
+	return fence, nil
 }
 
 func replayCheckFactFromBinding(claim app.TaskValidationReviewClaim, plan task.Plan,
@@ -230,7 +278,9 @@ func replayCheckFactFromBinding(claim app.TaskValidationReviewClaim, plan task.P
 		row.authorizationVersion != current.authVersion || len(row.requestDigest) != sha256.Size ||
 		row.operationTaskRevision != claim.TaskRevision || row.operationCallID != row.callID ||
 		row.operationToolName != row.toolName || !bytes.Equal(row.requestDigest, row.operationRequestHash) ||
-		row.operationWorkspaceID != current.workspaceID || row.operationBindingVersion < 1 ||
+		row.operationWorkspaceID != current.workspaceID || row.operationHostID != current.hostID ||
+		row.operationRuntimeGeneration < 1 || row.operationRuntimeInstanceID == "" || row.operationControlVersion < 0 ||
+		row.operationBindingVersion < 1 ||
 		row.operationInputRevision != current.inputRevision.Int64 || row.operationCheckpoint != current.checkpointRevision.Int64 ||
 		row.stepTaskRevision != claim.TaskRevision || row.stepSequence < 1 || row.stepToolName != row.toolName ||
 		row.stepCallID != row.callID || row.stepAgentSessionID != row.agentSessionID ||
@@ -244,12 +294,13 @@ func replayCheckFactFromBinding(claim app.TaskValidationReviewClaim, plan task.P
 		shell.TaskID != claim.TaskID || shell.WorkspaceID != current.workspaceID || shell.BindingVersion != row.operationBindingVersion ||
 		shell.WorkspaceCheckpointRevision == nil || *shell.WorkspaceCheckpointRevision != row.operationCheckpoint ||
 		!validReplayWorkspaceViewID(shell.WorkspaceViewID) || !validReplayDigest(shell.WorkspaceManifestSHA256Before) ||
-		!validReplayDigest(shell.WorkspaceManifestSHA256After) {
+		!validReplayDigest(shell.WorkspaceManifestSHA256After) || !validReplayDigest(shell.WorkspaceSnapshotSHA256Before) ||
+		!validReplayDigest(shell.WorkspaceSnapshotSHA256After) {
 		return fact
 	}
 	commandSHA256, checkSHA256, coverageSHA256, ok := replayPlanCheckDigests(*check)
 	proof := shell.VerificationCheck
-	if !ok || proof.Version != 1 || proof.TaskRevision != claim.TaskRevision || proof.PlanRevision != plan.Revision ||
+	if !ok || proof.Version != 2 || proof.TaskRevision != claim.TaskRevision || proof.PlanRevision != plan.Revision ||
 		proof.CheckID != row.planStepID || proof.Kind != string(check.Kind) || proof.Basis != string(check.Basis) ||
 		proof.CommandSHA256 != commandSHA256 || proof.CheckSHA256 != checkSHA256 || proof.CoverageSHA256 != coverageSHA256 ||
 		proof.RequestSHA256 != hex.EncodeToString(row.requestDigest) ||
@@ -264,6 +315,12 @@ func replayCheckFactFromBinding(claim app.TaskValidationReviewClaim, plan task.P
 	fact.WorkspaceID, fact.WorkspaceBindingVersion = shell.WorkspaceID, shell.BindingVersion
 	fact.WorkspaceCheckpointRevision, fact.WorkspaceViewID = *shell.WorkspaceCheckpointRevision, shell.WorkspaceViewID
 	fact.WorkspaceManifestSHA256Before, fact.WorkspaceManifestSHA256After = shell.WorkspaceManifestSHA256Before, shell.WorkspaceManifestSHA256After
+	fact.WorkspaceSnapshotSHA256Before, fact.WorkspaceSnapshotSHA256After = shell.WorkspaceSnapshotSHA256Before, shell.WorkspaceSnapshotSHA256After
+	fact.HostID, fact.HostRuntimeGeneration, fact.HostRuntimeInstanceID = row.operationHostID, row.operationRuntimeGeneration, row.operationRuntimeInstanceID
+	fact.HostControlVersion, fact.InputRevision = row.operationControlVersion, row.operationInputRevision
+	if len(current.contextDigest) == sha256.Size {
+		fact.InputManifestSHA256 = hex.EncodeToString(current.contextDigest)
+	}
 	if row.operationStatus == "failed" && (shell.ExitCode != 0 || shell.TimedOut) {
 		fact.Status = app.TaskValidationReplayFail
 	} else if row.operationStatus == "succeeded" && shell.ExitCode == 0 && !shell.TimedOut {
@@ -330,7 +387,8 @@ func taskValidationPlanCheckRequirementSourceVerified(ctx context.Context, tx pg
 		}
 		var content string
 		err := tx.QueryRow(ctx, `SELECT content FROM conversation_messages WHERE id=$1 AND owner_id=$2
-AND conversation_id=$3 AND task_id=$4 AND role='user'`, source.MessageID, claim.OwnerID, claim.ConversationID, claim.TaskID).Scan(&content)
+AND conversation_id=$3 AND task_id=$4 AND role='user' AND delivery_status='applied'`,
+			source.MessageID, claim.OwnerID, claim.ConversationID, claim.TaskID).Scan(&content)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil
 		}

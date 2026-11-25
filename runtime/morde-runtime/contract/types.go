@@ -614,6 +614,7 @@ type TaskWorkspaceManifestResponse struct {
 	InputManifestSHA256         string                           `json:"input_manifest_sha256"`
 	ViewID                      string                           `json:"view_id"`
 	ManifestSHA256              string                           `json:"manifest_sha256"`
+	WorkspaceSnapshotSHA256     string                           `json:"workspace_snapshot_sha256,omitempty"`
 	Files                       []TaskWorkspaceManifestFile      `json:"files"`
 	EmptyDirectories            []string                         `json:"empty_directories"`
 	Directories                 []TaskWorkspaceManifestDirectory `json:"directories"`
