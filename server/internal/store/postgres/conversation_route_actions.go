@@ -21,6 +21,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
@@ -2937,7 +2938,7 @@ FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Sca
 		}
 		auth := task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID,
 			ClientInstallationID: principal.ClientInstallationID, Version: 1, ExpiresAt: &expiresAt}
-	for _, scope := range tokenScopes {
+		for _, scope := range tokenScopes {
 			auth.Scopes = append(auth.Scopes, scope)
 		}
 		if sourceKind == "task_result_review" {
@@ -3052,7 +3053,7 @@ WHERE message_id=$1 AND actor_id=$2 AND state='unknown')`, messageID, actorID).S
 			return app.ConversationMessageRetryEligibility{}, fmt.Errorf("check unknown result review call before retry: %w", err)
 		}
 		if unknownReviewCall {
-			return ineligible(app.ConversationMessageRetryReasonReconciliationRequired), nil
+			return ineligible(app.ConversationMessageRetryReasonReviewOutcomeUnknown), nil
 		}
 	}
 	if state != "failed" {
@@ -3101,6 +3102,8 @@ func conversationRouteRetryEligibilityError(reason string) error {
 		return domain.NewError(domain.CodeInvalidState, "conversation message exceeded processing limits and cannot be retried unchanged")
 	case app.ConversationMessageRetryReasonReconciliationRequired:
 		return domain.NewError(domain.CodeInvalidState, "model call outcome or shared usage must be reconciled before retry")
+	case app.ConversationMessageRetryReasonReviewOutcomeUnknown:
+		return domain.NewError(domain.CodeConflict, "conversation route is still processing and cannot be retried")
 	case app.ConversationMessageRetryReasonProcessing:
 		return domain.NewError(domain.CodeConflict, "conversation route is still processing and cannot be retried")
 	case app.ConversationMessageRetryReasonLimitReached:
@@ -3154,38 +3157,32 @@ WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r
 		if _, _, err := authorizeConversationRouteRetryInTx(ctx, tx, principal); err != nil {
 			return err
 		}
-		var requestHash []byte
 		var state, failureReason, sourceKind, resultReviewID string
 		var routeAttempt int64
 		var taskID *string
-		err = tx.QueryRow(ctx, `SELECT r.request_hash,r.state,r.failure_reason,m.task_id,m.source_kind,
+		err = tx.QueryRow(ctx, `SELECT r.state,r.failure_reason,m.task_id,m.source_kind,
 COALESCE(r.request_metadata->>'result_review_id',''),r.route_attempt
 FROM conversation_message_routes r
 JOIN conversation_messages m ON m.id=r.message_id AND m.actor_id=r.actor_id AND m.conversation_id=r.conversation_id AND m.owner_id=r.owner_id
 WHERE r.service_instance_id=$1::uuid AND r.message_id=$2 AND r.actor_id=$3 AND r.conversation_id=$4
 FOR SHARE OF r,m`, instanceID, messageID, principal.UserID, conversationID).
-			Scan(&requestHash, &state, &failureReason, &taskID, &sourceKind, &resultReviewID, &routeAttempt)
+			Scan(&state, &failureReason, &taskID, &sourceKind, &resultReviewID, &routeAttempt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "conversation message not found")
 		}
 		if err != nil {
 			return fmt.Errorf("read conversation route retry eligibility: %w", err)
 		}
-		_ = requestHash
-		eligibility, err := conversationRouteRetryEligibilityInTx(ctx, tx, messageID, principal.UserID,
+		currentEligibility, err := conversationRouteRetryEligibilityInTx(ctx, tx, messageID, principal.UserID,
 			state, failureReason, taskID, sourceKind, resultReviewID, routeAttempt)
 		if err != nil {
 			return err
 		}
-		eligibility = cloneConversationMessageRetryEligibility(eligibility)
+		eligibility = currentEligibility
 		return nil
 	})
 	if err != nil {
 		return app.ConversationMessageRetryEligibility{}, err
 	}
 	return eligibility, nil
-}
-
-func cloneConversationMessageRetryEligibility(value app.ConversationMessageRetryEligibility) app.ConversationMessageRetryEligibility {
-	return value
 }
