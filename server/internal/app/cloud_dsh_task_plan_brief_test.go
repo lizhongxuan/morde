@@ -171,7 +171,9 @@ func TestAdvisoryHostWriteRejectsRevokedAuthorization(t *testing.T) {
 func briefPlan(revision int64, complete bool) *task.Plan {
 	plan := &task.Plan{TaskRevision: 0, Revision: revision, Goal: "Fix the login crash", CostEstimateState: "unknown",
 		Steps: []task.PlanStep{{ID: "repro", Title: "Reproduce", Status: task.PlanStepPending,
-			CompletionCriteria: []string{"crash reproduces"}}}}
+			CompletionCriteria: []string{"crash reproduces"},
+			VerificationCheck: &task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest,
+				Basis: task.PlanVerificationCheckRiskSelected, Command: "go test ./...", CoveragePaths: []string{"auth"}}}}}
 	if complete {
 		plan.Scope = "auth package only"
 		plan.VerificationMethod = "run the failing test"

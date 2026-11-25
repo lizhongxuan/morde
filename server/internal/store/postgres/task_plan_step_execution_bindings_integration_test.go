@@ -1,6 +1,7 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/json"
@@ -561,4 +562,199 @@ func assertTaskPlanReadiness(t *testing.T, store *Store, current task.Task, plan
 		t.Fatalf("CheckCloudDSHTaskPlanStepReadiness(%q) = ready:%t reason:%q err:%v; want ready:%t reason:%q",
 			stepID, ready, reason, err, wantReady, wantReason)
 	}
+}
+
+func TestPostgresCloudDSHTaskPlanStepReadBindingRequiresExactSettlement(t *testing.T) {
+	fixture := createS03RunningAgentTask(t, newRouteActionsTestFixture(t), "plan-step-read-binding", true)
+	ctx := context.Background()
+	plan := task.Plan{TaskRevision: *fixture.task.CurrentRevision, Revision: 1, Goal: "Prepare a verified report",
+		Scope: "Read approved sources and prepare a report", VerificationMethod: "Check the report evidence", CostEstimateState: "unknown",
+		Steps: []task.PlanStep{
+			{ID: "sources", Title: "Read sources", Status: task.PlanStepCompleted,
+				CompletionCriteria: []string{"source material is recorded"}, Outputs: []string{"source notes"}},
+			{ID: "report", Title: "Prepare report", Status: task.PlanStepCompleted, DependsOn: []string{"sources"},
+				CompletionCriteria: []string{"report is verified"}, Outputs: []string{"report"}},
+			{ID: "final", Title: "Verify report", Status: task.PlanStepCompleted, DependsOn: []string{"report"},
+				CompletionCriteria: []string{"report evidence is verified"}, Outputs: []string{"verified report"}},
+		}}
+	current := commitTaskPlanForStepBinding(t, fixture, plan, "plan-read-binding-plan")
+
+	sourceCall := taskPlanBindingToolCall(fixture, current, "call_read_sources", "morde_read_task_attachment",
+		taskPlanStepTestDigest("source request"))
+	sourceResultDigest := taskPlanStepTestDigest("exact source result")
+	reportCall := taskPlanBindingToolCall(fixture, current, "call_read_report", "morde_workspace_read",
+		taskPlanStepTestDigest("report request"))
+	reportResultDigest := taskPlanStepTestDigest("exact report result")
+
+	assertTaskPlanReadiness(t, fixture.route.store, current, 1, "report", false, planStepReadinessMissingBinding)
+	if err := fixture.route.store.AdmitCloudDSHTaskPlanStepRead(ctx, current, 1, "report", reportCall); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("admit dependent read before its source settles = %v; want conflict", err)
+	}
+	if err := fixture.route.store.AdmitCloudDSHTaskPlanStepRead(ctx, current, 1, "sources", sourceCall); err != nil {
+		t.Fatalf("admit source read: %v", err)
+	}
+	assertTaskPlanReadiness(t, fixture.route.store, current, 1, "report", false, planStepReadinessEvidenceMissing)
+	if err := fixture.route.store.SettleCloudDSHTaskPlanStepRead(ctx, current, 1, "sources", sourceCall, sourceResultDigest); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("settle read without a TaskStep = %v; want conflict", err)
+	}
+
+	sourceStepID := commitToolCallStepForPlanBindingWithStatus(t, fixture, current, sourceCall,
+		"read-source-running", task.StepRunning, "")
+	if err := fixture.route.store.SettleCloudDSHTaskPlanStepRead(ctx, current, 1, "sources", sourceCall, sourceResultDigest); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("settle running read TaskStep = %v; want conflict", err)
+	}
+	assertTaskPlanReadiness(t, fixture.route.store, current, 1, "report", false, planStepReadinessPending)
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET status='failed' WHERE task_id=$1 AND id=$2`, current.ID, sourceStepID); err != nil {
+		t.Fatal(err)
+	}
+	assertTaskPlanReadiness(t, fixture.route.store, current, 1, "report", false, planStepReadinessFailed)
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET status='unknown' WHERE task_id=$1 AND id=$2`, current.ID, sourceStepID); err != nil {
+		t.Fatal(err)
+	}
+	assertTaskPlanReadiness(t, fixture.route.store, current, 1, "report", false, planStepReadinessUnknown)
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET status='succeeded' WHERE task_id=$1 AND id=$2`, current.ID, sourceStepID); err != nil {
+		t.Fatal(err)
+	}
+	assertTaskPlanReadiness(t, fixture.route.store, current, 1, "report", false, planStepReadinessPending)
+	if err := fixture.route.store.AdmitCloudDSHTaskPlanStepRead(ctx, current, 1, "report", reportCall); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("admit dependent read before source result digest settles = %v; want conflict", err)
+	}
+	if err := fixture.route.store.SettleCloudDSHTaskPlanStepRead(ctx, current, 1, "sources", sourceCall, sourceResultDigest); err != nil {
+		t.Fatalf("settle successful source read: %v", err)
+	}
+	if err := fixture.route.store.AdmitCloudDSHTaskPlanStepRead(ctx, current, 1, "sources", sourceCall); err != nil {
+		t.Fatalf("replay source admission: %v", err)
+	}
+	if err := fixture.route.store.SettleCloudDSHTaskPlanStepRead(ctx, current, 1, "sources", sourceCall, sourceResultDigest); err != nil {
+		t.Fatalf("replay source settlement with the same digest: %v", err)
+	}
+
+	var executionID, storedCallID, storedSessionID string
+	var storedRequestDigest, storedResultDigest []byte
+	if err := fixture.route.store.pool.QueryRow(ctx, `SELECT execution_id,call_id,agent_session_id,request_digest,result_digest
+FROM task_plan_step_execution_bindings WHERE task_id=$1 AND execution_kind='read_tool' AND call_id=$2`,
+		current.ID, sourceCall.CallKey).Scan(&executionID, &storedCallID, &storedSessionID, &storedRequestDigest, &storedResultDigest); err != nil {
+		t.Fatalf("read settled source binding: %v", err)
+	}
+	if executionID != taskPlanReadToolExecutionID(sourceCall.AgentSessionID, sourceCall.CallKey) || executionID == sourceCall.CallKey ||
+		executionID == taskPlanReadToolExecutionID("another-session", sourceCall.CallKey) || storedCallID != sourceCall.CallKey ||
+		storedSessionID != sourceCall.AgentSessionID || !bytes.Equal(storedRequestDigest, sourceCall.RequestDigest) ||
+		!bytes.Equal(storedResultDigest, sourceResultDigest) {
+		t.Fatalf("settled read binding identity execution=%q call=%q session=%q request=%x result=%x; want exact hashed identity and digests",
+			executionID, storedCallID, storedSessionID, storedRequestDigest, storedResultDigest)
+	}
+	wrongRequest := sourceCall
+	wrongRequest.RequestDigest = taskPlanStepTestDigest("changed source request")
+	if err := fixture.route.store.AdmitCloudDSHTaskPlanStepRead(ctx, current, 1, "sources", wrongRequest); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("reuse read call with a different request digest = %v; want idempotency conflict", err)
+	}
+	if err := fixture.route.store.AdmitCloudDSHTaskPlanStepRead(ctx, current, 1, "report", sourceCall); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("reuse read call for another plan step = %v; want idempotency conflict", err)
+	}
+	changedSourceDigest := taskPlanStepTestDigest("changed source result")
+	if err := fixture.route.store.SettleCloudDSHTaskPlanStepRead(ctx, current, 1, "sources", sourceCall, changedSourceDigest); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("replay settled source read with a different result digest = %v; want idempotency conflict", err)
+	}
+
+	if err := fixture.route.store.AdmitCloudDSHTaskPlanStepRead(ctx, current, 1, "report", reportCall); err != nil {
+		t.Fatalf("admit dependent report read after source settlement: %v", err)
+	}
+	reportStepID := commitToolCallStepForPlanBindingWithStatus(t, fixture, current, reportCall,
+		"read-report-success", task.StepSucceeded, "")
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET status='failed' WHERE task_id=$1 AND id=$2`, current.ID, sourceStepID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.route.store.SettleCloudDSHTaskPlanStepRead(ctx, current, 1, "report", reportCall, reportResultDigest); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("settle dependent read after its source failed = %v; want conflict", err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET status='succeeded' WHERE task_id=$1 AND id=$2`, current.ID, sourceStepID); err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.route.store.SettleCloudDSHTaskPlanStepRead(ctx, current, 1, "report", reportCall, reportResultDigest); err != nil {
+		t.Fatalf("settle successful report read: %v", err)
+	}
+	if err := fixture.route.store.SettleCloudDSHTaskPlanStepRead(ctx, current, 1, "report", reportCall, reportResultDigest); err != nil {
+		t.Fatalf("replay report settlement with the same digest: %v", err)
+	}
+	assertTaskPlanReadiness(t, fixture.route.store, current, 1, "final", true, "")
+	if err := fixture.route.store.SettleCloudDSHTaskPlanStepRead(ctx, current, 1, "report", reportCall,
+		taskPlanStepTestDigest("changed report result")); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("replay settled report read with a different result digest = %v; want idempotency conflict", err)
+	}
+
+	for _, test := range []struct {
+		name      string
+		statement string
+		args      []any
+		reason    string
+	}{
+		{name: "agent session changed", statement: `UPDATE task_steps SET agent_session_id=$3 WHERE task_id=$1 AND id=$2`,
+			args: []any{current.ID, reportStepID, "other-session"}, reason: planStepReadinessEvidenceMissing},
+		{name: "call id changed", statement: `UPDATE task_steps SET tool_call_key=$3 WHERE task_id=$1 AND id=$2`,
+			args: []any{current.ID, reportStepID, "call_read_report_changed"}, reason: planStepReadinessEvidenceMissing},
+		{name: "request digest changed", statement: `UPDATE task_steps SET request_digest=$3 WHERE task_id=$1 AND id=$2`,
+			args: []any{current.ID, reportStepID, taskPlanStepTestDigest("tampered report request")}, reason: planStepReadinessEvidenceMissing},
+		{name: "task step id changed", statement: `UPDATE task_steps SET id=$3 WHERE task_id=$1 AND id=$2`,
+			args: []any{current.ID, reportStepID, mustID(t, domain.NewStepID)}, reason: planStepReadinessEvidenceMissing},
+		{name: "task revision changed", statement: `UPDATE task_steps SET task_revision=task_revision+1 WHERE task_id=$1 AND id=$2`,
+			args: []any{current.ID, reportStepID}, reason: planStepReadinessEvidenceMissing},
+		{name: "step failed", statement: `UPDATE task_steps SET status='failed' WHERE task_id=$1 AND id=$2`,
+			args: []any{current.ID, reportStepID}, reason: planStepReadinessFailed},
+		{name: "step unknown", statement: `UPDATE task_steps SET status='unknown' WHERE task_id=$1 AND id=$2`,
+			args: []any{current.ID, reportStepID}, reason: planStepReadinessUnknown},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := fixture.route.store.pool.Exec(ctx, test.statement, test.args...); err != nil {
+				t.Fatalf("tamper TaskStep: %v", err)
+			}
+			assertTaskPlanReadiness(t, fixture.route.store, current, 1, "final", false, test.reason)
+			var restore string
+			switch test.name {
+			case "agent session changed":
+				restore = `UPDATE task_steps SET agent_session_id=$3 WHERE task_id=$1 AND id=$2`
+				_, err := fixture.route.store.pool.Exec(ctx, restore, current.ID, reportStepID, reportCall.AgentSessionID)
+				if err != nil {
+					t.Fatalf("restore agent session: %v", err)
+				}
+			case "call id changed":
+				restore = `UPDATE task_steps SET tool_call_key=$3 WHERE task_id=$1 AND id=$2`
+				_, err := fixture.route.store.pool.Exec(ctx, restore, current.ID, reportStepID, reportCall.CallKey)
+				if err != nil {
+					t.Fatalf("restore call ID: %v", err)
+				}
+			case "request digest changed":
+				restore = `UPDATE task_steps SET request_digest=$3 WHERE task_id=$1 AND id=$2`
+				_, err := fixture.route.store.pool.Exec(ctx, restore, current.ID, reportStepID, reportCall.RequestDigest)
+				if err != nil {
+					t.Fatalf("restore request digest: %v", err)
+				}
+			case "task step id changed":
+				var changedID string
+				if err := fixture.route.store.pool.QueryRow(ctx, `SELECT id FROM task_steps WHERE task_id=$1 AND tool_call_key=$2`,
+					current.ID, reportCall.CallKey).Scan(&changedID); err != nil {
+					t.Fatalf("read changed TaskStep ID: %v", err)
+				}
+				if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET id=$3 WHERE task_id=$1 AND id=$2`,
+					current.ID, changedID, reportStepID); err != nil {
+					t.Fatalf("restore TaskStep ID: %v", err)
+				}
+			case "task revision changed":
+				if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET task_revision=$3 WHERE task_id=$1 AND id=$2`,
+					current.ID, reportStepID, *current.CurrentRevision); err != nil {
+					t.Fatalf("restore TaskStep revision: %v", err)
+				}
+			case "step failed", "step unknown":
+				if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET status='succeeded' WHERE task_id=$1 AND id=$2`,
+					current.ID, reportStepID); err != nil {
+					t.Fatalf("restore TaskStep status: %v", err)
+				}
+			}
+		})
+	}
+	assertTaskPlanReadiness(t, fixture.route.store, current, 1, "final", true, "")
+
+	plan.Revision = 2
+	plan.Goal = "Prepare the revised report"
+	latest := commitTaskPlanForStepBinding(t, fixture, plan, "plan-read-binding-plan-2")
+	assertTaskPlanReadiness(t, fixture.route.store, latest, 1, "final", false, planStepReadinessPlanRevisionStale)
 }

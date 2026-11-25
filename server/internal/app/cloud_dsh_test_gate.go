@@ -7,30 +7,15 @@ import (
 	"morde/server/internal/domain/task"
 )
 
-// The E07 test gate runs inside Complete(), after the minimal-diff recheck
-// and before regression verification. A fix task may only complete when both
-// halves hold, proven by real shell runs recorded on the task steps:
-//
-//   - the new test passed: the same test command the E03 gate recorded as
-//     failing ran again after the fix and passed (same tool call arguments,
-//     so the same request digest, at a later step sequence);
-//   - the full suite passed: a run containing a full-suite test command
-//     exited 0.
-//
-// Neither half trusts the model's TaskResultClaim: the claim is self-reported,
-// while these records come from the shell exit code captured when the tool
-// result was committed (see testPassReason). An unparsable run stamps
-// nothing, so the gate fails closed. Tasks without a fix plan are unaffected,
-// and hostless tasks are exempt: they have no shell tool, so no test run can
-// ever be recorded and the gate would deadlock them (see E03). A hostless
-// fix task therefore completes with no test gate; that is a known limitation,
-// and giving hostless tasks a test runner is follow-up work.
+// Legacy E07 helpers below read historical test stamps. They remain for
+// compatibility tests and step details only; task completion no longer
+// requires a blanket failing-test/full-suite pair. H07 uses the typed plan
+// check ledger and reports failed, missing or incomplete checks through the
+// independent review.
 
-// testPassReason returns the passing-test record for a shell run, or "" when
-// the activity is not a passing shell test run. A run that included a
-// full-suite test command is stamped test_suite_passed; any other passing
-// test run is stamped test_passed. A timed-out or non-zero run stamps
-// nothing here: it is the failing side, handled by failingTestFailureReason.
+// testPassReason returns a historical passing-test stamp only for a passing
+// run of the exact typed test check selected in the current plan. H07 itself
+// consumes the durable operation receipt, not this stamp.
 func testPassReason(activity cloudDSHToolActivity) string {
 	if activity.call.Name != runtimeToolShellExec || activity.shellExecution == nil ||
 		activity.shellExecution.TimedOut || activity.shellExecution.ExitCode != 0 {

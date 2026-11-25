@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -79,6 +80,25 @@ func attestTaskValidationShellResult(current task.Task, planRevision int64, chec
 		return output, false
 	}
 	return string(encoded), true
+}
+
+func attestReconciledTaskValidationShellResult(ctx context.Context, request AgentToolRequest, operation task.Operation,
+	result AgentToolResult) AgentToolResult {
+	if result.Status != AgentToolSucceeded && result.Status != AgentToolFailed || request.Call.Name != runtimeToolShellExec ||
+		request.Task.ID == "" || request.OperationID != operation.ID || !bytes.Equal(request.OperationRequestHash, operation.RequestHash) {
+		return result
+	}
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok || activity.current.ID != request.Task.ID || activity.verificationCheck == nil ||
+		activity.verificationPlanRevision < 1 || activity.verificationStepID == "" {
+		return result
+	}
+	if output, attested := attestTaskValidationShellResult(request.Task, activity.verificationPlanRevision,
+		activity.verificationStepID, *activity.verificationCheck, operation.BindingVersion,
+		request.OperationRequestHash, result.Output); attested {
+		result.Output = output
+	}
+	return result
 }
 
 func validTaskPlanVerificationCommand(check task.PlanVerificationCheck) bool {

@@ -8,10 +8,9 @@ import (
 	"morde/server/internal/domain/task"
 )
 
-// hasFailingTestRecord reports whether the task steps contain a failed test
-// run. A step counts only when the broker recorded it as a failed test run:
-// the shell command matched the test-command heuristic (see isTestCommand)
-// and the run failed with a non-zero exit or a timeout. That record is
+// hasFailingTestRecord reports whether the task steps contain a failed typed
+// test check. A step counts only when the broker matched the plan's exact
+// check command and the run failed with a non-zero exit or a timeout. That record is
 // stamped on the step when the shell result is committed, because a stored
 // step carries no command text or exit code of its own: the command and exit
 // code live only in the sealed step detail. A passing test does not count,
@@ -61,11 +60,9 @@ func taskPlanHasTypedTestCheck(plan *task.Plan) bool {
 	return false
 }
 
-// failingTestFailureReason returns taskToolTestFailureReason when the tool
-// activity is a shell run of a test command that failed. It returns "" for
-// every other call, including a failed non-test command and a test command
-// whose output could not be parsed into shell evidence, so the gate fails
-// closed: an unproven test run never unlocks a fix.
+// failingTestFailureReason returns taskToolTestFailureReason only for a
+// failed execution of the exact typed test check selected in the current
+// plan. Other shell failures and heuristic test stamps never unlock a fix.
 func failingTestFailureReason(activity cloudDSHToolActivity) string {
 	if activity.call.Name != runtimeToolShellExec || activity.shellExecution == nil ||
 		(!activity.shellExecution.TimedOut && activity.shellExecution.ExitCode == 0) {

@@ -107,6 +107,116 @@ func TestSyncRejectsRootReplacementAfterManifestCoverageBeforeSessionCreate(t *t
 	}
 }
 
+func TestSyncResumeRejectsReplacedWorkspaceRootBeforeSessionLookup(t *testing.T) {
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "project")
+	replacedDirectory := filepath.Join(parent, "project-original")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	canonical, rootIdentity, _, _, err := selectSyncRoot(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := mordesync.Manifest{Files: []mordesync.File{}, EmptyDirectories: []string{}}
+	if err := writeResumeMetadata(canonical, resumeMetadata{
+		Version: 1, WorkspaceID: testWorkspace, Directory: canonical, RootIdentity: rootIdentity,
+		SessionID: testSession, Direction: "upload", Policy: "compare_merge", Scope: []string{},
+		IdempotencyKey: "resume-root-identity-test", Manifest: manifest,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(canonical, replacedDirectory); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(canonical, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "unexpected request", http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "local-metadata-only-test-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.Sync(context.Background(), SyncOptions{
+		WorkspaceID: testWorkspace, Directory: canonical, SessionID: testSession,
+	})
+	if err == nil || !strings.Contains(err.Error(), "different local workspace root") {
+		t.Fatalf("resume after root replacement = %+v, err=%v; want a saved root identity error", result, err)
+	}
+	if requests.Load() != 0 || result.Session.ID != "" {
+		t.Fatalf("replaced root reached session lookup: requests=%d session=%q", requests.Load(), result.Session.ID)
+	}
+}
+
+func TestSyncStopsBeforeTransferWhenRootChangesAfterSessionCreate(t *testing.T) {
+	parent := t.TempDir()
+	directory := filepath.Join(parent, "project")
+	replacedDirectory := filepath.Join(parent, "project-original")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	const folderID = "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const sourceBindingID = "12345678-1234-4234-8234-123456789abc"
+	var creates atomic.Int32
+	var commits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/manifest"):
+			_ = json.NewEncoder(w).Encode(workspaceManifest{WorkspaceID: testWorkspace, Revision: 0,
+				Files: []workspaceFile{}, EmptyDirectories: []string{}, Directories: []workspaceDirectory{}})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/sync-sessions"):
+			creates.Add(1)
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(SyncSession{ID: testSession, WorkspaceID: testWorkspace, FolderID: folderID,
+				Direction: "upload", Policy: "compare_merge", State: "planned", BaseRevision: 0, TargetRevision: 1,
+				Stage: "compare", TransferBlocks: []TransferBlock{}, DownloadActions: []DownloadAction{}, Conflicts: []Conflict{}})
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/sync-sessions/"+testSession+"/commit"):
+			commits.Add(1)
+			t.Errorf("sync committed after the selected root was replaced")
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("unexpected request after root replacement: %s %s", r.Method, r.URL.Path)
+			http.Error(w, "unexpected request", http.StatusInternalServerError)
+		}
+	}))
+	defer server.Close()
+	client, err := New(server.URL, "local-metadata-only-test-token", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseRevision := int64(0)
+	replaced := false
+	result, err := client.Sync(context.Background(), SyncOptions{
+		WorkspaceID: testWorkspace, FolderID: folderID, SourceBindingID: sourceBindingID, Directory: directory,
+		Direction: "upload", Policy: "compare_merge", BaseRevision: &baseRevision, Scope: []string{},
+		Progress: func(progress Progress) {
+			if progress.SessionID != testSession || replaced {
+				return
+			}
+			replaced = true
+			if err := os.Rename(directory, replacedDirectory); err != nil {
+				t.Errorf("move scanned root aside: %v", err)
+				return
+			}
+			if err := os.Mkdir(directory, 0o700); err != nil {
+				t.Errorf("replace scanned root: %v", err)
+			}
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "local workspace root disappeared or changed") {
+		t.Fatalf("sync transfer after root replacement = %+v, err=%v; want a local root identity error", result, err)
+	}
+	if !replaced || creates.Load() != 1 || commits.Load() != 0 || result.Session.ID != testSession {
+		t.Fatalf("root replacement result: replaced=%t creates=%d commits=%d session=%q", replaced, creates.Load(), commits.Load(), result.Session.ID)
+	}
+}
+
 func TestTaskLinkedSyncRequiresAndPreservesItsFence(t *testing.T) {
 	baseRevision := int64(3)
 	options := SyncOptions{WorkspaceID: testWorkspace, Directory: t.TempDir(), Direction: "upload", Policy: "compare_merge",

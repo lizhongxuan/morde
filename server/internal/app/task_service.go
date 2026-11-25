@@ -735,6 +735,9 @@ func (s *TaskService) GetTaskValidationReviewSnapshot(ctx context.Context, claim
 			if replayErr != nil {
 				return TaskDetails{}, replayErr
 			}
+			if replay != nil && replay.PlanRevision != details.Plan.Revision {
+				return TaskDetails{}, domain.NewError(domain.CodeConflict, "Task validation plan changed while reading replay evidence")
+			}
 			details.ValidationReplayEvidence = replay
 		}
 	}

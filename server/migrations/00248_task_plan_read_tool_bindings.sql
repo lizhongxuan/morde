@@ -1,6 +1,7 @@
 -- +goose Up
 ALTER TABLE task_plan_step_execution_bindings
-  ADD COLUMN result_digest bytea CHECK (result_digest IS NULL OR octet_length(result_digest) = 32);
+  ADD COLUMN result_digest bytea CHECK (result_digest IS NULL OR octet_length(result_digest) = 32),
+  ADD COLUMN task_step_id text NOT NULL DEFAULT '' CHECK (task_step_id = '' OR task_step_id ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$');
 
 ALTER TABLE task_plan_step_execution_bindings
   DROP CONSTRAINT task_plan_step_execution_bindings_execution_kind_check,
@@ -11,13 +12,14 @@ ALTER TABLE task_plan_step_execution_bindings
   DROP CONSTRAINT task_plan_step_execution_bindings_check,
   ADD CONSTRAINT task_plan_step_execution_bindings_check CHECK (
     (execution_kind = 'operation' AND tool_name <> '' AND connector_id = '' AND
-      child_step_id = '' AND parent_step_id = '' AND result_digest IS NULL) OR
+      child_step_id = '' AND parent_step_id = '' AND result_digest IS NULL AND task_step_id = '') OR
     (execution_kind = 'mcp_connector' AND tool_name <> '' AND connector_id <> '' AND
-      child_step_id = '' AND parent_step_id = '' AND result_digest IS NULL) OR
+      child_step_id = '' AND parent_step_id = '' AND result_digest IS NULL AND task_step_id = '') OR
     (execution_kind = 'child_session' AND tool_name = '' AND connector_id = '' AND
-      child_step_id <> '' AND execution_id <> agent_session_id AND result_digest IS NULL) OR
+      child_step_id <> '' AND execution_id <> agent_session_id AND result_digest IS NULL AND task_step_id = '') OR
     (execution_kind = 'read_tool' AND tool_name <> '' AND connector_id = '' AND
-      child_step_id = '' AND parent_step_id = '')
+      child_step_id = '' AND parent_step_id = '' AND
+      ((task_step_id = '' AND result_digest IS NULL) OR (task_step_id <> '' AND result_digest IS NOT NULL)))
   );
 
 -- +goose Down
@@ -43,4 +45,5 @@ ALTER TABLE task_plan_step_execution_bindings
   DROP CONSTRAINT task_plan_step_execution_bindings_execution_kind_check,
   ADD CONSTRAINT task_plan_step_execution_bindings_execution_kind_check
     CHECK (execution_kind IN ('operation', 'mcp_connector', 'child_session')),
+  DROP COLUMN task_step_id,
   DROP COLUMN result_digest;

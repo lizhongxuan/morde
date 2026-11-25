@@ -28,13 +28,11 @@ import (
 //     a repeated error; it is verified only when the same call succeeds
 //     after its last failure (the correction is recorded in the ledger
 //     and holds).
-//   - replay (H07): the E07 test gate can re-derive whether a failing
-//     reproduction test and full suite passed, but those step stamps alone
-//     do not establish the required plan-revision, immutable Workspace
-//     version, and coverage binding. The PostgreSQL completion path therefore
-//     keeps fix-task replay pending until those identities are available. For
-//     other tasks, the read-back compare checks whether evidence claims remain
-//     covered by currently verified content.
+//   - replay (H07): fix-task checks are re-derived from current plan revisions,
+//     typed check identities, exact operation bindings, verified requirement
+//     sources and Runtime Workspace manifests. A confirmed applicable failure
+//     is FAIL; incomplete or mismatched facts stay pending. Other tasks use the
+//     verified read-back compare.
 //
 // No new agent session is created: M06-04 keeps the existing tool-less
 // task_validation_review DSH session, and the verifier does not re-execute
@@ -224,6 +222,7 @@ type TaskValidationReplayEvidence struct {
 	State                   TaskValidationReplayState            `json:"state"`
 	PlanRevision            int64                                 `json:"plan_revision"`
 	Checks                  []TaskValidationReplayCheckEvidence   `json:"checks"`
+	PlanStepsWithoutChecks   []string                              `json:"plan_steps_without_checks,omitempty"`
 	NewTestPassed           bool                                  `json:"-"`
 	FullSuitePassed         bool                                  `json:"-"`
 	NewTestFailedSequence   int64                                 `json:"-"`
@@ -270,10 +269,9 @@ type TaskValidationReplayCheckEvidence struct {
 	WorkspaceManifestSHA256After   string                                  `json:"workspace_manifest_sha256_after,omitempty"`
 }
 
-// ReplayEvidenceForSteps builds the replay section of the review packet
-// for a fix task, or nil for any other task (its read-back is already in
-// the packet as artifact content proofs). The section is included even
-// when the gate fails, so the model can see the re-run did not happen.
+// ReplayEvidenceForSteps retains the pre-H07 heuristic projection for tests
+// that exercise E07's legacy stamps. The review worker no longer sends it as
+// H07 evidence; fix-task verdicts use durable typed plan-check receipts.
 func ReplayEvidenceForSteps(steps []task.Step, currentRevision *int64, hasFixPlan bool) *TaskValidationReplayEvidence {
 	if !hasFixPlan {
 		return nil

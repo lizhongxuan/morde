@@ -188,7 +188,9 @@ func TestReplayEvidenceForSteps(t *testing.T) {
 	}
 	want := &TaskValidationReplayEvidence{NewTestPassed: true, FullSuitePassed: true,
 		NewTestFailedSequence: 1, NewTestPassedSequence: 2, FullSuitePassedSequence: 2}
-	if *got != *want {
+	if got.NewTestPassed != want.NewTestPassed || got.FullSuitePassed != want.FullSuitePassed ||
+		got.NewTestFailedSequence != want.NewTestFailedSequence || got.NewTestPassedSequence != want.NewTestPassedSequence ||
+		got.FullSuitePassedSequence != want.FullSuitePassedSequence || got.PlanRevision != want.PlanRevision || len(got.Checks) != 0 {
 		t.Fatalf("ReplayEvidenceForSteps() = %+v, want %+v", got, want)
 	}
 	if got := ReplayEvidenceForSteps(steps, &revision, false); got != nil {

@@ -104,6 +104,10 @@ func testFailingActivity(t *testing.T, command string, exitCode int, timedOut bo
 		current:        task.Task{ID: "q1234567", WorkspaceID: "w1234567", CurrentRevision: &revision},
 		digest:         digest[:],
 		shellExecution: &TaskStepShellExecutionEvidence{ExitCode: exitCode, TimedOut: timedOut},
+		verificationCheck: &task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest, Basis: task.PlanVerificationCheckRiskSelected,
+			Command: command, CoveragePaths: []string{"auth"}},
+		verificationPlanRevision: 1,
+		verificationStepID:       "repro",
 		phaseOverride:  "execute",
 		failureReason:  taskToolExecutionFailureReason,
 	}

@@ -533,10 +533,22 @@ func loadTaskValidationExecutionFacts(ctx context.Context, tx pgx.Tx, claim app.
 		return fmt.Errorf("read Task validation plan: %w", err)
 	}
 	hasFixPlan := plan != nil && plan.FixPlan != nil
-	facts.ReplayVerified = !hasFixPlan && app.EvaluateTaskValidationReplay(false, app.TestGateResult{}, facts.EvidenceContentVerified)
-	// shortcut: current test-step stamps do not bind to a plan revision or an
-	// immutable Workspace version; keep fix-task replay pending until those
-	// identities and coverage proof are persisted.
+	if hasFixPlan {
+		current, err := readTaskValidationReplayTask(ctx, tx, claim)
+		if err != nil {
+			return err
+		}
+		replay, err := loadTaskValidationPlanCheckReplay(ctx, tx, claim, *plan, current)
+		if err != nil {
+			return err
+		}
+		if replay != nil {
+			facts.ReplayVerified = replay.State == app.TaskValidationReplayPass
+			facts.ReplayFailed = replay.State == app.TaskValidationReplayFail
+		}
+	} else {
+		facts.ReplayVerified = app.EvaluateTaskValidationReplay(false, app.TestGateResult{}, facts.EvidenceContentVerified)
+	}
 	return nil
 }
 

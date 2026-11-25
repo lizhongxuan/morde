@@ -508,7 +508,7 @@ func TestPostgresListsBoundedAccountRuntimeStopCandidates(t *testing.T) {
 		}
 		return runtime
 	}
-	owners := make([]string, 6)
+	owners := make([]string, 7)
 	for index := range owners {
 		owners[index] = createPreRetirementTestUser(t, store, 8, 20_000, 40_000).ID
 	}
@@ -521,7 +521,9 @@ func TestPostgresListsBoundedAccountRuntimeStopCandidates(t *testing.T) {
 	failedExpired := start(owners[3], "runtime-candidate-failed", 74)
 	failedLive := start(owners[4], "runtime-candidate-failed-live", 75)
 	stopped := start(owners[5], "runtime-candidate-stopped", 76)
-	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='stopping' WHERE owner_id=$1 AND runtime_id=$2`, owners[0], stopping.Fence.RuntimeID); err != nil {
+	failedStartupLive := start(owners[6], "runtime-candidate-startup-failed-live", 77)
+	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='stopping',lease_expires_at=clock_timestamp()+interval '5 minutes'
+WHERE owner_id=$1 AND runtime_id=$2`, owners[0], stopping.Fence.RuntimeID); err != nil {
 		t.Fatal(err)
 	}
 	for _, runtime := range []app.AccountAgentRuntime{startingExpired, runningExpired, failedExpired, stopped} {
@@ -530,10 +532,15 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, runtime.F
 			t.Fatal(err)
 		}
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='failed',failure_reason='runtime_failed' WHERE owner_id=$1 AND runtime_id=$2`, owners[3], failedExpired.Fence.RuntimeID); err != nil {
+	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='failed',failure_reason='startup_failed' WHERE owner_id=$1 AND runtime_id=$2`, owners[3], failedExpired.Fence.RuntimeID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='failed',failure_reason='runtime_failed' WHERE owner_id=$1 AND runtime_id=$2`, owners[4], failedLive.Fence.RuntimeID); err != nil {
+	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='failed',failure_reason='runtime_failed',
+lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE owner_id=$1 AND runtime_id=$2`, owners[4], failedLive.Fence.RuntimeID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE account_agent_runtimes SET state='failed',failure_reason='startup_failed',
+lease_expires_at=clock_timestamp()+interval '5 minutes' WHERE owner_id=$1 AND runtime_id=$2`, owners[6], failedStartupLive.Fence.RuntimeID); err != nil {
 		t.Fatal(err)
 	}
 	identity, err := runtimeService.StopIdentity(ctx, stopped.Fence.ConversationID)
@@ -560,6 +567,9 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND runtime_id=$3`, runtime.F
 	for _, candidate := range candidates {
 		if !want[candidate.Fence.OwnerID] || candidate.NonceSHA256 == "" || candidate.ExpiresAt.IsZero() {
 			t.Fatalf("unexpected or incomplete Runtime stop candidate: %+v", candidate)
+		}
+		if candidate.Fence.OwnerID == owners[0] && !candidate.ExpiresAt.After(time.Now()) {
+			t.Fatalf("explicitly stopping Runtime with an active lease was not immediately returned: %+v", candidate)
 		}
 		delete(want, candidate.Fence.OwnerID)
 	}

@@ -16,20 +16,21 @@ func PendingTaskValidationReplayEvidence(plan *task.Plan) *TaskValidationReplayE
 	}
 	evidence := &TaskValidationReplayEvidence{State: TaskValidationReplayPending, PlanRevision: plan.Revision, Checks: make([]TaskValidationReplayCheckEvidence, 0)}
 	for _, step := range plan.Steps {
-		check := TaskValidationReplayCheckEvidence{CheckID: step.ID, Status: TaskValidationReplayPending}
-		if step.VerificationCheck != nil {
-			check.Kind = step.VerificationCheck.Kind
-			check.Basis = step.VerificationCheck.Basis
-			check.CoveragePaths = append([]string(nil), step.VerificationCheck.CoveragePaths...)
-			if step.VerificationCheck.RequirementSource != nil {
-				source := *step.VerificationCheck.RequirementSource
-				if source.WorkspaceRevision != nil {
-					revision := *source.WorkspaceRevision
-					source.WorkspaceRevision = &revision
-				}
-				check.RequirementSource = &source
+		if step.VerificationCheck == nil {
+			evidence.PlanStepsWithoutChecks = append(evidence.PlanStepsWithoutChecks, step.ID)
+			continue
+		}
+		check := TaskValidationReplayCheckEvidence{CheckID: step.ID, Status: TaskValidationReplayPending,
+			Kind: step.VerificationCheck.Kind, Basis: step.VerificationCheck.Basis,
+			CoveragePaths:             append([]string(nil), step.VerificationCheck.CoveragePaths...),
+			RequirementSourceVerified: step.VerificationCheck.Basis == task.PlanVerificationCheckRiskSelected}
+		if step.VerificationCheck.RequirementSource != nil {
+			source := *step.VerificationCheck.RequirementSource
+			if source.WorkspaceRevision != nil {
+				revision := *source.WorkspaceRevision
+				source.WorkspaceRevision = &revision
 			}
-			check.RequirementSourceVerified = check.Basis == task.PlanVerificationCheckRiskSelected
+			check.RequirementSource = &source
 		}
 		evidence.Checks = append(evidence.Checks, check)
 	}
@@ -58,6 +59,11 @@ func EvaluateTaskValidationPlanReplay(plan task.Plan, evidence *TaskValidationRe
 		expectedByID[step.ID] = *step.VerificationCheck
 	}
 	if len(expected) == 0 {
+		return TaskValidationReplayPending
+	}
+	// A fix plan whose steps predate or omit typed check declarations has not
+	// established which checks apply. A passing subset cannot close H07.
+	if len(evidence.PlanStepsWithoutChecks) != 0 {
 		return TaskValidationReplayPending
 	}
 	provided := make(map[string]TaskValidationReplayCheckEvidence, len(evidence.Checks))

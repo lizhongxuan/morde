@@ -104,6 +104,7 @@ type taskPlanStepExecutionBinding struct {
 	connectorID          string
 	childStepID          string
 	parentStepID         string
+	taskStepID           string
 	requestDigest        []byte
 	resultDigest         []byte
 	authorizationVersion int64
@@ -115,6 +116,7 @@ type taskPlanStepBindingFence struct {
 	taskRevision         int64
 	planRevision         int64
 	authorizationVersion int64
+	agentSessionID       string
 	planStepID           string
 	plan                 task.Plan
 	planTaskStepSequence int64
@@ -303,18 +305,19 @@ func (s *Store) AdmitCloudDSHTaskPlanStepRead(ctx context.Context, current task.
 			return taskPlanStepBindingConflict(reason)
 		}
 		binding := taskPlanStepExecutionBinding{kind: planStepExecutionReadTool,
-			executionID: taskPlanReadToolExecutionID(toolCall.AgentSessionID, toolCall.CallKey),
+			executionID:    taskPlanReadToolExecutionID(toolCall.AgentSessionID, toolCall.CallKey),
 			agentSessionID: toolCall.AgentSessionID, callID: toolCall.CallKey, toolName: toolCall.ToolName,
 			requestDigest: append([]byte(nil), toolCall.RequestDigest...), authorizationVersion: toolCall.AuthorizationVersion}
 		var stored taskPlanStepBindingRow
 		err = tx.QueryRow(ctx, `SELECT plan_step_id,execution_kind,execution_id,agent_session_id,call_id,tool_name,
-connector_id,child_step_id,parent_step_id,request_digest,authorization_version,result_digest
+connector_id,child_step_id,parent_step_id,request_digest,authorization_version,result_digest,task_step_id
 FROM task_plan_step_execution_bindings WHERE owner_id=$1 AND task_id=$2 AND task_revision=$3 AND plan_revision=$4
  AND execution_kind=$5 AND execution_id=$6 FOR UPDATE`, fence.ownerID, fence.taskID, fence.taskRevision,
 			fence.planRevision, binding.kind, binding.executionID).Scan(&stored.planStepID, &stored.binding.kind,
 			&stored.binding.executionID, &stored.binding.agentSessionID, &stored.binding.callID, &stored.binding.toolName,
 			&stored.binding.connectorID, &stored.binding.childStepID, &stored.binding.parentStepID,
-			&stored.binding.requestDigest, &stored.binding.authorizationVersion, &stored.binding.resultDigest)
+			&stored.binding.requestDigest, &stored.binding.authorizationVersion, &stored.binding.resultDigest,
+			&stored.binding.taskStepID)
 		if err == nil {
 			if stored.planStepID != planStepID || !sameTaskPlanStepExecutionBindingIgnoringResult(stored.binding, binding) ||
 				(len(stored.binding.resultDigest) != 0 && len(stored.binding.resultDigest) != 32) {
@@ -357,41 +360,48 @@ func (s *Store) SettleCloudDSHTaskPlanStepRead(ctx context.Context, current task
 			return taskPlanStepBindingConflict(reason)
 		}
 		binding := taskPlanStepExecutionBinding{kind: planStepExecutionReadTool,
-			executionID: taskPlanReadToolExecutionID(toolCall.AgentSessionID, toolCall.CallKey),
+			executionID:    taskPlanReadToolExecutionID(toolCall.AgentSessionID, toolCall.CallKey),
 			agentSessionID: toolCall.AgentSessionID, callID: toolCall.CallKey, toolName: toolCall.ToolName,
 			requestDigest: append([]byte(nil), toolCall.RequestDigest...), resultDigest: append([]byte(nil), resultDigest...),
 			authorizationVersion: toolCall.AuthorizationVersion}
-		if err := verifyTaskPlanStepReadSource(ctx, tx, fence, binding, true); err != nil {
+		stepID, stepStatus, err := verifyTaskPlanStepReadSource(ctx, tx, fence, binding)
+		if err != nil {
 			return err
 		}
-	var storedPlanStepID string
+		if stepStatus != string(task.StepSucceeded) {
+			return taskPlanStepBindingConflict(taskPlanChildSettlementReason(stepStatus))
+		}
+		binding.taskStepID = stepID
+		var storedPlanStepID string
 		var stored taskPlanStepExecutionBinding
 		err = tx.QueryRow(ctx, `SELECT plan_step_id,execution_kind,execution_id,agent_session_id,call_id,tool_name,
-connector_id,child_step_id,parent_step_id,request_digest,authorization_version,result_digest
+connector_id,child_step_id,parent_step_id,request_digest,authorization_version,result_digest,task_step_id
 FROM task_plan_step_execution_bindings WHERE owner_id=$1 AND task_id=$2 AND task_revision=$3 AND plan_revision=$4
  AND execution_kind=$5 AND execution_id=$6 FOR UPDATE`, fence.ownerID, fence.taskID, fence.taskRevision,
 			fence.planRevision, binding.kind, binding.executionID).Scan(&storedPlanStepID, &stored.kind,
 			&stored.executionID, &stored.agentSessionID, &stored.callID, &stored.toolName, &stored.connectorID,
-			&stored.childStepID, &stored.parentStepID, &stored.requestDigest, &stored.authorizationVersion, &stored.resultDigest)
+			&stored.childStepID, &stored.parentStepID, &stored.requestDigest, &stored.authorizationVersion,
+			&stored.resultDigest, &stored.taskStepID)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
 		}
 		if err != nil {
 			return fmt.Errorf("read pending task plan read binding: %w", err)
 		}
-		if storedPlanStepID != planStepID || !sameTaskPlanStepExecutionBindingIgnoringResult(stored, binding) {
+		if storedPlanStepID != planStepID || !sameTaskPlanStepExecutionBindingIgnoringResult(stored, binding) ||
+			(stored.taskStepID != "" && stored.taskStepID != stepID) {
 			return domain.NewError(domain.CodeIdempotencyConflict, "task plan read call was bound differently")
 		}
 		if len(stored.resultDigest) > 0 {
-			if bytes.Equal(stored.resultDigest, resultDigest) {
+			if bytes.Equal(stored.resultDigest, resultDigest) && stored.taskStepID == stepID {
 				return nil
 			}
 			return domain.NewError(domain.CodeIdempotencyConflict, "task plan read result changed after settlement")
 		}
-		command, err := tx.Exec(ctx, `UPDATE task_plan_step_execution_bindings SET result_digest=$7
+		command, err := tx.Exec(ctx, `UPDATE task_plan_step_execution_bindings SET result_digest=$7,task_step_id=$8
 WHERE owner_id=$1 AND task_id=$2 AND task_revision=$3 AND plan_revision=$4 AND execution_kind=$5 AND execution_id=$6
- AND plan_step_id=$8 AND result_digest IS NULL`, fence.ownerID, fence.taskID, fence.taskRevision,
-			fence.planRevision, binding.kind, binding.executionID, resultDigest, planStepID)
+			AND plan_step_id=$9 AND result_digest IS NULL AND task_step_id=''`, fence.ownerID, fence.taskID, fence.taskRevision,
+			fence.planRevision, binding.kind, binding.executionID, resultDigest, stepID, planStepID)
 		if err != nil {
 			return fmt.Errorf("settle task plan read binding: %w", err)
 		}
@@ -485,34 +495,38 @@ func taskPlanReadToolExecutionID(agentSessionID, callID string) string {
 
 func sameTaskPlanStepExecutionBindingIgnoringResult(a, b taskPlanStepExecutionBinding) bool {
 	a.resultDigest, b.resultDigest = nil, nil
+	a.taskStepID, b.taskStepID = "", ""
 	return sameTaskPlanStepExecutionBinding(a, b)
 }
 
 func verifyTaskPlanStepReadSource(ctx context.Context, tx pgx.Tx, fence taskPlanStepBindingFence,
-	binding taskPlanStepExecutionBinding, requireSuccess bool) error {
+	binding taskPlanStepExecutionBinding) (string, string, error) {
+	if binding.executionID != taskPlanReadToolExecutionID(binding.agentSessionID, binding.callID) ||
+		binding.agentSessionID != fence.agentSessionID || binding.authorizationVersion != fence.authorizationVersion {
+		return "", "", taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
+	}
 	var taskRevision, sequence int64
 	var status, agentSessionID, callID, toolName string
+	var stepID string
 	var requestDigest []byte
-	err := tx.QueryRow(ctx, `SELECT COALESCE(task_revision,-1),sequence,status,COALESCE(agent_session_id,''),
+	err := tx.QueryRow(ctx, `SELECT id,COALESCE(task_revision,-1),sequence,status,COALESCE(agent_session_id,''),
 COALESCE(tool_call_key,''),COALESCE(tool_name,''),COALESCE(request_digest,''::bytea)
 FROM task_steps WHERE task_id=$1 AND agent_session_id=$2 AND task_revision=$3 AND tool_call_key=$4 AND tool_name=$5
 FOR SHARE`, fence.taskID, binding.agentSessionID, fence.taskRevision, binding.callID, binding.toolName).
-		Scan(&taskRevision, &sequence, &status, &agentSessionID, &callID, &toolName, &requestDigest)
+		Scan(&stepID, &taskRevision, &sequence, &status, &agentSessionID, &callID, &toolName, &requestDigest)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
+		return "", "", taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
 	}
 	if err != nil {
-		return fmt.Errorf("verify task plan read TaskStep identity: %w", err)
+		return "", "", fmt.Errorf("verify task plan read TaskStep identity: %w", err)
 	}
 	if taskRevision != fence.taskRevision || sequence <= fence.planTaskStepSequence ||
 		agentSessionID != binding.agentSessionID || callID != binding.callID || toolName != binding.toolName ||
-		!bytes.Equal(requestDigest, binding.requestDigest) || !validTaskPlanStepStatus(status) {
-		return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
+		!bytes.Equal(requestDigest, binding.requestDigest) || !validTaskPlanStepStatus(status) || !domain.ValidStepID(stepID) ||
+		(binding.taskStepID != "" && binding.taskStepID != stepID) {
+		return "", "", taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
 	}
-	if requireSuccess && status != string(task.StepSucceeded) {
-		return taskPlanStepBindingConflict(taskPlanChildSettlementReason(status))
-	}
-	return nil
+	return stepID, status, nil
 }
 
 func validPlanStepToolCall(current task.Task, planRevision int64, planStepID string, call app.TaskToolCallProgress) bool {
@@ -733,13 +747,13 @@ func requireExistingTaskPlanStepOperationBindingInTx(ctx context.Context, tx pgx
 	planStepID string, binding taskPlanStepExecutionBinding) error {
 	var stored taskPlanStepBindingRow
 	err := tx.QueryRow(ctx, `SELECT plan_step_id,execution_kind,execution_id,agent_session_id,call_id,tool_name,
-connector_id,child_step_id,parent_step_id,request_digest,authorization_version,result_digest
+connector_id,child_step_id,parent_step_id,request_digest,authorization_version,result_digest,task_step_id
 FROM task_plan_step_execution_bindings WHERE owner_id=$1 AND task_id=$2 AND task_revision=$3 AND plan_revision=$4
  AND execution_kind=$5 AND execution_id=$6`, fence.ownerID, fence.taskID, fence.taskRevision, fence.planRevision,
 		binding.kind, binding.executionID).Scan(&stored.planStepID, &stored.binding.kind, &stored.binding.executionID,
 		&stored.binding.agentSessionID, &stored.binding.callID, &stored.binding.toolName, &stored.binding.connectorID,
 		&stored.binding.childStepID, &stored.binding.parentStepID, &stored.binding.requestDigest,
-		&stored.binding.authorizationVersion, &stored.binding.resultDigest)
+		&stored.binding.authorizationVersion, &stored.binding.resultDigest, &stored.binding.taskStepID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
 	}
@@ -766,13 +780,13 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) ON CONFLICT DO NOTHI
 	}
 	var stored taskPlanStepBindingRow
 	err = tx.QueryRow(ctx, `SELECT plan_step_id,execution_kind,execution_id,agent_session_id,call_id,tool_name,
-connector_id,child_step_id,parent_step_id,request_digest,authorization_version,result_digest
+connector_id,child_step_id,parent_step_id,request_digest,authorization_version,result_digest,task_step_id
 FROM task_plan_step_execution_bindings WHERE owner_id=$1 AND task_id=$2 AND task_revision=$3 AND plan_revision=$4
  AND execution_kind=$5 AND execution_id=$6`, fence.ownerID, fence.taskID, fence.taskRevision, fence.planRevision,
 		binding.kind, binding.executionID).Scan(&stored.planStepID, &stored.binding.kind, &stored.binding.executionID,
 		&stored.binding.agentSessionID, &stored.binding.callID, &stored.binding.toolName, &stored.binding.connectorID,
 		&stored.binding.childStepID, &stored.binding.parentStepID, &stored.binding.requestDigest,
-		&stored.binding.authorizationVersion, &stored.binding.resultDigest)
+		&stored.binding.authorizationVersion, &stored.binding.resultDigest, &stored.binding.taskStepID)
 	if err != nil {
 		return fmt.Errorf("read persisted task plan step execution binding: %w", err)
 	}
@@ -846,7 +860,8 @@ func taskPlanStepBindingFenceInTx(ctx context.Context, tx pgx.Tx, current task.T
 	}
 	return taskPlanStepBindingFence{ownerID: current.OwnerID, taskID: current.ID,
 		taskRevision: row.CurrentRevision, planRevision: planRevision, authorizationVersion: authorizationVersion,
-		planStepID: planStepID, plan: plan, planTaskStepSequence: planTaskStepSequence}, "", nil
+		agentSessionID: current.AgentSessionID,
+		planStepID:     planStepID, plan: plan, planTaskStepSequence: planTaskStepSequence}, "", nil
 }
 
 func currentCloudDSHTaskPlanForStep(ctx context.Context, tx pgx.Tx, taskID, ownerID string, taskRevision, planRevision int64,
@@ -998,13 +1013,17 @@ FOR SHARE OF child,parent,step`, fence.taskID, fence.ownerID, binding.executionI
 		binding.parentStepID = parentStepID
 		binding.requestDigest = requestDigest
 	case planStepExecutionReadTool:
-		if binding.executionID != binding.callID || binding.connectorID != "" || binding.childStepID != "" ||
-			binding.parentStepID != "" || binding.toolName == "" || len(binding.requestDigest) != 32 ||
-			len(binding.resultDigest) != 32 {
+		if binding.connectorID != "" || binding.childStepID != "" || binding.parentStepID != "" ||
+			binding.toolName == "" || len(binding.requestDigest) != 32 || len(binding.resultDigest) != 32 ||
+			binding.taskStepID == "" {
 			return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
 		}
-		if err := verifyTaskPlanStepReadSource(ctx, tx, fence, *binding, true); err != nil {
+		_, stepStatus, err := verifyTaskPlanStepReadSource(ctx, tx, fence, *binding)
+		if err != nil {
 			return err
+		}
+		if stepStatus != string(task.StepSucceeded) {
+			return taskPlanStepBindingConflict(taskPlanChildSettlementReason(stepStatus))
 		}
 	default:
 		return domain.InvalidArgument("task_plan_step.binding", "task plan execution kind is invalid")
@@ -1037,13 +1056,14 @@ func sameTaskPlanStepExecutionBinding(a, b taskPlanStepExecutionBinding) bool {
 		a.callID == b.callID && a.toolName == b.toolName && a.connectorID == b.connectorID &&
 		a.childStepID == b.childStepID && a.parentStepID == b.parentStepID &&
 		bytes.Equal(a.requestDigest, b.requestDigest) && bytes.Equal(a.resultDigest, b.resultDigest) &&
+		a.taskStepID == b.taskStepID &&
 		a.authorizationVersion == b.authorizationVersion
 }
 
 func loadTaskPlanStepBindings(ctx context.Context, tx pgx.Tx, fence taskPlanStepBindingFence,
 	planStepID string) ([]taskPlanStepExecutionBinding, error) {
 	rows, err := tx.Query(ctx, `SELECT execution_kind,execution_id,agent_session_id,call_id,tool_name,connector_id,
-child_step_id,parent_step_id,request_digest,authorization_version,result_digest
+child_step_id,parent_step_id,request_digest,authorization_version,result_digest,task_step_id
 FROM task_plan_step_execution_bindings WHERE owner_id=$1 AND task_id=$2 AND task_revision=$3 AND plan_revision=$4
  AND plan_step_id=$5 ORDER BY execution_kind,execution_id`, fence.ownerID, fence.taskID, fence.taskRevision,
 		fence.planRevision, planStepID)
@@ -1056,7 +1076,7 @@ FROM task_plan_step_execution_bindings WHERE owner_id=$1 AND task_id=$2 AND task
 		var value taskPlanStepExecutionBinding
 		if err := rows.Scan(&value.kind, &value.executionID, &value.agentSessionID, &value.callID, &value.toolName,
 			&value.connectorID, &value.childStepID, &value.parentStepID, &value.requestDigest,
-			&value.authorizationVersion, &value.resultDigest); err != nil {
+			&value.authorizationVersion, &value.resultDigest, &value.taskStepID); err != nil {
 			return nil, fmt.Errorf("scan task plan step execution binding: %w", err)
 		}
 		bindings = append(bindings, value)
@@ -1156,9 +1176,33 @@ WHERE child.task_id=$1 AND child.owner_id=$2 AND child.session_id=$3 AND child.p
 			return planStepReadinessCancelled, nil
 		}
 		return taskPlanChildSettlementReason(stepStatus), nil
+	case planStepExecutionReadTool:
+		return taskPlanReadToolSettlementReason(ctx, tx, fence, binding)
 	default:
 		return planStepReadinessEvidenceMissing, nil
 	}
+}
+
+func taskPlanReadToolSettlementReason(ctx context.Context, tx pgx.Tx, fence taskPlanStepBindingFence,
+	binding taskPlanStepExecutionBinding) (string, error) {
+	if binding.kind != planStepExecutionReadTool || binding.connectorID != "" || binding.childStepID != "" ||
+		binding.parentStepID != "" || binding.toolName == "" || len(binding.requestDigest) != 32 {
+		return planStepReadinessEvidenceMissing, nil
+	}
+	stepID, status, err := verifyTaskPlanStepReadSource(ctx, tx, fence, binding)
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeConflict {
+			return planStepReadinessEvidenceMissing, nil
+		}
+		return "", err
+	}
+	if status != string(task.StepSucceeded) {
+		return taskPlanChildSettlementReason(status), nil
+	}
+	if len(binding.resultDigest) != 32 || binding.taskStepID == "" || binding.taskStepID != stepID {
+		return planStepReadinessPending, nil
+	}
+	return "", nil
 }
 
 func taskPlanOperationSettlementReason(operationStatus, stepStatus string) string {

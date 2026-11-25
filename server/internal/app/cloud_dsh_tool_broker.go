@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/hub"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/record"
 	"morde/server/internal/domain/task"
@@ -417,6 +419,12 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 				definitions = append(definitions, hubDefinitions[:min(len(hubDefinitions), available)]...)
 			}
 		}
+		if details.Plan != nil {
+			definitions, err = addPlanStepArgumentToDirectReadTools(definitions, details.Plan.Revision)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	if goalFollowupReadOnly {
 		definitions = filterGoalFollowupReadOnlyTools(definitions)
@@ -594,6 +602,86 @@ func addPlanStepArgumentToMCPTools(definitions []AgentToolDefinition, planRevisi
 	return definitions, nil
 }
 
+func addPlanStepArgumentToDirectReadTools(definitions []AgentToolDefinition, planRevision int64) ([]AgentToolDefinition, error) {
+	if planRevision < 1 {
+		return nil, domain.NewError(domain.CodeInvalidState, "direct read tool plan revision is invalid")
+	}
+	for index := range definitions {
+		if !cloudDSHPlanStepReadTool(definitions[index].Name) {
+			continue
+		}
+		var schema map[string]json.RawMessage
+		if json.Unmarshal(definitions[index].Parameters, &schema) != nil || schema == nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "direct read tool schema is invalid")
+		}
+		var properties map[string]json.RawMessage
+		if json.Unmarshal(schema["properties"], &properties) != nil || properties == nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "direct read tool schema properties are invalid")
+		}
+		properties[cloudDSHPlanStepIDArgumentName] = json.RawMessage(`{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$","description":"ID of the current persisted plan step this read supports."}`)
+		revision, err := json.Marshal(map[string]any{"type": "integer", "enum": []int64{planRevision},
+			"description": "Current persisted plan revision; copy the provided value exactly."})
+		if err != nil {
+			return nil, fmt.Errorf("encode direct read plan revision schema: %w", err)
+		}
+		properties[cloudDSHPlanRevisionArgumentName] = revision
+		encodedProperties, err := json.Marshal(properties)
+		if err != nil {
+			return nil, fmt.Errorf("encode direct read plan metadata schema: %w", err)
+		}
+		schema["properties"] = encodedProperties
+		var required []string
+		if rawRequired, exists := schema["required"]; exists && json.Unmarshal(rawRequired, &required) != nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "direct read tool schema required fields are invalid")
+		}
+		for _, name := range []string{cloudDSHPlanStepIDArgumentName, cloudDSHPlanRevisionArgumentName} {
+			found := false
+			for _, existing := range required {
+				found = found || existing == name
+			}
+			if !found {
+				required = append(required, name)
+			}
+		}
+		encodedRequired, err := json.Marshal(required)
+		if err != nil {
+			return nil, fmt.Errorf("encode direct read plan metadata required fields: %w", err)
+		}
+		schema["required"] = encodedRequired
+		encodedSchema, err := json.Marshal(schema)
+		if err != nil {
+			return nil, fmt.Errorf("encode direct read tool schema: %w", err)
+		}
+		definitions[index].Parameters = encodedSchema
+		definitions[index].Description += " Include morde_plan_step_id for the current persisted plan step that owns this read and copy morde_plan_revision exactly from the current plan."
+	}
+	return definitions, nil
+}
+
+func cloudDSHPlanStepReadTool(name string) bool {
+	switch name {
+	case cloudDSHSkillReadToolName, cloudDSHTaskAttachmentReadToolName,
+		cloudDSHConversationHistorySearchToolName, cloudDSHRecentHistorySummaryToolName,
+		cloudDSHCurrentHistorySearchToolName, cloudDSHCurrentMessageReadToolName, cloudDSHCurrentMessageSearchToolName,
+		cloudDSHWorkspaceListToolName, cloudDSHWorkspaceReadToolName, cloudDSHWorkspaceSearchToolName,
+		cloudDSHImpactMapToolName, cloudDSHGoalListToolName, cloudDSHScheduleListToolName, cloudDSHScheduleRunsToolName:
+		return true
+	}
+	if !strings.HasPrefix(name, "morde_hub_") {
+		return false
+	}
+	tool, _, _, ok := parseHubTaskToolName(name)
+	if !ok {
+		return false
+	}
+	switch tool.action {
+	case hub.ActionScreenshot, hub.ActionFiles, hub.ActionFileGet, hub.ActionFileFetch:
+		return true
+	default:
+		return false
+	}
+}
+
 func cloudDSHPlanMCPTool(name string) bool {
 	switch name {
 	case cloudDSHMCPCallToolName, cloudDSHWebSearchToolName, cloudDSHWebReadToolName:
@@ -768,15 +856,8 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 				return b.pauseCompletion(ctx, current, step, "minimal_diff_violation", "The task changed files outside fix_plan.changed_files: "+strings.Join(violations, ", "))
 			}
 		}
-		// Test gate (E07): after the minimal-diff recheck, a stale
-		// completion still may not deliver an untested fix.
-		if paused, err := b.pauseForTestGate(ctx, current, step, details); err != nil {
-			return err
-		} else if paused {
-			return nil
-		}
-		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result, completion.ValidationClaims,
-			map[string]any{"source": "cloud_dsh"}, "", nil, completionFence)
+		return b.pauseCompletion(ctx, current, step, "output_verification_pending",
+			"The completion belongs to an older DSH checkpoint. Resume from the current checkpoint before delivering a result.")
 	}
 	fileIntent := current.FileDeliveryIntent
 	if current.HostID == "" {
@@ -1276,8 +1357,15 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		if planStepMetadata.HasStepID {
 			ctx = withCloudDSHMCPPlanStepMetadata(ctx, planStepMetadata)
 		}
+	} else if cloudDSHPlanStepReadTool(call.Name) {
+		var err error
+		planStepMetadata, err = extractCloudDSHPlanStepArguments(call.Arguments)
+		if err != nil {
+			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh direct read plan metadata is invalid")
+		}
+		call.Arguments = string(planStepMetadata.BusinessArgs)
 	} else if hasCloudDSHPlanStepMetadata(call.Arguments) {
-		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "plan step metadata is only valid for Host tools")
+		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "plan step metadata is only valid for Host, MCP, or direct read tools")
 	}
 	if cloudDSHGoalFollowupReadOnlyTask(claimed) && !goalFollowupReadOnlyToolAllowed(call.Name) {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "tool is not available to read-only Goal follow-up Tasks")
@@ -1319,64 +1407,97 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		return b.clarify(ctx, claimed, call, recovering)
 	}
 	if cloudDSHWorkspaceToolName(call.Name) {
-		if routed {
-			bound, resolvedCall, reason, bindErr := b.prepareDeferredWorkspaceCall(ctx, claimed, target, call, recovering, checkpointOutput)
-			if bindErr != nil {
-				return AgentToolResult{}, bindErr
+		run := func() (AgentToolResult, error) {
+			if routed {
+				bound, resolvedCall, reason, bindErr := b.prepareDeferredWorkspaceCall(ctx, claimed, target, call, recovering, checkpointOutput)
+				if bindErr != nil {
+					return AgentToolResult{}, bindErr
+				}
+				if reason != "" {
+					return b.pauseDeferredTarget(ctx, claimed, reason)
+				}
+				ctx = withBoundTaskToolActivity(ctx, bound)
+				claimed, call = bound, resolvedCall
 			}
-			if reason != "" {
-				return b.pauseDeferredTarget(ctx, claimed, reason)
-			}
-			ctx = withBoundTaskToolActivity(ctx, bound)
-			claimed, call = bound, resolvedCall
+			return b.executeWorkspaceTool(ctx, claimed, call, recovering, checkpointOutput)
 		}
-		return b.executeWorkspaceTool(ctx, claimed, call, recovering, checkpointOutput)
+		if cloudDSHPlanStepReadTool(call.Name) {
+			return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, run)
+		}
+		return run()
 	}
 	if call.Name == cloudDSHImpactMapToolName {
-		if routed {
-			bound, resolvedCall, reason, bindErr := b.prepareDeferredWorkspaceCall(ctx, claimed, target, call, recovering, checkpointOutput)
-			if bindErr != nil {
-				return AgentToolResult{}, bindErr
+		run := func() (AgentToolResult, error) {
+			if routed {
+				bound, resolvedCall, reason, bindErr := b.prepareDeferredWorkspaceCall(ctx, claimed, target, call, recovering, checkpointOutput)
+				if bindErr != nil {
+					return AgentToolResult{}, bindErr
+				}
+				if reason != "" {
+					return b.pauseDeferredTarget(ctx, claimed, reason)
+				}
+				ctx = withBoundTaskToolActivity(ctx, bound)
+				claimed, call = bound, resolvedCall
 			}
-			if reason != "" {
-				return b.pauseDeferredTarget(ctx, claimed, reason)
-			}
-			ctx = withBoundTaskToolActivity(ctx, bound)
-			claimed, call = bound, resolvedCall
+			return b.executeImpactMap(ctx, claimed, call, recovering, checkpointOutput)
 		}
-		return b.executeImpactMap(ctx, claimed, call, recovering, checkpointOutput)
+		return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, run)
 	}
 	if call.Name == cloudDSHSkillReadToolName {
-		return b.executeSkillRead(ctx, claimed, call, recovering, checkpointOutput)
+		return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, func() (AgentToolResult, error) {
+			return b.executeSkillRead(ctx, claimed, call, recovering, checkpointOutput)
+		})
 	}
 	if call.Name == cloudDSHPersonalUpdateToolName {
 		return b.executePersonalUpdate(ctx, claimed, call, recovering, checkpointOutput)
 	}
 	if call.Name == cloudDSHConversationHistorySearchToolName {
-		return b.executeConversationHistorySearch(ctx, claimed, call, recovering, checkpointOutput)
+		return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, func() (AgentToolResult, error) {
+			return b.executeConversationHistorySearch(ctx, claimed, call, recovering, checkpointOutput)
+		})
 	}
 	if call.Name == cloudDSHCurrentHistorySearchToolName {
-		return b.executeCurrentConversationHistorySearch(ctx, claimed, call, recovering, checkpointOutput)
+		return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, func() (AgentToolResult, error) {
+			return b.executeCurrentConversationHistorySearch(ctx, claimed, call, recovering, checkpointOutput)
+		})
 	}
 	if call.Name == cloudDSHCurrentMessageReadToolName {
-		return b.executeCurrentConversationMessageRead(ctx, claimed, call, recovering, checkpointOutput)
+		return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, func() (AgentToolResult, error) {
+			return b.executeCurrentConversationMessageRead(ctx, claimed, call, recovering, checkpointOutput)
+		})
 	}
 	if call.Name == cloudDSHCurrentMessageSearchToolName {
-		return b.executeCurrentConversationMessageSearch(ctx, claimed, call, recovering, checkpointOutput)
+		return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, func() (AgentToolResult, error) {
+			return b.executeCurrentConversationMessageSearch(ctx, claimed, call, recovering, checkpointOutput)
+		})
 	}
 	if call.Name == cloudDSHRecentHistorySummaryToolName {
-		return b.executeRecentHistorySummary(ctx, claimed, call, recovering, checkpointOutput)
+		return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, func() (AgentToolResult, error) {
+			return b.executeRecentHistorySummary(ctx, claimed, call, recovering, checkpointOutput)
+		})
 	}
 	if cloudDSHGoalScheduleToolName(call.Name) {
+		if cloudDSHPlanStepReadTool(call.Name) {
+			return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, func() (AgentToolResult, error) {
+				return b.executeGoalScheduleTool(ctx, claimed, call, recovering, checkpointOutput)
+			})
+		}
 		return b.executeGoalScheduleTool(ctx, claimed, call, recovering, checkpointOutput)
 	}
 	if call.Name == cloudDSHTaskAttachmentReadToolName {
-		return b.executeTaskAttachmentRead(ctx, claimed, call, recovering, checkpointOutput)
+		return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, func() (AgentToolResult, error) {
+			return b.executeTaskAttachmentRead(ctx, claimed, call, recovering, checkpointOutput)
+		})
 	}
 	if call.Name == cloudDSHWebSearchToolName || call.Name == cloudDSHWebReadToolName {
 		return b.executeBuiltinSearch(ctx, claimed, call, recovering, checkpointOutput)
 	}
 	if strings.HasPrefix(call.Name, "morde_hub_") {
+		if cloudDSHPlanStepReadTool(call.Name) {
+			return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, func() (AgentToolResult, error) {
+				return b.executeHubTaskAction(ctx, claimed, call, recovering, checkpointOutput)
+			})
+		}
 		return b.executeHubTaskAction(ctx, claimed, call, recovering, checkpointOutput)
 	}
 	if call.Name == cloudDSHMCPDiscoverToolName || call.Name == cloudDSHMCPCallToolName {
@@ -1792,6 +1913,98 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		return AgentToolResult{}, err
 	}
 	return AgentToolResult{Status: result.Status, ExternalID: result.ExternalID, Output: output, Images: result.Images}, nil
+}
+
+func (b *CloudDSHToolBroker) executePlanStepRead(ctx context.Context, claimed task.Task, call ModelToolCall,
+	metadata cloudDSHPlanStepArguments, read func() (AgentToolResult, error)) (AgentToolResult, error) {
+	if read == nil || !cloudDSHPlanStepReadTool(call.Name) {
+		return AgentToolResult{}, domain.NewError(domain.CodeInvalidArgument, "direct read plan execution is invalid")
+	}
+	details, err := b.currentServerTask(ctx, claimed)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	planRevision, err := validateCloudDSHPlanStepSelection(details, metadata, "direct read")
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	if planRevision == 0 {
+		return read()
+	}
+	store, ok := b.store.(CloudDSHPlanStepReadStore)
+	if !ok {
+		return AgentToolResult{}, domain.NewError(domain.CodeUnsupported, "Task plan direct-read admission is unavailable")
+	}
+	toolCall, err := cloudDSHPlanStepReadToolCallProgress(ctx, details.Task, call)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	if err := store.AdmitCloudDSHTaskPlanStepRead(ctx, details.Task, planRevision, metadata.StepID, toolCall); err != nil {
+		return AgentToolResult{}, err
+	}
+	result, err := read()
+	if err != nil || result.Status != AgentToolSucceeded {
+		return result, err
+	}
+	resultDigest, err := cloudDSHPlanStepReadResultDigest(result)
+	if err != nil {
+		return AgentToolResult{Status: AgentToolUnknown}, err
+	}
+	if err := store.SettleCloudDSHTaskPlanStepRead(ctx, details.Task, planRevision, metadata.StepID, toolCall, resultDigest); err != nil {
+		return AgentToolResult{Status: AgentToolUnknown}, err
+	}
+	return result, nil
+}
+
+func cloudDSHPlanStepReadToolCallProgress(ctx context.Context, current task.Task, call ModelToolCall) (TaskToolCallProgress, error) {
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok || activity.call.TaskFence == nil || activity.call.CallID != call.CallID || activity.call.Name != call.Name ||
+		!validCloudDSHToolActivityFence(ctx, activity.current, activity.call) || len(activity.digest) != sha256.Size ||
+		activity.current.ID != current.ID || activity.current.OwnerID != current.OwnerID ||
+		activity.current.AgentSessionID != current.AgentSessionID || activity.current.AgentInstanceID != current.AgentInstanceID ||
+		activity.current.AgentGeneration != current.AgentGeneration || !sameTaskInputRevision(activity.current.CurrentRevision, current.CurrentRevision) ||
+		!sameCloudDSHAuthorization(activity.current.Authorization, current.Authorization) ||
+		activity.current.Lease.Owner != current.Lease.Owner || activity.current.Lease.Version != current.Lease.Version {
+		return TaskToolCallProgress{}, domain.NewError(domain.CodeInvalidState, "direct read DSH call identity is unavailable")
+	}
+	fence := activity.call.TaskFence
+	if activity.current.CurrentRevision == nil || fence.TaskID != current.ID || fence.OwnerID != current.OwnerID ||
+		fence.AgentSessionID != current.AgentSessionID || fence.AuthorizationVersion != current.Authorization.Version {
+		return TaskToolCallProgress{}, domain.NewError(domain.CodeInvalidState, "direct read DSH call fence changed")
+	}
+	return TaskToolCallProgress{
+		AgentSessionID: fence.AgentSessionID, AgentInstanceID: fence.AgentInstanceID,
+		AgentGeneration: fence.AgentGeneration, AuthorizationVersion: fence.AuthorizationVersion,
+		TaskRevision: *activity.current.CurrentRevision, CallKey: activity.call.CallID, ToolName: activity.call.Name,
+		RequestDigest: append([]byte(nil), activity.digest...),
+	}, nil
+}
+
+func cloudDSHPlanStepReadResultDigest(result AgentToolResult) ([]byte, error) {
+	if result.Status != AgentToolSucceeded || !utf8.ValidString(result.Output) {
+		return nil, domain.NewError(domain.CodeInvalidState, "direct read result cannot be settled")
+	}
+	type resultImage struct {
+		MediaType string `json:"media_type"`
+		Data      []byte `json:"data"`
+	}
+	images := make([]resultImage, 0, len(result.Images))
+	for _, image := range result.Images {
+		if image.MediaType == "" || len(image.Data) == 0 {
+			return nil, domain.NewError(domain.CodeInvalidState, "direct read image result is invalid")
+		}
+		images = append(images, resultImage{MediaType: image.MediaType, Data: image.Data})
+	}
+	canonical, err := json.Marshal(struct {
+		Status AgentToolResultStatus `json:"status"`
+		Output string                `json:"output"`
+		Images []resultImage         `json:"images"`
+	}{Status: result.Status, Output: result.Output, Images: images})
+	if err != nil {
+		return nil, fmt.Errorf("encode direct read result digest: %w", err)
+	}
+	digest := sha256.Sum256(canonical)
+	return append([]byte(nil), digest[:]...), nil
 }
 
 func (b *CloudDSHToolBroker) executeApprovedTaskMediaSave(ctx context.Context, current task.Task, call ModelToolCall, details TaskDetails,
@@ -2458,10 +2671,10 @@ func safeCloudDSHToolFailureResult(name string, result AgentToolResult) AgentToo
 				ExitCode: shell.ExitCode, TimedOut: shell.TimedOut,
 				StdoutTruncated: shell.StdoutTruncated || shell.Stdout != "",
 				StderrTruncated: shell.StderrTruncated || shell.Stderr != "",
-				TaskID: shell.TaskID, WorkspaceID: shell.WorkspaceID, BindingVersion: shell.BindingVersion,
+				TaskID:          shell.TaskID, WorkspaceID: shell.WorkspaceID, BindingVersion: shell.BindingVersion,
 				WorkspaceViewID: shell.WorkspaceViewID, WorkspaceCheckpointRevision: shell.WorkspaceCheckpointRevision,
 				WorkspaceManifestSHA256Before: shell.WorkspaceManifestSHA256Before,
-				WorkspaceManifestSHA256After: shell.WorkspaceManifestSHA256After, VerificationCheck: shell.VerificationCheck,
+				WorkspaceManifestSHA256After:  shell.WorkspaceManifestSHA256After, VerificationCheck: shell.VerificationCheck,
 			})
 			if err == nil {
 				result.Output = string(canonical)
@@ -2507,6 +2720,14 @@ func (b *CloudDSHToolBroker) reconcile(ctx context.Context, request AgentToolReq
 		if err != nil || result.Status == AgentToolUnknown {
 			paused, pauseErr := b.pauseUnknown(ctx, request.Task, step, usage, request.OperationKey, "The prior operation could not be safely reconciled.")
 			return operation, paused, true, errors.Join(err, pauseErr)
+		}
+		// Reconciliation may be the first point at which the broker receives a
+		// definitive Runtime result after a crash between dispatch and ledger
+		// settlement. Bind the same typed check receipt before persisting that
+		// recovered result. Already-terminal ledger results retain their stored
+		// receipt and are not rewritten here.
+		if operation.Status != task.OperationSucceeded && operation.Status != task.OperationFailed {
+			result = attestReconciledTaskValidationShellResult(ctx, request, operation, result)
 		}
 		if result.Status == AgentToolNotFound {
 			if operation.Status != task.OperationUnknown {

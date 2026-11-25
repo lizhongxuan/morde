@@ -78,9 +78,8 @@ type TaskValidationReviewInput struct {
 	Evidence              *TaskValidationEvidenceRecord              `json:"evidence"`
 	EvidenceDetails       []TaskValidationReviewEvidenceDetail       `json:"evidence_details"`
 	ArtifactContentProofs []TaskValidationReviewArtifactContentProof `json:"-"`
-	// Replay is the server-attested test re-run for a fix task (E09), or
-	// nil for any other task. It lets the review model judge H07 on ledger
-	// fact instead of on shell exit codes alone.
+	// Replay is the server-attested typed check ledger for a fix task, or
+	// nil for any other task. Missing or invalid check receipts remain pending.
 	Replay *TaskValidationReplayEvidence `json:"replay,omitempty"`
 }
 

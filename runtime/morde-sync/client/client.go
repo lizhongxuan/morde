@@ -212,6 +212,7 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 	if err != nil {
 		return Result{}, fmt.Errorf("select local workspace directory: %w", err)
 	}
+	options.Directory = directory
 	if lockDirectory {
 		releaseOperation, err := acquireOperationLock(ctx, directory)
 		if err != nil {
@@ -298,7 +299,9 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 				return Result{}, err
 			}
 		}
-		session, err = c.getSession(ctx, options.WorkspaceID, options.SessionID)
+		if err = verifySyncRootIdentity(directory, rootIdentity); err == nil {
+			session, err = c.getSession(ctx, options.WorkspaceID, options.SessionID)
+		}
 	} else {
 		previous, previousErr := readResumeMetadata(directory, options.WorkspaceID)
 		if previousErr != nil && !errors.Is(previousErr, os.ErrNotExist) {
@@ -433,6 +436,9 @@ func (c *Client) sync(ctx context.Context, options SyncOptions, lockDirectory, k
 	}
 	progress := progressReporter{callback: options.Progress, session: session, fileCount: local.FileCount, totalBytes: local.TotalBytes}
 	progress.report("")
+	if err := verifySyncRootIdentity(directory, rootIdentity); err != nil {
+		return result, err
+	}
 	if isTerminal(session.State) {
 		if session.State != "completed" || !keepCompletedMetadata {
 			_ = removeResumeMetadata(directory, options.WorkspaceID, session.ID)

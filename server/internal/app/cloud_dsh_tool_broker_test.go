@@ -32,6 +32,79 @@ type cloudDSHBrokerTaskStore struct {
 	toolCalls               []TaskToolCallProgress
 	commitTaskProgressError error
 	committedTaskProgress   []TaskProgress
+	planReadEvents          []string
+	planReadAdmissions      []cloudDSHPlanReadRecord
+	planReadSettlements     []cloudDSHPlanReadRecord
+	planReadAdmissionError  error
+	planReadSettlementError error
+	planReadSettledDigests  map[string][]byte
+}
+
+type cloudDSHPlanReadRecord struct {
+	PlanRevision int64
+	StepID       string
+	ToolCall     TaskToolCallProgress
+	ResultDigest []byte
+}
+
+func (s *cloudDSHBrokerTaskStore) AdmitCloudDSHTaskPlanStepRead(ctx context.Context, current task.Task, planRevision int64,
+	stepID string, toolCall TaskToolCallProgress) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.planReadEvents = append(s.planReadEvents, "admit")
+	s.planReadAdmissions = append(s.planReadAdmissions, cloudDSHPlanReadRecord{PlanRevision: planRevision, StepID: stepID, ToolCall: toolCall})
+	if s.planReadAdmissionError != nil {
+		return s.planReadAdmissionError
+	}
+	if current.ID != s.details.Task.ID || current.OwnerID != s.details.Task.OwnerID {
+		return errors.New("stale direct read admission")
+	}
+	return nil
+}
+
+func (s *cloudDSHBrokerTaskStore) SettleCloudDSHTaskPlanStepRead(ctx context.Context, current task.Task, planRevision int64,
+	stepID string, toolCall TaskToolCallProgress, resultDigest []byte) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.planReadSettlementError != nil {
+		return s.planReadSettlementError
+	}
+	if len(resultDigest) != sha256.Size || current.ID != s.details.Task.ID || current.OwnerID != s.details.Task.OwnerID {
+		return errors.New("invalid direct read settlement")
+	}
+	foundSuccessfulStep := false
+	for _, step := range s.details.Steps {
+		if step.AgentSessionID == toolCall.AgentSessionID && step.TaskRevision != nil && *step.TaskRevision == toolCall.TaskRevision &&
+			step.ToolCallKey == toolCall.CallKey && step.ToolName == toolCall.ToolName &&
+			bytes.Equal(step.RequestDigest, toolCall.RequestDigest) && step.Status == task.StepSucceeded {
+			foundSuccessfulStep = true
+			break
+		}
+	}
+	if !foundSuccessfulStep {
+		return errors.New("direct read TaskStep is not durably successful")
+	}
+	key := current.ID + "\x00" + toolCall.AgentSessionID + "\x00" + toolCall.CallKey
+	if s.planReadSettledDigests == nil {
+		s.planReadSettledDigests = make(map[string][]byte)
+	}
+	if previous, found := s.planReadSettledDigests[key]; found {
+		if !bytes.Equal(previous, resultDigest) {
+			return domain.NewError(domain.CodeConflict, "direct read replay result digest changed")
+		}
+		return nil
+	}
+	s.planReadEvents = append(s.planReadEvents, "settle")
+	s.planReadSettledDigests[key] = append([]byte(nil), resultDigest...)
+	s.planReadSettlements = append(s.planReadSettlements, cloudDSHPlanReadRecord{PlanRevision: planRevision, StepID: stepID,
+		ToolCall: toolCall, ResultDigest: append([]byte(nil), resultDigest...)})
+	return nil
 }
 
 func TestCloudDSHPlanStepArgumentsAreSeparatedFromBusinessArguments(t *testing.T) {
@@ -140,6 +213,211 @@ func TestCloudDSHPlanStepSelectionRequiresCurrentPersistedStep(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCloudDSHPlanMetadataIsExposedOnlyOnDirectReadTools(t *testing.T) {
+	hubReadNames := []string{
+		hubTaskToolName("morde_hub_screenshot", "i7654321", 5),
+		hubTaskToolName("morde_hub_files", "i7654321", 5),
+		hubTaskToolName("morde_hub_file_get", "i7654321", 5),
+		hubTaskToolName("morde_hub_file_fetch", "i7654321", 5),
+	}
+	readNames := []string{
+		cloudDSHSkillReadToolName, cloudDSHTaskAttachmentReadToolName,
+		cloudDSHConversationHistorySearchToolName, cloudDSHRecentHistorySummaryToolName,
+		cloudDSHCurrentHistorySearchToolName, cloudDSHCurrentMessageReadToolName, cloudDSHCurrentMessageSearchToolName,
+		cloudDSHWorkspaceListToolName, cloudDSHWorkspaceReadToolName, cloudDSHWorkspaceSearchToolName,
+		cloudDSHImpactMapToolName, cloudDSHGoalListToolName, cloudDSHScheduleListToolName, cloudDSHScheduleRunsToolName,
+	}
+	readNames = append(readNames, hubReadNames...)
+	nonReadNames := []string{
+		cloudDSHGoalCreateToolName, cloudDSHScheduleCreateToolName, runtimeToolFileRead,
+		cloudDSHWebSearchToolName, cloudDSHWebReadToolName, cloudDSHMCPCallToolName, cloudDSHMCPDiscoverToolName,
+		hubTaskToolName("morde_hub_command", "i7654321", 5),
+	}
+	definitions := make([]AgentToolDefinition, 0, len(readNames)+len(nonReadNames))
+	for _, name := range append(append([]string(nil), readNames...), nonReadNames...) {
+		definitions = append(definitions, AgentToolDefinition{ModelTool: ModelTool{Name: name,
+			Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)}})
+	}
+	got, err := addPlanStepArgumentToDirectReadTools(definitions, 7)
+	if err != nil {
+		t.Fatalf("addPlanStepArgumentToDirectReadTools() error = %v", err)
+	}
+	for index, name := range append(append([]string(nil), readNames...), nonReadNames...) {
+		var schema struct {
+			Properties map[string]json.RawMessage `json:"properties"`
+			Required   []string                   `json:"required"`
+		}
+		if err := json.Unmarshal(got[index].Parameters, &schema); err != nil {
+			t.Fatalf("decode %q schema: %v", name, err)
+		}
+		if index < len(readNames) {
+			var revision struct {
+				Enum []int64 `json:"enum"`
+			}
+			if len(schema.Properties[cloudDSHPlanStepIDArgumentName]) == 0 || len(schema.Properties[cloudDSHPlanRevisionArgumentName]) == 0 ||
+				!containsString(schema.Required, cloudDSHPlanStepIDArgumentName) || !containsString(schema.Required, cloudDSHPlanRevisionArgumentName) ||
+				json.Unmarshal(schema.Properties[cloudDSHPlanRevisionArgumentName], &revision) != nil || len(revision.Enum) != 1 || revision.Enum[0] != 7 {
+				t.Fatalf("direct read tool %q schema lacks exact required plan metadata: %s", name, got[index].Parameters)
+			}
+		} else if len(schema.Properties[cloudDSHPlanStepIDArgumentName]) != 0 || len(schema.Properties[cloudDSHPlanRevisionArgumentName]) != 0 ||
+			containsString(schema.Required, cloudDSHPlanStepIDArgumentName) || containsString(schema.Required, cloudDSHPlanRevisionArgumentName) {
+			t.Fatalf("non-read tool %q received direct-read plan metadata: %s", name, got[index].Parameters)
+		}
+	}
+}
+
+func TestCloudDSHPlanStepReadAdmissionAndSettlement(t *testing.T) {
+	t.Run("missing or stale selector is rejected before read", func(t *testing.T) {
+		for name, metadata := range map[string]cloudDSHPlanStepArguments{
+			"missing": {BusinessArgs: json.RawMessage(`{}`)},
+			"stale":   {HasStepID: true, StepID: "sources", PlanRevision: 1, BusinessArgs: json.RawMessage(`{}`)},
+		} {
+			t.Run(name, func(t *testing.T) {
+				broker, store, current, ctx, call := newCloudDSHPlanStepReadFixture(t)
+				readCalled := false
+				_, err := broker.executePlanStepRead(ctx, current, call, metadata, func() (AgentToolResult, error) {
+					readCalled = true
+					return AgentToolResult{Status: AgentToolSucceeded, Output: "should not be read"}, nil
+				})
+				if domain.CodeOf(err) != domain.CodeConflict || readCalled || len(store.planReadAdmissions) != 0 {
+					t.Fatalf("executePlanStepRead() error=%v read=%t admissions=%d; want pre-read conflict", err, readCalled, len(store.planReadAdmissions))
+				}
+			})
+		}
+	})
+
+	t.Run("successful read settles after durable step", func(t *testing.T) {
+		broker, store, current, ctx, call, metadata := newCloudDSHPlanStepReadFixtureWithMetadata(t)
+		result, err := broker.executePlanStepRead(ctx, current, call, metadata, func() (AgentToolResult, error) {
+			store.mu.Lock()
+			store.planReadEvents = append(store.planReadEvents, "read")
+			store.mu.Unlock()
+			step, stepErr := newAgentStep(current.ID, 1, "tool", task.StepSucceeded, "Read source", "Read completed.")
+			if stepErr != nil {
+				return AgentToolResult{}, stepErr
+			}
+			if commitErr := broker.commitProgress(ctx, current, step, current.Usage, task.StatusRunning, "", "task.step", map[string]any{"tool": call.Name}); commitErr != nil {
+				return AgentToolResult{}, commitErr
+			}
+			return AgentToolResult{Status: AgentToolSucceeded, Output: "source contents"}, nil
+		})
+		if err != nil || result.Status != AgentToolSucceeded {
+			t.Fatalf("executePlanStepRead() = %#v, %v", result, err)
+		}
+		if got := strings.Join(store.planReadEvents, ","); got != "admit,read,settle" {
+			t.Fatalf("read lifecycle order = %q; want admission before read and settlement afterward", got)
+		}
+		if len(store.planReadAdmissions) != 1 || len(store.planReadSettlements) != 1 {
+			t.Fatalf("admissions=%d settlements=%d; want exactly one each", len(store.planReadAdmissions), len(store.planReadSettlements))
+		}
+		callIdentity := store.planReadAdmissions[0].ToolCall
+		if callIdentity.CallKey != call.CallID || callIdentity.ToolName != call.Name || callIdentity.TaskRevision != *current.CurrentRevision ||
+			callIdentity.AgentSessionID != current.AgentSessionID || len(callIdentity.RequestDigest) != sha256.Size ||
+			store.planReadSettlements[0].PlanRevision != metadata.PlanRevision || store.planReadSettlements[0].StepID != metadata.StepID ||
+			len(store.planReadSettlements[0].ResultDigest) != sha256.Size {
+			t.Fatalf("direct read call/result binding = admission:%+v settlement:%+v", store.planReadAdmissions[0], store.planReadSettlements[0])
+		}
+	})
+
+	t.Run("failed read does not settle", func(t *testing.T) {
+		broker, store, current, ctx, call, metadata := newCloudDSHPlanStepReadFixtureWithMetadata(t)
+		result, err := broker.executePlanStepRead(ctx, current, call, metadata, func() (AgentToolResult, error) {
+			store.mu.Lock()
+			store.planReadEvents = append(store.planReadEvents, "read")
+			store.mu.Unlock()
+			return AgentToolResult{Status: AgentToolFailed, Output: "read failed"}, nil
+		})
+		if err != nil || result.Status != AgentToolFailed || len(store.planReadAdmissions) != 1 || len(store.planReadSettlements) != 0 {
+			t.Fatalf("failed read = %#v, %v admissions=%d settlements=%d", result, err, len(store.planReadAdmissions), len(store.planReadSettlements))
+		}
+	})
+
+	t.Run("settled replay mismatch becomes unknown", func(t *testing.T) {
+		broker, store, current, ctx, call, metadata := newCloudDSHPlanStepReadFixtureWithMetadata(t)
+		read := func(output string) func() (AgentToolResult, error) {
+			return func() (AgentToolResult, error) {
+				step, stepErr := newAgentStep(current.ID, 1, "tool", task.StepSucceeded, "Read source", "Read completed.")
+				if stepErr != nil {
+					return AgentToolResult{}, stepErr
+				}
+				if commitErr := broker.commitProgress(ctx, current, step, current.Usage, task.StatusRunning, "", "task.step", map[string]any{"tool": call.Name}); commitErr != nil {
+					return AgentToolResult{}, commitErr
+				}
+				return AgentToolResult{Status: AgentToolSucceeded, Output: output}, nil
+			}
+		}
+		first, firstErr := broker.executePlanStepRead(ctx, current, call, metadata, read("first result"))
+		if firstErr != nil || first.Status != AgentToolSucceeded {
+			t.Fatalf("initial read = %#v, %v", first, firstErr)
+		}
+		replayed, replayErr := broker.executePlanStepRead(ctx, current, call, metadata, read("changed result"))
+		if domain.CodeOf(replayErr) != domain.CodeConflict || replayed.Status != AgentToolUnknown || len(store.planReadSettlements) != 1 {
+			t.Fatalf("changed replay = %#v, %v settlements=%d; want unknown/conflict without replacing original receipt", replayed, replayErr, len(store.planReadSettlements))
+		}
+	})
+}
+
+func TestCloudDSHPlanStepReadResultDigestIncludesImages(t *testing.T) {
+	base, err := cloudDSHPlanStepReadResultDigest(AgentToolResult{Status: AgentToolSucceeded, Output: "same output"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withImage, err := cloudDSHPlanStepReadResultDigest(AgentToolResult{Status: AgentToolSucceeded, Output: "same output",
+		Images: []ModelImage{{MediaType: "image/png", Data: []byte{1, 2, 3}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withChangedData, err := cloudDSHPlanStepReadResultDigest(AgentToolResult{Status: AgentToolSucceeded, Output: "same output",
+		Images: []ModelImage{{MediaType: "image/png", Data: []byte{1, 2, 4}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withChangedType, err := cloudDSHPlanStepReadResultDigest(AgentToolResult{Status: AgentToolSucceeded, Output: "same output",
+		Images: []ModelImage{{MediaType: "image/jpeg", Data: []byte{1, 2, 3}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(base, withImage) || bytes.Equal(withImage, withChangedData) || bytes.Equal(withImage, withChangedType) {
+		t.Fatalf("image result changes were not reflected in result digest: base=%x image=%x data=%x type=%x", base, withImage, withChangedData, withChangedType)
+	}
+}
+
+func newCloudDSHPlanStepReadFixture(t *testing.T) (*CloudDSHToolBroker, *cloudDSHBrokerTaskStore, task.Task, context.Context, ModelToolCall) {
+	t.Helper()
+	broker, store, current, ctx, call, _ := newCloudDSHPlanStepReadFixtureWithMetadata(t)
+	return broker, store, current, ctx, call
+}
+
+func newCloudDSHPlanStepReadFixtureWithMetadata(t *testing.T) (*CloudDSHToolBroker, *cloudDSHBrokerTaskStore, task.Task,
+	context.Context, ModelToolCall, cloudDSHPlanStepArguments) {
+	t.Helper()
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	current := configureInvalidRuntimeToolTask(&store.details.Task)
+	current.ExecutionLocation = "server"
+	current.Status = task.StatusRunning
+	store.details.Task = current
+	store.details.Plan = &task.Plan{TaskRevision: *current.CurrentRevision, Revision: 2,
+		Goal: "Read a source", Scope: "Inspect the selected source", VerificationMethod: "Check the returned content",
+		CostEstimateState: "unknown", Steps: []task.PlanStep{{ID: "sources", Title: "Read source",
+			Status: task.PlanStepPending, CompletionCriteria: []string{"the source is read"}}}}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := store.details.Plan.Revision
+	original := invalidRuntimeToolCall(current, "call-direct-plan-read", cloudDSHCurrentHistorySearchToolName,
+		`{"query":"history","morde_plan_step_id":"sources","morde_plan_revision":2}`)
+	ctx := withCloudDSHToolActivity(context.Background(), current, original, nil)
+	metadata, err := extractCloudDSHPlanStepArguments(original.Arguments)
+	if err != nil || !metadata.HasStepID || metadata.PlanRevision != revision {
+		t.Fatalf("extract direct read plan metadata = %#v, %v", metadata, err)
+	}
+	call := original
+	call.Arguments = string(metadata.BusinessArgs)
+	return broker, store, current, ctx, call, metadata
 }
 
 func setCloudDSHPlanStepMetadataForTest(t *testing.T, call ModelToolCall, stepID string, revision *int64) ModelToolCall {
