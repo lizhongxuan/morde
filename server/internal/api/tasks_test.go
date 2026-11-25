@@ -790,6 +790,66 @@ func TestTaskResponseIncludesOnlyActivePendingApproval(t *testing.T) {
 	}
 }
 
+func TestTaskResponseIncludesPendingApprovalEvidenceFields(t *testing.T) {
+	now := time.Now().UTC()
+	totalCost := int64(12345)
+	value := app.TaskDetails{
+		Task: func() task.Task { result := apiTestTask(); result.Status = task.StatusWaitingUser; return result }(),
+		PendingRequest: &task.PendingRequest{
+			ID: "r1234567", TaskID: "q1234567", Version: 2, Kind: "approval", Title: "Approve file upload",
+			Object: "report.txt", Content: "Upload this report?", Impact: "The file will leave this Host.",
+			Status: task.PendingRequestPending, CreatedAt: now,
+			EvidencePointer: "step:s1234567", ThisCostMicros: nil, TotalCostMicros: &totalCost,
+			TriggerRule:          task.ApprovalTriggerHostSensitiveTool,
+			RejectionConsequence: "If you reject, the file is not uploaded and the task stops at this step.",
+		},
+	}
+	view, err := toTaskResponse(value)
+	if err != nil || view.PendingRequest == nil {
+		t.Fatalf("task response with evidence fields error = %v, view = %#v", err, view.PendingRequest)
+	}
+	pending := view.PendingRequest
+	if pending.EvidencePointer != "step:s1234567" || pending.ThisCostMicros != nil ||
+		pending.TotalCostMicros == nil || *pending.TotalCostMicros != totalCost ||
+		pending.TriggerRule != task.ApprovalTriggerHostSensitiveTool ||
+		pending.RejectionConsequence != "If you reject, the file is not uploaded and the task stops at this step." {
+		t.Fatalf("pending evidence fields = %#v", pending)
+	}
+	encoded, err := json.Marshal(pending)
+	if err != nil || !strings.Contains(string(encoded), `"evidence_pointer":"step:s1234567"`) ||
+		!strings.Contains(string(encoded), `"this_cost_micros":null`) ||
+		!strings.Contains(string(encoded), `"total_cost_micros":12345`) ||
+		!strings.Contains(string(encoded), `"trigger_rule":"host_sensitive_tool"`) {
+		t.Fatalf("pending evidence JSON = %s, err=%v", encoded, err)
+	}
+	invalid := []struct {
+		name  string
+		apply func(*task.PendingRequest)
+	}{
+		{name: "bad evidence pointer", apply: func(p *task.PendingRequest) { p.EvidencePointer = "bogus" }},
+		{name: "bad trigger rule", apply: func(p *task.PendingRequest) { p.TriggerRule = "bogus" }},
+		{name: "negative total cost", apply: func(p *task.PendingRequest) { negative := int64(-1); p.TotalCostMicros = &negative }},
+		{name: "negative this cost", apply: func(p *task.PendingRequest) { negative := int64(-1); p.ThisCostMicros = &negative }},
+		{name: "over-long rejection consequence", apply: func(p *task.PendingRequest) {
+			p.RejectionConsequence = strings.Repeat("x", 513)
+		}},
+	}
+	for _, tc := range invalid {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.apply(value.PendingRequest)
+			if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+				t.Fatalf("toTaskResponse() error = %v, want internal for %s", err, tc.name)
+			}
+			// Restore the valid evidence fields for the next case.
+			value.PendingRequest.EvidencePointer = "step:s1234567"
+			value.PendingRequest.TriggerRule = task.ApprovalTriggerHostSensitiveTool
+			value.PendingRequest.TotalCostMicros = &totalCost
+			value.PendingRequest.ThisCostMicros = nil
+			value.PendingRequest.RejectionConsequence = "If you reject, the file is not uploaded and the task stops at this step."
+		})
+	}
+}
+
 func TestTaskApprovalDisclosuresRequireKnownValuesAndCostBasis(t *testing.T) {
 	disclosures := unknownTaskApprovalDisclosures()
 	risk, alternative, revocation := "May expose the selected file to the connected service.", "Review the file before export.", "The external service may not support undo."
@@ -1648,6 +1708,35 @@ func TestTaskApprovalSnapshotReturnsExpiredStatusForPastPendingRequest(t *testin
 	response, err := toTaskApprovalResponse(value)
 	if err != nil || response.Approval.Status != string(task.PendingRequestExpired) || response.Approval.Decision != "" {
 		t.Fatalf("expired pending snapshot = %#v err=%v", response, err)
+	}
+}
+
+func TestTaskApprovalSnapshotIncludesEvidenceFields(t *testing.T) {
+	now := time.Now().UTC()
+	totalCost := int64(12345)
+	value := app.TaskApproval{
+		TaskID: "q1234567", ConversationID: "c1234567", TaskStatus: task.StatusWaitingUser, TaskEventSeq: 2, TaskUpdatedAt: now,
+		Request: task.PendingRequest{ID: "r1234567", TaskID: "q1234567", Version: 1, Kind: "approval", Title: "Confirm access",
+			Object: "Workspace", Content: "Read selected file", Impact: "File content may be disclosed", Status: task.PendingRequestPending,
+			CreatedAt: now, EvidencePointer: "step:s1234567", ThisCostMicros: nil, TotalCostMicros: &totalCost,
+			TriggerRule:          task.ApprovalTriggerExternalMCPTool,
+			RejectionConsequence: "If you reject, the service is not called and the task stops at this step."},
+	}
+	response, err := toTaskApprovalResponse(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	approval := response.Approval
+	if approval.EvidencePointer != "step:s1234567" || approval.ThisCostMicros != nil ||
+		approval.TotalCostMicros == nil || *approval.TotalCostMicros != totalCost ||
+		approval.TriggerRule != task.ApprovalTriggerExternalMCPTool ||
+		approval.RejectionConsequence != "If you reject, the service is not called and the task stops at this step." {
+		t.Fatalf("approval snapshot evidence fields = %#v", approval)
+	}
+	encoded, err := json.Marshal(approval)
+	if err != nil || !strings.Contains(string(encoded), `"this_cost_micros":null`) ||
+		!strings.Contains(string(encoded), `"total_cost_micros":12345`) {
+		t.Fatalf("approval snapshot evidence JSON = %s, err=%v", encoded, err)
 	}
 }
 

@@ -319,12 +319,20 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 				}
 			}
 			definitions = append(definitions, deferredWorkspaceToolDefinitions(details.Task.Authorization, liveDirectory)...)
+			if !liveDirectory {
+				if definition, ok := deferredCloudDSHImpactMapDefinition(details.Task.Authorization); ok {
+					definitions = append(definitions, definition)
+				}
+			}
 		} else if b.workspaceTools != nil && cloudDSHWorkspaceToolsEligible(details.Task) {
 			liveDirectory, err := b.workspaceTools.workspaces.UsesLiveDirectorySource(ctx, taskWorkspaceOwner(details.Task), details.Task.WorkspaceID)
 			if err != nil {
 				return nil, err
 			}
 			definitions = append(definitions, cloudDSHWorkspaceToolDefinitions(*details.Task.WorkspaceCheckpointRevision, liveDirectory)...)
+			if !liveDirectory {
+				definitions = append(definitions, cloudDSHImpactMapDefinition())
+			}
 		}
 		if !goalFollowupReadOnly && b.builtinSearch != nil && b.authorizeBuiltinSearch(ctx, details.Task) == nil {
 			definitions = append(definitions, cloudDSHBuiltinSearchDefinitions()...)
@@ -406,7 +414,7 @@ func cloudDSHGoalFollowupReadOnlyTask(value task.Task) bool {
 func goalFollowupReadOnlyToolAllowed(name string) bool {
 	switch name {
 	case cloudDSHSkillReadToolName, cloudDSHTaskAttachmentReadToolName,
-		cloudDSHWorkspaceListToolName, cloudDSHWorkspaceReadToolName, cloudDSHWorkspaceSearchToolName:
+		cloudDSHWorkspaceListToolName, cloudDSHWorkspaceReadToolName, cloudDSHWorkspaceSearchToolName, cloudDSHImpactMapToolName:
 		return true
 	default:
 		return false
@@ -478,6 +486,20 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 			return err
 		}
 		useCloudDSHStreamResultStep(&step, details, completion)
+		// Minimal-diff recheck (E06): a stale completion still may not
+		// deliver files changed outside the fix plan allow set.
+		if evidence, evidenceErr := agentFileWriteEvidence(completion.Inputs); evidenceErr == nil {
+			if violations := minimalDiffOutOfScopeFiles(details.Plan, agentFileEvidencePaths(evidence)); len(violations) > 0 {
+				return b.pauseCompletion(ctx, current, step, "minimal_diff_violation", "The task changed files outside fix_plan.changed_files: "+strings.Join(violations, ", "))
+			}
+		}
+		// Test gate (E07): after the minimal-diff recheck, a stale
+		// completion still may not deliver an untested fix.
+		if paused, err := b.pauseForTestGate(ctx, current, step, details); err != nil {
+			return err
+		} else if paused {
+			return nil
+		}
 		return b.completeWithRecordCapture(ctx, current, step, current.Usage, completion.Result, completion.ValidationClaims,
 			map[string]any{"source": "cloud_dsh"}, "", nil, completionFence)
 	}
@@ -494,6 +516,18 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 			return err
 		}
 		workspaceWrite := len(verifiedArtifacts) > 0
+		// Minimal-diff recheck (E06): hostless writes are summarized by the
+		// verified artifacts, not by agentFileWriteEvidence, which only
+		// covers host file_write calls. Any verified file outside the fix
+		// plan allow set pauses completion instead of delivering.
+		if violations := minimalDiffOutOfScopeFiles(details.Plan, verifiedArtifactPaths(verifiedArtifacts)); len(violations) > 0 {
+			step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "result", task.StepSucceeded,
+				"Complete cloud task", "The cloud dsh session completed and its process tree stopped.")
+			if err != nil {
+				return err
+			}
+			return b.pauseCompletion(ctx, current, step, "minimal_diff_violation", "The task changed files outside fix_plan.changed_files: "+strings.Join(violations, ", "))
+		}
 		if fileIntent != task.FileDeliveryNone && !workspaceWrite {
 			return b.pauseForFileDelivery(ctx, current, details, fileIntent, current.WorkspaceID != "")
 		}
@@ -541,6 +575,21 @@ func (b *CloudDSHToolBroker) Complete(ctx context.Context, claimed task.Task, co
 		"phase": "verify", "source": "cloud_dsh",
 	}); err != nil {
 		return err
+	}
+	// Minimal-diff recheck (E06): the evidence summarizes every file this
+	// task wrote, including files written before the fix plan was submitted,
+	// so a plan that does not list them cannot smuggle them into delivery.
+	if evidenceErr == nil {
+		if violations := minimalDiffOutOfScopeFiles(details.Plan, agentFileEvidencePaths(evidence)); len(violations) > 0 {
+			return b.pauseCompletion(ctx, current, step, "minimal_diff_violation", "The task changed files outside fix_plan.changed_files: "+strings.Join(violations, ", "))
+		}
+	}
+	// Test gate (E07): after the minimal-diff recheck and before regression
+	// verification, an untested fix never reaches Verify or delivery.
+	if paused, err := b.pauseForTestGate(ctx, current, step, details); err != nil {
+		return err
+	} else if paused {
+		return nil
 	}
 	if evidenceErr != nil || cloudDSHHasUnverifiedFileWrite(completion.Inputs, evidence) ||
 		(len(evidence) == 0 && fileIntent != task.FileDeliveryRequired) {
@@ -937,6 +986,24 @@ func (b *CloudDSHToolBroker) pauseCompletion(ctx context.Context, current task.T
 	})
 }
 
+// pauseForTestGate pauses completion with test_gate_failed when the E07 test
+// gate fails for a fix task. It reports whether it paused: false when the
+// gate passes, when the task has no fix plan, or when the task is hostless.
+// Hostless tasks are exempt because they have no shell tool, so no test run
+// can ever be recorded; the missing hostless test gate is a known
+// limitation. The caller reuses its own result step, as the minimal-diff
+// recheck does, and returns nil when paused.
+func (b *CloudDSHToolBroker) pauseForTestGate(ctx context.Context, current task.Task, step task.Step, details TaskDetails) (bool, error) {
+	if current.HostID == "" {
+		return false, nil
+	}
+	missing := testGateMissing(details)
+	if missing == "" {
+		return false, nil
+	}
+	return true, b.pauseCompletion(ctx, current, step, "test_gate_failed", "The fix cannot complete: "+missing)
+}
+
 func (b *CloudDSHToolBroker) Execute(ctx context.Context, claimed task.Task, call ModelToolCall) (AgentToolResult, error) {
 	ctx = b.toolActivityContext(ctx, claimed, call)
 	result, err := b.execute(ctx, claimed, call, false, nil)
@@ -1048,6 +1115,20 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		}
 		return b.executeWorkspaceTool(ctx, claimed, call, recovering, checkpointOutput)
 	}
+	if call.Name == cloudDSHImpactMapToolName {
+		if routed {
+			bound, resolvedCall, reason, bindErr := b.prepareDeferredWorkspaceCall(ctx, claimed, target, call, recovering, checkpointOutput)
+			if bindErr != nil {
+				return AgentToolResult{}, bindErr
+			}
+			if reason != "" {
+				return b.pauseDeferredTarget(ctx, claimed, reason)
+			}
+			ctx = withBoundTaskToolActivity(ctx, bound)
+			claimed, call = bound, resolvedCall
+		}
+		return b.executeImpactMap(ctx, claimed, call, recovering, checkpointOutput)
+	}
 	if call.Name == cloudDSHSkillReadToolName {
 		return b.executeSkillRead(ctx, claimed, call, recovering, checkpointOutput)
 	}
@@ -1099,6 +1180,30 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	details, err := b.store.GetTask(ctx, current.ID, current.OwnerID)
 	if err != nil {
 		return AgentToolResult{}, err
+	}
+	// Write gates (E01, E03, E06): a host file write is refused while the task has
+	// a submitted plan with an incomplete brief, while no failing reproduction
+	// test has run on a fix task, and while the written file is outside the
+	// fix plan's changed_files allow set. The brief is checked first, then the
+	// failing test, then the minimal diff. Read-only calls are unaffected.
+	if call.Name == runtimeToolFileWrite {
+		if err := requireCompleteTaskPlanBrief(details); err != nil {
+			return AgentToolResult{}, err
+		}
+		if err := requireFailingTestRecord(details); err != nil {
+			return AgentToolResult{}, err
+		}
+		var writeArguments struct {
+			WorkspaceID string `json:"workspace_id"`
+			Path        string `json:"path"`
+			Content     string `json:"content"`
+		}
+		if decodeStrictRuntimeResult([]byte(call.Arguments), &writeArguments) != nil || writeArguments.Path == "" {
+			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
+		}
+		if err := requireMinimalDiffWrite(details, writeArguments.Path); err != nil {
+			return AgentToolResult{}, err
+		}
 	}
 	pendingApproval := details.PendingRequest
 	if pendingApproval != nil && pendingApproval.MediaPreviewOperationID != "" {
@@ -1196,6 +1301,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		step.Status, step.Title, step.Summary = task.StepWaitingUser, "Approval required: "+call.Name, pendingApproval.Content
 		if err := b.commitProgress(ctx, current, step, usage, task.StatusWaitingUser, "approval_required", "task.waiting_user", AgentApprovalRequest{
 			Object: pendingApproval.Object, Content: pendingApproval.Content, Impact: pendingApproval.Impact,
+			RejectionConsequence: pendingApproval.RejectionConsequence,
 		}); err != nil {
 			return AgentToolResult{}, err
 		}
@@ -1229,7 +1335,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		return b.failBeforeDispatch(ctx, current, step, usage, call.Name, err)
 	}
 	if preparation.Status == AgentToolApprovalRequired {
-		return b.pauseForApproval(ctx, current, step, usage, request, hash[:], preparation, details.PendingRequest)
+		return b.pauseForApproval(ctx, current, step, usage, request, hash[:], preparation, details.PendingRequest, TaskBillingTotalActualMicros(details.Billing))
 	}
 	if preparation.Status != AgentToolReady || !sameAgentControlFence(preparation.Fence, fence) {
 		return b.failBeforeDispatch(ctx, current, step, usage, call.Name, domain.NewError(domain.CodeInvalidState, "Host control fence changed"))
@@ -1855,6 +1961,22 @@ func (b *CloudDSHToolBroker) PauseModelRecoveryDiagnostic(ctx context.Context, c
 	return b.pauseRecovery(ctx, claimed, diagnostic)
 }
 
+// PauseModelRecoveryAfterLadderExhaustion records the terminal state once a
+// retry ladder spent its budget (attempts retries on reason). The persisted
+// step carries the ladder-exhausted marker and the §4.3 user-visible text
+// for that reason; no provider text, stack trace, or raw error is stored.
+// There is no task-level caller yet: task model calls have no retry loop,
+// so the live exhaustion path is the route ladder (route_retry_ladder_exhausted).
+// This helper is the terminal the first task-level retry loop must call.
+func (b *CloudDSHToolBroker) PauseModelRecoveryAfterLadderExhaustion(ctx context.Context, claimed task.Task, reason FailoverReason, attempts int) error {
+	if _, ok := failoverReasonStrategies[reason]; !ok {
+		return domain.InvalidArgument("failover_reason", "unknown failover reason cannot end a retry ladder")
+	}
+	return b.PauseModelRecoveryDiagnostic(ctx, claimed, AgentModelFailureDiagnostic{
+		Category: "model_retry_ladder_exhausted", LadderExhausted: true, Attempts: attempts, Reason: reason,
+	})
+}
+
 func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentModelFailureDiagnostic {
 	if value.Stage != "model_response_validation" {
 		value.Stage = ""
@@ -1864,9 +1986,16 @@ func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentMod
 		"unavailable", "timeout", "transport", "invalid_response", "empty_response", "truncated_response", "upstream_error", "usage_unknown", "unsupported",
 		"client_request_invalid", "context_length_exceeded", "provider_invalid_request", "provider_unsupported_parameter", "provider_context_length_exceeded",
 		"provider_model_not_found", "provider_permission_denied", "provider_invalid_api_key", "provider_rate_limited",
-		"provider_quota_exhausted", "provider_server_error", "provider_request_rejected", "attachment_reader_unavailable", "stream_result_mismatch", "unauthorized_tool":
+		"provider_quota_exhausted", "provider_server_error", "provider_request_rejected", "attachment_reader_unavailable", "stream_result_mismatch", "unauthorized_tool",
+		"model_retry_ladder_exhausted":
 	default:
 		value.Category = "unknown"
+	}
+	if _, ok := failoverReasonStrategies[value.Reason]; !ok {
+		value.Reason = ""
+	}
+	if value.Attempts < 0 {
+		value.Attempts = 0
 	}
 	switch value.ReasonCode {
 	case "response_shape_invalid", "tool_call_metadata_invalid", "task_has_no_authorized_tools", "tool_not_in_task_allowlist", "tool_arguments_not_object":
@@ -1933,6 +2062,26 @@ func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Tas
 		summary = "已显示的部分回复与模型最终结果不一致，回复已中断；请重新发送消息。"
 		waitingReason = "model_stream_interrupted"
 	}
+	if diagnostic.LadderExhausted {
+		// Terminal state: the retry ladder spent its budget. The user
+		// text comes from the ladder message builder (reason case and
+		// attempt count only), never from provider text or a stack trace,
+		// and only names where it got stuck, what was tried, and what is
+		// needed. It is shown only when the failure maps to a §4.3 case;
+		// other exhausted ladders keep the generic pause text.
+		title = "模型重试已耗尽"
+		waitingReason = "model_retry_ladder_exhausted"
+		attempts := diagnostic.Attempts
+		if attempts < 0 {
+			attempts = 0
+		}
+		classification := ErrorClassification{Reason: diagnostic.Reason, Strategy: FailoverStrategyFor(diagnostic.Reason)}
+		if message, ok := LadderExhaustedUserMessage(classification, attempts); ok {
+			summary = message
+		} else {
+			summary = "模型服务暂时无法恢复，任务已暂停；请稍后再试。"
+		}
+	}
 	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "verification", task.StepUnknown,
 		title, summary)
 	if err != nil {
@@ -1957,6 +2106,13 @@ func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Tas
 	}
 	if modelFailureToolNotDispatched(diagnostic) {
 		metadata["tool_dispatched"] = false
+	}
+	if diagnostic.LadderExhausted {
+		metadata["ladder_exhausted"] = true
+		metadata["retry_attempts"] = max(diagnostic.Attempts, 0)
+		if _, ok := failoverReasonStrategies[diagnostic.Reason]; ok {
+			metadata["failover_reason"] = string(diagnostic.Reason)
+		}
 	}
 	return b.commitProgress(persistCtx, current, step, current.Usage, task.StatusWaitingUser, waitingReason, "task.waiting_user", metadata)
 }
@@ -2060,7 +2216,7 @@ func (b *CloudDSHToolBroker) failBeforeDispatch(ctx context.Context, current tas
 	return AgentToolResult{Status: AgentToolFailed, Output: "The Host tool request was not executed because authorization or Host readiness could not be confirmed."}, nil
 }
 
-func (b *CloudDSHToolBroker) pauseForApproval(ctx context.Context, current task.Task, step task.Step, usage task.Usage, request AgentToolRequest, hash []byte, preparation AgentToolPreparation, previous *task.PendingRequest) (AgentToolResult, error) {
+func (b *CloudDSHToolBroker) pauseForApproval(ctx context.Context, current task.Task, step task.Step, usage task.Usage, request AgentToolRequest, hash []byte, preparation AgentToolPreparation, previous *task.PendingRequest, totalCostMicros *int64) (AgentToolResult, error) {
 	if current.CurrentRevision == nil || *current.CurrentRevision < 0 {
 		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "Task revision is unavailable for Host approval binding")
 	}
@@ -2068,10 +2224,20 @@ func (b *CloudDSHToolBroker) pauseForApproval(ctx context.Context, current task.
 	if previous != nil {
 		version = previous.Version + 1
 	}
-	pending, err := newPendingApproval(current, request.Call, hash, preparation.Approval, preparation.Fence, version)
+	pending, err := newPendingApproval(current, request.Call, hash, preparation, version)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
+	// EvidencePointer anchors the card to the step whose command and output
+	// justify the action; TotalCostMicros is the billing snapshot at card
+	// creation. Both are set here because only this pause owns the step and
+	// the caller owns the billing snapshot.
+	pointer, ok := task.EvidencePointerForStep(step.ID)
+	if !ok {
+		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "approval evidence step ID is invalid")
+	}
+	pending.EvidencePointer = pointer
+	pending.TotalCostMicros = totalCostMicros
 	revision := *current.CurrentRevision
 	pending.TaskRevision = &revision
 	step.Status, step.Summary = task.StepWaitingUser, preparation.Approval.Content

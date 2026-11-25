@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"math/rand"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -243,9 +244,15 @@ func modelConcurrencyReservationLimited(err error) bool {
 
 // reserveModelCall retries only a typed, pre-dispatch account concurrency limit.
 // Other rate limits, uncertain reservations, and provider errors remain terminal.
+// The wait between attempts is the shared jittered backoff with this path's
+// own policy (100ms base, 1s cap): a local concurrency slot is not a provider
+// error, so the E12 provider ladder (base 5s / max 120s, 3 retries) does not
+// apply here. The retry count stays unbounded until the caller context ends,
+// as before; only the delay computation moved to the shared helper, and a
+// single wait stays bounded (base cap 1s plus at most 50% jitter).
 func (s *ModelGatewayService) reserveModelCall(ctx context.Context, source ModelCallSource, projectCall bool, projectID string,
 	reservation ModelCallReservation, usage project.Usage) error {
-	delay := 100 * time.Millisecond
+	attempt := 0
 	for {
 		var err error
 		if projectCall {
@@ -262,6 +269,8 @@ func (s *ModelGatewayService) reserveModelCall(ctx context.Context, source Model
 		if err == nil || source != ModelCallTask || !modelConcurrencyReservationLimited(err) {
 			return err
 		}
+		attempt++
+		delay := JitteredBackoff(attempt, 100*time.Millisecond, modelConcurrencyReservationRetryMaxDelay, ModelRetryJitterRatio, rand.Float64)
 		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
@@ -273,11 +282,6 @@ func (s *ModelGatewayService) reserveModelCall(ctx context.Context, source Model
 			}
 			return context.Cause(ctx)
 		case <-timer.C:
-		}
-		if delay < modelConcurrencyReservationRetryMaxDelay/2 {
-			delay *= 2
-		} else {
-			delay = modelConcurrencyReservationRetryMaxDelay
 		}
 	}
 }
@@ -632,17 +636,16 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	var summaryOutputErr error
 	var reviewOutputErr error
 	if call.Source == ModelCallCompaction && !settlement.Unknown {
-		if response.StopReason != "stop" || len(response.ToolCalls) != 0 || strings.TrimSpace(response.Text) == "" ||
-			!utf8.ValidString(response.Text) || strings.ContainsRune(response.Text, '\x00') || len(response.Text) > MaxConversationSummaryBytes {
+		if failure := ValidateConversationSummaryModelResponse(response); failure != nil {
 			settlement.ResponseInvalid = true
-			summaryOutputErr = domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid conversation summary")
+			summaryOutputErr = domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid conversation summary: "+failure.Error())
 		} else {
 			settlement.ResponseCiphertext, settlement.ResponseDigest, err = SealConversationSummaryModelOutput(s.responseSealer,
 				ConversationSummaryModelOutput{Identity: call.Summary.Identity, OperationID: call.Summary.OperationID,
 					CallID: call.CallID, ModelID: call.ModelID, Text: response.Text, Usage: response.Usage})
 			if err != nil {
 				settlement.ResponseInvalid = true
-				summaryOutputErr = domain.NewError(domain.CodeInvalidState, "conversation summary model result could not be stored safely")
+				summaryOutputErr = domain.NewError(domain.CodeInvalidState, "conversation summary model result could not be stored safely: "+err.Error())
 			}
 		}
 	}

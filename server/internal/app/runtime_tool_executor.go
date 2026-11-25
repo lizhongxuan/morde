@@ -327,6 +327,7 @@ func (e *RuntimeToolExecutor) Prepare(ctx context.Context, request AgentToolRequ
 			return AgentToolPreparation{
 				Status: AgentToolApprovalRequired, Approval: runtimeToolApprovalRequest(mapping, request.Arguments),
 				Fence: fence, WorkspaceID: workspaceID, BindingVersion: bindingVersion,
+				TriggerRule: task.ApprovalTriggerHostSensitiveTool,
 			}, nil
 		}
 	}
@@ -399,10 +400,12 @@ func runtimeToolApprovalRequest(mapping runtimeToolMapping, arguments json.RawMe
 	switch mapping.name {
 	case runtimeToolShellExec:
 		return AgentApprovalRequest{Object: "Host Workspace shell command", Content: "Command preview: " + preview,
-			Impact: "The command can change files or send data from the authorized Workspace. Approval is limited to these exact arguments and the current Host control version."}
+			Impact:               "The command can change files or send data from the authorized Workspace. Approval is limited to these exact arguments and the current Host control version.",
+			RejectionConsequence: "If you reject, the command is not run and the task stops at this step."}
 	case runtimeToolBrowserType:
 		return AgentApprovalRequest{Object: "Selected browser field", Content: "Input preview: " + preview,
-			Impact: "The website may receive and store the shown text. Approval is limited to these exact arguments and the current Host control version."}
+			Impact:               "The website may receive and store the shown text. Approval is limited to these exact arguments and the current Host control version.",
+			RejectionConsequence: "If you reject, the text is not typed and the task stops at this step."}
 	case runtimeToolDesktopClick:
 		var click struct {
 			WindowID string `json:"window_id"`
@@ -415,19 +418,24 @@ func runtimeToolApprovalRequest(mapping runtimeToolMapping, arguments json.RawMe
 				click.Button = "left"
 			}
 			return AgentApprovalRequest{Object: "Host desktop input",
-				Content: fmt.Sprintf("Click window %s at screenshot point (%d, %d) with the %s button using its one-time screenshot proof?", click.WindowID, click.X, click.Y, click.Button),
-				Impact:  "The Host derives the screen coordinates from the captured screenshot and rejects the action if the display changes or the target window loses focus."}
+				Content:              fmt.Sprintf("Click window %s at screenshot point (%d, %d) with the %s button using its one-time screenshot proof?", click.WindowID, click.X, click.Y, click.Button),
+				Impact:               "The Host derives the screen coordinates from the captured screenshot and rejects the action if the display changes or the target window loses focus.",
+				RejectionConsequence: "If you reject, nothing is clicked and the task stops at this step."}
 		}
-		return AgentApprovalRequest{Object: "Host desktop input", Content: "Click a point on the Host desktop?", Impact: "The current window target cannot be confirmed for this action."}
+		return AgentApprovalRequest{Object: "Host desktop input", Content: "Click a point on the Host desktop?", Impact: "The current window target cannot be confirmed for this action.",
+			RejectionConsequence: "If you reject, nothing is clicked and the task stops at this step."}
 	case runtimeToolDesktopType:
 		return AgentApprovalRequest{Object: "Current Host desktop window", Content: "Input preview: " + preview,
-			Impact: "The shown text may change app data or be submitted externally. Approval is limited to these exact arguments and the current Host control version."}
+			Impact:               "The shown text may change app data or be submitted externally. Approval is limited to these exact arguments and the current Host control version.",
+			RejectionConsequence: "If you reject, the text is not typed and the task stops at this step."}
 	case runtimeToolDesktopPressKey:
 		return AgentApprovalRequest{Object: "Current Host desktop window", Content: "Key action preview: " + preview,
-			Impact: "This key may submit or destroy data in the current window. Approval is limited to these exact arguments and the current Host control version."}
+			Impact:               "This key may submit or destroy data in the current window. Approval is limited to these exact arguments and the current Host control version.",
+			RejectionConsequence: "If you reject, the key is not pressed and the task stops at this step."}
 	default:
 		return AgentApprovalRequest{Object: "Host tool action: " + mapping.name, Content: "Argument preview: " + preview,
-			Impact: "The action may have effects that cannot be assessed from the available tool context. Approval is limited to these exact arguments and the current Host control version."}
+			Impact:               "The action may have effects that cannot be assessed from the available tool context. Approval is limited to these exact arguments and the current Host control version.",
+			RejectionConsequence: "If you reject, the action is not run and the task stops at this step."}
 	}
 }
 

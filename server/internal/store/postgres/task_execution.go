@@ -167,18 +167,33 @@ func (s *Store) GetTask(ctx context.Context, id, ownerID string) (app.TaskDetail
 		var requestHash []byte
 		var pendingRevision pgtype.Int8
 		var expiresAt, respondedAt pgtype.Timestamptz
+		var evidencePointer, triggerRule, rejectionConsequence string
+		var thisCostMicros, totalCostMicros pgtype.Int8
 		err = tx.QueryRow(ctx, `SELECT id, task_id, version, kind, title, object, content, impact, call_id, COALESCE(media_preview_operation_id,''), tool_name,
-task_revision, request_hash, runtime_generation, runtime_instance_id, control_version, status, decision, created_at, expires_at, responded_at
+task_revision, request_hash, runtime_generation, runtime_instance_id, control_version, status, decision, created_at, expires_at, responded_at,
+COALESCE(evidence_pointer,''), this_cost_micros, total_cost_micros, COALESCE(trigger_rule,''), COALESCE(rejection_consequence,'')
 FROM task_pending_requests WHERE task_id=$1 ORDER BY version DESC LIMIT 1`, id).Scan(
 			&pending.ID, &pending.TaskID, &pending.Version, &pending.Kind, &pending.Title, &pending.Object, &pending.Content,
 			&pending.Impact, &pending.CallID, &pending.MediaPreviewOperationID, &pending.ToolName, &pendingRevision, &requestHash, &pending.RuntimeGeneration,
-			&pending.RuntimeInstanceID, &pending.ControlVersion, &pending.Status, &pending.Decision, &pending.CreatedAt, &expiresAt, &respondedAt)
+			&pending.RuntimeInstanceID, &pending.ControlVersion, &pending.Status, &pending.Decision, &pending.CreatedAt, &expiresAt, &respondedAt,
+			&evidencePointer, &thisCostMicros, &totalCostMicros, &triggerRule, &rejectionConsequence)
 		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read latest task pending request: %w", err)
 		}
 		var pendingRequest *task.PendingRequest
 		if err == nil {
 			pending.RequestHash = append([]byte(nil), requestHash...)
+			pending.EvidencePointer = evidencePointer
+			if thisCostMicros.Valid {
+				value := thisCostMicros.Int64
+				pending.ThisCostMicros = &value
+			}
+			if totalCostMicros.Valid {
+				value := totalCostMicros.Int64
+				pending.TotalCostMicros = &value
+			}
+			pending.TriggerRule = triggerRule
+			pending.RejectionConsequence = rejectionConsequence
 			if pendingRevision.Valid {
 				revision := pendingRevision.Int64
 				pending.TaskRevision = &revision
@@ -2341,12 +2356,34 @@ RETURNING event_seq`,
 			if pending.MediaPreviewOperationID != "" {
 				mediaOperationID = pgtype.Text{String: pending.MediaPreviewOperationID, Valid: true}
 			}
+			evidencePointer := pgtype.Text{}
+			if pending.EvidencePointer != "" {
+				evidencePointer = pgtype.Text{String: pending.EvidencePointer, Valid: true}
+			}
+			thisCostMicros := pgtype.Int8{}
+			if pending.ThisCostMicros != nil {
+				thisCostMicros = pgtype.Int8{Int64: *pending.ThisCostMicros, Valid: true}
+			}
+			totalCostMicros := pgtype.Int8{}
+			if pending.TotalCostMicros != nil {
+				totalCostMicros = pgtype.Int8{Int64: *pending.TotalCostMicros, Valid: true}
+			}
+			triggerRule := pgtype.Text{}
+			if pending.TriggerRule != "" {
+				triggerRule = pgtype.Text{String: pending.TriggerRule, Valid: true}
+			}
+			rejectionConsequence := pgtype.Text{}
+			if pending.RejectionConsequence != "" {
+				rejectionConsequence = pgtype.Text{String: pending.RejectionConsequence, Valid: true}
+			}
 			_, err = tx.Exec(ctx, `INSERT INTO task_pending_requests
 (id, task_id, version, task_revision, kind, title, object, content, impact, call_id, media_preview_operation_id, tool_name, request_hash,
- runtime_generation, runtime_instance_id, control_version, status, expires_at)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17)`,
+ runtime_generation, runtime_instance_id, control_version, status, expires_at,
+ evidence_pointer, this_cost_micros, total_cost_micros, trigger_rule, rejection_consequence)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,'pending',$17,$18,$19,$20,$21,$22)`,
 				pending.ID, pending.TaskID, pending.Version, pending.TaskRevision, pending.Kind, pending.Title, pending.Object, pending.Content, pending.Impact,
-				pending.CallID, mediaOperationID, pending.ToolName, pending.RequestHash, pending.RuntimeGeneration, pending.RuntimeInstanceID, pending.ControlVersion, pending.ExpiresAt)
+				pending.CallID, mediaOperationID, pending.ToolName, pending.RequestHash, pending.RuntimeGeneration, pending.RuntimeInstanceID, pending.ControlVersion, pending.ExpiresAt,
+				evidencePointer, thisCostMicros, totalCostMicros, triggerRule, rejectionConsequence)
 			if err != nil {
 				return fmt.Errorf("persist task pending request: %w", err)
 			}
@@ -2611,6 +2648,20 @@ func validTaskToolCallFailureEvidence(call app.TaskToolCallProgress, step task.S
 			app.IsMCPConnectorStepRetryTool(call.ToolName)
 	case "tool_execution_failed":
 		return !call.Retryable && call.Phase == "execute" && step.Kind == "tool" && step.Status == task.StepFailed
+	case "test_failed":
+		// Stamped by the app only for a failed shell run of a test command;
+		// same shape as a definitive tool failure, and the E03 gate re-checks
+		// the tool name when it reads the record back.
+		return !call.Retryable && call.Phase == "execute" && step.Kind == "tool" && step.Status == task.StepFailed
+	case "test_passed", "test_suite_passed":
+		// Stamped by the app only for a succeeded shell run of a test
+		// command (test_suite_passed: the run included a full-suite test
+		// command); the E07 gate reads these back as the passing-test
+		// record. A succeeded step carries the phase of its status
+		// ("succeeded"); the "execute" phase is accepted as well for tool
+		// steps committed through the execute path.
+		return !call.Retryable && step.Kind == "tool" && step.Status == task.StepSucceeded &&
+			(call.Phase == "succeeded" || call.Phase == "execute")
 	default:
 		return false
 	}

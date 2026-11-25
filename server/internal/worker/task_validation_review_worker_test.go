@@ -500,3 +500,70 @@ func TestTaskValidationReviewInputIncludesOnlyStructuredShellExecutionEvidence(t
 		t.Fatalf("review packet shell evidence = %s, err=%v", encoded, err)
 	}
 }
+
+// TestTaskValidationReviewPromptIncludesReplaySection covers the E09
+// packet change: the server-attested test re-run rides with the review
+// packet for a fix task, and is omitted for any other task.
+func TestTaskValidationReviewPromptIncludesReplaySection(t *testing.T) {
+	replay := &app.TaskValidationReplayEvidence{NewTestPassed: true, FullSuitePassed: true,
+		NewTestFailedSequence: 1, NewTestPassedSequence: 2, FullSuitePassedSequence: 2}
+	prompt, err := taskValidationReviewPrompt(app.TaskValidationReviewInput{
+		Objective: "Fix the bug", Result: "Fixed", Replay: replay})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(prompt, `"replay":{"new_test_passed":true,"full_suite_passed":true,"new_test_failed_sequence":1,"new_test_passed_sequence":2,"full_suite_passed_sequence":2}`) {
+		t.Fatalf("review prompt without replay section = %s", prompt)
+	}
+	prompt, err = taskValidationReviewPrompt(app.TaskValidationReviewInput{Objective: "Fix the bug", Result: "Fixed"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(prompt, `"replay"`) {
+		t.Fatalf("review prompt without replay must omit the section, got %s", prompt)
+	}
+}
+
+// TestTaskValidationReviewInputSetsReplayForFixTask covers the E09 wiring
+// in reviewInput: a fix task's snapshot steps re-derive the test gate
+// into the replay section; a task without a fix plan gets none.
+func TestTaskValidationReviewInputSetsReplayForFixTask(t *testing.T) {
+	result := "Fixed the login bug and the suite passes."
+	digest := sha256.Sum256([]byte(result))
+	revision, desiredRevision := int64(4), int64(4)
+	claim := app.TaskValidationReviewClaim{OwnerID: "u1234567", InitiatorID: "u1234567", ConversationID: "c1234567",
+		TaskID: "q1234567", TaskRevision: revision, ResultEventSequence: 9, ResultSHA256: digest[:], ClaimGeneration: 1, LeaseOwner: "worker"}
+	// The failure-reason stamps are the persisted ledger values; they
+	// must match the E03/E07 stamps in internal/app.
+	fixSteps := []task.Step{
+		{ID: "s1111111", TaskID: claim.TaskID, Sequence: 1, Kind: "tool", Status: task.StepFailed,
+			ToolName: "shell_exec", FailureReason: "test_failed", RequestDigest: digest[:]},
+		{ID: "s2222222", TaskID: claim.TaskID, Sequence: 2, Kind: "tool", Status: task.StepSucceeded,
+			ToolName: "shell_exec", FailureReason: "test_suite_passed", RequestDigest: digest[:]},
+	}
+	plan := &task.Plan{TaskRevision: revision, Revision: 1, FixPlan: &task.FixPlan{}}
+	snapshots := taskValidationReviewSnapshotStub{details: app.TaskDetails{
+		Task: task.Task{ID: claim.TaskID, OwnerID: claim.OwnerID, InitiatorID: claim.InitiatorID, ConversationID: claim.ConversationID,
+			Status: task.StatusCompleted, CurrentRevision: &revision, DesiredRevision: &desiredRevision, Objective: "Fix the bug", Result: result},
+		Steps: fixSteps, Plan: plan,
+	}}
+	worker := TaskValidationReviewWorker{options: TaskValidationReviewWorkerOptions{Snapshots: snapshots}}
+	got, err := worker.reviewInput(context.Background(), claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Replay == nil || !got.Replay.NewTestPassed || !got.Replay.FullSuitePassed ||
+		got.Replay.NewTestFailedSequence != 1 || got.Replay.NewTestPassedSequence != 2 || got.Replay.FullSuitePassedSequence != 2 {
+		t.Fatalf("review input replay = %+v, want the passing gate with sequences 1/2/2", got.Replay)
+	}
+
+	snapshots.details.Plan = nil
+	worker = TaskValidationReviewWorker{options: TaskValidationReviewWorkerOptions{Snapshots: snapshots}}
+	got, err = worker.reviewInput(context.Background(), claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Replay != nil {
+		t.Fatalf("review input replay without a fix plan = %+v, want nil", got.Replay)
+	}
+}

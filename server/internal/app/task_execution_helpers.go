@@ -102,7 +102,9 @@ func validateAgentInput(inputs []ModelInput, tools []ModelTool) error {
 	return nil
 }
 
-func newPendingApproval(current task.Task, call ModelToolCall, requestHash []byte, approval AgentApprovalRequest, fence AgentHostFence, version int64) (*task.PendingRequest, error) {
+func newPendingApproval(current task.Task, call ModelToolCall, requestHash []byte, preparation AgentToolPreparation, version int64) (*task.PendingRequest, error) {
+	approval := preparation.Approval
+	fence := preparation.Fence
 	if len(requestHash) != sha256.Size || call.CallID == "" || len(call.CallID) > 256 || call.Name == "" || len(call.Name) > 128 || version < 1 ||
 		!fence.AIAllowed || fence.RuntimeGeneration < 0 || fence.RuntimeInstanceID == "" || fence.ControlVersion < 0 {
 		return nil, domain.NewError(domain.CodeInvalidState, "approval request is missing a current Host fence")
@@ -110,15 +112,25 @@ func newPendingApproval(current task.Task, call ModelToolCall, requestHash []byt
 	if _, ok := boundedApproval(approval); !ok {
 		return nil, domain.NewError(domain.CodeInvalidState, "approval request contains invalid display text")
 	}
+	if !task.ValidApprovalTriggerRule(preparation.TriggerRule) {
+		return nil, domain.NewError(domain.CodeInvalidState, "approval request contains an unknown trigger rule")
+	}
 	id, err := domain.NewPendingRequestID()
 	if err != nil {
 		return nil, fmt.Errorf("generate pending request ID: %w", err)
 	}
 	return &task.PendingRequest{
 		ID: id, TaskID: current.ID, Version: version, Kind: "approval", Title: "Approve tool action: " + call.Name,
-		Object: approval.Object, Content: approval.Content, Impact: approval.Impact, CallID: call.CallID, ToolName: call.Name,
+		Object: approval.Object, Content: approval.Content, Impact: approval.Impact,
+		RejectionConsequence: approval.RejectionConsequence, TriggerRule: preparation.TriggerRule,
+		CallID: call.CallID, ToolName: call.Name,
 		RequestHash: append([]byte(nil), requestHash...), RuntimeGeneration: fence.RuntimeGeneration,
 		RuntimeInstanceID: fence.RuntimeInstanceID, ControlVersion: fence.ControlVersion, Status: task.PendingRequestPending,
+		// ThisCostMicros stays nil: no trusted per-action cost source exists
+		// (tool calls carry no price declaration), so the card renders the
+		// single-action cost unknown instead of a fabricated 0. EvidencePointer
+		// and TotalCostMicros are filled by the pause caller, which owns the
+		// step and the task billing snapshot.
 	}, nil
 }
 
@@ -210,6 +222,12 @@ func boundedApproval(value AgentApprovalRequest) (AgentApprovalRequest, bool) {
 		if !utf8.ValidString(field) || strings.TrimSpace(field) == "" || utf8.RuneCountInString(field) > agentApprovalFieldMaxRunes {
 			return AgentApprovalRequest{}, false
 		}
+	}
+	// RejectionConsequence may be blank (approvals created before E05), but
+	// when present it must be bounded text like the other display fields.
+	if value.RejectionConsequence != "" &&
+		(!utf8.ValidString(value.RejectionConsequence) || utf8.RuneCountInString(value.RejectionConsequence) > agentApprovalFieldMaxRunes) {
+		return AgentApprovalRequest{}, false
 	}
 	return value, true
 }

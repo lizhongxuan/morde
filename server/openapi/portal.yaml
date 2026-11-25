@@ -12881,6 +12881,11 @@ components:
         disclosures: { $ref: '#/components/schemas/TaskApprovalDisclosures' }
         expires_at: { type: [string, 'null'], format: date-time, description: Null unless a trusted service policy explicitly sets an expiry. }
         media_preview_operation_id: { $ref: '#/components/schemas/OperationId', description: Present only while an image, video or speech output awaits the Task owner's save decision; use it with the Task media preview route. }
+        evidence_pointer: { type: string, description: 'Evidence anchor for the action, "step:<step-id>" of the step whose command and output justify it. Empty for approvals created before E05.' }
+        this_cost_micros: { type: [integer, 'null'], format: int64, minimum: 0, description: Trusted cost of this exact action in micro-units. Null when no trusted per-action cost source exists; never a fabricated 0. }
+        total_cost_micros: { type: [integer, 'null'], format: int64, minimum: 0, description: Trusted cumulative cost of the task in micro-units at the moment the card was created. Null when any cost component is unknown. }
+        trigger_rule: { type: string, enum: [host_sensitive_tool, external_mcp_tool, workspace_live_write, media_publish], description: Action-matrix category that required this approval. Empty for approvals created before E05. }
+        rejection_consequence: { type: string, description: What happens if the user rejects the action. Empty when the approval text did not state one. }
     TaskApprovalTextDisclosure:
       type: object
       additionalProperties: false
@@ -13145,6 +13150,11 @@ components:
         responded_at: { type: [string, 'null'], format: date-time }
         created_at: { type: string, format: date-time }
         media_preview_operation_id: { $ref: '#/components/schemas/OperationId' }
+        evidence_pointer: { type: string, description: 'Evidence anchor for the action, "step:<step-id>" of the step whose command and output justify it. Empty for approvals created before E05.' }
+        this_cost_micros: { type: [integer, 'null'], format: int64, minimum: 0, description: Trusted cost of this exact action in micro-units. Null when no trusted per-action cost source exists; never a fabricated 0. }
+        total_cost_micros: { type: [integer, 'null'], format: int64, minimum: 0, description: Trusted cumulative cost of the task in micro-units at the moment the card was created. Null when any cost component is unknown. }
+        trigger_rule: { type: string, enum: [host_sensitive_tool, external_mcp_tool, workspace_live_write, media_publish], description: Action-matrix category that required this approval. Empty for approvals created before E05. }
+        rejection_consequence: { type: string, description: What happens if the user rejects the action. Empty when the approval text did not state one. }
     ConversationActiveTask:
       allOf:
         - { $ref: '#/components/schemas/TaskSummary' }

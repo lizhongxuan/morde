@@ -937,6 +937,27 @@ func (b *CloudDSHToolBroker) executeWorkspaceTool(ctx context.Context, claimed t
 	if !cloudDSHWorkspaceToolsEligible(current) || !sameCloudDSHAuthorization(current.Authorization, claimed.Authorization) {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Workspace tools are not authorized for this task")
 	}
+	if call.Name == cloudDSHWorkspaceWriteToolName {
+		if err := requireCompleteTaskPlanBrief(details); err != nil {
+			return AgentToolResult{}, err
+		}
+		// The minimal-diff gate (E06) does run here, unlike the failing-test
+		// gate (E03): it only compares the written path against the fix
+		// plan's changed_files allow set, so it needs no shell and cannot
+		// deadlock a hostless fix task.
+		var writeArguments cloudDSHWorkspaceWriteArguments
+		if decodeStrictRuntimeResult([]byte(call.Arguments), &writeArguments) != nil || writeArguments.Path == "" {
+			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "Workspace write arguments are invalid")
+		}
+		if err := requireMinimalDiffWrite(details, writeArguments.Path); err != nil {
+			return AgentToolResult{}, err
+		}
+		// The failing-test gate (E03) deliberately does not run here: this
+		// hostless path has no shell tool, so a failing test can never be
+		// recorded and the gate would deadlock every fix task. The gate
+		// applies on the host file_write path, where a shell exists. Giving
+		// hostless tasks a test runner is a follow-up, not this gate.
+	}
 	operationKey := agentOperationKey(call.CallID)
 	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
 		"Run Hostless Workspace tool: "+call.Name, "Checking the task checkpoint and Workspace revision.")
@@ -1068,10 +1089,19 @@ func (b *CloudDSHToolBroker) authorizeWorkspaceWrite(ctx context.Context, detail
 		version = pending.Version + 1
 	}
 	approval := cloudDSHWorkspaceWriteApproval(write, current.WorkspaceID)
-	newPending, err := newHostlessWorkspaceApproval(current, call, requestHash[:], approval, version)
+	newPending, err := newHostlessWorkspaceApproval(current, call, requestHash[:], approval, version, task.ApprovalTriggerWorkspaceLiveWrite)
 	if err != nil {
 		return AgentToolResult{}, true, err
 	}
+	// EvidencePointer anchors the card to this step; TotalCostMicros is the
+	// billing snapshot at card creation. ThisCostMicros stays nil: no trusted
+	// per-action cost source exists.
+	pointer, ok := task.EvidencePointerForStep(step.ID)
+	if !ok {
+		return AgentToolResult{}, true, domain.NewError(domain.CodeInvalidState, "approval evidence step ID is invalid")
+	}
+	newPending.EvidencePointer = pointer
+	newPending.TotalCostMicros = TaskBillingTotalActualMicros(details.Billing)
 	step.Status, step.Title, step.Summary = task.StepWaitingUser, "Save Workspace file", approval.Content
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusWaitingUser, "approval_required", "task.waiting_user", approval, newPending); err != nil {
 		return AgentToolResult{}, true, err
@@ -1085,14 +1115,14 @@ func (b *CloudDSHToolBroker) pauseForExistingWorkspaceApproval(ctx context.Conte
 		return AgentToolResult{}, true, domain.NewError(domain.CodeInvalidState, "pending Workspace approval is invalid")
 	}
 	step.Status, step.Title, step.Summary = task.StepWaitingUser, "Approval required: "+pending.ToolName, pending.Content
-	approval := AgentApprovalRequest{Object: pending.Object, Content: pending.Content, Impact: pending.Impact}
+	approval := AgentApprovalRequest{Object: pending.Object, Content: pending.Content, Impact: pending.Impact, RejectionConsequence: pending.RejectionConsequence}
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusWaitingUser, "approval_required", "task.waiting_user", approval); err != nil {
 		return AgentToolResult{}, true, err
 	}
 	return AgentToolResult{Status: AgentToolNeedsUser}, true, nil
 }
 
-func newHostlessWorkspaceApproval(current task.Task, call ModelToolCall, requestHash []byte, approval AgentApprovalRequest, version int64) (*task.PendingRequest, error) {
+func newHostlessWorkspaceApproval(current task.Task, call ModelToolCall, requestHash []byte, approval AgentApprovalRequest, version int64, triggerRule string) (*task.PendingRequest, error) {
 	if current.HostID != "" || current.ExecutionLocation != "server" || !cloudDSHWorkspaceToolsEligible(current) ||
 		current.CurrentRevision == nil || *current.CurrentRevision < 0 ||
 		len(requestHash) != sha256.Size || call.CallID == "" || len(call.CallID) > 256 || call.Name != cloudDSHWorkspaceWriteToolName || version < 1 {
@@ -1101,6 +1131,9 @@ func newHostlessWorkspaceApproval(current task.Task, call ModelToolCall, request
 	if _, ok := boundedApproval(approval); !ok {
 		return nil, domain.NewError(domain.CodeInvalidState, "Workspace approval display text is invalid")
 	}
+	if !task.ValidApprovalTriggerRule(triggerRule) {
+		return nil, domain.NewError(domain.CodeInvalidState, "Workspace approval trigger rule is unknown")
+	}
 	id, err := domain.NewPendingRequestID()
 	if err != nil {
 		return nil, fmt.Errorf("generate Workspace approval ID: %w", err)
@@ -1108,6 +1141,7 @@ func newHostlessWorkspaceApproval(current task.Task, call ModelToolCall, request
 	revision := *current.CurrentRevision
 	return &task.PendingRequest{ID: id, TaskID: current.ID, Version: version, TaskRevision: &revision, Kind: "approval",
 		Title: "Approve Workspace file save", Object: approval.Object, Content: approval.Content, Impact: approval.Impact,
+		RejectionConsequence: approval.RejectionConsequence, TriggerRule: triggerRule,
 		CallID: call.CallID, ToolName: call.Name, RequestHash: append([]byte(nil), requestHash...), Status: task.PendingRequestPending}, nil
 }
 
@@ -1127,7 +1161,8 @@ func cloudDSHWorkspaceWriteApproval(write cloudDSHWorkspaceWriteArguments, works
 		Object: "Save a file to your Workspace",
 		Content: fmt.Sprintf("Path: %s\nWorkspace: %s · revision %d\nSize: %d bytes · SHA-256: %x\nPreview: %s",
 			pathPreview, workspaceID, write.ExpectedRevision, len(write.Content), contentHash, preview),
-		Impact: "This writes the shown file into your saved Workspace only after you approve. It does not run shell commands or send data externally.",
+		Impact:               "This writes the shown file into your saved Workspace only after you approve. It does not run shell commands or send data externally.",
+		RejectionConsequence: "If you reject, the file is not saved and the task stops at this step.",
 	}
 }
 

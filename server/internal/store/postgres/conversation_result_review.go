@@ -442,6 +442,13 @@ WHERE message_id=$1 AND state='processing'`, replyMessageID); err != nil {
 		}
 		deliveryFacts = append(deliveryFacts, facts)
 	}
+	// E11 delivery-authenticity fence: a result that failed independent
+	// verification is never published. The gate runs before the receipt is
+	// built and before any publish write, so the refusal is atomic and the
+	// route failure leaves the batch failed and retryable.
+	if err := app.ValidateConversationResultDelivery(review.Sources, validationStates); err != nil {
+		return err
+	}
 	receipt := conversationTaskResultReceiptWithDeliveryFacts(reply, review.Sources, validationStates, deliveryFacts)
 	if !app.ValidConversationRouteReply(receipt) {
 		return domain.InvalidArgument("result_review", "task result review receipt is invalid")

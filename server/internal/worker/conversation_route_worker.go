@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -349,13 +350,31 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+// conversationRouteRetryAfterHorizon is the durable route queue's horizon
+// for a provider-named wait (M09-02/M09-05). It is deliberately longer than
+// the E12 ladder's ModelRetryMaxRetryAfter (600s): a provider-named wait is
+// a scheduled resume persisted as available_after, not a ladder retry delay,
+// so it is honoured up to 24h and only ends the attempt beyond that.
+const conversationRouteRetryAfterHorizon = 24 * time.Hour
+
+// conversationRouteRateLimitDelay decides whether a confirmed provider 429
+// requeues the route and for how long. The delay is the E12 ladder: a
+// provider Retry-After wins (honoured up to the durable 24h horizon, never
+// truncated), otherwise the jittered backoff (base 5s / max 120s) indexed by
+// the persisted route attempt. Returning (0, true) ends the attempt: the
+// store then marks the route failed instead of requeueing it. The retry
+// count itself stays durable in the store (three rejected calls, counted
+// from the route ledger), so a worker restart cannot reset the ladder.
 func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error) (time.Duration, bool) {
 	var routeErr *domain.Error
 	if !errors.As(err, &routeErr) || routeErr.Code != domain.CodeRateLimited ||
 		routeErr.Details["reason"] != string(app.ModelErrorRateLimited) || routeErr.Details["stage"] != "provider_status" {
 		return 0, false
 	}
-	if routeErr.Details["retry_after_exceeds_durable_horizon"] == "true" || routeErr.RetryAfter > 24*time.Hour {
+	if app.ClassifyModelClientError(err).Reason != app.FailoverRateLimit {
+		return 0, false
+	}
+	if routeErr.Details["retry_after_exceeds_durable_horizon"] == "true" || routeErr.RetryAfter > conversationRouteRetryAfterHorizon {
 		// The durable route queue supports at most 24 hours; do not retry earlier than the provider requested.
 		return 0, true
 	}
@@ -367,8 +386,21 @@ func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error
 		}
 		return delay * time.Second, true
 	}
-	shift := min(max(claim.RouteAttempt-1, int64(0)), int64(2))
-	return time.Second << shift, true
+	attempt := int(claim.RouteAttempt) + 1
+	if attempt > app.ModelRetryMaxRetries {
+		return 0, true
+	}
+	delay, ok := app.ModelRetryDelay(attempt, 0, conversationRouteRetryAfterHorizon, rand.Float64)
+	if !ok {
+		return 0, true
+	}
+	// The store requires whole seconds; round up so the wait is never
+	// shorter than the ladder computed.
+	seconds := delay / time.Second
+	if delay%time.Second != 0 {
+		seconds++
+	}
+	return seconds * time.Second, true
 }
 
 // conversationRouteHistoryPreviewBytes bounds one history entry when the
@@ -655,6 +687,14 @@ func (w *ConversationRouteWorker) failRoute(ctx context.Context, claim app.Conve
 		}
 		if historyBytes, ok := routeErr.Details["history_bytes"].(int); ok {
 			fields = append(fields, zap.Int("history_bytes", historyBytes))
+		}
+	}
+	// The failover reason is a bounded 31-value label, never raw provider
+	// text, so the terminal state stays locatable from the log alone.
+	if classification := app.ClassifyModelClientError(cause); classification.Known {
+		fields = append(fields, zap.String("failover_reason", string(classification.Reason)))
+		if classification.Strategy.UserVisibleCase > 0 {
+			fields = append(fields, zap.Int("user_visible_case", classification.Strategy.UserVisibleCase))
 		}
 	}
 	w.options.Logger.Warn("conversation route failed", fields...)

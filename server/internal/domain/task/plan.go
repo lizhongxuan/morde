@@ -22,11 +22,16 @@ const (
 
 // Plan is an advisory, revisioned execution outline. It never grants tool access.
 type Plan struct {
-	TaskRevision      int64      `json:"task_revision"`
-	Revision          int64      `json:"revision"`
-	Goal              string     `json:"goal"`
-	CostEstimateState string     `json:"cost_estimate_state"`
-	Steps             []PlanStep `json:"steps"`
+	TaskRevision       int64      `json:"task_revision"`
+	Revision           int64      `json:"revision"`
+	Goal               string     `json:"goal"`
+	Scope              string     `json:"scope,omitempty"`
+	VerificationMethod string     `json:"verification_method,omitempty"`
+	CostEstimateState  string     `json:"cost_estimate_state"`
+	Steps              []PlanStep `json:"steps"`
+	// FixPlan is optional: when present it marks the task as a bug fix and
+	// carries the structured fix proposal. Plans stored before E03 omit it.
+	FixPlan *FixPlan `json:"fix_plan,omitempty"`
 }
 
 type PlanStep struct {
@@ -42,6 +47,18 @@ type PlanStep struct {
 func (p Plan) Validate() error {
 	if p.TaskRevision < 0 || p.Revision < 1 || !planText(p.Goal, 1, 2048) || p.CostEstimateState != "unknown" || len(p.Steps) == 0 || len(p.Steps) > MaxPlanSteps {
 		return errors.New("task plan fields are invalid")
+	}
+	// Scope and verification method are optional so plans stored before the
+	// brief gate stay readable; when present they must satisfy the brief bounds.
+	if (p.Scope != "" && !planText(p.Scope, 1, 2048)) || (p.VerificationMethod != "" && !planText(p.VerificationMethod, 1, 1024)) {
+		return errors.New("task plan fields are invalid")
+	}
+	// A fix plan is optional so plans stored before E03 stay readable; when
+	// present it must satisfy its own boundaries.
+	if p.FixPlan != nil {
+		if err := p.FixPlan.Validate(); err != nil {
+			return err
+		}
 	}
 	steps := make(map[string]PlanStep, len(p.Steps))
 	for _, step := range p.Steps {

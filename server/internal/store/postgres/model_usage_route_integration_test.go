@@ -598,7 +598,7 @@ FROM project_budget_ledger WHERE source='route' AND call_id=$1`, callID).
 		if attempt == 2 {
 			wantState, wantAttempt = "failed", initialClaim.RouteAttempt+attempt
 		}
-		if routeState != wantState || persistedAttempt != wantAttempt || (attempt == 2 && failureReason != "model_unavailable") {
+		if routeState != wantState || persistedAttempt != wantAttempt || (attempt == 2 && failureReason != app.RouteRetryLadderExhaustedReason) {
 			t.Fatalf("coordinator route after attempt %d: state=%q attempt=%d reason=%q, want %q/%d",
 				attempt+1, routeState, persistedAttempt, failureReason, wantState, wantAttempt)
 		}

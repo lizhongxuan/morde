@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/task"
 	"morde/server/internal/store/postgres/sqlcgen"
 )
 
@@ -297,7 +299,7 @@ WHERE review.task_id=$1 AND review.task_revision=$3 AND review.owner_id=$2
 func loadTaskValidationVerdictFacts(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim, result string,
 	evidence *app.TaskValidationEvidenceRecord, report app.TaskValidationReviewReport,
 	artifactProofs []app.TaskValidationReviewArtifactContentProof) (app.TaskValidationVerdictFacts, error) {
-	var hasExecution, hasClarifications bool
+	var hasExecution, hasPendingClarifications bool
 	if err := tx.QueryRow(ctx, `SELECT EXISTS (
   SELECT 1 FROM task_steps WHERE task_id=$1 AND (kind='tool' OR tool_name IS NOT NULL)
   UNION ALL SELECT 1 FROM task_operations WHERE task_id=$1
@@ -309,11 +311,15 @@ func loadTaskValidationVerdictFacts(ctx context.Context, tx pgx.Tx, claim app.Ta
   UNION ALL SELECT 1 FROM task_agent_request_reconciliations WHERE task_id=$1
   UNION ALL SELECT 1 FROM task_agent_sessions WHERE task_id=$1 AND parent_session_id IS NOT NULL
   UNION ALL SELECT 1 FROM task_artifacts WHERE task_id=$1
-), EXISTS (SELECT 1 FROM task_clarification_requests WHERE task_id=$1)`, claim.TaskID).
-		Scan(&hasExecution, &hasClarifications); err != nil {
+), EXISTS (SELECT 1 FROM task_clarification_requests WHERE task_id=$1 AND status='pending')`, claim.TaskID).
+		Scan(&hasExecution, &hasPendingClarifications); err != nil {
 		return app.TaskValidationVerdictFacts{}, fmt.Errorf("read Task validation facts: %w", err)
 	}
-	facts := app.TaskValidationVerdictFacts{ClarificationHistoryKnown: !hasClarifications}
+	// E09: the clarification history is known when no clarification is
+	// still unanswered. Answered and cancelled requests both have a
+	// terminal state with a timestamp, so the history is verifiable; a
+	// pending request means the history is not closed yet.
+	facts := app.TaskValidationVerdictFacts{ClarificationHistoryKnown: !hasPendingClarifications}
 	eligibleContent := make(map[app.TaskValidationEvidenceRefRecord]struct{})
 	if evidence != nil {
 		eligibleWeb := make(map[app.TaskValidationEvidenceRefRecord]struct{})
@@ -359,14 +365,166 @@ WHERE st.task_id=$1 AND st.task_revision=$2 AND st.status='succeeded' AND st.det
 	}
 	if hasExecution {
 		facts.TaskExecution = app.TaskValidationFactPresent
-		facts.IrreversibleAction = app.TaskValidationFactUnknown
-		facts.RepeatedError = app.TaskValidationFactUnknown
+		if err := loadTaskValidationExecutionFacts(ctx, tx, claim, &facts); err != nil {
+			return app.TaskValidationVerdictFacts{}, err
+		}
 	} else {
 		facts.TaskExecution = app.TaskValidationFactAbsent
 		facts.IrreversibleAction = app.TaskValidationFactAbsent
 		facts.RepeatedError = app.TaskValidationFactAbsent
 	}
 	return facts, nil
+}
+
+// loadTaskValidationExecutionFacts derives the H05/H06/H07 server facts
+// (E09) from the durable ledger, independently of the execution broker
+// that recorded it and of the review model. Every load failure fails
+// closed: the review completion errors and the verdict stays pending
+// instead of passing on partial facts.
+//
+//   - H05: every executed action in a per-call approval category must
+//     match an approved pending request. Steps carry the tool call
+//     identity (call ID, tool name, request digest, task revision);
+//     succeeded MCP operations are checked the same way as a safety net
+//     for external calls that left no step. Hub operations, sandbox
+//     receipts and publish receipts are not checked separately: Hub
+//     actions are task-scope governed (no per-call approval category),
+//     sandbox calls are the same shell executions the steps record, and
+//     a media publish goes through the workspace-write step, whose
+//     identity the step check covers. The publish receipts table carries
+//     no call identity to match against.
+//   - H06: repeated errors and their correction records, from the step
+//     digests.
+//   - H07: the test gate re-derived from the steps for fix tasks, or
+//     the read-back compare (evidence content still verified) otherwise.
+func loadTaskValidationExecutionFacts(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim, facts *app.TaskValidationVerdictFacts) error {
+	steps, err := listTaskStepsWithActivity(ctx, tx, claim.TaskID)
+	if err != nil {
+		return fmt.Errorf("read Task validation steps: %w", err)
+	}
+	approvals, err := listTaskValidationApprovedRequests(ctx, tx, claim.TaskID)
+	if err != nil {
+		return err
+	}
+	actions, unclassifiable := taskValidationApprovalActions(steps)
+	mcpActions, mcpUnclassifiable, err := listTaskValidationMCPApprovalActions(ctx, tx, claim)
+	if err != nil {
+		return err
+	}
+	actions = append(actions, mcpActions...)
+	facts.IrreversibleAction, facts.ApprovalHistoryVerified = app.EvaluateTaskApprovalCoverage(actions, approvals, unclassifiable || mcpUnclassifiable)
+	facts.RepeatedError, facts.CorrectionRecordVerified = app.EvaluateRepeatedErrorCorrections(steps)
+	plan, err := latestTaskPlan(ctx, tx, claim.TaskID, claim.TaskRevision)
+	if err != nil {
+		return fmt.Errorf("read Task validation plan: %w", err)
+	}
+	hasFixPlan := plan != nil && plan.FixPlan != nil
+	facts.ReplayVerified = app.EvaluateTaskValidationReplay(hasFixPlan, app.EvaluateTestGate(steps), facts.EvidenceContentVerified)
+	return nil
+}
+
+// listTaskValidationApprovedRequests returns the task's approved pending
+// requests that can still vouch for an executed action: approved by a
+// user, answered, and not expired. Rejected, pending and expired rows
+// cannot vouch for anything.
+func listTaskValidationApprovedRequests(ctx context.Context, tx pgx.Tx, taskID string) ([]app.TaskApprovalRecord, error) {
+	rows, err := tx.Query(ctx, `SELECT call_id,tool_name,request_hash,task_revision FROM task_pending_requests
+WHERE task_id=$1 AND status='approved' AND decision='approve'
+  AND responded_by_user_id IS NOT NULL AND responded_at IS NOT NULL
+  AND (expires_at IS NULL OR responded_at < expires_at)`, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("read Task validation approvals: %w", err)
+	}
+	defer rows.Close()
+	approvals := make([]app.TaskApprovalRecord, 0)
+	for rows.Next() {
+		var approval app.TaskApprovalRecord
+		var revision pgtype.Int8
+		var requestHash []byte
+		if err := rows.Scan(&approval.CallID, &approval.ToolName, &requestHash, &revision); err != nil {
+			return nil, fmt.Errorf("scan Task validation approvals: %w", err)
+		}
+		approval.RequestHash = requestHash
+		if revision.Valid {
+			value := revision.Int64
+			approval.TaskRevision = &value
+		}
+		approvals = append(approvals, approval)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate Task validation approvals: %w", err)
+	}
+	return approvals, nil
+}
+
+// taskValidationApprovalActions collects the executed approval-requiring
+// actions from the step ledger. A succeeded step with no tool name cannot
+// be classified, so unclassifiable is reported and the approval fact
+// stays unknown instead of guessing.
+func taskValidationApprovalActions(steps []task.Step) ([]app.TaskApprovalAction, bool) {
+	actions := make([]app.TaskApprovalAction, 0)
+	unclassifiable := false
+	for _, step := range steps {
+		if step.Status != task.StepSucceeded {
+			continue
+		}
+		if step.ToolName == "" {
+			unclassifiable = true
+			continue
+		}
+		if !app.TaskToolRequiresPerCallApproval(step.ToolName) {
+			continue
+		}
+		actions = append(actions, app.TaskApprovalAction{
+			CallID:        step.ToolCallKey,
+			ToolName:      step.ToolName,
+			RequestDigest: step.RequestDigest,
+			TaskRevision:  step.TaskRevision,
+		})
+	}
+	return actions, unclassifiable
+}
+
+// listTaskValidationMCPApprovalActions collects the succeeded external
+// MCP operations as approval-requiring actions. A step normally records
+// the same call, so this is a safety net for an external call that left
+// no step; a matching pending request vouches for both records. Rows
+// without a call ID cannot be matched to any approval and stay
+// unverifiable, so they are reported as unclassifiable.
+func listTaskValidationMCPApprovalActions(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim) ([]app.TaskApprovalAction, bool, error) {
+	rows, err := tx.Query(ctx, `SELECT COALESCE(call_id,''),tool_name,request_hash,task_revision
+FROM task_mcp_connector_operations WHERE task_id=$1 AND owner_id=$2 AND status='succeeded'`, claim.TaskID, claim.OwnerID)
+	if err != nil {
+		return nil, false, fmt.Errorf("read Task validation MCP operations: %w", err)
+	}
+	defer rows.Close()
+	actions := make([]app.TaskApprovalAction, 0)
+	unclassifiable := false
+	for rows.Next() {
+		var action app.TaskApprovalAction
+		var revision pgtype.Int8
+		var requestHash []byte
+		if err := rows.Scan(&action.CallID, &action.ToolName, &requestHash, &revision); err != nil {
+			return nil, false, fmt.Errorf("scan Task validation MCP operations: %w", err)
+		}
+		action.RequestDigest = requestHash
+		if revision.Valid {
+			value := revision.Int64
+			action.TaskRevision = &value
+		}
+		if !app.TaskToolRequiresPerCallApproval(action.ToolName) {
+			continue
+		}
+		if action.CallID == "" {
+			unclassifiable = true
+			continue
+		}
+		actions = append(actions, action)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("iterate Task validation MCP operations: %w", err)
+	}
+	return actions, unclassifiable, nil
 }
 
 func currentTaskValidationReviewArtifactContentRefsInTx(ctx context.Context, tx pgx.Tx,
