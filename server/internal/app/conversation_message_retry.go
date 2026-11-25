@@ -32,6 +32,9 @@ const (
 
 type ConversationMessageRetryStore interface {
 	RetryConversationRoute(context.Context, identity.Principal, string, string, string, string, string) error
+}
+
+type ConversationMessageRetryEligibilityStore interface {
 	GetConversationMessageRetryEligibility(context.Context, identity.Principal, string, string, string, string) (ConversationMessageRetryEligibility, error)
 }
 
@@ -63,7 +66,7 @@ func (s *TaskService) GetConversationMessageRetryEligibility(ctx context.Context
 	if !domain.ValidServiceInstanceID(instanceID) {
 		return ConversationMessageRetryEligibility{}, domain.InvalidArgument("retry", "message retry identity is invalid")
 	}
-	store, ok := s.store.(ConversationMessageRetryStore)
+	store, ok := s.store.(ConversationMessageRetryEligibilityStore)
 	if !ok {
 		return ConversationMessageRetryEligibility{}, domain.NewError(domain.CodeUnsupported, "message processing retry eligibility is unavailable")
 	}

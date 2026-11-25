@@ -2429,7 +2429,14 @@ func dshToolResultText(result AgentToolResult) string {
 // PauseRecovery moves an unresolved restored session out of the worker claim
 // queue. It records no checkpoint contents or tool arguments in the task event.
 func (b *CloudDSHToolBroker) PauseRecovery(ctx context.Context, claimed task.Task) error {
-	return b.pauseRecovery(ctx, claimed, AgentModelFailureDiagnostic{})
+	return b.PauseRecoveryDiagnostic(ctx, claimed, AgentRecoveryDiagnostic{})
+}
+
+// PauseRecoveryDiagnostic persists only allowlisted details about the failing
+// recovery stage. The worker must not pass the underlying runtime error.
+func (b *CloudDSHToolBroker) PauseRecoveryDiagnostic(ctx context.Context, claimed task.Task, diagnostic AgentRecoveryDiagnostic) error {
+	diagnostic = safeAgentRecoveryDiagnostic(diagnostic)
+	return b.pauseRecovery(ctx, claimed, AgentModelFailureDiagnostic{}, diagnostic)
 }
 
 // PauseModelRecovery records an allowlisted model failure category without
@@ -2442,7 +2449,7 @@ func (b *CloudDSHToolBroker) PauseModelRecovery(ctx context.Context, claimed tas
 // details. It excludes model text, tool arguments, and provider credentials.
 func (b *CloudDSHToolBroker) PauseModelRecoveryDiagnostic(ctx context.Context, claimed task.Task, diagnostic AgentModelFailureDiagnostic) error {
 	diagnostic = safeAgentModelFailureDiagnostic(diagnostic)
-	return b.pauseRecovery(ctx, claimed, diagnostic)
+	return b.pauseRecovery(ctx, claimed, diagnostic, AgentRecoveryDiagnostic{})
 }
 
 // PauseModelRecoveryAfterLadderExhaustion records the terminal state once a
@@ -2457,6 +2464,16 @@ func (b *CloudDSHToolBroker) PauseModelRecoveryAfterLadderExhaustion(ctx context
 	return b.PauseModelRecoveryDiagnostic(ctx, claimed, AgentModelFailureDiagnostic{
 		Category: "model_retry_ladder_exhausted", LadderExhausted: true, Attempts: attempts, Reason: reason,
 	})
+}
+
+func safeAgentRecoveryDiagnostic(value AgentRecoveryDiagnostic) AgentRecoveryDiagnostic {
+	if value.Stage != AgentRecoveryStageCloudDSHRun {
+		value.Stage = ""
+	}
+	if value.ReasonCode != AgentRecoveryReasonUnclassifiedRuntime {
+		value.ReasonCode = ""
+	}
+	return value
 }
 
 func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentModelFailureDiagnostic {
@@ -2493,7 +2510,8 @@ func safeAgentModelFailureDiagnostic(value AgentModelFailureDiagnostic) AgentMod
 	return value
 }
 
-func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Task, diagnostic AgentModelFailureDiagnostic) error {
+func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Task, diagnostic AgentModelFailureDiagnostic,
+	recoveryDiagnostic AgentRecoveryDiagnostic) error {
 	if ctx == nil {
 		return domain.InvalidArgument("context", "recovery context is required")
 	}
@@ -2509,7 +2527,7 @@ func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Tas
 		return nil
 	}
 	title := "Review cloud task recovery"
-	summary := "The previous cloud task checkpoint could not be reconciled safely."
+	summary := "The recovered cloud task could not be safely resumed; it has been paused for review."
 	waitingReason := "dsh_recovery_unresolved"
 	if diagnostic.Category != "" {
 		summary = "The model request could not be verified (category: " + diagnostic.Category + "); retry after checking the model connection."
@@ -2608,6 +2626,12 @@ func (b *CloudDSHToolBroker) pauseRecovery(ctx context.Context, claimed task.Tas
 		if _, ok := failoverReasonStrategies[diagnostic.Reason]; ok {
 			metadata["failover_reason"] = string(diagnostic.Reason)
 		}
+	}
+	if recoveryDiagnostic.Stage != "" {
+		metadata["recovery_stage"] = recoveryDiagnostic.Stage
+	}
+	if recoveryDiagnostic.ReasonCode != "" {
+		metadata["recovery_reason"] = recoveryDiagnostic.ReasonCode
 	}
 	return b.commitProgress(persistCtx, current, step, current.Usage, task.StatusWaitingUser, waitingReason, "task.waiting_user", metadata)
 }

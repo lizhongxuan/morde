@@ -26,78 +26,85 @@ import (
 )
 
 type taskServiceStub struct {
-	submitCommand           app.SubmitTaskCommand
-	submitCalls             int
-	submitReplayed          bool
-	acceptedConversationID  string
-	acceptCommand           app.AcceptConversationMessageCommand
-	acceptCalls             int
-	acceptReplayed          bool
-	listRequest             app.TaskListRequest
-	listCalls               int
-	listPage                app.TaskPage
-	conversationTasks       app.TaskPage
-	conversationTaskID      string
-	conversationTaskView    app.ConversationTaskView
-	conversationTaskCalls   int
-	approvalConversationID  string
-	approvalPage            app.TaskApprovalPage
-	approvalCalls           int
-	getID                   string
-	getPrincipal            identity.Principal
-	getDetails              *app.TaskDetails
-	stepDetail              app.TaskStepDetail
-	stepDetailCalls         int
-	stepDetailTaskID        string
-	stepDetailStepID        string
-	stepRetryResult         app.TaskStepRetryResult
-	stepRetryCalls          int
-	stepRetryTaskID         string
-	stepRetryStepID         string
-	stepRetryRevision       int64
-	stepRetryAttempt        int64
-	stepRetryIdempotency    string
-	actionTaskID            string
-	action                  task.Action
-	actionExpected          task.Status
-	actionRevisionFence     *app.TaskActionRevisionFence
-	actionKey               string
-	actionCalls             int
-	priorityCalls           int
-	priorityTaskID          string
-	priorityValue           task.QueuePriority
-	priorityEventSequence   int64
-	priorityKey             string
-	retryTaskID             string
-	retryItemID             string
-	retryKey                string
-	retryCalls              int
-	responseTaskID          string
-	responseID              string
-	responseVersion         int64
-	responseDecision        task.PendingDecision
-	responseKey             string
-	responseCalls           int
-	clarificationTaskID     string
-	clarificationID         string
-	clarificationVersion    int64
-	clarificationAnswer     string
-	clarificationFileIntent task.FileDeliveryIntent
-	clarificationKey        string
-	clarificationCalls      int
-	events                  []task.Event
-	eventPrincipal          identity.Principal
-	eventStatus             task.Status
-	eventCurrentSequence    int64
-	eventCalls              int
-	eventAfter              int64
-	eventErrorAfterCall     int
-	eventPages              []app.TaskEventPage
-	revokeTaskID            string
-	revokeConnectorID       string
-	revokeVersion           int64
-	revokeCalls             int
-	err                     error
+	submitCommand                app.SubmitTaskCommand
+	submitCalls                  int
+	submitReplayed               bool
+	acceptedConversationID       string
+	acceptCommand                app.AcceptConversationMessageCommand
+	acceptCalls                  int
+	acceptReplayed               bool
+	listRequest                  app.TaskListRequest
+	listCalls                    int
+	listPage                     app.TaskPage
+	conversationTasks            app.TaskPage
+	conversationTaskID           string
+	conversationTaskView         app.ConversationTaskView
+	conversationTaskCalls        int
+	approvalConversationID       string
+	approvalPage                 app.TaskApprovalPage
+	approvalCalls                int
+	getID                        string
+	getPrincipal                 identity.Principal
+	getDetails                   *app.TaskDetails
+	stepDetail                   app.TaskStepDetail
+	stepDetailCalls              int
+	stepDetailTaskID             string
+	stepDetailStepID             string
+	stepRetryResult              app.TaskStepRetryResult
+	stepRetryCalls               int
+	stepRetryTaskID              string
+	stepRetryStepID              string
+	stepRetryRevision            int64
+	stepRetryAttempt             int64
+	stepRetryIdempotency         string
+	actionTaskID                 string
+	action                       task.Action
+	actionExpected               task.Status
+	actionRevisionFence          *app.TaskActionRevisionFence
+	actionKey                    string
+	actionCalls                  int
+	priorityCalls                int
+	priorityTaskID               string
+	priorityValue                task.QueuePriority
+	priorityEventSequence        int64
+	priorityKey                  string
+	retryTaskID                  string
+	retryItemID                  string
+	retryKey                     string
+	retryCalls                   int
+	retryEligibilityCalls        int
+	retryEligibilityProject      string
+	retryEligibilityConversation string
+	retryEligibilityMessage      string
+	retryEligibilityInstance     string
+	retryEligibilityPrincipal    identity.Principal
+	retryEligibilityResult       app.ConversationMessageRetryEligibility
+	responseTaskID               string
+	responseID                   string
+	responseVersion              int64
+	responseDecision             task.PendingDecision
+	responseKey                  string
+	responseCalls                int
+	clarificationTaskID          string
+	clarificationID              string
+	clarificationVersion         int64
+	clarificationAnswer          string
+	clarificationFileIntent      task.FileDeliveryIntent
+	clarificationKey             string
+	clarificationCalls           int
+	events                       []task.Event
+	eventPrincipal               identity.Principal
+	eventStatus                  task.Status
+	eventCurrentSequence         int64
+	eventCalls                   int
+	eventAfter                   int64
+	eventErrorAfterCall          int
+	eventPages                   []app.TaskEventPage
+	revokeTaskID                 string
+	revokeConnectorID            string
+	revokeVersion                int64
+	revokeCalls                  int
+	err                          error
 }
 
 type conversationRecoveryTaskServiceStub struct {
@@ -203,6 +210,17 @@ func (s *taskServiceStub) AssociateConversationMessageAttachment(context.Context
 
 func (s *taskServiceStub) RetryConversationMessageProcessing(context.Context, identity.Principal, string, string, string, string, string) error {
 	return s.err
+}
+
+func (s *taskServiceStub) GetConversationMessageRetryEligibility(_ context.Context, principal identity.Principal, projectID, conversationID, messageID, instanceID string) (app.ConversationMessageRetryEligibility, error) {
+	s.retryEligibilityCalls++
+	s.retryEligibilityPrincipal = principal
+	s.retryEligibilityProject, s.retryEligibilityConversation = projectID, conversationID
+	s.retryEligibilityMessage, s.retryEligibilityInstance = messageID, instanceID
+	if s.retryEligibilityResult.Reason == "" {
+		s.retryEligibilityResult = app.ConversationMessageRetryEligibility{Eligible: false, Reason: app.ConversationMessageRetryReasonNotFailed}
+	}
+	return s.retryEligibilityResult, s.err
 }
 
 func (s *taskServiceStub) List(_ context.Context, _ identity.Principal, request app.TaskListRequest) (app.TaskPage, error) {
@@ -892,6 +910,94 @@ func TestTaskResponseIncludesPendingApprovalEvidenceFields(t *testing.T) {
 			value.PendingRequest.ThisCostMicros = nil
 			value.PendingRequest.RejectionConsequence = "If you reject, the file is not uploaded and the task stops at this step."
 		})
+	}
+}
+
+func TestConversationMessageRetryEligibilityForwardsScopedIdentityAndResponse(t *testing.T) {
+	for _, tc := range []struct {
+		path      string
+		projectID string
+	}{
+		{"/api/conversations/c1234567/messages/m1234567/retry-eligibility", ""},
+		{"/api/projects/j1234567/conversations/c1234567/messages/m1234567/retry-eligibility", "j1234567"},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			expected := app.ConversationMessageRetryEligibility{
+				Eligible: true,
+				Reason:   app.ConversationMessageRetryReasonAvailable,
+				Warning:  app.ConversationMessageRetryWarningPersonalOutcomeUnknown,
+			}
+			tasks := &taskServiceStub{retryEligibilityResult: expected}
+			router := taskAPIRouter(tasks, nil)
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			req.Header.Set("X-Morde-Actor-ID", "u1234567")
+			req.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
+			resp := httptest.NewRecorder()
+			router.ServeHTTP(resp, req)
+
+			var actual app.ConversationMessageRetryEligibility
+			if err := json.Unmarshal(resp.Body.Bytes(), &actual); err != nil {
+				t.Fatalf("decode eligibility response: %v; body=%s", err, resp.Body.String())
+			}
+			if resp.Code != http.StatusOK || actual != expected || tasks.retryEligibilityCalls != 1 ||
+				tasks.retryEligibilityProject != tc.projectID || tasks.retryEligibilityConversation != "c1234567" ||
+				tasks.retryEligibilityMessage != "m1234567" || tasks.retryEligibilityInstance != "11111111-1111-4111-8111-111111111111" ||
+				tasks.retryEligibilityPrincipal.UserID != "u1234567" {
+				t.Fatalf("eligibility status=%d response=%+v calls=%d task=%+v body=%s",
+					resp.Code, actual, tasks.retryEligibilityCalls, tasks, resp.Body.String())
+			}
+		})
+	}
+}
+
+func TestConversationMessageRetryEligibilityRequiresActorAndServiceInstance(t *testing.T) {
+	tasks := &taskServiceStub{}
+	router := taskAPIRouter(tasks, nil)
+	for _, tc := range []struct {
+		name     string
+		actor    string
+		instance string
+	}{
+		{name: "missing actor", instance: "11111111-1111-4111-8111-111111111111"},
+		{name: "missing instance", actor: "u1234567"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/api/conversations/c1234567/messages/m1234567/retry-eligibility", nil)
+			if tc.actor != "" {
+				req.Header.Set("X-Morde-Actor-ID", tc.actor)
+			}
+			if tc.instance != "" {
+				req.Header.Set("X-Morde-Service-Instance-ID", tc.instance)
+			}
+			resp := httptest.NewRecorder()
+			router.ServeHTTP(resp, req)
+			if resp.Code != http.StatusBadRequest || tasks.retryEligibilityCalls != 0 {
+				t.Fatalf("missing required identity: status=%d calls=%d body=%s", resp.Code, tasks.retryEligibilityCalls, resp.Body.String())
+			}
+		})
+	}
+}
+
+func TestConversationMessageRetryEligibilityOpenAPIContract(t *testing.T) {
+	openAPI, err := os.ReadFile(filepath.Join("..", "..", "openapi", "portal.yaml"))
+	if err != nil {
+		t.Fatalf("read Portal OpenAPI schema: %v", err)
+	}
+	contract := string(openAPI)
+	for _, expected := range []string{
+		"/api/conversations/{id}/messages/{message_id}/retry-eligibility:",
+		"operationId: getConversationMessageRetryEligibility",
+		"/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-eligibility:",
+		"operationId: getProjectConversationMessageRetryEligibility",
+		"ConversationMessageRetryEligibility:",
+		"required: [retry_eligible, retry_reason]",
+		"retry_warning:",
+		"previous_personal_model_call_outcome_unknown",
+		"eligibility may change before it is called",
+	} {
+		if !strings.Contains(contract, expected) {
+			t.Fatalf("Portal OpenAPI retry eligibility contract is missing %q", expected)
+		}
 	}
 }
 

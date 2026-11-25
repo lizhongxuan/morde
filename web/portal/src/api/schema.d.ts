@@ -2999,6 +2999,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-eligibility": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Check whether an accepted message can be retried
+         * @description Returns the current advisory eligibility for retrying this message. The retry-processing POST rechecks authorization and route state transactionally, so eligibility may change before it is called.
+         */
+        get: operations["getProjectConversationMessageRetryEligibility"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}": {
         parameters: {
             query?: never;
@@ -3673,6 +3702,34 @@ export interface paths {
          * @description Only the original actor may retry a failed message without a Task. A repeated message is normalized to its original request and retry identity. Exact retries use the same key; dispatched or unknown model calls are reconciled, never blindly repeated. Existing Tasks use Task operations.
          */
         post: operations["retryConversationMessageProcessing"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/conversations/{id}/messages/{message_id}/retry-eligibility": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Check whether an accepted message can be retried
+         * @description Returns the current advisory eligibility for retrying this message. The retry-processing POST rechecks authorization and route state transactionally, so eligibility may change before it is called.
+         */
+        get: operations["getConversationMessageRetryEligibility"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -9211,6 +9268,17 @@ export interface components {
             /** @description True when an identical message receipt was returned. */
             replayed: boolean;
         };
+        ConversationMessageRetryEligibility: {
+            /** @description Whether the saved source message currently passes the server retry gate. */
+            retry_eligible: boolean;
+            /** @enum {string} */
+            retry_reason: "retry_available" | "route_not_failed" | "task_already_created" | "message_too_long" | "reconciliation_required" | "route_processing" | "result_review_not_retryable" | "result_review_outcome_unknown" | "retry_limit_reached";
+            /**
+             * @description A previous personal model call has an unknown outcome. A new attempt is independent and does not prove the previous call settled.
+             * @enum {string}
+             */
+            retry_warning?: "previous_personal_model_call_outcome_unknown";
+        };
         CreateConversationMessageVariantRequest: {
             /** @enum {string} */
             action: "edit_resend" | "regenerate_text" | "continue_generation";
@@ -9543,6 +9611,33 @@ export interface components {
             completion_criteria: string[];
             /** @enum {string} */
             status: "pending" | "in_progress" | "completed" | "blocked";
+            /**
+             * @description Omitted on legacy plans means verification applicability is unknown and H07 must remain pending. New fix plan submissions classify every step.
+             * @enum {string}
+             */
+            verification_applicability?: "check" | "not_applicable";
+            /** @description Typed check identity for H07. A declared coverage path is plan scope, not proof of actual test coverage. */
+            verification_check?: {
+                /** @enum {string} */
+                kind: "test" | "build" | "lint" | "typecheck" | "other";
+                /**
+                 * @description Required checks cite an explicit user message or project file; risk_selected checks are chosen for this task.
+                 * @enum {string}
+                 */
+                basis: "required" | "risk_selected";
+                command: string;
+                coverage_paths: string[];
+                requirement_source?: {
+                    /** @enum {string} */
+                    kind: "user_message" | "project_file";
+                    message_id?: string;
+                    workspace_path?: string;
+                    /** Format: int64 */
+                    workspace_revision?: number;
+                    /** @description Canonical digest stored in the plan; new plan-tool submissions have the server resolve the source and compute this value. */
+                    content_sha256: string;
+                };
+            };
         };
         TaskPlan: {
             /** Format: int64 */
@@ -15996,6 +16091,40 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getProjectConversationMessageRetryEligibility: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current advisory retry eligibility */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageRetryEligibility"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     getProjectConversationAttachmentUpload: {
         parameters: {
             query?: never;
@@ -17318,6 +17447,39 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getConversationMessageRetryEligibility: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current advisory retry eligibility */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageRetryEligibility"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };

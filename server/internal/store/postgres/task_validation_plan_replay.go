@@ -389,7 +389,7 @@ func taskValidationPlanCheckRequirementSourceVerified(ctx context.Context, tx pg
 		}
 		var content string
 		err := tx.QueryRow(ctx, `SELECT content FROM conversation_messages WHERE id=$1 AND owner_id=$2
-AND conversation_id=$3 AND task_id=$4 AND role='user' AND delivery_status='applied'`,
+AND conversation_id=$3 AND task_id=$4 AND role='user' AND source_kind IN ('task','conversation') AND delivery_status='applied'`,
 			source.MessageID, claim.OwnerID, claim.ConversationID, claim.TaskID).Scan(&content)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return false, nil

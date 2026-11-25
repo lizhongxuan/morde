@@ -185,6 +185,19 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.Task.ID).Sc
 			t.Fatalf("restored applied user message did not restore source identity proof: %+v", got)
 		}
 	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE conversation_messages SET source_kind='conversation_variant_input' WHERE id=$1`, sourceMessageID); err != nil {
+		t.Fatalf("mark exact Task source as a synthetic variant input: %v", err)
+	}
+	if got := loadReplay(); got.State != app.TaskValidationReplayPending || len(got.Checks) != 1 ||
+		got.Checks[0].Status != app.TaskValidationReplayPass || got.Checks[0].RequirementSourceVerified {
+		t.Fatalf("applied same-Task conversation_variant_input replay = %+v; the check run may remain PASS, but its non-user source must be unverified and H07 pending", got)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE conversation_messages SET source_kind='task' WHERE id=$1`, sourceMessageID); err != nil {
+		t.Fatalf("restore direct Task input source kind: %v", err)
+	}
+	if got := loadReplay(); got.State != app.TaskValidationReplayPending || len(got.Checks) != 1 || !got.Checks[0].RequirementSourceVerified {
+		t.Fatalf("restored direct Task input source replay = %+v; want source identity verified", got)
+	}
 	checkFact := loadReplay().Checks[0]
 	finalProof := &app.TaskValidationFinalWorkspaceSnapshotProof{Claim: claim,
 		TaskID: claim.TaskID, TaskRevision: claim.TaskRevision,

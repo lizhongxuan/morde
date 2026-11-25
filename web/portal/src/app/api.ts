@@ -203,6 +203,13 @@ export const portalApi = {
           ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) } } : {}) },
     }));
   },
+  conversationMessageRetryEligibility: async (conversationID: string, messageID: string, serviceInstanceID: string, actorID: string) => {
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    return unwrapApiResponse(await api.GET('/api/conversations/{id}/messages/{message_id}/retry-eligibility', {
+      params: { path: { id: conversationID, message_id: messageID },
+        header: { 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } },
+    }));
+  },
   conversationPreview: async (id: string) => unwrapApiResponse(await api.GET('/api/conversations/{id}/messages', {
     params: { path: { id }, query: { limit: 5 } },
   })),

@@ -4356,6 +4356,33 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-eligibility:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    get:
+      tags: [Projects]
+      operationId: getProjectConversationMessageRetryEligibility
+      summary: Check whether an accepted message can be retried
+      description: Returns the current advisory eligibility for retrying this message. The retry-processing POST rechecks authorization and route state transactionally, so eligibility may change before it is called.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Current advisory retry eligibility
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationMessageRetryEligibility' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}:
     parameters:
       - { $ref: '#/components/parameters/ProjectId' }
@@ -5353,6 +5380,35 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/messages/{message_id}/retry-eligibility:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+      - { $ref: '#/components/parameters/ServiceInstanceID' }
+      - { $ref: '#/components/parameters/MessageActor' }
+    get:
+      tags: [Tasks]
+      operationId: getConversationMessageRetryEligibility
+      summary: Check whether an accepted message can be retried
+      description: Returns the current advisory eligibility for retrying this message. The retry-processing POST rechecks authorization and route state transactionally, so eligibility may change before it is called.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: Current advisory retry eligibility
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ConversationMessageRetryEligibility' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/conversations/{id}/messages/{message_id}/variants:
     parameters:
@@ -12447,6 +12503,18 @@ components:
       properties:
         message: { $ref: '#/components/schemas/ConversationMessage' }
         replayed: { type: boolean, description: True when an identical message receipt was returned. }
+    ConversationMessageRetryEligibility:
+      type: object
+      required: [retry_eligible, retry_reason]
+      properties:
+        retry_eligible: { type: boolean, description: Whether the saved source message currently passes the server retry gate. }
+        retry_reason:
+          type: string
+          enum: [retry_available, route_not_failed, task_already_created, message_too_long, reconciliation_required, route_processing, result_review_not_retryable, result_review_outcome_unknown, retry_limit_reached]
+        retry_warning:
+          type: string
+          enum: [previous_personal_model_call_outcome_unknown]
+          description: A previous personal model call has an unknown outcome. A new attempt is independent and does not prove the previous call settled.
     CreateConversationMessageVariantRequest:
       type: object
       additionalProperties: false

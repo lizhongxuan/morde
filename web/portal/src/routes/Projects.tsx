@@ -18,6 +18,7 @@ import type { MessageOutboxEntry } from '../app/use-message-outbox';
 import type { PendingConversationMessage } from '../app/message-outbox';
 import { outboxReceiptRequest } from '../app/message-outbox';
 import { ChatMarkdown } from '../components/ChatMarkdown';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import { ScreenPagination } from '../components/ScreenPagination';
 import { AssistantReplySpeech } from '../components/AssistantReplySpeech';
 import { AssistantVoiceInput } from '../components/AssistantVoiceInput';
@@ -48,6 +49,25 @@ function showReadError(query: { isError: boolean; error: unknown }) {
 
 function showReadLoading(query: { isPending: boolean; isError: boolean; error: unknown; data: unknown }) {
   return query.isPending || (transientReadFailure(query) && query.data === undefined);
+}
+
+function isUnlinkedProjectRetryFailure(message: ProjectConversationMessage): boolean {
+  return message.role === 'user' && message.routing_status === 'failed' && !message.task_id
+    && !message.related_task_id && !message.duplicate_of_message_id;
+}
+
+function retryEligibilityReasonText(reason: string): string {
+  switch (reason) {
+    case 'route_not_failed': return '服务端确认这条消息当前不再处于失败状态；刷新对话后核对最新状态。';
+    case 'task_already_created': return '服务端确认这条消息已关联任务；请从该任务查看进度。';
+    case 'message_too_long': return '原文超过当前处理限制；请缩短后重新发送，不能原样重试。';
+    case 'reconciliation_required': return '上次共享模型调用仍待对账；完成对账前不会重复处理。';
+    case 'route_processing': return '这条消息仍在处理中；请稍后刷新状态。';
+    case 'result_review_not_retryable': return '这条结果复核不支持从原消息重试。';
+    case 'result_review_outcome_unknown': return '结果复核调用状态仍未知；核对完成前不会重试。';
+    case 'retry_limit_reached': return '这条消息已达到重试次数上限。';
+    default: return '服务端暂时无法确认这条消息是否可以重试；原消息仍已保留。';
+  }
 }
 
 function roleLabel(role: ProjectRole) {
@@ -153,7 +173,10 @@ function UserProjects() {
   const [pendingAction, setPendingAction] = useState('');
   const [notice, setNotice] = useState<ActionNotice | null>(null);
   const [retryAcceptedMessageIDs, setRetryAcceptedMessageIDs] = useState<Set<string>>(() => new Set());
+  const [unknownProjectRetryConfirmation, setUnknownProjectRetryConfirmation] = useState<{ messageID: string; warning: string } | null>(null);
   const requestKeys = useRef(new Map<string, RequestKeyRecord>());
+  const projectRetryInFlight = useRef(new Set<string>());
+  const currentProjectRetryIdentity = useRef<{ actorID?: string; serviceInstanceID?: string }>({});
 
   const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: projectApi.projects, retry: false });
   const projects = projectsQuery.data ?? [];
@@ -253,6 +276,25 @@ function UserProjects() {
   const selectedVariantMap = new Map(Object.entries(selectedMessageVariantVersions).map(([groupID, version]) => [groupID, version]));
   const projectVariantTimeline = buildMessageVariantTimeline(projectConversationMessages as ProjectVersionableMessage[], selectedVariantMap);
   const visibleProjectConversationMessages = projectVariantTimeline.items;
+  useLayoutEffect(() => {
+    currentProjectRetryIdentity.current = { actorID: user?.id, serviceInstanceID: projectTaskCapabilitiesQuery.data?.service_instance_id };
+  }, [projectTaskCapabilitiesQuery.data?.service_instance_id, user?.id]);
+  const projectRetryCandidateMessages = visibleProjectConversationMessages.filter((message) =>
+    isUnlinkedProjectRetryFailure(message) && Boolean(user?.id) && message.actor_id === user?.id);
+  const projectRetryEligibilityQueries = useQueries({ queries: projectRetryCandidateMessages.map((message) => {
+    const actorID = user!.id;
+    const serviceInstanceID = projectTaskCapabilitiesQuery.data?.service_instance_id ?? '';
+    return {
+      queryKey: ['project-conversation-message-retry-eligibility', projectID, message.conversation_id, message.id, actorID, serviceInstanceID],
+      queryFn: () => projectApi.projectConversationMessageRetryEligibility(projectID, message.conversation_id, message.id, serviceInstanceID, actorID),
+      enabled: Boolean(!projectTaskMock && serviceInstanceID && projectTaskCapabilitiesQuery.data?.supported_features.includes('conversation_auto_routing_v1')),
+      staleTime: 5_000,
+      retry: false,
+      refetchOnWindowFocus: false,
+    };
+  }) });
+  const projectRetryEligibilityByMessageID = new Map(projectRetryCandidateMessages.map((message, index) =>
+    [message.id, projectRetryEligibilityQueries[index]] as const));
   const latestProjectMessageByTaskID = new Map<string, string>();
   for (const message of visibleProjectConversationMessages) {
     const taskID = message.task_id ?? message.related_task_id;
@@ -435,18 +477,43 @@ function UserProjects() {
     }
   };
   const retryProjectProcessing = useMutation({
-    mutationFn: async (target: { projectID: string; conversationID: string; messageID: string }) => {
-      if (!user?.id || !projectTaskCapabilitiesQuery.data?.service_instance_id) throw new Error('账号或服务尚未确认。');
-      const instanceID = projectTaskCapabilitiesQuery.data.service_instance_id;
-      const current = await portalApi.capabilities();
-      if (current.service_instance_id !== instanceID || !current.supported_features.includes('conversation_auto_routing_v1')) {
-        throw new Error('服务身份已变化或尚不支持消息处理，请核对后重试。');
+    mutationFn: async (target: { projectID: string; conversationID: string; messageID: string; confirmedWarning?: string }) => {
+      if (projectRetryInFlight.current.has(target.messageID)) return null;
+      const actorID = user?.id;
+      const instanceID = projectTaskCapabilitiesQuery.data?.service_instance_id;
+      const message = visibleProjectConversationMessages.find((item) => item.id === target.messageID && item.conversation_id === target.conversationID);
+      if (!actorID || !instanceID || target.projectID !== projectID || !message || !isUnlinkedProjectRetryFailure(message)
+        || message.actor_id !== actorID || projectTaskMock
+        || !projectTaskCapabilitiesQuery.data?.supported_features.includes('conversation_auto_routing_v1')) {
+        throw new Error('此消息、账号或服务状态尚未通过安全重试检查。');
       }
-      const key = processingRetryKey(instanceID, user.id, target.projectID, target.conversationID, target.messageID);
-      await projectApi.retryProjectConversationMessageProcessing(target.projectID, target.conversationID, target.messageID, key, instanceID, user.id);
-      clearProcessingRetryKey(instanceID, user.id, target.projectID, target.conversationID, target.messageID);
+      projectRetryInFlight.current.add(target.messageID);
+      try {
+        const [current, eligibility] = await Promise.all([
+          portalApi.capabilities(),
+          projectApi.projectConversationMessageRetryEligibility(target.projectID, target.conversationID, target.messageID, instanceID, actorID),
+        ]);
+        if (current.service_instance_id !== instanceID || !current.supported_features.includes('conversation_auto_routing_v1')) {
+          throw new Error('服务身份已变化或尚不支持消息处理，请核对后重试。');
+        }
+        if (currentProjectRetryIdentity.current.actorID !== actorID || currentProjectRetryIdentity.current.serviceInstanceID !== instanceID) {
+          throw new Error('账号或服务身份已变化；未发送重试请求。');
+        }
+        if (!eligibility.retry_eligible) throw new Error(retryEligibilityReasonText(eligibility.retry_reason));
+        if (eligibility.retry_warning && eligibility.retry_warning !== target.confirmedWarning) {
+          setUnknownProjectRetryConfirmation({ messageID: target.messageID, warning: eligibility.retry_warning });
+          return null;
+        }
+        const key = processingRetryKey(instanceID, actorID, target.projectID, target.conversationID, target.messageID);
+        await projectApi.retryProjectConversationMessageProcessing(target.projectID, target.conversationID, target.messageID, key, instanceID, actorID);
+        clearProcessingRetryKey(instanceID, actorID, target.projectID, target.conversationID, target.messageID);
+        return { projectID: target.projectID, conversationID: target.conversationID, messageID: target.messageID };
+      } finally {
+        projectRetryInFlight.current.delete(target.messageID);
+      }
     },
-    onSuccess: async (_value, target) => {
+    onSuccess: async (result, target) => {
+      if (!result) return;
       setRetryAcceptedMessageIDs((current) => new Set(current).add(target.messageID));
       window.setTimeout(() => setRetryAcceptedMessageIDs((current) => {
         if (!current.has(target.messageID)) return current;
@@ -454,7 +521,8 @@ function UserProjects() {
         next.delete(target.messageID);
         return next;
       }), 30_000);
-      await queryClient.invalidateQueries({ queryKey: ['project-conversation-messages', target.projectID, target.conversationID] });
+      await queryClient.invalidateQueries({ queryKey: ['project-conversation-messages', result.projectID, result.conversationID] });
+      await queryClient.invalidateQueries({ queryKey: ['project-conversation-message-retry-eligibility', result.projectID, result.conversationID, result.messageID] });
     },
     onError: (error, target) => {
       setRetryAcceptedMessageIDs((current) => {
@@ -463,6 +531,7 @@ function UserProjects() {
         next.delete(target.messageID);
         return next;
       });
+      void queryClient.invalidateQueries({ queryKey: ['project-conversation-message-retry-eligibility', target.projectID, target.conversationID, target.messageID] });
       setNotice({ kind: 'error', message: errorDetails(error).message });
     },
   });
@@ -974,10 +1043,25 @@ function UserProjects() {
                         const retryAccepted = retryAcceptedMessageIDs.has(message.id);
                         const retryAcceptedStatus = retryAccepted && ['failed', 'pending', 'processing'].includes(message.routing_status ?? '')
                           ? '正在重新处理消息' : null;
+                        const retryCandidate = isUnlinkedProjectRetryFailure(message) && message.actor_id === user?.id;
+                        const retryEligibilityQuery = projectRetryEligibilityByMessageID.get(message.id);
+                        const projectRetryCapabilityReady = !projectTaskMock && Boolean(projectTaskCapabilitiesQuery.data?.service_instance_id
+                          && projectTaskCapabilitiesQuery.data.supported_features.includes('conversation_auto_routing_v1'));
+                        const retryEligibilityStatus = !retryCandidate ? null
+                          : !projectRetryCapabilityReady ? '当前服务尚未确认安全重试能力；原消息已保留。'
+                            : !retryEligibilityQuery || retryEligibilityQuery.isPending || retryEligibilityQuery.isFetching ? '正在核对服务端重试条件；核对完成前不会发送重试。'
+                              : retryEligibilityQuery.isError || !retryEligibilityQuery.data ? '暂时无法确认重试资格；原消息已保留，请稍后重新核对。'
+                                : !retryEligibilityQuery.data.retry_eligible ? retryEligibilityReasonText(retryEligibilityQuery.data.retry_reason)
+                                  : retryEligibilityQuery.data.retry_warning === 'previous_personal_model_call_outcome_unknown'
+                                    ? '上一次个人模型调用结果仍未知；新的尝试可能产生重复调用，确认后才会继续。'
+                                    : '服务端确认这条消息当前可以重试。';
+                        const canRetryProjectMessage = retryCandidate && projectRetryCapabilityReady && !retryAccepted
+                          && retryEligibilityQuery?.isSuccess === true && !retryEligibilityQuery.isFetching
+                          && retryEligibilityQuery.data.retry_eligible;
                         const messageStatus = message.duplicate_of_message_id
                           ? `重复请求 · 原消息 ${message.duplicate_of_message_id}${message.related_task_id
                             ? ` · Task ${message.related_task_id} · 状态 ${task?.status ?? '待核对'}` : ''}`
-                          : message.role === 'user' ? retryAcceptedStatus ?? (message.delivery_status === 'applied' ? deliveryStatusText('applied') : null)
+                          : message.role === 'user' ? retryAcceptedStatus ?? retryEligibilityStatus ?? (message.delivery_status === 'applied' ? deliveryStatusText('applied') : null)
                             : routingStatusText(message.routing_status) ?? deliveryStatusText(message.delivery_status);
                         const canEditThisMessage = message.role === 'user' && message.actor_id === user?.id && currentMember && currentMember.role !== 'viewer' && !editingThisMessage;
                         const hasVariantControls = Boolean(variantGroup && (
@@ -989,12 +1073,13 @@ function UserProjects() {
                           sources.map((source) => source.content).join('\n\n') === message.content;
                         return <article id={`project-conversation-message-${encodeURIComponent(message.id)}`} className="schedule-card" aria-label="项目对话消息">
                           <div className="schedule-card-heading">
-                            {message.role === 'user' && message.routing_status === 'failed' && !message.task_id && !message.related_task_id &&
-                              message.actor_id === user?.id && message.routing_failure_reason !== 'message_too_long' && !retryAccepted && <button type="button"
+                            {canRetryProjectMessage && <button type="button"
                                 className="message-retry" aria-label="重新处理这条消息" title="重新处理"
                                 style={{ flex: '0 0 22px', width: 22, height: 22, margin: '2px 0 0', padding: 0, display: 'grid', placeItems: 'center', border: '1px solid #f0b8b4', borderRadius: '50%', color: '#c72f2b', background: '#fff5f4', fontSize: 14, fontWeight: 800, lineHeight: 1, cursor: 'pointer' }}
                                 disabled={retryProjectProcessing.isPending && retryProjectProcessing.variables?.messageID === message.id}
-                                onClick={() => retryProjectProcessing.mutate({ projectID: project.id, conversationID: message.conversation_id, messageID: message.id })}>!</button>}
+                                onClick={() => retryProjectProcessing.mutate({ projectID: project.id, conversationID: message.conversation_id, messageID: message.id })}>
+                                {retryEligibilityQuery?.data.retry_warning ? '↻' : '!'}
+                              </button>}
                             <div><h4>{message.role === 'user' ? '成员提示' : 'AI 回复'}</h4><p className="muted">执行者 {message.actor_id} · 对话创建者 {message.owner_id}</p></div>
                             {(message.output_status === 'streaming' || message.output_status === 'interrupted' || messageStatus) &&
                               <span className="status">{message.output_status === 'streaming' ? '生成中' : message.output_status === 'interrupted' ? '已中断' : messageStatus}</span>}
@@ -1249,5 +1334,16 @@ function UserProjects() {
         </>}
       </section>
     </>}
+    {unknownProjectRetryConfirmation && visibleProjectConversationMessages.some((message) => message.id === unknownProjectRetryConfirmation.messageID)
+      && <ConfirmDialog title="上一次模型调用结果未知"
+        description="上一次个人模型调用没有确定结果。继续会创建新的独立尝试，可能产生重复调用；服务端不会重复派发旧调用。请确认后继续。"
+        confirmLabel="确认后重试" busy={retryProjectProcessing.isPending}
+        onClose={() => setUnknownProjectRetryConfirmation(null)}
+        onConfirm={() => {
+          const confirmation = unknownProjectRetryConfirmation;
+          setUnknownProjectRetryConfirmation(null);
+          retryProjectProcessing.mutate({ projectID, conversationID: selectedProjectConversation!.id,
+            messageID: confirmation.messageID, confirmedWarning: confirmation.warning });
+        }} />}
   </section>;
 }

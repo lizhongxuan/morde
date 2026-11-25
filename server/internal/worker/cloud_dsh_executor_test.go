@@ -690,6 +690,61 @@ func (t *cloudDSHTestTools) PauseRecovery(context.Context, task.Task) error {
 	return nil
 }
 
+type cloudDSHRecoveryPauseTaskStore struct {
+	app.TaskStore
+	mu       sync.Mutex
+	details  app.TaskDetails
+	progress []app.TaskProgress
+}
+
+func (s *cloudDSHRecoveryPauseTaskStore) GetTask(ctx context.Context, taskID, ownerID string) (app.TaskDetails, error) {
+	if err := ctx.Err(); err != nil {
+		return app.TaskDetails{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if taskID != s.details.Task.ID || ownerID != s.details.Task.OwnerID {
+		return app.TaskDetails{}, errors.New("task not found")
+	}
+	return s.details, nil
+}
+
+func (s *cloudDSHRecoveryPauseTaskStore) CommitTaskProgress(ctx context.Context, progress app.TaskProgress) (task.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return task.Event{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := &s.details.Task
+	if progress.TaskID != current.ID || progress.LeaseOwner != current.Lease.Owner || progress.LeaseVersion != current.Lease.Version {
+		return task.Event{}, errors.New("stale task progress")
+	}
+	s.progress = append(s.progress, progress)
+	current.Status, current.CurrentStep, current.Result = progress.Status, progress.CurrentStep, progress.Result
+	current.WaitingReason, current.Usage = progress.WaitingReason, progress.Usage
+	current.EventSequence++
+	event := progress.Event
+	event.TaskID, event.Sequence = progress.TaskID, current.EventSequence
+	s.details.Steps = append(s.details.Steps, progress.Steps...)
+	return event, nil
+}
+
+type cloudDSHFailingDefinitionsBroker struct {
+	*app.CloudDSHToolBroker
+	definitionsErr error
+	executeCalls   int
+}
+
+func (b *cloudDSHFailingDefinitionsBroker) Definitions(context.Context, task.Task) ([]app.AgentToolDefinition, error) {
+	return nil, b.definitionsErr
+}
+
+func (b *cloudDSHFailingDefinitionsBroker) Execute(ctx context.Context, claimed task.Task,
+	call app.ModelToolCall) (app.AgentToolResult, error) {
+	b.executeCalls++
+	return b.CloudDSHToolBroker.Execute(ctx, claimed, call)
+}
+
 type cloudDSHTestCompleter struct {
 	instances  *cloudDSHTestInstanceStore
 	completion app.CloudDSHTaskCompletion
@@ -1793,6 +1848,68 @@ func TestCloudDSHModelFailureWaitsForConfirmedStopBeforeRecovery(t *testing.T) {
 				t.Fatalf("recovery pauses = %d; want %d", tools.pauseRecoveryCall, want)
 			}
 		})
+	}
+}
+
+func TestCloudDSHRecoveredRuntimeErrorPausesSafelyThroughBroker(t *testing.T) {
+	executor, _, _, checkpoints, models, value := cloudDSHFixture(t)
+	value.AgentInstanceID = "agent_previous"
+	value.AgentGeneration = 1
+	value.AgentSessionID = "session_previous"
+	value.AgentEngineVersion = cloudDSHEngineVersion
+	value.AgentProfileVersion = cloudDSHProfileVersion
+	value.CheckpointThroughSequence = 0
+	value.CheckpointDigest = bytes.Repeat([]byte{9}, sha256.Size)
+
+	store := &cloudDSHRecoveryPauseTaskStore{details: app.TaskDetails{Task: value}}
+	broker, err := app.NewCloudDSHToolBroker(store, &app.RuntimeToolExecutor{}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const privateRuntimeError = "private protocol failure with credential=do-not-persist"
+	tools := &cloudDSHFailingDefinitionsBroker{CloudDSHToolBroker: broker, definitionsErr: errors.New(privateRuntimeError)}
+	executor.options.Tools = tools
+
+	err = executor.ExecuteTask(context.Background(), value)
+	if err == nil || strings.Contains(err.Error(), privateRuntimeError) {
+		t.Fatalf("recovery runtime error was missing or exposed raw detail: %v", err)
+	}
+	if len(models.calls) != 0 || tools.executeCalls != 0 || len(checkpoints.reads) != 0 || len(checkpoints.commands) != 0 {
+		t.Fatalf("recovery error reached model/tool/checkpoint work: models=%d tools=%d checkpoint_reads=%d checkpoint_writes=%d",
+			len(models.calls), tools.executeCalls, len(checkpoints.reads), len(checkpoints.commands))
+	}
+	if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != "dsh_recovery_unresolved" ||
+		len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepUnknown || len(store.progress) != 1 {
+		t.Fatalf("recovery error was not durably paused: task=%+v steps=%+v progress=%d",
+			store.details.Task, store.details.Steps, len(store.progress))
+	}
+
+	progress := store.progress[0]
+	var event struct {
+		Summary string                     `json:"summary"`
+		Detail  map[string]json.RawMessage `json:"detail"`
+	}
+	if err := json.Unmarshal(progress.Event.Payload, &event); err != nil {
+		t.Fatalf("decode persisted recovery event: %v", err)
+	}
+	var stage, reason string
+	if err := json.Unmarshal(event.Detail["recovery_stage"], &stage); err != nil {
+		t.Fatalf("decode persisted recovery stage: %v", err)
+	}
+	if err := json.Unmarshal(event.Detail["recovery_reason"], &reason); err != nil {
+		t.Fatalf("decode persisted recovery reason: %v", err)
+	}
+	allowedDetails := map[string]bool{"phase": true, "source": true, "recovery_stage": true, "recovery_reason": true}
+	for key := range event.Detail {
+		if !allowedDetails[key] {
+			t.Errorf("recovery event contains non-allowlisted diagnostic field %q", key)
+		}
+	}
+	if stage != app.AgentRecoveryStageCloudDSHRun || reason != app.AgentRecoveryReasonUnclassifiedRuntime ||
+		strings.Contains(strings.ToLower(event.Summary), "checkpoint") || strings.Contains(event.Summary, stage) ||
+		strings.Contains(event.Summary, reason) || strings.Contains(string(progress.Event.Payload), privateRuntimeError) {
+		t.Fatalf("persisted recovery event is inaccurate or unsafe: summary=%q stage=%q reason=%q payload=%s",
+			event.Summary, stage, reason, progress.Event.Payload)
 	}
 }
 

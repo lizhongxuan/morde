@@ -190,6 +190,8 @@ func (h *api) registerConversations(group *gin.RouterGroup, conversations Conver
 		group.PUT("/conversations/:id/messages/:message_id/attachments/:client_attachment_id", h.associateConversationMessageAttachment(tasks))
 		group.POST("/conversations/:id/messages/:message_id/retry-processing", h.retryConversationMessageProcessing(tasks))
 		group.POST("/projects/:id/conversations/:conversation_id/messages/:message_id/retry-processing", h.retryConversationMessageProcessing(tasks))
+		group.GET("/conversations/:id/messages/:message_id/retry-eligibility", h.getConversationMessageRetryEligibility(tasks))
+		group.GET("/projects/:id/conversations/:conversation_id/messages/:message_id/retry-eligibility", h.getConversationMessageRetryEligibility(tasks))
 		if variants, ok := tasks.(ConversationMessageVariantService); ok {
 			group.POST("/conversations/:id/messages/:message_id/variants", h.createConversationMessageVariant(variants))
 			group.POST("/projects/:id/conversations/:conversation_id/messages/:message_id/variants", h.createConversationMessageVariant(variants))

@@ -175,6 +175,7 @@ function mockCommon(options: { conversations?: Conversation[]; messages?: Conver
   vi.spyOn(portalApi, 'ensureMainConversation').mockResolvedValue({ status: 'ready', conversation_id: conversation.id, version: 1 });
   vi.spyOn(portalApi, 'setMainConversation').mockImplementation(async (conversationID) => ({ status: 'ready', conversation_id: conversationID, version: 2 }));
   vi.spyOn(portalApi, 'conversationMessages').mockResolvedValue({ items: options.messages ?? [], next_cursor: null });
+  vi.spyOn(portalApi, 'conversationMessageRetryEligibility').mockResolvedValue({ retry_eligible: true, retry_reason: 'retry_available' });
   vi.spyOn(portalApi, 'conversationPreview').mockResolvedValue({ items: [], next_cursor: null });
   vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
   vi.spyOn(portalApi, 'conversationTasks').mockResolvedValue({ items: [], next_cursor: null, pending_count: 0 });

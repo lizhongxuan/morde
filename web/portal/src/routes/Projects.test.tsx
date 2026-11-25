@@ -115,6 +115,7 @@ describe('Projects API integration', () => {
     vi.spyOn(projectApi, 'resources').mockResolvedValue([]);
     vi.spyOn(projectApi, 'projectConversations').mockResolvedValue([projectConversation]);
     vi.spyOn(projectApi, 'projectConversationMessages').mockImplementation(async (_id, conversationID) => conversationID === projectConversation.id ? [projectHistoryMessage] : []);
+    vi.spyOn(projectApi, 'projectConversationMessageRetryEligibility').mockResolvedValue({ retry_eligible: true, retry_reason: 'retry_available' });
     vi.spyOn(projectApi, 'createProjectConversation').mockResolvedValue(projectConversation);
     vi.spyOn(projectApi, 'acceptProjectConversationMessage').mockImplementation(async (_id, conversationID, body) => ({
       message: { ...projectMessageReceipt.message, conversation_id: conversationID, client_message_id: body.client_message_id, content: body.content },

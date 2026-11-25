@@ -182,6 +182,26 @@ describe('typed Portal API client', () => {
       && request.headers.get('X-Morde-Service-Instance-ID') === 'instance-a')).toBe(true);
   });
 
+  it('reads personal and project retry eligibility with their exact message and actor scopes', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(input instanceof Request ? new Request(input, init) : new Request(new URL(String(input), window.location.origin), init));
+      return Response.json({ retry_eligible: false, retry_reason: 'reconciliation_required' });
+    }));
+
+    await expect(portalApi.conversationMessageRetryEligibility('c1234567', 'm1234567', 'instance-a', 'u1234567'))
+      .resolves.toEqual({ retry_eligible: false, retry_reason: 'reconciliation_required' });
+    await expect(projectApi.projectConversationMessageRetryEligibility('j1234567', 'c7654321', 'm7654321', 'instance-a', 'u1234567'))
+      .resolves.toEqual({ retry_eligible: false, retry_reason: 'reconciliation_required' });
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ['GET', '/api/conversations/c1234567/messages/m1234567/retry-eligibility'],
+      ['GET', '/api/projects/j1234567/conversations/c7654321/messages/m7654321/retry-eligibility'],
+    ]);
+    expect(requests.every((request) => request.headers.get('X-Morde-Service-Instance-ID') === 'instance-a'
+      && request.headers.get('X-Morde-Actor-ID') === 'u1234567')).toBe(true);
+  });
+
   it('posts personal and project variants with the expected-version CAS and scoped idempotency headers', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

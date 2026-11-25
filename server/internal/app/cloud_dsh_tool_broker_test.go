@@ -2652,6 +2652,35 @@ func TestCloudDSHToolBrokerPausesUnresolvedRecoveryDurably(t *testing.T) {
 		store.details.Task.Usage.ToolCalls != 0 || len(store.details.Steps) != 1 || store.details.Steps[0].Status != task.StepUnknown {
 		t.Fatalf("paused recovery task = %#v, steps=%#v", store.details.Task, store.details.Steps)
 	}
+	if summary := store.details.Steps[0].Summary; strings.Contains(strings.ToLower(summary), "checkpoint") ||
+		!strings.Contains(summary, "could not be safely resumed") {
+		t.Fatalf("generic recovery summary asserts an unobserved checkpoint failure: %q", summary)
+	}
+
+	fixture = newRuntimeToolExecutorFixture(t, nil)
+	store = &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	broker, err = NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := broker.PauseRecoveryDiagnostic(context.Background(), store.details.Task, AgentRecoveryDiagnostic{
+		Stage: "private stage containing credentials", ReasonCode: "private raw protocol error",
+	}); err != nil {
+		t.Fatalf("PauseRecoveryDiagnostic() with unknown values error = %v", err)
+	}
+	progress := store.committedTaskProgress[0]
+	var event struct {
+		Summary string            `json:"summary"`
+		Detail  map[string]string `json:"detail"`
+	}
+	if err := json.Unmarshal(progress.Event.Payload, &event); err != nil {
+		t.Fatalf("decode recovery event: %v", err)
+	}
+	if strings.Contains(string(progress.Event.Payload), "private") || strings.Contains(event.Summary, "checkpoint") ||
+		event.Detail["recovery_stage"] != "" || event.Detail["recovery_reason"] != "" {
+		t.Fatalf("unknown recovery diagnostics were not filtered: summary=%q detail=%#v payload=%s", event.Summary, event.Detail, progress.Event.Payload)
+	}
 }
 
 func TestCloudDSHToolBrokerModelRecoveryStoresSafeFailureCategory(t *testing.T) {

@@ -81,7 +81,7 @@ FROM tasks WHERE id=$1 FOR SHARE`, current.ID).Scan(&ownerID, &conversationID, &
 		var messageID, content string
 		if source.Locator == task.PlanVerificationRequirementCurrentTaskInputLocator {
 			err := tx.QueryRow(ctx, `SELECT id,content FROM conversation_messages
-WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='user' AND delivery_status='applied'
+WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='user' AND source_kind IN ('task','conversation') AND delivery_status='applied'
 ORDER BY sequence ASC,id ASC LIMIT 1 FOR SHARE`, current.ID, current.OwnerID, current.ConversationID).Scan(&messageID, &content)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.NewError(domain.CodeNotFound, "current Task input source is unavailable")
@@ -91,7 +91,7 @@ ORDER BY sequence ASC,id ASC LIMIT 1 FOR SHARE`, current.ID, current.OwnerID, cu
 			}
 		} else {
 			err := tx.QueryRow(ctx, `SELECT id,content FROM conversation_messages
-WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND conversation_id=$4 AND role='user' AND delivery_status='applied'
+WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND conversation_id=$4 AND role='user' AND source_kind IN ('task','conversation') AND delivery_status='applied'
 FOR SHARE`, source.MessageID, current.ID, current.OwnerID, current.ConversationID).Scan(&messageID, &content)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return domain.NewError(domain.CodeNotFound, "user-message requirement source is unavailable to this Task")

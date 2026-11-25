@@ -238,6 +238,18 @@ type AgentModelFailureDiagnostic struct {
 	Reason FailoverReason
 }
 
+// AgentRecoveryDiagnostic contains only allowlisted facts about an unresolved
+// restored DSH run. It must never carry the underlying runtime error.
+type AgentRecoveryDiagnostic struct {
+	Stage      string
+	ReasonCode string
+}
+
+const (
+	AgentRecoveryStageCloudDSHRun          = "cloud_dsh_run"
+	AgentRecoveryReasonUnclassifiedRuntime = "unclassified_recovery_error"
+)
+
 // AgentToolTerminalAttemptFinisher durably closes a Task after the worker has
 // resolved the DSH request that produced a terminal tool result.
 type AgentToolTerminalAttemptFinisher interface {

@@ -338,6 +338,10 @@ type CloudDSHRecoveryTools interface {
 	PauseRecovery(context.Context, task.Task) error
 }
 
+type cloudDSHDetailedRecoveryTools interface {
+	PauseRecoveryDiagnostic(context.Context, task.Task, app.AgentRecoveryDiagnostic) error
+}
+
 type cloudDSHModelRecoveryTools interface {
 	PauseModelRecovery(context.Context, task.Task, string) error
 }
@@ -362,6 +366,15 @@ func pauseCloudDSHModelRecovery(ctx context.Context, tools CloudDSHRecoveryTools
 		if detailed, ok := tools.(cloudDSHModelRecoveryTools); ok {
 			return detailed.PauseModelRecovery(ctx, value, failure.ModelFailureCategory())
 		}
+	}
+	return tools.PauseRecovery(ctx, value)
+}
+
+func pauseCloudDSHRecovery(ctx context.Context, tools CloudDSHRecoveryTools, value task.Task) error {
+	if detailed, ok := tools.(cloudDSHDetailedRecoveryTools); ok {
+		return detailed.PauseRecoveryDiagnostic(ctx, value, app.AgentRecoveryDiagnostic{
+			Stage: app.AgentRecoveryStageCloudDSHRun, ReasonCode: app.AgentRecoveryReasonUnclassifiedRuntime,
+		})
 	}
 	return tools.PauseRecovery(ctx, value)
 }
@@ -810,7 +823,7 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 		!errors.Is(err, errCloudDSHPersonalMemoryChanged) && !errors.Is(err, errCloudDSHTerminalToolAttempt) && recoveringAgent && ctx.Err() == nil {
 		if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
 			pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-			err = errors.Join(err, recoveryTools.PauseRecovery(pauseCtx, value))
+			err = errors.Join(err, pauseCloudDSHRecovery(pauseCtx, recoveryTools, value))
 			cancelPause()
 		}
 	}

@@ -28,6 +28,7 @@ type TaskService interface {
 	CommitConversationMessageUpload(context.Context, identity.Principal, string, string, string, string, string) (conversation.Message, error)
 	AssociateConversationMessageAttachment(context.Context, identity.Principal, string, string, string, string, string) error
 	RetryConversationMessageProcessing(context.Context, identity.Principal, string, string, string, string, string) error
+	GetConversationMessageRetryEligibility(context.Context, identity.Principal, string, string, string, string) (app.ConversationMessageRetryEligibility, error)
 	List(context.Context, identity.Principal, app.TaskListRequest) (app.TaskPage, error)
 	ListConversationActiveTasks(context.Context, identity.Principal, string, string, app.PageRequest) (app.TaskPage, error)
 	ListConversationTasks(context.Context, identity.Principal, string, string, app.ConversationTaskView, app.PageRequest) (app.TaskPage, error)

@@ -131,6 +131,13 @@ export const projectApi = {
     if (clientMessageID && (!serviceInstanceID || !actorID)) throw new Error('服务或账号身份尚未确认。');
     return allPages(async (query: ProjectConversationMessagesPageQuery) => unwrapApiResponse(await api.GET('/api/projects/{id}/conversations/{conversation_id}/messages', { params: { path: { id, conversation_id: conversationID }, query: { ...query, ...(clientMessageID ? { client_message_id: clientMessageID } : {}) }, ...(serviceInstanceID || actorID ? { header: { ...(serviceInstanceID ? { 'X-Morde-Service-Instance-ID': serviceInstanceID } : {}), ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) } } : {}) } })));
   },
+  projectConversationMessageRetryEligibility: async (id: string, conversationID: string, messageID: string, serviceInstanceID: string, actorID: string) => {
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    return unwrapApiResponse(await api.GET('/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-eligibility', {
+      params: { path: { id, conversation_id: conversationID, message_id: messageID },
+        header: { 'X-Morde-Service-Instance-ID': serviceInstanceID, 'X-Morde-Actor-ID': actorID } },
+    }));
+  },
   createProjectConversation: async (id: string, body: components['schemas']['CreateProjectConversationRequest'], idempotencyKey?: RequestKey) => unwrapApiResponse(await api.POST('/api/projects/{id}/conversations', {
     params: { path: { id }, header: { 'Idempotency-Key': requestKey(idempotencyKey) } }, body,
   })),

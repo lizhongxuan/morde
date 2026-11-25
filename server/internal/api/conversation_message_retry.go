@@ -50,3 +50,42 @@ func (h *api) retryConversationMessageProcessing(service TaskService) gin.Handle
 		c.Status(http.StatusAccepted)
 	}
 }
+
+func (h *api) getConversationMessageRetryEligibility(service TaskService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		if !requiredMessageActor(c, principal) {
+			return
+		}
+		instanceID, ok := requiredMessageServiceInstance(c)
+		if !ok {
+			return
+		}
+		projectID, conversationID := "", c.Param("id")
+		if c.Param("conversation_id") != "" {
+			projectID, conversationID = c.Param("id"), c.Param("conversation_id")
+			if !project.ValidID(projectID) {
+				writeError(c, domain.NewError(domain.CodeNotFound, "project not found"))
+				return
+			}
+		}
+		if !domain.ValidConversationID(conversationID) {
+			writeError(c, domain.NewError(domain.CodeNotFound, "conversation not found"))
+			return
+		}
+		messageID, ok := safeIDParam(c, "message_id", "message_id", domain.ValidMessageID)
+		if !ok {
+			return
+		}
+		eligibility, err := service.GetConversationMessageRetryEligibility(c.Request.Context(), principal, projectID, conversationID, messageID, instanceID)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusOK, eligibility)
+	}
+}
