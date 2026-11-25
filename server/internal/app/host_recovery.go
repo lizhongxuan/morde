@@ -90,7 +90,7 @@ func (s *hostService) RecoverUnknownRestore(ctx context.Context, principal ident
 			return HostRecoveryResult{}, err
 		}
 		result.Action = "adopt_existing"
-		s.auditHostRecovery(ctx, principal, value, result)
+		s.auditHostRecovery(ctx, principal, value, result, confirmRetry)
 		if err := s.notifyCreate(ctx, hostID); err != nil {
 			s.logger.Error("notify recovered host sandbox worker failed", zap.String("host_id", hostID), zap.Error(err))
 		}
@@ -103,7 +103,7 @@ func (s *hostService) RecoverUnknownRestore(ctx context.Context, principal ident
 		return HostRecoveryResult{}, err
 	}
 	result.Action = "retry_create"
-	s.auditHostRecovery(ctx, principal, value, result)
+	s.auditHostRecovery(ctx, principal, value, result, confirmRetry)
 	if err := s.notifyCreate(ctx, hostID); err != nil {
 		s.logger.Error("notify recovered host restore worker failed", zap.String("host_id", hostID), zap.Error(err))
 	}
@@ -112,8 +112,11 @@ func (s *hostService) RecoverUnknownRestore(ctx context.Context, principal ident
 
 func (s *hostService) recoverFailedHost(ctx context.Context, principal identity.Principal, value host.Host, expectedGeneration int64, confirmRetry bool) (HostRecoveryResult, error) {
 	if value.RuntimeGeneration <= 1 || value.RuntimeGeneration != expectedGeneration ||
-		(value.StateReason != "orchestrator_error" && value.StateReason != "ready_timeout") {
+		(value.StateReason != "orchestrator_error" && value.StateReason != "ready_timeout" && value.StateReason != "lost") {
 		return HostRecoveryResult{}, domain.NewError(domain.CodeConflict, "this failed Host state cannot be recovered automatically")
+	}
+	if value.StateReason == "lost" && value.SandboxID == "" {
+		return HostRecoveryResult{}, domain.NewError(domain.CodeConflict, "lost Host recovery requires the saved sandbox identity")
 	}
 	if _, err := s.requireUsableHostWorkspace(ctx, principal, value.ID, value.OwnerID); err != nil {
 		return HostRecoveryResult{}, err
@@ -129,6 +132,16 @@ func (s *hostService) recoverFailedHost(ctx context.Context, principal identity.
 	if len(matches) > 1 {
 		return HostRecoveryResult{}, domain.NewError(domain.CodeConflict, "multiple sandboxes match this failed Host; manual review is required")
 	}
+	if value.StateReason == "lost" {
+		for _, sandbox := range matches {
+			if sandbox.ID != value.SandboxID {
+				return HostRecoveryResult{}, domain.NewError(domain.CodeConflict, "a different sandbox exists for a lost Host; manual review is required")
+			}
+			if sandbox.State == SandboxFailed {
+				return HostRecoveryResult{}, domain.NewError(domain.CodeConflict, "a failed sandbox exists for a lost Host; manual review is required")
+			}
+		}
+	}
 	store, ok := s.hosts.(HostRestoreRecoveryStore)
 	if !ok {
 		return HostRecoveryResult{}, domain.NewError(domain.CodeUnsupported, "host restore recovery is unavailable")
@@ -142,7 +155,7 @@ func (s *hostService) recoverFailedHost(ctx context.Context, principal identity.
 				return HostRecoveryResult{}, err
 			}
 			result.Action = "adopt_existing"
-			s.auditHostRecovery(ctx, principal, value, result)
+			s.auditHostRecovery(ctx, principal, value, result, confirmRetry)
 			if err := s.notifyCreate(ctx, value.ID); err != nil {
 				s.logger.Error("notify recovered failed Host sandbox worker failed", zap.String("host_id", value.ID), zap.Error(err))
 			}
@@ -195,7 +208,7 @@ func (s *hostService) recoverFailedHost(ctx context.Context, principal identity.
 	}
 	result.RuntimeGeneration = updated.RuntimeGeneration
 	result.Action = "retry_create"
-	s.auditHostRecovery(ctx, principal, value, result)
+	s.auditHostRecovery(ctx, principal, value, result, confirmRetry)
 	if err := s.notifyCreate(ctx, value.ID); err != nil {
 		s.logger.Error("notify recovered failed Host restore worker failed", zap.String("host_id", value.ID), zap.Error(err))
 	}
@@ -258,10 +271,17 @@ func hostRecoverySandboxes(ctx context.Context, client SandboxClient, instance s
 	return result, nil
 }
 
-func (s *hostService) auditHostRecovery(ctx context.Context, principal identity.Principal, value host.Host, result HostRecoveryResult) {
+func (s *hostService) auditHostRecovery(ctx context.Context, principal identity.Principal, value host.Host, result HostRecoveryResult, confirmRetry bool) {
 	s.writeAudit(ctx, audit.Entry{
 		ActorID: adminActorID(principal), ActorKind: adminActorKind(principal),
 		Action: audit.ActionHostRestoreRecovery, Target: value.ID,
-		Detail: map[string]any{"runtime_generation": value.RuntimeGeneration, "action": result.Action, "sandbox_count": result.SandboxCount},
+		Detail: map[string]any{
+			"old_runtime_generation": value.RuntimeGeneration,
+			"new_runtime_generation": result.RuntimeGeneration,
+			"state_reason":           value.StateReason,
+			"confirm_retry":          confirmRetry,
+			"action":                 result.Action,
+			"sandbox_count":          result.SandboxCount,
+		},
 	})
 }

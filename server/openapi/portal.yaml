@@ -7594,8 +7594,8 @@ paths:
     post:
       tags: [Admin]
       operationId: recoverAdminHost
-      summary: Safely recover an uncertain Host restore
-      description: Rechecks remote sandbox state. Existing sandboxes are adopted; a new create is queued only after an administrator confirms the external issue is fixed and no matching sandbox exists.
+      summary: Safely recover a failed or uncertain Host restore
+      description: Rechecks remote sandbox state for the expected runtime generation. A single matching running or pending sandbox is adopted. For a failed Host with reason lost, replacement requires a complete successful sandbox listing with no active candidate and the saved sandbox confirmed not found or terminated; a failed or ambiguous candidate in this state requires manual review. For other recoverable failure reasons, a failed sandbox may be replaced after explicit confirmation. Recovery keeps the same Host and Workspace/Profile volumes and advances the runtime generation when creating a replacement.
       security: [{ portalSession: [] }]
       requestBody:
         required: true
@@ -13440,7 +13440,7 @@ components:
       additionalProperties: false
       properties:
         runtime_generation: { type: integer, format: int64, minimum: 1 }
-        confirm_retry: { type: boolean, description: Confirm that the external issue is fixed before creating a replacement sandbox. }
+        confirm_retry: { type: boolean, description: Confirm an administrator reviewed the remote state and the external issue is fixed before creating a replacement sandbox; adoption does not create or replace a sandbox. }
     AdminHostRecoveryResult:
       type: object
       required: [host_id, runtime_generation, action, sandbox_count]

@@ -568,8 +568,18 @@ SELECT 1 FROM workspace_copy_reservations WHERE source_host_id=$1 AND host_copy_
 		if params.RecoveryFromFailed {
 			if params.ExpectedGeneration <= 1 || current.State != host.StateFailed || current.RuntimeGeneration != params.ExpectedGeneration ||
 				current.StateReason != params.ExpectedReason || current.SandboxID != params.ExpectedSandboxID ||
-				(current.StateReason != "orchestrator_error" && current.StateReason != "ready_timeout") {
+				(current.StateReason != "orchestrator_error" && current.StateReason != "ready_timeout" && current.StateReason != "lost") {
 				return hostStateConflict(current)
+			}
+			var hasOutstandingLease bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM host_activity_leases
+WHERE host_id=$1 AND runtime_generation=$2 AND expires_at > clock_timestamp()
+)`, current.ID, current.RuntimeGeneration).Scan(&hasOutstandingLease); err != nil {
+				return fmt.Errorf("check outstanding Host activity leases before failed restore: %w", err)
+			}
+			if hasOutstandingLease {
+				return domain.NewError(domain.CodeConflict, "Host activity must expire before failed Host restore")
 			}
 			expectedState = host.StateFailed
 		} else if current.State != host.StateStopped {
@@ -736,27 +746,52 @@ func (s *Store) AdoptFailedHostRestore(ctx context.Context, hostID string, gener
 	if !domain.ValidHostID(hostID) || generation <= 1 || len(reason) > 64 || len(sandboxID) == 0 || len(sandboxID) > 128 {
 		return domain.InvalidArgument("host.recovery", "host recovery request is invalid")
 	}
-	tag, err := s.pool.Exec(ctx, `
+	return s.WithTx(ctx, func(tx pgx.Tx) error {
+		// AcquireHostActivityLease takes FOR SHARE on the Host row. Holding
+		// FOR UPDATE here serializes adoption with lease creation and renewal.
+		if err := lockHost(ctx, tx, hostID); err != nil {
+			return err
+		}
+		queries := sqlcgen.New(tx)
+		row, err := queries.GetHost(ctx, hostID)
+		if err != nil {
+			return fmt.Errorf("read Host before failed restore adoption: %w", err)
+		}
+		current, err := hostDomainWithBindings(ctx, queries, row)
+		if err != nil {
+			return err
+		}
+		if current.State != host.StateFailed || current.RuntimeGeneration != generation || current.StateReason != reason ||
+			current.SandboxID != sandboxID || current.DeletedAt != nil || current.ControlState != host.ControlAI ||
+			(reason != "orchestrator_error" && reason != "ready_timeout" && reason != "lost") {
+			return hostStateConflict(current)
+		}
+		var hasOutstandingLease bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM host_activity_leases
+WHERE host_id=$1 AND runtime_generation=$2 AND expires_at > clock_timestamp()
+)`, hostID, generation).Scan(&hasOutstandingLease); err != nil {
+			return fmt.Errorf("check outstanding Host activity leases before failed restore adoption: %w", err)
+		}
+		if hasOutstandingLease {
+			return domain.NewError(domain.CodeConflict, "Host activity must expire before failed Host restore adoption")
+		}
+		tag, err := tx.Exec(ctx, `
 UPDATE hosts
 SET state='creating', state_reason='restore_pending', runtime_instance_id=NULL,
     create_attempted_at=now(), updated_at=now()
 WHERE id=$1 AND state='failed' AND runtime_generation=$2 AND state_reason=$3
-  AND state_reason IN ('orchestrator_error','ready_timeout') AND sandbox_id=$4 AND deleted_at IS NULL`,
-		hostID, generation, reason, sandboxID)
-	if err != nil {
-		return fmt.Errorf("adopt failed Host restore sandbox: %w", err)
-	}
-	if tag.RowsAffected() == 1 {
+	  AND state_reason IN ('orchestrator_error','ready_timeout','lost') AND sandbox_id=$4
+  AND control_state='ai' AND deleted_at IS NULL`,
+			hostID, generation, reason, sandboxID)
+		if err != nil {
+			return fmt.Errorf("adopt failed Host restore sandbox: %w", err)
+		}
+		if tag.RowsAffected() != 1 {
+			return hostStateConflict(current)
+		}
 		return nil
-	}
-	current, err := s.GetHost(ctx, hostID)
-	if errors.Is(err, pgx.ErrNoRows) || domain.CodeOf(err) == domain.CodeNotFound {
-		return domain.NewError(domain.CodeNotFound, "host not found")
-	}
-	if err != nil {
-		return fmt.Errorf("check Host after failed restore adoption: %w", err)
-	}
-	return hostStateConflict(current)
+	})
 }
 
 func lockHost(ctx context.Context, tx pgx.Tx, hostID string) error {

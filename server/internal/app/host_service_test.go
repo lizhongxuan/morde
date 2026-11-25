@@ -905,6 +905,218 @@ func TestAdminRecoveryRestartsFailedRestoreWithoutDeletingVolumes(t *testing.T) 
 	}
 }
 
+func TestAdminRecoveryRestartsLostHostAfterConfirmedAbsence(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value := hostServiceTestHost(host.StateFailed)
+	value.RuntimeGeneration = 9
+	value.StateReason = "lost"
+	value.SandboxID = "sandbox-lost"
+	sealHostServiceTestKey(t, deps.sealer, &value)
+	deps.hosts.addHost(value)
+	workspaceValue := workspace.Workspace{ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, Name: "test", State: workspace.StateReady}
+	deps.workspaces.add(workspaceValue)
+	hostServiceTestAddBinding(deps, value)
+	admin := identity.Principal{UserID: "u1234567", TokenID: "t1234567", Role: identity.RoleAdmin, Kind: identity.KindSession}
+
+	if _, err := service.RecoverUnknownRestore(context.Background(), admin, value.ID, 9, false); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("recovery without explicit retry confirmation error = %v, want conflict", err)
+	}
+	unchanged, _ := deps.hosts.GetHost(context.Background(), value.ID)
+	if unchanged.State != host.StateFailed || unchanged.StateReason != "lost" || unchanged.RuntimeGeneration != 9 ||
+		unchanged.SandboxID != value.SandboxID || deps.sandbox.createCalls != 0 || len(deps.sandbox.deleteCalls) != 0 {
+		t.Fatalf("unconfirmed lost recovery changed Host/sandbox: Host=%#v creates=%d deletes=%v", unchanged, deps.sandbox.createCalls, deps.sandbox.deleteCalls)
+	}
+
+	recovered, err := service.RecoverUnknownRestore(context.Background(), admin, value.ID, 9, true)
+	if err != nil || recovered.Action != "retry_create" || recovered.RuntimeGeneration != 10 || recovered.SandboxCount != 0 {
+		t.Fatalf("RecoverUnknownRestore(lost) = %#v, err=%v", recovered, err)
+	}
+	if len(deps.audit.entries) != 1 {
+		t.Fatalf("recovery audit entries = %d, want 1", len(deps.audit.entries))
+	}
+	assertHostRecoveryAudit(t, deps.audit.entries[0], 9, 10, "lost", true, "retry_create", 0)
+	if err := service.AdvanceCreate(context.Background(), value.ID); err != nil {
+		t.Fatalf("AdvanceCreate(recovered lost Host) = %v", err)
+	}
+	request := deps.sandbox.createRequest
+	if deps.sandbox.createCalls != 1 || request.Metadata["ch-generation"] != "10" || len(request.Volumes) != 3 ||
+		request.Volumes[0].ClaimName != domain.ProfileVolumeName(value.ID) ||
+		request.Volumes[1].ClaimName != WorkspaceNamedVolumeName(testHostWorkspaceID(value)) || !request.Volumes[1].RequireExisting ||
+		request.Volumes[2].ClaimName != domain.RuntimeVolumeName(value.ID) {
+		t.Fatalf("lost recovery did not create exactly once with retained Host volumes: calls=%d request=%#v", deps.sandbox.createCalls, request.Volumes)
+	}
+	stored, _ := deps.hosts.GetHost(context.Background(), value.ID)
+	workspaceAfter, _ := deps.workspaces.GetWorkspace(context.Background(), workspaceValue.ID)
+	if stored.State != host.StateRunning || stored.RuntimeGeneration != 10 || testHostWorkspaceID(stored) != workspaceValue.ID ||
+		workspaceAfter.ID != workspaceValue.ID || workspaceAfter.OwnerID != workspaceValue.OwnerID ||
+		workspaceAfter.State != workspaceValue.State || workspaceAfter.Revision != workspaceValue.Revision ||
+		workspaceAfter.UsedBytes != workspaceValue.UsedBytes || workspaceAfter.QuotaBytes != workspaceValue.QuotaBytes ||
+		workspaceAfter.ReadOnly != workspaceValue.ReadOnly {
+		t.Fatalf("Host/Workspace after lost recovery = %#v / %#v", stored, workspaceAfter)
+	}
+}
+
+func TestAdminRecoveryLostHostFailsClosedWithoutSavedIdentityOrSandboxEvidence(t *testing.T) {
+	testCase := func(t *testing.T, setup func(*hostServiceTestDeps, *host.Host), expectedGeneration int64) {
+		t.Helper()
+		service, deps := newHostServiceTest(t)
+		value := hostServiceTestHost(host.StateFailed)
+		value.RuntimeGeneration = 9
+		value.StateReason = "lost"
+		value.SandboxID = "sandbox-lost"
+		setup(&deps, &value)
+		sealHostServiceTestKey(t, deps.sealer, &value)
+		deps.hosts.addHost(value)
+		deps.workspaces.add(workspace.Workspace{ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, Name: "test", State: workspace.StateReady})
+		hostServiceTestAddBinding(deps, value)
+		admin := identity.Principal{UserID: "u1234567", TokenID: "t1234567", Role: identity.RoleAdmin, Kind: identity.KindSession}
+
+		if _, err := service.RecoverUnknownRestore(context.Background(), admin, value.ID, expectedGeneration, true); err == nil {
+			t.Fatal("lost Host recovery unexpectedly passed incomplete evidence")
+		}
+		stored, _ := deps.hosts.GetHost(context.Background(), value.ID)
+		if stored.State != host.StateFailed || stored.StateReason != "lost" || stored.RuntimeGeneration != 9 ||
+			stored.SandboxID != value.SandboxID || deps.sandbox.createCalls != 0 || len(deps.sandbox.deleteCalls) != 0 {
+			t.Fatalf("rejected lost recovery changed Host/sandbox: Host=%#v creates=%d deletes=%v", stored, deps.sandbox.createCalls, deps.sandbox.deleteCalls)
+		}
+	}
+
+	t.Run("missing saved sandbox ID", func(t *testing.T) {
+		testCase(t, func(_ *hostServiceTestDeps, value *host.Host) { value.SandboxID = "" }, 9)
+	})
+	t.Run("stale generation", func(t *testing.T) {
+		testCase(t, func(_ *hostServiceTestDeps, _ *host.Host) {}, 8)
+	})
+	t.Run("list unavailable", func(t *testing.T) {
+		testCase(t, func(deps *hostServiceTestDeps, _ *host.Host) { deps.sandbox.listErr = ErrSandboxUnavailable }, 9)
+	})
+	t.Run("saved sandbox lookup unavailable", func(t *testing.T) {
+		testCase(t, func(deps *hostServiceTestDeps, _ *host.Host) { deps.sandbox.getErr = ErrSandboxUnavailable }, 9)
+	})
+}
+
+func TestAdminRecoveryAdoptsExistingLostHostSandboxWithoutRetryConfirmation(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value := hostServiceTestHost(host.StateFailed)
+	value.RuntimeGeneration = 9
+	value.StateReason = "lost"
+	value.SandboxID = "sandbox-lost"
+	sealHostServiceTestKey(t, deps.sealer, &value)
+	deps.hosts.addHost(value)
+	deps.workspaces.add(workspace.Workspace{ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, Name: "test", State: workspace.StateReady})
+	hostServiceTestAddBinding(deps, value)
+	metadata := hostServiceMetadata(value.ID)
+	metadata["ch-generation"] = "9"
+	deps.sandbox.add(Sandbox{ID: value.SandboxID, State: SandboxRunning, Metadata: metadata})
+	admin := identity.Principal{UserID: "u1234567", TokenID: "t1234567", Role: identity.RoleAdmin, Kind: identity.KindSession}
+
+	recovered, err := service.RecoverUnknownRestore(context.Background(), admin, value.ID, 9, false)
+	if err != nil || recovered.Action != "adopt_existing" || recovered.RuntimeGeneration != 9 || recovered.SandboxCount != 1 {
+		t.Fatalf("RecoverUnknownRestore(lost existing sandbox) = %#v, err=%v", recovered, err)
+	}
+	if len(deps.audit.entries) != 1 {
+		t.Fatalf("recovery audit entries = %d, want 1", len(deps.audit.entries))
+	}
+	assertHostRecoveryAudit(t, deps.audit.entries[0], 9, 9, "lost", false, "adopt_existing", 1)
+	stored, _ := deps.hosts.GetHost(context.Background(), value.ID)
+	if stored.State != host.StateCreating || stored.StateReason != "restore_pending" || stored.RuntimeGeneration != 9 ||
+		deps.sandbox.createCalls != 0 || len(deps.sandbox.deleteCalls) != 0 {
+		t.Fatalf("adopting existing lost Host sandbox changed identity or duplicated it: Host=%#v creates=%d deletes=%v", stored, deps.sandbox.createCalls, deps.sandbox.deleteCalls)
+	}
+}
+
+func TestAdminRecoveryLostFailedSandboxRequiresManualReview(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value := hostServiceTestHost(host.StateFailed)
+	value.RuntimeGeneration = 9
+	value.StateReason = "lost"
+	value.SandboxID = "sandbox-lost-failed"
+	sealHostServiceTestKey(t, deps.sealer, &value)
+	deps.hosts.addHost(value)
+	workspaceValue := workspace.Workspace{ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, Name: "test", State: workspace.StateReady}
+	deps.workspaces.add(workspaceValue)
+	hostServiceTestAddBinding(deps, value)
+	metadata := hostServiceMetadata(value.ID)
+	metadata["ch-generation"] = "9"
+	deps.sandbox.add(Sandbox{ID: value.SandboxID, State: SandboxFailed, Metadata: metadata})
+	admin := identity.Principal{UserID: "u1234567", TokenID: "t1234567", Role: identity.RoleAdmin, Kind: identity.KindSession}
+
+	for _, confirmRetry := range []bool{false, true} {
+		if _, err := service.RecoverUnknownRestore(context.Background(), admin, value.ID, 9, confirmRetry); domain.CodeOf(err) != domain.CodeConflict {
+			t.Fatalf("lost failed sandbox recovery confirm=%t error = %v, want conflict", confirmRetry, err)
+		}
+	}
+	stored, _ := deps.hosts.GetHost(context.Background(), value.ID)
+	if stored.State != host.StateFailed || stored.StateReason != "lost" || stored.RuntimeGeneration != 9 ||
+		stored.SandboxID != value.SandboxID || len(deps.sandbox.deleteCalls) != 0 || deps.sandbox.createCalls != 0 {
+		t.Fatalf("lost failed sandbox was changed instead of flagged for manual review: Host=%#v deletes=%v creates=%d",
+			stored, deps.sandbox.deleteCalls, deps.sandbox.createCalls)
+	}
+}
+
+func TestAdminRecoveryLostDifferentFailedSandboxRequiresManualReview(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value := hostServiceTestHost(host.StateFailed)
+	value.RuntimeGeneration = 9
+	value.StateReason = "lost"
+	value.SandboxID = "sandbox-saved"
+	sealHostServiceTestKey(t, deps.sealer, &value)
+	deps.hosts.addHost(value)
+	deps.workspaces.add(workspace.Workspace{ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, Name: "test", State: workspace.StateReady})
+	hostServiceTestAddBinding(deps, value)
+	metadata := hostServiceMetadata(value.ID)
+	metadata["ch-generation"] = "9"
+	deps.sandbox.add(Sandbox{ID: "sandbox-other-failed", State: SandboxFailed, Metadata: metadata})
+	admin := identity.Principal{UserID: "u1234567", TokenID: "t1234567", Role: identity.RoleAdmin, Kind: identity.KindSession}
+
+	if _, err := service.RecoverUnknownRestore(context.Background(), admin, value.ID, 9, true); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("lost Host with a different failed sandbox error = %v, want conflict", err)
+	}
+	stored, _ := deps.hosts.GetHost(context.Background(), value.ID)
+	if stored.State != host.StateFailed || stored.StateReason != "lost" || stored.RuntimeGeneration != 9 ||
+		stored.SandboxID != value.SandboxID || len(deps.sandbox.deleteCalls) != 0 || deps.sandbox.createCalls != 0 {
+		t.Fatalf("manual-review case changed Host/sandbox: Host=%#v deletes=%v creates=%d",
+			stored, deps.sandbox.deleteCalls, deps.sandbox.createCalls)
+	}
+}
+
+func TestAdminRecoveryLostDifferentRunningSandboxRequiresManualReview(t *testing.T) {
+	service, deps := newHostServiceTest(t)
+	value := hostServiceTestHost(host.StateFailed)
+	value.RuntimeGeneration = 9
+	value.StateReason = "lost"
+	value.SandboxID = "sandbox-saved"
+	sealHostServiceTestKey(t, deps.sealer, &value)
+	deps.hosts.addHost(value)
+	deps.workspaces.add(workspace.Workspace{ID: testHostWorkspaceID(value), OwnerID: value.OwnerID, Name: "test", State: workspace.StateReady})
+	hostServiceTestAddBinding(deps, value)
+	metadata := hostServiceMetadata(value.ID)
+	metadata["ch-generation"] = "9"
+	deps.sandbox.add(Sandbox{ID: "sandbox-other-running", State: SandboxRunning, Metadata: metadata})
+	admin := identity.Principal{UserID: "u1234567", TokenID: "t1234567", Role: identity.RoleAdmin, Kind: identity.KindSession}
+
+	if _, err := service.RecoverUnknownRestore(context.Background(), admin, value.ID, 9, true); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("lost Host with a different running sandbox error = %v, want conflict", err)
+	}
+	stored, _ := deps.hosts.GetHost(context.Background(), value.ID)
+	if stored.State != host.StateFailed || stored.StateReason != "lost" || stored.RuntimeGeneration != 9 ||
+		stored.SandboxID != value.SandboxID || len(deps.sandbox.deleteCalls) != 0 || deps.sandbox.createCalls != 0 {
+		t.Fatalf("manual-review case changed Host/sandbox: Host=%#v deletes=%v creates=%d",
+			stored, deps.sandbox.deleteCalls, deps.sandbox.createCalls)
+	}
+}
+
+func assertHostRecoveryAudit(t *testing.T, entry audit.Entry, oldGeneration, newGeneration int64, reason string,
+	confirmRetry bool, action string, sandboxCount int) {
+	t.Helper()
+	detail := entry.Detail
+	if detail["old_runtime_generation"] != oldGeneration || detail["new_runtime_generation"] != newGeneration ||
+		detail["state_reason"] != reason || detail["confirm_retry"] != confirmRetry ||
+		detail["action"] != action || detail["sandbox_count"] != sandboxCount {
+		t.Fatalf("Host recovery audit detail = %#v", detail)
+	}
+}
+
 func TestHostServiceRestoreRejectsMultipleBindingsAndUnscopedAPIKey(t *testing.T) {
 	service, deps := newHostServiceTest(t)
 	value := hostServiceTestHost(host.StateStopped)
@@ -2399,6 +2611,7 @@ type hostServiceTestSandbox struct {
 	createRequest  SandboxCreateRequest
 	deleteCalls    []string
 	listErr        error
+	getErr         error
 	createErr      error
 	deleteErr      error
 	getAfterDelete bool
@@ -2425,6 +2638,9 @@ func (s *hostServiceTestSandbox) Create(_ context.Context, value SandboxCreateRe
 func (s *hostServiceTestSandbox) Get(_ context.Context, id string) (Sandbox, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.getErr != nil {
+		return Sandbox{}, s.getErr
+	}
 	value, ok := s.values[id]
 	if !ok || (value.State == SandboxTerminated && !s.getAfterDelete) {
 		return Sandbox{}, ErrSandboxNotFound
