@@ -36,7 +36,7 @@ func (s *Store) RegisterWorkspaceSyncFolder(ctx context.Context, principal ident
 		if err := requireApprovedWorkspaceSyncOwner(ctx, tx, principal.UserID); err != nil {
 			return err
 		}
-		if err := requireActivePortalSession(ctx, tx, principal); err != nil {
+		if err := requireActiveWorkspaceSyncSession(ctx, tx, principal); err != nil {
 			return err
 		}
 		workspaceID, err := lockHostSyncFolderWorkspace(ctx, tx, principal.UserID, hostID, true)
@@ -164,7 +164,7 @@ func (s *Store) ListWorkspaceSyncFolders(ctx context.Context, principal identity
 		if err := requireApprovedWorkspaceSyncOwner(ctx, tx, principal.UserID); err != nil {
 			return err
 		}
-		if err := requireActivePortalSession(ctx, tx, principal); err != nil {
+		if err := requireActiveWorkspaceSyncSession(ctx, tx, principal); err != nil {
 			return err
 		}
 		workspaceID, err := lockHostSyncFolderWorkspace(ctx, tx, principal.UserID, hostID, false)
@@ -208,7 +208,7 @@ func (s *Store) GetWorkspaceSyncFolder(ctx context.Context, principal identity.P
 		}
 		switch principal.Kind {
 		case identity.KindSession:
-			if err := requireActivePortalSession(ctx, tx, principal); err != nil {
+			if err := requireActiveWorkspaceSyncSession(ctx, tx, principal); err != nil {
 				return err
 			}
 		case identity.KindDevice:
@@ -711,7 +711,7 @@ func (s *Store) RevokeWorkspaceSyncDevice(ctx context.Context, principal identit
 		if err := requireApprovedWorkspaceSyncOwner(ctx, tx, principal.UserID); err != nil {
 			return err
 		}
-		if err := requireActivePortalSession(ctx, tx, principal); err != nil {
+		if err := requireActiveWorkspaceSyncSession(ctx, tx, principal); err != nil {
 			return err
 		}
 		if err := lockReadyWorkspaceForSyncDevice(ctx, tx, principal.UserID, workspaceID, true); err != nil {
@@ -777,7 +777,7 @@ func (s *Store) ListWorkspaceSyncDeviceBindings(ctx context.Context, principal i
 		if err := requireApprovedWorkspaceSyncOwner(ctx, tx, principal.UserID); err != nil {
 			return err
 		}
-		if err := requireActivePortalSession(ctx, tx, principal); err != nil {
+		if err := requireActiveWorkspaceSyncSession(ctx, tx, principal); err != nil {
 			return err
 		}
 		if err := lockReadyWorkspaceForSyncDevice(ctx, tx, principal.UserID, workspaceID, false); err != nil {
@@ -881,12 +881,35 @@ FROM tokens WHERE id=$1 AND owner_id=$2 AND client_installation_id=$3 FOR SHARE`
 	return nil
 }
 
-func requireActivePortalSession(ctx context.Context, tx pgx.Tx, principal identity.Principal) error {
+func requireActiveWorkspaceSyncSession(ctx context.Context, tx pgx.Tx, principal identity.Principal) error {
+	unauthenticated := func() error {
+		return domain.NewError(domain.CodeUnauthenticated, "Workspace sync session is unavailable")
+	}
+	if principal.Kind != identity.KindSession {
+		return unauthenticated()
+	}
 	var active bool
-	err := tx.QueryRow(ctx, `SELECT kind='session' AND client_installation_id IS NULL AND revoked_at IS NULL AND expires_at>clock_timestamp()
+	if principal.ClientInstallationID == "" {
+		err := tx.QueryRow(ctx, `SELECT kind='session' AND client_installation_id IS NULL AND revoked_at IS NULL AND expires_at>clock_timestamp()
 FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`, principal.TokenID, principal.UserID).Scan(&active)
+		if err != nil || !active {
+			return unauthenticated()
+		}
+		return nil
+	}
+
+	// The desktop Portal view uses a session token bound to its client installation.
+	// Verify that installation first, then the exact session token, matching the
+	// lock order used by requireWorkspaceSyncClientInstallation.
+	err := tx.QueryRow(ctx, `SELECT platform='desktop' AND revoked_at IS NULL AND expires_at>clock_timestamp()
+FROM client_installations WHERE id=$1 AND owner_id=$2 FOR SHARE`, principal.ClientInstallationID, principal.UserID).Scan(&active)
 	if err != nil || !active {
-		return identity.ErrInvalidCredential
+		return unauthenticated()
+	}
+	err = tx.QueryRow(ctx, `SELECT kind='session' AND client_installation_id=$3 AND revoked_at IS NULL AND expires_at>clock_timestamp()
+FROM tokens WHERE id=$1 AND owner_id=$2 FOR SHARE`, principal.TokenID, principal.UserID, principal.ClientInstallationID).Scan(&active)
+	if err != nil || !active {
+		return unauthenticated()
 	}
 	return nil
 }

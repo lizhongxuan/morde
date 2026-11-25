@@ -19,6 +19,7 @@ type ModelCall = Awaited<ReturnType<typeof portalApi.adminUserModelCalls>>['item
 
 const modelUsageSourceLabel: Record<UnknownModelCall['source'], string> = {
   client: '客户端', chat: '对话', task: '云端任务', route: '消息分流', probe: '连接检查', compaction: '摘要压缩',
+  review: '任务验证', terminal_delivery: '任务终态说明',
 };
 
 function UserResourceEditor({ user }: { user: AdminUser }) {

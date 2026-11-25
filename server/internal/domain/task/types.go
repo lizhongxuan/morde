@@ -398,16 +398,17 @@ type Operation struct {
 }
 
 type BatchItem struct {
-	ID        string
-	TaskID    string
-	Key       string
-	Input     string
-	Status    BatchItemStatus
-	Attempt   int32
-	Result    string
-	Error     string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID                 string
+	TaskID             string
+	Key                string
+	Input              string
+	FileDeliveryIntent FileDeliveryIntent
+	Status             BatchItemStatus
+	Attempt            int32
+	Result             string
+	Error              string
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
 }
 
 type Artifact struct {
@@ -454,6 +455,8 @@ const (
 
 type ClarificationStatus string
 
+const RouteFileDeliveryIntentClarificationCallID = "morde-route-file-delivery-intent"
+
 const (
 	ClarificationPending   ClarificationStatus = "pending"
 	ClarificationAnswered  ClarificationStatus = "answered"
@@ -463,16 +466,18 @@ const (
 // ClarificationRequest is an Agent question awaiting a free-form user answer.
 // It is separate from PendingRequest, which represents an exact tool approval.
 type ClarificationRequest struct {
-	ID          string
-	TaskID      string
-	Version     int64
-	ModelStepID string
-	CallID      string
-	Question    string
-	Status      ClarificationStatus
-	Answer      string
-	CreatedAt   time.Time
-	RespondedAt *time.Time
+	ID           string
+	TaskID       string
+	Version      int64
+	ModelStepID  string
+	CallID       string
+	Question     string
+	BatchItemID  string
+	BatchAttempt int32
+	Status       ClarificationStatus
+	Answer       string
+	CreatedAt    time.Time
+	RespondedAt  *time.Time
 }
 
 // PendingRequest is an immutable, versioned user approval bound to one exact

@@ -843,7 +843,7 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
         {configuredDefaultWorkspace && !configuredDefaultWorkspaceReady && <p className="notice notice-warning" role="status">默认云端电脑的文件状态未确认完成或存在冲突，文件同步已暂停。</p>}
         {projectPreferences.isSuccess && Boolean(defaultHostID) && configuredDefaultHost && configuredDefaultWorkspace && projectTargets.isPending
           && <FloatingNotice className="notice-info">正在核对默认电脑的项目同步权限…</FloatingNotice>}
-        {projectPreferences.isSuccess && Boolean(defaultHostID) && projectTargets.isError && <div className="error-inline" role="alert">无法核对默认电脑的项目同步权限，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void projectTargets.refetch()}>重试</button></div>}
+        {projectPreferences.isSuccess && Boolean(defaultHostID) && projectTargets.isError && <div className="error-inline" role="alert">无法核对默认电脑的项目同步权限，文件同步已暂停：{errorDetails(projectTargets.error).message}<button type="button" className="button button-secondary button-small" onClick={() => void projectTargets.refetch()}>重试</button></div>}
         {projectTargets.isSuccess && defaultHostID && configuredDefaultHost && configuredDefaultWorkspace && !configuredDefaultProjectTarget
           && <p className="notice notice-warning" role="status">默认云端电脑当前不可用于项目同步（目录未就绪、授权变化或仍有旧版同步）。文件同步已暂停，不会切换到其他电脑。</p>}
         {configuredDefaultProjectTarget && <article className="schedule-card" role="group" aria-label="同步目标电脑" style={{ padding: '8px 10px' }}>

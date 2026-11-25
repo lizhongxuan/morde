@@ -102,9 +102,9 @@ func (s *Store) UpdateBatchItem(ctx context.Context, ownerID string, item task.B
 		}
 
 		var current sqlcgen.TaskBatchItem
-		err = tx.QueryRow(ctx, `SELECT id, task_id, item_key, input, status, result, error, created_at, updated_at, attempt
+		err = tx.QueryRow(ctx, `SELECT id, task_id, item_key, input, file_delivery_intent, status, result, error, created_at, updated_at, attempt
 FROM task_batch_items WHERE id=$1 AND task_id=$2 FOR UPDATE`, item.ID, item.TaskID).Scan(
-			&current.ID, &current.TaskID, &current.ItemKey, &current.Input, &current.Status,
+			&current.ID, &current.TaskID, &current.ItemKey, &current.Input, &current.FileDeliveryIntent, &current.Status,
 			&current.Result, &current.Error, &current.CreatedAt, &current.UpdatedAt, &current.Attempt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "task batch item not found")
@@ -112,7 +112,7 @@ FROM task_batch_items WHERE id=$1 AND task_id=$2 FOR UPDATE`, item.ID, item.Task
 		if err != nil {
 			return fmt.Errorf("read batch item for update: %w", err)
 		}
-		if current.ItemKey != item.Key || current.Input != item.Input || current.Attempt != item.Attempt {
+		if current.ItemKey != item.Key || current.Input != item.Input || current.FileDeliveryIntent != string(item.FileDeliveryIntent) || current.Attempt != item.Attempt {
 			return domain.NewError(domain.CodeInvalidState, "batch item identity cannot be changed")
 		}
 		if current.Status == string(item.Status) {

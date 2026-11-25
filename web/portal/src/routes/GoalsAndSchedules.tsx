@@ -410,6 +410,7 @@ function ScheduleEditor({ initial, hosts, defaultHost, models, busy, onCancel, o
         ...hostField,
         model_id: modelID,
         objective: objective.trim(),
+        file_delivery_intent: initial?.file_delivery_intent ?? 'none',
         timing,
         budget: { active_seconds: Number(activeSeconds), tool_calls: Number(toolCalls), model_tokens: Number(modelTokens) },
         misfire_policy: misfirePolicy,

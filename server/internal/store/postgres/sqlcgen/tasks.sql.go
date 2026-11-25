@@ -570,7 +570,7 @@ func (q *Queries) ListTaskArtifacts(ctx context.Context, taskID string) ([]TaskA
 }
 
 const listTaskBatchItems = `-- name: ListTaskBatchItems :many
-SELECT id, task_id, item_key, input, status, result, error, created_at, updated_at, attempt FROM task_batch_items WHERE task_id = $1 ORDER BY created_at, id
+SELECT id, task_id, item_key, input, file_delivery_intent, status, result, error, created_at, updated_at, attempt FROM task_batch_items WHERE task_id = $1 ORDER BY created_at, id
 `
 
 func (q *Queries) ListTaskBatchItems(ctx context.Context, taskID string) ([]TaskBatchItem, error) {
@@ -587,6 +587,7 @@ func (q *Queries) ListTaskBatchItems(ctx context.Context, taskID string) ([]Task
 			&i.TaskID,
 			&i.ItemKey,
 			&i.Input,
+			&i.FileDeliveryIntent,
 			&i.Status,
 			&i.Result,
 			&i.Error,

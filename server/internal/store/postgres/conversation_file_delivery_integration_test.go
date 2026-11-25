@@ -2,11 +2,13 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
 )
 
@@ -16,21 +18,19 @@ func TestConversationFileDeliveryFollowsAppliedRevisions(t *testing.T) {
 		intent  task.FileDeliveryIntent
 	}
 	for _, test := range []struct {
-		name          string
-		initial       string
-		initialIntent task.FileDeliveryIntent
-		revisions     []revisionDecision
-		want          task.FileDeliveryIntent
+		name           string
+		initial        string
+		initialIntent  task.FileDeliveryIntent
+		revisions      []revisionDecision
+		want           task.FileDeliveryIntent
+		wantFieldError string
 	}{
 		{name: "ordinary question", initial: "分析文件并写一段总结", initialIntent: task.FileDeliveryNone, want: task.FileDeliveryNone},
-		{name: "preserve requirement", initial: "生成 PDF 报告文件", initialIntent: task.FileDeliveryRequired,
-			revisions: []revisionDecision{{content: "标题改成中文"}}, want: task.FileDeliveryRequired},
-		{name: "explicit cancellation", initial: "生成 PDF 报告文件", initialIntent: task.FileDeliveryRequired,
-			revisions: []revisionDecision{{content: "不要生成文件，只要文字", intent: task.FileDeliveryNone}}, want: task.FileDeliveryNone},
-		{name: "conflicting revision", initial: "生成 PDF 报告文件", initialIntent: task.FileDeliveryRequired,
-			revisions: []revisionDecision{{content: "不要生成文件，但请创建 PDF 文件", intent: task.FileDeliveryUnclear}}, want: task.FileDeliveryUnclear},
-		{name: "later file request", initial: "只要文字回答", initialIntent: task.FileDeliveryNone,
-			revisions: []revisionDecision{{content: "请生成 PDF 文件", intent: task.FileDeliveryRequired}}, want: task.FileDeliveryRequired},
+		{name: "none survives an applied revision", initial: "请生成 PDF 报告文件", initialIntent: task.FileDeliveryNone,
+			revisions: []revisionDecision{{content: "标题改成中文", intent: task.FileDeliveryNone}}, want: task.FileDeliveryNone},
+		{name: "required update needs a bound Workspace snapshot", initial: "只要文字回答", initialIntent: task.FileDeliveryNone,
+			revisions: []revisionDecision{{content: "请生成 PDF 文件", intent: task.FileDeliveryRequired}}, want: task.FileDeliveryNone,
+			wantFieldError: "workspace_id"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			client := &routeModelClientTest{reply: fmt.Sprintf(`{"action":"new","task_id":"","file_delivery_intent":"%s"}`, test.initialIntent)}
@@ -63,7 +63,29 @@ func TestConversationFileDeliveryFollowsAppliedRevisions(t *testing.T) {
 					revisionRoute.FileDeliveryIntent != revision.intent {
 					t.Fatalf("revision model route = %+v", revisionRoute)
 				}
-				if err := store.ApplyConversationRoute(ctx, claim, updated, revisionRoute); err != nil {
+				err := store.ApplyConversationRoute(ctx, claim, updated, revisionRoute)
+				if test.wantFieldError != "" {
+					var domainErr *domain.Error
+					if !errors.As(err, &domainErr) || domainErr.Code != domain.CodeInvalidArgument || domainErr.Details["field"] != test.wantFieldError {
+						t.Fatalf("ApplyConversationRoute() error = %v, want invalid %s", err, test.wantFieldError)
+					}
+					var status, intent string
+					var desiredRevision int64
+					if err := store.pool.QueryRow(ctx, `SELECT status,file_delivery_intent,desired_revision FROM tasks WHERE id=$1`, taskID).
+						Scan(&status, &intent, &desiredRevision); err != nil {
+						t.Fatal(err)
+					}
+					var revisionCount int
+					if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_revision_intents WHERE task_id=$1`, taskID).Scan(&revisionCount); err != nil {
+						t.Fatal(err)
+					}
+					if status != string(task.StatusQueued) || intent != string(task.FileDeliveryNone) || desiredRevision != 0 || revisionCount != 0 {
+						t.Fatalf("rejected Workspace-less revision changed task: status=%s intent=%s desired_revision=%d revision_count=%d",
+							status, intent, desiredRevision, revisionCount)
+					}
+					return
+				}
+				if err != nil {
 					t.Fatal(err)
 				}
 			}

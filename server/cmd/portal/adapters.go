@@ -137,7 +137,8 @@ func (s runtimeUnavailableTaskService) RespondToPendingRequest(ctx context.Conte
 	return s.TaskService.RespondToPendingRequest(ctx, principal, taskID, pendingID, version, decision, idempotencyKey)
 }
 
-func (s runtimeUnavailableTaskService) AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, string) error {
+func (s runtimeUnavailableTaskService) AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string,
+	task.FileDeliveryIntent, string) error {
 	return taskRuntimeUnavailable()
 }
 

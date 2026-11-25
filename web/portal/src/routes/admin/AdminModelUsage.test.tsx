@@ -17,7 +17,7 @@ const user: components['schemas']['AdminUser'] = {
 type UnknownModelCall = Awaited<ReturnType<typeof portalApi.adminUnknownModelUsage>>['items'][number];
 
 const call: UnknownModelCall = {
-  owner_id: user.id, source: 'task', call_id: 'model-call-123', model_id: 'm1234567', provider_model: 'provider-model',
+  owner_id: user.id, source: 'terminal_delivery', call_id: 'terminal_delivery_12', model_id: 'm1234567', provider_model: 'provider-model',
   task_id: 't1234567', reserved_tokens: 1000, created_at: '2026-10-27T00:00:00Z', unknown_at: '2026-10-27T00:01:00Z',
 };
 
@@ -53,6 +53,7 @@ describe('admin model usage reconciliation', () => {
     expect(list).not.toHaveBeenCalled();
     await input.click(screen.getByRole('button', { name: '查看待核对记录' }));
     expect(await screen.findByText('provider-model')).toBeInTheDocument();
+    expect(screen.getByText(/任务终态说明/)).toBeInTheDocument();
     expect(list).toHaveBeenCalledWith(user.id);
 
     await input.type(screen.getByLabelText('核实的输入 tokens'), '620');
@@ -61,7 +62,7 @@ describe('admin model usage reconciliation', () => {
     await input.click(screen.getByRole('button', { name: '保存核对结果' }));
 
     expect(reconcile).toHaveBeenCalledWith({
-      owner_id: user.id, source: 'task', call_id: call.call_id, input_tokens: 620, output_tokens: 180,
+      owner_id: user.id, source: 'terminal_delivery', call_id: call.call_id, input_tokens: 620, output_tokens: 180,
       evidence: '供应商账单记录 #abc-123',
     });
     expect(await screen.findByText('模型用量已核对并记账。')).toBeInTheDocument();

@@ -28,10 +28,13 @@ import (
 //     a repeated error; it is verified only when the same call succeeds
 //     after its last failure (the correction is recorded in the ledger
 //     and holds).
-//   - replay (H07): for fix tasks, the E07 test gate re-derived from the
-//     steps (the failing reproduction test re-ran and passed, and the
-//     full suite passed); for other tasks, the read-back compare — the
-//     evidence claims are still covered by currently verified content.
+//   - replay (H07): the E07 test gate can re-derive whether a failing
+//     reproduction test and full suite passed, but those step stamps alone
+//     do not establish the required plan-revision, immutable Workspace
+//     version, and coverage binding. The PostgreSQL completion path therefore
+//     keeps fix-task replay pending until those identities are available. For
+//     other tasks, the read-back compare checks whether evidence claims remain
+//     covered by currently verified content.
 //
 // No new agent session is created: M06-04 keeps the existing tool-less
 // task_validation_review DSH session, and the verifier does not re-execute

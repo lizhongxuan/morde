@@ -433,31 +433,87 @@ func TestTaskServiceSubmitCreatesHostBoundConversationAndIdempotencyHash(t *test
 	}
 }
 
-func TestTaskServiceStoresFileDeliveryIntentFromTaskAndBatchText(t *testing.T) {
+func TestTaskServicePreservesStructuredFileDeliveryIntentAndHashesIt(t *testing.T) {
 	store := &taskStoreStub{}
 	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, test := range []struct {
-		key       string
-		objective string
-		items     []BatchItemInput
-		want      task.FileDeliveryIntent
-	}{
-		{key: "intent-none-001", objective: "Explain what caused the error.", want: task.FileDeliveryNone},
-		{key: "intent-required-01", objective: "Review each record.", items: []BatchItemInput{{Key: "row-a", Input: "Generate and save a PDF report."}}, want: task.FileDeliveryRequired},
-		{key: "intent-unclear-01", objective: "Write a report about this project.", want: task.FileDeliveryUnclear},
-	} {
+	command := SubmitTaskCommand{
+		ModelID: "model-a", Objective: "Explain what caused the error and save a PDF report.",
+		FileDeliveryIntent: task.FileDeliveryNone,
+		BatchItems:         []BatchItemInput{{Key: "row-a", Input: "Explain the result, but only answer in chat.", FileDeliveryIntent: task.FileDeliveryUnclear}},
+		IdempotencyKey:     "intent-structured-001",
+	}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); err != nil {
+		t.Fatal(err)
+	}
+	first := store.submissions[0]
+	if first.Task.FileDeliveryIntent != task.FileDeliveryNone || len(first.BatchItems) != 1 ||
+		first.BatchItems[0].FileDeliveryIntent != task.FileDeliveryUnclear {
+		t.Fatalf("structured file delivery intent was not preserved: Task=%q items=%#v", first.Task.FileDeliveryIntent, first.BatchItems)
+	}
+	command.FileDeliveryIntent = task.FileDeliveryUnclear
+	command.BatchItems[0].FileDeliveryIntent = task.FileDeliveryNone
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), command); err != nil {
+		t.Fatal(err)
+	}
+	second := store.submissions[1]
+	if bytes.Equal(first.Idempotency.RequestHash, second.Idempotency.RequestHash) {
+		t.Fatal("changing structured Task and batch file delivery intents did not change idempotency request hash")
+	}
+}
+
+func TestTaskServiceDefaultsAndValidatesStructuredFileDeliveryIntent(t *testing.T) {
+	store := &taskStoreStub{}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defaultCommand := SubmitTaskCommand{
+		ModelID: "model-a", Objective: "The wording asks for a saved file, but the structured intent is none.",
+		IdempotencyKey: "intent-default-none-01", BatchItems: []BatchItemInput{{Key: "row-a", Input: "save this later"}},
+	}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), defaultCommand); err != nil {
+		t.Fatal(err)
+	}
+	got := store.submissions[0]
+	if got.Task.FileDeliveryIntent != task.FileDeliveryNone || len(got.BatchItems) != 1 || got.BatchItems[0].FileDeliveryIntent != task.FileDeliveryNone {
+		t.Fatalf("omitted structured intent was not defaulted to none: Task=%q items=%#v", got.Task.FileDeliveryIntent, got.BatchItems)
+	}
+	explicitNone := defaultCommand
+	explicitNone.FileDeliveryIntent = task.FileDeliveryNone
+	explicitNone.BatchItems = []BatchItemInput{{Key: "row-a", Input: "save this later", FileDeliveryIntent: task.FileDeliveryNone}}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), explicitNone); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(store.submissions[0].Idempotency.RequestHash, store.submissions[1].Idempotency.RequestHash) {
+		t.Fatal("omitted and explicit none intents produced different request hashes")
+	}
+	for _, invalid := range []task.FileDeliveryIntent{"maybe"} {
 		if _, err := service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
-			ModelID: "model-a", Objective: test.objective, BatchItems: test.items, IdempotencyKey: test.key,
-		}); err != nil {
-			t.Fatalf("Submit(%q): %v", test.key, err)
+			ModelID: "model-a", Objective: "do work", FileDeliveryIntent: invalid, IdempotencyKey: "intent-invalid-task-01",
+		}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Fatalf("invalid Task intent %q error = %v", invalid, err)
 		}
-		got := store.submissions[len(store.submissions)-1].Task.FileDeliveryIntent
-		if got != test.want {
-			t.Fatalf("file delivery intent for %q = %q, want %q", test.key, got, test.want)
+		if _, err := service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
+			ModelID: "model-a", Objective: "do work", BatchItems: []BatchItemInput{{Key: "row-a", Input: "item", FileDeliveryIntent: invalid}},
+			IdempotencyKey: "intent-invalid-item-01",
+		}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+			t.Fatalf("invalid item intent %q error = %v", invalid, err)
 		}
+	}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
+		ModelID: "model-a", Objective: "do work", FileDeliveryIntent: task.FileDeliveryRequired,
+		IdempotencyKey: "intent-required-no-workspace-01",
+	}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("required Task intent without Workspace error = %v", err)
+	}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
+		ModelID: "model-a", Objective: "do work", BatchItems: []BatchItemInput{{Key: "row-a", Input: "item", FileDeliveryIntent: task.FileDeliveryRequired}},
+		IdempotencyKey: "intent-required-item-no-workspace-01",
+	}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("required batch item intent without Workspace error = %v", err)
 	}
 }
 
@@ -468,7 +524,8 @@ func TestTaskServiceSubmitsUnclearFileIntentAsAnswerableClarification(t *testing
 		t.Fatal(err)
 	}
 	_, err = service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
-		ModelID: "model-a", Objective: "Write a report about the project.", IdempotencyKey: "intent-clarify-01",
+		ModelID: "model-a", Objective: "Write a report about the project.", FileDeliveryIntent: task.FileDeliveryUnclear,
+		IdempotencyKey: "intent-clarify-01",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -483,21 +540,50 @@ func TestTaskServiceSubmitsUnclearFileIntentAsAnswerableClarification(t *testing
 	}
 }
 
+func TestTaskServiceSubmitsUnclearBatchItemIntentAsTargetedClarification(t *testing.T) {
+	store := &taskStoreStub{}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
+		ModelID: "model-a", Objective: "Review the records.", IdempotencyKey: "intent-clarify-item-01",
+		BatchItems: []BatchItemInput{{Key: "row-a", Input: "Prepare a report about this record.", FileDeliveryIntent: task.FileDeliveryUnclear}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submission := store.submissions[0]
+	request := submission.InitialClarificationRequest
+	if submission.Task.Status != task.StatusWaitingUser || submission.Task.FileDeliveryIntent != task.FileDeliveryNone ||
+		len(submission.BatchItems) != 1 || submission.BatchItems[0].FileDeliveryIntent != task.FileDeliveryUnclear ||
+		request == nil || request.BatchItemID != submission.BatchItems[0].ID || request.BatchAttempt != 1 ||
+		request.CallID != FileDeliveryIntentClarificationCallID || request.Status != task.ClarificationPending {
+		t.Fatalf("batch item unclear intent was not bound to its versioned target: submission=%#v", submission)
+	}
+	if _, err := service.Submit(context.Background(), taskTestPrincipal(), SubmitTaskCommand{
+		ModelID: "model-a", Objective: "Review the records.", FileDeliveryIntent: task.FileDeliveryUnclear,
+		IdempotencyKey: "intent-clarify-ambiguous-01",
+		BatchItems:     []BatchItemInput{{Key: "row-a", Input: "Prepare a report.", FileDeliveryIntent: task.FileDeliveryUnclear}},
+	}); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("simultaneous Task and batch unclear intents error = %v", err)
+	}
+}
+
 func TestTaskServiceResolvesFileDeliveryClarificationFromAnswer(t *testing.T) {
 	for _, test := range []struct {
 		name      string
 		answer    string
+		intent    task.FileDeliveryIntent
 		want      task.FileDeliveryIntent
 		wantErr   domain.ErrorCode
 		workspace string
 	}{
-		{name: "required", answer: "需要生成并交付 PDF 文件", want: task.FileDeliveryRequired, workspace: "w1234567"},
-		{name: "chat only", answer: "不需要文件，只要聊天答复", want: task.FileDeliveryNone, workspace: "w1234567"},
-		{name: "English chat only", answer: "I don't need a file, just answer in chat", want: task.FileDeliveryNone, workspace: "w1234567"},
-		{name: "Chinese no delivery", answer: "无需交付文件，直接在聊天回答", want: task.FileDeliveryNone, workspace: "w1234567"},
-		{name: "unclear", answer: "看着办", wantErr: domain.CodeInvalidArgument, workspace: "w1234567"},
-		{name: "contradictory", answer: "不需要文件，但请交付 PDF", wantErr: domain.CodeInvalidArgument, workspace: "w1234567"},
-		{name: "required without workspace", answer: "需要交付文件", wantErr: domain.CodeInvalidArgument},
+		{name: "structured required despite contradictory free text", answer: "I do not need a file, just answer in chat", intent: task.FileDeliveryRequired, want: task.FileDeliveryRequired, workspace: "w1234567"},
+		{name: "structured none despite file wording", answer: "Please create and deliver a PDF", intent: task.FileDeliveryNone, want: task.FileDeliveryNone, workspace: "w1234567"},
+		{name: "unclear is not a resolution", answer: "看着办", intent: task.FileDeliveryUnclear, wantErr: domain.CodeInvalidArgument, workspace: "w1234567"},
+		{name: "missing structured resolution", answer: "需要交付文件", wantErr: domain.CodeInvalidArgument, workspace: "w1234567"},
+		{name: "required without workspace", answer: "需要交付文件", intent: task.FileDeliveryRequired, wantErr: domain.CodeInvalidArgument},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store := &taskStoreStub{details: TaskDetails{
@@ -512,7 +598,7 @@ func TestTaskServiceResolvesFileDeliveryClarificationFromAnswer(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			err = service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 1, test.answer, "file-answer-001")
+			err = service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 1, test.answer, test.intent, "file-answer-001")
 			if test.wantErr != "" {
 				if domain.CodeOf(err) != test.wantErr || store.clarificationCalls != 0 {
 					t.Fatalf("answer error=%v writes=%d, want %s and no write", err, store.clarificationCalls, test.wantErr)
@@ -523,6 +609,139 @@ func TestTaskServiceResolvesFileDeliveryClarificationFromAnswer(t *testing.T) {
 				!strings.Contains(store.clarificationObjective, "Write a report about the project.") ||
 				!strings.Contains(store.clarificationObjective, test.answer) {
 				t.Fatalf("resolved answer error=%v intent=%q objective=%q", err, store.clarificationIntent, store.clarificationObjective)
+			}
+		})
+	}
+}
+
+func TestTaskServiceResolvesRouteFileDeliveryClarificationWithoutChangingObjective(t *testing.T) {
+	for _, status := range []task.Status{task.StatusPausing, task.StatusPaused} {
+		t.Run(string(status), func(t *testing.T) {
+			revision := int64(4)
+			store := &taskStoreStub{details: TaskDetails{
+				Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", WorkspaceID: "w1234567",
+					InputRevision: &revision, WorkspaceCheckpointRevision: &revision, ContextDigest: bytes.Repeat([]byte{7}, 32),
+					Status: status, Objective: "Revise the report.", FileDeliveryIntent: task.FileDeliveryNone},
+				ClarificationRequests: []task.ClarificationRequest{{
+					ID: "r1234567", TaskID: "q1234567", Version: 2,
+					CallID: task.RouteFileDeliveryIntentClarificationCallID, Status: task.ClarificationPending,
+				}},
+			}}
+			service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			answer := "不要生成文件，只在聊天里回答"
+			if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 2,
+				answer, task.FileDeliveryRequired, "route-intent-answer-001"); err != nil {
+				t.Fatal(err)
+			}
+			if store.clarificationCalls != 1 || store.clarificationIntent != task.FileDeliveryRequired || store.clarificationObjective != "" ||
+				store.clarificationTaskID != "q1234567" || store.clarificationID != "r1234567" || store.clarificationVersion != 2 {
+				t.Fatalf("route clarification did not forward only the structured answer: %#v", store)
+			}
+		})
+	}
+}
+
+func TestTaskServiceRejectsRouteRequiredWithoutCompleteWorkspaceSnapshot(t *testing.T) {
+	for _, status := range []task.Status{task.StatusPausing, task.StatusPaused} {
+		t.Run(string(status), func(t *testing.T) {
+			store := &taskStoreStub{details: TaskDetails{
+				Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", Status: status,
+					Objective: "Revise the report."},
+				ClarificationRequests: []task.ClarificationRequest{{
+					ID: "r1234567", TaskID: "q1234567", Version: 1,
+					CallID: task.RouteFileDeliveryIntentClarificationCallID, Status: task.ClarificationPending,
+				}},
+			}}
+			service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 1,
+				"需要文件", task.FileDeliveryRequired, "route-intent-no-workspace")
+			if domain.CodeOf(err) != domain.CodeInvalidArgument || store.clarificationCalls != 0 {
+				t.Fatalf("route required without complete Workspace snapshot: err=%v calls=%d", err, store.clarificationCalls)
+			}
+		})
+	}
+	store := &taskStoreStub{details: TaskDetails{
+		Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", Status: task.StatusRunning,
+			Objective: "Revise the report."},
+		ClarificationRequests: []task.ClarificationRequest{{
+			ID: "r1234567", TaskID: "q1234567", Version: 1,
+			CallID: task.RouteFileDeliveryIntentClarificationCallID, Status: task.ClarificationPending,
+		}},
+	}}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 1,
+		"只要聊天回答", task.FileDeliveryNone, "route-intent-running-task"); domain.CodeOf(err) != domain.CodeConflict || store.clarificationCalls != 0 {
+		t.Fatalf("route clarification answered before Task pauses: err=%v calls=%d", err, store.clarificationCalls)
+	}
+}
+
+func TestTaskServiceResolvesBatchFileDeliveryClarificationOnlyForItsExactItem(t *testing.T) {
+	store := &taskStoreStub{details: TaskDetails{
+		Task:       task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", WorkspaceID: "w1234567", Objective: "Review records."},
+		BatchItems: []task.BatchItem{{ID: "b1234567", TaskID: "q1234567", Key: "row-a", Input: "prepare a report", Attempt: 1, FileDeliveryIntent: task.FileDeliveryUnclear}},
+		ClarificationRequests: []task.ClarificationRequest{{ID: "r1234567", TaskID: "q1234567", Version: 3,
+			CallID: FileDeliveryIntentClarificationCallID, BatchItemID: "b1234567", BatchAttempt: 1, Status: task.ClarificationPending}},
+	}}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	answer := "Please create a report, but do not save a file."
+	if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 3,
+		answer, task.FileDeliveryNone, "batch-file-answer-001"); err != nil {
+		t.Fatal(err)
+	}
+	if store.clarificationIntent != task.FileDeliveryNone || store.clarificationObjective != "Review records.\n\nUser clarification about file delivery: "+answer {
+		t.Fatalf("batch clarification did not forward structured resolution: intent=%q objective=%q", store.clarificationIntent, store.clarificationObjective)
+	}
+	firstHash := append([]byte(nil), store.clarificationRecord.RequestHash...)
+	if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 3,
+		answer, task.FileDeliveryRequired, "batch-file-answer-001"); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(firstHash, store.clarificationRecord.RequestHash) {
+		t.Fatal("changing structured clarification intent did not change idempotency request hash")
+	}
+	store.details.BatchItems = append(store.details.BatchItems, task.BatchItem{ID: "b8765432", TaskID: "q1234567", Key: "row-b", Input: "write", Attempt: 1, FileDeliveryIntent: task.FileDeliveryUnclear})
+	if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 3,
+		answer, task.FileDeliveryNone, "batch-file-answer-002"); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("ambiguous batch clarification error = %v", err)
+	}
+}
+
+func TestTaskServiceDelegatesStaleFileDeliveryClarificationVersionToStore(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		version int64
+		status  task.ClarificationStatus
+		intent  task.FileDeliveryIntent
+	}{
+		{name: "stale version", version: 2, status: task.ClarificationPending, intent: task.FileDeliveryUnclear},
+		{name: "already answered", version: 3, status: task.ClarificationAnswered, intent: task.FileDeliveryNone},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := &taskStoreStub{details: TaskDetails{
+				Task: task.Task{ID: "q1234567", OwnerID: "u1234567", HostID: "h1234567", Objective: "Write a report.", FileDeliveryIntent: test.intent},
+				ClarificationRequests: []task.ClarificationRequest{{ID: "r1234567", TaskID: "q1234567", Version: test.version,
+					CallID: FileDeliveryIntentClarificationCallID, Status: test.status}},
+			}}
+			service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{configured: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 3,
+				"answer", task.FileDeliveryNone, "stale-file-answer-001")
+			if err != nil || store.clarificationCalls != 1 {
+				t.Fatalf("stale file clarification was not delegated to the versioned Store check: err=%v calls=%d", err, store.clarificationCalls)
 			}
 		})
 	}
@@ -1408,7 +1627,7 @@ func TestTaskServiceAnswerClarificationRequiresControlAndBindsAnswerToVersion(t 
 	principal := taskTestPrincipal()
 	answer := "Use the staging environment."
 	for range 2 {
-		if err := service.AnswerClarificationRequest(context.Background(), principal, "q1234567", "r1234567", 4, answer, "clarify-key-001"); err != nil {
+		if err := service.AnswerClarificationRequest(context.Background(), principal, "q1234567", "r1234567", 4, answer, "", "clarify-key-001"); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -1422,13 +1641,13 @@ func TestTaskServiceAnswerClarificationRequiresControlAndBindsAnswerToVersion(t 
 		UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindAPIKey, TokenID: "t1234567",
 		HostIDs: []string{"h1234567"}, Scopes: []identity.Scope{identity.ScopeTaskRead},
 	}
-	if err := service.AnswerClarificationRequest(context.Background(), principal, "q1234567", "r1234567", 4, answer, "clarify-key-002"); domain.CodeOf(err) != domain.CodeNotFound || store.clarificationCalls != 2 {
+	if err := service.AnswerClarificationRequest(context.Background(), principal, "q1234567", "r1234567", 4, answer, "", "clarify-key-002"); domain.CodeOf(err) != domain.CodeNotFound || store.clarificationCalls != 2 {
 		t.Fatalf("unscoped answer err=%v writes=%d", err, store.clarificationCalls)
 	}
-	if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 0, answer, "clarify-key-003"); domain.CodeOf(err) != domain.CodeInvalidArgument || store.clarificationCalls != 2 {
+	if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 0, answer, "", "clarify-key-003"); domain.CodeOf(err) != domain.CodeInvalidArgument || store.clarificationCalls != 2 {
 		t.Fatalf("invalid version err=%v writes=%d", err, store.clarificationCalls)
 	}
-	if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 4, "a\x00b", "clarify-key-004"); domain.CodeOf(err) != domain.CodeInvalidArgument || store.clarificationCalls != 2 {
+	if err := service.AnswerClarificationRequest(context.Background(), taskTestPrincipal(), "q1234567", "r1234567", 4, "a\x00b", "", "clarify-key-004"); domain.CodeOf(err) != domain.CodeInvalidArgument || store.clarificationCalls != 2 {
 		t.Fatalf("NUL answer err=%v writes=%d", err, store.clarificationCalls)
 	}
 }

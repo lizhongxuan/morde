@@ -21,7 +21,7 @@ import (
 	"morde/server/internal/domain/task"
 )
 
-const scheduleColumns = `id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, timing,
+const scheduleColumns = `id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, file_delivery_intent, timing,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, auth_kind, auth_token_id, auth_scopes, auth_client_installation_id,
 misfire_policy, notification_events, next_occurrence_key, next_run_at, next_check_at, observation_spec,
 observation_config_hash, baseline_fingerprint, created_at, updated_at, execution_policy`
@@ -38,6 +38,9 @@ type scheduleRowScanner interface {
 }
 
 func (s *Store) CreateSchedule(ctx context.Context, value schedule.Schedule, record app.IdempotencyRecord) (schedule.Schedule, bool, error) {
+	if value.FileDeliveryIntent == "" {
+		value.FileDeliveryIntent = task.FileDeliveryNone
+	}
 	if record.OwnerID != value.OwnerID || record.ResourceID != value.ID || !schedule.ValidID(value.ID) || !domain.ValidUserID(value.OwnerID) {
 		return schedule.Schedule{}, false, domain.InvalidArgument("schedule", "schedule owner or idempotency fields are invalid")
 	}
@@ -83,12 +86,13 @@ func (s *Store) CreateSchedule(ctx context.Context, value schedule.Schedule, rec
 			return err
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO schedules (
-id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, timing,
+id, owner_id, version, status, execution_epoch, host_id, model_id, title, objective, file_delivery_intent, timing,
 budget_active_seconds, budget_tool_calls, budget_model_tokens, auth_kind, auth_token_id, auth_scopes,
 auth_client_installation_id, misfire_policy, notification_events, next_occurrence_key, next_run_at, next_check_at, observation_spec,
 observation_config_hash, baseline_fingerprint, execution_policy
-) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)`,
-			value.ID, value.OwnerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID, value.Title, value.Objective, timing,
+) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`,
+			value.ID, value.OwnerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID, value.Title, value.Objective,
+			string(value.FileDeliveryIntent), timing,
 			value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens, value.Authorization.Kind,
 			value.Authorization.TokenID, nonNilStrings(value.Authorization.Scopes), nullableText(value.Authorization.ClientInstallationID), string(value.MisfirePolicy),
 			notificationEventStrings(value.NotificationEvents), value.NextOccurrenceKey,
@@ -175,6 +179,9 @@ func (s *Store) GetSchedule(ctx context.Context, ownerID, id string) (schedule.S
 }
 
 func (s *Store) UpdateSchedule(ctx context.Context, ownerID string, record app.IdempotencyRecord, value schedule.Schedule, expectedVersion int64) (schedule.Schedule, error) {
+	if value.FileDeliveryIntent == "" {
+		value.FileDeliveryIntent = task.FileDeliveryNone
+	}
 	if !domain.ValidUserID(ownerID) || value.OwnerID != ownerID || record.OwnerID != ownerID || record.Operation != "schedule.update" ||
 		record.ResourceID != value.ID || expectedVersion < 1 || !schedule.ValidID(value.ID) {
 		return schedule.Schedule{}, domain.InvalidArgument("schedule", "schedule update fields are invalid")
@@ -569,7 +576,7 @@ ORDER BY r.created_at DESC,r.id DESC LIMIT 1 FOR UPDATE OF t`, value.ID).Scan(&p
 			}
 			taskValue := normalizeNewTask(task.Task{
 				ID: taskID, OwnerID: value.OwnerID, InitiatorID: value.OwnerID, ConversationID: conversationID, HostID: value.HostID,
-				ExecutionLocation: "server", ModelID: value.ModelID, Objective: value.Objective, Status: task.StatusQueued,
+				ExecutionLocation: "server", ModelID: value.ModelID, Objective: value.Objective, FileDeliveryIntent: value.FileDeliveryIntent, Status: task.StatusQueued,
 				Authorization: internalAuthorization, Budget: value.Budget,
 			})
 			if err := validateTask(taskValue); err != nil {
@@ -766,7 +773,7 @@ func scanSchedule(row scheduleRowScanner) (schedule.Schedule, error) {
 	var nextRunAt, nextCheckAt, createdAt, updatedAt pgtype.Timestamptz
 	var hostID pgtype.Text
 	err := row.Scan(&value.ID, &value.OwnerID, &value.Version, &status, &value.ExecutionEpoch, &hostID, &value.ModelID,
-		&value.Title, &value.Objective, &timingJSON, &value.Budget.ActiveSeconds, &value.Budget.ToolCalls, &value.Budget.ModelTokens,
+		&value.Title, &value.Objective, &value.FileDeliveryIntent, &timingJSON, &value.Budget.ActiveSeconds, &value.Budget.ToolCalls, &value.Budget.ModelTokens,
 		&authKind, &value.Authorization.TokenID, &authScopes, &authClientInstallationID, &misfirePolicy, &notificationEvents, &value.NextOccurrenceKey,
 		&nextRunAt, &nextCheckAt, &observationJSON, &value.ObservationConfigHash, &value.BaselineFingerprint, &createdAt, &updatedAt, &executionPolicy)
 	if err != nil {
@@ -857,12 +864,12 @@ func updateScheduleRow(ctx context.Context, tx pgx.Tx, ownerID string, value sch
 	if err != nil {
 		return err
 	}
-	command, err := tx.Exec(ctx, `UPDATE schedules SET version=$3,status=$4,execution_epoch=$5,host_id=$6,model_id=$7,title=$8,objective=$9,timing=$10,
-budget_active_seconds=$11,budget_tool_calls=$12,budget_model_tokens=$13,auth_kind=$14,auth_token_id=$15,auth_scopes=$16,
-auth_client_installation_id=$17,misfire_policy=$18,notification_events=$19,next_occurrence_key=$20,next_run_at=$21,next_check_at=$22,observation_spec=$23,
-observation_config_hash=$24,baseline_fingerprint=$25,execution_policy=$26,updated_at=clock_timestamp()
+	command, err := tx.Exec(ctx, `UPDATE schedules SET version=$3,status=$4,execution_epoch=$5,host_id=$6,model_id=$7,title=$8,objective=$9,file_delivery_intent=$10,timing=$11,
+budget_active_seconds=$12,budget_tool_calls=$13,budget_model_tokens=$14,auth_kind=$15,auth_token_id=$16,auth_scopes=$17,
+auth_client_installation_id=$18,misfire_policy=$19,notification_events=$20,next_occurrence_key=$21,next_run_at=$22,next_check_at=$23,observation_spec=$24,
+observation_config_hash=$25,baseline_fingerprint=$26,execution_policy=$27,updated_at=clock_timestamp()
 		WHERE id=$1 AND owner_id=$2`, value.ID, ownerID, value.Version, string(value.Status), value.ExecutionEpoch, nullableText(value.HostID), value.ModelID,
-		value.Title, value.Objective, timing, value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
+		value.Title, value.Objective, string(value.FileDeliveryIntent), timing, value.Budget.ActiveSeconds, value.Budget.ToolCalls, value.Budget.ModelTokens,
 		value.Authorization.Kind, value.Authorization.TokenID, nonNilStrings(value.Authorization.Scopes), nullableText(value.Authorization.ClientInstallationID), string(value.MisfirePolicy),
 		notificationEventStrings(value.NotificationEvents), value.NextOccurrenceKey, nullableTimestamp(value.NextRunAt), nullableTimestamp(value.NextCheckAt),
 		observation, value.ObservationConfigHash, value.BaselineFingerprint, string(storedScheduleExecutionPolicy(value.ExecutionPolicy)))
@@ -878,7 +885,7 @@ observation_config_hash=$24,baseline_fingerprint=$25,execution_policy=$26,update
 func personalScheduleContentBytesInTx(ctx context.Context, tx pgx.Tx, ownerID, scheduleID string) (int64, error) {
 	var contentBytes int64
 	err := tx.QueryRow(ctx, `SELECT octet_length(jsonb_build_object(
-  'title',title,'objective',objective,'model',model_id,'host',host_id,'timing',timing,
+  'title',title,'objective',objective,'file_delivery_intent',file_delivery_intent,'model',model_id,'host',host_id,'timing',timing,
   'budgets',jsonb_build_object('active_seconds',budget_active_seconds,'tool_calls',budget_tool_calls,'model_tokens',budget_model_tokens),
   'misfire',misfire_policy,'notification',to_jsonb(notification_events),'observation',observation_spec,'execution_policy',execution_policy
 )::text) FROM schedules WHERE id=$1 AND owner_id=$2`, scheduleID, ownerID).Scan(&contentBytes)
@@ -916,7 +923,8 @@ func prefixScheduleColumns(alias string) string {
 func validateScheduleTaskFields(value schedule.Schedule) error {
 	if value.Authorization.Kind == "" || strings.TrimSpace(value.Objective) == "" || value.ModelID == "" ||
 		(value.HostID != "" && !domain.ValidHostID(value.HostID)) || !domain.ValidUserID(value.OwnerID) ||
-		(value.HostID == "" && (value.Observation != nil || app.ClassifyFileDeliveryIntent(value.Objective, false) != task.FileDeliveryNone)) {
+		!value.FileDeliveryIntent.Valid() || value.FileDeliveryIntent != task.FileDeliveryNone ||
+		(value.HostID == "" && value.Observation != nil) {
 		return domain.InvalidArgument("schedule", "scheduled task fields are invalid")
 	}
 	if err := value.Budget.Validate(); err != nil {

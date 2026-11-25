@@ -4963,7 +4963,7 @@ describe('Assistant durable tasks', () => {
 
   it('answers a clarification from the conversation card without opening task dynamics', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
+    const clarification = { id: 'k7654321', version: 2, call_id: 'call-clarify', question: '文件应该保存在哪个目录？' };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: 'clarification_required', clarification_request: clarification, finished_at: null });
     const answer = vi.spyOn(portalApi, 'answerTaskInput');
     const accept = vi.spyOn(portalApi, 'acceptConversationMessage');
@@ -4972,6 +4972,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
     const card = await screen.findByRole('region', { name: '对话中的澄清请求' });
     expect(card).toHaveTextContent(clarification.question);
+    expect(within(card).queryByRole('group', { name: '文件交付方式' })).not.toBeInTheDocument();
     expect(card.closest('.chat-message')).toBeNull();
     const assistantRow = card.closest('.chat-message-row');
     expect(assistantRow).toHaveClass('chat-message-row-assistant');
@@ -5001,9 +5002,88 @@ describe('Assistant durable tasks', () => {
     expect(within(activity).queryByRole('button', { name: /补充|提交并继续/u })).not.toBeInTheDocument();
   });
 
+  it.each([
+    { callID: 'morde-file-delivery-intent', status: 'waiting_user' as const, waitingReason: 'clarification_required' as const },
+    { callID: 'morde-route-file-delivery-intent', status: 'running' as const, waitingReason: null },
+    { callID: 'morde-route-file-delivery-intent', status: 'pausing' as const, waitingReason: null },
+    { callID: 'morde-route-file-delivery-intent', status: 'paused' as const, waitingReason: null },
+  ])('requires a structured file delivery choice for $callID while $status and binds it to the clarification retry key', async ({ callID, status, waitingReason }) => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const clarification = { id: 'k7654321', version: 3, call_id: callID,
+      question: 'Do you need a file saved or only a chat answer?' };
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, workspace_id: 'w1234567', status, result: null,
+      waiting_reason: waitingReason, clarification_request: clarification, finished_at: null });
+    const answer = vi.spyOn(portalApi, 'answerTaskInput');
+    answer.mockRejectedValueOnce(new ApiError({ message: 'Synthetic invalid answer', code: 'invalid_argument', status: 400 }))
+      .mockResolvedValueOnce({ task_id: task.id, action: 'answer_input', status: 'running', unsettled_operation_ids: [] });
+    const user = userEvent.setup();
+    renderPage();
+
+    const card = await screen.findByRole('region', { name: '对话中的澄清请求' });
+    const answerBox = within(card).getByRole('textbox', { name: '澄清问题答复' });
+    const noneChoice = within(card).getByRole('radio', { name: '只需在聊天中回答' });
+    const requiredChoice = within(card).getByRole('radio', { name: '需要交付文件' });
+    const submit = within(card).getByRole('button', { name: '提交并继续' });
+    expect(noneChoice).toBeInTheDocument();
+    expect(requiredChoice).toBeInTheDocument();
+    expect(submit).toBeDisabled();
+
+    await user.type(answerBox, 'Please prepare the requested result.');
+    await user.click(noneChoice);
+    await user.click(submit);
+    await waitFor(() => expect(answer).toHaveBeenCalledTimes(1));
+    expect(answer.mock.calls[0]?.[1]).toEqual({
+      clarification_id: clarification.id, clarification_version: clarification.version,
+      answer: 'Please prepare the requested result.', file_delivery_intent: 'none',
+    });
+    const firstKey = answer.mock.calls[0]?.[2];
+
+    await within(card).findByRole('alert');
+    const retryRequiredChoice = within(card).getByRole('radio', { name: '需要交付文件' });
+    const retrySubmit = within(card).getByRole('button', { name: '提交并继续' });
+    expect(retryRequiredChoice).toBeEnabled();
+    await user.click(retryRequiredChoice);
+    expect(retryRequiredChoice).toBeChecked();
+    expect(retrySubmit).toBeEnabled();
+    await user.click(retrySubmit);
+    await waitFor(() => expect(answer).toHaveBeenCalledTimes(2));
+    expect(answer.mock.calls[1]?.[1]).toEqual({
+      clarification_id: clarification.id, clarification_version: clarification.version,
+      answer: 'Please prepare the requested result.', file_delivery_intent: 'required',
+    });
+    expect(answer.mock.calls[1]?.[2]).not.toBe(firstKey);
+    expect(await within(card).findByRole('status')).toHaveTextContent('补充信息已提交，等待任务状态更新。');
+  });
+
+  it('requires a Workspace before offering file delivery on an active route clarification', async () => {
+    mockCommon({ conversations: [conversation], messages: [message] });
+    const clarification = { id: 'k7654321', version: 4, call_id: 'morde-route-file-delivery-intent',
+      question: 'Do you need a file saved or only a chat answer?' };
+    vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, workspace_id: undefined, status: 'running', result: null,
+      waiting_reason: null, clarification_request: clarification, finished_at: null });
+    const answer = vi.spyOn(portalApi, 'answerTaskInput').mockResolvedValue({
+      task_id: task.id, action: 'answer_input', status: 'running', unsettled_operation_ids: [],
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    const card = await screen.findByRole('region', { name: '对话中的澄清请求' });
+    expect(within(card).getByRole('radio', { name: '只需在聊天中回答' })).toBeInTheDocument();
+    expect(within(card).queryByRole('radio', { name: '需要交付文件' })).not.toBeInTheDocument();
+    expect(within(card).getByRole('note')).toHaveTextContent('先绑定 Workspace，再重新提交此澄清');
+    const answerBox = within(card).getByRole('textbox', { name: '澄清问题答复' });
+    await user.type(answerBox, 'No file is needed.');
+    await user.click(within(card).getByRole('radio', { name: '只需在聊天中回答' }));
+    await user.click(within(card).getByRole('button', { name: '提交并继续' }));
+    await waitFor(() => expect(answer).toHaveBeenCalledWith(task.id, {
+      clarification_id: clarification.id, clarification_version: clarification.version,
+      answer: 'No file is needed.', file_delivery_intent: 'none',
+    }, expect.any(String)));
+  });
+
   it('links a browser authentication handoff to the exact task host', async () => {
     mockCommon({ conversations: [conversation], messages: [message], hosts: [targetHost] });
-    const clarification = { id: 'k7654321', version: 2, question: '请先在云端浏览器登录，然后告诉我继续。' };
+    const clarification = { id: 'k7654321', version: 2, call_id: 'call-clarify', question: '请先在云端浏览器登录，然后告诉我继续。' };
     vi.spyOn(portalApi, 'task').mockResolvedValue({
       ...task, status: 'waiting_user', result: null, waiting_reason: 'clarification_required', clarification_request: clarification,
       host_id: targetHost.id, steps: [{ id: 's1234567', sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
@@ -5021,7 +5101,7 @@ describe('Assistant durable tasks', () => {
   it('does not offer a Host handoff link for an ordinary clarification', async () => {
     mockCommon({ conversations: [conversation], messages: [message], hosts: [targetHost] });
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: 'clarification_required',
-      clarification_request: { id: 'k7654321', version: 2, question: '需要补充一个细节。' }, host_id: targetHost.id, finished_at: null });
+      clarification_request: { id: 'k7654321', version: 2, call_id: 'call-clarify', question: '需要补充一个细节。' }, host_id: targetHost.id, finished_at: null });
     renderPage();
     const activity = await findTaskActivity(task.id);
     expect(within(activity).getByRole('region', { name: '待补充信息' })).toHaveTextContent('需要补充一个细节。');
@@ -5031,7 +5111,7 @@ describe('Assistant durable tasks', () => {
 
   it('keeps clarification answer controls in the conversation and task details read-only', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
+    const clarification = { id: 'k7654321', version: 2, call_id: 'call-clarify', question: '文件应该保存在哪个目录？' };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null, waiting_reason: 'clarification_required', clarification_request: clarification, finished_at: null });
     const answer = vi.spyOn(portalApi, 'answerTaskInput');
     renderPage();
@@ -5047,7 +5127,7 @@ describe('Assistant durable tasks', () => {
 
   it('keeps clarification details read-only in task dynamics while preserving the conversation card', async () => {
     mockCommon({ conversations: [conversation], messages: [message] });
-    const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
+    const clarification = { id: 'k7654321', version: 2, call_id: 'call-clarify', question: '文件应该保存在哪个目录？' };
     const getTask = vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null,
       waiting_reason: 'clarification_required', clarification_request: clarification, finished_at: null });
     const answer = vi.spyOn(portalApi, 'answerTaskInput');
@@ -5063,7 +5143,7 @@ describe('Assistant durable tasks', () => {
   it.each(['approval', 'clarification'] as const)('does not report a %s response as successful after access is revoked', async (kind) => {
     mockCommon({ conversations: [conversation], messages: [message] });
     const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const, title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件', disclosures: unknownApprovalDisclosures, expires_at: null };
-    const clarification = { id: 'k7654321', version: 2, question: '文件应该保存在哪个目录？' };
+    const clarification = { id: 'k7654321', version: 2, call_id: 'call-clarify', question: '文件应该保存在哪个目录？' };
     vi.spyOn(portalApi, 'task').mockResolvedValue({ ...task, status: 'waiting_user', result: null,
       waiting_reason: kind === 'approval' ? 'approval_required' : 'clarification_required',
       pending_request: kind === 'approval' ? approval : null,

@@ -208,6 +208,7 @@ type Schedule struct {
 	ModelID               string
 	Title                 string
 	Objective             string
+	FileDeliveryIntent    task.FileDeliveryIntent `json:"file_delivery_intent"`
 	Timing                Timing
 	Budget                task.Budget
 	Authorization         task.Authorization
@@ -367,6 +368,7 @@ func Validate(s Schedule) error {
 		(s.HostID != "" && !domain.ValidHostID(s.HostID)) || s.ModelID == "" ||
 		strings.TrimSpace(s.Title) == "" || len(strings.TrimSpace(s.Title)) > 32768 ||
 		strings.TrimSpace(s.Objective) == "" || len(strings.TrimSpace(s.Objective)) > 32768 || !s.ExecutionPolicy.Valid() ||
+		!s.FileDeliveryIntent.Valid() ||
 		s.Authorization.Kind == "" || !s.MisfirePolicy.Valid() || s.ExecutionEpoch < 1 {
 		return errors.New("schedule fields are invalid")
 	}

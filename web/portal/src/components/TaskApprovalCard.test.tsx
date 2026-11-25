@@ -116,4 +116,19 @@ describe('TaskApprovalCard', () => {
     expect(screen.queryByRole('button', { name: '允许本次操作' })).not.toBeInTheDocument();
     expect(onDecision).not.toHaveBeenCalled();
   });
+
+  it('does not label an unknown cost basis as settled', () => {
+    const invalidBasis = {
+      ...approval,
+      status: 'approved' as const,
+      disclosures: {
+        ...approval.disclosures,
+        this_cost: { state: 'known', basis: 'unknown', amount_micros: 1_000_000, currency: 'USD' },
+      },
+    } as unknown as components['schemas']['TaskPendingRequest'];
+    render(<TaskApprovalCard approval={invalidBasis} onDecision={vi.fn()} />);
+
+    expect(screen.getByText('费用数据不完整')).toBeInTheDocument();
+    expect(screen.queryByText('已结算 USD 1')).not.toBeInTheDocument();
+  });
 });

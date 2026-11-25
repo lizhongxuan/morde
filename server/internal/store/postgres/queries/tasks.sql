@@ -118,7 +118,8 @@ GROUP BY COALESCE(tasks.host_id, '');
 SELECT * FROM task_steps WHERE task_id = $1 ORDER BY sequence;
 
 -- name: ListTaskBatchItems :many
-SELECT * FROM task_batch_items WHERE task_id = $1 ORDER BY created_at, id;
+SELECT id, task_id, item_key, input, file_delivery_intent, status, result, error, created_at, updated_at, attempt
+FROM task_batch_items WHERE task_id = $1 ORDER BY created_at, id;
 
 -- name: ListTaskArtifacts :many
 SELECT id, task_id, step_id, label, path, media_type, created_at, batch_item_id, batch_attempt,

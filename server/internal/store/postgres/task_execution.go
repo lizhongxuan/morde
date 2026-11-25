@@ -2417,6 +2417,16 @@ VALUES ($1,$2,$3,$4,$5,$6,'pending')`, clarification.ID, clarification.TaskID, c
 		if err := insertTaskEvent(ctx, tx, progress.Event); err != nil {
 			return err
 		}
+		if progress.Status == task.StatusWaitingUser && progress.Event.Type == "task.waiting_user" {
+			if err := enqueueTaskWaitingUnknownDeliveryInTx(ctx, tx, progress.TaskID, sequence, progress.Event.Type); err != nil {
+				return err
+			}
+		}
+		if progress.Status == task.StatusFailed || progress.Status == task.StatusCancelled {
+			if err := enqueueTaskTerminalDeliveryInTx(ctx, tx, progress.TaskID, sequence, progress.Event.Type); err != nil {
+				return err
+			}
+		}
 		if progress.AssistantMessage == nil {
 			if progress.Status != task.StatusRunning {
 				if err := interruptAssistantMessageSnapshot(ctx, tx, progress.TaskID, "", true); err != nil {
@@ -3333,8 +3343,19 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,'
 }
 
 func (s *Store) UpdateOperation(ctx context.Context, update app.OperationUpdate) (task.Operation, error) {
-	if !domain.ValidTaskID(update.TaskID) || update.OperationKey == "" || update.LeaseOwner == "" || update.LeaseVersion < 1 || !validOperationStatus(update.Status) {
+	if !domain.ValidTaskID(update.TaskID) || update.OperationKey == "" || update.LeaseOwner == "" || update.LeaseVersion < 1 || !validOperationStatus(update.Status) ||
+		update.PlanRevision < 0 || (update.PlanRevision == 0) != (update.PlanStepID == "") ||
+		(update.PlanStepID != "" && !validTaskPlanStepID(update.PlanStepID)) ||
+		(update.Status != task.OperationDispatched && (update.PlanRevision != 0 || update.PlanStepID != "")) ||
+		(update.InternalPurpose == "" && len(update.EvidenceSources) != 0) ||
+		(update.InternalPurpose != "" && (update.InternalPurpose != app.InternalOperationDispatchPurposeFileEvidenceRead ||
+			update.Status != task.OperationDispatched || update.PlanRevision != 0 || update.PlanStepID != "")) {
 		return task.Operation{}, domain.InvalidArgument("operation", "operation update fields are invalid")
+	}
+	if update.InternalPurpose == app.InternalOperationDispatchPurposeFileEvidenceRead {
+		if _, err := app.FileEvidenceReadRequestHash(update.OperationKey, update.EvidenceSources); err != nil {
+			return task.Operation{}, domain.InvalidArgument("operation.evidence_sources", "internal file evidence source proof is invalid")
+		}
 	}
 	var result task.Operation
 	var authorizationDenied bool
@@ -3517,6 +3538,21 @@ FROM tasks WHERE id=$1 FOR UPDATE`, update.TaskID).Scan(
 		}
 		if adoptingPrepared || rearming || update.Status == task.OperationDispatched {
 			if err := requireRunningTaskApplication(ctx, tx, row); err != nil {
+				return err
+			}
+		}
+		if update.Status == task.OperationDispatched {
+			current := rowTaskDomain(authorizationRow)
+			desiredRevision := authorizationRow.DesiredRevision
+			current.DesiredRevision = &desiredRevision
+			var err error
+			if update.InternalPurpose == app.InternalOperationDispatchPurposeFileEvidenceRead {
+				err = admitCloudDSHInternalFileEvidenceReadDispatchInTx(ctx, tx, current, operation, update.EvidenceSources)
+			} else {
+				err = admitCloudDSHTaskPlanStepOperationDispatchInTx(ctx, tx, current, operation,
+					update.PlanRevision, update.PlanStepID)
+			}
+			if err != nil {
 				return err
 			}
 		}

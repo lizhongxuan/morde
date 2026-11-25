@@ -119,6 +119,13 @@ func TestDomainConversions(t *testing.T) {
 	}
 }
 
+func TestTaskDomainProjectsBothTaskRevisions(t *testing.T) {
+	got := taskDomain(sqlcgen.Task{CurrentRevision: 4, DesiredRevision: 6})
+	if got.CurrentRevision == nil || *got.CurrentRevision != 4 || got.DesiredRevision == nil || *got.DesiredRevision != 6 {
+		t.Fatalf("task revision projection = current:%v desired:%v; want current:4 desired:6", got.CurrentRevision, got.DesiredRevision)
+	}
+}
+
 func TestStoreError(t *testing.T) {
 	if got := storeError("get host", "host", pgx.ErrNoRows); domain.CodeOf(got) != domain.CodeNotFound {
 		t.Fatalf("no rows mapped to %q, want not_found", domain.CodeOf(got))

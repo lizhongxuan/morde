@@ -343,6 +343,106 @@ WHERE workspace_id=$1 AND id=$2`, value.ID, projectSession.ID); err != nil {
 	}
 }
 
+func TestWorkspaceProjectFoldersAcceptOnlyBrowserOrDesktopWebSessions(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 10_000, 20_000)
+	value := createTestWorkspace(t, ctx, store, owner.ID, "sync-project-folder-client-session")
+	hostValue := createTestHost(t, ctx, store, owner.ID, app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{value.ID})
+	hostValue = startWorkspaceSyncTestHost(t, ctx, store, hostValue)
+	binding, err := store.GetWorkspaceBinding(ctx, hostValue.ID, value.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.TransitionWorkspaceBinding(ctx, hostValue.ID, value.ID, binding.BindingVersion,
+		workspace.BindingPreparing, workspace.BindingActive, value.Revision, 0); err != nil {
+		t.Fatal(err)
+	}
+	service, err := app.NewWorkspaceSyncDeviceService(store, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	portalToken := clientTestToken(t, owner.ID, "", identity.KindSession, nil)
+	if _, err := store.CreateToken(ctx, portalToken); err != nil {
+		t.Fatal(err)
+	}
+	portal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: portalToken.ID}
+	if _, err := service.CreateFolder(ctx, portal, hostValue.ID, "portal-project", "portal-project-folder-key"); err != nil {
+		t.Fatalf("portal session creates a project folder: %v", err)
+	}
+	portalFolders, err := service.ListFolders(ctx, portal, hostValue.ID)
+	if err != nil || len(portalFolders) != 1 || portalFolders[0].ProjectName != "portal-project" {
+		t.Fatalf("portal session lists project folders = %#v, %v", portalFolders, err)
+	}
+
+	newClientWebSession := func(platform string) (identity.Principal, string) {
+		t.Helper()
+		installationID := createTestClientInstallation(t, store.pool, owner.ID, nil)
+		if platform != "desktop" {
+			if _, err := store.pool.Exec(ctx, `UPDATE client_installations SET platform=$2 WHERE id=$1`, installationID, platform); err != nil {
+				t.Fatal(err)
+			}
+		}
+		clientToken := clientTestToken(t, owner.ID, installationID, identity.KindClient, nil)
+		if _, err := store.CreateToken(ctx, clientToken); err != nil {
+			t.Fatal(err)
+		}
+		client := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindClient,
+			TokenID: clientToken.ID, ClientInstallationID: installationID}
+		webToken := clientTestToken(t, owner.ID, installationID, identity.KindSession, nil)
+		if err := store.IssueClientWebSession(ctx, client, webToken); err != nil {
+			t.Fatalf("issue %s client web session: %v", platform, err)
+		}
+		return identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession,
+			TokenID: webToken.ID, ClientInstallationID: installationID}, installationID
+	}
+
+	desktop, desktopInstallationID := newClientWebSession("desktop")
+	if _, err := service.CreateFolder(ctx, desktop, hostValue.ID, "desktop-project", "desktop-project-folder-key"); err != nil {
+		t.Fatalf("desktop client web session creates a project folder: %v", err)
+	}
+	desktopFolders, err := service.ListFolders(ctx, desktop, hostValue.ID)
+	if err != nil || len(desktopFolders) != 2 {
+		t.Fatalf("desktop client web session lists project folders = %#v, %v", desktopFolders, err)
+	}
+
+	ios, _ := newClientWebSession("ios")
+	if _, err := service.ListFolders(ctx, ios, hostValue.ID); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("iOS client web session list error = %v, want unauthenticated", err)
+	}
+	if _, err := service.CreateFolder(ctx, ios, hostValue.ID, "ios-project", "ios-project-folder-key"); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("iOS client web session create error = %v, want unauthenticated", err)
+	}
+
+	mismatched, _ := newClientWebSession("desktop")
+	otherInstallation := createTestClientInstallation(t, store.pool, owner.ID, nil)
+	mismatched.ClientInstallationID = otherInstallation
+	if _, err := service.ListFolders(ctx, mismatched, hostValue.ID); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("mismatched installation list error = %v, want unauthenticated", err)
+	}
+
+	revoked, revokedInstallation := newClientWebSession("desktop")
+	if _, err := store.pool.Exec(ctx, `UPDATE client_installations SET revoked_at=clock_timestamp() WHERE id=$1`, revokedInstallation); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ListFolders(ctx, revoked, hostValue.ID); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("revoked installation list error = %v, want unauthenticated", err)
+	}
+
+	expired, _ := newClientWebSession("desktop")
+	if _, err := store.pool.Exec(ctx, `UPDATE tokens SET expires_at=clock_timestamp()-interval '1 second' WHERE id=$1`, expired.TokenID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.ListFolders(ctx, expired, hostValue.ID); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("expired session list error = %v, want unauthenticated", err)
+	}
+
+	if _, err := service.ListFolders(ctx, desktop, hostValue.ID); err != nil {
+		t.Fatalf("desktop session stops working after unrelated installation revocations: %v (installation %s)", err, desktopInstallationID)
+	}
+}
+
 func TestWorkspaceSyncProjectFolderRegistrationWaitsForReceiveReservation(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()

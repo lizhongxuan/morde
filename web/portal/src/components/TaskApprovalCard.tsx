@@ -22,7 +22,8 @@ function costDisclosure(value: components['schemas']['TaskApprovalCostDisclosure
   if (!value) return '未知';
   if (value.state !== 'known') return value.state === 'not_applicable' ? '不适用' : '未知';
   if (value.amount_micros === null || !Number.isSafeInteger(value.amount_micros) || value.amount_micros < 0 ||
-    !value.currency || !/^[A-Z]{3}$/.test(value.currency) || !value.basis) return '费用数据不完整';
+    !value.currency || !/^[A-Z]{3}$/.test(value.currency) ||
+    (value.basis !== 'estimate' && value.basis !== 'settled')) return '费用数据不完整';
   const whole = Math.floor(value.amount_micros / 1_000_000).toLocaleString('zh-CN');
   const fraction = String(value.amount_micros % 1_000_000).padStart(6, '0').replace(/0+$/u, '');
   return `${value.basis === 'estimate' ? '估算' : '已结算'} ${value.currency} ${whole}${fraction ? `.${fraction}` : ''}`;

@@ -11,6 +11,7 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/schedule"
+	"morde/server/internal/domain/task"
 )
 
 const (
@@ -117,8 +118,17 @@ func ValidateObjectBody(objectType, objectID string, body []byte) error {
 	}
 	if objectType == ObjectTypeSchedule {
 		var value schedule.SyncDefinition
-		if !decodePersonalObject(body, &value, "status", "host_id", "model_id", "title", "objective", "timing", "budget", "misfire_policy", "notification_events", "observation") ||
-			schedule.ValidateSyncDefinition(objectID, value) != nil {
+		if !decodePersonalObject(body, &value, "status", "host_id", "model_id", "title", "objective", "file_delivery_intent", "timing", "budget", "misfire_policy", "notification_events", "observation") {
+			return invalidPersonalBody()
+		}
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(body, &fields); err != nil {
+			return invalidPersonalBody()
+		}
+		if _, present := fields["file_delivery_intent"]; !present {
+			value.FileDeliveryIntent = task.FileDeliveryNone
+		}
+		if schedule.ValidateSyncDefinition(objectID, value) != nil {
 			return invalidPersonalBody()
 		}
 		return nil

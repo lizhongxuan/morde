@@ -11,16 +11,17 @@ import (
 // SyncDefinition is the client-visible definition. Execution credentials and
 // occurrence/runtime state stay server-side.
 type SyncDefinition struct {
-	Status             Status              `json:"status"`
-	HostID             *string             `json:"host_id"`
-	ModelID            string              `json:"model_id"`
-	Title              string              `json:"title"`
-	Objective          string              `json:"objective"`
-	Timing             Timing              `json:"timing"`
-	Budget             SyncBudget          `json:"budget"`
-	MisfirePolicy      MisfirePolicy       `json:"misfire_policy"`
-	NotificationEvents []NotificationEvent `json:"notification_events"`
-	Observation        *ObservationSpec    `json:"observation,omitempty"`
+	Status             Status                  `json:"status"`
+	HostID             *string                 `json:"host_id"`
+	ModelID            string                  `json:"model_id"`
+	Title              string                  `json:"title"`
+	Objective          string                  `json:"objective"`
+	FileDeliveryIntent task.FileDeliveryIntent `json:"file_delivery_intent"`
+	Timing             Timing                  `json:"timing"`
+	Budget             SyncBudget              `json:"budget"`
+	MisfirePolicy      MisfirePolicy           `json:"misfire_policy"`
+	NotificationEvents []NotificationEvent     `json:"notification_events"`
+	Observation        *ObservationSpec        `json:"observation,omitempty"`
 }
 
 type SyncBudget struct {
@@ -34,9 +35,14 @@ func NewSyncDefinition(value Schedule) SyncDefinition {
 	if value.HostID != "" {
 		hostID = &value.HostID
 	}
+	fileDeliveryIntent := value.FileDeliveryIntent
+	if fileDeliveryIntent == "" {
+		fileDeliveryIntent = task.FileDeliveryNone
+	}
 	return SyncDefinition{
 		Status: value.Status, HostID: hostID, ModelID: value.ModelID, Title: value.Title, Objective: value.Objective,
-		Timing: value.Timing, Budget: SyncBudget{ActiveSeconds: value.Budget.ActiveSeconds,
+		FileDeliveryIntent: fileDeliveryIntent,
+		Timing:             value.Timing, Budget: SyncBudget{ActiveSeconds: value.Budget.ActiveSeconds,
 			ToolCalls: value.Budget.ToolCalls, ModelTokens: value.Budget.ModelTokens},
 		MisfirePolicy: value.MisfirePolicy, NotificationEvents: append([]NotificationEvent(nil), value.NotificationEvents...),
 		Observation: value.Observation,
@@ -51,6 +57,7 @@ func ValidateSyncDefinition(id string, value SyncDefinition) error {
 	if !ValidID(id) || !value.Status.Valid() || (hostID != "" && !domain.ValidHostID(hostID)) || value.ModelID == "" ||
 		len(value.ModelID) > 200 || strings.TrimSpace(value.Title) == "" || len(strings.TrimSpace(value.Title)) > 32768 ||
 		strings.TrimSpace(value.Objective) == "" || len(strings.TrimSpace(value.Objective)) > 32768 ||
+		!value.FileDeliveryIntent.Valid() || value.FileDeliveryIntent != task.FileDeliveryNone ||
 		!value.MisfirePolicy.Valid() || value.Timing.Validate() != nil ||
 		(task.Budget{ActiveSeconds: value.Budget.ActiveSeconds, ToolCalls: value.Budget.ToolCalls, ModelTokens: value.Budget.ModelTokens}).Validate() != nil {
 		return errors.New("schedule sync definition is invalid")

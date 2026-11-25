@@ -1914,16 +1914,17 @@ type TaskAssistantMessageSnapshot struct {
 }
 
 type TaskBatchItem struct {
-	ID        string             `json:"id"`
-	TaskID    string             `json:"task_id"`
-	ItemKey   string             `json:"item_key"`
-	Input     string             `json:"input"`
-	Status    string             `json:"status"`
-	Result    string             `json:"result"`
-	Error     string             `json:"error"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
-	Attempt   int32              `json:"attempt"`
+	ID                 string             `json:"id"`
+	TaskID             string             `json:"task_id"`
+	ItemKey            string             `json:"item_key"`
+	Input              string             `json:"input"`
+	FileDeliveryIntent string             `json:"file_delivery_intent"`
+	Status             string             `json:"status"`
+	Result             string             `json:"result"`
+	Error              string             `json:"error"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	Attempt            int32              `json:"attempt"`
 }
 
 type TaskClarificationRequest struct {

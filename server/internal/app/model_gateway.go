@@ -26,13 +26,14 @@ import (
 type ModelCallSource string
 
 const (
-	ModelCallClient     ModelCallSource = "client"
-	ModelCallChat       ModelCallSource = "chat"
-	ModelCallTask       ModelCallSource = "task"
-	ModelCallProbe      ModelCallSource = "probe"
-	ModelCallRoute      ModelCallSource = "route"
-	ModelCallCompaction ModelCallSource = "compaction"
-	ModelCallReview     ModelCallSource = "review"
+	ModelCallClient           ModelCallSource = "client"
+	ModelCallChat             ModelCallSource = "chat"
+	ModelCallTask             ModelCallSource = "task"
+	ModelCallProbe            ModelCallSource = "probe"
+	ModelCallRoute            ModelCallSource = "route"
+	ModelCallCompaction       ModelCallSource = "compaction"
+	ModelCallReview           ModelCallSource = "review"
+	ModelCallTerminalDelivery ModelCallSource = "terminal_delivery"
 )
 
 type ModelTaskFence struct {
@@ -58,16 +59,17 @@ type ModelTaskProjectResolver interface {
 }
 
 type ModelCall struct {
-	Source        ModelCallSource
-	Principal     identity.Principal
-	Task          *ModelTaskFence
-	Review        *TaskValidationReviewModelFence
-	Summary       *ConversationSummaryModelFence
-	ModelID       string
-	CallID        string
-	RawRequest    json.RawMessage
-	ImageResolver TaskModelImageResolver
-	Request       ModelRequest
+	Source           ModelCallSource
+	Principal        identity.Principal
+	Task             *ModelTaskFence
+	Review           *TaskValidationReviewModelFence
+	TerminalDelivery *TaskTerminalDeliveryModelFence
+	Summary          *ConversationSummaryModelFence
+	ModelID          string
+	CallID           string
+	RawRequest       json.RawMessage
+	ImageResolver    TaskModelImageResolver
+	Request          ModelRequest
 }
 
 type ModelCallReservation struct {
@@ -75,6 +77,7 @@ type ModelCallReservation struct {
 	Principal         identity.Principal
 	Task              *ModelTaskFence
 	Review            *TaskValidationReviewModelFence
+	TerminalDelivery  *TaskTerminalDeliveryModelFence
 	Summary           *ConversationSummaryModelFence
 	Route             *ConversationRouteModelFence
 	ProjectID         string
@@ -103,6 +106,7 @@ type ModelCallSettlement struct {
 	Summary               *ConversationSummaryModelFence
 	TaskCall              *ModelCallReservation
 	ReviewCall            *ModelCallReservation
+	TerminalDeliveryCall  *ModelCallReservation
 	ResponseCiphertext    []byte
 	ResponseDigest        []byte
 	ResponseTextDigest    []byte
@@ -261,6 +265,8 @@ func (s *ModelGatewayService) reserveModelCall(ctx context.Context, source Model
 				_, _, err = s.projectBudget.reserveConversationSummaryModelCall(ctx, projectID, reservation, usage)
 			} else if source == ModelCallReview {
 				_, _, err = s.projectBudget.reserveTaskValidationReviewModelCall(ctx, projectID, reservation, usage)
+			} else if source == ModelCallTerminalDelivery {
+				_, _, err = s.projectBudget.reserveTaskTerminalDeliveryModelCall(ctx, projectID, reservation, usage)
 			} else {
 				_, _, err = s.projectBudget.reserveTaskModelCall(ctx, projectID, reservation, usage)
 			}
@@ -384,8 +390,20 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		return ModelResponse{}, domain.InvalidArgument("model_call", "model call context is required")
 	}
 	call.Task = normalizedModelTaskFence(call.Task)
-	if (call.Source == ModelCallCompaction || call.Source == ModelCallTask || call.Source == ModelCallReview) && s.responseSealer == nil {
+	if (call.Source == ModelCallCompaction || call.Source == ModelCallTask || call.Source == ModelCallReview || call.Source == ModelCallTerminalDelivery) && s.responseSealer == nil {
 		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "model response encryption is unavailable")
+	}
+	if call.Source == ModelCallTerminalDelivery {
+		if call.TerminalDelivery == nil {
+			return ModelResponse{}, domain.InvalidArgument("model_call", "invalid terminal delivery model call")
+		}
+		stored, found, err := s.RecoverTaskTerminalDeliveryDSHModelResponse(ctx, *call.TerminalDelivery, call.RawRequest)
+		if err != nil {
+			return ModelResponse{}, err
+		}
+		if found {
+			return stored, nil
+		}
 	}
 	if call.Source == ModelCallTask {
 		if call.Task == nil || call.Request.Endpoint != (ModelEndpoint{}) {
@@ -402,6 +420,11 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if call.Source == ModelCallReview && (call.Review == nil || call.Task != nil || call.Summary != nil ||
 		len(call.Request.Tools) != 0 || call.Request.RequiredTool != "") {
 		return ModelResponse{}, domain.InvalidArgument("model_call", "invalid Task validation review model call")
+	}
+	if call.Source == ModelCallTerminalDelivery && (call.TerminalDelivery == nil || !ValidTaskTerminalDeliveryModelDispatchFence(*call.TerminalDelivery) || call.Task != nil || call.Review != nil ||
+		call.Summary != nil || call.Principal.UserID != "" || call.Principal.TokenID != "" ||
+		call.Principal.ClientInstallationID != "" || len(call.Request.Tools) != 0 || call.Request.RequiredTool != "") {
+		return ModelResponse{}, domain.InvalidArgument("model_call", "invalid terminal delivery model call")
 	}
 	ownerID, digest, reserve, err := validateModelCall(call)
 	if err != nil {
@@ -436,6 +459,15 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "Task validation review project scope is unavailable")
 		}
 		projectID, err = resolver.ModelTaskProjectIDForReview(ctx, *call.Review)
+		if err != nil {
+			return ModelResponse{}, err
+		}
+	} else if call.Source == ModelCallTerminalDelivery {
+		resolver, ok := s.store.(TaskTerminalDeliveryModelProjectResolver)
+		if !ok {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "terminal delivery project scope is unavailable")
+		}
+		projectID, err = resolver.ModelTaskProjectIDForTerminalDelivery(ctx, *call.TerminalDelivery)
 		if err != nil {
 			return ModelResponse{}, err
 		}
@@ -483,7 +515,8 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "project model budget is unavailable")
 	}
 	reservation := ModelCallReservation{
-		Source: call.Source, Principal: call.Principal, Task: call.Task, Review: call.Review, Summary: call.Summary, OwnerID: ownerID,
+		Source: call.Source, Principal: call.Principal, Task: call.Task, Review: call.Review,
+		TerminalDelivery: call.TerminalDelivery, Summary: call.Summary, OwnerID: ownerID,
 		ProjectID: projectID, PersonalModel: endpoint.Personal,
 		ModelID: call.ModelID, ProviderEndpoint: endpoint.Endpoint.BaseURL, ProviderModel: endpoint.Endpoint.ModelID, ConnectionVersion: endpoint.Version,
 		NeedsTools: needsTools, NeedsVision: needsVision, CallID: call.CallID, RequestDigest: digest[:], ReservedTokens: reserve,
@@ -588,7 +621,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			dispatchErr = explicit.Err()
 		}
 	}
-	if call.Source == ModelCallTask && dispatchErr != nil {
+	if (call.Source == ModelCallTask || call.Source == ModelCallTerminalDelivery) && dispatchErr != nil {
 		abandonCtx, cancelAbandon := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancelAbandon()
 		if abandonErr := s.store.AbandonModelCallReservation(abandonCtx, reservation); abandonErr != nil {
@@ -615,7 +648,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			}
 		}
 	}
-	if call.Source == ModelCallTask && providerCtx.Err() != nil {
+	if (call.Source == ModelCallTask || call.Source == ModelCallTerminalDelivery) && providerCtx.Err() != nil {
 		err := providerCtx.Err()
 		finishProvider()
 		abandonCtx, cancelAbandon := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -630,6 +663,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: call.CallID, Usage: response.Usage,
 		ProviderReportedModel: response.ProviderReportedModel,
 		Unknown:               callErr != nil || !response.Usage.Known, Summary: call.Summary}
+	if call.Source == ModelCallTerminalDelivery {
+		settlement.TerminalDeliveryCall = &reservation
+	}
 	if response.Usage.Known && (response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 || response.Usage.InputTokens > math.MaxInt64-response.Usage.OutputTokens) {
 		settlement.Unknown = true
 		settlement.Usage = ModelUsage{}
@@ -637,6 +673,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	var summaryOutputErr error
 	var reviewOutputErr error
+	var terminalDeliveryOutputErr error
 	if call.Source == ModelCallCompaction && !settlement.Unknown {
 		if failure := ValidateConversationSummaryModelResponse(response); failure != nil {
 			settlement.ResponseInvalid = true
@@ -664,6 +701,25 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 				settlement.ReviewCall = &reservation
 				settlement.ResponseCiphertext, settlement.ResponseDigest = stored.Ciphertext, stored.Digest
 				settlement.ResponseTextDigest = stored.TextDigest
+			}
+		}
+	}
+	if call.Source == ModelCallTerminalDelivery && !settlement.Unknown {
+		if !validTaskTerminalDeliveryModelResponse(response) {
+			settlement.ResponseInvalid = true
+			terminalDeliveryOutputErr = domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid terminal delivery response")
+		} else {
+			ciphertext, sealErr := sealTaskTerminalDeliveryModelResponse(s.responseSealer, *call.TerminalDelivery,
+				call.ModelID, reservation.RequestDigest, response)
+			if sealErr != nil {
+				settlement.ResponseInvalid = true
+				terminalDeliveryOutputErr = domain.NewError(domain.CodeInvalidState, "terminal delivery model result could not be stored safely")
+			} else {
+				cipherDigest := sha256.Sum256(ciphertext)
+				textDigest := sha256.Sum256([]byte(response.Text))
+				settlement.ResponseCiphertext = ciphertext
+				settlement.ResponseDigest = append([]byte(nil), cipherDigest[:]...)
+				settlement.ResponseTextDigest = append([]byte(nil), textDigest[:]...)
 			}
 		}
 	}
@@ -696,17 +752,18 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			ProviderReportedModel: settlement.ProviderReportedModel,
 			Summary:               call.Summary, TaskCall: settlement.TaskCall, ResponseCiphertext: settlement.ResponseCiphertext,
 			ReviewCall: settlement.ReviewCall, ResponseDigest: settlement.ResponseDigest, ResponseInvalid: settlement.ResponseInvalid,
-			ResponseTextDigest: settlement.ResponseTextDigest,
+			TerminalDeliveryCall: settlement.TerminalDeliveryCall, ResponseTextDigest: settlement.ResponseTextDigest,
 		})
 	} else {
 		settleErr = s.store.SettleModelCall(settleCtx, settlement)
 	}
 	if settleErr != nil {
-		if call.Source == ModelCallReview && projectCall && !settlement.Unknown {
+		if (call.Source == ModelCallReview || call.Source == ModelCallTerminalDelivery) && projectCall && !settlement.Unknown {
 			unknownCtx, cancelUnknown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancelUnknown()
 			unknownErr := s.projectBudget.SettleModelCall(unknownCtx, SettleProjectModelCallCommand{
 				ProjectID: projectID, Source: call.Source, CallID: call.CallID, Unknown: true,
+				TerminalDeliveryCall: settlement.TerminalDeliveryCall,
 			})
 			if unknownErr != nil {
 				return ModelResponse{}, errors.Join(fmt.Errorf("settle project review model call: %w", settleErr),
@@ -716,11 +773,12 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			return ModelResponse{}, fmt.Errorf("settle project review model call: %w", settleErr)
 		}
 		if (call.Source == ModelCallTask && !settlement.Unknown ||
-			call.Source == ModelCallCompaction || call.Source == ModelCallReview) && !projectCall {
+			call.Source == ModelCallCompaction || call.Source == ModelCallReview || call.Source == ModelCallTerminalDelivery) && !projectCall {
 			unknownCtx, cancelUnknown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancelUnknown()
 			unknownErr := s.store.SettleModelCall(unknownCtx, ModelCallSettlement{Source: call.Source, OwnerID: ownerID,
-				CallID: call.CallID, Unknown: true, Summary: call.Summary})
+				CallID: call.CallID, Unknown: true, Summary: call.Summary,
+				TerminalDeliveryCall: settlement.TerminalDeliveryCall})
 			if unknownErr != nil {
 				return ModelResponse{}, errors.Join(fmt.Errorf("settle model call: %w", settleErr),
 					fmt.Errorf("preserve unknown model usage: %w", unknownErr))
@@ -752,6 +810,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	if taskOutputErr != nil {
 		return ModelResponse{}, taskOutputErr
+	}
+	if terminalDeliveryOutputErr != nil {
+		return ModelResponse{}, terminalDeliveryOutputErr
 	}
 	if !response.Usage.Known {
 		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "model usage is unknown and requires reconciliation")
@@ -880,6 +941,28 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 		if err != nil || expectedCallID != call.CallID {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid conversation summary model call identity")
 		}
+	case ModelCallTerminalDelivery:
+		if call.TerminalDelivery == nil || call.Task != nil || call.Review != nil || call.Summary != nil ||
+			call.Principal.UserID != "" || call.Principal.TokenID != "" || call.Principal.ClientInstallationID != "" ||
+			call.Request.RequiredTool != "" || len(call.Request.Tools) != 0 || len(call.RawRequest) == 0 || !json.Valid(call.RawRequest) ||
+			!ValidTaskTerminalDeliveryModelFence(*call.TerminalDelivery) {
+			return "", empty, 0, domain.InvalidArgument("model_call", "invalid terminal delivery model fence")
+		}
+		for _, input := range call.Request.Input {
+			if input.Type != "message" || len(input.Images) != 0 || input.CallID != "" || input.Name != "" || input.Arguments != "" || input.Output != "" {
+				return "", empty, 0, domain.InvalidArgument("model_call", "terminal delivery model call must be text-only")
+			}
+			for _, part := range input.Parts {
+				if part.Type == "image" || part.Image != nil {
+					return "", empty, 0, domain.InvalidArgument("model_call", "terminal delivery model call must be text-only")
+				}
+			}
+		}
+		id, err := DSHTerminalDeliveryModelCallID(*call.TerminalDelivery)
+		if err != nil || id != call.CallID {
+			return "", empty, 0, domain.InvalidArgument("model_call", "invalid terminal delivery model call identity")
+		}
+		ownerID = call.TerminalDelivery.InitiatorID
 	default:
 		return "", empty, 0, domain.InvalidArgument("model_call", "invalid model call source")
 	}

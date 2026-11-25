@@ -562,6 +562,11 @@ FROM task_validation_reviews WHERE task_id=$1`, current.Task.ID).
 	if updated, err := f.store.CompleteTaskValidationReview(ctx, completion); err != nil || updated {
 		t.Fatalf("duplicate completion changed persisted review: updated=%v err=%v", updated, err)
 	}
+	var lateValidationDeliveries int
+	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_terminal_delivery_outbox
+WHERE task_id=$1 AND source_kind='late_validation'`, current.Task.ID).Scan(&lateValidationDeliveries); err != nil || lateValidationDeliveries != 0 {
+		t.Fatalf("unpublished first result created %d late-validation deliveries err=%v", lateValidationDeliveries, err)
+	}
 	var taskStatus string
 	if err := f.store.pool.QueryRow(ctx, `SELECT status FROM tasks WHERE id=$1`, current.Task.ID).Scan(&taskStatus); err != nil || taskStatus != string(task.StatusCompleted) {
 		t.Fatalf("review changed Task lifecycle: status=%q err=%v", taskStatus, err)
@@ -1196,14 +1201,19 @@ VALUES ($1,$2,$3,$4,$5,0,0,1,'succeeded',$6,$7,'shell_exec',$8,$9,$4)`,
 	insertApproval(1, "call-suite-pass", suiteDigest[:])
 	insertApproval(2, "call-targeted-pass", targetedDigest[:])
 
-	planPayload, err := json.Marshal(appTaskPlanEvent{TaskRevision: revision, PlanRevision: 1,
-		Plan: task.Plan{TaskRevision: revision, Revision: 1, Goal: "Fix the login bug", CostEstimateState: "unknown",
-			Steps:   []task.PlanStep{{ID: "step-1", Title: "Reproduce the bug", Status: task.PlanStepPending}},
-			FixPlan: &task.FixPlan{ChangedFiles: []string{"auth.go"}, Risks: []string{"regression"}, Alternatives: []string{"revert"}}},
-		Detail: struct {
-			CallID         string `json:"call_id"`
-			AgentSessionID string `json:"agent_session_id"`
-		}{CallID: "call-plan-1"}})
+	plan := task.Plan{TaskRevision: revision, Revision: 1, Goal: "Fix the login bug", CostEstimateState: "unknown",
+		Steps:   []task.PlanStep{{ID: "step-1", Title: "Reproduce the bug", Status: task.PlanStepPending}},
+		FixPlan: &task.FixPlan{ChangedFiles: []string{"auth.go"}, Risks: []string{"regression"}, Alternatives: []string{"revert"}}}
+	planCommit := app.CloudDSHTaskPlanCommit{TaskID: created.Task.ID, OwnerID: owner.ID, AgentSessionID: "e09-session",
+		AuthorizationVersion: details.Task.Authorization.Version, CallID: "call-plan-1", Plan: plan}
+	planCommit.FingerprintSHA256 = postgresCloudDSHTaskPlanFingerprint(planCommit)
+	planEvent := appTaskPlanEvent{TaskRevision: revision, PlanRevision: 1, Plan: plan}
+	planEvent.Detail.CallID = planCommit.CallID
+	planEvent.Detail.AgentSessionID = planCommit.AgentSessionID
+	planEvent.Detail.Tool = "morde_task_plan_update"
+	planEvent.Detail.AuthorizationVersion = planCommit.AuthorizationVersion
+	planEvent.Detail.FingerprintSHA256 = planCommit.FingerprintSHA256
+	planPayload, err := json.Marshal(planEvent)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -541,6 +541,10 @@ type AssistantTextDelta struct {
 type OperationUpdate struct {
 	TaskID              string
 	OperationKey        string
+	PlanRevision        int64
+	PlanStepID          string
+	InternalPurpose     InternalOperationDispatchPurpose
+	EvidenceSources     []OperationEvidenceSource
 	LeaseOwner          string
 	LeaseVersion        int64
 	RuntimeGeneration   int64
@@ -552,6 +556,26 @@ type OperationUpdate struct {
 	Status              task.OperationStatus
 	ExternalID          string
 	Result              string
+}
+
+// InternalOperationDispatchPurpose identifies a small set of trusted
+// read-only operations that are not model-selected plan steps.
+type InternalOperationDispatchPurpose string
+
+const InternalOperationDispatchPurposeFileEvidenceRead InternalOperationDispatchPurpose = "file_evidence_read"
+
+// OperationEvidenceSource binds an internal Workspace verification read to
+// the durable file_write call whose output produced the candidate evidence.
+type OperationEvidenceSource struct {
+	OperationKey   string `json:"operation_key"`
+	CallID         string `json:"call_id"`
+	WorkspaceID    string `json:"workspace_id"`
+	BindingVersion int64  `json:"binding_version"`
+	RequestHash    []byte `json:"request_hash"`
+	Result         string `json:"result"`
+	Path           string `json:"path"`
+	Size           int64  `json:"size"`
+	SHA256         string `json:"sha256"`
 }
 
 // TaskEventPage carries the task authorization and stream cursor state with a

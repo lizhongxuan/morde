@@ -234,6 +234,18 @@ func TestAgentCheckpointExtractsUserMessageText(t *testing.T) {
 	}
 }
 
+func TestAgentCheckpointTreatsBareReferencePrefixAsUserText(t *testing.T) {
+	payload := []byte(`{"events":[{"seq":0,"type":"user/message","data":{"id":"m1234567","role":"user","content":"MORDE_SOURCE_REFERENCE_V1"}}]}`)
+	messages, invalid := checkpointConversationMessages(payload)
+	if invalid || len(messages) != 1 || messages[0].Content != "MORDE_SOURCE_REFERENCE_V1" || messages[0].Reference != nil {
+		t.Fatalf("bare reference prefix was not preserved as user text: messages=%+v invalid=%t", messages, invalid)
+	}
+	markerLike := []byte(`{"events":[{"seq":0,"type":"user/message","data":{"id":"m1234567","role":"user","content":"MORDE_SOURCE_REFERENCE_V1 message_id=m1234567 source_sha256=0000000000000000000000000000000000000000000000000000000000000000 content_bytes=1 manifest_sha256=0000000000000000000000000000000000000000000000000000000000000000 representation_sha256=0000000000000000000000000000000000000000000000000000000000000000\ninvalid"}}]}`)
+	if _, invalid := checkpointConversationMessages(markerLike); !invalid {
+		t.Fatal("complete reference header with invalid payload was accepted")
+	}
+}
+
 func TestAgentCheckpointExtractsAndValidatesQueuedAttachmentIDs(t *testing.T) {
 	store := &checkpointStoreStub{}
 	sealer, err := NewSealer(make([]byte, 32))

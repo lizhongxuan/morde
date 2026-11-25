@@ -28,6 +28,7 @@ type CreateScheduleCommand struct {
 	ModelID            string
 	Title              *string
 	Objective          string
+	FileDeliveryIntent task.FileDeliveryIntent
 	Timing             schedule.Timing
 	Budget             task.Budget
 	Observation        *schedule.ObservationSpec
@@ -42,6 +43,7 @@ type UpdateScheduleCommand struct {
 	ModelID            *string
 	Title              *string
 	Objective          *string
+	FileDeliveryIntent *task.FileDeliveryIntent
 	Timing             *schedule.Timing
 	Budget             *task.Budget
 	ObservationSet     bool

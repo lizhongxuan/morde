@@ -1973,7 +1973,9 @@ export const handlers = [
     const timestamp = now();
     const value: Schedule = {
       id: id("j"), version: 1, status: "enabled", host_id: body.host_id, model_id: body.model_id,
-      title: body.title ?? body.objective.trim(), objective: body.objective, timing: body.timing, budget: body.budget, misfire_policy: body.misfire_policy ?? "skip",
+      title: body.title ?? body.objective.trim(), objective: body.objective,
+      file_delivery_intent: body.file_delivery_intent ?? "none",
+      timing: body.timing, budget: body.budget, misfire_policy: body.misfire_policy ?? "skip",
       notification_events: body.notification_events ?? ["completed", "failed", "waiting_user"],
       observation: body.observation ?? null,
       next_run_at: body.timing.kind === "once" ? body.timing.run_at : new Date(Date.now() + 60_000).toISOString(),

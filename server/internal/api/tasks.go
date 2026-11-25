@@ -35,7 +35,7 @@ type TaskService interface {
 	RequestAction(context.Context, identity.Principal, string, task.Action, task.Status, string) (app.TaskActionResult, error)
 	RetryBatchItem(context.Context, identity.Principal, string, string, string) error
 	RespondToPendingRequest(context.Context, identity.Principal, string, string, int64, task.PendingDecision, string) error
-	AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, string) error
+	AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, task.FileDeliveryIntent, string) error
 	ListEvents(context.Context, identity.Principal, string, int64, int32) (app.TaskEventPage, error)
 }
 
@@ -396,6 +396,7 @@ type taskClarificationRequestResponse struct {
 	ID       string `json:"id"`
 	Version  int64  `json:"version"`
 	Question string `json:"question"`
+	CallID   string `json:"call_id"`
 }
 
 func validTaskText(value string, maxRunes int) bool {
@@ -544,15 +545,16 @@ type taskArtifactResponse struct {
 }
 
 type submitTaskRequest struct {
-	HostID          string             `json:"host_id"`
-	WorkspaceID     string             `json:"workspace_id"`
-	InputRevision   *int64             `json:"input_revision"`
-	MCPConnectorIDs []string           `json:"mcp_connector_ids"`
-	ApplicationID   string             `json:"application_id"`
-	ModelID         string             `json:"model_id"`
-	Objective       string             `json:"objective"`
-	Budget          *taskBudgetRequest `json:"budget"`
-	BatchItems      []batchItemRequest `json:"batch_items"`
+	HostID             string             `json:"host_id"`
+	WorkspaceID        string             `json:"workspace_id"`
+	InputRevision      *int64             `json:"input_revision"`
+	MCPConnectorIDs    []string           `json:"mcp_connector_ids"`
+	ApplicationID      string             `json:"application_id"`
+	ModelID            string             `json:"model_id"`
+	Objective          string             `json:"objective"`
+	FileDeliveryIntent json.RawMessage    `json:"file_delivery_intent"`
+	Budget             *taskBudgetRequest `json:"budget"`
+	BatchItems         []batchItemRequest `json:"batch_items"`
 }
 
 type taskBudgetRequest struct {
@@ -562,8 +564,9 @@ type taskBudgetRequest struct {
 }
 
 type batchItemRequest struct {
-	Key   string `json:"key"`
-	Input string `json:"input"`
+	Key                string          `json:"key"`
+	Input              string          `json:"input"`
+	FileDeliveryIntent json.RawMessage `json:"file_delivery_intent"`
 }
 
 type taskActionRequest struct {
@@ -588,9 +591,25 @@ func parseOptionalTaskActionRevision(raw json.RawMessage) (*int64, bool) {
 }
 
 type taskInputRequest struct {
-	ClarificationID      string `json:"clarification_id"`
-	ClarificationVersion int64  `json:"clarification_version"`
-	Answer               string `json:"answer"`
+	ClarificationID      string          `json:"clarification_id"`
+	ClarificationVersion int64           `json:"clarification_version"`
+	Answer               string          `json:"answer"`
+	FileDeliveryIntent   json.RawMessage `json:"file_delivery_intent"`
+}
+
+func parseFileDeliveryIntentRequest(raw json.RawMessage, allowUnclear bool) (task.FileDeliveryIntent, bool) {
+	if raw == nil {
+		return "", true
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return "", false
+	}
+	intent := task.FileDeliveryIntent(value)
+	if !intent.Valid() || !allowUnclear && intent == task.FileDeliveryUnclear {
+		return "", false
+	}
+	return intent, true
 }
 
 type taskApprovalResponseRequest struct {
@@ -957,8 +976,13 @@ func (h *api) addTaskInput(service TaskService) gin.HandlerFunc {
 			writeError(c, domain.InvalidArgument("input", "a clarification id, positive version, and answer are required"))
 			return
 		}
+		fileIntent, valid := parseFileDeliveryIntentRequest(request.FileDeliveryIntent, false)
+		if !valid {
+			writeError(c, domain.InvalidArgument("file_delivery_intent", "file delivery intent must be none or required"))
+			return
+		}
 		if err := service.AnswerClarificationRequest(c.Request.Context(), principal, taskID, request.ClarificationID,
-			request.ClarificationVersion, request.Answer, c.GetHeader("Idempotency-Key")); err != nil {
+			request.ClarificationVersion, request.Answer, fileIntent, c.GetHeader("Idempotency-Key")); err != nil {
 			writeError(c, err)
 			return
 		}
@@ -1019,19 +1043,29 @@ func (h *api) submitTask(service TaskService) gin.HandlerFunc {
 		if !decodeStrictTaskJSON(c, &request) {
 			return
 		}
+		fileIntent, valid := parseFileDeliveryIntentRequest(request.FileDeliveryIntent, true)
+		if !valid {
+			writeError(c, domain.InvalidArgument("file_delivery_intent", "file delivery intent is invalid"))
+			return
+		}
 		budget, ok := requestBudget(c, request.Budget)
 		if !ok {
 			return
 		}
 		batchItems := make([]app.BatchItemInput, 0, len(request.BatchItems))
 		for _, item := range request.BatchItems {
-			batchItems = append(batchItems, app.BatchItemInput{Key: item.Key, Input: item.Input})
+			itemIntent, valid := parseFileDeliveryIntentRequest(item.FileDeliveryIntent, true)
+			if !valid {
+				writeError(c, domain.InvalidArgument("batch_items.file_delivery_intent", "batch item file delivery intent is invalid"))
+				return
+			}
+			batchItems = append(batchItems, app.BatchItemInput{Key: item.Key, Input: item.Input, FileDeliveryIntent: itemIntent})
 		}
 		result, err := service.Submit(c.Request.Context(), principal, app.SubmitTaskCommand{
 			HostID: request.HostID, WorkspaceID: request.WorkspaceID, InputRevision: request.InputRevision,
 			MCPConnectorIDs: request.MCPConnectorIDs,
 			ApplicationID:   request.ApplicationID, ModelID: request.ModelID,
-			Objective: request.Objective, Budget: budget, BatchItems: batchItems,
+			Objective: request.Objective, FileDeliveryIntent: fileIntent, Budget: budget, BatchItems: batchItems,
 			IdempotencyKey: c.GetHeader("Idempotency-Key"),
 		})
 		if err != nil {
@@ -1477,7 +1511,11 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		if clarification.Status != task.ClarificationPending {
 			continue
 		}
-		if value.Task.Status != task.StatusWaitingUser || value.Task.WaitingReason != "clarification_required" ||
+		routeFileDeliveryClarification := clarification.CallID == task.RouteFileDeliveryIntentClarificationCallID
+		waitingStatusValid := value.Task.Status == task.StatusWaitingUser && value.Task.WaitingReason == "clarification_required"
+		routeStatusValid := routeFileDeliveryClarification && (value.Task.Status == task.StatusPausing || value.Task.Status == task.StatusPaused) &&
+			value.Task.WaitingReason == ""
+		if (!waitingStatusValid && !routeStatusValid) ||
 			!domain.ValidPendingRequestID(clarification.ID) || clarification.TaskID != value.Task.ID || clarification.Version < 1 ||
 			!domain.ValidStepID(clarification.ModelStepID) || clarification.CallID == "" || len(clarification.CallID) > 256 ||
 			!validTaskText(clarification.Question, 4096) || clarification.Answer != "" || clarification.RespondedAt != nil {
@@ -1487,7 +1525,7 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 		}
 		response.ClarificationRequest = &taskClarificationRequestResponse{
-			ID: clarification.ID, Version: clarification.Version, Question: clarification.Question,
+			ID: clarification.ID, Version: clarification.Version, Question: clarification.Question, CallID: clarification.CallID,
 		}
 	}
 	if stop := value.StopRequest; stop != nil {

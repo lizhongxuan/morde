@@ -236,7 +236,8 @@ FOR UPDATE OF task`, claim.TaskID, claim.OwnerID, claim.TaskRevision, claim.Resu
 		if err != nil {
 			return err
 		}
-		verdict := app.SummarizeTaskValidationEvaluations(app.EvaluateTaskValidationReview(completion.Report, facts))
+		evaluations := app.EvaluateTaskValidationReview(completion.Report, facts)
+		verdict := app.SummarizeTaskValidationEvaluations(evaluations)
 		if completion.SessionID != completion.ReviewerModel.SessionID {
 			return domain.NewError(domain.CodeConflict, "Task validation review session does not match its model response")
 		}
@@ -291,9 +292,121 @@ WHERE review.task_id=$1 AND review.task_revision=$3 AND review.owner_id=$2
 			return fmt.Errorf("complete Task validation review: %w", err)
 		}
 		completed = updated.RowsAffected() == 1
+		if !completed {
+			return nil
+		}
+		verdictDigest, err := taskValidationDeliveryVerdictDigest(claim, verdict, evaluations, report, artifactContentEvidence)
+		if err != nil {
+			return err
+		}
+		if err := enqueueLateTaskValidationDeliveryInTx(ctx, tx, claim, verdict, verdictDigest, report, artifactContentEvidence); err != nil {
+			return fmt.Errorf("enqueue late Task validation delivery: %w", err)
+		}
 		return nil
 	})
+	if err != nil {
+		completed = false
+	}
 	return completed, err
+}
+
+type taskValidationDeliveryVerdictCheck struct {
+	ID                  app.TaskHardCheckID                  `json:"id"`
+	Outcome             app.TaskValidationCheckOutcome       `json:"outcome"`
+	NotApplicableReason app.TaskHardCheckNotApplicableReason `json:"not_applicable_reason,omitempty"`
+	NonBlockingNote     string                               `json:"non_blocking_note,omitempty"`
+}
+
+// taskValidationDeliveryVerdictDigest binds the outbox identity to the
+// server-owned conclusion and its bounded review/evidence references.
+func taskValidationDeliveryVerdictDigest(claim app.TaskValidationReviewClaim, verdict app.TaskValidationSummary,
+	evaluations []app.TaskValidationCheckEvaluation, report, artifactContentEvidence []byte) ([]byte, error) {
+	if !app.ValidTaskValidationReviewClaim(claim) || !app.ValidTaskValidationState(verdict.State) ||
+		len(evaluations) != 7 || !json.Valid(report) || !json.Valid(artifactContentEvidence) {
+		return nil, domain.InvalidArgument("task_validation_delivery", "Task validation delivery facts are invalid")
+	}
+	checks := make([]taskValidationDeliveryVerdictCheck, len(evaluations))
+	for index, evaluation := range evaluations {
+		checks[index] = taskValidationDeliveryVerdictCheck{ID: evaluation.ID, Outcome: evaluation.Outcome,
+			NotApplicableReason: evaluation.NotApplicableReason, NonBlockingNote: evaluation.NonBlockingNote}
+	}
+	encoded, err := json.Marshal(struct {
+		Version                 int                                  `json:"version"`
+		TaskID                  string                               `json:"task_id"`
+		TaskRevision            int64                                `json:"task_revision"`
+		ResultEventSequence     int64                                `json:"result_event_sequence"`
+		ResultSHA256            []byte                               `json:"result_sha256"`
+		ClaimGeneration         int64                                `json:"claim_generation"`
+		State                   app.TaskValidationState              `json:"state"`
+		Checks                  []taskValidationDeliveryVerdictCheck `json:"checks"`
+		ReviewReport            json.RawMessage                      `json:"review_report"`
+		ArtifactContentEvidence json.RawMessage                      `json:"artifact_content_evidence"`
+	}{1, claim.TaskID, claim.TaskRevision, claim.ResultEventSequence, claim.ResultSHA256, claim.ClaimGeneration,
+		verdict.State, checks, report, artifactContentEvidence})
+	if err != nil {
+		return nil, fmt.Errorf("encode Task validation delivery verdict: %w", err)
+	}
+	digest := sha256.Sum256(encoded)
+	return digest[:], nil
+}
+
+// enqueueLateTaskValidationDeliveryInTx adds an independent source only after
+// the first result receipt has been published. The Task lock held by
+// CompleteTaskValidationReview serializes this check with result publication;
+// an unpublished receipt will observe the just-committed verdict instead.
+func enqueueLateTaskValidationDeliveryInTx(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim,
+	verdict app.TaskValidationSummary, verdictDigest, report, artifactContentEvidence []byte) error {
+	if ctx == nil || tx == nil || !app.ValidTaskValidationReviewClaim(claim) || !app.ValidTaskValidationState(verdict.State) || len(verdictDigest) != sha256.Size {
+		return domain.InvalidArgument("task_validation_delivery", "Task validation delivery source is invalid")
+	}
+	if !json.Valid(report) || !json.Valid(artifactContentEvidence) {
+		return domain.InvalidArgument("task_validation_delivery", "Task validation delivery evidence is invalid")
+	}
+	_, err := tx.Exec(ctx, `INSERT INTO task_terminal_delivery_outbox
+(task_id,owner_id,conversation_id,initiator_id,task_revision,authorization_version,source_kind,
+ source_event_sequence,source_event_type,source_sha256,result_sha256,validation_claim_generation,verdict_sha256)
+SELECT task.id,task.owner_id,task.conversation_id,task.initiator_id,task.current_revision,task.auth_version,'late_validation',
+       event.sequence,event.event_type,sha256(convert_to(event.payload::text,'UTF8')),
+       review.result_sha256,review.claim_generation,$7
+FROM task_validation_reviews review
+JOIN tasks task ON task.id=review.task_id AND task.owner_id=review.owner_id
+JOIN task_events event ON event.task_id=review.task_id AND event.sequence=review.result_event_sequence
+WHERE review.task_id=$1 AND review.owner_id=$2 AND review.task_revision=$5
+  AND review.result_event_sequence=$6 AND review.result_sha256=$8 AND review.claim_generation=$9
+  AND review.state='reviewed' AND review.validation_state=$10 AND review.review_report=$11::jsonb
+  AND review.artifact_content_evidence=$12::jsonb
+  AND task.initiator_id=$3 AND task.conversation_id=$4 AND task.status='completed'
+  AND task.current_revision=review.task_revision AND task.desired_revision=review.task_revision
+  AND event.task_revision=review.task_revision AND event.event_type='task.result'
+  AND event.result_content_sha256=review.result_sha256
+  AND task.result<>'' AND sha256(convert_to(task.result,'UTF8'))=review.result_sha256
+  AND (
+    EXISTS (
+    SELECT 1 FROM conversation_result_sources source
+    JOIN conversation_result_batches batch ON batch.message_id=source.batch_message_id
+    WHERE source.task_id=review.task_id AND source.task_revision=review.task_revision
+      AND source.event_sequence=review.result_event_sequence AND source.state='published'
+      AND batch.state='published' AND batch.published_message_id IS NOT NULL
+      AND batch.owner_id=task.owner_id AND batch.actor_id=task.initiator_id
+      AND batch.conversation_id=task.conversation_id
+    )
+    OR EXISTS (
+      SELECT 1 FROM conversation_messages message
+      WHERE message.task_id=task.id AND message.owner_id=task.owner_id
+        AND message.actor_id=task.initiator_id AND message.conversation_id=task.conversation_id
+        AND message.role='assistant' AND message.output_status='completed'
+        AND message.output_task_revision=review.task_revision
+        AND message.output_result_event_sequence=review.result_event_sequence
+        AND message.content=task.result
+    )
+  )
+ON CONFLICT DO NOTHING`, claim.TaskID, claim.OwnerID, claim.InitiatorID, claim.ConversationID,
+		claim.TaskRevision, claim.ResultEventSequence, verdictDigest, claim.ResultSHA256, claim.ClaimGeneration,
+		verdict.State, string(report), string(artifactContentEvidence))
+	if err != nil {
+		return fmt.Errorf("persist late Task validation source: %w", err)
+	}
+	return nil
 }
 
 func loadTaskValidationVerdictFacts(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim, result string,
@@ -390,8 +503,9 @@ WHERE st.task_id=$1 AND st.task_revision=$2 AND st.status='succeeded' AND st.det
 //     considered independently verified.
 //   - H06: repeated errors and their correction records, from the step
 //     digests.
-//   - H07: fix-task replay remains pending without immutable workspace
-//     and coverage proof; other tasks use the verified read-back compare.
+//   - H07: fix-task replay remains pending without plan-revision, immutable
+//     Workspace-version, and coverage bindings; other tasks use the verified
+//     read-back compare.
 func loadTaskValidationExecutionFacts(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim, facts *app.TaskValidationVerdictFacts) error {
 	steps, err := listTaskStepsWithActivity(ctx, tx, claim.TaskID)
 	if err != nil {
@@ -420,8 +534,9 @@ func loadTaskValidationExecutionFacts(ctx context.Context, tx pgx.Tx, claim app.
 	}
 	hasFixPlan := plan != nil && plan.FixPlan != nil
 	facts.ReplayVerified = !hasFixPlan && app.EvaluateTaskValidationReplay(false, app.TestGateResult{}, facts.EvidenceContentVerified)
-	// shortcut: shell exit stamps do not bind test coverage to an immutable
-	// Workspace version; keep fix-task replay pending until that proof exists.
+	// shortcut: current test-step stamps do not bind to a plan revision or an
+	// immutable Workspace version; keep fix-task replay pending until those
+	// identities and coverage proof are persisted.
 	return nil
 }
 

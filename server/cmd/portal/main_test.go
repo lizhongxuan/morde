@@ -280,7 +280,8 @@ func (s *cloudDSHTaskServiceProbe) RespondToPendingRequest(_ context.Context, _ 
 	return nil
 }
 
-func (s *cloudDSHTaskServiceProbe) AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string, string) error {
+func (s *cloudDSHTaskServiceProbe) AnswerClarificationRequest(context.Context, identity.Principal, string, string, int64, string,
+	task.FileDeliveryIntent, string) error {
 	s.answers++
 	return nil
 }
@@ -348,7 +349,7 @@ func TestCloudDSHDisabledKeepsReadsAndRejectsNewExecution(t *testing.T) {
 	if err := services.tasks.RespondToPendingRequest(context.Background(), principal, "t1234567", "p1234567", 1, task.PendingDecisionReject, "reject-key"); err != nil || len(tasks.decisions) != 1 || tasks.decisions[0] != task.PendingDecisionReject {
 		t.Fatalf("pending rejection = %v, underlying decisions = %v", err, tasks.decisions)
 	}
-	if err := services.tasks.AnswerClarificationRequest(context.Background(), principal, "t1234567", "p1234567", 1, "answer", "answer-key"); domain.CodeOf(err) != domain.CodeHostNotReady || tasks.answers != 0 {
+	if err := services.tasks.AnswerClarificationRequest(context.Background(), principal, "t1234567", "p1234567", 1, "answer", task.FileDeliveryNone, "answer-key"); domain.CodeOf(err) != domain.CodeHostNotReady || tasks.answers != 0 {
 		t.Fatalf("clarification answer = %v, underlying calls = %d", err, tasks.answers)
 	}
 

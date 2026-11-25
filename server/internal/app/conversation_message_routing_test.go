@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -10,6 +11,7 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/workspace"
 )
 
 type conversationReceiptStoreStub struct {
@@ -20,6 +22,100 @@ type conversationReceiptStoreStub struct {
 func (s *conversationReceiptStoreStub) AcceptConversationMessage(_ context.Context, receipt ConversationMessageReceipt) (conversation.Message, bool, error) {
 	s.receipts = append(s.receipts, receipt)
 	return receipt.Message, false, nil
+}
+
+type conversationReceiptWorkspaceStoreStub struct {
+	*conversationReceiptStoreStub
+	value workspace.Workspace
+}
+
+func (s *conversationReceiptWorkspaceStoreStub) GetWorkspace(_ context.Context, id string) (workspace.Workspace, error) {
+	if id != s.value.ID {
+		return workspace.Workspace{}, domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	return s.value, nil
+}
+
+func (s *conversationReceiptWorkspaceStoreStub) GetWorkspaceManifestPageForOwner(_ context.Context, ownerID, workspaceID string,
+	revision int64, _ string, _ string, _ int32) (workspace.ManifestPage, error) {
+	if ownerID != s.value.OwnerID || workspaceID != s.value.ID || revision != s.value.Revision {
+		return workspace.ManifestPage{}, domain.NewError(domain.CodeNotFound, "workspace manifest not found")
+	}
+	return workspace.ManifestPage{WorkspaceID: workspaceID, Revision: revision,
+		Files: []workspace.File{}, EmptyDirectories: []string{}, Directories: []workspace.Directory{}}, nil
+}
+
+func TestConversationReceiptCapturesWorkspaceInputSnapshotAndKeepsRetryHashStable(t *testing.T) {
+	principal := taskTestPrincipal()
+	base := &conversationReceiptStoreStub{taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
+		"c1234567": {ID: "c1234567", OwnerID: principal.UserID},
+	}}}
+	store := &conversationReceiptWorkspaceStoreStub{conversationReceiptStoreStub: base,
+		value: workspace.Workspace{ID: "w1234567", OwnerID: principal.UserID, State: workspace.StateReady, Revision: 3}}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := AcceptConversationMessageCommand{ServiceInstanceID: "11111111-1111-4111-8111-111111111111",
+		ClientMessageID: "message-workspace-01", IdempotencyKey: "message-workspace-01", Content: "分析这个工作区。", WorkspaceID: store.value.ID}
+	if _, _, err := service.AcceptConversationMessage(context.Background(), principal, "c1234567", command); err != nil {
+		t.Fatal(err)
+	}
+	first := base.receipts[0]
+	if first.Input.WorkspaceInputRevision == nil || *first.Input.WorkspaceInputRevision != 3 || len(first.Input.WorkspaceContextDigest) != 32 {
+		t.Fatalf("accepted receipt did not capture the selected Workspace snapshot: revision=%v digest_bytes=%d",
+			first.Input.WorkspaceInputRevision, len(first.Input.WorkspaceContextDigest))
+	}
+	wantDigest, err := workspace.ManifestTreeWithMetadataSHA256(nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first.Input.WorkspaceContextDigest, mustDecodeWorkspaceDigest(t, wantDigest)) {
+		t.Fatalf("captured Workspace digest = %x, want manifest digest %s", first.Input.WorkspaceContextDigest, wantDigest)
+	}
+
+	store.value.Revision = 4
+	if _, _, err := service.AcceptConversationMessage(context.Background(), principal, "c1234567", command); err != nil {
+		t.Fatal(err)
+	}
+	second := base.receipts[1]
+	if second.Input.WorkspaceInputRevision == nil || *second.Input.WorkspaceInputRevision != 4 {
+		t.Fatalf("new receipt attempt did not capture its current Workspace revision: %v", second.Input.WorkspaceInputRevision)
+	}
+	if !bytes.Equal(first.RequestHash, second.RequestHash) {
+		t.Fatal("server-captured Workspace revision changed the client message idempotency hash")
+	}
+}
+
+func TestConversationReceiptDoesNotAuthorizeForeignWorkspaceSnapshot(t *testing.T) {
+	principal := taskTestPrincipal()
+	base := &conversationReceiptStoreStub{taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{
+		"c1234567": {ID: "c1234567", OwnerID: principal.UserID},
+	}}}
+	store := &conversationReceiptWorkspaceStoreStub{conversationReceiptStoreStub: base,
+		value: workspace.Workspace{ID: "w1234567", OwnerID: "u7654321", State: workspace.StateReady, Revision: 3}}
+	service, err := NewTaskService(store, &taskAuthorizerStub{}, &modelCatalogStub{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := AcceptConversationMessageCommand{ServiceInstanceID: "11111111-1111-4111-8111-111111111111",
+		ClientMessageID: "message-workspace-foreign", IdempotencyKey: "message-workspace-foreign", Content: "分析这个工作区。", WorkspaceID: store.value.ID}
+	if _, _, err := service.AcceptConversationMessage(context.Background(), principal, "c1234567", command); err != nil {
+		t.Fatal(err)
+	}
+	if base.receipts[0].Input.WorkspaceID != store.value.ID || base.receipts[0].Input.WorkspaceInputRevision != nil ||
+		len(base.receipts[0].Input.WorkspaceContextDigest) != 0 {
+		t.Fatalf("foreign Workspace was treated as an authorized snapshot: %+v", base.receipts[0].Input)
+	}
+}
+
+func mustDecodeWorkspaceDigest(t *testing.T, value string) []byte {
+	t.Helper()
+	decoded, err := hex.DecodeString(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decoded
 }
 
 func TestConversationReceiptDefersModelAndHostChecks(t *testing.T) {

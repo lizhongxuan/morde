@@ -26,77 +26,78 @@ import (
 )
 
 type taskServiceStub struct {
-	submitCommand          app.SubmitTaskCommand
-	submitCalls            int
-	submitReplayed         bool
-	acceptedConversationID string
-	acceptCommand          app.AcceptConversationMessageCommand
-	acceptCalls            int
-	acceptReplayed         bool
-	listRequest            app.TaskListRequest
-	listCalls              int
-	listPage               app.TaskPage
-	conversationTasks      app.TaskPage
-	conversationTaskID     string
-	conversationTaskView   app.ConversationTaskView
-	conversationTaskCalls  int
-	approvalConversationID string
-	approvalPage           app.TaskApprovalPage
-	approvalCalls          int
-	getID                  string
-	getPrincipal           identity.Principal
-	getDetails             *app.TaskDetails
-	stepDetail             app.TaskStepDetail
-	stepDetailCalls        int
-	stepDetailTaskID       string
-	stepDetailStepID       string
-	stepRetryResult        app.TaskStepRetryResult
-	stepRetryCalls         int
-	stepRetryTaskID        string
-	stepRetryStepID        string
-	stepRetryRevision      int64
-	stepRetryAttempt       int64
-	stepRetryIdempotency   string
-	actionTaskID           string
-	action                 task.Action
-	actionExpected         task.Status
-	actionRevisionFence    *app.TaskActionRevisionFence
-	actionKey              string
-	actionCalls            int
-	priorityCalls          int
-	priorityTaskID         string
-	priorityValue          task.QueuePriority
-	priorityEventSequence  int64
-	priorityKey            string
-	retryTaskID            string
-	retryItemID            string
-	retryKey               string
-	retryCalls             int
-	responseTaskID         string
-	responseID             string
-	responseVersion        int64
-	responseDecision       task.PendingDecision
-	responseKey            string
-	responseCalls          int
-	clarificationTaskID    string
-	clarificationID        string
-	clarificationVersion   int64
-	clarificationAnswer    string
-	clarificationKey       string
-	clarificationCalls     int
-	events                 []task.Event
-	eventPrincipal         identity.Principal
-	eventStatus            task.Status
-	eventCurrentSequence   int64
-	eventCalls             int
-	eventAfter             int64
-	eventErrorAfterCall    int
-	eventPages             []app.TaskEventPage
-	revokeTaskID           string
-	revokeConnectorID      string
-	revokeVersion          int64
-	revokeCalls            int
-	err                    error
+	submitCommand           app.SubmitTaskCommand
+	submitCalls             int
+	submitReplayed          bool
+	acceptedConversationID  string
+	acceptCommand           app.AcceptConversationMessageCommand
+	acceptCalls             int
+	acceptReplayed          bool
+	listRequest             app.TaskListRequest
+	listCalls               int
+	listPage                app.TaskPage
+	conversationTasks       app.TaskPage
+	conversationTaskID      string
+	conversationTaskView    app.ConversationTaskView
+	conversationTaskCalls   int
+	approvalConversationID  string
+	approvalPage            app.TaskApprovalPage
+	approvalCalls           int
+	getID                   string
+	getPrincipal            identity.Principal
+	getDetails              *app.TaskDetails
+	stepDetail              app.TaskStepDetail
+	stepDetailCalls         int
+	stepDetailTaskID        string
+	stepDetailStepID        string
+	stepRetryResult         app.TaskStepRetryResult
+	stepRetryCalls          int
+	stepRetryTaskID         string
+	stepRetryStepID         string
+	stepRetryRevision       int64
+	stepRetryAttempt        int64
+	stepRetryIdempotency    string
+	actionTaskID            string
+	action                  task.Action
+	actionExpected          task.Status
+	actionRevisionFence     *app.TaskActionRevisionFence
+	actionKey               string
+	actionCalls             int
+	priorityCalls           int
+	priorityTaskID          string
+	priorityValue           task.QueuePriority
+	priorityEventSequence   int64
+	priorityKey             string
+	retryTaskID             string
+	retryItemID             string
+	retryKey                string
+	retryCalls              int
+	responseTaskID          string
+	responseID              string
+	responseVersion         int64
+	responseDecision        task.PendingDecision
+	responseKey             string
+	responseCalls           int
+	clarificationTaskID     string
+	clarificationID         string
+	clarificationVersion    int64
+	clarificationAnswer     string
+	clarificationFileIntent task.FileDeliveryIntent
+	clarificationKey        string
+	clarificationCalls      int
+	events                  []task.Event
+	eventPrincipal          identity.Principal
+	eventStatus             task.Status
+	eventCurrentSequence    int64
+	eventCalls              int
+	eventAfter              int64
+	eventErrorAfterCall     int
+	eventPages              []app.TaskEventPage
+	revokeTaskID            string
+	revokeConnectorID       string
+	revokeVersion           int64
+	revokeCalls             int
+	err                     error
 }
 
 type conversationRecoveryTaskServiceStub struct {
@@ -282,10 +283,11 @@ func (s *taskServiceStub) RespondToPendingRequest(_ context.Context, _ identity.
 	return s.err
 }
 
-func (s *taskServiceStub) AnswerClarificationRequest(_ context.Context, _ identity.Principal, taskID, clarificationID string, version int64, answer, idempotencyKey string) error {
+func (s *taskServiceStub) AnswerClarificationRequest(_ context.Context, _ identity.Principal, taskID, clarificationID string, version int64,
+	answer string, fileIntent task.FileDeliveryIntent, idempotencyKey string) error {
 	s.clarificationCalls++
 	s.clarificationTaskID, s.clarificationID, s.clarificationVersion = taskID, clarificationID, version
-	s.clarificationAnswer, s.clarificationKey = answer, idempotencyKey
+	s.clarificationAnswer, s.clarificationFileIntent, s.clarificationKey = answer, fileIntent, idempotencyKey
 	return s.err
 }
 
@@ -324,7 +326,7 @@ func (s *taskServiceStub) RevokeMCPConnectorGrant(_ context.Context, _ identity.
 func TestTaskSubmitHandlerPassesRequestAndReturnsStableShape(t *testing.T) {
 	service := &taskServiceStub{}
 	engine := taskAPIRouter(service, nil)
-	request := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(`{"host_id":"h1234567","workspace_id":"w1234567","input_revision":7,"mcp_connector_ids":["kbbbbbbb","kaaaaaaa"],"application_id":"wechat","model_id":"model-a","objective":"summarize files","batch_items":[]}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(`{"host_id":"h1234567","workspace_id":"w1234567","input_revision":7,"mcp_connector_ids":["kbbbbbbb","kaaaaaaa"],"application_id":"wechat","model_id":"model-a","objective":"summarize files","file_delivery_intent":"none","batch_items":[{"key":"row-a","input":"save this result","file_delivery_intent":"required"},{"key":"row-b","input":"explain this result","file_delivery_intent":"none"}]}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "retry-key-007")
 	response := httptest.NewRecorder()
@@ -332,7 +334,10 @@ func TestTaskSubmitHandlerPassesRequestAndReturnsStableShape(t *testing.T) {
 	if response.Code != http.StatusAccepted || service.submitCalls != 1 || service.submitCommand.IdempotencyKey != "retry-key-007" || service.submitCommand.HostID != "h1234567" ||
 		service.submitCommand.WorkspaceID != "w1234567" || service.submitCommand.InputRevision == nil || *service.submitCommand.InputRevision != 7 ||
 		service.submitCommand.ApplicationID != "wechat" || service.submitCommand.ModelID != "model-a" || len(service.submitCommand.MCPConnectorIDs) != 2 ||
-		service.submitCommand.MCPConnectorIDs[0] != "kbbbbbbb" || service.submitCommand.MCPConnectorIDs[1] != "kaaaaaaa" {
+		service.submitCommand.MCPConnectorIDs[0] != "kbbbbbbb" || service.submitCommand.MCPConnectorIDs[1] != "kaaaaaaa" ||
+		service.submitCommand.FileDeliveryIntent != task.FileDeliveryNone || len(service.submitCommand.BatchItems) != 2 ||
+		service.submitCommand.BatchItems[0].FileDeliveryIntent != task.FileDeliveryRequired ||
+		service.submitCommand.BatchItems[1].FileDeliveryIntent != task.FileDeliveryNone {
 		t.Fatalf("status=%d calls=%d command=%#v body=%s", response.Code, service.submitCalls, service.submitCommand, response.Body.String())
 	}
 	var body map[string]json.RawMessage
@@ -365,6 +370,26 @@ func TestTaskSubmitRejectsUnknownFieldsBeforeCallingService(t *testing.T) {
 	engine.ServeHTTP(response, request)
 	if response.Code != http.StatusBadRequest || service.submitCalls != 0 {
 		t.Fatalf("status=%d calls=%d body=%s", response.Code, service.submitCalls, response.Body.String())
+	}
+}
+
+func TestTaskSubmitRejectsInvalidFileDeliveryIntentsBeforeCallingService(t *testing.T) {
+	for _, body := range []string{
+		`{"model_id":"model-a","objective":"summarize","file_delivery_intent":"maybe"}`,
+		`{"model_id":"model-a","objective":"summarize","file_delivery_intent":null}`,
+		`{"model_id":"model-a","objective":"summarize","batch_items":[{"key":"row-a","input":"save","file_delivery_intent":"maybe"}]}`,
+		`{"model_id":"model-a","objective":"summarize","batch_items":[{"key":"row-a","input":"save","file_delivery_intent":null}]}`,
+	} {
+		service := &taskServiceStub{}
+		engine := taskAPIRouter(service, nil)
+		request := httptest.NewRequest(http.MethodPost, "/api/tasks", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "retry-key-invalid-intent")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || service.submitCalls != 0 {
+			t.Errorf("body=%s status=%d submit_calls=%d", body, response.Code, service.submitCalls)
+		}
 	}
 }
 
@@ -441,7 +466,7 @@ func TestTaskActionRespondsToExactPendingRequest(t *testing.T) {
 func TestTaskActionAnswersExactClarification(t *testing.T) {
 	service := &taskServiceStub{}
 	engine := taskAPIRouter(service, nil)
-	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/inputs", strings.NewReader(`{"clarification_id":"r1234567","clarification_version":2,"answer":"Use staging"}`))
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/inputs", strings.NewReader(`{"clarification_id":"r1234567","clarification_version":2,"answer":"Use staging","file_delivery_intent":"required"}`))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "clarify-key-001")
 	response := httptest.NewRecorder()
@@ -452,8 +477,28 @@ func TestTaskActionAnswersExactClarification(t *testing.T) {
 	}
 	if response.Code != http.StatusAccepted || service.clarificationCalls != 1 || service.clarificationTaskID != "q1234567" ||
 		service.clarificationID != "r1234567" || service.clarificationVersion != 2 || service.clarificationAnswer != "Use staging" ||
+		service.clarificationFileIntent != task.FileDeliveryRequired ||
 		service.clarificationKey != "clarify-key-001" || body.TaskID != "q1234567" || body.Action != "answer_clarification" || body.Status != task.StatusQueued {
 		t.Fatalf("status=%d calls=%d request=%#v response=%#v body=%s", response.Code, service.clarificationCalls, service, body, response.Body.String())
+	}
+}
+
+func TestTaskInputRejectsInvalidFileDeliveryIntentBeforeCallingService(t *testing.T) {
+	for _, body := range []string{
+		`{"clarification_id":"r1234567","clarification_version":1,"answer":"answer","file_delivery_intent":"unclear"}`,
+		`{"clarification_id":"r1234567","clarification_version":1,"answer":"answer","file_delivery_intent":"maybe"}`,
+		`{"clarification_id":"r1234567","clarification_version":1,"answer":"answer","file_delivery_intent":null}`,
+	} {
+		service := &taskServiceStub{}
+		engine := taskAPIRouter(service, nil)
+		request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/inputs", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Idempotency-Key", "clarify-invalid-intent")
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || service.clarificationCalls != 0 {
+			t.Errorf("body=%s status=%d clarification_calls=%d", body, response.Code, service.clarificationCalls)
+		}
 	}
 }
 
@@ -956,6 +1001,38 @@ func TestTaskResponseIncludesOnlyPendingClarificationForClarificationWait(t *tes
 	}
 }
 
+func TestTaskResponseProjectsRouteClarificationOnPausingOrPausedTask(t *testing.T) {
+	for _, status := range []task.Status{task.StatusPausing, task.StatusPaused} {
+		t.Run(string(status), func(t *testing.T) {
+			current := apiTestTask()
+			current.Status = status
+			value := app.TaskDetails{Task: current, ClarificationRequests: []task.ClarificationRequest{{
+				ID: "r1234567", TaskID: current.ID, Version: 2, ModelStepID: "s1234567",
+				CallID: task.RouteFileDeliveryIntentClarificationCallID, Question: "Does this update need a file?", Status: task.ClarificationPending,
+			}}}
+			view, err := toTaskResponse(value)
+			if err != nil || view.ClarificationRequest == nil || view.ClarificationRequest.CallID != task.RouteFileDeliveryIntentClarificationCallID ||
+				view.ClarificationRequest.Version != 2 {
+				t.Fatalf("route clarification projection = %#v err=%v", view.ClarificationRequest, err)
+			}
+		})
+	}
+	current := apiTestTask()
+	value := app.TaskDetails{Task: current, ClarificationRequests: []task.ClarificationRequest{{
+		ID: "r1234567", TaskID: current.ID, Version: 1, ModelStepID: "s1234567",
+		CallID: task.RouteFileDeliveryIntentClarificationCallID, Question: "Does this update need a file?", Status: task.ClarificationPending,
+	}}}
+	if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("route clarification on an executing Task should remain hidden: %v", err)
+	}
+	current.Status = task.StatusPaused
+	value.Task = current
+	value.ClarificationRequests[0].CallID = app.FileDeliveryIntentClarificationCallID
+	if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("ordinary clarification must remain limited to waiting_user Tasks: %v", err)
+	}
+}
+
 func TestTaskResponseAllowsCancelledStepsAfterTaskStop(t *testing.T) {
 	now := time.Now().UTC()
 	taskValue := apiTestTask()
@@ -988,7 +1065,8 @@ func TestGetTaskReturnsChildAndClarificationSteps(t *testing.T) {
 		},
 		ClarificationRequests: []task.ClarificationRequest{{
 			ID: clarificationID, TaskID: taskValue.ID, Version: 1, ModelStepID: modelStepID,
-			CallID: "call-clarify", Question: "Which environment?", Status: task.ClarificationPending,
+			CallID:   app.FileDeliveryIntentClarificationCallID,
+			Question: "Do you need a file saved or only a chat answer?", Status: task.ClarificationPending,
 		}},
 	}}
 	engine := taskAPIRouter(service, nil)
@@ -1003,6 +1081,7 @@ func TestGetTaskReturnsChildAndClarificationSteps(t *testing.T) {
 		} `json:"steps"`
 		ClarificationRequest *struct {
 			ID       string `json:"id"`
+			CallID   string `json:"call_id"`
 			Question string `json:"question"`
 		} `json:"clarification_request"`
 	}
@@ -1014,7 +1093,8 @@ func TestGetTaskReturnsChildAndClarificationSteps(t *testing.T) {
 		kinds[step.Kind] = true
 	}
 	if !kinds["subagent"] || !kinds["clarification"] || !kinds["progress"] || body.ClarificationRequest == nil ||
-		body.ClarificationRequest.ID != clarificationID || body.ClarificationRequest.Question != "Which environment?" {
+		body.ClarificationRequest.ID != clarificationID || body.ClarificationRequest.CallID != app.FileDeliveryIntentClarificationCallID ||
+		body.ClarificationRequest.Question != "Do you need a file saved or only a chat answer?" {
 		t.Fatalf("GET task omitted child/clarification contract: %#v", body)
 	}
 }

@@ -20,6 +20,7 @@ const goal: components['schemas']['PersonalObject'] = {
 
 const schedule: components['schemas']['Schedule'] = {
   id: 'j1234567', version: 2, status: 'enabled', host_id: 'h1234567', model_id: 'model-1', title: '日报标题', objective: '检查日报',
+  file_delivery_intent: 'none',
   timing: { kind: 'daily', starts_on: '2026-11-02', local_time: '09:00', time_zone: 'Asia/Shanghai' },
   budget: { active_seconds: 300, tool_calls: 12, model_tokens: 9000 }, misfire_policy: 'skip',
   notification_events: ['completed', 'failed'], observation: null, next_run_at: '2026-11-03T01:00:00Z',

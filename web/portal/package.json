@@ -25,6 +25,7 @@
   "dependencies": {
     "@tanstack/react-query": "5.104.4",
     "@tesseract.js-data/chi_sim": "1.0.0",
+    "mermaid": "11.17.2",
     "openapi-fetch": "0.17.0",
     "pdfjs-dist": "6.5.438",
     "react": "19.3.1",

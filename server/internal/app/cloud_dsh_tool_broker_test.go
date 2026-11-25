@@ -12,6 +12,7 @@ import (
 	"image"
 	"image/jpeg"
 	"image/png"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,6 +32,239 @@ type cloudDSHBrokerTaskStore struct {
 	toolCalls               []TaskToolCallProgress
 	commitTaskProgressError error
 	committedTaskProgress   []TaskProgress
+}
+
+func TestCloudDSHPlanStepArgumentsAreSeparatedFromBusinessArguments(t *testing.T) {
+	parsed, err := extractCloudDSHPlanStepArguments(`{"workspace_id":"w1234567","path":"README.md","morde_plan_step_id":"sources","morde_plan_revision":7}`)
+	if err != nil || !parsed.HasStepID || parsed.StepID != "sources" || parsed.PlanRevision != 7 {
+		t.Fatalf("extractCloudDSHPlanStepArguments() = %#v, %v", parsed, err)
+	}
+	var business map[string]json.RawMessage
+	if err := json.Unmarshal(parsed.BusinessArgs, &business); err != nil || len(business) != 2 ||
+		string(business["path"]) != `"README.md"` || string(business["workspace_id"]) != `"w1234567"` {
+		t.Fatalf("business arguments = %s, err=%v; plan metadata leaked or business fields changed", parsed.BusinessArgs, err)
+	}
+	if hasCloudDSHPlanStepMetadata(string(parsed.BusinessArgs)) {
+		t.Fatal("reserved plan metadata remained in business arguments")
+	}
+	plain, err := extractCloudDSHPlanStepArguments(`{"path":"README.md"}`)
+	if err != nil || plain.HasStepID || string(plain.BusinessArgs) != `{"path":"README.md"}` {
+		t.Fatalf("metadata-free arguments changed: %#v, %v", plain, err)
+	}
+	for name, raw := range map[string]string{
+		"missing revision":    `{"morde_plan_step_id":"sources"}`,
+		"missing step":        `{"morde_plan_revision":7}`,
+		"invalid step":        `{"morde_plan_step_id":"../sources","morde_plan_revision":7}`,
+		"string revision":     `{"morde_plan_step_id":"sources","morde_plan_revision":"7"}`,
+		"fractional revision": `{"morde_plan_step_id":"sources","morde_plan_revision":7.5}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := extractCloudDSHPlanStepArguments(raw); err == nil {
+				t.Fatalf("invalid plan metadata %s was accepted", raw)
+			}
+		})
+	}
+}
+
+func TestCloudDSHPlanMetadataIsExposedOnSideEffectToolSchemas(t *testing.T) {
+	definitions := []AgentToolDefinition{
+		{ModelTool: ModelTool{Name: runtimeToolFileRead, Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`)}},
+		{ModelTool: ModelTool{Name: cloudDSHWebSearchToolName, Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)}},
+		{ModelTool: ModelTool{Name: cloudDSHMCPCallToolName, Parameters: json.RawMessage(`{"type":"object","properties":{"connector_id":{"type":"string"}},"required":["connector_id"],"additionalProperties":false}`)}},
+		{ModelTool: ModelTool{Name: cloudDSHMCPDiscoverToolName, Parameters: json.RawMessage(`{"type":"object","properties":{"connector_id":{"type":"string"}},"additionalProperties":false}`)}},
+	}
+	got, err := addPlanStepArgumentToHostTools(definitions, 9)
+	if err != nil {
+		t.Fatalf("addPlanStepArgumentToHostTools() error = %v", err)
+	}
+	got, err = addPlanStepArgumentToMCPTools(got, 9)
+	if err != nil {
+		t.Fatalf("addPlanStepArgumentToMCPTools() error = %v", err)
+	}
+	var schema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	var revisionSchema struct {
+		Enum []int64 `json:"enum"`
+	}
+	for _, index := range []int{0, 1, 2} {
+		if err := json.Unmarshal(got[index].Parameters, &schema); err != nil {
+			t.Fatal(err)
+		}
+		if len(schema.Properties[cloudDSHPlanStepIDArgumentName]) == 0 || len(schema.Properties[cloudDSHPlanRevisionArgumentName]) == 0 ||
+			!containsString(schema.Required, cloudDSHPlanStepIDArgumentName) || !containsString(schema.Required, cloudDSHPlanRevisionArgumentName) {
+			t.Fatalf("side-effect schema %q omits required plan metadata: %s", got[index].Name, got[index].Parameters)
+		}
+		if err := json.Unmarshal(schema.Properties[cloudDSHPlanRevisionArgumentName], &revisionSchema); err != nil ||
+			len(revisionSchema.Enum) != 1 || revisionSchema.Enum[0] != 9 {
+			t.Fatalf("plan revision schema = %s, err=%v; want current revision enum", schema.Properties[cloudDSHPlanRevisionArgumentName], err)
+		}
+	}
+	var discoverySchema map[string]json.RawMessage
+	if err := json.Unmarshal(got[3].Parameters, &discoverySchema); err != nil {
+		t.Fatal(err)
+	}
+	var discoveryProperties map[string]json.RawMessage
+	if err := json.Unmarshal(discoverySchema["properties"], &discoveryProperties); err != nil ||
+		len(discoveryProperties[cloudDSHPlanStepIDArgumentName]) != 0 || len(discoveryProperties[cloudDSHPlanRevisionArgumentName]) != 0 {
+		t.Fatalf("MCP discovery schema received plan metadata: %s, err=%v", got[3].Parameters, err)
+	}
+}
+
+func TestCloudDSHPlanStepSelectionRequiresCurrentPersistedStep(t *testing.T) {
+	currentRevision := int64(4)
+	details := TaskDetails{Task: task.Task{CurrentRevision: &currentRevision}, Plan: &task.Plan{
+		TaskRevision: 4, Revision: 9, Steps: []task.PlanStep{{ID: "sources"}},
+	}}
+	for name, tc := range map[string]struct {
+		details  TaskDetails
+		metadata cloudDSHPlanStepArguments
+		wantErr  bool
+	}{
+		"valid current step": {details: details, metadata: cloudDSHPlanStepArguments{HasStepID: true, StepID: "sources", PlanRevision: 9}},
+		"missing metadata":   {details: details, wantErr: true},
+		"unknown step":       {details: details, metadata: cloudDSHPlanStepArguments{HasStepID: true, StepID: "model-invented", PlanRevision: 9}, wantErr: true},
+		"stale revision":     {details: details, metadata: cloudDSHPlanStepArguments{HasStepID: true, StepID: "sources", PlanRevision: 8}, wantErr: true},
+		"no plan":            {details: TaskDetails{Task: task.Task{CurrentRevision: &currentRevision}}},
+		"metadata without plan": {details: TaskDetails{Task: task.Task{CurrentRevision: &currentRevision}},
+			metadata: cloudDSHPlanStepArguments{HasStepID: true, StepID: "sources", PlanRevision: 9}, wantErr: true},
+		"stale task revision": {details: TaskDetails{Task: task.Task{CurrentRevision: &currentRevision}, Plan: &task.Plan{
+			TaskRevision: 3, Revision: 9, Steps: []task.PlanStep{{ID: "sources"}},
+		}}, metadata: cloudDSHPlanStepArguments{HasStepID: true, StepID: "sources", PlanRevision: 9}, wantErr: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := validateCloudDSHPlanStepSelection(tc.details, tc.metadata, "MCP operation")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateCloudDSHPlanStepSelection() err=%v, wantErr=%t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func setCloudDSHPlanStepMetadataForTest(t *testing.T, call ModelToolCall, stepID string, revision *int64) ModelToolCall {
+	t.Helper()
+	var arguments map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(call.Arguments), &arguments); err != nil {
+		t.Fatalf("decode DSH tool arguments: %v", err)
+	}
+	delete(arguments, cloudDSHPlanStepIDArgumentName)
+	delete(arguments, cloudDSHPlanRevisionArgumentName)
+	if stepID != "" {
+		encoded, err := json.Marshal(stepID)
+		if err != nil {
+			t.Fatalf("encode step ID: %v", err)
+		}
+		arguments[cloudDSHPlanStepIDArgumentName] = encoded
+	}
+	if revision != nil {
+		encoded, err := json.Marshal(*revision)
+		if err != nil {
+			t.Fatalf("encode plan revision: %v", err)
+		}
+		arguments[cloudDSHPlanRevisionArgumentName] = encoded
+	}
+	encoded, err := json.Marshal(arguments)
+	if err != nil {
+		t.Fatalf("encode DSH tool arguments: %v", err)
+	}
+	call.Arguments = string(encoded)
+	return call
+}
+
+func TestCloudDSHToolBrokerStripsPlanMetadataBeforeHostDispatch(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "window.list", action: "list", result: `{"windows":[]}`,
+	}})
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	current := configureInvalidRuntimeToolTask(&store.details.Task)
+	current.ExecutionLocation = "server"
+	store.details.Task = current
+	store.details.Plan = &task.Plan{TaskRevision: *current.CurrentRevision, Revision: 2, Goal: "Read the project file",
+		Scope: "Read the requested file", VerificationMethod: "Inspect the returned content", CostEstimateState: "unknown",
+		Steps: []task.PlanStep{{ID: "sources", Title: "List windows", Status: task.PlanStepPending,
+			CompletionCriteria: []string{"window list is returned"}}}}
+	session, err := fixture.executor.connect(context.Background(), current, fixture.fence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.fences.fence = agentFenceFromRuntime(session.Fence)
+	session.Close()
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	definitions, err := broker.Definitions(context.Background(), current)
+	if err != nil {
+		t.Fatalf("Definitions() error = %v", err)
+	}
+	var fileReadDefinition AgentToolDefinition
+	for _, definition := range definitions {
+		if definition.Name == runtimeToolWindowList {
+			fileReadDefinition = definition
+			break
+		}
+	}
+	if len(fileReadDefinition.Parameters) == 0 || !strings.Contains(string(fileReadDefinition.Parameters), `"morde_plan_revision"`) ||
+		!strings.Contains(string(fileReadDefinition.Parameters), `"morde_plan_step_id"`) {
+		t.Fatalf("current plan metadata was not exposed to the Host tool schema: %s", fileReadDefinition.Parameters)
+	}
+
+	call := invalidRuntimeToolCall(current, "call_plan_metadata_read", runtimeToolWindowList,
+		`{"morde_plan_step_id":"sources","morde_plan_revision":2}`)
+	for name, arguments := range map[string]string{
+		"missing metadata":   `{}`,
+		"unknown model step": `{"morde_plan_step_id":"model-invented","morde_plan_revision":2}`,
+		"stale revision":     `{"morde_plan_step_id":"sources","morde_plan_revision":1}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := invalidRuntimeToolCall(current, "call_invalid_plan_metadata_"+strings.ReplaceAll(name, " ", "_"), runtimeToolWindowList, arguments)
+			if _, err := broker.Execute(context.Background(), current, invalid); domain.CodeOf(err) != domain.CodeConflict {
+				t.Fatalf("invalid plan metadata dispatch error=%v; want conflict", err)
+			}
+			if fixture.handlers["window.list"].calls.Load() != 0 || store.operation.ID != "" {
+				t.Fatalf("invalid metadata reached Host admission: calls=%d operation=%+v", fixture.handlers["window.list"].calls.Load(), store.operation)
+			}
+		})
+	}
+	var runtimeArguments json.RawMessage
+	fixture.wrap = func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+			if request.Method == http.MethodPost && request.URL.Path == "/runtime/v1/operations" {
+				body, err := io.ReadAll(request.Body)
+				if err != nil {
+					t.Errorf("read Runtime request body: %v", err)
+				}
+				request.Body = io.NopCloser(bytes.NewReader(body))
+				var payload struct {
+					Arguments json.RawMessage `json:"arguments"`
+				}
+				if err := json.Unmarshal(body, &payload); err == nil {
+					runtimeArguments = append(json.RawMessage(nil), payload.Arguments...)
+				}
+			}
+			next.ServeHTTP(writer, request)
+		})
+	}
+	result, err := broker.Execute(context.Background(), current, call)
+	if err != nil || result.Status != AgentToolSucceeded || fixture.handlers["window.list"].calls.Load() != 1 {
+		t.Fatalf("Execute() = %#v, %v; Host calls=%d operation=%+v steps=%+v progress=%+v runtime_args=%s",
+			result, err, fixture.handlers["window.list"].calls.Load(), store.operation, store.details.Steps,
+			store.committedTaskProgress, runtimeArguments)
+	}
+	var business map[string]json.RawMessage
+	if err := json.Unmarshal(runtimeArguments, &business); err != nil || len(business) != 0 ||
+		len(business[cloudDSHPlanStepIDArgumentName]) != 0 || len(business[cloudDSHPlanRevisionArgumentName]) != 0 {
+		t.Fatalf("runtime received plan metadata or invalid business args: %s, err=%v", runtimeArguments, err)
+	}
+	expectedHash, err := agentOperationHash(call.Name, json.RawMessage(call.Arguments))
+	if err != nil || !bytes.Equal(store.operation.RequestHash, expectedHash[:]) {
+		t.Fatalf("stored operation hash does not bind the original DSH call: %x, err=%v", store.operation.RequestHash, err)
+	}
+	if len(store.toolCalls) == 0 || !bytes.Equal(store.toolCalls[0].RequestDigest, expectedHash[:]) {
+		t.Fatalf("persisted Task tool-call digest does not retain original metadata: %+v", store.toolCalls)
+	}
 }
 
 // ListTaskEvents returns the events the fake recorded, in order. The broker's
@@ -797,6 +1031,44 @@ func TestCloudDSHToolBrokerPersistsSafeDefinitiveFailureReason(t *testing.T) {
 		bytes.Contains(store.events[0].Payload, []byte("private-error-detail")) ||
 		bytes.Contains(store.events[0].Payload, []byte("credential-value")) {
 		t.Fatalf("Host failure event exposed unsafe data or omitted its reason: %s", store.events[0].Payload)
+	}
+}
+
+func TestCloudDSHToolBrokerRedactsDefinitiveShellFailureAndReplaysExactOutput(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "shell.exec", action: "run",
+		result: `{"exit_code":7,"stdout":"https://internal.example/path?token=private-token-92","stderr":"api_key=private-key-61","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
+	}})
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelToolCall{CallID: "call_dsh_failed_shell", Name: runtimeToolShellExec,
+		Arguments: `{"workspace_id":"w1234567","command":"run failed check"}`}
+	if result, err := broker.Execute(context.Background(), store.details.Task, call); err != nil || result.Status != AgentToolNeedsUser {
+		t.Fatalf("initial sensitive call = %#v, %v; want approval pause", result, err)
+	}
+	resumeCloudDSHApproval(fixture, store, task.PendingRequestApproved, task.PendingDecisionApprove)
+	first, err := broker.Reconcile(context.Background(), store.details.Task, call, nil)
+	if err != nil || first.Status != AgentToolFailed || fixture.handlers["shell.exec"].calls.Load() != 1 {
+		t.Fatalf("first failed shell result = %#v, %v; dispatches=%d", first, err, fixture.handlers["shell.exec"].calls.Load())
+	}
+	operation := store.operations[agentOperationKey(call.CallID)]
+	want := `{"exit_code":7,"timed_out":false,"stdout":"","stderr":"","stdout_truncated":true,"stderr_truncated":true}`
+	if operation.Status != task.OperationFailed || operation.Result != first.Output || first.Output != want {
+		t.Fatalf("first result/ledger output differs: result=%q ledger=%+v; want %q", first.Output, operation, want)
+	}
+	for _, secret := range []string{"internal.example", "private-token-92", "private-key-61", "api_key"} {
+		if strings.Contains(first.Output, secret) || strings.Contains(operation.Result, secret) {
+			t.Fatalf("sensitive shell failure detail %q escaped: output=%q ledger=%q", secret, first.Output, operation.Result)
+		}
+	}
+	checkpoint := dshToolResultText(first)
+	replayed, err := broker.Reconcile(context.Background(), store.details.Task, call, &checkpoint)
+	if err != nil || replayed.Status != AgentToolFailed || replayed.Output != first.Output || fixture.handlers["shell.exec"].calls.Load() != 1 {
+		t.Fatalf("replayed failed shell result = %#v, %v; first=%q dispatches=%d", replayed, err, first.Output, fixture.handlers["shell.exec"].calls.Load())
 	}
 }
 
@@ -2478,95 +2750,26 @@ func TestCloudDSHToolBrokerDoesNotPublishUnverifiedFileClaim(t *testing.T) {
 	}
 }
 
-func TestCloudDSHFileDeliveryIntentUsesTaskTextConservatively(t *testing.T) {
-	for _, test := range []struct {
-		name         string
-		objective    string
-		hasWorkspace bool
-		want         task.FileDeliveryIntent
-	}{
-		{name: "explicit file", objective: "Generate a PDF report and save it to the Workspace.", hasWorkspace: true, want: task.FileDeliveryRequired},
-		{name: "explicit Chinese file", objective: "生成 PDF 报告文件并保存到工作区。", hasWorkspace: true, want: task.FileDeliveryRequired},
-		{name: "explicit Workspace destination", objective: "Write and verify a note in the attached Workspace.", hasWorkspace: true, want: task.FileDeliveryRequired},
-		{name: "explicit Chinese Workspace destination", objective: "在工作区写一份任务总结。", hasWorkspace: true, want: task.FileDeliveryRequired},
-		{name: "workspace code change", objective: "Fix the bug in this project.", hasWorkspace: true, want: task.FileDeliveryRequired},
-		{name: "ambiguous report", objective: "Write a report about the project.", want: task.FileDeliveryUnclear},
-		{name: "ambiguous note about Workspace", objective: "Write a note about the Workspace.", hasWorkspace: true, want: task.FileDeliveryUnclear},
-		{name: "ambiguous Chinese report", objective: "写一份项目报告。", want: task.FileDeliveryUnclear},
-		{name: "colloquial Chinese report", objective: "帮我做一份项目报告。", want: task.FileDeliveryUnclear},
-		{name: "colloquial Chinese spreadsheet", objective: "做个 Excel 表格。", want: task.FileDeliveryRequired},
-		{name: "ordinary explanation", objective: "Explain what caused the error.", want: task.FileDeliveryNone},
-		{name: "ordinary Chinese explanation", objective: "解释一下错误原因。", want: task.FileDeliveryNone},
-		{name: "explicit Chinese chat only", objective: "不要生成文件，直接用文字回答。", want: task.FileDeliveryNone},
-		{name: "Chinese no file write", objective: "不要写文件，只要在聊天里回答。", want: task.FileDeliveryNone},
-		{name: "Chinese no Workspace write", objective: "不要在工作区写文件，只在聊天说明。", hasWorkspace: true, want: task.FileDeliveryNone},
-		{name: "Chinese no file save", objective: "不需要保存文件，解释结论即可。", want: task.FileDeliveryNone},
-		{name: "English no file create", objective: "Don't create any files; just answer in chat.", want: task.FileDeliveryNone},
-		{name: "English no Workspace write", objective: "Do not write the file to the Workspace; answer in chat.", hasWorkspace: true, want: task.FileDeliveryNone},
-		{name: "explicit chat only", objective: "Create a PDF report, but no file is needed; explain it in chat.", want: task.FileDeliveryUnclear},
-		{name: "conflicting Chinese code edit", objective: "不要生成文件，直接修改工作区代码。", hasWorkspace: true, want: task.FileDeliveryUnclear},
-		{name: "conflicting file delivery", objective: "Do not create a file, but save a PDF report in the Workspace.", hasWorkspace: true, want: task.FileDeliveryUnclear},
-		{name: "conflicting file write", objective: "Do not write a file, but save the PDF report in the Workspace.", hasWorkspace: true, want: task.FileDeliveryUnclear},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := ClassifyFileDeliveryIntent(test.objective, test.hasWorkspace); got != test.want {
-				t.Fatalf("ClassifyFileDeliveryIntent(%q, %t) = %q, want %q", test.objective, test.hasWorkspace, got, test.want)
-			}
-		})
-	}
-}
-
-func TestCloudDSHMarkdownFileDeliveryIntent(t *testing.T) {
-	for _, test := range []struct {
-		name      string
-		objective string
-		want      task.FileDeliveryIntent
-	}{
-		{name: "screenshot request", objective: "我要生产一个md文档", want: task.FileDeliveryRequired},
-		{name: "spaced markdown", objective: "为五子棋生成一份 Markdown 文档", want: task.FileDeliveryRequired},
-		{name: "extension", objective: "生成 .MD 文件并提供下载", want: task.FileDeliveryRequired},
-		{name: "md shorthand", objective: "生成md", want: task.FileDeliveryRequired},
-		{name: "save as markdown", objective: "保存为 Markdown 文件", want: task.FileDeliveryRequired},
-		{name: "design plan download request", objective: "为五子棋应用写一份设计方案，保存为 Markdown 文件并提供下载", want: task.FileDeliveryRequired},
-		{name: "downloadable design plan", objective: "帮助我写一个设计方案文档，并提供下载", want: task.FileDeliveryRequired},
-		{name: "chat only", objective: "只在聊天回答怎么生成 Markdown 文档", want: task.FileDeliveryNone},
-		{name: "negative", objective: "不要生产md文档，只用文字回答", want: task.FileDeliveryNone},
-		{name: "conflict", objective: "不要生成 .md 文件，但保存为 Markdown 文档", want: task.FileDeliveryUnclear},
-		{name: "how-to question", objective: "请告诉我如何生成一个 .md 文档", want: task.FileDeliveryNone},
-		{name: "tutorial file", objective: "帮我写一份如何生成 Markdown 文档的教程，保存为.md", want: task.FileDeliveryRequired},
-		{name: "tutorial filename", objective: "请生成一份关于如何生成 Markdown 的教程.md", want: task.FileDeliveryRequired},
-		{name: "summarize input file in chat", objective: "帮我分析文件并写一段总结", want: task.FileDeliveryNone},
-		{name: "output existing file contents", objective: "输出文件内容", want: task.FileDeliveryNone},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if got := ClassifyFileDeliveryIntent(test.objective, false); got != test.want {
-				t.Fatalf("ClassifyFileDeliveryIntent(%q) = %q, want %q", test.objective, got, test.want)
-			}
-		})
-	}
-}
-
-func TestCloudDSHToolBrokerPausesWhenTaskTextRequiresMissingFile(t *testing.T) {
+func TestCloudDSHToolBrokerUsesStructuredFileDeliveryIntent(t *testing.T) {
 	for _, test := range []struct {
 		name              string
 		objective         string
+		intent            task.FileDeliveryIntent
 		hostless          bool
 		reason            string
 		wantClarification bool
 	}{
-		{name: "required file", objective: "Create and save a PDF report.", reason: "file_delivery_required"},
-		{name: "unclear report", objective: "Write a report about the project.", reason: "clarification_required", wantClarification: true},
-		{name: "hostless file", objective: "Create and save a PDF report.", hostless: true, reason: "file_delivery_required"},
+		{name: "required despite ordinary wording", objective: "Explain what caused the error.", intent: task.FileDeliveryRequired, reason: "file_delivery_required"},
+		{name: "unclear requests clarification", objective: "Write a report about the project.", intent: task.FileDeliveryUnclear, reason: "clarification_required", wantClarification: true},
+		{name: "hostless required still waits", objective: "Explain what caused the error.", intent: task.FileDeliveryRequired, hostless: true, reason: "file_delivery_required"},
+		{name: "none despite file wording", objective: "Create and save a PDF report.", intent: task.FileDeliveryNone},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRuntimeToolExecutorFixture(t, nil)
 			store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
 			fixture.executor.store = store
 			store.details.Task.Objective = test.objective
-			store.details.Task.FileDeliveryIntent = task.FileDeliveryRequired
-			if test.wantClarification {
-				store.details.Task.FileDeliveryIntent = task.FileDeliveryUnclear
-			}
+			store.details.Task.FileDeliveryIntent = test.intent
 			if test.hostless {
 				store.details.Task.HostID = ""
 			}
@@ -2585,8 +2788,14 @@ func TestCloudDSHToolBrokerPausesWhenTaskTextRequiresMissingFile(t *testing.T) {
 			if err := broker.Complete(context.Background(), claimed, cloudDSHCompletionFor(claimed, "Done.", nil)); err != nil {
 				t.Fatalf("Complete() error = %v", err)
 			}
+			if test.reason == "" {
+				if store.details.Task.Status != task.StatusCompleted || store.details.Task.Result != "Done." {
+					t.Fatalf("none intent was overridden by Objective text: task=%#v", store.details.Task)
+				}
+				return
+			}
 			if store.details.Task.Status != task.StatusWaitingUser || store.details.Task.WaitingReason != test.reason || store.details.Task.Result != "" {
-				t.Fatalf("missing file did not pause task: task=%#v steps=%#v", store.details.Task, store.details.Steps)
+				t.Fatalf("structured file intent did not pause task: task=%#v steps=%#v", store.details.Task, store.details.Steps)
 			}
 			if test.wantClarification {
 				if len(store.details.Steps) != 2 || len(store.details.ClarificationRequests) != 2 ||

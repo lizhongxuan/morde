@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 
@@ -183,11 +184,15 @@ func (s *Store) ReconcileUnknownModelCall(ctx context.Context, principal identit
 		var accountDigest []byte
 		var reviewTaskRevision, reviewResultSequence, reviewClaimGeneration *int64
 		var reviewResultSHA256 []byte
+		var terminalDeliveryID, terminalDeliveryClaimGeneration *int64
+		var terminalDeliveryDispatchStarted bool
 		err = tx.QueryRow(ctx, `SELECT state,COALESCE(task_id,''),model_id,reserved_tokens,input_tokens,output_tokens,request_digest,
-review_task_revision,review_result_event_sequence,review_result_sha256,review_claim_generation FROM model_call_ledger
+review_task_revision,review_result_event_sequence,review_result_sha256,review_claim_generation,
+terminal_delivery_id,terminal_delivery_claim_generation,terminal_delivery_dispatch_started FROM model_call_ledger
  WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, command.OwnerID, string(command.Source), command.CallID).
 			Scan(&state, &taskID, &modelID, &accountReserved, &priorInput, &priorOutput, &accountDigest,
-				&reviewTaskRevision, &reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration)
+				&reviewTaskRevision, &reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration,
+				&terminalDeliveryID, &terminalDeliveryClaimGeneration, &terminalDeliveryDispatchStarted)
 		if err != nil {
 			return storeError("lock model usage", "model call", err)
 		}
@@ -195,6 +200,16 @@ review_task_revision,review_result_event_sequence,review_result_sha256,review_cl
 			reviewClaimGeneration == nil || *reviewTaskRevision < 0 || *reviewResultSequence <= 0 || *reviewClaimGeneration <= 0 ||
 			len(reviewResultSHA256) != 32) {
 			return domain.NewError(domain.CodeInvalidState, "Task validation review model attribution is unavailable")
+		}
+		if command.Source == app.ModelCallTerminalDelivery {
+			matches, err := taskTerminalDeliveryUnknownUsageAttributionMatches(ctx, tx, command, taskID,
+				terminalDeliveryID, terminalDeliveryClaimGeneration, terminalDeliveryDispatchStarted)
+			if err != nil {
+				return err
+			}
+			if !matches {
+				return domain.NewError(domain.CodeInvalidState, "Task terminal delivery model call attribution is unavailable")
+			}
 		}
 		var taskOwnerID, taskProjectID string
 		switch command.Source {
@@ -299,7 +314,8 @@ WHERE o.actor_id=$1 AND o.model_call_id=$2 AND h.service_instance_id=o.service_i
 				return domain.NewError(domain.CodeInvalidState, "personal Task actor does not match its owner")
 			}
 			if observedProject != "" {
-				if command.Source != app.ModelCallTask && command.Source != app.ModelCallReview {
+				if command.Source != app.ModelCallTask && command.Source != app.ModelCallReview &&
+					command.Source != app.ModelCallTerminalDelivery {
 					return domain.NewError(domain.CodeInvalidState, "project usage cannot be reconciled from this ledger")
 				}
 				if err := lockProjectByIDInTx(ctx, tx, observedProject); err != nil {
@@ -460,6 +476,38 @@ actual_micros=NULL,settled_at=clock_timestamp() WHERE project_id=$1 AND source=$
 		return false, domain.NewError(domain.CodeQuotaExceeded, "reconciled usage exceeded a token or project reservation; both holds remain unknown")
 	}
 	return replayed, err
+}
+
+// taskTerminalDeliveryUnknownUsageAttributionMatches binds an admin usage
+// reconciliation to the durable source row that owns the stable model call ID.
+// It intentionally does not require the source to remain publishable: an
+// already-dispatched provider charge still needs reconciliation after a newer
+// user message or authorization change invalidates the reply. The source read
+// is non-locking so it does not invert the terminal worker's outbox-to-ledger
+// lock order.
+func taskTerminalDeliveryUnknownUsageAttributionMatches(ctx context.Context, tx pgx.Tx,
+	command app.ModelUsageReconcileCommand, taskID string, deliveryID, dispatchGeneration *int64,
+	dispatchStarted bool) (bool, error) {
+	if command.Source != app.ModelCallTerminalDelivery || !domain.ValidTaskID(taskID) || deliveryID == nil || *deliveryID < 1 ||
+		dispatchGeneration == nil || *dispatchGeneration < 1 || !dispatchStarted ||
+		command.CallID != "terminal_delivery_"+strconv.FormatInt(*deliveryID, 10) {
+		return false, nil
+	}
+	var storedTaskID, initiatorID, modelCallID string
+	var currentGeneration int64
+	err := tx.QueryRow(ctx, `SELECT delivery.task_id,delivery.initiator_id,delivery.model_call_id,delivery.claim_generation
+FROM task_terminal_delivery_outbox delivery
+JOIN tasks task ON task.id=delivery.task_id AND task.owner_id=delivery.owner_id
+WHERE delivery.id=$1 AND task.initiator_id=delivery.initiator_id`, *deliveryID).
+		Scan(&storedTaskID, &initiatorID, &modelCallID, &currentGeneration)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("verify Task terminal delivery model usage source: %w", err)
+	}
+	return storedTaskID == taskID && initiatorID == command.OwnerID && modelCallID == command.CallID &&
+		currentGeneration >= *dispatchGeneration, nil
 }
 
 type modelUsageProjectCall struct {

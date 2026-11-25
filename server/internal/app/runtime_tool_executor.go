@@ -14,6 +14,7 @@ import (
 	"mime"
 	"net/url"
 	"path"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -374,7 +375,7 @@ func (e *RuntimeToolExecutor) hasCurrentRuntimeToolApproval(ctx context.Context,
 	if decision == nil {
 		return false, nil
 	}
-	hash, err := agentOperationHash(request.Call.Name, request.Arguments)
+	hash, err := runtimeToolRequestDigest(request)
 	if err != nil {
 		return false, domain.NewError(domain.CodeInvalidArgument, "runtime tool approval request is invalid")
 	}
@@ -640,7 +641,7 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 	if !ok {
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
-	requestHash, hashErr := agentOperationHash(request.Call.Name, request.Arguments)
+	requestHash, hashErr := runtimeToolRequestDigest(request)
 	terminal := persisted.Status == task.OperationSucceeded || persisted.Status == task.OperationFailed
 	leaseMatches := persisted.LeaseVersion == request.Task.Lease.Version
 	if terminal {
@@ -1188,7 +1189,8 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 		return unknownAgentVerification("The Workspace file verification request is invalid."), nil
 	}
 	operationKey := runtimeVerificationOperationKey(stepID, group.workspaceID, group.bindingVersion)
-	requestHash, err := agentOperationHash(runtimeFileVerifyCapability+"/"+runtimeFileVerifyAction, arguments)
+	evidenceSources := operationEvidenceSources(group.files, group.bindingVersion)
+	requestHash, err := FileEvidenceReadRequestHash(operationKey, evidenceSources)
 	if err != nil || operationKey == "" {
 		return unknownAgentVerification("The Workspace file verification identity is invalid."), nil
 	}
@@ -1272,6 +1274,7 @@ func (e *RuntimeToolExecutor) verifyFileEvidenceGroup(ctx context.Context, sessi
 		TaskID: current.ID, OperationKey: operationKey, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 		RuntimeGeneration: fence.RuntimeGeneration, RuntimeInstanceID: fence.RuntimeInstanceID,
 		ControlVersion: fence.ControlVersion, RuntimeLeaseVersion: current.Lease.Version, Status: task.OperationDispatched,
+		InternalPurpose: InternalOperationDispatchPurposeFileEvidenceRead, EvidenceSources: evidenceSources,
 	}); err != nil {
 		return unknownAgentVerification("The file verification operation could not pass its persisted fence."), nil
 	}
@@ -1579,7 +1582,23 @@ func runtimeVerificationOperationKey(stepID, workspaceID string, bindingVersion 
 	if !domain.ValidStepID(stepID) || !domain.ValidWorkspaceID(workspaceID) || bindingVersion < 1 {
 		return ""
 	}
-	return fmt.Sprintf("agent:verify:%s:%s:%d", stepID, workspaceID, bindingVersion)
+	return fmt.Sprintf("agent:verify:v2:%s:%s:%d", stepID, workspaceID, bindingVersion)
+}
+
+func operationEvidenceSources(evidence []AgentFileEvidence, bindingVersion int64) []OperationEvidenceSource {
+	sources := make([]OperationEvidenceSource, 0, len(evidence))
+	for _, item := range evidence {
+		callID := item.DurableCallID
+		if callID == "" {
+			callID = item.CallID
+		}
+		sources = append(sources, OperationEvidenceSource{
+			OperationKey: item.OperationKey, CallID: callID, WorkspaceID: item.WorkspaceID,
+			BindingVersion: bindingVersion, RequestHash: append([]byte(nil), item.RequestHash...),
+			Result: item.Result, Path: item.Path, Size: item.Size, SHA256: item.SHA256,
+		})
+	}
+	return sources
 }
 
 func validAgentFileEvidence(evidence []AgentFileEvidence) bool {
@@ -2290,7 +2309,7 @@ func (e *RuntimeToolExecutor) validatePersistedOperation(ctx context.Context, cu
 	if preparation.WorkspaceID != "" {
 		inputRevision = current.InputRevision
 	}
-	hash, err := agentOperationHash(request.Call.Name, request.Arguments)
+	hash, err := runtimeToolRequestDigest(request)
 	if err != nil {
 		return domain.NewError(domain.CodeInvalidArgument, "runtime operation request is invalid")
 	}
@@ -2305,6 +2324,52 @@ func (e *RuntimeToolExecutor) validatePersistedOperation(ctx context.Context, cu
 		return domain.NewError(domain.CodeInvalidState, "persisted operation fence changed")
 	}
 	return nil
+}
+
+// runtimeToolRequestDigest binds the durable operation ledger to the complete
+// DSH call, including reserved plan metadata, while requiring the business
+// arguments sent to the Host to be exactly the metadata-free projection.
+// Internal RuntimeToolExecutor callers may omit Call.Arguments and the trusted
+// broker digest; in that case their already-validated business arguments are
+// the complete call.
+func runtimeToolRequestDigest(request AgentToolRequest) ([32]byte, error) {
+	rawArguments := request.Call.Arguments
+	if rawArguments == "" && len(request.OperationRequestHash) == 0 {
+		rawArguments = string(request.Arguments)
+	}
+	parsed, err := extractCloudDSHPlanStepArguments(rawArguments)
+	if err != nil || !sameAgentJSONObject(parsed.BusinessArgs, request.Arguments) {
+		return [32]byte{}, domain.NewError(domain.CodeInvalidArgument, "runtime tool request arguments are inconsistent")
+	}
+	validated, err := validateAgentToolArguments(rawArguments)
+	if err != nil {
+		return [32]byte{}, domain.NewError(domain.CodeInvalidArgument, "runtime tool request arguments are invalid")
+	}
+	digest, err := agentOperationHash(request.Call.Name, validated)
+	if err != nil || len(request.OperationRequestHash) > 0 &&
+		(len(request.OperationRequestHash) != sha256.Size || !bytes.Equal(request.OperationRequestHash, digest[:])) {
+		return [32]byte{}, domain.NewError(domain.CodeInvalidArgument, "runtime tool request digest is invalid")
+	}
+	return digest, nil
+}
+
+func sameAgentJSONObject(left, right []byte) bool {
+	decode := func(raw []byte) (any, bool) {
+		decoder := json.NewDecoder(bytes.NewReader(raw))
+		decoder.UseNumber()
+		var value any
+		if decoder.Decode(&value) != nil {
+			return nil, false
+		}
+		var trailing any
+		if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+			return nil, false
+		}
+		return value, true
+	}
+	leftValue, leftOK := decode(left)
+	rightValue, rightOK := decode(right)
+	return leftOK && rightOK && reflect.DeepEqual(leftValue, rightValue)
 }
 
 func mapRuntimeToolResult(mapping runtimeToolMapping, operation runtimeclient.Operation, arguments json.RawMessage) (AgentToolResult, error) {

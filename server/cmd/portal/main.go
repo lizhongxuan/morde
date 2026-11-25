@@ -723,6 +723,7 @@ func serve(ctx context.Context, configPath string) error {
 	var taskWorker *worker.TaskWorker
 	var routeWorker *worker.ConversationRouteWorker
 	var taskValidationReviewWorker *worker.TaskValidationReviewWorker
+	var taskTerminalDeliveryWorker *worker.TaskTerminalDeliveryWorker
 	var taskAgentStopReconciler worker.TaskAgentStopReconciler
 	if cfg.CloudDSH.Enabled {
 		executionControlService, err = app.NewExecutionControlService(store, countedAudit)
@@ -764,6 +765,13 @@ func serve(ctx context.Context, configPath string) error {
 		})
 		if err != nil {
 			return fmt.Errorf("initialize Task validation review worker: %w", err)
+		}
+		taskTerminalDeliveryWorker, err = worker.NewTaskTerminalDeliveryWorker(worker.TaskTerminalDeliveryWorkerOptions{
+			Store: store, Models: modelGateway, ReplySealer: sealer, WorkerID: workerSuffix + "-terminal-delivery",
+			LeaseDuration: 30 * time.Second, PollInterval: 500 * time.Millisecond, Logger: logger,
+		})
+		if err != nil {
+			return fmt.Errorf("initialize Task terminal delivery worker: %w", err)
 		}
 	}
 	mcpRuntimeTools, err := app.NewMCPRuntimeToolExecutor(store, mcpHosts, credentials, store, runtimeControl)
@@ -906,7 +914,7 @@ func serve(ctx context.Context, configPath string) error {
 	defer stopFileFetchCleanup()
 	go runTaskFileFetchCleanup(fileFetchCleanupCtx, tasks, logger)
 	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, routeWorker,
-		taskValidationReviewWorker, resultWorker, recordWorker, scheduleWorker, goalAgentTriggerWorker, runtime,
+		taskValidationReviewWorker, taskTerminalDeliveryWorker, resultWorker, recordWorker, scheduleWorker, goalAgentTriggerWorker, runtime,
 		gatewayHandler, apiServer, gatewayServer, metricsServer)
 }
 
@@ -1022,6 +1030,9 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	tools, err := app.NewCloudDSHToolBrokerWithPersonalDataAndSchedules(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient(),
 		recordCapture, personalData, personalSync, goals, personalFiles, projects, schedules, hubService)
 	if err != nil {
+		return nil, err
+	}
+	if err := tools.SetAgentMessageSourceReader(checkpoints); err != nil {
 		return nil, err
 	}
 	if err := tools.SetTaskStepDetailSealer(sealer); err != nil {
@@ -1535,7 +1546,7 @@ func registerHistogram(reg prometheus.Registerer, opts prometheus.HistogramOpts,
 	return collector, nil
 }
 
-func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, taskValidationReviewWorker *worker.TaskValidationReviewWorker, resultWorker *worker.ConversationResultReviewWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, goalAgentTriggerWorker *worker.GoalAgentTriggerWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
+func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Duration, background *worker.Worker, taskStopWorker *worker.TaskStopWorker, notificationWorker *worker.NotificationWorker, taskWorker *worker.TaskWorker, routeWorker *worker.ConversationRouteWorker, taskValidationReviewWorker *worker.TaskValidationReviewWorker, taskTerminalDeliveryWorker *worker.TaskTerminalDeliveryWorker, resultWorker *worker.ConversationResultReviewWorker, recordWorker *worker.RecordCaptureWorker, scheduleWorker *worker.ScheduleWorker, goalAgentTriggerWorker *worker.GoalAgentTriggerWorker, runtime *app.Runtime, gatewayHandler http.Handler, servers ...*http.Server) error {
 	listeners := make([]net.Listener, 0, len(servers))
 	for _, server := range servers {
 		listener, err := net.Listen("tcp", server.Addr)
@@ -1595,6 +1606,14 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 		taskValidationReviewWorkerDone = make(chan error, 1)
 		go func() { taskValidationReviewWorkerDone <- taskValidationReviewWorker.Run(reviewWorkerCtx) }()
 	}
+	var taskTerminalDeliveryWorkerDone chan error
+	var cancelTaskTerminalDeliveryWorker context.CancelFunc
+	if taskTerminalDeliveryWorker != nil {
+		deliveryWorkerCtx, cancel := context.WithCancel(context.Background())
+		cancelTaskTerminalDeliveryWorker = cancel
+		taskTerminalDeliveryWorkerDone = make(chan error, 1)
+		go func() { taskTerminalDeliveryWorkerDone <- taskTerminalDeliveryWorker.Run(deliveryWorkerCtx) }()
+	}
 	serverErrors := make(chan error, len(servers))
 	var serverWG sync.WaitGroup
 	for index, server := range servers {
@@ -1613,6 +1632,7 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	taskWorkerExited := false
 	routeWorkerExited := false
 	taskValidationReviewWorkerExited := false
+	taskTerminalDeliveryWorkerExited := false
 	resultWorkerExited := false
 	select {
 	case <-ctx.Done():
@@ -1637,6 +1657,13 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 			runErr = errors.New("Task validation review worker stopped unexpectedly")
 		} else {
 			runErr = fmt.Errorf("Task validation review worker stopped unexpectedly: %w", err)
+		}
+	case err := <-taskTerminalDeliveryWorkerDone:
+		taskTerminalDeliveryWorkerExited = true
+		if err == nil {
+			runErr = errors.New("Task terminal delivery worker stopped unexpectedly")
+		} else {
+			runErr = fmt.Errorf("Task terminal delivery worker stopped unexpectedly: %w", err)
 		}
 	case err := <-resultWorkerDone:
 		resultWorkerExited = true
@@ -1698,6 +1725,21 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 			case <-shutdownCtx.Done():
 				if runErr == nil {
 					runErr = errors.New("Task validation review worker did not stop before shutdown timeout")
+				}
+			}
+		}
+	}
+	if cancelTaskTerminalDeliveryWorker != nil {
+		cancelTaskTerminalDeliveryWorker()
+		if !taskTerminalDeliveryWorkerExited {
+			select {
+			case err := <-taskTerminalDeliveryWorkerDone:
+				if err != nil && !errors.Is(err, context.Canceled) && runErr == nil {
+					runErr = fmt.Errorf("stop Task terminal delivery worker: %w", err)
+				}
+			case <-shutdownCtx.Done():
+				if runErr == nil {
+					runErr = errors.New("Task terminal delivery worker did not stop before shutdown timeout")
 				}
 			}
 		}

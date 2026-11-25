@@ -118,6 +118,24 @@ function clarificationDraftKey(taskID: string, clarificationID: string, version:
   return `${taskID}:${clarificationID}:${version}`;
 }
 
+const fileDeliveryIntentClarificationCallIDs = new Set([
+  'morde-file-delivery-intent',
+  'morde-route-file-delivery-intent',
+]);
+const routeFileDeliveryIntentClarificationCallID = 'morde-route-file-delivery-intent';
+
+function isFileDeliveryIntentClarification(callID: string | null | undefined): boolean {
+  return callID != null && fileDeliveryIntentClarificationCallIDs.has(callID);
+}
+
+function canAnswerClarification(task: Task): boolean {
+  const request = task.clarification_request;
+  if (!request?.question) return false;
+  if (task.status === 'waiting_user' && task.waiting_reason === 'clarification_required') return true;
+  return request.call_id === routeFileDeliveryIntentClarificationCallID &&
+    (task.status === 'running' || task.status === 'pausing' || task.status === 'paused');
+}
+
 function UserMessageContent({ content, attachmentIDs = [] }: { content: string; attachmentIDs?: string[] }) {
   return <>
     <p>{content}</p>
@@ -978,6 +996,7 @@ export function Assistant() {
   const [visibleTaskPanelCount, setVisibleTaskPanelCount] = useState(5);
   const [pendingTaskActions, setPendingTaskActions] = useState<Map<string, { fingerprint: string; key: string }>>(() => new Map());
   const [clarificationAnswers, setClarificationAnswers] = useState<Record<string, string>>({});
+  const [clarificationFileDeliveryIntents, setClarificationFileDeliveryIntents] = useState<Record<string, 'none' | 'required'>>({});
   const [clarificationInteractions, setClarificationInteractions] = useState<Record<string, ClarificationInteraction>>({});
   const clarificationSubmissionsInFlight = useRef(new Set<string>());
   const [taskEventFeeds, setTaskEventFeeds] = useState<Record<string, TaskFeedState>>({});
@@ -2237,18 +2256,22 @@ export function Assistant() {
   };
   const submitClarificationAnswer = async (task: Task) => {
     const request = task.clarification_request;
-    if (task.status !== 'waiting_user' || task.waiting_reason !== 'clarification_required' || !request ||
-      task.conversation_id !== conversationID) {
+    if (!request || !canAnswerClarification(task) || task.conversation_id !== conversationID) {
       notify('澄清请求已变化，请核对任务最新状态。', 'error');
       return;
     }
     const draftKey = clarificationDraftKey(task.id, request.id, request.version);
     const answer = (clarificationAnswers[draftKey] ?? '').trim();
     if (!answer) return;
+    const isFileDeliveryClarification = isFileDeliveryIntentClarification(request.call_id);
+    const fileDeliveryIntent = isFileDeliveryClarification ? clarificationFileDeliveryIntents[draftKey] : undefined;
+    if (isFileDeliveryClarification && (!fileDeliveryIntent ||
+      (fileDeliveryIntent === 'required' && !task.workspace_id))) return;
     if (clarificationSubmissionsInFlight.current.has(task.id)) return;
     clarificationSubmissionsInFlight.current.add(task.id);
     const actionScope = `clarification:${task.id}:${request.id}`;
-    const fingerprint = JSON.stringify({ version: request.version, answer });
+    const fingerprint = JSON.stringify({ call_id: request.call_id, version: request.version, answer,
+      ...(fileDeliveryIntent ? { file_delivery_intent: fileDeliveryIntent } : {}) });
     const key = taskActionKey(actionScope, fingerprint);
     setClarificationInteractions((current) => ({ ...current, [task.id]: {
       clarificationID: request.id, version: request.version, question: request.question, status: 'sending',
@@ -2258,9 +2281,16 @@ export function Assistant() {
         clarification_id: request.id,
         clarification_version: request.version,
         answer,
+        ...(fileDeliveryIntent ? { file_delivery_intent: fileDeliveryIntent } : {}),
       }, key);
       clearTaskActionKey(actionScope, key);
       setClarificationAnswers((current) => ({ ...current, [draftKey]: '' }));
+      setClarificationFileDeliveryIntents((current) => {
+        if (!(draftKey in current)) return current;
+        const next = { ...current };
+        delete next[draftKey];
+        return next;
+      });
       setClarificationInteractions((current) => ({ ...current, [task.id]: {
         clarificationID: request.id, version: request.version, question: request.question,
         status: 'submitted', message: '补充信息已提交，等待任务状态更新。',
@@ -3395,8 +3425,8 @@ export function Assistant() {
                 {displayMessages.map((message, index) => {
                   const messageTaskID = message.task_id ?? message.related_task_id ?? '';
                   const messageTask = tasksByID.get(messageTaskID);
-                  const activeClarification = messageTask?.conversation_id === conversationID && messageTask.status === 'waiting_user' &&
-                    messageTask.waiting_reason === 'clarification_required' && messageTask.clarification_request?.question
+                  const activeClarification = messageTask?.conversation_id === conversationID &&
+                    canAnswerClarification(messageTask)
                     ? messageTask.clarification_request : null;
                   const savedClarificationInteraction = messageTaskID ? clarificationInteractions[messageTaskID] : undefined;
                   const clarificationInteraction = activeClarification && savedClarificationInteraction &&
@@ -3410,6 +3440,9 @@ export function Assistant() {
                   const clarificationDraftID = activeClarification
                     ? clarificationDraftKey(messageTaskID, activeClarification.id, activeClarification.version) : '';
                   const clarificationAnswer = clarificationDraftID ? clarificationAnswers[clarificationDraftID] ?? '' : '';
+                  const fileDeliveryClarification = isFileDeliveryIntentClarification(activeClarification?.call_id);
+                  const clarificationFileDeliveryIntent = fileDeliveryClarification
+                    ? clarificationFileDeliveryIntents[clarificationDraftID] : undefined;
                   const showClarificationCard = message.role === 'user' && Boolean(messageTaskID) &&
                     latestUserMessageByTaskID.get(messageTaskID) === message.id && Boolean(clarificationDisplay);
                   const previous = displayMessages[index - 1];
@@ -3471,9 +3504,24 @@ export function Assistant() {
                               <textarea id={`clarification-answer-${encodeURIComponent(messageTaskID)}`} aria-label="澄清问题答复"
                                 value={clarificationAnswer} maxLength={16_384}
                                 onChange={(event) => setClarificationAnswers((current) => ({ ...current, [clarificationDraftID]: event.target.value }))}
-                                placeholder="在这里补充信息…" />
+                                placeholder="在这里补充信息…" disabled={clarificationInteraction?.status === 'unknown'} />
+                              {fileDeliveryClarification && <fieldset aria-label="文件交付方式">
+                                <legend>文件交付方式</legend>
+                                <label><input type="radio" name={`file-delivery-intent-${encodeURIComponent(messageTaskID)}`}
+                                  checked={clarificationFileDeliveryIntent === 'none'}
+                                  disabled={clarificationInteraction?.status === 'unknown'}
+                                  onChange={() => setClarificationFileDeliveryIntents((current) => ({ ...current, [clarificationDraftID]: 'none' }))} />
+                                  只需在聊天中回答</label>
+                                {messageTask?.workspace_id ? <label><input type="radio" name={`file-delivery-intent-${encodeURIComponent(messageTaskID)}`}
+                                  checked={clarificationFileDeliveryIntent === 'required'}
+                                  disabled={clarificationInteraction?.status === 'unknown'}
+                                  onChange={() => setClarificationFileDeliveryIntents((current) => ({ ...current, [clarificationDraftID]: 'required' }))} />
+                                  需要交付文件</label> : <p role="note">当前任务尚未绑定 Workspace。若需要交付文件，请先绑定 Workspace，再重新提交此澄清。</p>}
+                              </fieldset>}
                               <div className="chat-approval-actions">
-                                <button type="submit" className="button button-primary" disabled={!clarificationAnswer.trim()}>
+                                <button type="submit" className="button button-primary"
+                                  disabled={!clarificationAnswer.trim() || (fileDeliveryClarification && (!clarificationFileDeliveryIntent ||
+                                    (clarificationFileDeliveryIntent === 'required' && !messageTask?.workspace_id)))}>
                                   {clarificationInteraction?.status === 'unknown' ? '使用相同回答重试' : '提交并继续'}
                                 </button>
                               </div>

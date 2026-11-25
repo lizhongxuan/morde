@@ -23,6 +23,7 @@ func TestSyncDefinitionOmitsAuthorizationAndRuntimeState(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(encoded), `"title":"Report title"`) || !strings.Contains(string(encoded), `"objective":"check report"`) ||
+		!strings.Contains(string(encoded), `"file_delivery_intent":"none"`) ||
 		!strings.Contains(string(encoded), `"anchor_at":"2030-03-10T06:00:30Z"`) {
 		t.Fatalf("sync definition did not keep title separate from objective: %s", encoded)
 	}
@@ -46,6 +47,11 @@ func TestSyncDefinitionAllowsOnlyHostlessModelSchedules(t *testing.T) {
 	if err := ValidateSyncDefinition(value.ID, definition); err != nil {
 		t.Fatalf("valid hostless sync definition rejected: %v", err)
 	}
+	definition.FileDeliveryIntent = task.FileDeliveryRequired
+	if err := ValidateSyncDefinition(value.ID, definition); err == nil {
+		t.Fatal("sync definition accepted a file intent without Workspace binding")
+	}
+	definition.FileDeliveryIntent = task.FileDeliveryNone
 	definition.Observation = &ObservationSpec{URL: "https://example.test/status", Selector: "#status", Field: ObservationText}
 	if err := ValidateSyncDefinition(value.ID, definition); err == nil {
 		t.Fatal("hostless sync definition accepted computer observation")

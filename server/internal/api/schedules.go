@@ -43,6 +43,7 @@ type scheduleCreateRequest struct {
 	ModelID            string                       `json:"model_id"`
 	Title              json.RawMessage              `json:"title"`
 	Objective          string                       `json:"objective"`
+	FileDeliveryIntent json.RawMessage              `json:"file_delivery_intent"`
 	Timing             schedule.Timing              `json:"timing"`
 	Budget             *scheduleBudgetRequest       `json:"budget"`
 	MisfirePolicy      schedule.MisfirePolicy       `json:"misfire_policy"`
@@ -56,6 +57,7 @@ type scheduleUpdateRequest struct {
 	ModelID            *string                       `json:"model_id"`
 	Title              json.RawMessage               `json:"title"`
 	Objective          *string                       `json:"objective"`
+	FileDeliveryIntent json.RawMessage               `json:"file_delivery_intent"`
 	Timing             *schedule.Timing              `json:"timing"`
 	Budget             *scheduleBudgetRequest        `json:"budget"`
 	MisfirePolicy      *schedule.MisfirePolicy       `json:"misfire_policy"`
@@ -103,6 +105,7 @@ type scheduleResponse struct {
 	ModelID            string                       `json:"model_id"`
 	Title              string                       `json:"title"`
 	Objective          string                       `json:"objective"`
+	FileDeliveryIntent task.FileDeliveryIntent      `json:"file_delivery_intent"`
 	Timing             schedule.Timing              `json:"timing"`
 	Budget             scheduleBudgetResponse       `json:"budget"`
 	MisfirePolicy      schedule.MisfirePolicy       `json:"misfire_policy"`
@@ -185,13 +188,23 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 			writeError(c, invalidScheduleBody())
 			return
 		}
+		fileDeliveryIntent, err := parseOptionalScheduleFileDeliveryIntent(request.FileDeliveryIntent)
+		if err != nil {
+			writeError(c, invalidScheduleBody())
+			return
+		}
+		if fileDeliveryIntent == nil {
+			intent := task.FileDeliveryNone
+			fileDeliveryIntent = &intent
+		}
 		key, ok := scheduleIdempotencyKey(c)
 		if !ok {
 			return
 		}
 		command := app.CreateScheduleCommand{
 			HostID: request.HostID, ModelID: request.ModelID, Title: title, Objective: request.Objective,
-			Timing: request.Timing, MisfirePolicy: request.MisfirePolicy,
+			FileDeliveryIntent: *fileDeliveryIntent,
+			Timing:             request.Timing, MisfirePolicy: request.MisfirePolicy,
 			NotificationEvents: request.NotificationEvents, Observation: request.Observation,
 		}
 		if request.Budget != nil {
@@ -267,9 +280,14 @@ func (h *api) registerSchedules(group *gin.RouterGroup, service ScheduleService)
 			writeError(c, invalidScheduleBody())
 			return
 		}
+		fileDeliveryIntent, err := parseOptionalScheduleFileDeliveryIntent(request.FileDeliveryIntent)
+		if err != nil {
+			writeError(c, invalidScheduleBody())
+			return
+		}
 		command := app.UpdateScheduleCommand{
 			ExpectedVersion: *request.ExpectedVersion, HostID: hostID, ModelID: request.ModelID, Title: title,
-			Objective: request.Objective, Timing: request.Timing, MisfirePolicy: request.MisfirePolicy,
+			Objective: request.Objective, FileDeliveryIntent: fileDeliveryIntent, Timing: request.Timing, MisfirePolicy: request.MisfirePolicy,
 			NotificationEvents: request.NotificationEvents,
 		}
 		if request.Budget != nil {
@@ -414,13 +432,17 @@ func scheduleIdempotencyKey(c *gin.Context) (string, bool) {
 }
 
 func toScheduleResponse(value schedule.Schedule) scheduleResponse {
+	fileDeliveryIntent := value.FileDeliveryIntent
+	if fileDeliveryIntent == "" {
+		fileDeliveryIntent = task.FileDeliveryNone
+	}
 	var hostID *string
 	if value.HostID != "" {
 		hostID = &value.HostID
 	}
 	result := scheduleResponse{
 		ID: value.ID, Version: value.Version, Status: value.Status, HostID: hostID, ModelID: value.ModelID, Title: value.Title,
-		Objective: value.Objective, Timing: value.Timing,
+		Objective: value.Objective, FileDeliveryIntent: fileDeliveryIntent, Timing: value.Timing,
 		Budget: scheduleBudgetResponse{
 			ActiveSeconds: value.Budget.ActiveSeconds,
 			ToolCalls:     value.Budget.ToolCalls,
@@ -456,6 +478,24 @@ func parseOptionalScheduleTitle(raw json.RawMessage) (*string, error) {
 		return nil, errors.New("schedule title cannot be null")
 	}
 	return title, nil
+}
+
+func parseOptionalScheduleFileDeliveryIntent(raw json.RawMessage) (*task.FileDeliveryIntent, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil, errors.New("schedule file delivery intent cannot be null")
+	}
+	var value string
+	if err := decodeStrictJSONBytes(raw, &value); err != nil {
+		return nil, err
+	}
+	intent := task.FileDeliveryIntent(value)
+	if !intent.Valid() {
+		return nil, errors.New("schedule file delivery intent is invalid")
+	}
+	return &intent, nil
 }
 
 func parseScheduleHostID(raw json.RawMessage) (*string, error) {

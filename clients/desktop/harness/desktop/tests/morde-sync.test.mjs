@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdtemp, mkdir, readFile, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, parse } from 'node:path';
@@ -111,9 +111,14 @@ process.stdin.once('data', chunk => {
       ...mapping, mode: 'project_upload', scope: [], projectSelectionID: '123e4567-e89b-42d3-a456-426614174000',
       sourceBindingID: '12345678-1234-4234-8234-123456789abd',
       hostId: 'h1234567', folderId: folderID, projectName: 'demo', idempotencyKey: 'project-upload-key',
+      sessionId: 'p1234567',
     };
     const sync = new MordeSync(() => binary, () => {});
     const result = await sync.run({
+      origin: 'https://portal.example', installationId: 'i1234567', clientCredential: 'client-secret',
+      clientExpiresAt: '2099-01-01T00:00:00Z', syncCredential: 'sync-secret', syncExpiresAt: '2099-01-01T00:00:00Z',
+    }, mapping, 'project_upload', [], checkpoint);
+    const retried = await sync.run({
       origin: 'https://portal.example', installationId: 'i1234567', clientCredential: 'client-secret',
       clientExpiresAt: '2099-01-01T00:00:00Z', syncCredential: 'sync-secret', syncExpiresAt: '2099-01-01T00:00:00Z',
     }, mapping, 'project_upload', [], checkpoint);
@@ -123,9 +128,30 @@ process.stdin.once('data', chunk => {
     assert.equal(result.params.base_revision, 0);
     assert.deepEqual(result.params.scope, []);
     assert.equal(result.params.idempotency_key, 'project-upload-key');
+    assert.equal(result.params.session_id, 'p1234567');
+    assert.equal(retried.params.idempotency_key, result.params.idempotency_key);
+    assert.equal(retried.params.session_id, result.params.session_id);
     assert.equal(result.params.bearer_token, 'sync-secret');
     assert.equal(JSON.stringify(result.params).includes('client-secret'), false);
     assert.equal(sync.snapshot(), 'idle');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('sync rechecks selected directory identity after the asynchronous confirmation hook', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'morde-sync-confirm-race-'));
+  try {
+    const directory = join(root, 'project'), moved = join(root, 'project-selected-before-confirmation');
+    await mkdir(directory);
+    const mapping = { ...await checkedDirectory(directory, []), workspaceId: 'w1234567' };
+    const auth = { origin: 'https://portal.example', installationId: 'inst', clientCredential: 'client-secret',
+      clientExpiresAt: '2099-01-01T00:00:00Z', syncCredential: 'sync-secret', syncExpiresAt: '2099-01-01T00:00:00Z' };
+    let binaryRequested = false;
+    const sync = new MordeSync(() => { binaryRequested = true; throw new Error('child should not start'); }, () => {});
+    await assert.rejects(() => sync.run(auth, mapping, 'upload', [], undefined, undefined, async () => {
+      await rename(directory, moved);
+      await mkdir(directory);
+    }), /identity changed/);
+    assert.equal(binaryRequested, false);
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
@@ -178,6 +204,27 @@ process.stdin.once('data', chunk => {
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 
+test('a missing helper during local inspection does not block a later inspection', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'morde-preserved-helper-retry-'));
+  try {
+    const directory = join(root, 'project'), binary = join(root, 'fake-sync');
+    await mkdir(directory);
+    await writeFile(binary, `#!/usr/bin/env node
+process.stdin.once('data', chunk => { const req = JSON.parse(String(chunk).trim()); process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:req.id,result:[]})+'\\n'); });
+`);
+    await chmod(binary, 0o700);
+    const mapping = { ...await checkedDirectory(directory, []), workspaceId: 'w1234567' };
+    let lookupCount = 0;
+    const sync = new MordeSync(() => {
+      if (lookupCount++ === 0) throw new Error('helper unavailable');
+      return binary;
+    }, () => {});
+    await assert.rejects(() => sync.listPreserved(mapping), /Could not locate the local safety-copy helper/);
+    assert.deepEqual(await sync.listPreserved(mapping), []);
+    assert.equal(sync.snapshot(), 'idle');
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
 test('safety-copy RPC rejects malformed paths, timestamps, sizes and mismatched Workspace IDs', async () => {
   const root = await mkdtemp(join(tmpdir(), 'morde-preserved-invalid-'));
   try {
@@ -200,6 +247,30 @@ test('a missing or expired sync credential cannot start the sync child', async (
     const sync = new MordeSync(() => { throw new Error('child should not start'); }, () => {});
     await assert.rejects(() => sync.run({ origin: 'https://portal.example', installationId: 'inst', clientCredential: 'client-secret', clientExpiresAt: '2099-01-01T00:00:00Z' }, mapping, 'upload'), /not authorized/);
     await assert.rejects(() => sync.run({ origin: 'https://portal.example', installationId: 'inst', clientCredential: 'client-secret', clientExpiresAt: '2099-01-01T00:00:00Z', syncCredential: 'sync-secret', syncExpiresAt: 'invalid' }, mapping, 'upload'), /not authorized/);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+test('a missing sync helper leaves the engine idle and allows retry', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'morde-sync-helper-retry-'));
+  try {
+    const directory = join(root, 'project'), binary = join(root, 'fake-sync');
+    await mkdir(directory);
+    await writeFile(binary, `#!/usr/bin/env node
+process.stdin.once('data', chunk => { const req = JSON.parse(String(chunk).trim()); process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:req.id,result:{session:{state:'completed'}}})+'\\n'); });
+`);
+    await chmod(binary, 0o700);
+    const mapping = { ...await checkedDirectory(directory, []), workspaceId: 'w1234567' };
+    const auth = { origin: 'https://portal.example', installationId: 'inst', clientCredential: 'client-secret',
+      clientExpiresAt: '2099-01-01T00:00:00Z', syncCredential: 'sync-secret', syncExpiresAt: '2099-01-01T00:00:00Z' };
+    let lookupCount = 0;
+    const sync = new MordeSync(() => {
+      if (lookupCount++ === 0) throw new Error('helper unavailable');
+      return binary;
+    }, () => {});
+    await assert.rejects(() => sync.run(auth, mapping, 'upload'), /Could not locate morde-sync/);
+    assert.equal(sync.snapshot(), 'idle');
+    await sync.run(auth, mapping, 'upload');
+    assert.equal(sync.snapshot(), 'idle');
   } finally { await rm(root, { recursive: true, force: true }); }
 });
 

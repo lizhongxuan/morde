@@ -32,6 +32,7 @@ func messageDomain(row sqlcgen.ConversationMessage) conversation.Message {
 
 func taskDomain(row sqlcgen.Task) task.Task {
 	currentRevision := row.CurrentRevision
+	desiredRevision := row.DesiredRevision
 	return task.Task{
 		ID: row.ID, OwnerID: row.OwnerID, ProjectID: row.ProjectID.String, InitiatorID: row.InitiatorID,
 		ConversationID: row.ConversationID, HostID: row.HostID.String,
@@ -39,6 +40,7 @@ func taskDomain(row sqlcgen.Task) task.Task {
 		WorkspaceOwnerID: row.WorkspaceOwnerID.String, WorkspaceProjectResourceVersion: int64Pointer(row.WorkspaceProjectResourceVersion),
 		InputRevision: int64Pointer(row.InputRevision), WorkspaceCheckpointRevision: int64Pointer(row.WorkspaceCheckpointRevision),
 		CurrentRevision: &currentRevision,
+		DesiredRevision: &desiredRevision,
 		ContextDigest:   append([]byte(nil), row.ContextDigest...),
 		AgentInstanceID: row.AgentInstanceID, AgentGeneration: row.AgentGeneration, AgentSessionID: row.AgentSessionID,
 		AgentEngineVersion: row.AgentEngineVersion, AgentProfileVersion: row.AgentProfileVersion,
@@ -62,7 +64,8 @@ func taskDomain(row sqlcgen.Task) task.Task {
 func taskBatchItemDomain(row sqlcgen.TaskBatchItem) task.BatchItem {
 	return task.BatchItem{
 		ID: row.ID, TaskID: row.TaskID, Key: row.ItemKey, Input: row.Input,
-		Status: task.BatchItemStatus(row.Status), Attempt: row.Attempt, Result: row.Result, Error: row.Error,
+		FileDeliveryIntent: task.FileDeliveryIntent(row.FileDeliveryIntent),
+		Status:             task.BatchItemStatus(row.Status), Attempt: row.Attempt, Result: row.Result, Error: row.Error,
 		CreatedAt: row.CreatedAt.Time, UpdatedAt: row.UpdatedAt.Time,
 	}
 }

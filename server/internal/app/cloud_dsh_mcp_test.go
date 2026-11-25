@@ -21,6 +21,7 @@ type cloudDSHMCPStoreStub struct {
 	*mcpConnectorStoreStub
 	grants                []TaskMCPConnectorGrant
 	operations            map[string]MCPConnectorOperation
+	lastDispatched        MCPConnectorOperation
 	binding               *workspace.Binding
 	projectGrantActive    bool
 	projectGrantVersion   int64
@@ -151,6 +152,7 @@ func (s *cloudDSHMCPStoreStub) MarkMCPConnectorOperationDispatched(_ context.Con
 	if !ok || stored.Status != task.OperationPrepared {
 		return MCPConnectorOperation{}, domain.NewError(domain.CodeConflict, "operation is not prepared")
 	}
+	s.lastDispatched = value
 	stored.Status = task.OperationDispatched
 	s.operations[value.Key] = stored
 	return stored, nil
@@ -295,12 +297,28 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	claimed := store.details.Task
+	store.details.Plan = &task.Plan{TaskRevision: *claimed.CurrentRevision, Revision: 3, Goal: "Find sources",
+		Scope: "Search the source catalog", VerificationMethod: "Inspect the saved sources", CostEstimateState: "unknown",
+		Steps: []task.PlanStep{{ID: "search", Title: "Find sources", Status: task.PlanStepPending,
+			CompletionCriteria: []string{"sources are recorded"}}}}
 	discoverSelectedMCPForTest(t, broker, claimed, connectorID)
 	grant := store.grants[0]
 	if len(grant.ToolSchema) == 0 || !bytes.Equal(grant.ToolSchemaSHA256, func() []byte { digest := sha256.Sum256(grant.ToolSchema); return digest[:] }()) {
 		t.Fatalf("pinned MCP schema/digest = %q / %x", grant.ToolSchema, grant.ToolSchemaSHA256)
 	}
-	call := selectedMCPCallForTest(t, "mcp-call-1", connectorID, "lookup", `{"query":"agent"}`)
+	call := selectedMCPCallForTest(t, "mcp-call-1", connectorID, "lookup",
+		`{"query":"agent","morde_plan_step_id":"nested-untrusted","morde_plan_revision":99}`)
+	var callArguments map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(call.Arguments), &callArguments); err != nil {
+		t.Fatal(err)
+	}
+	callArguments[cloudDSHPlanStepIDArgumentName] = json.RawMessage(`"search"`)
+	callArguments[cloudDSHPlanRevisionArgumentName] = json.RawMessage(`3`)
+	callBytes, err := json.Marshal(callArguments)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call.Arguments = string(callBytes)
 	approval, err := broker.Execute(context.Background(), claimed, call)
 	if err != nil || approval.Status != AgentToolNeedsUser || client.callCalls != 0 || len(store.operations) != 0 ||
 		store.details.Task.Usage.ToolCalls != 0 || store.details.Task.Status != task.StatusWaitingUser {
@@ -308,9 +326,34 @@ func TestCloudDSHMCPBrokerPinsGrantAndReplaysDurableResult(t *testing.T) {
 	}
 	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
 	claimed = store.details.Task
+	planRevision := int64(3)
+	for name, invalidCall := range map[string]ModelToolCall{
+		"missing metadata": setCloudDSHPlanStepMetadataForTest(t, call, "", nil),
+		"unknown step":     setCloudDSHPlanStepMetadataForTest(t, call, "model-invented", &planRevision),
+		"stale revision":   setCloudDSHPlanStepMetadataForTest(t, call, "search", func() *int64 { stale := int64(2); return &stale }()),
+	} {
+		t.Run("admission rejects "+name, func(t *testing.T) {
+			result, err := broker.Execute(context.Background(), claimed, invalidCall)
+			if err != nil || result.Status != AgentToolFailed {
+				t.Fatalf("invalid MCP plan metadata result=%+v error=%v; want fail-closed result", result, err)
+			}
+			if client.callCalls != 0 || len(store.operations) != 0 {
+				t.Fatalf("invalid MCP plan metadata reached connector: calls=%d operations=%d", client.callCalls, len(store.operations))
+			}
+		})
+	}
 	first, err := broker.Execute(context.Background(), claimed, call)
 	if err != nil || first.Status != AgentToolSucceeded || client.callCalls != 1 || client.lastTool != "lookup" {
 		t.Fatalf("MCP execution = %#v, err=%v; calls=%d tool=%q", first, err, client.callCalls, client.lastTool)
+	}
+	if store.lastDispatched.PlanRevision != 3 || store.lastDispatched.PlanStepID != "search" {
+		t.Fatalf("MCP admission selectors = revision:%d step:%q; want current plan revision and step",
+			store.lastDispatched.PlanRevision, store.lastDispatched.PlanStepID)
+	}
+	var remoteArguments map[string]json.RawMessage
+	if err := json.Unmarshal(client.lastRequest, &remoteArguments); err != nil || len(remoteArguments) != 1 ||
+		string(remoteArguments["query"]) != `"agent"` || hasCloudDSHPlanStepMetadata(string(client.lastRequest)) {
+		t.Fatalf("remote MCP tool received plan metadata or changed business arguments: %s, err=%v", client.lastRequest, err)
 	}
 	var output cloudDSHMCPOutput
 	if err := json.Unmarshal([]byte(first.Output), &output); err != nil || output.IsError || string(output.StructuredContent) != `{"count":1}` || len(output.Text) != 1 || output.Text[0] != "one record" {
@@ -405,7 +448,8 @@ func TestCloudDSHMCPTerminalRateLimitFailsTaskAndReplaysLedgerResult(t *testing.
 	}
 	store.commitTaskProgressError = nil
 	result, err := broker.Reconcile(context.Background(), claimed, call, nil)
-	if err != nil || result.Status != AgentToolFailed || !result.TerminalForAttempt || client.callCalls != 1 ||
+	if err != nil || result.Status != AgentToolFailed || !result.TerminalForAttempt || result.Output != operation.Result ||
+		strings.Contains(result.Output, "synthetic provider detail") || client.callCalls != 1 ||
 		store.details.Task.Status != task.StatusRunning || store.details.Task.WaitingReason != "" {
 		t.Fatalf("reconciled terminal result=%+v err=%v connector calls=%d task=%+v", result, err, client.callCalls, store.details.Task)
 	}
@@ -428,6 +472,73 @@ func TestCloudDSHMCPTerminalRateLimitFailsTaskAndReplaysLedgerResult(t *testing.
 		status != string(task.StatusFailed) || reason != "connector_rate_limited" ||
 		bytes.Contains(store.events[len(store.events)-1].Payload, []byte("synthetic provider detail")) {
 		t.Fatalf("terminal task result event=%s", store.events[len(store.events)-1].Payload)
+	}
+}
+
+func TestCloudDSHMCPDefinitiveFailureIsRedactedAndReplayedExactly(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	fixture.store.details.Task.HostID = ""
+	fixture.store.details.Task.WorkspaceID = ""
+	fixture.store.details.Task.InputRevision = nil
+	fixture.store.details.Task.WorkspaceCheckpointRevision = nil
+	fixture.store.details.Task.ExecutionLocation = "server"
+	current := fixture.store.details.Task
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-mcp-safe-failure", 1, "session-mcp-safe-failure"
+	current.Authorization.Version = 1
+	fixture.store.details.Task = current
+	connectorID := "k1234567"
+	store := &cloudDSHMCPStoreStub{
+		cloudDSHBrokerTaskStore: &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store},
+		mcpConnectorStoreStub: &mcpConnectorStoreStub{values: map[string]MCPConnectorRecord{
+			connectorID: {ID: connectorID, OwnerID: current.OwnerID, Name: "Synthetic", EndpointURL: "https://mcp.example.test", Enabled: true, Revision: 1},
+		}},
+		grants: []TaskMCPConnectorGrant{{TaskID: current.ID, OwnerID: current.OwnerID,
+			ConnectorOwnerID: current.OwnerID, ConnectorID: connectorID, ConnectorRevision: 1, GrantVersion: 1}},
+	}
+	fixture.executor.store = store
+	largeFailureText := strings.Repeat("api_key=private-key-83 https://internal.example/path?token=private-token-44 provider private detail ", 4)
+	largeFailureTexts := make([]string, 256)
+	for index := range largeFailureTexts {
+		largeFailureTexts[index] = largeFailureText
+	}
+	if len(largeFailureText)*len(largeFailureTexts) <= maxAgentToolOutputBytes-1024 {
+		t.Fatal("synthetic MCP error body does not exceed the durable output limit")
+	}
+	client := &cloudDSHMCPClientStub{
+		tools: []MCPConnectorToolDefinition{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)}},
+		result: MCPConnectorToolResult{IsError: true,
+			StructuredContent: json.RawMessage(`{"message":"provider private detail","url":"https://internal.example/path?token=private-token-44"}`),
+			Text:              largeFailureTexts},
+	}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, cloudDSHMCPCredentialStub{}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed := store.details.Task
+	discoverSelectedMCPForTest(t, broker, claimed, connectorID)
+	call := selectedMCPCallForTest(t, "mcp-safe-failure-1", connectorID, "lookup", `{"query":"synthetic"}`)
+	if result, err := broker.Execute(context.Background(), claimed, call); err != nil || result.Status != AgentToolNeedsUser {
+		t.Fatalf("unapproved MCP action = %+v err=%v", result, err)
+	}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	claimed = store.details.Task
+	first, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || first.Status != AgentToolFailed || client.callCalls != 1 {
+		t.Fatalf("first MCP failure = %+v err=%v remoteCalls=%d", first, err, client.callCalls)
+	}
+	operation := store.operations[agentOperationKey(call.CallID)]
+	want := `{"is_error":true,"text":["error_category: connector_tool_error"]}`
+	if operation.Status != task.OperationFailed || operation.Result != first.Output || first.Output != want {
+		t.Fatalf("MCP failure result/ledger mismatch: result=%q operation=%+v; want %q", first.Output, operation, want)
+	}
+	for _, secret := range []string{"provider private detail", "internal.example", "private-token-44", "api_key", "private-key-83"} {
+		if strings.Contains(first.Output, secret) || strings.Contains(operation.Result, secret) {
+			t.Fatalf("sensitive MCP failure detail %q escaped: output=%q ledger=%q", secret, first.Output, operation.Result)
+		}
+	}
+	replayed, err := broker.Reconcile(context.Background(), claimed, call, nil)
+	if err != nil || replayed.Status != AgentToolFailed || replayed.Output != first.Output || client.callCalls != 1 {
+		t.Fatalf("replayed MCP failure = %+v err=%v first=%q remoteCalls=%d", replayed, err, first.Output, client.callCalls)
 	}
 }
 

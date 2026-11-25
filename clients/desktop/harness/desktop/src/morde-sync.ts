@@ -167,7 +167,9 @@ export class MordeSync {
   private async localRequest(method: "list_preserved" | "restore_preserved" | "delete_preserved" | "project_fingerprint", params: Record<string, string>): Promise<unknown> {
     if (this.child || this.localOperation || this.state !== "idle") throw new Error("Finish or verify the prior sync before accessing safety copies");
     this.localOperation = true;
-    const binary = this.binary();
+    let binary: string;
+    try { binary = this.binary(); }
+    catch { this.localOperation = false; throw new Error("Could not locate the local safety-copy helper"); }
     this.lastBinary = binary;
     let child: ChildProcessWithoutNullStreams;
     try { child = spawn(binary, [], { shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }); }
@@ -228,6 +230,10 @@ export class MordeSync {
     if (!auth.syncCredential || credentialExpired(auth.syncExpiresAt)) throw new Error("Workspace sync is not authorized");
     await verifyMapping(mapping);
     await confirmMapping?.();
+    // Recheck after the asynchronous confirmation hook. The selected path can
+    // be replaced while that hook is running, so the pre-confirmation check
+    // alone is not enough to bind the child process to the selected directory.
+    await verifyMapping(mapping);
     if (!stillAuthorized() || credentialExpired(auth.syncExpiresAt)) throw new Error("Workspace sync authorization changed");
     scope = validateSyncScope(scope);
     if (mode === "live_sync" && (!Number.isSafeInteger(rescanSeconds) || rescanSeconds < 5 || rescanSeconds > 3600)) throw new Error("Live sync scan interval must be between 5 and 3600 seconds");
@@ -248,6 +254,10 @@ export class MordeSync {
     const data = mode === "project_upload"
       ? { ...params, folder_id: checkpoint!.folderId, source_binding_id: checkpoint!.sourceBindingID, direction: "upload", policy: "compare_merge", base_revision: 0, scope: [], idempotency_key: checkpoint!.idempotencyKey, ...(checkpoint!.sessionId ? { session_id: checkpoint!.sessionId } : {}) }
       : method === "sync" ? { ...params, direction: mode, idempotency_key: checkpoint?.idempotencyKey ?? randomUUID(), ...(checkpoint?.sessionId ? { session_id: checkpoint.sessionId } : {}) } : method === "handoff_checkpoint" ? { ...params, idempotency_key: checkpoint?.idempotencyKey ?? randomUUID() } : { ...params, rescan_seconds: rescanSeconds };
+    let binary: string;
+    try { binary = this.binary(); }
+    catch { this.update(this.state); throw new Error("Could not locate morde-sync"); }
+    this.lastBinary = binary;
     this.state = "running";
     this.stopping = false;
     this.cancelId = 0;
@@ -255,8 +265,6 @@ export class MordeSync {
     this.operationConfirmed = false;
     this.update("running");
     let child: ChildProcessWithoutNullStreams;
-    const binary = this.binary();
-    this.lastBinary = binary;
     try { child = spawn(binary, [], { shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true }); }
     catch { this.state = "idle"; this.update("idle"); throw new Error("Could not start morde-sync"); }
     this.child = child;

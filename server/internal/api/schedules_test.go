@@ -104,6 +104,7 @@ func scheduleRoutesTestValue() schedule.Schedule {
 	return schedule.Schedule{
 		ID: "j1234567", OwnerID: "u1234567", Version: 2, Status: schedule.StatusEnabled,
 		HostID: "h1234567", ModelID: "model-a", Title: "Weekly report", Objective: "check the weekly goal",
+		FileDeliveryIntent: task.FileDeliveryNone,
 		Timing: schedule.Timing{
 			Kind: schedule.TimingWeekly, StartsOn: "2026-11-02", LocalTime: "09:30",
 			TimeZone: "Asia/Shanghai", Weekdays: []int{1, 3},
@@ -138,6 +139,7 @@ func TestScheduleListPaginationAndDTOOmitSensitiveFields(t *testing.T) {
 	item := items[0]
 	if string(body["next_cursor"]) != `"cursor-2"` || string(item["host_id"]) != `"h1234567"` ||
 		string(item["budget"]) == "null" || item["owner_id"] != nil || item["authorization"] != nil ||
+		string(item["file_delivery_intent"]) != `"none"` ||
 		strings.Contains(response.Body.String(), "secret-token-id") {
 		t.Fatalf("unexpected Schedule response fields: %s", response.Body)
 	}
@@ -146,7 +148,7 @@ func TestScheduleListPaginationAndDTOOmitSensitiveFields(t *testing.T) {
 func TestScheduleCreatePassesTypedCommandPrincipalAndIdempotencyKey(t *testing.T) {
 	service := &scheduleRoutesServiceStub{value: scheduleRoutesTestValue()}
 	principal := identity.Principal{UserID: "u1234567", Kind: identity.KindSession, TokenID: "t1234567"}
-	body := `{"host_id":"h1234567","model_id":"model-a","title":"Weekly report","objective":"check the weekly goal","timing":{"kind":"weekly","starts_on":"2026-11-02","local_time":"09:30","time_zone":"Asia/Shanghai","weekdays":[1,3]},"budget":{"active_seconds":300,"tool_calls":12,"model_tokens":9000},"misfire_policy":"run_once","notification_events":["completed","failed"],"observation":{"url":"https://example.com","selector":"main h1","field":"text"}}`
+	body := `{"host_id":"h1234567","model_id":"model-a","title":"Weekly report","objective":"check the weekly goal","file_delivery_intent":"none","timing":{"kind":"weekly","starts_on":"2026-11-02","local_time":"09:30","time_zone":"Asia/Shanghai","weekdays":[1,3]},"budget":{"active_seconds":300,"tool_calls":12,"model_tokens":9000},"misfire_policy":"run_once","notification_events":["completed","failed"],"observation":{"url":"https://example.com","selector":"main h1","field":"text"}}`
 	request := httptest.NewRequest(http.MethodPost, "/api/schedules", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Idempotency-Key", "schedule-create-1")
@@ -154,10 +156,37 @@ func TestScheduleCreatePassesTypedCommandPrincipalAndIdempotencyKey(t *testing.T
 	scheduleRoutesRouter(&principal, service).ServeHTTP(response, request)
 	if response.Code != http.StatusCreated || service.createCalls != 1 || service.createKey != "schedule-create-1" ||
 		service.principal.UserID != principal.UserID || service.create.HostID != "h1234567" || service.create.ModelID != "model-a" ||
+		service.create.FileDeliveryIntent != task.FileDeliveryNone ||
 		service.create.Budget.ActiveSeconds != 300 || service.create.Timing.Kind != schedule.TimingWeekly ||
 		service.create.Title == nil || *service.create.Title != "Weekly report" ||
-		service.create.Observation == nil || service.create.Observation.Selector != "main h1" || !strings.Contains(response.Body.String(), `"title":"Weekly report"`) {
+		service.create.Observation == nil || service.create.Observation.Selector != "main h1" ||
+		!strings.Contains(response.Body.String(), `"title":"Weekly report"`) || !strings.Contains(response.Body.String(), `"file_delivery_intent":"none"`) {
 		t.Fatalf("POST schedules status=%d calls=%d command=%+v body=%s", response.Code, service.createCalls, service.create, response.Body)
+	}
+}
+
+func TestScheduleFileDeliveryIntentRejectsInvalidCreateAndUpdateBodies(t *testing.T) {
+	principal := identity.Principal{UserID: "u1234567", Kind: identity.KindSession, TokenID: "t1234567"}
+	for _, raw := range []string{`null`, `""`, `"maybe"`, `123`} {
+		createService := &scheduleRoutesServiceStub{value: scheduleRoutesTestValue()}
+		create := httptest.NewRequest(http.MethodPost, "/api/schedules", strings.NewReader(`{"file_delivery_intent":`+raw+`}`))
+		create.Header.Set("Content-Type", "application/json")
+		create.Header.Set("Idempotency-Key", "schedule-intent-invalid")
+		created := httptest.NewRecorder()
+		scheduleRoutesRouter(&principal, createService).ServeHTTP(created, create)
+		if created.Code != http.StatusBadRequest || createService.createCalls != 0 {
+			t.Errorf("invalid create intent %s status=%d calls=%d body=%s", raw, created.Code, createService.createCalls, created.Body)
+		}
+
+		updateService := &scheduleRoutesServiceStub{value: scheduleRoutesTestValue()}
+		update := httptest.NewRequest(http.MethodPut, "/api/schedules/j1234567", strings.NewReader(`{"expected_version":2,"file_delivery_intent":`+raw+`}`))
+		update.Header.Set("Content-Type", "application/json")
+		update.Header.Set("Idempotency-Key", "schedule-intent-invalid")
+		updated := httptest.NewRecorder()
+		scheduleRoutesRouter(&principal, updateService).ServeHTTP(updated, update)
+		if updated.Code != http.StatusBadRequest || updateService.updateCalls != 0 {
+			t.Errorf("invalid update intent %s status=%d calls=%d body=%s", raw, updated.Code, updateService.updateCalls, updated.Body)
+		}
 	}
 }
 
@@ -300,6 +329,7 @@ func TestScheduleGetAndUpdateRoutes(t *testing.T) {
 		want *schedule.ObservationSpec
 	}{
 		{body: `{"expected_version":2,"objective":"revised"}`, set: false},
+		{body: `{"expected_version":2,"file_delivery_intent":"none"}`, set: false},
 		{body: `{"expected_version":2,"observation":null}`, set: true},
 		{body: `{"expected_version":2,"observation":{"url":"https://example.com","selector":"main","field":"value"}}`, set: true, want: &schedule.ObservationSpec{URL: "https://example.com", Selector: "main", Field: schedule.ObservationValue}},
 	} {
@@ -315,6 +345,10 @@ func TestScheduleGetAndUpdateRoutes(t *testing.T) {
 		}
 		if test.want == nil && updateService.update.Observation != nil || test.want != nil && updateService.update.Observation == nil {
 			t.Fatalf("observation = %+v, want %+v", updateService.update.Observation, test.want)
+		}
+		if strings.Contains(test.body, `"file_delivery_intent"`) &&
+			(updateService.update.FileDeliveryIntent == nil || *updateService.update.FileDeliveryIntent != task.FileDeliveryNone) {
+			t.Fatalf("file_delivery_intent = %v, want explicit none", updateService.update.FileDeliveryIntent)
 		}
 	}
 }

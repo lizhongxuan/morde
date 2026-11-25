@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -291,6 +292,84 @@ func TestSelectedMCPActivityUsesResolvedToolAndReusesCallIdentity(t *testing.T) 
 	if settled.ID != original.ID || settled.Sequence != original.Sequence || settled.ToolCallKey != call.CallID ||
 		settled.ToolName != cloudDSHMCPCallToolName || settled.Title != "Run cloud dsh MCP tool: lookup" || settled.Status != task.StepSucceeded {
 		t.Fatalf("selected MCP replay created a different activity: original=%+v settled=%+v", original, settled)
+	}
+}
+
+func TestSelectedMCPPlanSelectorsBindAdmissionAndStayOutOfBusinessArguments(t *testing.T) {
+	client := &cloudDSHMCPClientStub{tools: []MCPConnectorToolDefinition{{Name: "lookup", Description: "Find a synthetic record",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)}},
+		result: MCPConnectorToolResult{Text: []string{"synthetic result"}}}
+	broker, store, claimed := selectedMCPTestFixture(t, client)
+	discoverSelectedMCPForTest(t, broker, claimed, "k1234567")
+	current := store.details.Task
+	current.AgentInstanceID, current.AgentGeneration, current.AgentSessionID = "agent-mcp", 1, "session-root"
+	revision := int64(5)
+	current.CurrentRevision, current.DesiredRevision = &revision, &revision
+	current.Authorization.Version = 2
+	plan := task.Plan{TaskRevision: revision, Revision: 3, Goal: "Find sources", Scope: "Search for sources",
+		VerificationMethod: "Inspect returned sources", CostEstimateState: "unknown",
+		Steps: []task.PlanStep{{ID: "sources", Title: "Search sources", Status: task.PlanStepPending,
+			CompletionCriteria: []string{"sources found"}}}}
+	store.details.Task, store.details.Plan = current, &plan
+	claimed = current
+
+	definitions, err := broker.Definitions(context.Background(), claimed)
+	if err != nil {
+		t.Fatalf("Definitions() error = %v", err)
+	}
+	var callSchema AgentToolDefinition
+	for _, definition := range definitions {
+		if definition.Name == cloudDSHMCPCallToolName {
+			callSchema = definition
+			break
+		}
+	}
+	if len(callSchema.Parameters) == 0 || !bytes.Contains(callSchema.Parameters, []byte(cloudDSHPlanStepIDArgumentName)) ||
+		!bytes.Contains(callSchema.Parameters, []byte(cloudDSHPlanRevisionArgumentName)) {
+		t.Fatalf("MCP call schema omitted plan selectors: %s", callSchema.Parameters)
+	}
+
+	call := selectedMCPCallForTest(t, "selected-plan-call", "k1234567", "lookup",
+		`{"query":"local","morde_plan_step_id":"nested-step","morde_plan_revision":99}`)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(call.Arguments), &fields); err != nil {
+		t.Fatal(err)
+	}
+	fields[cloudDSHPlanStepIDArgumentName] = json.RawMessage(`"sources"`)
+	fields[cloudDSHPlanRevisionArgumentName] = json.RawMessage(`3`)
+	encodedCall, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call.Arguments = string(encodedCall)
+	call.TaskFence = &ModelTaskFence{TaskID: current.ID, OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+		LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version, AgentInstanceID: current.AgentInstanceID,
+		AgentGeneration: current.AgentGeneration, AgentSessionID: current.AgentSessionID,
+		AuthorizationVersion: current.Authorization.Version}
+
+	approval, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || approval.Status != AgentToolNeedsUser || client.callCalls != 0 {
+		t.Fatalf("selected MCP approval = %+v, calls=%d err=%v", approval, client.callCalls, err)
+	}
+	resumeCloudDSHMCPApproval(t, store, task.PendingDecisionApprove)
+	claimed = store.details.Task
+	call.TaskFence.LeaseOwner, call.TaskFence.LeaseVersion = claimed.Lease.Owner, claimed.Lease.Version
+	result, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || result.Status != AgentToolSucceeded || client.callCalls != 1 {
+		t.Fatalf("selected MCP dispatch = %+v, calls=%d err=%v", result, client.callCalls, err)
+	}
+	if store.lastDispatched.PlanRevision != 3 || store.lastDispatched.PlanStepID != "sources" {
+		t.Fatalf("MCP dispatch did not receive the top-level plan selector: revision=%d step=%q",
+			store.lastDispatched.PlanRevision, store.lastDispatched.PlanStepID)
+	}
+	var business map[string]json.RawMessage
+	if err := json.Unmarshal(client.lastRequest, &business); err != nil || len(business) != 1 ||
+		string(business["query"]) != `"local"` || hasCloudDSHPlanStepMetadata(string(client.lastRequest)) {
+		t.Fatalf("MCP business arguments contain plan selectors or changed: %s err=%v", client.lastRequest, err)
+	}
+	step := store.details.Steps[0]
+	if step.ToolName != cloudDSHMCPToolName("k1234567", "lookup") || step.Status != task.StepSucceeded {
+		t.Fatalf("plan-bound TaskStep does not match the admitted MCP operation: %+v", step)
 	}
 }
 

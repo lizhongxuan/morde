@@ -107,16 +107,17 @@ WHERE c.owner_id=$1 AND m.task_id=$2`, owner.ID, *run.TaskID).Scan(&conversation
 		expectedAccountChange{objectType: "message", objectID: messageID, revision: 1},
 		expectedAccountChange{objectType: "schedule", objectID: value.ID, revision: value.Version + 1},
 	)
-	var authKind string
+	var authKind, fileDeliveryIntent string
 	var executionEpoch int64
-	if err := store.pool.QueryRow(ctx, `SELECT auth_kind,execution_epoch FROM tasks WHERE id=$1`, *run.TaskID).Scan(&authKind, &executionEpoch); err != nil {
+	if err := store.pool.QueryRow(ctx, `SELECT auth_kind,execution_epoch,file_delivery_intent FROM tasks WHERE id=$1`, *run.TaskID).
+		Scan(&authKind, &executionEpoch, &fileDeliveryIntent); err != nil {
 		t.Fatal(err)
 	}
-	if authKind != string(identity.KindScheduleTask) || executionEpoch != value.ExecutionEpoch {
-		t.Fatalf("scheduled task authorization/epoch = %s/%d, want schedule_task/%d", authKind, executionEpoch, value.ExecutionEpoch)
+	if authKind != string(identity.KindScheduleTask) || executionEpoch != value.ExecutionEpoch || fileDeliveryIntent != string(task.FileDeliveryNone) {
+		t.Fatalf("scheduled task authorization/epoch/file intent = %s/%d/%s, want schedule_task/%d/none", authKind, executionEpoch, fileDeliveryIntent, value.ExecutionEpoch)
 	}
 	loaded, err := store.GetSchedule(ctx, owner.ID, value.ID)
-	if err != nil || loaded.Status != schedule.StatusCompleted || loaded.Version != value.Version+1 || loaded.LastRun == nil || loaded.LastRun.ID != run.ID {
+	if err != nil || loaded.FileDeliveryIntent != task.FileDeliveryNone || loaded.Status != schedule.StatusCompleted || loaded.Version != value.Version+1 || loaded.LastRun == nil || loaded.LastRun.ID != run.ID {
 		t.Fatalf("completed schedule = %#v, %v", loaded, err)
 	}
 	assertScheduleSyncRevision(t, store, owner.ID, value.ID, loaded.Version, 4)
@@ -192,13 +193,22 @@ func TestPostgresHostlessScheduleRunsWithoutComputerAuthorization(t *testing.T) 
 	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: runAt.Format(time.RFC3339), TimeZone: "UTC"}
 	value, _ := createPostgresSchedule(t, ctx, store, owner.ID, "", timing, schedule.MisfireRunOnce,
 		[]schedule.NotificationEvent{schedule.NotifyCompleted})
+	keywordOnly := value
+	keywordOnly.ID = mustID(t, schedule.NewID)
+	keywordOnly.Objective = "Create a PDF report"
+	keywordOnlyRecord := testIdempotency(owner.ID, "schedule.create", "schedule-keyword-file-intent")
+	keywordOnlyRecord.ResourceID = keywordOnly.ID
+	createdKeywordOnly, _, err := store.CreateSchedule(ctx, keywordOnly, keywordOnlyRecord)
+	if err != nil || createdKeywordOnly.FileDeliveryIntent != task.FileDeliveryNone {
+		t.Fatalf("objective text inferred scheduled file-delivery intent: %#v, err=%v", createdKeywordOnly, err)
+	}
 	unsafe := value
 	unsafe.ID = mustID(t, schedule.NewID)
-	unsafe.Objective = "Create a PDF report"
+	unsafe.FileDeliveryIntent = task.FileDeliveryRequired
 	unsafeRecord := testIdempotency(owner.ID, "schedule.create", "schedule-create-unsafe-hostless")
 	unsafeRecord.ResourceID = unsafe.ID
 	if _, _, err := store.CreateSchedule(ctx, unsafe, unsafeRecord); domain.CodeOf(err) != domain.CodeInvalidArgument {
-		t.Fatalf("store accepted hostless file-delivery schedule: %v", err)
+		t.Fatalf("store accepted schedule without Workspace with required file delivery: %v", err)
 	}
 	occurrence, err := schedule.FirstOccurrence(timing, time.Now().UTC())
 	if err != nil {
@@ -878,6 +888,10 @@ func TestPostgresScheduleDefinitionsPublishBusinessVersionsAndSyncProjection(t *
 	var title string
 	if err := json.Unmarshal(body["title"], &title); err != nil || title != enabled.Title {
 		t.Fatalf("schedule snapshot title = %q, %v; body=%s", title, err, snapshot.Items[0].Body)
+	}
+	var fileDeliveryIntent task.FileDeliveryIntent
+	if err := json.Unmarshal(body["file_delivery_intent"], &fileDeliveryIntent); err != nil || fileDeliveryIntent != task.FileDeliveryNone {
+		t.Fatalf("schedule snapshot file_delivery_intent = %q, %v; body=%s", fileDeliveryIntent, err, snapshot.Items[0].Body)
 	}
 	for _, forbidden := range []string{"auth_kind", "auth_token_id", "auth_scopes", "client_installation_id", "authorization", "execution_epoch", "next_run_at"} {
 		if _, exists := body[forbidden]; exists {

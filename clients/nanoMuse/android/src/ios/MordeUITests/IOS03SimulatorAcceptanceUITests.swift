@@ -2485,6 +2485,8 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         let submit = app.buttons["morde.task.clarification.submit"]
         XCTAssertTrue(answer.exists)
         XCTAssertTrue(submit.exists)
+        XCTAssertFalse(app.descendants(matching: .any)["morde.task.clarification.fileDeliveryIntent"].exists,
+                       "An ordinary clarification must remain text-only.")
         XCTAssertFalse(submit.isEnabled, "An empty answer must not be submitted.")
         XCTAssertTrue(app.buttons["morde.task.action.cancel"].exists)
         XCTAssertFalse(app.buttons["morde.task.approval.approve.r0000001"].exists)
@@ -2493,6 +2495,118 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
         answer.typeText("Synthetic response")
         XCTAssertTrue(submit.isEnabled, "A nonempty answer should enable the existing submit action.")
         attachScreen(app, named: "MDA-04 waiting clarification task detail")
+        submit.tap()
+        let answeredStatus = app.staticTexts["morde.task.status"]
+        let completed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "label CONTAINS %@", "已完成"),
+                                                  object: answeredStatus)
+        XCTAssertEqual(XCTWaiter.wait(for: [completed], timeout: 15), .completed,
+                       "The text-only answer should submit without a file-delivery field.")
+    }
+
+    func testMordeRouteFileDeliveryClarificationCanBeAnsweredWhileRunningPausingOrPaused() {
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        launchLocalChat(app, additionalArguments: [
+            "-morde.localTaskPagesFixture",
+            "-morde.localTaskPagesRouteClarificationFixture",
+        ])
+        app.buttons["morde.nav.tab.tasks"].tap()
+
+        let initialIntentTask = app.buttons["morde.tasks.row.q0000103"]
+        XCTAssertTrue(initialIntentTask.waitForExistence(timeout: 15))
+        initialIntentTask.tap()
+        let initialPicker = app.descendants(matching: .any)["morde.task.clarification.fileDeliveryIntent"]
+        XCTAssertTrue(initialPicker.waitForExistence(timeout: 10))
+        let initialAnswer = app.textFields["morde.task.clarification.answer"]
+        initialAnswer.tap()
+        initialAnswer.typeText("Only a chat answer is needed.")
+        initialPicker.tap()
+        let chatOnlyOption = app.descendants(matching: .any)["morde.task.clarification.fileDeliveryIntent.none"]
+        XCTAssertTrue(chatOnlyOption.waitForExistence(timeout: 5))
+        chatOnlyOption.tap()
+        let initialSubmit = app.buttons["morde.task.clarification.submit"]
+        XCTAssertTrue(initialSubmit.isEnabled)
+        initialSubmit.tap()
+        let initialCompleted = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", "已完成"),
+            object: app.staticTexts["morde.task.status"])
+        XCTAssertEqual(XCTWaiter.wait(for: [initialCompleted], timeout: 15), .completed,
+                       "The initial file-intent clarification must submit `none`.")
+
+        app.buttons["morde.task.back"].tap()
+        let routeTask = app.buttons["morde.tasks.row.q0000104"]
+        XCTAssertTrue(routeTask.waitForExistence(timeout: 10))
+        routeTask.tap()
+        XCTAssertTrue(app.staticTexts["morde.task.status"].label.contains("运行中"),
+                      "The route update fixture should remain an active Task.")
+        let routePicker = app.descendants(matching: .any)["morde.task.clarification.fileDeliveryIntent"]
+        XCTAssertTrue(routePicker.waitForExistence(timeout: 10),
+                      "A route file-delivery clarification must appear while the Task is running.")
+        let routeAnswer = app.textFields["morde.task.clarification.answer"]
+        routeAnswer.tap()
+        routeAnswer.typeText("Please deliver a file.")
+        routePicker.tap()
+        let deliverFileOption = app.descendants(matching: .any)["morde.task.clarification.fileDeliveryIntent.required"]
+        XCTAssertTrue(deliverFileOption.waitForExistence(timeout: 5))
+        deliverFileOption.tap()
+        let routeSubmit = app.buttons["morde.task.clarification.submit"]
+        XCTAssertTrue(routeSubmit.isEnabled)
+        routeSubmit.tap()
+        let routeCompleted = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", "已完成"),
+            object: app.staticTexts["morde.task.status"])
+        XCTAssertEqual(XCTWaiter.wait(for: [routeCompleted], timeout: 15), .completed,
+                       "The active route clarification must submit `required` with its exact call ID.")
+
+        app.buttons["morde.task.back"].tap()
+        let pausingTask = app.buttons["morde.tasks.row.q0000105"]
+        XCTAssertTrue(pausingTask.waitForExistence(timeout: 10))
+        pausingTask.tap()
+        let pausingPicker = app.descendants(matching: .any)["morde.task.clarification.fileDeliveryIntent"]
+        XCTAssertTrue(pausingPicker.waitForExistence(timeout: 10),
+                      "A route file-delivery clarification must remain available while the Task is pausing.")
+        XCTAssertTrue(app.staticTexts["morde.task.clarification.workspaceGuidance"].exists)
+        pausingPicker.tap()
+        XCTAssertFalse(app.descendants(matching: .any)["morde.task.clarification.fileDeliveryIntent.required"].exists,
+                       "File delivery must be unavailable without a bound Workspace.")
+        let pausingNone = app.descendants(matching: .any)["morde.task.clarification.fileDeliveryIntent.none"]
+        XCTAssertTrue(pausingNone.exists)
+        pausingNone.tap()
+        let pausingAnswer = app.textFields["morde.task.clarification.answer"]
+        pausingAnswer.tap()
+        pausingAnswer.typeText("No file is needed.")
+        let pausingSubmit = app.buttons["morde.task.clarification.submit"]
+        XCTAssertTrue(pausingSubmit.isEnabled)
+        pausingSubmit.tap()
+        let pausingCompleted = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", "已完成"),
+            object: app.staticTexts["morde.task.status"])
+        XCTAssertEqual(XCTWaiter.wait(for: [pausingCompleted], timeout: 15), .completed,
+                       "The route clarification must remain answerable while the Task is pausing.")
+
+        app.buttons["morde.task.back"].tap()
+        let pausedTask = app.buttons["morde.tasks.row.q0000106"]
+        XCTAssertTrue(pausedTask.waitForExistence(timeout: 10))
+        pausedTask.tap()
+        let pausedPicker = app.descendants(matching: .any)["morde.task.clarification.fileDeliveryIntent"]
+        XCTAssertTrue(pausedPicker.waitForExistence(timeout: 10),
+                      "A route file-delivery clarification must remain available while the Task is paused.")
+        XCTAssertTrue(app.staticTexts["morde.task.status"].label.contains("暂停"))
+        let pausedAnswer = app.textFields["morde.task.clarification.answer"]
+        pausedAnswer.tap()
+        pausedAnswer.typeText("Only a chat answer is needed.")
+        pausedPicker.tap()
+        let pausedNone = app.descendants(matching: .any)["morde.task.clarification.fileDeliveryIntent.none"]
+        XCTAssertTrue(pausedNone.waitForExistence(timeout: 5))
+        pausedNone.tap()
+        let pausedSubmit = app.buttons["morde.task.clarification.submit"]
+        XCTAssertTrue(pausedSubmit.isEnabled)
+        pausedSubmit.tap()
+        let pausedCompleted = XCTNSPredicateExpectation(
+            predicate: NSPredicate(format: "label CONTAINS %@", "已完成"),
+            object: app.staticTexts["morde.task.status"])
+        XCTAssertEqual(XCTWaiter.wait(for: [pausedCompleted], timeout: 15), .completed,
+                       "The route clarification must remain answerable while the Task is paused.")
+        app.terminate()
     }
 
     func testMordeTaskFileFetchShowsSafeProgressAndDoesNotBlockIndependentMessages() {

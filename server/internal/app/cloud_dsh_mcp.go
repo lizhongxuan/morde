@@ -32,6 +32,20 @@ const (
 	maxCloudDSHTerminalRetryAfterSeconds = 24 * 60 * 60
 )
 
+type cloudDSHMCPPlanStepMetadataKey struct{}
+
+func withCloudDSHMCPPlanStepMetadata(ctx context.Context, metadata cloudDSHPlanStepArguments) context.Context {
+	return context.WithValue(ctx, cloudDSHMCPPlanStepMetadataKey{}, metadata)
+}
+
+func cloudDSHMCPPlanStepMetadataFromContext(ctx context.Context) (cloudDSHPlanStepArguments, bool) {
+	if ctx == nil {
+		return cloudDSHPlanStepArguments{}, false
+	}
+	metadata, ok := ctx.Value(cloudDSHMCPPlanStepMetadataKey{}).(cloudDSHPlanStepArguments)
+	return metadata, ok && metadata.HasStepID
+}
+
 type cloudDSHMCPOutput struct {
 	IsError            bool                     `json:"is_error"`
 	UnsupportedContent bool                     `json:"unsupported_content,omitempty"`
@@ -137,8 +151,7 @@ func cloudDSHMCPToolName(connectorID, remoteName string) string {
 }
 
 // IsMCPConnectorOperationToolName validates the connector-specific alias
-// stored in the MCP operation ledger. The task step keeps the DSH-facing
-// mcp_call name and request digest so a retry can match the pinned checkpoint.
+// stored in the MCP operation ledger and in plan-bound TaskStep evidence.
 func IsMCPConnectorOperationToolName(name, connectorID string) bool {
 	if !domain.ValidMCPConnectorID(connectorID) {
 		return false
@@ -215,8 +228,13 @@ func (b *CloudDSHToolBroker) executeMCP(ctx context.Context, details TaskDetails
 			return githubMCPRequestHeaders(connector.EndpointURL, headers), nil
 		},
 	}
+	_, planBound := cloudDSHMCPPlanStepMetadataFromContext(ctx)
 	activity, hasActivity := cloudDSHToolActivityFromContext(ctx)
-	if !hasActivity || activity.call.CallID != call.CallID || activity.current.ID != current.ID || activity.call.TaskFence == nil {
+	if planBound {
+		call.Arguments = string(arguments)
+		ctx = withCloudDSHToolActivity(ctx, current, call, b.stepDetailSealer)
+		activity, hasActivity = cloudDSHToolActivityFromContext(ctx)
+	} else if !hasActivity || activity.call.CallID != call.CallID || activity.current.ID != current.ID || activity.call.TaskFence == nil {
 		ctx = withCloudDSHToolActivity(ctx, current, call, b.stepDetailSealer)
 		activity, hasActivity = cloudDSHToolActivityFromContext(ctx)
 	}
@@ -625,6 +643,10 @@ func (b *CloudDSHToolBroker) executeMCPSourceWithApproval(ctx context.Context, d
 	if err != nil {
 		return AgentToolResult{}, err
 	}
+	planStepMetadata, _ := cloudDSHMCPPlanStepMetadataFromContext(ctx)
+	if _, err := validateCloudDSHPlanStepSelection(details, planStepMetadata, "MCP operation"); err != nil {
+		return AgentToolResult{}, err
+	}
 	approvalID, approvalVersion := "", int64(0)
 	var approvalRequestHash []byte
 	if source.connectorID == BuiltinSearchMCPConnectorID {
@@ -780,6 +802,9 @@ func (b *CloudDSHToolBroker) executeMCPSourceWithApproval(ctx context.Context, d
 	headers, err := source.headers(ctx)
 	if err != nil {
 		return AgentToolResult{}, err
+	}
+	if metadata, planBound := cloudDSHMCPPlanStepMetadataFromContext(ctx); planBound {
+		operation.PlanRevision, operation.PlanStepID = metadata.PlanRevision, metadata.StepID
 	}
 	if _, err := operationStore.MarkMCPConnectorOperationDispatched(ctx, operation, current.Lease.Owner); err != nil {
 		if latest, getErr := operationStore.GetMCPConnectorOperation(ctx, current.OwnerID, current.ID, source.connectorID, key); getErr == nil &&
@@ -989,6 +1014,13 @@ func sha256Bytes(value []byte) []byte {
 }
 
 func encodeCloudDSHMCPOutput(result MCPConnectorToolResult) (string, error) {
+	if result.IsError {
+		if len(result.Images) != 0 {
+			return "", errors.New("MCP tool output is invalid")
+		}
+		allowTerminal := len(result.StructuredContent) <= 64<<10
+		result = safeCloudDSHMCPToolFailure(result, allowTerminal)
+	}
 	if len(result.StructuredContent) > 64<<10 || len(result.StructuredContent) != 0 && !validCloudDSHMCPJSON(result.StructuredContent) ||
 		len(result.Text) > 256 || len(result.Images) > 1 || result.UnsupportedContent && len(result.Images) != 0 ||
 		result.IsError && len(result.Images) != 0 {
@@ -1042,6 +1074,14 @@ func cloudDSHMCPResult(status task.OperationStatus, output string) (AgentToolRes
 	if (status == task.OperationFailed) != value.IsError {
 		return AgentToolResult{}, errors.New("MCP operation result status is inconsistent")
 	}
+	if status == task.OperationFailed {
+		value = safeCloudDSHMCPStoredFailure(value)
+		canonical, err := json.Marshal(value)
+		if err != nil || len(canonical) > maxAgentToolOutputBytes {
+			return AgentToolResult{}, errors.New("MCP operation model output is invalid")
+		}
+		output = string(canonical)
+	}
 	images := make([]ModelImage, 0, len(value.Images))
 	for _, image := range value.Images {
 		data, err := base64.StdEncoding.Strict().DecodeString(image.DataBase64)
@@ -1082,6 +1122,76 @@ func cloudDSHMCPTerminalForAttempt(value cloudDSHMCPOutput) bool {
 	}
 	return signal.Code == "connector_rate_limited" && signal.TerminalForAttempt && signal.RetryAfterSeconds > 0 &&
 		signal.RetryAfterSeconds <= maxCloudDSHTerminalRetryAfterSeconds
+}
+
+func safeCloudDSHMCPToolFailure(result MCPConnectorToolResult, allowTerminal bool) MCPConnectorToolResult {
+	if !result.IsError {
+		return result
+	}
+	safe := MCPConnectorToolResult{IsError: true, UnsupportedContent: result.UnsupportedContent}
+	if allowTerminal && cloudDSHMCPTerminalForAttempt(cloudDSHMCPOutput{
+		IsError: true, UnsupportedContent: result.UnsupportedContent, StructuredContent: result.StructuredContent,
+	}) {
+		var signal struct {
+			Code               string `json:"code"`
+			TerminalForAttempt bool   `json:"terminal_for_attempt"`
+			RetryAfterSeconds  int64  `json:"retry_after_seconds"`
+		}
+		if json.Unmarshal(result.StructuredContent, &signal) == nil {
+			safe.StructuredContent, _ = json.Marshal(signal)
+			return safe
+		}
+	}
+	for _, category := range []string{
+		cloudDSHBuiltinSearchErrorUpstream, cloudDSHBuiltinSearchErrorTimeout,
+		cloudDSHBuiltinSearchErrorCanceled, cloudDSHBuiltinSearchErrorTransport,
+	} {
+		if len(result.Text) == 1 && result.Text[0] == "error_category: "+category {
+			safe.Text = []string{result.Text[0]}
+			return safe
+		}
+	}
+	safe.Text = []string{"error_category: connector_tool_error"}
+	return safe
+}
+
+func safeCloudDSHMCPStoredFailure(value cloudDSHMCPOutput) cloudDSHMCPOutput {
+	result := safeCloudDSHMCPToolFailure(MCPConnectorToolResult{
+		IsError: value.IsError, UnsupportedContent: value.UnsupportedContent,
+		StructuredContent: value.StructuredContent, Text: value.Text,
+	}, true)
+	return cloudDSHMCPOutput{
+		IsError: result.IsError, UnsupportedContent: result.UnsupportedContent,
+		StructuredContent: append(json.RawMessage(nil), result.StructuredContent...), Text: append([]string(nil), result.Text...),
+	}
+}
+
+func safeCloudDSHMCPFailureResult(result AgentToolResult) AgentToolResult {
+	if result.Status != AgentToolFailed {
+		return result
+	}
+	var value cloudDSHMCPOutput
+	if json.Unmarshal([]byte(result.Output), &value) == nil && value.IsError && len(value.Images) == 0 {
+		remote := MCPConnectorToolResult{
+			IsError: value.IsError, UnsupportedContent: value.UnsupportedContent,
+			StructuredContent: value.StructuredContent, Text: value.Text,
+		}
+		safe := safeCloudDSHMCPToolFailure(remote, result.TerminalForAttempt)
+		canonical, err := json.Marshal(cloudDSHMCPOutput{
+			IsError: safe.IsError, UnsupportedContent: safe.UnsupportedContent,
+			StructuredContent: append(json.RawMessage(nil), safe.StructuredContent...), Text: append([]string(nil), safe.Text...),
+		})
+		if err == nil {
+			result.Output = string(canonical)
+			result.TerminalForAttempt = result.TerminalForAttempt && cloudDSHMCPTerminalForAttempt(cloudDSHMCPOutput{
+				IsError: safe.IsError, UnsupportedContent: safe.UnsupportedContent, StructuredContent: safe.StructuredContent,
+			})
+			return result
+		}
+	}
+	result.Output = `{"is_error":true,"text":["error_category: connector_tool_error"]}`
+	result.TerminalForAttempt = false
+	return result
 }
 
 // MCPConnectorTerminalRetryAfterSeconds validates the durable MCP result before
@@ -1161,6 +1271,9 @@ func validCloudDSHMCPJSON(raw []byte) bool {
 }
 
 func (b *CloudDSHToolBroker) commitMCPResult(ctx context.Context, current task.Task, step task.Step, usage task.Usage, name string, result AgentToolResult) (AgentToolResult, error) {
+	if result.Status == AgentToolFailed {
+		result = safeCloudDSHMCPFailureResult(result)
+	}
 	ctx = withTaskToolContentEvidence(ctx, name, result)
 	if result.TerminalForAttempt {
 		ctx = withTaskToolResultEvidence(ctx, "execute", "connector_rate_limited")

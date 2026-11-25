@@ -4418,7 +4418,7 @@ export interface paths {
         put?: never;
         /**
          * Create and enable a schedule
-         * @description Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
+         * @description Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. `file_delivery_intent` is structured and defaults to `none`; schedules currently cannot require file delivery because they do not bind a Workspace, and `unclear` must be clarified before saving. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
          */
         post: operations["createSchedule"];
         delete?: never;
@@ -4443,7 +4443,7 @@ export interface paths {
         get: operations["getSchedule"];
         /**
          * Update a schedule definition at the expected version
-         * @description Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host.
+         * @description Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host. Omitted `file_delivery_intent` preserves the current structured intent; schedules currently support `none` only.
          */
         put: operations["updateSchedule"];
         post?: never;
@@ -8159,6 +8159,11 @@ export interface components {
             title: string;
             /** @description Execution objective must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes. */
             objective: string;
+            /**
+             * @description Structured output intent. Omission from legacy sync definitions means none; schedules currently only execute with none because they have no Workspace binding.
+             * @enum {string}
+             */
+            file_delivery_intent: "none" | "required" | "unclear";
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
             misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
@@ -8189,6 +8194,11 @@ export interface components {
             title?: string;
             /** @description Required execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes. */
             objective: string;
+            /**
+             * @description Structured output intent; never inferred from objective text. Omission means none. Schedules currently have no Workspace binding, so required is rejected; unclear must be clarified before saving.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
@@ -8204,6 +8214,11 @@ export interface components {
             title?: string;
             /** @description Optional execution objective update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes. */
             objective?: string;
+            /**
+             * @description Structured output intent; never inferred from objective text. Omission preserves the current value. Schedules currently have no Workspace binding, so required is rejected; unclear must be clarified before saving.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
             timing?: components["schemas"]["ScheduleTiming"];
             budget?: components["schemas"]["ScheduleBudget"];
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
@@ -8257,6 +8272,11 @@ export interface components {
             title: string;
             /** @description Stored execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes. */
             objective: string;
+            /**
+             * @description Structured output intent selected when the schedule is defined. Currently only none can execute because schedules have no Workspace binding.
+             * @enum {string}
+             */
+            file_delivery_intent: "none" | "required" | "unclear";
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
             misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
@@ -9698,6 +9718,25 @@ export interface components {
             expires_at: string | null;
             /** @description Present only while an image */
             media_preview_operation_id?: components["schemas"]["OperationId"];
+            /** @description Evidence anchor for the action, "step:<step-id>" of the step whose command and output justify it. Empty for approvals created before E05. */
+            evidence_pointer?: string;
+            /**
+             * Format: int64
+             * @description Trusted cost of this exact action in micro-units. Null when no trusted per-action cost source exists; never a fabricated 0.
+             */
+            this_cost_micros?: number | null;
+            /**
+             * Format: int64
+             * @description Trusted cumulative cost of the task in micro-units at the moment the card was created. Null when any cost component is unknown.
+             */
+            total_cost_micros?: number | null;
+            /**
+             * @description Action-matrix category that required this approval. Empty for approvals created before E05.
+             * @enum {string}
+             */
+            trigger_rule?: "host_sensitive_tool" | "external_mcp_tool" | "workspace_live_write" | "media_publish";
+            /** @description What happens if the user rejects the action. Empty when the approval text did not state one. */
+            rejection_consequence?: string;
         };
         /** @description A known disclosure includes its evidence-backed summary. Unknown and not_applicable disclosures have a null summary. */
         TaskApprovalTextDisclosure: {
@@ -9732,6 +9771,8 @@ export interface components {
             id: components["schemas"]["ClarificationId"];
             version: number;
             question: string;
+            /** @description Opaque clarification identity used by clients to select any structured answer fields. Clients must not infer clarification type from question text. */
+            call_id: string;
         };
         TaskStopRequest: {
             id: string;
@@ -9969,6 +10010,25 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             media_preview_operation_id?: components["schemas"]["OperationId"];
+            /** @description Evidence anchor for the action, "step:<step-id>" of the step whose command and output justify it. Empty for approvals created before E05. */
+            evidence_pointer?: string;
+            /**
+             * Format: int64
+             * @description Trusted cost of this exact action in micro-units. Null when no trusted per-action cost source exists; never a fabricated 0.
+             */
+            this_cost_micros?: number | null;
+            /**
+             * Format: int64
+             * @description Trusted cumulative cost of the task in micro-units at the moment the card was created. Null when any cost component is unknown.
+             */
+            total_cost_micros?: number | null;
+            /**
+             * @description Action-matrix category that required this approval. Empty for approvals created before E05.
+             * @enum {string}
+             */
+            trigger_rule?: "host_sensitive_tool" | "external_mcp_tool" | "workspace_live_write" | "media_publish";
+            /** @description What happens if the user rejects the action. Empty when the approval text did not state one. */
+            rejection_consequence?: string;
         };
         ConversationActiveTask: components["schemas"]["TaskSummary"] & {
             /** Format: int64 */
@@ -9992,6 +10052,11 @@ export interface components {
             application_id?: string;
             model_id: string;
             objective: string;
+            /**
+             * @description Structured output intent for the Task. Omission means none. `required` requires workspace_id. `unclear` opens a versioned clarification; it is never inferred from objective text.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             budget?: components["schemas"]["TaskBudgetRequest"] | null;
             batch_items?: components["schemas"]["TaskBatchItemInput"][];
@@ -9999,6 +10064,11 @@ export interface components {
         TaskBatchItemInput: {
             key: string;
             input: string;
+            /**
+             * @description Structured output intent for this batch item. Omission means none. `required` requires workspace_id. `unclear` opens a versioned clarification targeted to this item and its current attempt.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
         };
         /** @description retry_batch_item requires batch_item_id only. Pause, resume and cancel require expected_status. expected_current_revision and expected_desired_revision are optional together; when both are present, both task revisions are compared atomically before applying the action. Legacy clients may omit both revision fields. Supplying only one is invalid. set_priority requires queue_priority and expected_event_sequence and is accepted only while the task is queued. Priority changes are idempotent and append a task.priority event. Supplying fields for a different action is invalid. */
         TaskActionRequest: {
@@ -10028,6 +10098,11 @@ export interface components {
             clarification_id: components["schemas"]["ClarificationId"];
             clarification_version: number;
             answer: string;
+            /**
+             * @description Required only when answering a file delivery clarification. This structured choice is authoritative; it is not inferred from answer text. `required` requires the Task to have a Workspace.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required";
         };
         TaskApprovalResponseRequest: {
             version: number;
@@ -21134,7 +21209,7 @@ export interface operations {
                         items: {
                             owner_id: components["schemas"]["UserId"];
                             /** @enum {string} */
-                            source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
+                            source: "client" | "chat" | "task" | "probe" | "route" | "compaction" | "review" | "terminal_delivery";
                             call_id: string;
                             model_id: string;
                             provider_model: string;
@@ -21167,7 +21242,7 @@ export interface operations {
                 "application/json": {
                     owner_id: components["schemas"]["UserId"];
                     /** @enum {string} */
-                    source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
+                    source: "client" | "chat" | "task" | "probe" | "route" | "compaction" | "review" | "terminal_delivery";
                     call_id: string;
                     /** Format: int64 */
                     input_tokens: number;

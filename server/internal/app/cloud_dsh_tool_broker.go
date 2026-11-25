@@ -21,6 +21,7 @@ import (
 type CloudDSHToolBroker struct {
 	store                    TaskStore
 	runtime                  *RuntimeToolExecutor
+	messageSourceReader      AgentMessageSourceReader
 	historyCursorKey         []byte
 	historyCursorInstanceID  string
 	recordCapture            *RecordCaptureService
@@ -38,6 +39,26 @@ type CloudDSHToolBroker struct {
 	schedules                *ScheduleService
 	projectContext           *ProjectService
 	stepDetailSealer         *Sealer
+}
+
+// AgentMessageSourceReader exposes only fenced metadata and bounded page
+// reads for long user messages accepted by the root Agent checkpoint.
+type AgentMessageSourceReader interface {
+	ReadMessageSourceReference(context.Context, AgentCheckpointFence, string) (AgentMessageSourceReference, error)
+	ReadMessageSourcePage(context.Context, AgentCheckpointFence, string, []byte, int64) (AgentMessageSourcePageRead, error)
+}
+
+// SetAgentMessageSourceReader configures the per-message receipt reader used by
+// long-message tools. The existing current-message Store reader stays active.
+func (b *CloudDSHToolBroker) SetAgentMessageSourceReader(reader AgentMessageSourceReader) error {
+	if b == nil || reader == nil {
+		return domain.NewError(domain.CodeInvalidArgument, "agent message source reader is required")
+	}
+	if b.messageSourceReader != nil {
+		return domain.NewError(domain.CodeInvalidState, "agent message source reader cannot be replaced")
+	}
+	b.messageSourceReader = reader
+	return nil
 }
 
 // AgentToolCallAdmissionStatus reports whether a DSH call may begin under the
@@ -300,15 +321,24 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		}
 		if cloudDSHCurrentConversationHistoryEligible(details.Task) {
 			definitions = append(definitions, cloudDSHCurrentConversationHistoryDefinition())
-			if _, ok := b.store.(currentConversationMessageChunkStore); ok {
-				definitions = append(definitions, cloudDSHCurrentConversationMessageReadDefinition())
-				if ValidConversationMessageSourceManifest(details.Task.ConversationContext.CurrentMessageSource) {
-					definitions = append(definitions, cloudDSHCurrentConversationMessageSearchDefinition())
-				}
+			_, legacyReader := b.store.(currentConversationMessageChunkStore)
+			legacySource := legacyReader && ValidConversationMessageSourceManifest(details.Task.ConversationContext.CurrentMessageSource)
+			if b.messageSourceReader != nil || legacySource {
+				definitions = append(definitions, cloudDSHCurrentConversationMessageReadDefinition(), cloudDSHCurrentConversationMessageSearchDefinition())
 			}
 		}
 		if !goalFollowupReadOnly {
 			definitions = append(definitions, cloudDSHTaskPlanDefinition())
+		}
+		if details.Plan != nil {
+			definitions, err = addPlanStepArgumentToHostTools(definitions, details.Plan.Revision)
+			if err != nil {
+				return nil, err
+			}
+			selectedMCP, err = addPlanStepArgumentToMCPTools(selectedMCP, details.Plan.Revision)
+			if err != nil {
+				return nil, err
+			}
 		}
 		if b.workspaceTools != nil && routed && details.Task.HostID == "" && target.HostID == "" && target.WorkspaceID != "" {
 			liveDirectory := false
@@ -336,6 +366,12 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 		}
 		if !goalFollowupReadOnly && b.builtinSearch != nil && b.authorizeBuiltinSearch(ctx, details.Task) == nil {
 			definitions = append(definitions, cloudDSHBuiltinSearchDefinitions()...)
+			if details.Plan != nil {
+				definitions, err = addPlanStepArgumentToMCPTools(definitions, details.Plan.Revision)
+				if err != nil {
+					return nil, err
+				}
+			}
 		}
 		if b.authorizeSkillTask(ctx, details.Task) == nil {
 			hostAvailable := domain.ValidHostID(claimed.HostID) || routed && !target.Unavailable && domain.ValidHostID(target.HostID)
@@ -436,6 +472,192 @@ func appendSelectedMCPDefinitionsWithinLimit(definitions, selectedMCP []AgentToo
 		return definitions
 	}
 	return append(definitions, selectedMCP...)
+}
+
+func addPlanStepArgumentToHostTools(definitions []AgentToolDefinition, planRevision int64) ([]AgentToolDefinition, error) {
+	if planRevision < 1 {
+		return nil, domain.NewError(domain.CodeInvalidState, "Host tool plan revision is invalid")
+	}
+	for index := range definitions {
+		mapping, exists := runtimeToolMappingByName(definitions[index].Name)
+		if !exists || mapping.internal {
+			continue
+		}
+		var schema map[string]json.RawMessage
+		if json.Unmarshal(definitions[index].Parameters, &schema) != nil || schema == nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "Host tool schema is invalid")
+		}
+		var properties map[string]json.RawMessage
+		if json.Unmarshal(schema["properties"], &properties) != nil || properties == nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "Host tool schema properties are invalid")
+		}
+		properties[cloudDSHPlanStepIDArgumentName] = json.RawMessage(`{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$","description":"ID of the current persisted plan step this operation performs."}`)
+		encodedRevision, err := json.Marshal(map[string]any{"type": "integer", "enum": []int64{planRevision},
+			"description": "Current persisted plan revision; copy the provided value exactly."})
+		if err != nil {
+			return nil, fmt.Errorf("encode Host tool plan revision schema: %w", err)
+		}
+		properties[cloudDSHPlanRevisionArgumentName] = encodedRevision
+		encodedProperties, err := json.Marshal(properties)
+		if err != nil {
+			return nil, fmt.Errorf("encode Host tool plan metadata schema: %w", err)
+		}
+		schema["properties"] = encodedProperties
+		var required []string
+		if rawRequired, exists := schema["required"]; exists {
+			if json.Unmarshal(rawRequired, &required) != nil {
+				return nil, domain.NewError(domain.CodeInvalidState, "Host tool schema required fields are invalid")
+			}
+		}
+		foundStepID, foundRevision := false, false
+		for _, value := range required {
+			foundStepID = foundStepID || value == cloudDSHPlanStepIDArgumentName
+			foundRevision = foundRevision || value == cloudDSHPlanRevisionArgumentName
+		}
+		if !foundStepID {
+			required = append(required, cloudDSHPlanStepIDArgumentName)
+		}
+		if !foundRevision {
+			required = append(required, cloudDSHPlanRevisionArgumentName)
+		}
+		encodedRequired, err := json.Marshal(required)
+		if err != nil {
+			return nil, fmt.Errorf("encode Host tool plan metadata required fields: %w", err)
+		}
+		schema["required"] = encodedRequired
+		encodedSchema, err := json.Marshal(schema)
+		if err != nil {
+			return nil, fmt.Errorf("encode Host tool plan metadata schema: %w", err)
+		}
+		definitions[index].Parameters = encodedSchema
+		definitions[index].Description += " Include morde_plan_step_id for the current plan step that owns this operation and copy morde_plan_revision exactly from the current plan."
+	}
+	return definitions, nil
+}
+
+func addPlanStepArgumentToMCPTools(definitions []AgentToolDefinition, planRevision int64) ([]AgentToolDefinition, error) {
+	if planRevision < 1 {
+		return nil, domain.NewError(domain.CodeInvalidState, "MCP tool plan revision is invalid")
+	}
+	for index := range definitions {
+		switch definitions[index].Name {
+		case cloudDSHMCPCallToolName, cloudDSHWebSearchToolName, cloudDSHWebReadToolName:
+		default:
+			continue
+		}
+		var schema map[string]json.RawMessage
+		if json.Unmarshal(definitions[index].Parameters, &schema) != nil || schema == nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "MCP tool schema is invalid")
+		}
+		var properties map[string]json.RawMessage
+		if json.Unmarshal(schema["properties"], &properties) != nil || properties == nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "MCP tool schema properties are invalid")
+		}
+		properties[cloudDSHPlanStepIDArgumentName] = json.RawMessage(`{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$","description":"ID of the current persisted plan step this operation performs."}`)
+		encodedRevision, err := json.Marshal(map[string]any{"type": "integer", "enum": []int64{planRevision},
+			"description": "Current persisted plan revision; copy the provided value exactly."})
+		if err != nil {
+			return nil, fmt.Errorf("encode MCP tool plan revision schema: %w", err)
+		}
+		properties[cloudDSHPlanRevisionArgumentName] = encodedRevision
+		encodedProperties, err := json.Marshal(properties)
+		if err != nil {
+			return nil, fmt.Errorf("encode MCP tool plan metadata schema: %w", err)
+		}
+		schema["properties"] = encodedProperties
+		var required []string
+		if rawRequired, exists := schema["required"]; exists && json.Unmarshal(rawRequired, &required) != nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "MCP tool schema required fields are invalid")
+		}
+		hasRequired := make(map[string]bool, len(required))
+		for _, name := range required {
+			hasRequired[name] = true
+		}
+		for _, reserved := range []string{cloudDSHPlanStepIDArgumentName, cloudDSHPlanRevisionArgumentName} {
+			if !hasRequired[reserved] {
+				required = append(required, reserved)
+				hasRequired[reserved] = true
+			}
+		}
+		encodedRequired, err := json.Marshal(required)
+		if err != nil {
+			return nil, fmt.Errorf("encode MCP tool plan metadata required fields: %w", err)
+		}
+		schema["required"] = encodedRequired
+		encodedSchema, err := json.Marshal(schema)
+		if err != nil {
+			return nil, fmt.Errorf("encode MCP tool plan metadata schema: %w", err)
+		}
+		definitions[index].Parameters = encodedSchema
+		definitions[index].Description += " Include morde_plan_step_id for the current plan step that owns this operation and copy morde_plan_revision exactly from the current plan."
+	}
+	return definitions, nil
+}
+
+func cloudDSHPlanMCPTool(name string) bool {
+	switch name {
+	case cloudDSHMCPCallToolName, cloudDSHWebSearchToolName, cloudDSHWebReadToolName:
+		return true
+	default:
+		return false
+	}
+}
+
+func stripSelectedMCPBusinessPlanMetadata(raw string) (string, error) {
+	arguments, err := validateAgentToolArguments(raw)
+	if err != nil {
+		return "", err
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(arguments, &fields) != nil || fields == nil {
+		return "", errors.New("selected MCP arguments must be an object")
+	}
+	nestedRaw, exists := fields["arguments"]
+	if !exists {
+		return string(arguments), nil
+	}
+	var nested map[string]json.RawMessage
+	if json.Unmarshal(nestedRaw, &nested) != nil || nested == nil {
+		return "", errors.New("selected MCP business arguments must be an object")
+	}
+	_, hasStepID := nested[cloudDSHPlanStepIDArgumentName]
+	_, hasRevision := nested[cloudDSHPlanRevisionArgumentName]
+	if !hasStepID && !hasRevision {
+		return string(arguments), nil
+	}
+	delete(nested, cloudDSHPlanStepIDArgumentName)
+	delete(nested, cloudDSHPlanRevisionArgumentName)
+	nestedRaw, err = json.Marshal(nested)
+	if err != nil {
+		return "", err
+	}
+	fields["arguments"] = nestedRaw
+	encoded, err := json.Marshal(fields)
+	if err != nil || !validAgentJSONObject(encoded, maxAgentToolArgsBytes) {
+		return "", errors.New("selected MCP arguments are invalid")
+	}
+	return string(encoded), nil
+}
+
+func validateCloudDSHPlanStepSelection(details TaskDetails, metadata cloudDSHPlanStepArguments, operationKind string) (int64, error) {
+	if details.Plan == nil {
+		if metadata.HasStepID {
+			return 0, domain.NewError(domain.CodeConflict, "task plan changed before "+operationKind+" admission")
+		}
+		return 0, nil
+	}
+	if details.Task.CurrentRevision == nil || details.Plan.TaskRevision != *details.Task.CurrentRevision || details.Plan.Revision < 1 {
+		return 0, domain.NewError(domain.CodeConflict, "current task plan is stale")
+	}
+	if !metadata.HasStepID || metadata.PlanRevision != details.Plan.Revision {
+		return 0, domain.NewError(domain.CodeConflict, "current plan step metadata is missing or stale")
+	}
+	for _, step := range details.Plan.Steps {
+		if step.ID == metadata.StepID {
+			return metadata.PlanRevision, nil
+		}
+	}
+	return 0, domain.NewError(domain.CodeConflict, operationKind+" references an unknown plan step")
 }
 
 // Complete only commits a dsh result after the worker has confirmed its
@@ -806,99 +1028,6 @@ func cloudDSHCompletionVerificationStep(current task.Task, steps []task.Step) (t
 		"Verify cloud task output", "Checking successful file writes against the Host and committed Workspace.")
 }
 
-// shortcut: fixed phrase matching can miss uncommon wording, upgrade when broader language coverage is required.
-func ClassifyFileDeliveryIntent(objective string, hasWorkspace bool) task.FileDeliveryIntent {
-	text := strings.ToLower(strings.TrimSpace(objective))
-	if text == "" {
-		return task.FileDeliveryUnclear
-	}
-	if fileDeliveryReadOutput.MatchString(text) {
-		return task.FileDeliveryNone
-	}
-	noFileRequested := fileDeliveryNegative.MatchString(text)
-	text = fileDeliveryNegative.ReplaceAllString(text, " ")
-	for _, phrase := range []string{
-		"不要生成文件", "不要创建文件", "不要写文件", "不要写入文件", "不要保存文件", "不要输出文件",
-		"不要在工作区写文件", "不要在工作区保存文件",
-		"不需要生成文件", "无需生成文件", "不用生成文件", "不需要写文件", "无需写文件", "不用写文件",
-		"不需要保存文件", "无需保存文件", "不用保存文件",
-		"do not create a file", "don't create a file", "do not create the file", "don't create the file",
-		"do not create any file", "don't create any file",
-		"do not generate a file", "don't generate a file", "do not generate the file", "don't generate the file",
-		"do not generate any file", "don't generate any file",
-		"do not write a file", "don't write a file", "do not write the file", "don't write the file",
-		"do not write to a file", "don't write to a file", "do not save a file", "don't save a file",
-		"do not save the file", "don't save the file", "do not save to a file", "don't save to a file",
-		"do not output a file", "don't output a file",
-	} {
-		if strings.Contains(text, phrase) {
-			noFileRequested = true
-			text = strings.ReplaceAll(text, phrase, " ")
-		}
-	}
-	noFileRequested = noFileRequested || containsAny(text, "不需要文件", "无需文件", "不用文件", "不要文件", "无需附件", "只要文字", "只需要文字",
-		"只在聊天回答", "只在聊天里回答", "只在聊天中回答", "直接回答", "直接回复文字", "在聊天里回答", "no file needed", "no need for a file",
-		"no attachment", "no file", "without a file", "text only", "text-only", "just answer", "answer in chat", "reply in chat")
-	if fileDeliveryQuestionBeforeAction(text) {
-		if containsAny(text, "保存为", "保存到", "保存至", "写入工作区", "提供下载", "下载到", "save as", "save to", "to the workspace") {
-			return task.FileDeliveryUnclear
-		}
-		return task.FileDeliveryNone
-	}
-	outputAction := containsAny(text, "生成", "生产", "创建", "新建", "制作", "做一份", "做个", "做一个", "导出", "下载", "保存", "另存", "交付", "提供",
-		"输出", "上传", "写成", "写", "撰写", "整理成", "draft", "generate", "create", "make", "produce", "export", "download", "save", "deliver",
-		"attach", "provide", "output", "write", "prepare")
-	fileTarget := fileDeliveryTargetAfterAction(text)
-	workspaceDestination := containsAny(text, "在工作区", "到工作区", "写入工作区", "保存到工作区", "保存至工作区", "in the workspace", "in the attached workspace", "in the cloud workspace", "to the workspace", "to the attached workspace", "to the cloud workspace", "into the workspace", "into the attached workspace", "into the cloud workspace")
-	if !fileTarget && !workspaceDestination && containsAny(text, "一段总结", "写一段总结", "总结一下", "a short summary", "a brief summary", "summarize it in chat") {
-		return task.FileDeliveryNone
-	}
-	if outputAction && workspaceDestination {
-		if noFileRequested {
-			return task.FileDeliveryUnclear
-		}
-		return task.FileDeliveryRequired
-	}
-	if outputAction && fileTarget {
-		if noFileRequested {
-			return task.FileDeliveryUnclear
-		}
-		return task.FileDeliveryRequired
-	}
-	deliverable := containsAny(text, "报告", "方案", "计划", "总结", "论文", "表格", "幻灯片", "演示文稿", "代码", "脚本", "源码", "项目", "仓库", "report", "plan", "summary", "spreadsheet", "slides", "code", "script", "project", "repository", "repo", "deliverable", "artifact")
-	editAction := containsAny(text, "修改", "修复", "实现", "开发", "重构", "编辑", "更新", "改造", "fix", "implement", "develop", "refactor", "edit", "modify", "update")
-	codeTarget := containsAny(text, "代码", "源码", "脚本", "code", "source", "script")
-	projectTarget := containsAny(text, "项目", "仓库", "project", "repository", "repo")
-	if hasWorkspace && ((editAction && (codeTarget || projectTarget)) || (outputAction && codeTarget)) {
-		if noFileRequested {
-			return task.FileDeliveryUnclear
-		}
-		return task.FileDeliveryRequired
-	}
-	if noFileRequested {
-		return task.FileDeliveryNone
-	}
-	if (outputAction || editAction) && deliverable {
-		return task.FileDeliveryUnclear
-	}
-	if fileTarget && !containsAny(text, "读取", "阅读", "查看", "审阅", "检查", "分析", "总结", "解释", "read", "review", "inspect", "analyze", "summarize", "explain") {
-		return task.FileDeliveryUnclear
-	}
-	if outputAction {
-		return task.FileDeliveryUnclear
-	}
-	return task.FileDeliveryNone
-}
-
-func containsAny(text string, values ...string) bool {
-	for _, value := range values {
-		if strings.Contains(text, value) {
-			return true
-		}
-	}
-	return false
-}
-
 func (b *CloudDSHToolBroker) pauseForFileDelivery(ctx context.Context, current task.Task, details TaskDetails, intent task.FileDeliveryIntent, hasWorkspace bool) error {
 	if intent == task.FileDeliveryUnclear {
 		version := nextClarificationVersion(details.ClarificationRequests)
@@ -1080,6 +1209,41 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if ctx == nil || call.CallID == "" || len(call.CallID) > 256 || len(call.Name) == 0 || len(call.Name) > 128 {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call", "dsh tool call identity is invalid")
 	}
+	originalCall := call
+	var planStepMetadata cloudDSHPlanStepArguments
+	mapping, hostRuntimeTool := runtimeToolMappingByName(call.Name)
+	if hostRuntimeTool && !mapping.internal {
+		var err error
+		planStepMetadata, err = extractCloudDSHPlanStepArguments(call.Arguments)
+		if err != nil {
+			if _, argumentsErr := validateAgentToolArguments(originalCall.Arguments); argumentsErr != nil {
+				if result, handled, handleErr := b.returnInvalidRuntimeToolArguments(ctx, claimed, originalCall, recovering, checkpointOutput); handled {
+					return result, handleErr
+				}
+				return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
+			}
+			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh plan step metadata is invalid")
+		}
+		call.Arguments = string(planStepMetadata.BusinessArgs)
+	} else if cloudDSHPlanMCPTool(call.Name) {
+		var err error
+		planStepMetadata, err = extractCloudDSHPlanStepArguments(call.Arguments)
+		if err != nil {
+			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh plan step metadata is invalid")
+		}
+		call.Arguments = string(planStepMetadata.BusinessArgs)
+		if call.Name == cloudDSHMCPCallToolName {
+			call.Arguments, err = stripSelectedMCPBusinessPlanMetadata(call.Arguments)
+			if err != nil {
+				return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "selected MCP arguments are invalid")
+			}
+		}
+		if planStepMetadata.HasStepID {
+			ctx = withCloudDSHMCPPlanStepMetadata(ctx, planStepMetadata)
+		}
+	} else if hasCloudDSHPlanStepMetadata(call.Arguments) {
+		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "plan step metadata is only valid for Host tools")
+	}
 	if cloudDSHGoalFollowupReadOnlyTask(claimed) && !goalFollowupReadOnlyToolAllowed(call.Name) {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "tool is not available to read-only Goal follow-up Tasks")
 	}
@@ -1100,7 +1264,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		}
 		arguments, parseErr := validateAgentToolArguments(call.Arguments)
 		if parseErr != nil {
-			if result, handled, handleErr := b.returnInvalidRuntimeToolArguments(ctx, claimed, call, recovering, checkpointOutput); handled {
+			if result, handled, handleErr := b.returnInvalidRuntimeToolArguments(ctx, claimed, originalCall, recovering, checkpointOutput); handled {
 				return result, handleErr
 			}
 			return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
@@ -1189,14 +1353,14 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	}
 	arguments, err := validateAgentToolArguments(call.Arguments)
 	if err != nil {
-		if result, handled, handleErr := b.returnInvalidRuntimeToolArguments(ctx, current, call, recovering, checkpointOutput); handled {
+		if result, handled, handleErr := b.returnInvalidRuntimeToolArguments(ctx, current, originalCall, recovering, checkpointOutput); handled {
 			return result, handleErr
 		}
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
 	}
 	if mapping, runtimeTool := runtimeToolMappingByName(call.Name); runtimeTool && !mapping.internal &&
 		!validRuntimeToolArguments(mapping, arguments) {
-		if result, handled, handleErr := b.returnInvalidRuntimeToolArguments(ctx, current, call, recovering, checkpointOutput); handled {
+		if result, handled, handleErr := b.returnInvalidRuntimeToolArguments(ctx, current, originalCall, recovering, checkpointOutput); handled {
 			return result, handleErr
 		}
 		// A schema-invalid Runtime tool call must never reach Prepare or the
@@ -1204,11 +1368,19 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		// authorization were verified by returnInvalidRuntimeToolArguments.
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
 	}
-	hash, err := agentOperationHash(call.Name, arguments)
+	originalArguments, err := validateAgentToolArguments(originalCall.Arguments)
+	if err != nil {
+		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
+	}
+	hash, err := agentOperationHash(call.Name, originalArguments)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
 	details, err := b.store.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		return AgentToolResult{}, err
+	}
+	planRevision, err := validateCloudDSHPlanStepSelection(details, planStepMetadata, "Host operation")
 	if err != nil {
 		return AgentToolResult{}, err
 	}
@@ -1262,7 +1434,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		return b.executeApprovedTaskMediaSave(ctx, current, call, details, *pendingApproval, checkpointOutput)
 	}
 	if recovering {
-		result, handled, err := b.reconcileCheckpointedCall(ctx, claimed, call, checkpointOutput)
+		result, handled, err := b.reconcileCheckpointedCall(ctx, claimed, originalCall, checkpointOutput)
 		if err != nil || handled {
 			return result, err
 		}
@@ -1290,7 +1462,8 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		workspaceID = runtimeToolWorkspaceID(mapping, arguments)
 	}
 	request := AgentToolRequest{
-		Task: current, Call: call, Arguments: arguments, OperationKey: agentOperationKey(call.CallID),
+		Task: current, Call: originalCall, Arguments: arguments, OperationRequestHash: append([]byte(nil), hash[:]...),
+		OperationKey:  agentOperationKey(call.CallID),
 		RequiredScope: definition.RequiredScope, Fence: fence, WorkspaceID: workspaceID,
 	}
 	approvalCall := pendingApproval != nil && pendingApproval.CallID == call.CallID
@@ -1477,7 +1650,8 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	if _, err := b.store.UpdateOperation(ctx, OperationUpdate{
 		TaskID: current.ID, OperationKey: request.OperationKey, LeaseOwner: current.Lease.Owner, LeaseVersion: current.Lease.Version,
 		RuntimeGeneration: request.Fence.RuntimeGeneration, RuntimeInstanceID: request.Fence.RuntimeInstanceID,
-		ControlVersion: request.Fence.ControlVersion, RuntimeLeaseVersion: current.Lease.Version, Status: task.OperationDispatched,
+		ControlVersion: request.Fence.ControlVersion, RuntimeLeaseVersion: current.Lease.Version,
+		PlanRevision: planRevision, PlanStepID: planStepMetadata.StepID, Status: task.OperationDispatched,
 	}); err != nil {
 		return AgentToolResult{}, err
 	}
@@ -1541,6 +1715,10 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		}
 		return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "The tool returned an unsupported result; the action will not be replayed.")
 	}
+	ctx = withTaskToolShellExecutionEvidence(ctx, call.Name, result)
+	if result.Status == AgentToolFailed {
+		result = safeCloudDSHToolFailureResult(call.Name, result)
+	}
 	operationStatus, stepStatus := task.OperationSucceeded, task.StepSucceeded
 	summary := "The cloud dsh tool completed and its result was saved."
 	eventDetail := map[string]any{
@@ -1564,7 +1742,6 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "The Host action completed but its result could not be committed safely.")
 	}
 	step.Status, step.Summary = stepStatus, summary
-	ctx = withTaskToolShellExecutionEvidence(ctx, call.Name, result)
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", eventDetail); err != nil {
 		return AgentToolResult{}, err
 	}
@@ -1853,20 +2030,27 @@ func (b *CloudDSHToolBroker) clarify(ctx context.Context, claimed task.Task, cal
 // tool call. It returns handled=false only when a fresh call or a previously
 // prepared operation can continue through the normal budgeted path.
 func (b *CloudDSHToolBroker) reconcileCheckpointedCall(ctx context.Context, claimed task.Task, call ModelToolCall, checkpointOutput *string) (AgentToolResult, bool, error) {
+	originalCall := call
 	current, err := b.runtime.currentTaskForOperationReconciliation(ctx, claimed)
 	if err != nil {
 		return AgentToolResult{}, true, err
 	}
-	arguments, err := validateAgentToolArguments(call.Arguments)
+	originalArguments, err := validateAgentToolArguments(call.Arguments)
 	if err != nil {
 		return AgentToolResult{}, true, domain.InvalidArgument("tool_call.arguments", "dsh tool arguments are invalid")
 	}
+	planStepMetadata, err := extractCloudDSHPlanStepArguments(call.Arguments)
+	if err != nil {
+		return AgentToolResult{}, true, domain.InvalidArgument("tool_call.arguments", "dsh plan step metadata is invalid")
+	}
+	arguments := planStepMetadata.BusinessArgs
+	call.Arguments = string(arguments)
 	mapping, ok := runtimeToolMappingByName(call.Name)
 	if !ok || !validRuntimeToolArguments(mapping, arguments) {
 		return AgentToolResult{}, true, domain.NewError(domain.CodeForbidden, "dsh tool is not available for this Host")
 	}
 	operationKey := agentOperationKey(call.CallID)
-	hash, err := agentOperationHash(call.Name, arguments)
+	hash, err := agentOperationHash(call.Name, originalArguments)
 	if err != nil {
 		return AgentToolResult{}, true, err
 	}
@@ -1954,7 +2138,8 @@ func (b *CloudDSHToolBroker) reconcileCheckpointedCall(ctx context.Context, clai
 		return AgentToolResult{}, false, nil
 	}
 	request := AgentToolRequest{
-		Task: current, Call: call, Arguments: arguments, OperationKey: operationKey, OperationID: operation.ID,
+		Task: current, Call: originalCall, Arguments: arguments, OperationRequestHash: append([]byte(nil), hash[:]...),
+		OperationKey: operationKey, OperationID: operation.ID,
 		RequiredScope: mapping.scope, WorkspaceID: workspaceID,
 	}
 	if operation.Status == task.OperationDispatched {
@@ -2183,6 +2368,9 @@ func modelFailureToolNotDispatched(diagnostic AgentModelFailureDiagnostic) bool 
 
 func (b *CloudDSHToolBroker) commitResult(ctx context.Context, current task.Task, step task.Step, usage task.Usage, name string, result AgentToolResult) (AgentToolResult, error) {
 	ctx = withTaskToolShellExecutionEvidence(ctx, name, result)
+	if result.Status == AgentToolFailed {
+		result = safeCloudDSHToolFailureResult(name, result)
+	}
 	step.Status, step.Summary = task.StepSucceeded, "The cloud dsh tool completed and its result was saved."
 	eventDetail := map[string]any{"tool": name, "operation_status": result.Status, "reused": true}
 	if result.Status == AgentToolFailed {
@@ -2195,6 +2383,62 @@ func (b *CloudDSHToolBroker) commitResult(ctx context.Context, current task.Task
 	}
 	result.Output = boundedToolOutput(result.Output)
 	return result, nil
+}
+
+const safeCloudDSHToolFailureOutput = `{"error":"tool_execution_failed"}`
+
+var safeRuntimeToolFailureCodes = map[string]struct{}{
+	"desktop_geometry_changed":    {},
+	"invalid_browser_handoff":     {},
+	"invalid_browser_observation": {},
+	"invalid_browser_result":      {},
+	"invalid_browser_screenshot":  {},
+	"invalid_browser_snapshot":    {},
+	"invalid_desktop_screenshot":  {},
+	"invalid_runtime_result":      {},
+	"invalid_shell_result":        {},
+	"invalid_window_list":         {},
+	"runtime_operation_failed":    {},
+}
+
+func safeCloudDSHToolFailureResult(name string, result AgentToolResult) AgentToolResult {
+	if result.Status != AgentToolFailed {
+		return result
+	}
+	if name == runtimeToolShellExec {
+		var shell taskStepShellOutput
+		if decodeStrictRuntimeResult([]byte(result.Output), &shell) == nil && shell.ExitCode >= 0 && shell.ExitCode <= 255 {
+			canonical, err := json.Marshal(taskStepShellOutput{
+				ExitCode: shell.ExitCode, TimedOut: shell.TimedOut,
+				StdoutTruncated: shell.StdoutTruncated || shell.Stdout != "",
+				StderrTruncated: shell.StderrTruncated || shell.Stderr != "",
+			})
+			if err == nil {
+				result.Output = string(canonical)
+				return result
+			}
+		}
+	}
+
+	var failure struct {
+		Error   string `json:"error"`
+		Message string `json:"message,omitempty"`
+	}
+	if validCloudDSHMCPJSON([]byte(result.Output)) && decodeStrictRuntimeResult([]byte(result.Output), &failure) == nil {
+		if _, okay := safeRuntimeToolFailureCodes[failure.Error]; okay {
+			if failure.Error != "desktop_geometry_changed" || failure.Message == "The screen size changed. Take a new screenshot before clicking." {
+				if failure.Error == "desktop_geometry_changed" || failure.Message == "" {
+					canonical, err := json.Marshal(failure)
+					if err == nil {
+						result.Output = string(canonical)
+						return result
+					}
+				}
+			}
+		}
+	}
+	result.Output = safeCloudDSHToolFailureOutput
+	return result
 }
 
 func (b *CloudDSHToolBroker) reconcile(ctx context.Context, request AgentToolRequest, operation task.Operation, step task.Step, usage task.Usage) (task.Operation, AgentToolResult, bool, error) {
@@ -2241,6 +2485,9 @@ func (b *CloudDSHToolBroker) reconcile(ctx context.Context, request AgentToolReq
 				paused, pauseErr := b.pauseUnknown(ctx, request.Task, step, usage, request.OperationKey, "The terminal ledger result changed during recovery.")
 				return operation, paused, true, pauseErr
 			}
+			if result.Status == AgentToolFailed {
+				result = safeCloudDSHToolFailureResult(request.Call.Name, result)
+			}
 			return operation, result, true, nil
 		}
 		operationStatus := task.OperationSucceeded
@@ -2250,6 +2497,9 @@ func (b *CloudDSHToolBroker) reconcile(ctx context.Context, request AgentToolReq
 			!validCloudDSHToolImages(request.Call.Name, result) {
 			paused, pauseErr := b.pauseUnknown(ctx, request.Task, step, usage, request.OperationKey, "The reconciled operation result is unsupported.")
 			return task.Operation{}, paused, true, pauseErr
+		}
+		if result.Status == AgentToolFailed {
+			result = safeCloudDSHToolFailureResult(request.Call.Name, result)
 		}
 		operation, err = b.store.UpdateOperation(ctx, OperationUpdate{
 			TaskID: request.Task.ID, OperationKey: request.OperationKey, LeaseOwner: request.Task.Lease.Owner,

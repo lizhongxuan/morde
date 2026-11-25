@@ -15,12 +15,14 @@ import (
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 // lockConversationRouteClaim makes the persisted receipt, current service
@@ -1062,6 +1064,14 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 			if err := requireConversationRouteScope(ctx, tx, claim, identity.ScopeTaskControl); err != nil {
 				return err
 			}
+			pendingClarification, err := conversationRouteHasPendingFileDeliveryClarification(ctx, tx, candidate.TaskID)
+			if err != nil {
+				return err
+			}
+			if pendingClarification {
+				return finishConversationRoute(ctx, tx, claim, "waiting_user",
+					"上一条修改仍在等待文件交付确认，请先处理该确认。 / The previous update is still waiting for a file delivery answer; resolve it first.", "", false)
+			}
 			var waitingReason string
 			var ownStop bool
 			if err := tx.QueryRow(ctx, `SELECT waiting_reason,EXISTS(SELECT 1 FROM task_revision_intents i WHERE i.task_id=tasks.id AND i.state='stopping')
@@ -1088,6 +1098,16 @@ COALESCE((SELECT expected_revision FROM task_revision_intents WHERE task_id=$1 O
 				return finishConversationRoute(ctx, tx, claim, "waiting_user", "另一条较新的修改已收到，请确认这条修改是否仍要执行。", "", false)
 			}
 			if err := validateInitialRouteAttachments(ctx, tx, claim); err != nil {
+				return err
+			}
+			if decision.FileDeliveryIntent == task.FileDeliveryUnclear {
+				question, err := beginConversationRouteFileDeliveryClarification(ctx, tx, claim, *candidate)
+				if err != nil {
+					return err
+				}
+				return finishConversationRoute(ctx, tx, claim, "waiting_user", question, candidate.TaskID, false)
+			}
+			if err := validateConversationRouteTaskFileDeliverySnapshot(ctx, tx, claim, candidate.TaskID, decision.FileDeliveryIntent); err != nil {
 				return err
 			}
 			if err := beginConversationTaskRevision(ctx, tx, claim, *candidate); err != nil {
@@ -1906,6 +1926,14 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='normal' AND attempt=$3 AND state=
 		if err := validateInitialRouteAttachments(ctx, tx, claim); err != nil {
 			return err
 		}
+		pendingClarification, err := conversationRouteHasPendingFileDeliveryClarification(ctx, tx, rootTaskID)
+		if err != nil {
+			return err
+		}
+		if pendingClarification {
+			return finishConversationRoute(ctx, tx, claim, "waiting_user",
+				"目标任务仍在等待文件交付确认，请先处理该确认。 / The target Task is still waiting for a file delivery answer; resolve it first.", "", false)
+		}
 		if err := beginConversationTaskRevision(ctx, tx, claim, *revisionTaskCandidate); err != nil {
 			return err
 		}
@@ -2070,9 +2098,49 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 	if !fileIntent.Valid() {
 		return domain.InvalidArgument("route_decision", "file delivery intent is invalid")
 	}
+	if fileIntent == task.FileDeliveryRequired {
+		if err := validateConversationRouteWorkspaceInputSnapshot(ctx, tx, claim); err != nil {
+			return err
+		}
+	}
+	initialStatus, initialEventType := task.StatusQueued, "task.status"
+	initialWaitingReason, initialCurrentStep := "", ""
+	var initialSteps []task.Step
+	var initialClarification *task.ClarificationRequest
+	if fileIntent == task.FileDeliveryUnclear {
+		workspaceSnapshotAvailable := false
+		if claim.Input.WorkspaceID != "" && (claim.Input.WorkspaceInputRevision != nil || len(claim.Input.WorkspaceContextDigest) != 0) {
+			if err := validateConversationRouteWorkspaceInputSnapshot(ctx, tx, claim); err != nil {
+				return err
+			}
+			workspaceSnapshotAvailable = true
+		}
+		initialSteps, initialClarification, err = newConversationRouteFileDeliveryClarification(taskID, workspaceSnapshotAvailable)
+		if err != nil {
+			return err
+		}
+		initialStatus, initialEventType = task.StatusWaitingUser, "task.waiting_user"
+		initialWaitingReason, initialCurrentStep = "clarification_required", initialSteps[1].ID
+	}
+	var workspaceID, workspaceOwnerID string
+	var inputRevision, workspaceCheckpointRevision *int64
+	var contextDigest []byte
+	if fileIntent == task.FileDeliveryRequired || (fileIntent == task.FileDeliveryUnclear && claim.Input.WorkspaceID != "" &&
+		claim.Input.WorkspaceInputRevision != nil && len(claim.Input.WorkspaceContextDigest) == 32) {
+		workspaceID = claim.Input.WorkspaceID
+		workspaceOwnerID = claim.Message.ActorID
+		revision := *claim.Input.WorkspaceInputRevision
+		inputRevision = &revision
+		checkpointRevision := revision
+		workspaceCheckpointRevision = &checkpointRevision
+		contextDigest = append([]byte(nil), claim.Input.WorkspaceContextDigest...)
+	}
 	value := task.Task{ID: taskID, OwnerID: claim.Message.OwnerID, InitiatorID: claim.Message.ActorID,
 		ProjectID: claim.Input.ProjectID, ConversationID: claim.Message.ConversationID, ModelID: modelID,
-		Objective: objective, Status: task.StatusQueued, Authorization: claim.Authorization, Budget: claim.Input.Budget,
+		WorkspaceID: workspaceID, WorkspaceOwnerID: workspaceOwnerID, InputRevision: inputRevision,
+		WorkspaceCheckpointRevision: workspaceCheckpointRevision, ContextDigest: contextDigest,
+		Objective: objective, Status: initialStatus, WaitingReason: initialWaitingReason, CurrentStep: initialCurrentStep,
+		Authorization: claim.Authorization, Budget: claim.Input.Budget,
 		ExecutionLocation: "server", FileDeliveryIntent: fileIntent, CheckpointThroughSequence: -1}
 	value = normalizeNewTask(value)
 	if err := validateTaskConversationScope(value, value.ProjectID); err != nil {
@@ -2126,11 +2194,29 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 			return err
 		}
 	}
-	payload, err := attachTaskConversationContextManifest([]byte(`{"status":"queued"}`), manifest)
+	eventPayload := map[string]string{"status": string(initialStatus)}
+	if initialClarification != nil {
+		eventPayload["reason"] = initialWaitingReason
+		eventPayload["clarification_id"] = initialClarification.ID
+		eventPayload["clarification_version"] = "1"
+	}
+	encodedEventPayload, err := json.Marshal(eventPayload)
+	if err != nil {
+		return fmt.Errorf("encode initial routed task event: %w", err)
+	}
+	payload, err := attachTaskConversationContextManifest(encodedEventPayload, manifest)
 	if err != nil {
 		return err
 	}
+	initialSubmission := app.TaskSubmission{Task: value, InitialEvent: task.Event{TaskID: taskID, Sequence: 1, Type: initialEventType, Payload: payload},
+		InitialSteps: initialSteps, InitialClarificationRequest: initialClarification}
+	if err := validateInitialFileDeliveryClarification(initialSubmission); err != nil {
+		return err
+	}
 	if err := insertTask(ctx, tx, value, 1, gate.epoch); err != nil {
+		return err
+	}
+	if err := insertInitialFileDeliveryClarification(ctx, tx, initialSubmission); err != nil {
 		return err
 	}
 	if internalTool != nil {
@@ -2166,7 +2252,7 @@ WHERE id=$1 AND owner_id=$2 AND conversation_id=$3 AND initiator_id=$4
 			return fmt.Errorf("persist task dependency: %w", err)
 		}
 	}
-	if err := insertTaskEvent(ctx, tx, task.Event{TaskID: value.ID, Sequence: 1, Type: "task.status", Payload: payload}); err != nil {
+	if err := insertTaskEvent(ctx, tx, task.Event{TaskID: value.ID, Sequence: 1, Type: initialEventType, Payload: payload}); err != nil {
 		return err
 	}
 	var reclassifyingDirectReply bool
@@ -2180,6 +2266,279 @@ FROM conversation_message_routes WHERE message_id=$1 AND owner_id=$2 AND actor_i
 	}
 	return finishConversationRoute(ctx, tx, claim, "routed", "", taskID,
 		len(claim.Input.ClientAttachmentIDs) == 0 && !reclassifyingDirectReply)
+}
+
+func validateConversationRouteWorkspaceInputSnapshot(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) error {
+	input := claim.Input
+	if input.ProjectID != "" || claim.Message.ActorID != claim.Message.OwnerID {
+		return domain.InvalidArgument("workspace_id", "a project Workspace requires an authorized project selection")
+	}
+	if !domain.ValidWorkspaceID(input.WorkspaceID) || input.WorkspaceInputRevision == nil || *input.WorkspaceInputRevision < 0 ||
+		len(input.WorkspaceContextDigest) != 32 {
+		return domain.InvalidArgument("workspace_id", "file delivery requires a valid Workspace input revision and context digest")
+	}
+	var ownerID, state string
+	var revision int64
+	var deleted bool
+	err := tx.QueryRow(ctx, `SELECT owner_id,state,revision,deleted_at IS NOT NULL FROM workspaces WHERE id=$1 FOR SHARE`,
+		input.WorkspaceID).Scan(&ownerID, &state, &revision, &deleted)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	if err != nil {
+		return fmt.Errorf("lock selected conversation Workspace: %w", err)
+	}
+	if ownerID != claim.Message.ActorID {
+		return domain.NewError(domain.CodeNotFound, "workspace not found")
+	}
+	if state != string(workspace.StateReady) || deleted {
+		return domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace is not ready for a file delivery Task")
+	}
+	if revision != *input.WorkspaceInputRevision {
+		return domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace changed after the conversation receipt")
+	}
+	actualDigest, err := conversationRouteWorkspaceManifestDigest(ctx, tx, input.WorkspaceID, revision)
+	if err != nil {
+		return domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace input manifest is unavailable or stale")
+	}
+	if !bytes.Equal(actualDigest, input.WorkspaceContextDigest) {
+		return domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace context digest is stale")
+	}
+	return nil
+}
+
+func conversationRouteWorkspaceManifestDigest(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64) ([]byte, error) {
+	files := make([]workspace.File, 0)
+	emptyDirectories := make([]string, 0)
+	directoriesByPath := make(map[string]workspace.Directory)
+	afterPath := ""
+	for {
+		page, err := getWorkspaceManifestPageTx(ctx, tx, workspaceID, revision, "", afterPath, maxWorkspaceSyncPage)
+		if err != nil {
+			return nil, err
+		}
+		if page.WorkspaceID != workspaceID || page.Revision != revision {
+			return nil, errors.New("selected Workspace manifest page changed revision")
+		}
+		if len(files)+len(emptyDirectories)+len(page.Files)+len(page.EmptyDirectories) > workspace.MaxSyncFiles {
+			return nil, errors.New("selected Workspace manifest exceeds item limit")
+		}
+		files = append(files, page.Files...)
+		emptyDirectories = append(emptyDirectories, page.EmptyDirectories...)
+		pagePaths := make([]string, 0, len(page.Files)+len(page.EmptyDirectories))
+		for _, directory := range page.Directories {
+			if err := workspace.ValidateDirectory(directory, false); err != nil {
+				return nil, err
+			}
+			key := strings.ToLower(directory.Path)
+			if previous, exists := directoriesByPath[key]; exists {
+				if !workspace.SameDirectoryMetadata(previous, directory) {
+					return nil, errors.New("selected Workspace directory metadata changed between pages")
+				}
+				continue
+			}
+			directoriesByPath[key] = directory
+		}
+		for _, file := range page.Files {
+			pagePaths = append(pagePaths, file.Path)
+		}
+		pagePaths = append(pagePaths, page.EmptyDirectories...)
+		sort.Strings(pagePaths)
+		previousPath := afterPath
+		for _, path := range pagePaths {
+			if path <= previousPath || strings.EqualFold(path, previousPath) {
+				return nil, errors.New("selected Workspace manifest paths are not in cursor order")
+			}
+			previousPath = path
+		}
+		if page.NextCursor == nil {
+			break
+		}
+		cursor, err := workspace.DecodeManifestCursor(*page.NextCursor)
+		if err != nil || cursor.Revision != revision || cursor.Prefix != "" || len(pagePaths) == 0 ||
+			cursor.After != pagePaths[len(pagePaths)-1] || cursor.After <= afterPath {
+			return nil, errors.New("selected Workspace manifest cursor is invalid")
+		}
+		afterPath = cursor.After
+	}
+	directories := make([]workspace.Directory, 0, len(directoriesByPath))
+	for _, directory := range directoriesByPath {
+		directories = append(directories, directory)
+	}
+	sort.Slice(directories, func(i, j int) bool { return directories[i].Path < directories[j].Path })
+	digest, err := workspace.ManifestTreeWithMetadataSHA256(files, emptyDirectories, directories)
+	if err != nil {
+		return nil, err
+	}
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != 32 {
+		return nil, errors.New("selected Workspace manifest digest is invalid")
+	}
+	return decoded, nil
+}
+
+func newConversationRouteFileDeliveryClarification(taskID string, workspaceSnapshotAvailable bool) ([]task.Step, *task.ClarificationRequest, error) {
+	classificationStepID, err := domain.NewStepID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate routed file intent classification step ID: %w", err)
+	}
+	clarificationStepID, err := domain.NewStepID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate routed file intent clarification step ID: %w", err)
+	}
+	requestID, err := domain.NewPendingRequestID()
+	if err != nil {
+		return nil, nil, fmt.Errorf("generate routed file intent clarification ID: %w", err)
+	}
+	question := "当前任务尚未绑定工作区。你需要交付文件，还是只要在聊天中回答？如需文件，请重新提交并选择工作区。 / This Task has no bound Workspace. Do you need a file, or is a chat answer enough? For file delivery, resubmit with a Workspace selected."
+	if workspaceSnapshotAvailable {
+		question = "你需要交付文件，还是只要在聊天中回答？如需文件，将使用本任务已绑定的工作区。 / Do you need a file, or is a chat answer enough? If you need a file, this Task will use its bound Workspace."
+	}
+	steps := []task.Step{
+		{ID: classificationStepID, TaskID: taskID, Sequence: 1, Kind: "verification", Status: task.StepSucceeded,
+			Title: "Check file delivery intent", Summary: "The router could not determine whether a file is required."},
+		{ID: clarificationStepID, TaskID: taskID, Sequence: 2, Kind: "clarification", Status: task.StepWaitingUser,
+			Title: "Confirm file delivery", Summary: question},
+	}
+	request := &task.ClarificationRequest{ID: requestID, TaskID: taskID, Version: 1, ModelStepID: classificationStepID,
+		CallID: app.FileDeliveryIntentClarificationCallID, Question: question, Status: task.ClarificationPending}
+	return steps, request, nil
+}
+
+func conversationRouteHasPendingFileDeliveryClarification(ctx context.Context, tx pgx.Tx, taskID string) (bool, error) {
+	var pending bool
+	err := tx.QueryRow(ctx, `SELECT EXISTS (
+ SELECT 1 FROM conversation_route_file_delivery_clarifications
+ WHERE task_id=$1 AND status='pending'
+)`, taskID).Scan(&pending)
+	if err != nil {
+		return false, fmt.Errorf("check pending route file delivery clarification: %w", err)
+	}
+	return pending, nil
+}
+
+func beginConversationRouteFileDeliveryClarification(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,
+	candidate app.ConversationRouteCandidate) (string, error) {
+	if err := beginConversationTaskRevision(ctx, tx, claim, candidate); err != nil {
+		return "", err
+	}
+	var nextSequence, version int64
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM task_steps WHERE task_id=$1`, candidate.TaskID).Scan(&nextSequence); err != nil {
+		return "", fmt.Errorf("read next Task clarification step sequence: %w", err)
+	}
+	if nextSequence < 1 || nextSequence == int64(^uint64(0)>>1) {
+		return "", domain.NewError(domain.CodeInvalidState, "Task step sequence is exhausted")
+	}
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version),0)+1 FROM task_clarification_requests WHERE task_id=$1`, candidate.TaskID).Scan(&version); err != nil {
+		return "", fmt.Errorf("read next Task clarification version: %w", err)
+	}
+	if version < 1 || version == int64(^uint64(0)>>1) {
+		return "", domain.NewError(domain.CodeInvalidState, "Task clarification version is exhausted")
+	}
+	classificationStepID, err := domain.NewStepID()
+	if err != nil {
+		return "", fmt.Errorf("generate route file intent classification step ID: %w", err)
+	}
+	clarificationStepID, err := domain.NewStepID()
+	if err != nil {
+		return "", fmt.Errorf("generate route file intent clarification step ID: %w", err)
+	}
+	requestID, err := domain.NewPendingRequestID()
+	if err != nil {
+		return "", fmt.Errorf("generate route file intent clarification ID: %w", err)
+	}
+	question := "这次修改需要交付文件，还是只需在聊天中回答？文件交付将使用当前任务绑定的工作区；如果任务没有可用工作区，无法选择文件交付。 / Does this update need a file, or is a chat answer enough? File delivery uses the Workspace already bound to this Task; it cannot be selected if no usable Workspace is bound."
+	steps := []task.Step{
+		{ID: classificationStepID, TaskID: candidate.TaskID, Sequence: nextSequence, Kind: "verification", Status: task.StepSucceeded,
+			Title: "Check file delivery intent", Summary: "The route could not determine whether this Task update needs a file."},
+		{ID: clarificationStepID, TaskID: candidate.TaskID, Sequence: nextSequence + 1, Kind: "clarification", Status: task.StepWaitingUser,
+			Title: "Confirm file delivery", Summary: question},
+	}
+	for _, step := range steps {
+		if _, err := tx.Exec(ctx, `INSERT INTO task_steps (id,task_id,sequence,kind,status,title,summary)
+VALUES ($1,$2,$3,$4,$5,$6,$7)`, step.ID, step.TaskID, step.Sequence, step.Kind, string(step.Status), step.Title, step.Summary); err != nil {
+			return "", fmt.Errorf("persist route file delivery clarification step: %w", err)
+		}
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO task_clarification_requests
+(id,task_id,version,model_step_id,call_id,question,status)
+VALUES ($1,$2,$3,$4,$5,$6,'pending')`, requestID, candidate.TaskID, version, classificationStepID,
+		task.RouteFileDeliveryIntentClarificationCallID, question); err != nil {
+		return "", fmt.Errorf("persist route file delivery clarification request: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `INSERT INTO conversation_route_file_delivery_clarifications
+(message_id,task_id,owner_id,initiator_id,conversation_id,expected_revision,clarification_id,clarification_version,status)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'pending')`, claim.Message.ID, candidate.TaskID, claim.Message.OwnerID,
+		claim.Message.ActorID, claim.Message.ConversationID, candidate.Revision, requestID, version); err != nil {
+		return "", fmt.Errorf("persist route file delivery clarification binding: %w", err)
+	}
+	return question, nil
+}
+
+func validateConversationRouteTaskFileDeliverySnapshot(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim,
+	taskID string, decisionIntent task.FileDeliveryIntent) error {
+	var storedIntent, workspaceID, workspaceOwnerID, initiatorID string
+	var hasWorkspaceInputSnapshot bool
+	var inputRevision, checkpointRevision pgtype.Int8
+	var contextDigest []byte
+	err := tx.QueryRow(ctx, `SELECT file_delivery_intent,COALESCE(workspace_id,''),COALESCE(workspace_owner_id,''),initiator_id,
+input_revision,workspace_checkpoint_revision,context_digest,
+input_revision IS NOT NULL AND workspace_checkpoint_revision IS NOT NULL
+AND workspace_checkpoint_revision=input_revision AND COALESCE(octet_length(context_digest)=32,false)
+FROM tasks WHERE id=$1 AND owner_id=$2 AND initiator_id=$3 AND conversation_id=$4 FOR UPDATE`,
+		taskID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID).
+		Scan(&storedIntent, &workspaceID, &workspaceOwnerID, &initiatorID, &inputRevision, &checkpointRevision, &contextDigest, &hasWorkspaceInputSnapshot)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeNotFound, "task not found")
+	}
+	if err != nil {
+		return fmt.Errorf("read task Workspace snapshot for route update: %w", err)
+	}
+	currentIntent := task.FileDeliveryIntent(storedIntent)
+	if !currentIntent.Valid() {
+		return domain.NewError(domain.CodeInvalidState, "task file delivery intent is invalid")
+	}
+	effectiveIntent := decisionIntent
+	if effectiveIntent == "" {
+		effectiveIntent = currentIntent
+	}
+	if effectiveIntent == task.FileDeliveryUnclear {
+		return domain.NewError(domain.CodeConflict, "file delivery intent must be clarified before updating this Task")
+	}
+	if effectiveIntent == task.FileDeliveryRequired && (workspaceID == "" || !hasWorkspaceInputSnapshot) {
+		return domain.InvalidArgument("workspace_id", "file delivery requires a Workspace input snapshot bound to the Task")
+	}
+	if effectiveIntent == task.FileDeliveryRequired {
+		if !domain.ValidWorkspaceID(workspaceID) || !inputRevision.Valid || !checkpointRevision.Valid ||
+			inputRevision.Int64 < 0 || checkpointRevision.Int64 != inputRevision.Int64 || len(contextDigest) != 32 || workspaceOwnerID == "" {
+			return domain.InvalidArgument("workspace_id", "file delivery requires a complete Workspace input snapshot bound to the Task")
+		}
+		var ownerID, state string
+		var revision int64
+		var deleted bool
+		err := tx.QueryRow(ctx, `SELECT owner_id,state,revision,deleted_at IS NOT NULL FROM workspaces WHERE id=$1 FOR SHARE`, workspaceID).
+			Scan(&ownerID, &state, &revision, &deleted)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if err != nil {
+			return fmt.Errorf("check Task Workspace snapshot for file delivery: %w", err)
+		}
+		if ownerID != workspaceOwnerID {
+			return domain.NewError(domain.CodeNotFound, "workspace not found")
+		}
+		if state != string(workspace.StateReady) || deleted || revision != checkpointRevision.Int64 {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace snapshot is no longer current and ready for file delivery")
+		}
+		actualDigest, err := conversationRouteWorkspaceManifestDigest(ctx, tx, workspaceID, revision)
+		if err != nil || !bytes.Equal(actualDigest, contextDigest) {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace input manifest is unavailable or stale")
+		}
+		if workspaceOwnerID != initiatorID {
+			return domain.NewError(domain.CodeWorkspaceConflict, "Task Workspace owner is no longer authorized for this file delivery")
+		}
+	}
+	return nil
 }
 
 func validateInitialRouteAttachments(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) error {

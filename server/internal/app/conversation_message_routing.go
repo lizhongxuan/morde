@@ -11,6 +11,7 @@ import (
 	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/domain/workspace"
 )
 
 // AcceptConversationMessageCommand describes user input before any Task exists.
@@ -47,6 +48,8 @@ type ConversationRoutingInput struct {
 	ModelID                 string      `json:"model_id,omitempty"`
 	HostID                  string      `json:"host_id,omitempty"`
 	WorkspaceID             string      `json:"workspace_id,omitempty"`
+	WorkspaceInputRevision  *int64      `json:"workspace_input_revision,omitempty"`
+	WorkspaceContextDigest  []byte      `json:"workspace_context_digest,omitempty"`
 	ChangeTaskTarget        bool        `json:"change_task_target,omitempty"`
 	ApplicationID           string      `json:"application_id,omitempty"`
 	TimeZone                string      `json:"time_zone,omitempty"`
@@ -147,7 +150,9 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 	} else if _, err := s.store.GetConversation(ctx, conversationID, principal.UserID); err != nil {
 		return ConversationMessageReceipt{}, err
 	}
-	// Host and Workspace authorization is intentionally deferred until a tool uses them.
+	// Host authorization remains deferred. A selected personal Workspace is
+	// best-effort captured below, but the selection grants no access unless the
+	// routed Task later passes the owner-scoped snapshot gate.
 	authorization, err := s.authorizeTask(ctx, principal, "", identity.ScopeTaskSubmit)
 	if err != nil {
 		return ConversationMessageReceipt{}, err
@@ -160,6 +165,20 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 		TimeZone:            command.TimeZone,
 		ClientAttachmentIDs: append([]string(nil), command.ClientAttachmentIDs...), Budget: budget,
 	}
+	// A selected personal Workspace is captured at the current committed
+	// revision when the receipt is accepted. The selection remains only a hint
+	// until routing requires a file deliverable; missing or inaccessible
+	// snapshots are left unset so a non-file request can still be accepted.
+	if command.WorkspaceID != "" && command.ProjectID == "" && ownerID == principal.UserID {
+		if reader, ok := s.store.(taskWorkspaceSnapshotReader); ok {
+			value, readErr := reader.GetWorkspace(ctx, command.WorkspaceID)
+			if readErr == nil && value.OwnerID == principal.UserID && value.State == workspace.StateReady && value.DeletedAt == nil {
+				revision := value.Revision
+				input.WorkspaceInputRevision, input.WorkspaceContextDigest, _ = s.workspaceInputSnapshot(ctx,
+					principal.UserID, command.HostID, command.WorkspaceID, &revision)
+			}
+		}
+	}
 	return ConversationMessageReceipt{
 		Message: conversation.Message{ConversationID: conversationID, OwnerID: ownerID, ActorID: principal.UserID,
 			Role: conversation.RoleUser, DeliveryStatus: conversation.DeliveryPending},
@@ -169,6 +188,11 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 
 // ConversationReceiptHash binds the complete text and immutable routing options to one receipt.
 func ConversationReceiptHash(conversationID, content string, input ConversationRoutingInput) ([]byte, error) {
+	// These fields are captured from mutable server state at first acceptance.
+	// Exclude them from request identity so retrying the same client message
+	// after a Workspace revision advances still replays its original receipt.
+	input.WorkspaceInputRevision = nil
+	input.WorkspaceContextDigest = nil
 	return hashIdempotencyRequest(struct {
 		ConversationID string                   `json:"conversation_id"`
 		Content        string                   `json:"content"`

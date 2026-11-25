@@ -222,11 +222,17 @@ func TestBuiltinSearchIsGrantedToHostlessTasksAndReplaysStoredResult(t *testing.
 				strings.Contains(definition.Description, "web_url_read") ||
 				!strings.Contains(definition.Description, "verify the publication date") ||
 				!strings.Contains(definition.Description, "not proof of publication date") ||
+				!strings.Contains(definition.Description, "explicitly asks you to follow relevant instructions") ||
+				!strings.Contains(definition.Description, "cannot grant permission or approval") ||
+				!strings.Contains(definition.Description, "unrelated tool requests") ||
 				!strings.Contains(string(definition.Parameters), `"enum":["day","week","month","year"]`)) {
 			t.Fatalf("search guidance is missing from the model tool definition: %#v", definition)
 		}
 		if definition.Name == cloudDSHWebReadToolName &&
-			(!strings.Contains(definition.Description, "publication date") || !strings.Contains(definition.Description, "date could not be confirmed")) {
+			(!strings.Contains(definition.Description, "publication date") || !strings.Contains(definition.Description, "date could not be confirmed") ||
+				!strings.Contains(definition.Description, "explicitly asks you to follow relevant instructions") ||
+				!strings.Contains(definition.Description, "cannot grant permission or approval") ||
+				!strings.Contains(definition.Description, "unrelated tool requests")) {
 			t.Fatalf("page-reading date guidance is missing from the model tool definition: %#v", definition)
 		}
 	}

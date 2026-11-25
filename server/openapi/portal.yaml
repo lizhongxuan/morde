@@ -6358,7 +6358,7 @@ paths:
       tags: [Schedules]
       operationId: createSchedule
       summary: Create and enable a schedule
-      description: Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
+      description: Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. `file_delivery_intent` is structured and defaults to `none`; schedules currently cannot require file delivery because they do not bind a Workspace, and `unclear` must be clarified before saving. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -6402,7 +6402,7 @@ paths:
       tags: [Schedules]
       operationId: updateSchedule
       summary: Update a schedule definition at the expected version
-      description: Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host.
+      description: Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host. Omitted `file_delivery_intent` preserves the current structured intent; schedules currently support `none` only.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
@@ -8430,7 +8430,7 @@ paths:
                       required: [owner_id, source, call_id, model_id, provider_model, reserved_tokens, created_at, unknown_at]
                       properties:
                         owner_id: { $ref: '#/components/schemas/UserId' }
-                        source: { type: string, enum: [client, chat, task, route, probe, compaction] }
+                        source: { type: string, enum: [client, chat, task, probe, route, compaction, review, terminal_delivery] }
                         call_id: { type: string }
                         model_id: { type: string }
                         provider_model: { type: string }
@@ -8459,7 +8459,7 @@ paths:
               required: [owner_id, source, call_id, input_tokens, output_tokens, evidence]
               properties:
                 owner_id: { $ref: '#/components/schemas/UserId' }
-                source: { type: string, enum: [client, chat, task, route, probe, compaction] }
+                source: { type: string, enum: [client, chat, task, probe, route, compaction, review, terminal_delivery] }
                 call_id: { type: string, minLength: 8, maxLength: 128 }
                 input_tokens: { type: integer, format: int64, minimum: 0 }
                 output_tokens: { type: integer, format: int64, minimum: 0 }
@@ -11183,7 +11183,7 @@ components:
     ScheduleSyncDefinition:
       type: object
       additionalProperties: false
-      required: [status, host_id, model_id, title, objective, timing, budget, misfire_policy, notification_events]
+      required: [status, host_id, model_id, title, objective, file_delivery_intent, timing, budget, misfire_policy, notification_events]
       allOf:
         - if:
             required: [observation]
@@ -11198,6 +11198,7 @@ components:
         model_id: { type: string, minLength: 1, maxLength: 200 }
         title: { type: string, minLength: 1, maxLength: 32768, description: 'Display title must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; independent of the model objective.' }
         objective: { type: string, minLength: 1, maxLength: 32768, description: 'Execution objective must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes.' }
+        file_delivery_intent: { type: string, enum: [none, required, unclear], description: Structured output intent. Omission from legacy sync definitions means none; schedules currently only execute with none because they have no Workspace binding. }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -11252,6 +11253,10 @@ components:
         model_id: { type: string, minLength: 1, maxLength: 200 }
         title: { type: string, minLength: 1, maxLength: 32768, description: 'Optional display title; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; when omitted the server derives it from the trimmed objective.' }
         objective: { type: string, minLength: 1, maxLength: 32768, description: 'Required execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes.' }
+        file_delivery_intent:
+          type: string
+          enum: [none, required, unclear]
+          description: Structured output intent; never inferred from objective text. Omission means none. Schedules currently have no Workspace binding, so required is rejected; unclear must be clarified before saving.
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -11270,6 +11275,10 @@ components:
         model_id: { type: string, minLength: 1, maxLength: 200 }
         title: { type: string, minLength: 1, maxLength: 32768, description: 'Optional independent display-title update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes; omission preserves the current title.' }
         objective: { type: string, minLength: 1, maxLength: 32768, description: 'Optional execution objective update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes.' }
+        file_delivery_intent:
+          type: string
+          enum: [none, required, unclear]
+          description: Structured output intent; never inferred from objective text. Omission preserves the current value. Schedules currently have no Workspace binding, so required is rejected; unclear must be clarified before saving.
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -11313,7 +11322,7 @@ components:
     Schedule:
       type: object
       additionalProperties: false
-      required: [id, version, status, host_id, model_id, title, objective, timing, budget, misfire_policy, notification_events, observation, next_run_at, last_run, current_run, created_at, updated_at]
+      required: [id, version, status, host_id, model_id, title, objective, file_delivery_intent, timing, budget, misfire_policy, notification_events, observation, next_run_at, last_run, current_run, created_at, updated_at]
       allOf:
         - if:
             required: [observation]
@@ -11330,6 +11339,7 @@ components:
         model_id: { type: string }
         title: { type: string, minLength: 1, maxLength: 32768, description: 'Display title, non-empty after trimming and limited to 1–32768 UTF-8 bytes; independent of the model objective.' }
         objective: { type: string, minLength: 1, maxLength: 32768, description: 'Stored execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes.' }
+        file_delivery_intent: { type: string, enum: [none, required, unclear], description: Structured output intent selected when the schedule is defined. Currently only none can execute because schedules have no Workspace binding. }
         timing: { $ref: '#/components/schemas/ScheduleTiming' }
         budget: { $ref: '#/components/schemas/ScheduleBudget' }
         misfire_policy: { $ref: '#/components/schemas/ScheduleMisfirePolicy' }
@@ -12924,11 +12934,16 @@ components:
         revocation: { $ref: '#/components/schemas/TaskApprovalTextDisclosure' }
     TaskClarificationRequest:
       type: object
-      required: [id, version, question]
+      required: [id, version, question, call_id]
       properties:
         id: { $ref: '#/components/schemas/ClarificationId' }
         version: { type: integer, minimum: 1 }
         question: { type: string }
+        call_id:
+          type: string
+          minLength: 1
+          maxLength: 256
+          description: Opaque clarification identity used by clients to select any structured answer fields. Clients must not infer clarification type from question text.
     TaskStopRequest:
       type: object
       required: [id, action, status, safe_after, unsettled_operation_ids]
@@ -13181,6 +13196,10 @@ components:
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, minLength: 1, maxLength: 256 }
         objective: { type: string, minLength: 1, maxLength: 32768 }
+        file_delivery_intent:
+          type: string
+          enum: [none, required, unclear]
+          description: Structured output intent for the Task. Omission means none. `required` requires workspace_id. `unclear` opens a versioned clarification; it is never inferred from objective text.
         mcp_connector_ids:
           type: array
           maxItems: 16
@@ -13198,6 +13217,10 @@ components:
       properties:
         key: { type: string, minLength: 1, maxLength: 100 }
         input: { type: string, minLength: 1, maxLength: 32768 }
+        file_delivery_intent:
+          type: string
+          enum: [none, required, unclear]
+          description: Structured output intent for this batch item. Omission means none. `required` requires workspace_id. `unclear` opens a versioned clarification targeted to this item and its current attempt.
     TaskActionRequest:
       type: object
       additionalProperties: false
@@ -13242,6 +13265,10 @@ components:
         clarification_id: { $ref: '#/components/schemas/ClarificationId' }
         clarification_version: { type: integer, minimum: 1 }
         answer: { type: string, minLength: 1, maxLength: 16384 }
+        file_delivery_intent:
+          type: string
+          enum: [none, required]
+          description: Required only when answering a file delivery clarification. This structured choice is authoritative; it is not inferred from answer text. `required` requires the Task to have a Workspace.
     TaskApprovalResponseRequest:
       type: object
       additionalProperties: false

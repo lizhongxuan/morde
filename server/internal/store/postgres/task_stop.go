@@ -579,6 +579,11 @@ WHERE id=$1 AND task_id=$2 AND status='pending'`, stopID, taskID)
 		} else if err := insertTaskStatusEvent(ctx, tx, taskID, sequence, target, action, stopID); err != nil {
 			return err
 		}
+		if target == task.StatusCancelled {
+			if err := enqueueTaskTerminalDeliveryInTx(ctx, tx, taskID, sequence, "task.status"); err != nil {
+				return err
+			}
+		}
 		if action == task.ActionPause && workspaceInputChanged {
 			if err := insertWorkspaceInputChangedEvent(ctx, tx, taskID); err != nil {
 				return err

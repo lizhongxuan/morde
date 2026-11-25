@@ -307,7 +307,8 @@ func (s *Store) AnswerClarificationRequest(ctx context.Context, record app.Idemp
 	if !domain.ValidTaskID(taskID) || !domain.ValidPendingRequestID(clarificationID) || version < 1 || !validClarificationText(answer) {
 		return domain.InvalidArgument("clarification", "clarification response fields are invalid")
 	}
-	if (fileIntent == "") != (objective == "") || (fileIntent != "" && (!fileIntent.Valid() || fileIntent == task.FileDeliveryUnclear || strings.TrimSpace(objective) == "")) {
+	if fileIntent == task.FileDeliveryUnclear || (fileIntent != "" && !fileIntent.Valid()) ||
+		(fileIntent == "" && objective != "") || (fileIntent != "" && objective != "" && strings.TrimSpace(objective) == "") {
 		return domain.InvalidArgument("clarification", "file delivery clarification resolution is invalid")
 	}
 	if err := validateIdempotency(record); err != nil {
@@ -327,14 +328,15 @@ func (s *Store) AnswerClarificationRequest(ctx context.Context, record app.Idemp
 			return err
 		}
 		var status, waitingReason, storedFileIntent, workspaceID, initiatorID string
-		var leaseVersion, taskEpoch int64
+		var leaseVersion, taskEpoch, currentRevision, desiredRevision int64
 		taskOwnerID, err := taskOwnerIDForActor(ctx, tx, taskID, record.OwnerID, true, true)
 		if err != nil {
 			return err
 		}
 		if err := tx.QueryRow(ctx, `SELECT status, waiting_reason, lease_version, execution_epoch, file_delivery_intent,
-COALESCE(workspace_id, ''), initiator_id FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, taskOwnerID).
-			Scan(&status, &waitingReason, &leaseVersion, &taskEpoch, &storedFileIntent, &workspaceID, &initiatorID); errors.Is(err, pgx.ErrNoRows) {
+COALESCE(workspace_id, ''), initiator_id, current_revision, desired_revision
+FROM tasks WHERE id=$1 AND owner_id=$2 FOR UPDATE`, taskID, taskOwnerID).
+			Scan(&status, &waitingReason, &leaseVersion, &taskEpoch, &storedFileIntent, &workspaceID, &initiatorID, &currentRevision, &desiredRevision); errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
 		} else if err != nil {
 			return fmt.Errorf("lock task for clarification answer: %w", err)
@@ -350,13 +352,12 @@ COALESCE(workspace_id, ''), initiator_id FROM tasks WHERE id=$1 AND owner_id=$2`
 		} else if replayed {
 			return nil
 		}
-		if status != string(task.StatusWaitingUser) || waitingReason != "clarification_required" || leaseVersion == int64(^uint64(0)>>1) {
-			return domain.NewError(domain.CodeConflict, "task is no longer waiting for this clarification")
-		}
 		var storedVersion int64
-		var requestStatus, callID string
-		if err := tx.QueryRow(ctx, `SELECT version, status, call_id FROM task_clarification_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, clarificationID, taskID).
-			Scan(&storedVersion, &requestStatus, &callID); errors.Is(err, pgx.ErrNoRows) {
+		var requestStatus, callID, clarificationBatchItemID string
+		var clarificationBatchAttempt int32
+		if err := tx.QueryRow(ctx, `SELECT version, status, call_id, COALESCE(batch_item_id,''), COALESCE(batch_attempt,0)
+FROM task_clarification_requests WHERE id=$1 AND task_id=$2 FOR UPDATE`, clarificationID, taskID).
+			Scan(&storedVersion, &requestStatus, &callID, &clarificationBatchItemID, &clarificationBatchAttempt); errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeConflict, "clarification request is no longer active")
 		} else if err != nil {
 			return fmt.Errorf("lock task clarification request: %w", err)
@@ -364,15 +365,60 @@ COALESCE(workspace_id, ''), initiator_id FROM tasks WHERE id=$1 AND owner_id=$2`
 		if storedVersion != version || requestStatus != string(task.ClarificationPending) {
 			return domain.NewError(domain.CodeConflict, "clarification version is stale or already answered")
 		}
+		if callID == task.RouteFileDeliveryIntentClarificationCallID {
+			return answerConversationRouteFileDeliveryClarificationInTx(ctx, tx, record, taskID, clarificationID, version,
+				answer, fileIntent, objective, taskOwnerID, status, waitingReason, currentRevision, desiredRevision, workspaceID)
+		}
+		if status != string(task.StatusWaitingUser) || waitingReason != "clarification_required" || leaseVersion == int64(^uint64(0)>>1) {
+			return domain.NewError(domain.CodeConflict, "task is no longer waiting for this clarification")
+		}
+		resolvedTaskFileIntent := fileIntent
 		if callID == app.FileDeliveryIntentClarificationCallID {
-			if fileIntent == "" || storedFileIntent != string(task.FileDeliveryUnclear) {
+			if fileIntent == "" || fileIntent == task.FileDeliveryUnclear || strings.TrimSpace(objective) == "" {
 				return domain.NewError(domain.CodeConflict, "file delivery clarification resolution is missing or stale")
 			}
 			if fileIntent == task.FileDeliveryRequired && workspaceID == "" {
 				return domain.InvalidArgument("workspace_id", "file delivery requires a Workspace")
 			}
-		} else if fileIntent != "" {
+			var unclearBatchItems int64
+			if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_batch_items WHERE task_id=$1 AND file_delivery_intent='unclear'`, taskID).
+				Scan(&unclearBatchItems); err != nil {
+				return fmt.Errorf("count unclear batch item file delivery intents: %w", err)
+			}
+			if clarificationBatchItemID == "" {
+				if clarificationBatchAttempt != 0 || storedFileIntent != string(task.FileDeliveryUnclear) || unclearBatchItems != 0 {
+					return domain.NewError(domain.CodeConflict, "file delivery clarification target is ambiguous or stale")
+				}
+			} else {
+				if clarificationBatchAttempt < 1 || storedFileIntent == string(task.FileDeliveryUnclear) || unclearBatchItems != 1 {
+					return domain.NewError(domain.CodeConflict, "batch item file delivery clarification target is ambiguous or stale")
+				}
+				var itemIntent string
+				var itemAttempt int32
+				if err := tx.QueryRow(ctx, `SELECT file_delivery_intent, attempt FROM task_batch_items
+WHERE task_id=$1 AND id=$2 FOR UPDATE`, taskID, clarificationBatchItemID).Scan(&itemIntent, &itemAttempt); errors.Is(err, pgx.ErrNoRows) {
+					return domain.NewError(domain.CodeConflict, "batch item file delivery clarification target is no longer available")
+				} else if err != nil {
+					return fmt.Errorf("lock batch item for file delivery clarification: %w", err)
+				}
+				if itemIntent != string(task.FileDeliveryUnclear) || itemAttempt != clarificationBatchAttempt {
+					return domain.NewError(domain.CodeConflict, "batch item file delivery clarification attempt changed")
+				}
+				result, err := tx.Exec(ctx, `UPDATE task_batch_items SET file_delivery_intent=$3, updated_at=clock_timestamp()
+WHERE task_id=$1 AND id=$2 AND attempt=$4 AND file_delivery_intent='unclear'`,
+					taskID, clarificationBatchItemID, string(fileIntent), clarificationBatchAttempt)
+				if err != nil {
+					return fmt.Errorf("resolve batch item file delivery intent: %w", err)
+				}
+				if result.RowsAffected() != 1 {
+					return domain.NewError(domain.CodeConflict, "batch item file delivery intent changed before clarification")
+				}
+				resolvedTaskFileIntent = ""
+			}
+		} else if fileIntent != "" || objective != "" {
 			return domain.InvalidArgument("clarification", "only file delivery clarifications may change file delivery intent")
+		} else if clarificationBatchItemID != "" || clarificationBatchAttempt != 0 {
+			return domain.NewError(domain.CodeInvalidState, "non-file clarification has a batch item target")
 		}
 		if _, err := tx.Exec(ctx, `UPDATE task_clarification_requests SET status='answered', answer=$3, responded_at=clock_timestamp()
 WHERE id=$1 AND task_id=$2`, clarificationID, taskID, answer); err != nil {
@@ -384,6 +430,10 @@ WHERE id=$1 AND task_id=$2`, clarificationID, taskID, answer); err != nil {
 		}
 		if fileIntent != "" {
 			payloadValues["file_delivery_intent"] = fileIntent
+			if clarificationBatchItemID != "" {
+				payloadValues["batch_item_id"] = clarificationBatchItemID
+				payloadValues["batch_attempt"] = clarificationBatchAttempt
+			}
 		}
 		payload, err := json.Marshal(payloadValues)
 		if err != nil {
@@ -394,7 +444,7 @@ WHERE id=$1 AND task_id=$2`, clarificationID, taskID, answer); err != nil {
 file_delivery_intent=CASE WHEN $4='' THEN file_delivery_intent ELSE $4 END,
 status='queued', lease_version=lease_version+1, waiting_reason='', event_seq=event_seq+1, updated_at=clock_timestamp()
 WHERE id=$1 AND owner_id=$2 AND status='waiting_user' AND waiting_reason='clarification_required' AND lease_owner='' AND lease_expires_at IS NULL
-RETURNING event_seq`, taskID, taskOwnerID, objective, string(fileIntent)).Scan(&sequence)
+RETURNING event_seq`, taskID, taskOwnerID, objective, string(resolvedTaskFileIntent)).Scan(&sequence)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeConflict, "task state changed while applying the clarification")
 		}
@@ -403,6 +453,134 @@ RETURNING event_seq`, taskID, taskOwnerID, objective, string(fileIntent)).Scan(&
 		}
 		return insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: sequence, Type: "task.response", Payload: payload})
 	})
+}
+
+func answerConversationRouteFileDeliveryClarificationInTx(ctx context.Context, tx pgx.Tx, record app.IdempotencyRecord,
+	taskID, clarificationID string, version int64, answer string, fileIntent task.FileDeliveryIntent, objective, taskOwnerID,
+	taskStatus, waitingReason string, currentRevision, desiredRevision int64, workspaceID string) error {
+	if (fileIntent != task.FileDeliveryNone && fileIntent != task.FileDeliveryRequired) || objective != "" {
+		return domain.InvalidArgument("file_delivery_intent", "route clarification requires a structured file delivery choice")
+	}
+	if (taskStatus != string(task.StatusPausing) && taskStatus != string(task.StatusPaused)) || waitingReason != "" {
+		return domain.NewError(domain.CodeConflict, "route clarification Task revision is no longer awaiting an answer")
+	}
+	var routeClaim app.ConversationRouteClaim
+	var ownerID, actorID, conversationID, routeState, messageTaskID, intentState, clarificationState, boundTaskID string
+	var expectedRevision, clarificationVersion int64
+	err := tx.QueryRow(ctx, `SELECT clarification.message_id,clarification.task_id,clarification.owner_id,
+clarification.initiator_id,clarification.conversation_id,clarification.expected_revision,clarification.clarification_version,
+clarification.status,route.service_instance_id::text,route.client_message_id,route.state,message.sequence,message.content,
+COALESCE(message.task_id,''),intent.state
+FROM conversation_route_file_delivery_clarifications clarification
+JOIN conversation_message_routes route ON route.message_id=clarification.message_id
+JOIN conversation_messages message ON message.id=route.message_id AND message.owner_id=route.owner_id
+ AND message.actor_id=route.actor_id AND message.conversation_id=route.conversation_id
+JOIN task_revision_intents intent ON intent.message_id=clarification.message_id AND intent.task_id=clarification.task_id
+ AND intent.expected_revision=clarification.expected_revision
+WHERE clarification.clarification_id=$1 AND clarification.task_id=$2
+FOR UPDATE OF clarification,route,message,intent`, clarificationID, taskID).Scan(
+		&routeClaim.Message.ID, &boundTaskID, &ownerID, &actorID, &conversationID, &expectedRevision, &clarificationVersion,
+		&clarificationState, &routeClaim.ServiceInstanceID, &routeClaim.Message.ClientMessageID, &routeState,
+		&routeClaim.Message.Sequence, &routeClaim.Message.Content, &messageTaskID, &intentState)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeConflict, "route file delivery clarification is no longer active")
+	}
+	if err != nil {
+		return fmt.Errorf("lock route file delivery clarification binding: %w", err)
+	}
+	if ownerID != taskOwnerID || actorID != record.OwnerID || conversationID == "" || boundTaskID != taskID ||
+		clarificationVersion != version || clarificationState != "pending" || routeState != "waiting_user" ||
+		messageTaskID != taskID || intentState != "stopping" || expectedRevision != currentRevision ||
+		desiredRevision != expectedRevision+1 {
+		return domain.NewError(domain.CodeConflict, "route clarification source, Task revision, or stop state changed")
+	}
+	routeClaim.Message.OwnerID, routeClaim.Message.ActorID, routeClaim.Message.ConversationID = ownerID, actorID, conversationID
+	if fileIntent == task.FileDeliveryRequired {
+		if err := validateConversationRouteTaskFileDeliverySnapshot(ctx, tx, routeClaim, taskID, fileIntent); err != nil {
+			return err
+		}
+	}
+	result, err := tx.Exec(ctx, `UPDATE task_clarification_requests SET status='answered',answer=$4,responded_at=clock_timestamp()
+WHERE id=$1 AND task_id=$2 AND version=$3 AND call_id=$5 AND status='pending'`,
+		clarificationID, taskID, version, answer, task.RouteFileDeliveryIntentClarificationCallID)
+	if err != nil {
+		return fmt.Errorf("answer route file delivery clarification request: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return domain.NewError(domain.CodeConflict, "route clarification version was answered or cancelled")
+	}
+	result, err = tx.Exec(ctx, `UPDATE conversation_route_file_delivery_clarifications
+SET status='answered',file_delivery_intent=$5,answer=$6,responded_at=clock_timestamp()
+WHERE message_id=$1 AND task_id=$2 AND expected_revision=$3 AND clarification_id=$4
+ AND clarification_version=$7 AND status='pending'`, routeClaim.Message.ID, taskID, expectedRevision,
+		clarificationID, string(fileIntent), answer, version)
+	if err != nil {
+		return fmt.Errorf("persist resolved route file delivery intent: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return domain.NewError(domain.CodeConflict, "route clarification binding changed before answer")
+	}
+	if err := finishConversationRouteClarificationInTx(ctx, tx, routeClaim); err != nil {
+		return err
+	}
+	var sequence int64
+	err = tx.QueryRow(ctx, `UPDATE tasks SET event_seq=event_seq+1,updated_at=clock_timestamp()
+WHERE id=$1 AND owner_id=$2 AND initiator_id=$3 AND conversation_id=$4
+ AND status=$5 AND waiting_reason='' AND current_revision=$6 AND desired_revision=$7
+RETURNING event_seq`, taskID, taskOwnerID, actorID, conversationID, taskStatus, expectedRevision, expectedRevision+1).Scan(&sequence)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return domain.NewError(domain.CodeConflict, "Task revision changed while resolving route clarification")
+	}
+	if err != nil {
+		return fmt.Errorf("record route clarification answer event: %w", err)
+	}
+	payload, err := json.Marshal(map[string]any{
+		"clarification_id": clarificationID, "clarification_version": version, "answer": answer,
+		"file_delivery_intent": fileIntent, "source_message_id": routeClaim.Message.ID,
+		"expected_revision": expectedRevision, "status": taskStatus, "idempotency_replayed": false,
+	})
+	if err != nil {
+		return fmt.Errorf("encode route clarification answer event: %w", err)
+	}
+	return insertTaskEvent(ctx, tx, task.Event{TaskID: taskID, Sequence: sequence, Type: "task.response", Payload: payload})
+}
+
+func finishConversationRouteClarificationInTx(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) error {
+	result, err := tx.Exec(ctx, `UPDATE conversation_message_routes SET state='waiting_adjustment',
+aggregation_state=CASE WHEN aggregation_state='cancelled' THEN 'cancelled' ELSE 'settled' END,
+lease_owner='',lease_expires_at=NULL,lease_version=lease_version+1,failure_reason='',awaiting_predecessor=false,
+updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND message_id=$5
+ AND state='waiting_user' AND lease_owner='' AND lease_expires_at IS NULL`, claim.ServiceInstanceID,
+		claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID, claim.Message.ID)
+	if err != nil {
+		return fmt.Errorf("resolve route clarification state: %w", err)
+	}
+	if result.RowsAffected() != 1 {
+		return domain.NewError(domain.CodeConflict, "route clarification was superseded before answer")
+	}
+	if err := syncConversationDuplicateMessages(ctx, tx, claim.Message.ID); err != nil {
+		return err
+	}
+	rows, err := tx.Query(ctx, `UPDATE conversation_message_routes SET state='pending',awaiting_predecessor=false,
+available_after=clock_timestamp(),updated_at=clock_timestamp()
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4
+ AND previous_client_message_id=$5 AND state='waiting_user' AND awaiting_predecessor RETURNING message_id`,
+		claim.ServiceInstanceID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID, claim.Message.ClientMessageID)
+	if err != nil {
+		return fmt.Errorf("resume route messages after clarification: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var messageID string
+		if err := rows.Scan(&messageID); err != nil {
+			return fmt.Errorf("read resumed route clarification message: %w", err)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate resumed route clarification messages: %w", err)
+	}
+	return nil
 }
 
 // cancelPendingTaskRequest settles an outstanding approval in the same
@@ -509,6 +687,15 @@ WHERE task_id=$1 AND status='pending'`, taskID); err != nil {
 	if _, err := tx.Exec(ctx, `UPDATE task_clarification_requests SET status='cancelled', responded_at=clock_timestamp()
 WHERE task_id=$1 AND status='pending'`, taskID); err != nil {
 		return fmt.Errorf("cancel pending task clarification: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `WITH cancelled AS (
+ UPDATE conversation_route_file_delivery_clarifications SET status='cancelled',responded_at=clock_timestamp()
+ WHERE task_id=$1 AND status='pending' RETURNING message_id
+)
+UPDATE conversation_message_routes route SET state='failed',failure_reason='route file delivery clarification cancelled',
+ lease_owner='',lease_expires_at=NULL,lease_version=lease_version+1,updated_at=clock_timestamp()
+FROM cancelled WHERE route.message_id=cancelled.message_id AND route.state='waiting_user'`, taskID); err != nil {
+		return fmt.Errorf("cancel pending route file delivery clarification: %w", err)
 	}
 	return nil
 }

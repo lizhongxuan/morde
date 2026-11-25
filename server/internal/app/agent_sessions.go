@@ -37,6 +37,8 @@ type AgentChildSessionCreate struct {
 	ParentSessionID               string
 	SpawnKey                      string
 	RequestHash                   []byte
+	PlanStepID                    string
+	PlanRevision                  int64
 	StepID                        string
 	SessionID                     string
 	RootCheckpointThroughSequence int64
@@ -58,6 +60,8 @@ type AgentChildSessionCommand struct {
 	Fence                         AgentInstanceFence
 	ParentSessionID               string
 	SpawnKey                      string
+	PlanStepID                    string
+	PlanRevision                  int64
 	RootCheckpointThroughSequence int64
 	Arguments                     []byte
 	Title                         string
@@ -101,6 +105,7 @@ func (s *AgentChildSessionService) Create(ctx context.Context, command AgentChil
 	if err := command.Fence.Validate(); err != nil ||
 		!agentCheckpointIDPattern.MatchString(command.ParentSessionID) ||
 		!agentCheckpointIDPattern.MatchString(command.SpawnKey) ||
+		!validAgentChildPlanStepSelection(command.PlanStepID, command.PlanRevision) ||
 		command.RootCheckpointThroughSequence < -1 ||
 		len(command.Arguments) == 0 || len(command.Arguments) > 64*1024 || !argumentsValid ||
 		invalidCheckpointLabel(strings.TrimSpace(command.Title), 120) || len(command.Summary) > 2048 || !utf8.ValidString(command.Summary) ||
@@ -114,13 +119,43 @@ func (s *AgentChildSessionService) Create(ctx context.Context, command AgentChil
 		return AgentChildSession{}, false, fmt.Errorf("generate child TaskStep id: %w", err)
 	}
 	requestHash := sha256.Sum256(command.Arguments)
+	if command.PlanStepID != "" {
+		requestIdentity, err := json.Marshal(struct {
+			Arguments    json.RawMessage `json:"arguments"`
+			PlanStepID   string          `json:"morde_plan_step_id"`
+			PlanRevision int64           `json:"morde_plan_revision"`
+		}{Arguments: append(json.RawMessage(nil), command.Arguments...), PlanStepID: command.PlanStepID,
+			PlanRevision: command.PlanRevision})
+		if err != nil {
+			return AgentChildSession{}, false, fmt.Errorf("encode child plan binding request identity: %w", err)
+		}
+		requestHash = sha256.Sum256(requestIdentity)
+	}
 	return s.store.CreateAgentChildSession(ctx, AgentChildSessionCreate{
 		Fence: command.Fence, ParentSessionID: command.ParentSessionID, SpawnKey: command.SpawnKey,
-		RequestHash: requestHash[:], StepID: stepID, SessionID: "child_" + stepID,
+		RequestHash: requestHash[:], PlanStepID: command.PlanStepID, PlanRevision: command.PlanRevision,
+		StepID: stepID, SessionID: "child_" + stepID,
 		RootCheckpointThroughSequence: command.RootCheckpointThroughSequence,
 		Title:                         strings.TrimSpace(command.Title), Summary: strings.TrimSpace(command.Summary), AllowedTools: allowedTools,
 		Background: command.Background,
 	})
+}
+
+func validAgentChildPlanStepSelection(stepID string, planRevision int64) bool {
+	if stepID == "" {
+		return planRevision == 0
+	}
+	if planRevision < 1 || len(stepID) > 40 {
+		return false
+	}
+	for index, char := range stepID {
+		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') || (char >= '0' && char <= '9') ||
+			(index > 0 && (char == '-' || char == '_')) {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func (s *AgentChildSessionService) List(ctx context.Context, fence AgentInstanceFence, actorSessionID string) ([]AgentChildSession, error) {

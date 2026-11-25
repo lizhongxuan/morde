@@ -38,6 +38,11 @@ type MCPConnectorOperation struct {
 	Result                      string
 	CreatedAt                   time.Time
 	UpdatedAt                   time.Time
+	// PlanRevision and PlanStepID are admission selectors carried only to
+	// MarkMCPConnectorOperationDispatched. They are never persisted as operation
+	// identity; the Store validates and binds them to the durable plan and step.
+	PlanRevision int64
+	PlanStepID   string
 }
 
 type MCPConnectorWorkspaceBindingStore interface {

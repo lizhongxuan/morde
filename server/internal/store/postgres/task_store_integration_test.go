@@ -308,9 +308,16 @@ func TestPostgresTaskPersistsFileDeliveryIntent(t *testing.T) {
 	}{
 		{key: "persist-intent-none", objective: "Explain what caused the error.", want: task.FileDeliveryNone},
 		{key: "persist-intent-file", objective: "Generate and save a PDF report.", want: task.FileDeliveryRequired},
-		{key: "persist-intent-unclear", objective: "Write a report about the project.", want: task.FileDeliveryUnclear},
 	} {
 		submission := newTestTaskSubmission(t, owner.ID, "", test.key, test.objective)
+		submission.Task.FileDeliveryIntent = test.want
+		if test.want == task.FileDeliveryRequired {
+			workspaceValue := createTestWorkspace(t, ctx, store, owner.ID, "file-intent-"+test.key)
+			revision := workspaceValue.Revision
+			submission.Task.WorkspaceID = workspaceValue.ID
+			submission.Task.InputRevision = &revision
+			submission.Task.ContextDigest = hashBytes("workspace input snapshot:" + test.key)
+		}
 		created, err := store.SubmitTask(ctx, submission)
 		if err != nil {
 			t.Fatalf("submit %s task: %v", test.want, err)
@@ -322,6 +329,43 @@ func TestPostgresTaskPersistsFileDeliveryIntent(t *testing.T) {
 		if created.Task.FileDeliveryIntent != test.want || loaded.Task.FileDeliveryIntent != test.want {
 			t.Fatalf("file delivery intent create/read = %q/%q, want %q", created.Task.FileDeliveryIntent, loaded.Task.FileDeliveryIntent, test.want)
 		}
+	}
+}
+
+func TestPostgresTaskStoreDoesNotInferMissingFileDeliveryIntentFromObjective(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	submission := newTestTaskSubmission(t, owner.ID, "", "missing-intent-does-not-classify", "Generate and save a PDF report.")
+	submission.Task.FileDeliveryIntent = ""
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatalf("submit with omitted structured intent: %v", err)
+	}
+	if created.Task.FileDeliveryIntent != task.FileDeliveryNone {
+		t.Fatalf("omitted structured intent = %q, want %q", created.Task.FileDeliveryIntent, task.FileDeliveryNone)
+	}
+}
+
+func TestPostgresTaskUnclearFileDeliveryIntentRequiresInitialClarification(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+
+	taskIntentSubmission := newTestTaskSubmission(t, owner.ID, "", "unclear-task-intent", "process this request")
+	taskIntentSubmission.Task.FileDeliveryIntent = task.FileDeliveryUnclear
+	if _, err := store.SubmitTask(ctx, taskIntentSubmission); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("queued Task with unclear file intent and no clarification error = %v, want invalid argument", err)
+	}
+
+	batchIntentSubmission := newTestTaskSubmission(t, owner.ID, "", "unclear-batch-intent", "process this batch")
+	batchIntentSubmission.Task.FileDeliveryIntent = task.FileDeliveryNone
+	batchIntentSubmission.BatchItems = []task.BatchItem{{
+		ID: mustID(t, domain.NewBatchItemID), Key: "file-result", Input: "produce a report",
+		FileDeliveryIntent: task.FileDeliveryUnclear,
+	}}
+	if _, err := store.SubmitTask(ctx, batchIntentSubmission); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("queued Task with unclear batch intent and no matching clarification error = %v, want invalid argument", err)
 	}
 }
 
@@ -343,20 +387,17 @@ func TestPostgresTaskRevisionDoesNotInventFileDeliveryIntentWithoutSettledDecisi
 	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, initial.Message.ID).Scan(&taskID); err != nil {
 		t.Fatal(err)
 	}
-	for index, revision := range []struct {
-		content string
-		intent  task.FileDeliveryIntent
-	}{
-		{content: "Generate and save a PDF report.", intent: task.FileDeliveryRequired},
-		{content: "Continue the explanation."},
+	for index, content := range []string{
+		"Generate and save a PDF report.",
+		"Continue the explanation.",
 	} {
-		message := f.receive(t, fmt.Sprintf("file-intent-update-%d", index), revision.content, app.ConversationRoutingInput{ReferenceTaskID: taskID})
+		message := f.receive(t, fmt.Sprintf("file-intent-update-%d", index), content, app.ConversationRoutingInput{ReferenceTaskID: taskID})
 		updated, err := f.store.LoadConversationRouteSnapshot(ctx, message)
 		if err != nil || len(updated.Context.Candidates) != 1 {
 			t.Fatalf("file intent revision candidates=%+v err=%v", updated.Context.Candidates, err)
 		}
 		if err := f.store.ApplyConversationRoute(ctx, message, updated, app.ConversationRouteDecision{Action: app.ConversationRouteUpdate,
-			TaskID: taskID, ExpectedRevision: updated.Context.Candidates[0].Revision, FileDeliveryIntent: revision.intent}); err != nil {
+			TaskID: taskID, ExpectedRevision: updated.Context.Candidates[0].Revision}); err != nil {
 			t.Fatal(err)
 		}
 	}

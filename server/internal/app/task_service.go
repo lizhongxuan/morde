@@ -26,7 +26,8 @@ const (
 	taskSubmitScope  identity.Scope = identity.ScopeTaskSubmit
 	taskControlScope identity.Scope = identity.ScopeTaskControl
 
-	FileDeliveryIntentClarificationCallID = "morde-file-delivery-intent"
+	FileDeliveryIntentClarificationCallID      = "morde-file-delivery-intent"
+	RouteFileDeliveryIntentClarificationCallID = task.RouteFileDeliveryIntentClarificationCallID
 )
 
 type ConfiguredModelCatalog interface {
@@ -46,24 +47,26 @@ type taskWorkspaceOwnerManifestReader interface {
 }
 
 type SubmitTaskCommand struct {
-	ClientMessageID string
-	AttachmentIDs   []string
-	HostID          string
-	WorkspaceID     string
-	InputRevision   *int64
-	ApplicationID   string
-	ModelID         string
-	ConversationID  string
-	Objective       string
-	Budget          task.Budget
-	BatchItems      []BatchItemInput
-	MCPConnectorIDs []string
-	IdempotencyKey  string
+	ClientMessageID    string
+	AttachmentIDs      []string
+	HostID             string
+	WorkspaceID        string
+	InputRevision      *int64
+	ApplicationID      string
+	ModelID            string
+	ConversationID     string
+	Objective          string
+	FileDeliveryIntent task.FileDeliveryIntent
+	Budget             task.Budget
+	BatchItems         []BatchItemInput
+	MCPConnectorIDs    []string
+	IdempotencyKey     string
 }
 
 type BatchItemInput struct {
-	Key   string
-	Input string
+	Key                string
+	Input              string
+	FileDeliveryIntent task.FileDeliveryIntent `json:"file_delivery_intent,omitempty"`
 }
 
 type TaskService struct {
@@ -227,6 +230,21 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 	if !validBoundedText(command.Objective, 32768) {
 		return TaskSubmissionResult{}, domain.InvalidArgument("objective", "objective is required and must be at most 32768 characters")
 	}
+	if command.FileDeliveryIntent == "" {
+		command.FileDeliveryIntent = task.FileDeliveryNone
+	}
+	if !command.FileDeliveryIntent.Valid() {
+		return TaskSubmissionResult{}, domain.InvalidArgument("file_delivery_intent", "file delivery intent is invalid")
+	}
+	command.BatchItems = append([]BatchItemInput(nil), command.BatchItems...)
+	for index := range command.BatchItems {
+		if command.BatchItems[index].FileDeliveryIntent == "" {
+			command.BatchItems[index].FileDeliveryIntent = task.FileDeliveryNone
+		}
+		if !command.BatchItems[index].FileDeliveryIntent.Valid() {
+			return TaskSubmissionResult{}, domain.InvalidArgument("batch_items.file_delivery_intent", "batch item file delivery intent is invalid")
+		}
+	}
 	if command.ConversationID != "" && !domain.ValidConversationID(command.ConversationID) {
 		return TaskSubmissionResult{}, domain.InvalidArgument("conversation_id", "conversation id is invalid")
 	}
@@ -263,12 +281,25 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 	if err != nil {
 		return TaskSubmissionResult{}, err
 	}
-	fileDeliveryIntent := ClassifyFileDeliveryIntent(command.Objective, command.WorkspaceID != "")
-	for _, item := range batchItems {
-		itemIntent := ClassifyFileDeliveryIntent(item.Input, command.WorkspaceID != "")
-		if itemIntent == task.FileDeliveryRequired || (itemIntent == task.FileDeliveryUnclear && fileDeliveryIntent == task.FileDeliveryNone) {
-			fileDeliveryIntent = itemIntent
+	fileDeliveryIntent := command.FileDeliveryIntent
+	if fileDeliveryIntent == task.FileDeliveryRequired && command.WorkspaceID == "" {
+		return TaskSubmissionResult{}, domain.InvalidArgument("workspace_id", "file delivery requires a Workspace")
+	}
+	var unclearBatchItem *task.BatchItem
+	for index := range batchItems {
+		item := &batchItems[index]
+		if item.FileDeliveryIntent == task.FileDeliveryRequired && command.WorkspaceID == "" {
+			return TaskSubmissionResult{}, domain.InvalidArgument("workspace_id", "file delivery requires a Workspace")
 		}
+		if item.FileDeliveryIntent == task.FileDeliveryUnclear {
+			if unclearBatchItem != nil {
+				return TaskSubmissionResult{}, domain.InvalidArgument("batch_items.file_delivery_intent", "only one unclear file delivery intent can be clarified per Task")
+			}
+			unclearBatchItem = item
+		}
+	}
+	if fileDeliveryIntent == task.FileDeliveryUnclear && unclearBatchItem != nil {
+		return TaskSubmissionResult{}, domain.InvalidArgument("file_delivery_intent", "Task and batch item file delivery intents cannot both be unclear")
 	}
 	authorization, err := s.authorizeTask(ctx, principal, command.HostID, taskSubmitScope)
 	if err != nil {
@@ -306,23 +337,25 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 		return TaskSubmissionResult{}, fmt.Errorf("generate task message id: %w", err)
 	}
 	requestHash, err := hashIdempotencyRequest(struct {
-		HostID          string           `json:"host_id"`
-		ApplicationID   string           `json:"application_id,omitempty"`
-		ModelID         string           `json:"model_id"`
-		ConversationID  string           `json:"conversation_id,omitempty"`
-		WorkspaceID     string           `json:"workspace_id,omitempty"`
-		InputRevision   *int64           `json:"input_revision,omitempty"`
-		ContextDigest   []byte           `json:"context_digest,omitempty"`
-		Objective       string           `json:"objective"`
-		AttachmentIDs   []string         `json:"attachment_ids,omitempty"`
-		Budget          task.Budget      `json:"budget"`
-		BatchItems      []BatchItemInput `json:"batch_items"`
-		MCPConnectorIDs []string         `json:"mcp_connector_ids"`
+		HostID             string                  `json:"host_id"`
+		ApplicationID      string                  `json:"application_id,omitempty"`
+		ModelID            string                  `json:"model_id"`
+		ConversationID     string                  `json:"conversation_id,omitempty"`
+		WorkspaceID        string                  `json:"workspace_id,omitempty"`
+		InputRevision      *int64                  `json:"input_revision,omitempty"`
+		ContextDigest      []byte                  `json:"context_digest,omitempty"`
+		Objective          string                  `json:"objective"`
+		FileDeliveryIntent task.FileDeliveryIntent `json:"file_delivery_intent,omitempty"`
+		AttachmentIDs      []string                `json:"attachment_ids,omitempty"`
+		Budget             task.Budget             `json:"budget"`
+		BatchItems         []BatchItemInput        `json:"batch_items"`
+		MCPConnectorIDs    []string                `json:"mcp_connector_ids"`
 	}{
 		HostID: command.HostID, ApplicationID: command.ApplicationID, ModelID: command.ModelID,
 		ConversationID: command.ConversationID, WorkspaceID: command.WorkspaceID, InputRevision: inputRevision,
-		ContextDigest: contextDigest, Objective: command.Objective, AttachmentIDs: append([]string(nil), command.AttachmentIDs...),
-		Budget: command.Budget, BatchItems: normalizedBatchInputs(command.BatchItems), MCPConnectorIDs: command.MCPConnectorIDs,
+		ContextDigest: contextDigest, Objective: command.Objective, FileDeliveryIntent: hashFileDeliveryIntent(fileDeliveryIntent),
+		AttachmentIDs: append([]string(nil), command.AttachmentIDs...),
+		Budget:        command.Budget, BatchItems: normalizedBatchInputs(command.BatchItems), MCPConnectorIDs: command.MCPConnectorIDs,
 	})
 	if err != nil {
 		return TaskSubmissionResult{}, err
@@ -334,10 +367,18 @@ func (s *TaskService) Submit(ctx context.Context, principal identity.Principal, 
 	var initialSteps []task.Step
 	var initialClarification *task.ClarificationRequest
 	initialEventPayload := map[string]string{"status": string(initialStatus)}
-	if fileDeliveryIntent == task.FileDeliveryUnclear {
+	if fileDeliveryIntent == task.FileDeliveryUnclear || unclearBatchItem != nil {
 		initialSteps, initialClarification, err = newFileDeliveryIntentClarification(taskID, command.WorkspaceID != "", 0, 1)
 		if err != nil {
 			return TaskSubmissionResult{}, err
+		}
+		if unclearBatchItem != nil {
+			initialClarification.BatchItemID = unclearBatchItem.ID
+			initialClarification.BatchAttempt = unclearBatchItem.Attempt
+			question := fmt.Sprintf("批次项目 %q 是否需要交付文件，还是只需聊天答复？ / Does batch item %q require a file deliverable, or is a chat answer enough?",
+				unclearBatchItem.Key, unclearBatchItem.Key)
+			initialClarification.Question = question
+			initialSteps[1].Summary = question
 		}
 		initialStatus, initialEventType, initialWaitingReason, initialCurrentStep = task.StatusWaitingUser, "task.waiting_user", "clarification_required", initialSteps[1].ID
 		initialEventPayload = map[string]string{
@@ -1079,7 +1120,8 @@ func (s *TaskService) RespondToPendingRequest(ctx context.Context, principal ide
 
 // AnswerClarificationRequest records a free-form answer against the exact
 // active Agent question and atomically queues the waiting task.
-func (s *TaskService) AnswerClarificationRequest(ctx context.Context, principal identity.Principal, taskID, clarificationID string, version int64, answer, idempotencyKey string) error {
+func (s *TaskService) AnswerClarificationRequest(ctx context.Context, principal identity.Principal, taskID, clarificationID string, version int64,
+	answer string, fileIntent task.FileDeliveryIntent, idempotencyKey string) error {
 	if err := validateTaskPrincipal(principal); err != nil {
 		return err
 	}
@@ -1092,6 +1134,9 @@ func (s *TaskService) AnswerClarificationRequest(ctx context.Context, principal 
 	if err := validateIdempotencyKey(idempotencyKey); err != nil {
 		return err
 	}
+	if fileIntent != "" && !fileIntent.Valid() {
+		return domain.InvalidArgument("file_delivery_intent", "file delivery intent is invalid")
+	}
 	details, err := s.store.GetTask(ctx, taskID, principal.UserID)
 	if err != nil {
 		return err
@@ -1102,76 +1147,72 @@ func (s *TaskService) AnswerClarificationRequest(ctx context.Context, principal 
 	if _, err := s.authorizeTask(ctx, principal, details.Task.HostID, taskControlScope); err != nil {
 		return hideTaskAccessError(err)
 	}
-	var fileIntent task.FileDeliveryIntent
 	var objective string
+	fileDeliveryClarification := false
+	routeFileDeliveryClarification := false
 	for _, request := range details.ClarificationRequests {
-		if request.ID != clarificationID || request.Version != version || request.Status != task.ClarificationPending ||
-			request.CallID != FileDeliveryIntentClarificationCallID {
+		if request.ID != clarificationID || (request.CallID != FileDeliveryIntentClarificationCallID &&
+			request.CallID != RouteFileDeliveryIntentClarificationCallID) {
 			continue
 		}
-		if details.Task.FileDeliveryIntent != task.FileDeliveryUnclear {
-			return domain.NewError(domain.CodeConflict, "file delivery intent has already been resolved")
+		fileDeliveryClarification = true
+		routeFileDeliveryClarification = request.CallID == RouteFileDeliveryIntentClarificationCallID
+		if request.Version == version && request.Status == task.ClarificationPending {
+			if routeFileDeliveryClarification {
+				if (details.Task.Status != task.StatusPausing && details.Task.Status != task.StatusPaused) || details.Task.WaitingReason != "" {
+					return domain.NewError(domain.CodeConflict, "route file delivery clarification is no longer active")
+				}
+				if fileIntent == task.FileDeliveryRequired && (details.Task.WorkspaceID == "" || details.Task.InputRevision == nil ||
+					details.Task.WorkspaceCheckpointRevision == nil || *details.Task.WorkspaceCheckpointRevision != *details.Task.InputRevision ||
+					len(details.Task.ContextDigest) != 32) {
+					return domain.InvalidArgument("workspace_id", "文件交付需要任务当前绑定完整的工作区输入快照。 / File delivery requires a complete Workspace input snapshot bound to the Task.")
+				}
+			} else {
+				unresolvedIntents := 0
+				if details.Task.FileDeliveryIntent == task.FileDeliveryUnclear {
+					unresolvedIntents++
+				}
+				for _, item := range details.BatchItems {
+					if item.FileDeliveryIntent == task.FileDeliveryUnclear {
+						unresolvedIntents++
+					}
+				}
+				if unresolvedIntents != 1 {
+					return domain.NewError(domain.CodeConflict, "file delivery intent has already been resolved")
+				}
+				if fileIntent == task.FileDeliveryRequired && details.Task.WorkspaceID == "" {
+					return domain.InvalidArgument("workspace_id", "文件交付需要先为任务选择工作区，请使用工作区重新提交任务。 / File delivery requires a Workspace; resubmit the task with one selected.")
+				}
+			}
 		}
-		fileIntent = clarifiedFileDeliveryIntent(answer)
-		if fileIntent == task.FileDeliveryUnclear {
-			return domain.InvalidArgument("clarification", "请明确回答是否需要交付文件，或只需聊天答复。 / Please state whether you need a file deliverable or only a chat answer.")
+		if !routeFileDeliveryClarification {
+			objective = strings.TrimSpace(details.Task.Objective) + "\n\nUser clarification about file delivery: " + strings.TrimSpace(answer)
 		}
-		if fileIntent == task.FileDeliveryRequired && details.Task.WorkspaceID == "" {
-			return domain.InvalidArgument("workspace_id", "文件交付需要先为任务选择工作区，请使用工作区重新提交任务。 / File delivery requires a Workspace; resubmit the task with one selected.")
-		}
-		objective = strings.TrimSpace(details.Task.Objective) + "\n\nUser clarification about file delivery: " + strings.TrimSpace(answer)
 		break
 	}
+	if !fileDeliveryClarification && fileIntent != "" {
+		return domain.InvalidArgument("file_delivery_intent", "only file delivery clarifications accept a file delivery intent")
+	}
+	if fileDeliveryClarification {
+		if fileIntent != task.FileDeliveryNone && fileIntent != task.FileDeliveryRequired {
+			return domain.InvalidArgument("file_delivery_intent", "file delivery clarification requires none or required")
+		}
+		if routeFileDeliveryClarification && objective != "" {
+			return domain.NewError(domain.CodeInternal, "route file delivery clarification cannot change the Task objective")
+		}
+	}
 	record, err := idempotencyRecord(principal.UserID, "task.clarification.answer", idempotencyKey, struct {
-		Action  string `json:"action"`
-		TaskID  string `json:"task_id"`
-		ID      string `json:"clarification_id"`
-		Version int64  `json:"clarification_version"`
-		Answer  string `json:"answer"`
-	}{"answer_clarification", taskID, clarificationID, version, answer}, taskID, clarificationID)
+		Action             string                  `json:"action"`
+		TaskID             string                  `json:"task_id"`
+		ID                 string                  `json:"clarification_id"`
+		Version            int64                   `json:"clarification_version"`
+		Answer             string                  `json:"answer"`
+		FileDeliveryIntent task.FileDeliveryIntent `json:"file_delivery_intent,omitempty"`
+	}{"answer_clarification", taskID, clarificationID, version, answer, fileIntent}, taskID, clarificationID)
 	if err != nil {
 		return err
 	}
 	return s.store.AnswerClarificationRequest(ctx, record, taskID, clarificationID, version, answer, fileIntent, objective)
-}
-
-func clarifiedFileDeliveryIntent(answer string) task.FileDeliveryIntent {
-	text := strings.ToLower(strings.TrimSpace(answer))
-	negativePhrases := []string{
-		"不需要交付文件", "无需交付文件", "不用交付文件", "不要交付文件",
-		"不需要生成文件", "无需生成文件", "不用生成文件", "不需要创建文件", "无需创建文件", "不用创建文件",
-		"不需要写文件", "无需写文件", "不用写文件", "不需要保存文件", "无需保存文件", "不用保存文件",
-		"不需要文件", "无需文件", "不用文件", "不要文件", "不要生成文件", "不要创建文件", "不要写文件", "不要保存文件",
-		"不需要", "无需", "不用", "不要", "否", "不是", "只要聊天", "只要文字", "只要回答", "聊天答复", "只在聊天", "在聊天中回答", "直接回答", "只用文字",
-		"do not create a file", "don't create a file", "do not create the file", "don't create the file",
-		"do not generate a file", "don't generate a file", "do not write a file", "don't write a file",
-		"do not save a file", "don't save a file", "do not need a file", "don't need a file", "do not need the file", "don't need the file",
-		"no file needed", "no need for a file", "no file", "not needed", "chat only", "text only", "just answer", "answer in chat", "reply in chat",
-	}
-	positiveText := text
-	negative := false
-	for _, phrase := range negativePhrases {
-		if strings.Contains(text, phrase) {
-			negative = true
-			positiveText = strings.ReplaceAll(positiveText, phrase, " ")
-		}
-	}
-	if text == "no" || strings.HasPrefix(text, "no ") || strings.HasPrefix(text, "no,") || strings.HasPrefix(text, "no.") {
-		negative = true
-		positiveText = strings.TrimSpace(strings.TrimPrefix(positiveText, "no"))
-	}
-	positive := ClassifyFileDeliveryIntent(positiveText, true) == task.FileDeliveryRequired ||
-		containsAny(positiveText, "是的", "需要文件", "要文件", "需要交付", "要交付", "需要生成", "需要保存", "yes", "required", "need a file", "need a deliverable", "create a file", "save a file")
-	if negative && positive {
-		return task.FileDeliveryUnclear
-	}
-	if negative {
-		return task.FileDeliveryNone
-	}
-	if positive {
-		return task.FileDeliveryRequired
-	}
-	return task.FileDeliveryUnclear
 }
 
 func (s *TaskService) ListEvents(ctx context.Context, principal identity.Principal, id string, after int64, limit int32) (TaskEventPage, error) {
@@ -1368,7 +1409,8 @@ func newBatchItems(values []BatchItemInput) ([]task.BatchItem, error) {
 		if err != nil {
 			return nil, fmt.Errorf("generate batch item id: %w", err)
 		}
-		items = append(items, task.BatchItem{ID: id, Key: value.Key, Input: value.Input, Status: task.BatchItemQueued})
+		items = append(items, task.BatchItem{ID: id, Key: value.Key, Input: value.Input,
+			FileDeliveryIntent: value.FileDeliveryIntent, Status: task.BatchItemQueued, Attempt: 1})
 	}
 	return items, nil
 }
@@ -1377,7 +1419,18 @@ func normalizedBatchInputs(values []BatchItemInput) []BatchItemInput {
 	if values == nil {
 		return []BatchItemInput{}
 	}
-	return values
+	normalized := append([]BatchItemInput(nil), values...)
+	for index := range normalized {
+		normalized[index].FileDeliveryIntent = hashFileDeliveryIntent(normalized[index].FileDeliveryIntent)
+	}
+	return normalized
+}
+
+func hashFileDeliveryIntent(intent task.FileDeliveryIntent) task.FileDeliveryIntent {
+	if intent == task.FileDeliveryNone {
+		return ""
+	}
+	return intent
 }
 
 func truncateRunes(value string, maxRunes int) string {

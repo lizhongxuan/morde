@@ -16,15 +16,17 @@ MORDE HARNESS · MUSE 对照设计
 
 **本轮补充：**待答澄清已改为紧跟用户消息的左侧独立 Morde 行，并复用既有问题 ID/版本/答案/幂等 API；撤权失败显示在卡片中，任务动态保留只读问题。R24 工作项优先显示已记录的结构化失败原因，不被通用失败摘要覆盖；后端确定失败码 tool_execution_failed 已同步到 OpenAPI、生成类型和中文说明。确定失败的只读工具可作为结构化结果回到同一 DSH Session；普通 Go 执行错误继续记为 unknown 并停止，新增回归确认不会重试或完成 Task。Assistant 238/238、Assistant + TaskApprovalCard 联合回归 244/244、MCP App 组件 8/8；本轮最新三文件联合回归 246/246，Assistant ESLint、Portal 类型检查与 PC build 通过。Worker 失败边界定向回归及 app/worker 完整 Go 包通过；DSH Runtime 全量回归现为 244/244。它们是本地自动化/fixture 证据；本轮未操作实际 PC，真实 DSH/模型恢复和终态交付仍未验收。
 
-**R19-A 语义合同审计：**会话路由的文件交付意图已由模型结构化决定；直接 Task/批次 HTTP 请求与 OpenAPI 尚无对应字段，澄清回答、hostless schedule 和存储默认值仍使用文本分类。仅删除关键词规则会丢失这些入口的语义来源或改变能力判定，故须先统一结构化字段、幂等身份与持久化回放合同。任务含义交给 Agent 判断；身份、授权、Host/Workspace、预算、状态/修订、幂等及 unknown 对账仍由代码强制。缺失的权威公共合同未恢复，本轮未跨层改接口。
+**R19-A 语义合同审计：**Task、batch 与 schedule 的结构化文件交付字段已接入 API/OpenAPI、服务和 Store。新建 Task/schedule 缺省为 `none`，update 省略时继承现值；schedule 当前无 Workspace，只接受 `none`，并在服务层拒绝 `required` / `unclear`。迁移 `00243` / `00245` 持久化字段，schedule occurrence Task 与个人同步快照沿用该值；DSH schedule 工具也传递结构化字段。通用 `normalizeNewTask` 不再按 Objective 文本分类。个人 route `new/required` 已绑定 receipt Workspace input snapshot；route update `unclear` 澄清、计划及 Broker/admission 原子接线和真实 PC/DSH 验收仍待完成。任务含义由 Agent 判断；身份、授权、Host/Workspace、预算、状态/修订、幂等及 unknown 对账继续由代码强制。
 
 **R12 Runtime 提醒与超时边界（2026-11-25）：**现已接入 DSH 上游锁定版本的 `repeat-tool-reminder` advisory guard；连续三次完全相同的调用后向 Agent 注入来源可追溯提醒，但不拦截已授权工具。Runtime 全量测试 244/244 通过。本地 `timeout-policy` 插件要求工具合作处理 AbortSignal，现有 Morde IPC 工具没有声明时限；tool/child 6 分钟只限制 IPC 等待并触发结果对账，不表示已派发操作停止。因此不接入通用“硬超时”，真正取消须跨层确认，未知结果不重放。一般 65+ Morde 工具集选择/恢复、强制超时/取消和实际 PC/真实模型验证仍未完成。
 
-**R21 长输入代码边界：**8 MiB 上传不等于 8 MiB 可投递给 DSH。源码审计发现 Task 首轮将完整 pending message 作为 `initial_message`，Worker 与 Runtime 都限制 128 KiB；128 KiB–8 MiB 输入会在 Task 首轮失败。现有 source manifest 只支持 Task 启动后的授权读取；delivery ledger 记录消息身份和投递阶段，checkpoint 仍按原文/附件/模式精确匹配。复用 message ID 换成短 prompt 可能令恢复校验失败或结果变为 unknown。T50 的 1 MiB 正例需先完成原文哈希与 manifest 指针分离绑定、delivery applied、checkpoint 恢复和去重合同；公共合同文件缺失，本轮未修改跨层投递合同，也未端到端复现。
+**R21 长输入代码边界：**8 MiB 上传不等于 8 MiB 可投递给 DSH。源码审计发现 Task 首轮将完整 pending message 作为 `initial_message`，Worker 与 Runtime 都限制 128 KiB；128 KiB–8 MiB 输入会在 Task 首轮失败。现有 source manifest 只支持 Task 启动后的授权读取；delivery ledger 记录消息身份和投递阶段，checkpoint 仍按原文/附件/模式精确匹配。复用 message ID 换成短 prompt 可能令恢复校验失败或结果变为 unknown。公共合同 v1 §4 已定义原文哈希、manifest 指针、表示摘要、delivery applied 与 checkpoint 恢复身份。2026-11-25 C-01 已在本地接入初始消息、followup、steer 与 revision batch 的 receipt-backed 有界引用，并验证 1 MiB+1 原文经 PostgreSQL Store receipt 和 Broker 连续分页读回；实际 PC 成功提交、真实 DSH/模型首中尾语义和预算边界仍待验收。
 
-**R21 初始消息边界回归：**新增 Worker 与 Runtime 子进程两层本地测试：128 KiB UTF-8 正文的首/中/尾锚点完整进入合成模型请求；128 KiB+1 的多字节正文在模型/工具调用前拒绝。该组只验证现有全文帧的边界，不提高上限，不证明 128 KiB 以上首轮可用或真实模型理解；1 MiB 正例仍等待短指针与恢复合同。
+**R21 初始消息边界回归：**Worker 与 Runtime 子进程两层回归验证 128 KiB UTF-8 正文的首/中/尾锚点进入合成模型请求，128 KiB+1 的多字节正文在模型/工具调用前拒绝。该组只验证旧全文帧边界，不单独证明 128 KiB 以上可用或真实模型理解；当前长文可用性由 C-01 receipt-backed 引用及分页读取实现，真实 PC/DSH 语义仍待验证。
 
 **R07 审批历史事实审计（2026-11-25）：**现有审批表可证明已记录请求的决定，但不能证明所有需要审批的副作用都生成了请求；部分副作用账本也没有审批绑定。缺少可核对的操作分类和逐调用绑定前，验证状态必须保持 pending/unknown，不能通过只扫描已有批准记录推断完整覆盖。
+
+**D-01 定向复验（2026-11-25）：**同 Session 确定失败回传、可修复只读失败、unknown 不重派、terminal 结束当前尝试及长证据不足时 pending 的本地 Worker/App 回归通过；一次性 loopback PostgreSQL 上验证 claim/revision、审批绑定、验证队列、晚到验证来源原子写入、内容来源、child failure 和 Worker 持久化定向用例通过。未运行真实 DSH/模型或 PC。R20 合同 v1 已定义；A 已落地终态失败/取消来源表和事务写入，D 已在结果已发布时同事务写入晚到验证结论来源，并验证失败回滚与两种已发布结果路径。source consumer/交付编排 Worker 仍待 D 实现，依赖 A 的 claim/lease、ModelGateway 预算与发布接口；Agent/PC 实际投递仍未验。失败正文须在 Broker 账本与 checkpoint 共用边界脱敏，以维持精确重放一致性。详见[D-01 交接与验证](<五会话并发实施/会话D-01-失败恢复与验证事实.md>)及[验证记录](../../验证记录/Morde_Harness_最终流程测试用例.md)。
 
 **R24 工作区搜索展示补充（2026-11-25）：**`morde_workspace_search` 工作项现在以“搜索工作区文件”呈现，展开显示实际记录的查询与结果摘要，不编造来源 URL 或命中数量。Assistant 239/239、Portal 全量 68 个测试文件 893/893、目标 ESLint、类型检查和 PC build 通过；当时全量 lint 仍有其他组件/路由诊断，随后已修复并通过全量 lint。该证据仅证明 Portal 字段呈现，尚未在实际 PC + 真实 DSH 验证搜索调用与账本一致性。
 
@@ -34,7 +36,7 @@ MORDE HARNESS · MUSE 对照设计
 
 **R19/R11 真实模型路由修正（2026-11-25）：**首次真实 DeepSeek 测试显示：完整 51,842 字节档案首轮可正确回答首/中/尾锚点，但针对被省略中段记录的追问错误要求用户重发。修复仅强化路由模型提示：在历史不完整且答案依赖缺失消息时选择授权历史检索 Task，不增加文本关键词或 parser 强制分支；修复后 Gateway live test 处理首轮 18,502 tokens 和完整历史续问 18,575 tokens，返回锚点/中段内容正确，截断历史追问选择 `new`；历史仍不完整时，自包含的 1+1 问题仍选择有正文的 `reply`。这不证明 Task Agent 真正调用历史工具、PC 或超 128 KiB 初始投递已通过。
 
-**2026-11-25 当前复验状态：**Portal Assistant UI 自动化 239/239、Portal 全量 68 个测试文件 893/893，TypeScript 检查和全量 lint 通过；PersonalData、Reviews、FloatingError 三组受影响测试 48/48 通过。DSH Runtime 244/244。DB 定向组 8 个顶层测试、15 个子场景通过。`make test` 与 `make race` 均通过，但均未设置 `CH_TEST_DATABASE_URL`，其中的条件 PostgreSQL 测试均跳过；完整隔离 loopback `make it` 通过，PostgreSQL 包耗时 1166.815 秒，OpenSandbox 因未配置专用环境而跳过。golangci-lint diff 新增差异为 0。实际 `morde-pc` 登录状态不可靠，本轮未完成 PC 交互验收，也没有 PC + 真实 DSH 验收；R20 durable 终态合同仍阻塞，R21 长初始消息合同仍阻塞。以上是本地自动化与隔离环境证据，不代表 Muse 内部机制已知，也不代表端到端目标已完成。
+**2026-11-25 当前复验状态：**Portal Assistant UI 自动化 239/239、Portal 全量 68 个测试文件 893/893，TypeScript 检查和全量 lint 通过；PersonalData、Reviews、FloatingError 三组受影响测试 48/48 通过。DSH Runtime 最新全量 249/249。DB 定向组 8 个顶层测试、15 个子场景通过。`make test` 与 `make race` 均通过，但均未设置 `CH_TEST_DATABASE_URL`，其中的条件 PostgreSQL 测试均跳过；完整隔离 loopback `make it` 通过，PostgreSQL 包耗时 1166.815 秒，OpenSandbox 因未配置专用环境而跳过。C-01 app 定向组及 R21 receipt-backed Broker + PostgreSQL 连续读取集成组本轮通过（PostgreSQL 4/4）；完整 app 包仍有非 C01 Task Plan 元数据及审批断言失败。隔离源码 `morde-pc` 已显示 131,073 字节合成消息持久化，但助手只返回有界预览；测试机 Portal 未部署本地 C01 代码，因此实际 PC + 本轮服务端/DSH 仍未验收。R20 durable 终态合同仍阻塞，R21 本地实现已落地但产品端验收未完成。以上是本地自动化与隔离环境证据，不代表 Muse 内部机制已知，也不代表端到端目标已完成。
 
 **2026-11-25 T51/R03 局部回归补充：**Assistant 新增的气泡无默认 meta/status 和仅一个底部 thinking 行两条测试通过（2 项、237 项跳过），typecheck 与 Assistant ESLint 通过；没有生产 UI 改动或实际 PC 手工 UI 验收。Worker child handoff/recovery 8 项定向回归通过，最新执行未设置 `CH_TEST_DATABASE_URL`，其中 nested failure PostgreSQL 子场景跳过；此前 PostgreSQL 3/3 子场景是独立历史证据。child failure handoff 只读审查未发现可明确修复的缺陷。真实模型与 PC 交互仍待验，T51/R03 不关闭。
 
@@ -105,7 +107,7 @@ Muse 栏只概括逆向资料中的观察或文档要求；意图分类、合并
 | 逻辑模块 | Muse 对照 | Morde 当前与欠缺 | 对应任务 |
 | --- | --- | --- | --- |
 | 01 收件与会话 | 会话消息与任务、工作项可追溯。 | 已有发件箱、持久化和幂等基础；实际 PC 断线恢复、跨端接续及不重复执行仍须贯通。 | [R00A](<实施任务TODO/01-收件与会话.md>) |
-| 02 意图与依赖 | 能延续工作、处理多条消息；具体分类与合并算法未知。 | 路由使用结构化决策并对无效输出澄清；部分非路由入口仍依赖文本分类。计划步骤未绑定修订和真实工具 / 子 Agent 结算，不能仅凭模型标记完成解锁；代码修复计划与按需验证目标待对齐。 | [R19-A / M02-14 / R25](<实施任务TODO/02-意图路由与任务拆分.md>) |
+| 02 意图与依赖 | 能延续工作、处理多条消息；具体分类与合并算法未知。 | 路由、直接 Task、batch 与 schedule 使用结构化意图；新建缺省不按正文猜测。个人 route receipt Workspace input snapshot 已接入；route update `unclear` 澄清、计划步骤与真实工具 / 子 Agent 结算绑定仍未收口；代码修复计划与按需验证目标待对齐。 | [R19-A / M02-14 / R25](<实施任务TODO/02-意图路由与任务拆分.md>) |
 | 03 多 Agent 协作 | 资料观察到主 Agent 与多层子 Agent 协作，结果由上层汇总。 | DSH 委派及两层深度有实现和局部回归；实际 PC + 真实模型的两个独立子任务、失败回传与最终汇总尚未验收。 | [R03](<实施任务TODO/03-并发派发与协调.md>) |
 | 04 工具与工作项 | 任务动态记录搜索、浏览、文件及命令等操作，可展开实际结果；失败项保留。 | 有工作项、账本与工作区搜索摘要；全类事件投影、命令 / 查询 / 输出详情与真实账本一致性仍需 PC + DSH 验证。外部资料信任边界及真实来源定位需补充分层验收；65 项 MCP 目录局部回归不等于所有工具选择问题已解决。 | [R04 / R12 / R24 / R26](<实施任务TODO/04-工具执行与工作项.md>) |
 | 05 审批 | 资料描述敏感操作的卡片和范围授权；不能据此推断 Muse 审批内部实现。 | 对话与审核区已有共享审批的内置 MCP Apps view；真实批准、拒绝、刷新、授权变化和副作用闭环未验，任务动态不承载审批操作。 | [R06 / R22](<实施任务TODO/05-审批.md>) |
@@ -113,7 +115,7 @@ Muse 栏只概括逆向资料中的观察或文档要求；意图分类、合并
 | 07 交付与提问 | 资料要求结果回到原对话，用户可继续交流。 | 成功结果整理已有基础；失败、取消和验证失败原因尚未形成完整、耐久的自然说明；文件交付的关键要点和来源定位待验。合并到其他任务属于接续运行，不能误报失败。 | [R08 / R20 / R23 / R26](<实施任务TODO/07-交付与提问.md>) |
 | 08 记忆与纠正 | 资料描述授权记忆、纠正与遗忘，具体实现不可完全推断。 | 已有个人数据与记忆基础；授权读取、纠正 / 撤销 / 遗忘和跨端体验尚未形成完整验收证据。 | [R09](<实施任务TODO/08-记忆与纠正沉淀.md>) |
 | 09 失败与恢复 | 观察到失败工作项留痕，部分失败后可继续；具体重试策略未知。 | 已有部分受控重试和 unknown 对账；自动恢复、用户停止、预算耗尽和重启后的终态解释仍需贯通，未知副作用不得重派。 | [R10 / R20](<实施任务TODO/09-失败限流与恢复.md>) |
-| 10 长输入与上下文 | 资料有历史和上下文处理要求；具体模型窗口与压缩阈值未知。 | 8 KiB 不是已证实的统一硬上限；上传可到 8 MiB，但 Task 初始消息 128 KiB 以上被 Worker / Runtime 拒绝。短指针须绑定原文身份、恢复和去重；真实 PC 长文与长会话待验。 | [R11 / R21](<实施任务TODO/10-上下文管理.md>) |
+| 10 长输入与上下文 | 资料有历史和上下文处理要求；具体模型窗口与压缩阈值未知。 | 8 KiB 不是已证实的统一硬上限；C-01 已在本地实现超过 128 KiB 初始消息、followup、steer 和 revision batch 的 receipt-backed 引用投递及分页读取，PostgreSQL Broker 连续读回回归通过；真实 PC/DSH 长文语义、预算边界和长会话仍待验。 | [R11 / R21](<实施任务TODO/10-上下文管理.md>) |
 | 11 验收与改进 | 参考可观察的任务体验及证据，不把第三方数字视为 Muse 的固定规则。 | 已有分层用例和局部测试；完整真实 PC + DSH 链路、失败场景、用户体验和双端接续尚未验收，无法据此量化与 Muse 的整体差距。 | [R13 / R14](<实施任务TODO/11-Bug发现与处理.md>) |
 
 ### 建议实施顺序
@@ -216,9 +218,9 @@ flowchart TD
 
 #### 现状与要修改的地方
 
-路由模型返回结构化动作，服务端解析后按当前会话和 Task 快照执行。R19 已移除用请求中的关键词推断或改写 `new`、`update`、`stop`、`stop_all`、`tool` 等语义动作的兜底；分类输出非法时先尝试一次有界修复，仍失败或模型不可用则安全澄清，不猜测任务动作。应用与存储继续校验身份、目标、候选完整性、状态、revision、Project/执行范围、授权、操作账本和只读工具白名单。文件交付意图已作为模型结构化字段限定在 `new/update` 决策内，并在 Task 创建或修订时持久化/读取；未增加公开 API/DTO 或数据库迁移。此项仅覆盖会话路由；直接 Task/批次、澄清回答、hostless schedule、Broker 的无效意图回退，以及 Postgres `normalizeNewTask` 对缺失/非法字段的默认值仍有 `ClassifyFileDeliveryIntent` 等文本分类逻辑，单列为 R19-A/M02-13 待办；R19 会话路由的新 Task 缺字段默认为 `none`、update 缺字段继承现值的已定规则不在本次范围内。自然语言意图应由 Agent/路由模型结构化判断；代码继续强制身份、授权、范围、预算、状态、幂等与未知副作用对账。当前验证：app/worker 全量与 race 回归通过；隔离 PostgreSQL 的 4 个路由集成顶层测试、13 个子测试通过。此次没有对当前工作区 PC + 真实 DSH/模型做语义验收。跨 Task `dependency_task_ids` 已有 Project 范围过滤及事务复核；Task Plan 的 `PlanStep.depends_on` 仍只校验和保存，没有按真实工具/子 Agent 执行证据门控。Muse 的分类、合并算法未知；固定 Planner 文件、60 秒合并窗和“缺验收标准就必问”均不是已证实规则。
+路由模型返回结构化动作，服务端解析后按当前会话和 Task 快照执行。R19 已移除用请求中的关键词推断或改写 `new`、`update`、`stop`、`stop_all`、`tool` 等语义动作的兜底；分类输出非法时先尝试一次有界修复，仍失败或模型不可用则安全澄清，不猜测任务动作。应用与存储继续校验身份、目标、候选完整性、状态、revision、Project/执行范围、授权、操作账本和只读工具白名单。文件交付意图由结构化字段表达：Task、batch 和 schedule 的 API/OpenAPI、服务与持久化路径已接入；新建 Task/schedule 缺省为 `none`，update 省略时继承现值，幂等身份包含显式意图；batch item 意图保持不可变。schedule occurrence 创建 Task 时复制意图，个人 schedule snapshot 和 DSH schedule 工具保留字段。schedule 当前没有 Workspace 绑定，服务/API 仅接受 `none`，显式 `required` / `unclear` 提前拒绝。通用 `normalizeNewTask` 空值归一为 `none`，不再从 Objective 分类。个人 route `new/required` 已在 receipt 捕获并校验 Workspace input revision/context digest 后绑定 Task；未完成项包括 route update 的版本化 `unclear` 澄清、计划步骤与 Broker/admission 的原子调用方接线及真实 PC + DSH/模型验收。自然语言意图由 Agent/路由模型结构化判断；代码继续强制身份、授权、范围、预算、状态、幂等与未知副作用对账。当前自动化验证详见[统一验证记录](<../../../../docs/验证记录/Morde_Harness_最终流程测试用例.md>)；本轮未对当前工作区 PC + 真实 DSH/模型做语义验收。跨 Task `dependency_task_ids` 已有 Project 范围过滤及事务复核；Task Plan 的 `PlanStep.depends_on` 与 M02-14 execution binding 的真实结算/准入接线仍需完成。Muse 的分类、合并算法未知；固定 Planner 文件、60 秒合并窗和“缺验收标准就必问”均不是已证实规则。
 
-> **2026-11-25 最新覆盖：**下方步骤 02 的现状文字包含历史记录；Broker 已对缺失或非法的持久文件意图直接拒绝，不再依据文本推断。直接 Task / 澄清 / 计划等剩余入口仍按 R19-A 处理。
+> **2026-11-25 最新覆盖：**下方步骤 02 的部分现状文字包含历史记录；Broker 对缺失或非法的持久文件意图直接拒绝。Task、batch、schedule 结构化字段及 schedule persistence 已接入；route Workspace snapshot/update-unclear、计划与 Broker/admission 原子调用方仍按 R19-A/M02-14 跟踪。
 
 #### 设计与开发
 
@@ -226,7 +228,7 @@ Agent 根据完整上下文理解请求，并通过结构化 `action` 表达回�
 
 #### PlanStep 门控与当前阻塞
 
-`Plan.Validate` 只校验结构，`executeTaskPlan` 保存模型提交的计划；目前没有把 `PlanStep.depends_on` 绑定实际工具/子 Agent 调用及应用确认的成功结算，因此模型填写 `completed` 不可解锁。目标合同需稳定关联 `(plan_revision, plan_step_id)`、调用身份和结算证据；失败、取消、unknown 或过期修订不放行，独立步骤可并行。`server/AGENTS.md` 要求变更同步权威公共合同，但 `docs/实施/00-总览与公共约定.md` 在工作树与 HEAD 均缺失；因此此项仍阻塞，未做局部门禁或 schema 修改。
+`Plan.Validate` 只校验结构，`executeTaskPlan` 保存模型提交的计划；目前没有把 `PlanStep.depends_on` 绑定实际工具/子 Agent 调用及应用确认的成功结算，因此模型填写 `completed` 不可解锁。公共合同 v1 §3 已定义稳定 `(task_id, task_revision, plan_revision, plan_step_id)` 身份、调用绑定和结算证据；失败、取消、unknown 或过期修订不放行，独立步骤可并行。Store 执行绑定、迁移和 B/C 调用方仍待实现。
 
 #### Morde 落点
 
@@ -414,7 +416,7 @@ Task 完成前在锁内重检 pending/applied steer 与完成候选 fence；该 
 
 #### 现状与要修改的地方
 
-安全重试、操作账本对账、进程恢复及部分历史 PC 合成场景已有证据；本轮 app 4 项与 worker 3 项限流/重试门禁定向回归通过；另有 Hostless/live Workspace 提交、写后快照和文件适配器 unknown 对账的 7 个顶层/8 个子回归通过，明确拒绝结果回 Agent；2026-11-25 另补参数错误回送：只有当前工具定义精确包含该工具与 scope、Task/fence 和 scope 授权有效、operation ledger 明确 NotFound 时，malformed/schema 错误才以脱敏结果交回原 Agent；Executor 在 schema 分类前复核 Task 与 scope 授权，事件记稳定原因，Step 不开放用户重试。Broker/Executor 定向用例通过、完整 app 包 1996 通过/5 跳过、Store failure-evidence 14 项和参数失败持久化 PostgreSQL 集成 1 项通过，Worker 固定模型协议 fixture 同 Session 修正 1 项通过。普通 Go error、权限/范围失败、账本查询错误、已有 operation、checkpoint 不匹配和已派发 unknown 不因此转为可重试失败；unknown 仍须对账。真实模型修复与 R20 原对话 durable 终态未验。实际 PC/DSH 恢复语义及 R20 durable 终态交付仍待验。具名 Workspace 等待已核对领取条件；通用外部阻塞、真实连接器和服务重启装配仍待验。R20 的终态说明链仍未实现：服务端约定引用的 `docs/实施/00-总览与公共约定.md` 在当前工作树与 HEAD 均缺失，故未新增持久 outbox/schema，也未用内存队列替代。早期 S09-41 隔离 `make it` 曾因数据库迁移等待中断；随后修复 Host-target checkpoint 工具集边界并校正路由测试夹具后，最新隔离 loopback PostgreSQL `make it` 全仓通过（PostgreSQL 包 1166.815 秒）；OpenSandbox 因未配置专用环境跳过。该集成通过不代表 R20 终态说明已实现；详见[步骤 09 TODO](<实施任务TODO/09-失败限流与恢复.md>)与验证记录。
+安全重试、操作账本对账、进程恢复及部分历史 PC 合成场景已有证据；本轮 app 4 项与 worker 3 项限流/重试门禁定向回归通过；另有 Hostless/live Workspace 提交、写后快照和文件适配器 unknown 对账的 7 个顶层/8 个子回归通过，明确拒绝结果回 Agent；2026-11-25 另补参数错误回送：只有当前工具定义精确包含该工具与 scope、Task/fence 和 scope 授权有效、operation ledger 明确 NotFound 时，malformed/schema 错误才以脱敏结果交回原 Agent；Executor 在 schema 分类前复核 Task 与 scope 授权，事件记稳定原因，Step 不开放用户重试。Broker/Executor 定向用例通过、完整 app 包 1996 通过/5 跳过、Store failure-evidence 14 项和参数失败持久化 PostgreSQL 集成 1 项通过，Worker 固定模型协议 fixture 同 Session 修正 1 项通过。普通 Go error、权限/范围失败、账本查询错误、已有 operation、checkpoint 不匹配和已派发 unknown 不因此转为可重试失败；unknown 仍须对账。真实模型修复与 R20 原对话 durable 终态未验。实际 PC/DSH 恢复语义及 R20 durable 终态交付仍待验。具名 Workspace 等待已核对领取条件；通用外部阻塞、真实连接器和服务重启装配仍待验。R20 的完整终态说明链仍未实现：A-01 后续发布公共合同 v1 并增加 `00240` outbox 与失败/确认取消原子 source writer；D-01 又为已发布结果的晚到验证接入事务 source writer。claim/预算 Worker、source 消费、原会话发布及 PC 交付仍未完成。早期 S09-41 隔离 `make it` 曾因数据库迁移等待中断；随后修复 Host-target checkpoint 工具集边界并校正路由测试夹具后，最新隔离 loopback PostgreSQL `make it` 全仓通过（PostgreSQL 包 1166.815 秒）；OpenSandbox 因未配置专用环境跳过。该集成通过不代表 R20 终态说明已实现；详见[步骤 09 TODO](<实施任务TODO/09-失败限流与恢复.md>)与验证记录。
 
 #### 设计与开发
 
@@ -440,11 +442,11 @@ Task 完成前在锁内重检 pending/applied steer 与完成候选 fence；该 
 
 #### 现状与要修改的地方
 
-代码中可见跨 Task 摘要、授权历史检索和 DSH Session 压缩；1 MiB 搜索现已返回可核验的 rune 范围及摘录覆盖页哈希，检索 checkpoint 和工具定义上限也有服务端回归。本轮本地 DSH Runtime 244/244，包含受控模型的 18 KB 正文与长会话压缩测试，不证明真实模型语义覆盖；新补 8191/8192/8193 字节/字符入口单测也仅证明不误截断。测试机当前 Portal 源码版本尚未包含工作区路由修复，最新长任务失败仍未由 PC 与新服务版本复验；本机没有可用 Cloud DSH/Guardian，且 PC profile 隔离不能确认。真实模型窗口、长会话和大消息最终答案仍需从实际 `morde-pc` 客户端验证。按项目约定，不使用普通用户 Web 端或 iOS 代测。Muse 的压缩算法与触发阈值未知。
+代码中可见跨 Task 摘要、授权历史检索和 DSH Session 压缩；1 MiB 搜索返回可核验 rune 范围及摘录覆盖页哈希。C-01 新增 receipt-backed 长引用读取：loopback PostgreSQL 集成证明 1 MiB+1 字节原文可经 Store receipt 和 `CloudDSHToolBroker.Execute` 连续分页重建并校验首 / 中 / 尾锚点；本轮 R21 PostgreSQL 集成组 4/4、app 定向组通过。DSH Runtime 全量 249/249，包含受控模型的长正文与压缩测试，不证明真实模型语义覆盖；8191/8192/8193 字节/字符入口回归也仅证明不误截断。隔离源码 PC 会话显示一条 131,073 字节合成消息已持久化，但助手只返回“当前请求内容只显示了有界预览”，没有观察到 Task 或首 / 中 / 尾结果；测试机 Portal 仍未部署本地 C-01 代码，运行版本时间为 2026-11-24，因此这不是本轮实现的验收结果。真实 PC + 当前服务、模型窗口、长会话和大消息最终答案仍需从实际 `morde-pc` 客户端验证。按项目约定，不使用普通用户 Web 端或 iOS 代测。Muse 的压缩算法与触发阈值未知。
 
 #### 设计与开发
 
-首条消息之外，运行中的 followup、superseding steer 和启动/恢复 `revision_messages` 也受正文或批次上限约束；现有读取工具只认一个 `CurrentMessageSource`。需按[复杂链路设计](<五会话并发实施/01-复杂链路设计与交接.md#long-message>)为每条长消息绑定来源与投递身份，并保持顺序、mode、checkpoint 和幂等；此为待实施设计，不能只修首条消息。
+首条消息之外，运行中的 followup、superseding steer 和启动/恢复 `revision_messages` 也受正文或批次上限约束。C-01 已为每条长消息绑定 receipt、原文 / 表示摘要、Task / conversation / generation / session fence 和 delivery mode；Worker 按连续前缀有界分批，Runtime 校验 marker，checkpoint 恢复继续沿用原身份，Store 与 Broker 集成覆盖逐页读回。实际 PC 提交、真实 DSH 任务执行、模型预算不足时的端到端表现仍待验；详见[复杂链路设计](<五会话并发实施/01-复杂链路设计与交接.md#long-message>)和[C-01 实施记录](<五会话并发实施/会话C-01-长输入与上下文投递.md>)。
 
 路由层按模型窗口装配摘要、近期历史和当前消息，保留原文 ID、长度与摘要。针对超长当前消息中的具体问题，优先由授权服务端校验所有规范页及全文哈希，再检索并向模型返回不超过 5 段的有限摘录；每段带全局 rune 起止范围及覆盖页的页码/页哈希，确保跨页摘录的来源也可核对，避免把 1 MiB 全文灌入 Task 预算；需要总结全文时按需分段读取并归纳、记录覆盖范围和来源，遵守预算；无法完整处理时明确说明。针对 8K 字节、字符和 token 分别复现和回归；模型和授权预算足够时以实际模型答出正文首、中、尾及跨窗口全文正例，不以原文已保存或固定模型回复冒充语义通过。上传上限不等同模型可处理范围。Task 层复用 DSH 修剪和压缩，保留工具调用/结果配对及最新要求。账号 Runtime 转发模型请求和工具参数时保留原始 JSON 字节，再按原摘要校验，避免特殊字符重编码导致任务中断。压缩失败保留原文和旧摘要，无进展不得反复压缩；无法取得必要历史时说明。
 
@@ -492,7 +494,7 @@ Task 完成前在锁内重检 pending/applied steer 与完成候选 fence；该 
 
 本地实现已恢复两层子 Agent 委派、收紧测试与审批回执核对、移除摘要正文日志，并让含验证失败的结果批次继续进入原对话。规划或写入在确认未派发且授权有效时，可将门禁拒绝交回同一 Agent；不确定的操作仍需对账。
 
-仍需完成：让主 Agent 收到并解释具体验证失败原因；完成阶段门禁及失败/取消终态的耐久交付；补齐所有操作类型、工作区版本与测试覆盖证明；处理 R19-A 文件意图和 R21 超过 128 KiB 的 Task 初始消息。实际 PC、真实 DSH/模型与跨端验收尚未通过，流程图仍描述目标而非完成状态。
+仍需完成：让主 Agent 收到并解释具体验证失败原因；完成阶段门禁及失败/取消终态的耐久交付；补齐所有操作类型、工作区版本与测试覆盖证明；处理 R19-A 文件意图。R21 的本地长消息引用实现和自动化已完成，真实 PC、当前 DSH/模型、预算不足与跨端验收尚未通过，流程图仍描述目标而非完成状态。
 
 [查看本轮验证记录](<../../验证记录/Morde_Harness_最终流程测试用例.md#merge-route-correction-20261125>) · [查看未完成任务](<Morde%20复刻%20Muse%20一体化实施与验收%20TODO.md>)
 

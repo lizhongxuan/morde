@@ -159,7 +159,9 @@ describe('Workspaces', () => {
     render(<QueryClientProvider client={queryClient}><ToastProvider><ToastNoticeCenter /><MemoryRouter initialEntries={['/workspaces']}>
       <Workspaces /></MemoryRouter></ToastProvider></QueryClientProvider>);
 
-    expect(await screen.findByText(/无法核对默认电脑的项目同步权限/)).toBeInTheDocument();
+    const permissionError = await screen.findByRole('alert');
+    expect(permissionError).toHaveTextContent(/无法核对默认电脑的项目同步权限/);
+    expect(permissionError).toHaveTextContent('permission check failed');
     expect(queryClient.getQueryData(targetKey)).toEqual([projectTarget]);
     expect(queryClient.getQueryState(targetKey)?.status).toBe('error');
     expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
@@ -334,6 +336,22 @@ describe('Workspaces', () => {
     await user.click(screen.getByRole('button', { name: '确认项目名' }));
     await user.click(screen.getByRole('button', { name: '开始同步' }));
     expect(await screen.findByText('目标电脑已应用本次项目，但本机状态基线未确认；请重新同步后核对。')).toBeInTheDocument();
+    expect(screen.queryByText('上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。')).not.toBeInTheDocument();
+  });
+
+  it('does not claim success when the selected local project root becomes inaccessible', async () => {
+    const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'demo', directoryName: 'demo' };
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn().mockResolvedValue(selection),
+      uploadProject: vi.fn().mockRejectedValue(new Error('项目根目录不可访问；同步已暂停，恢复点已保留。')) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost();
+    const user = userEvent.setup();
+    renderWorkspaces();
+    await user.click(await screen.findByRole('button', { name: '选择本机目录' }));
+    await user.click(screen.getByRole('button', { name: '确认项目名' }));
+    await user.click(screen.getByRole('button', { name: '开始同步' }));
+    expect(await screen.findByText('同步未确认：项目根目录不可访问；同步已暂停，恢复点已保留。')).toBeInTheDocument();
     expect(screen.queryByText('上次同步完成，目标电脑已应用本次项目；本机之后的更改需再次点击同步。')).not.toBeInTheDocument();
   });
 
