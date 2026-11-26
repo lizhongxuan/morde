@@ -511,6 +511,20 @@ VALUES ($1,NULL,$2,$3,$4,decode(repeat('00',29),'hex'),clock_timestamp(),true)`,
 	if err := f.store.pool.QueryRow(ctx, `SELECT state FROM task_validation_reviews WHERE task_id=$1`, current.Task.ID).Scan(&reviewState); err != nil || reviewState != "processing" {
 		t.Fatalf("invalid review changed outbox state: state=%q err=%v", reviewState, err)
 	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE client_installations SET revoked_at=clock_timestamp() WHERE id=$1`, f.principal.ClientInstallationID); err != nil {
+		t.Fatalf("revoke Task authorization during review: %v", err)
+	}
+	if updated, err := f.store.CompleteTaskValidationReview(ctx, completion); err != nil || updated {
+		t.Fatalf("revoked Task authorization completed review: updated=%v err=%v; want no verdict", updated, err)
+	}
+	var revokedValidationState string
+	if err := f.store.pool.QueryRow(ctx, `SELECT state,COALESCE(validation_state,'') FROM task_validation_reviews WHERE task_id=$1`, current.Task.ID).
+		Scan(&reviewState, &revokedValidationState); err != nil || reviewState != "processing" || revokedValidationState != string(app.TaskValidationPending) {
+		t.Fatalf("revoked authorization persisted review state=%q validation=%q err=%v; want processing/pending without a verdict", reviewState, revokedValidationState, err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE client_installations SET revoked_at=NULL WHERE id=$1`, f.principal.ClientInstallationID); err != nil {
+		t.Fatalf("restore Task authorization for remaining review fence cases: %v", err)
+	}
 	if _, err := f.store.pool.Exec(ctx, `UPDATE task_validation_reviews SET lease_expires_at=clock_timestamp()-interval '1 second' WHERE task_id=$1`, current.Task.ID); err != nil {
 		t.Fatal(err)
 	}

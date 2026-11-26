@@ -2453,3 +2453,19 @@ Tokenizer 与 token 统计来源：
 - **边界：**登录修复已提交于 `771c6865`，尚未推送/部署；实际 PC 登录和强制改密页面未验。未修改账号密码、未尝试使用生产账号、未创建远端消息或 Task，也未使用提供的模型 API key。
 - **2026-11-26 复验：**`GIN_MODE=release GOPROXY=off GOSUMDB=off go test ./internal/app ./internal/api -count=1` 通过；其中新增 `TestInitialAdminCanLogInRemotelyButMustChangePasswordBeforeOnboarding` 使用非 loopback 地址验证初始超级管理员可登录、得到受限 session 且不触发 Host 初始化。服务端 reset 服务/API 用例覆盖 pending、disabled、管理员、其他超级管理员和本人，并确认状态 CAS、密码哈希、审计与凭据撤销。Portal `AdminUsers.test.tsx` 8/8，Workbench `npm run typecheck -- --pretty false` 通过。旧 loopback 说明已从部署文档和 Workbench 生成类型移除；没有改现有账号密码。
 - **部署授权：**用户于 2026-11-26 明确授权 `release` 推送及服务器拉取、重新部署，覆盖此前“仅本地”限制。服务器当前服务 active、healthz=ok，部署源码 `release` 为旧提交且有一项未跟踪文件；后续需用独立 checkout 保留该现场，再执行 dry-run 和发布。以上测试不代表服务器已更新或真实 PC 已验收。
+
+
+<a id="release-部署与-pc-登录补验-2026-11-26"></a>
+
+### release 部署与 PC 登录补验（2026-11-26）
+
+- **发布：**按用户授权推送并部署 release 20ba7f302f3a1717b3bb1e416c57d1e30c9f650e。迁移 254/254；Portal service active，healthz=ok、readyz=200。没有部署 PC 安装包；此次登录修复属于服务端鉴权桥接。
+- **实际 PC：**使用源码 make pc 和隔离 profile 打开 morde-pc 登录页。一次授权的登录请求到达 Portal，服务端访问日志记录 /api/auth/client-login 返回 401；界面仍在登录页。没有进入改密或主对话，没有发送消息、创建 Task、执行工具、审批或上传文件。测试进程已停止；保留本次隔离 profile 供后续诊断。
+- **结论：**本次证明该组生产凭据未通过认证，不能证明登录修复已被真实账号验收；也不能仅凭 401 区分密码错误与账号凭据状态问题。没有再尝试其他密码、没有改数据库或密码。下一步需用户提供有效凭据，或由用户在 PC/管理员界面完成密码设置，然后从实际 PC 入口继续验证。
+- **边界：**部署与健康检查通过，但 M01/T01、强制改密、PC+DSH 真实任务和完整 Muse 体验未通过验收。P0 smoke 的 5/0/5 结果保留为有限证据，数据库与 PC/DSH 例外不计 PASS。未使用模型 API key。
+
+
+### M04-06 与 M06-03 局部安全回归（2026-11-26）
+
+- **M04-06/R26：**仅修改 Assistant 测试，新增不可信 source locator 的路径穿越、负行号/修订号与 manifest digest 不得展示断言。Assistant 275/275、Portal typecheck 通过。真实 PC/DSH 未验。
+- **M06-03：**仅修改 PostgreSQL 集成测试，在复核提交窗口撤权后断言不产生 PASS/FAIL，review 保持 processing/pending；隔离 loopback PostgreSQL 定向用例 2.769 秒通过，gofmt 与 git diff --check 通过。Workspace 并发与未知审批仍缺覆盖。

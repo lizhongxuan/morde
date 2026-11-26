@@ -352,3 +352,16 @@ R25/R26 横跨第 2、4–6 项：A/B/D 可先对齐修复计划、适用验证�
 - **验证：**Portal 71 文件 952/952、typecheck、Assistant 目标 ESLint、`build:pc` 通过；Desktop 293/293 和构建通过；Runtime 255/255。M06 PostgreSQL 定向用例通过。Worker 单包无缓存 465 个顶层用例中 459 通过、6 跳过。
 - **整仓结果：**首次全量 `make it` 中 PostgreSQL 包通过（1320.983s），Worker 包失败（347.812s）；其后单包 Worker 通过。第二次等价整仓 `go test -json -timeout=45m ./...` 退出码 0，40 个有测试包通过、6 个无测试文件包跳过；PostgreSQL 1378.896s、Worker 359.191s。OpenSandbox 因专用环境未配置跳过；首次失败没有可核实的单项原因，保留为未复现记录。
 - **PC/发布边界：**隔离源码 PC 载入账号既有主会话后立即停止，没有发送消息或创建 Task；因此没有真实 UI 业务验收。本轮没有生产 smoke、push 或部署。T01–T59 分类未重算，原矩阵仍需按真实验收逐项收口。
+
+
+### 2026-11-26 release 部署与 PC 登录补验
+
+- 用户授权的 release 推送和服务器部署已完成，生产源码为 20ba7f302f3a1717b3bb1e416c57d1e30c9f650e，迁移 254/254；Portal service active，healthz 返回 ok、readyz 返回 200。部署健康不等于产品流程验收。
+- 当前源码 make pc 在隔离 profile 中打开 PC 登录页；一次授权登录请求到达服务器，POST /api/auth/client-login 返回 401。没有进入强制改密页，也没有创建会话消息、Task 或文件。账号密码未修改，避免继续尝试造成锁定。
+- 初始/重置密码登录代码修复与服务端、PC 桥接自动化回归已经部署；生产账号凭据当前未验证。账号恢复需要有效凭据或由用户在 PC/管理界面完成凭据设置后，再从 morde-pc 继续验收。实际登录、跨端、审批、工具执行与同步仍保持阻塞；不得据此勾选 M01/T01 或整体验收。
+- 本轮 smoke 记录为 pass=5 / fail=0 / exception=5，是有限环境结果：T01/T26/T36 的 DB 场景未设置测试 DSN，T10/T43 需要 PC/DSH。它不代表 PC 登录或真实任务通过。详见[验证记录的部署与登录补验](../../验证记录/Morde_Harness_最终流程测试用例.md#release-部署与-pc-登录补验-2026-11-26)。
+
+
+### 2026-11-26 本轮局部回归补充
+
+- **新增局部回归：**R26 来源位置 UI 拒绝路径穿越/无效行号/摘要泄露，Assistant 275/275 与 Portal typecheck 通过；M06-03 撤权发生于复核提交窗口时保持 processing/pending，隔离 PostgreSQL 定向用例通过。二者均不解除 PC/真实 DSH 端到端阻塞，也不改变 T01–T59 整项分类。

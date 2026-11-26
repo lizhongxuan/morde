@@ -4196,6 +4196,37 @@ describe('Assistant durable tasks', () => {
     expect(within(activity).queryByText('d'.repeat(64))).not.toBeInTheDocument();
   });
 
+  it('fails closed for unsafe workspace paths and omits invalid line and revision values', async () => {
+    const stepID = 's1234567';
+    const completedTask: Task = { ...task, status: 'completed', finished_at: timestamp, event_sequence: 3,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: morde_workspace_search', summary: '文件搜索完成', created_at: timestamp }] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: stepID, event_sequence: 3,
+      tool_name: 'morde_workspace_search', detail_state: 'available', object: '项目文件', input: '核心业务', result: '匹配完成', truncated: false,
+      source_locations: [
+        { id: 'unsafe-workspace-match', kind: 'workspace_search_match', workspace_id: 'w1234567',
+          path: '../private/secret.md', line: 88, revision: 21, manifest_sha256: 'f'.repeat(64),
+          state: 'immutable_workspace_revision', content_sha256: 'a'.repeat(64) },
+        { id: 'invalid-location-numbers', kind: 'workspace_file', workspace_id: 'w1234567',
+          path: 'docs/public.md', line: -1, revision: -1, manifest_sha256: 'b'.repeat(64),
+          state: 'immutable_workspace_revision', content_sha256: 'c'.repeat(64) },
+      ] });
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：搜索工作区文件' }));
+    await user.click(await within(activity).findByText('查看记录的位置'));
+
+    expect(within(activity).getByText('工作区位置暂不可用。')).toBeInTheDocument();
+    expect(within(activity).queryByText('../private/secret.md:88')).not.toBeInTheDocument();
+    expect(within(activity).getByText('docs/public.md')).toBeInTheDocument();
+    expect(within(activity).queryByText('docs/public.md:-1')).not.toBeInTheDocument();
+    expect(within(activity).queryByText('工作区修订 -1')).not.toBeInTheDocument();
+    expect(within(activity).queryByText('f'.repeat(64))).not.toBeInTheDocument();
+  });
+
   it('does not show web result evidence for an unconfirmed step', async () => {
     const stepID = 's1234567';
     const runningTask: Task = { ...task, status: 'running', result: null, finished_at: null, event_sequence: 3,
