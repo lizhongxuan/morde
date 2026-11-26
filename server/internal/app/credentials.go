@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net"
 	"strings"
 	"sync"
 	"time"
@@ -194,12 +193,6 @@ func (s *CredentialService) authenticatePassword(ctx context.Context, name, pass
 		}
 		return identity.User{}, accountStatusError(user.Status)
 	}
-	if user.Role == identity.RoleSuperAdmin && user.MustChangePassword && password == "admin" && !isLoopbackIP(ip) {
-		if auditErr := s.audit.Write(ctx, audit.Entry{ActorID: user.ID, ActorKind: audit.ActorSession, Action: audit.ActionLoginFailed, IP: ip}); auditErr != nil {
-			return identity.User{}, fmt.Errorf("write blocked login audit: %w", auditErr)
-		}
-		return identity.User{}, domain.NewError(domain.CodeUnauthenticated, "invalid credentials")
-	}
 	return user, nil
 }
 
@@ -214,13 +207,12 @@ func (s *CredentialService) Logout(ctx context.Context, principal identity.Princ
 }
 
 func (s *CredentialService) ChangePassword(ctx context.Context, principal identity.Principal, currentPassword, newPassword string) error {
-	if principal.Kind != identity.KindSession || principal.Role != identity.RoleSuperAdmin ||
-		!domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) {
-		return domain.NewError(domain.CodeForbidden, "only the super administrator can change this password")
+	if principal.Kind != identity.KindSession || !domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) {
+		return domain.NewError(domain.CodeUnauthenticated, "session required")
 	}
 	user, err := s.users.GetUserByID(ctx, principal.UserID)
-	if err != nil || user.Name != "admin" || user.Role != identity.RoleSuperAdmin || user.Status != identity.StatusApproved {
-		return domain.NewError(domain.CodeForbidden, "only the super administrator can change this password")
+	if err != nil || user.Status != identity.StatusApproved {
+		return domain.NewError(domain.CodeUnauthenticated, "authentication required")
 	}
 	if currentPassword == "" || bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(currentPassword)) != nil {
 		return domain.NewError(domain.CodeUnauthenticated, "current password is incorrect")
@@ -720,11 +712,6 @@ func accountStatusError(status identity.AccountStatus) error {
 	default:
 		return domain.NewError(domain.CodeUnauthenticated, "invalid credentials")
 	}
-}
-
-func isLoopbackIP(value string) bool {
-	address := net.ParseIP(value)
-	return address != nil && address.IsLoopback()
 }
 
 func validateUserPrincipal(principal identity.Principal) error {

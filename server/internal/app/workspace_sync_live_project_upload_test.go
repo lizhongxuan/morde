@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/workspace"
 )
 
@@ -35,6 +36,21 @@ func (d *failOnceLiveWorkspaceDirectory) WriteRegularFileFrom(ctx context.Contex
 		return d.failErr
 	}
 	return d.cloudDSHLiveWorkspaceDirectory.WriteRegularFileFrom(ctx, ownerID, workspaceID, relative, source, size, digest, mode, expectedSHA)
+}
+
+type failReadLiveWorkspaceDirectory struct {
+	cloudDSHLiveWorkspaceDirectory
+	failPath string
+	failErr  error
+	reads    []string
+}
+
+func (d *failReadLiveWorkspaceDirectory) ReadDirectory(ownerID, workspaceID, relative string) ([]workspace.DirectoryEntry, error) {
+	d.reads = append(d.reads, relative)
+	if relative == d.failPath {
+		return nil, d.failErr
+	}
+	return d.cloudDSHLiveWorkspaceDirectory.ReadDirectory(ownerID, workspaceID, relative)
 }
 
 func (r *recordingWorkspaceCurrentDirectory) MoveRegularFile(ctx context.Context, ownerID, workspaceID, sourcePath, targetPath, expectedSHA256 string, expectedMode uint32) error {
@@ -92,6 +108,115 @@ func TestApplyLiveProjectUploadWritesSharedDirectory(t *testing.T) {
 	}
 	if got, err := os.ReadFile(filepath.Join(root, "project", "demo", "main.go")); err != nil || string(got) != string(content) {
 		t.Fatalf("shared file = %q, err %v; want %q", got, err, content)
+	}
+}
+
+func TestProjectUploadUnreadableDirectoryFailsClosed(t *testing.T) {
+	for _, failPath := range []struct {
+		name string
+		path string
+	}{
+		{name: "workspace_root", path: ""},
+		{name: "registered_project_root", path: "project/demo"},
+	} {
+		t.Run(failPath.name, func(t *testing.T) {
+			const (
+				ownerID         = "u1234567"
+				workspaceID     = "w1234567"
+				folderID        = "morde-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+				projectRoot     = "project/demo"
+				sourceBindingID = projectUploadTestSourceBindingID
+			)
+			root := t.TempDir()
+			projectPath := filepath.Join(root, "project", "demo")
+			if err := os.MkdirAll(projectPath, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			original := []byte("source-owned file must remain")
+			filePath := filepath.Join(projectPath, "keep.txt")
+			if err := os.WriteFile(filePath, original, 0o640); err != nil {
+				t.Fatal(err)
+			}
+
+			injected := errors.New("injected unreadable directory")
+			directory := &failReadLiveWorkspaceDirectory{
+				cloudDSHLiveWorkspaceDirectory: cloudDSHLiveWorkspaceDirectory{root: root},
+				failPath:                       failPath.path,
+				failErr:                        injected,
+			}
+			serviceStore := newSyncServiceStore()
+			serviceStore.projectFolders[folderID] = workspace.SyncFolder{
+				FolderID: folderID, WorkspaceID: workspaceID, OwnerID: ownerID,
+				Kind: workspace.SyncFolderKindProject, ProjectName: "demo", RelativePath: projectRoot, State: "active",
+			}
+			baselineFile := syncServiceFile(projectRoot+"/keep.txt", original)
+			baselineFile.Kind = workspace.FileKindRegular
+			baseline := workspace.SyncSession{
+				ID: "p1234567", WorkspaceID: workspaceID, OwnerID: ownerID, FolderID: folderID,
+				SourceBindingID: sourceBindingID, Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
+				State: workspace.SyncCompleted, Scope: []string{projectRoot}, Files: []workspace.File{baselineFile},
+				Directories: []workspace.Directory{{Path: projectRoot}},
+			}
+			serviceStore.projectUploadBaselines[sourceBindingID] = baseline
+			createCalls := 0
+			serviceStore.onCreate = func() { createCalls++ }
+			service, err := NewWorkspaceSyncServiceWithOptions(serviceStore, newSyncBlockMemory(), workspace.MaxSyncManifestBytes, 1<<20,
+				WorkspaceSyncOptions{ProjectUploadEnabled: true, LiveDirectorySourceEnabled: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			service.currentDirectory = directory
+
+			files, emptyDirectories, directories, err := service.readLiveProjectManifest(context.Background(), ownerID, workspaceID, projectRoot)
+			if !errors.Is(err, injected) || files != nil || emptyDirectories != nil || directories != nil {
+				t.Fatalf("unreadable project manifest = files %#v, empty %#v, directories %#v, err %v; want nil manifest and injected read error",
+					files, emptyDirectories, directories, err)
+			}
+
+			baselineRecords := 0
+			uploadSession := workspace.SyncSession{
+				OwnerID: ownerID, WorkspaceID: workspaceID, FolderID: folderID,
+				Direction: workspace.SyncUpload, Scope: []string{projectRoot},
+				UploadDeletedPaths: []string{baselineFile.Path},
+			}
+			conflicts, err := service.applyLiveProjectUpload(context.Background(), WorkspaceSyncDirectCommitPlan{
+				Session: uploadSession, PinnedFiles: []workspace.File{baselineFile},
+				RecordProjectLiveBaseline: func(WorkspaceSyncProjectLiveBaseline) error {
+					baselineRecords++
+					return nil
+				},
+			})
+			if !errors.Is(err, injected) || len(conflicts) != 0 {
+				t.Fatalf("unreadable project apply = conflicts %#v, err %v; want injected read error before applying a deletion", conflicts, err)
+			}
+			if baselineRecords != 0 {
+				t.Fatalf("baseline records after unreadable source = %d; want none", baselineRecords)
+			}
+			if got, readErr := os.ReadFile(filePath); readErr != nil || !bytes.Equal(got, original) {
+				t.Fatalf("source-owned file after unreadable project apply = %q, err %v; want original content", got, readErr)
+			}
+
+			principal := identity.Principal{
+				UserID: ownerID, Role: identity.RoleUser, Kind: identity.KindDevice, TokenID: "t1234567",
+				ClientInstallationID: "i1234567", Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
+			}
+			_, err = service.CreateSyncSession(context.Background(), principal, workspaceID, workspace.CreateSyncSession{
+				FolderID: folderID, SourceBindingID: sourceBindingID, Direction: workspace.SyncUpload, Policy: workspace.SyncCompareMerge,
+				Files: []workspace.File{}, Directories: []workspace.Directory{}, EmptyDirectories: []string{},
+			}, "unreadable-project-source")
+			if !errors.Is(err, injected) {
+				t.Fatalf("CreateSyncSession() with unreadable source = %v; want injected read error", err)
+			}
+			if createCalls != 0 || len(serviceStore.sessions) != 0 {
+				t.Fatalf("unreadable source created upload sessions: create calls=%d sessions=%d; want none", createCalls, len(serviceStore.sessions))
+			}
+			if got := serviceStore.projectUploadBaselines[sourceBindingID].ID; got != baseline.ID {
+				t.Fatalf("source baseline after unreadable source = %q; want unchanged %q", got, baseline.ID)
+			}
+			if len(directory.reads) == 0 {
+				t.Fatal("injected unreadable directory was not reached")
+			}
+		})
 	}
 }
 

@@ -10,6 +10,7 @@ func TestPersonalSyncObjectTypeAllowlist(t *testing.T) {
 		ObjectTypeProfile,
 		ObjectTypeMemory,
 		ObjectTypeRuleCandidate,
+		ObjectTypeSkillCandidate,
 		ObjectTypeSoul,
 		ObjectTypeDiary,
 		ObjectTypeGoal,
@@ -49,6 +50,7 @@ func TestValidateObjectIdentifier(t *testing.T) {
 		{ObjectTypeMemory, "user"},
 		{ObjectTypeMemory, "m_0123abcd"},
 		{ObjectTypeRuleCandidate, "r_0123abcd"},
+		{ObjectTypeSkillCandidate, "sk_0123abcd"},
 		{ObjectTypeSoul, "soul_v1"},
 		{ObjectTypeDiary, "2026-11-02"},
 		{ObjectTypeGoal, "g_1234"},
@@ -74,6 +76,8 @@ func TestValidateObjectIdentifier(t *testing.T) {
 		{"memory", "other"},
 		{"memory", "m_0123ABCd"},
 		{"memory", "m_0123abc"},
+		{"skill_candidate", "sk_0123ABCd"},
+		{"skill_candidate", "../skill"},
 		{"profile", "other"},
 		{"feed_preferences", "default2"},
 		{"skill_setting", "weather"},
@@ -114,6 +118,9 @@ func TestValidateObjectBodyAcceptsAllowlistedShapesAndBoundaries(t *testing.T) {
 		{ObjectTypeLibraryItem, "item_2", `{"name":"x","kind":"artifact","attachment_id":"pa_0123456789abcdef0123456789abcdef","mime":"application/pdf","size_bytes":20}`},
 		{ObjectTypeSkillSetting, "builtin_weather", `{"enabled":false}`},
 		{ObjectTypeSkillSetting, "builtin_ideas", `{"enabled":false}`},
+		{ObjectTypeSkillCandidate, "sk_0123abcd", `{"scope":"personal","status":"candidate","name":"Weekly review","description":"Review goals and plans","content":"Read goals, list blockers, and draft next steps."}`},
+		{ObjectTypeSkillCandidate, "sk_abcdef01", `{"scope":"personal","status":"validated","name":"Weekly review","description":"Review goals and plans","content":"Read goals, list blockers, and draft next steps."}`},
+		{ObjectTypeSkillCandidate, "sk_abcdef02", `{"scope":"personal","status":"active","name":"Weekly review","description":"Review goals and plans","content":"Read goals, list blockers, and draft next steps."}`},
 		{ObjectTypeConnectorSetting, "catalogue_calendar", `{"auth":"open","enabled":true}`},
 	}
 	for _, test := range valid {
@@ -171,6 +178,8 @@ func TestValidateObjectBodyRejectsUnknownFieldsAndMalformedJSON(t *testing.T) {
 		{"invalid library attachment id denied", ObjectTypeLibraryItem, "file_1", `{"name":"x","kind":"artifact","attachment_id":"a"}`},
 		{"negative library size denied", ObjectTypeLibraryItem, "file_1", `{"name":"x","kind":"artifact","size_bytes":-1}`},
 		{"skill field denied", ObjectTypeSkillSetting, "builtin_weather", `{"enabled":true,"config":{"url":"https://example.invalid"}}`},
+		{"personal skill permission field denied", ObjectTypeSkillCandidate, "sk_0123abcd", `{"scope":"personal","status":"candidate","name":"Workflow","description":"Description","content":"Instructions","permissions":["filesystem"]}`},
+		{"personal skill external runtime field denied", ObjectTypeSkillCandidate, "sk_0123abcd", `{"scope":"personal","status":"candidate","name":"Workflow","description":"Description","content":"Instructions","runtime":"dsh"}`},
 		{"connector URL denied", ObjectTypeConnectorSetting, "catalogue_calendar", `{"auth":"oauth","enabled":true,"url":"https://example.invalid"}`},
 		{"connector grant denied", ObjectTypeConnectorSetting, "catalogue_calendar", `{"auth":"key","enabled":true,"grant":"secret"}`},
 		{"SOUL absent in profile", ObjectTypeProfile, ProfileObjectID, `{"name":"Muse","avatar":"face"}`},
@@ -213,6 +222,9 @@ func TestValidateObjectBodyRejectsFieldLimitAndEnumViolations(t *testing.T) {
 		{"feed preferences too long", ObjectTypeFeedPreferences, "default", `{"content":"` + strings.Repeat("p", 8193) + `"}`},
 		{"library name too long", ObjectTypeLibraryItem, "file_1", `{"name":"` + strings.Repeat("n", 256) + `","kind":"artifact"}`},
 		{"library mime too long", ObjectTypeLibraryItem, "file_1", `{"name":"x","kind":"artifact","mime":"` + strings.Repeat("m", 129) + `"}`},
+		{"personal skill name too long", ObjectTypeSkillCandidate, "sk_0123abcd", `{"scope":"personal","status":"candidate","name":"` + strings.Repeat("n", 81) + `","description":"x","content":"y"}`},
+		{"personal skill description too long", ObjectTypeSkillCandidate, "sk_0123abcd", `{"scope":"personal","status":"candidate","name":"x","description":"` + strings.Repeat("d", 241) + `","content":"y"}`},
+		{"personal skill content too long", ObjectTypeSkillCandidate, "sk_0123abcd", `{"scope":"personal","status":"candidate","name":"x","description":"y","content":"` + strings.Repeat("c", MaxSkillCandidateContentRunes+1) + `"}`},
 		{"library kind invalid", ObjectTypeLibraryItem, "file_1", `{"name":"x","kind":"attachment"}`},
 		{"library dot name denied", ObjectTypeLibraryItem, "file_1", `{"name":".","kind":"artifact"}`},
 		{"library control denied", ObjectTypeLibraryItem, "file_1", "{\"name\":\"a\\u0001b\",\"kind\":\"artifact\"}"},
@@ -228,6 +240,24 @@ func TestValidateObjectBodyRejectsFieldLimitAndEnumViolations(t *testing.T) {
 				t.Fatal("invalid body accepted")
 			}
 		})
+	}
+}
+
+func TestValidatePersonalSkillCandidateBodyScopeStatusAndBounds(t *testing.T) {
+	valid := []byte(`{"scope":"personal","status":"candidate","name":"Weekly review","description":"Review goals and plans","content":"Read goals and list blockers."}`)
+	if err := ValidateObjectBody(ObjectTypeSkillCandidate, "sk_0123abcd", valid); err != nil {
+		t.Fatalf("valid personal Skill candidate rejected: %v", err)
+	}
+	invalid := []string{
+		`{"scope":"project","status":"candidate","name":"x","description":"y","content":"z"}`,
+		`{"scope":"personal","status":"active","name":"x","description":"y","content":"z"}`,
+		`{"scope":"personal","status":"candidate","name":" x","description":"y","content":"z"}`,
+		`{"scope":"personal","status":"candidate","name":"x","description":"y","content":"  "}`,
+	}
+	for _, body := range invalid {
+		if err := ValidateObjectBody(ObjectTypeSkillCandidate, "sk_0123abcd", []byte(body)); err == nil {
+			t.Errorf("invalid personal Skill candidate accepted: %s", body)
+		}
 	}
 }
 

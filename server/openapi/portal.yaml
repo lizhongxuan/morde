@@ -556,7 +556,7 @@ paths:
       tags: [Auth]
       operationId: login
       summary: Log in to the portal
-      description: Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. The default admin/admin credential is accepted only from a loopback client and receives a restricted password-change session.
+      description: Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. An account marked for a password change receives a restricted session until it changes its password.
       security: []
       requestBody:
         required: true
@@ -6598,7 +6598,8 @@ paths:
           Identifier rules depend on type. profile and feed_preferences use default;
           memory uses global, user, or m_<8 lowercase hex characters; skill_setting
           uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>.
-          Other enabled types use a path-free opaque identifier. The server also rejects
+          skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled
+          types use a path-free opaque identifier. The server also rejects
           . and ..; schedule uses its dedicated API rather than this mutation route.
     get:
       tags: [Personal Data]
@@ -7759,6 +7760,32 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AdminUser' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{id}/password:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/UserId' }
+    post:
+      tags: [Admin]
+      operationId: resetAdminUserPassword
+      summary: Reset an account password
+      description: Requires a super administrator's approved Portal session. The new password takes effect immediately, invalidates the target account's existing sessions and client credentials, and requires the user to change it in the Portal before using a client application.
+      security:
+        - portalSession: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AdminResetUserPasswordRequest' }
+      responses:
+        '204': { description: Password reset and account credentials revoked }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -9530,8 +9557,8 @@ components:
           items: { $ref: '#/components/schemas/HostMemberPermission' }
     TokenId: { type: string, pattern: '^t[a-z0-9]{7}$' }
     ClientInstallationId: { type: string, pattern: '^i[a-z0-9]{7}$' }
-    PersonalMutationObjectType: { type: string, enum: [profile, memory, rule_candidate, soul, diary, goal, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
-    PersonalObjectType: { type: string, enum: [profile, memory, rule_candidate, soul, diary, goal, schedule, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
+    PersonalMutationObjectType: { type: string, enum: [profile, memory, rule_candidate, skill_candidate, soul, diary, goal, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
+    PersonalObjectType: { type: string, enum: [profile, memory, rule_candidate, skill_candidate, soul, diary, goal, schedule, feed_post, feed_preferences, idea_mark, library_item, skill_setting, connector_setting] }
     PersonalObjectId:
       type: string
       minLength: 1
@@ -14349,3 +14376,10 @@ components:
         role: { $ref: '#/components/schemas/UserRole' }
         quota: { $ref: '#/components/schemas/Quota' }
         default_host_resources: { $ref: '#/components/schemas/HostResourcesTarget' }
+    AdminResetUserPasswordRequest:
+      type: object
+      required: [expected_status, new_password]
+      additionalProperties: false
+      properties:
+        expected_status: { $ref: '#/components/schemas/AccountStatus' }
+        new_password: { type: string, minLength: 8, maxLength: 72, writeOnly: true }

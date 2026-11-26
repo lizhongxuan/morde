@@ -384,8 +384,9 @@ func validTaskValidationRunnerCoverageReceipt(receipt *app.TaskValidationRunnerC
 	case task.PlanVerificationScopeTargeted:
 		const selectorPrefix = "go test -run=^"
 		targetPackage := strings.TrimPrefix(receipt.PackageSelector, "./")
+		validPackageSelector := receipt.PackageSelector == "." || strings.HasPrefix(receipt.PackageSelector, "./")
 		if !strings.HasPrefix(check.Command, selectorPrefix) || len(check.CoveragePaths) != 1 || len(check.Selectors) != 1 ||
-			!strings.HasPrefix(receipt.PackageSelector, "./") || path.Clean(targetPackage) != targetPackage ||
+			!validPackageSelector || path.Clean(targetPackage) != targetPackage ||
 			strings.HasPrefix(targetPackage, "../") || strings.Contains(targetPackage, "...") || targetPackage != check.CoveragePaths[0] {
 			return false
 		}

@@ -17,6 +17,7 @@ import (
 const (
 	ObjectTypeMemory           = "memory"
 	ObjectTypeRuleCandidate    = "rule_candidate"
+	ObjectTypeSkillCandidate   = "skill_candidate"
 	ObjectTypeSoul             = "soul"
 	ObjectTypeDiary            = "diary"
 	ObjectTypeGoal             = "goal"
@@ -33,6 +34,7 @@ var personalSyncObjectTypes = [...]string{
 	ObjectTypeProfile,
 	ObjectTypeMemory,
 	ObjectTypeRuleCandidate,
+	ObjectTypeSkillCandidate,
 	ObjectTypeSoul,
 	ObjectTypeDiary,
 	ObjectTypeGoal,
@@ -54,7 +56,7 @@ func PersonalSyncObjectTypes() []string {
 // IsPersonalSyncObjectType reports whether the type is included in personal sync.
 func IsPersonalSyncObjectType(objectType string) bool {
 	switch objectType {
-	case ObjectTypeProfile, ObjectTypeMemory, ObjectTypeRuleCandidate, ObjectTypeSoul, ObjectTypeDiary, ObjectTypeGoal, ObjectTypeSchedule,
+	case ObjectTypeProfile, ObjectTypeMemory, ObjectTypeRuleCandidate, ObjectTypeSkillCandidate, ObjectTypeSoul, ObjectTypeDiary, ObjectTypeGoal, ObjectTypeSchedule,
 		ObjectTypeFeedPost, ObjectTypeFeedPreferences, ObjectTypeIdeaMark,
 		ObjectTypeLibraryItem, ObjectTypeSkillSetting, ObjectTypeConnectorSetting:
 		return true
@@ -91,6 +93,8 @@ func ValidateObjectIdentifier(objectType, objectID string) error {
 		valid = objectID == "global" || objectID == "user" || isMemoryEntryID(objectID)
 	case ObjectTypeRuleCandidate:
 		valid = isRuleCandidateID(objectID)
+	case ObjectTypeSkillCandidate:
+		valid = isSkillCandidateID(objectID)
 	case ObjectTypeFeedPreferences:
 		valid = objectID == "default"
 	case ObjectTypeSkillSetting:
@@ -155,6 +159,15 @@ func ValidateObjectBody(objectType, objectID string, body []byte) error {
 		if !decodePersonalObject(body, &value, "scope", "status", "source_memory_id", "source_memory_revision") || value.Scope != "personal" ||
 			(value.Status != RuleCandidatePending && value.Status != RuleCandidateActive) ||
 			ValidateObjectIdentifier(ObjectTypeMemory, value.SourceMemoryID) != nil || value.SourceMemoryRevision < 1 {
+			return invalidPersonalBody()
+		}
+	case ObjectTypeSkillCandidate:
+		var value SkillCandidateBody
+		if !decodePersonalObject(body, &value, "scope", "status", "name", "description", "content") || value.Scope != "personal" ||
+			(value.Status != SkillCandidatePending && value.Status != SkillCandidateValidated && value.Status != SkillCandidateActive) ||
+			!validText(value.Name, 1, 80) || strings.TrimSpace(value.Name) != value.Name ||
+			!validText(value.Description, 1, 240) || strings.TrimSpace(value.Description) != value.Description ||
+			!validText(value.Content, 1, MaxSkillCandidateContentRunes) || strings.TrimSpace(value.Content) == "" {
 			return invalidPersonalBody()
 		}
 	case ObjectTypeSoul:
@@ -301,8 +314,13 @@ func isMemoryEntryID(value string) bool {
 }
 
 const (
-	RuleCandidatePending = "candidate"
-	RuleCandidateActive  = "active"
+	RuleCandidatePending          = "candidate"
+	RuleCandidateActive           = "active"
+	SkillCandidatePending         = "candidate"
+	SkillCandidateValidated       = "validated"
+	SkillCandidateActive          = "active"
+	MaxSkillCandidateCount        = 32
+	MaxSkillCandidateContentRunes = 8192
 )
 
 // RuleCandidateBody points at the source memory instead of copying its text, so
@@ -312,6 +330,16 @@ type RuleCandidateBody struct {
 	Status               string `json:"status"`
 	SourceMemoryID       string `json:"source_memory_id"`
 	SourceMemoryRevision int64  `json:"source_memory_revision"`
+}
+
+// SkillCandidateBody stores a user-authored workflow. It remains inert until a
+// server-validated revision is explicitly activated by the account owner.
+type SkillCandidateBody struct {
+	Scope       string `json:"scope"`
+	Status      string `json:"status"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	Content     string `json:"content"`
 }
 
 func isRuleCandidateID(value string) bool {
@@ -325,6 +353,21 @@ func isRuleCandidateID(value string) bool {
 	}
 	return true
 }
+
+func isSkillCandidateID(value string) bool {
+	if len(value) != len("sk_")+8 || !strings.HasPrefix(value, "sk_") {
+		return false
+	}
+	for _, char := range value[3:] {
+		if !((char >= 'a' && char <= 'f') || (char >= '0' && char <= '9')) {
+			return false
+		}
+	}
+	return true
+}
+
+// ValidSkillCandidateID reports whether value is a stable personal Skill ID.
+func ValidSkillCandidateID(value string) bool { return isSkillCandidateID(value) }
 
 func decodePersonalObject(body []byte, target any, allowedFields ...string) bool {
 	var fields map[string]json.RawMessage

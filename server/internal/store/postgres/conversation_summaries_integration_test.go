@@ -621,6 +621,11 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 		f := newRouteActionsTestFixture(t)
 		ctx := context.Background()
 		principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID}
+		setting := personalObjectMutationForTest(t, f.ownerID, "summary-memory-live-enable", personal.ObjectTypeSkillSetting,
+			"builtin_memory", 0, `{"enabled":true}`, false)
+		if _, err := f.store.ApplyPersonalMutation(ctx, principal, setting); err != nil {
+			t.Fatal(err)
+		}
 		memory := personalObjectMutationForTest(t, f.ownerID, "summary-memory-live-create", personal.ObjectTypeMemory, "global", 0,
 			`{"content":"The user prefers morning meetings.","category":"fact"}`, false)
 		if _, err := f.store.ApplyPersonalMutation(ctx, principal, memory); err != nil {

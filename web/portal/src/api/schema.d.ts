@@ -305,7 +305,7 @@ export interface paths {
         put?: never;
         /**
          * Log in to the portal
-         * @description Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. The default admin/admin credential is accepted only from a loopback client and receives a restricted password-change session.
+         * @description Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. An account marked for a password change receives a restricted session until it changes its password.
          */
         post: operations["login"];
         delete?: never;
@@ -4599,7 +4599,7 @@ export interface paths {
             header?: never;
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -5380,6 +5380,28 @@ export interface paths {
          * @description Requires an approved administrator's unbound Portal session. On the first transition from pending or rejected to approved, a configured default platform model budget is created in the same transaction as the status change and audit. If no default is configured, approval succeeds without granting a platform model budget. Disabling and restoring an account does not grant or reset a budget.
          */
         patch: operations["updateUser"];
+        trace?: never;
+    };
+    "/api/admin/users/{id}/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reset an account password
+         * @description Requires a super administrator's approved Portal session. The new password takes effect immediately, invalidates the target account's existing sessions and client credentials, and requires the user to change it in the Portal before using a client application.
+         */
+        post: operations["resetAdminUserPassword"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/admin/users/{id}/personal-data-quota": {
@@ -6666,9 +6688,9 @@ export interface components {
         TokenId: string;
         ClientInstallationId: string;
         /** @enum {string} */
-        PersonalMutationObjectType: "profile" | "memory" | "rule_candidate" | "soul" | "diary" | "goal" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        PersonalMutationObjectType: "profile" | "memory" | "rule_candidate" | "skill_candidate" | "soul" | "diary" | "goal" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
         /** @enum {string} */
-        PersonalObjectType: "profile" | "memory" | "rule_candidate" | "soul" | "diary" | "goal" | "schedule" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        PersonalObjectType: "profile" | "memory" | "rule_candidate" | "skill_candidate" | "soul" | "diary" | "goal" | "schedule" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
         /** @description Path-free opaque identifier; exact accepted values depend on object_type. The server rejects . and .. and enforces each type's allowlist. */
         PersonalObjectId: string;
         GoalId: string;
@@ -11088,6 +11110,10 @@ export interface components {
             role?: components["schemas"]["UserRole"];
             quota?: components["schemas"]["Quota"];
             default_host_resources?: components["schemas"]["HostResourcesTarget"];
+        };
+        AdminResetUserPasswordRequest: {
+            expected_status: components["schemas"]["AccountStatus"];
+            new_password: string;
         };
     };
     responses: {
@@ -19050,7 +19076,7 @@ export interface operations {
             header?: never;
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -19084,7 +19110,7 @@ export interface operations {
             };
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -19124,7 +19150,7 @@ export interface operations {
             };
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -20484,6 +20510,36 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["AdminUser"];
                 };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    resetAdminUserPassword: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminResetUserPasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Password reset and account credentials revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];

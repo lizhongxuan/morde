@@ -695,6 +695,9 @@ func TestTaskPlanRequirementSourceToolSchemaUsesServerResolvedDigest(t *testing.
 		!strings.Contains(definition.Description, "fixed through_sequence") ||
 		!strings.Contains(definition.Description, "can omit messages accepted after Task start") ||
 		!strings.Contains(definition.Description, "Never infer or invent an ID") ||
+		!strings.Contains(definition.Description, "execute it before marking its step complete") ||
+		!strings.Contains(definition.Description, "If a required check fails or cannot run") ||
+		!strings.Contains(definition.Description, "do not require a full suite without an explicit request or risk reason") ||
 		!strings.Contains(definition.Description, "Never claim completeness or verification") {
 		t.Fatalf("plan source instructions do not describe trusted source resolution: %s", definition.Description)
 	}

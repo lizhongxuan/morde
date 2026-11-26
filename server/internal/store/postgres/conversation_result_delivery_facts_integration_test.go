@@ -549,7 +549,7 @@ func TestConversationResultReceiptBoundsDeliveryFactFooter(t *testing.T) {
 	receipt := conversationTaskResultReceiptWithDeliveryFacts(strings.Repeat("摘要", app.MaxConversationRouteReplyRunes),
 		[]app.ConversationTaskResultSource{{TaskID: "task1234", TaskRevision: 3}},
 		[]app.TaskValidationState{app.TaskValidationPending}, []conversationResultDeliveryFacts{facts})
-	if utf8.RuneCountInString(receipt) > app.MaxConversationRouteReplyRunes || !strings.Contains(receipt, "部分审批或操作回执未展开") {
+	if utf8.RuneCountInString(receipt) > app.MaxConversationRouteReplyRunes || !strings.Contains(receipt, "部分验证或操作事实未展开") {
 		t.Fatalf("delivery facts exceeded the durable reply limit or hid truncation: runes=%d receipt=%q",
 			utf8.RuneCountInString(receipt), receipt)
 	}

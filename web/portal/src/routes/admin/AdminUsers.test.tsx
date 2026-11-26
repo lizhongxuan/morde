@@ -60,7 +60,7 @@ describe('admin account management', () => {
     expect(await screen.findByText('受保护的超级管理员')).toBeInTheDocument();
     const protectedRow = screen.getByRole('row', { name: /admin.*超级管理员/ });
     expect(protectedRow).toHaveTextContent('受保护的超级管理员');
-    expect(within(protectedRow).queryByRole('button')).not.toBeInTheDocument();
+    expect(within(protectedRow).getByRole('button', { name: '修改密码' })).toBeInTheDocument();
     await input.selectOptions(screen.getByLabelText('账号状态'), 'pending');
     expect(await screen.findByRole('row', { name: /alice.*待审核/ })).toBeInTheDocument();
     expect(list).toHaveBeenLastCalledWith('pending', 0);

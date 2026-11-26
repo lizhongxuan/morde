@@ -352,7 +352,7 @@ func conversationTaskResultReceiptWithDeliveryFacts(reply string, sources []app.
 	}
 	remaining := app.MaxConversationRouteReplyRunes - utf8.RuneCountInString(header+footer.String())
 	if len(deliveryLines) > 0 && remaining > 0 {
-		const omittedFactsLine = "部分审批或操作回执未展开，请在 Task 详情核对"
+		const omittedFactsLine = "部分验证或操作事实未展开，请在 Task 详情核对"
 		noteRunes := utf8.RuneCountInString("\n- " + omittedFactsLine)
 		budget := remaining
 		if noteRunes <= budget {

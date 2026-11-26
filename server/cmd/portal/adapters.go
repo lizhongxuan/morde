@@ -364,6 +364,11 @@ func (a adminAdapter) UpdateUser(ctx context.Context, principal identity.Princip
 	return adminUser(updated), nil
 }
 
+func (a adminAdapter) ResetPassword(ctx context.Context, principal identity.Principal, id string,
+	expectedStatus identity.AccountStatus, newPassword string) error {
+	return a.users.ResetPassword(ctx, principal, id, expectedStatus, newPassword)
+}
+
 func (a adminAdapter) Capacity(ctx context.Context, principal identity.Principal) (api.CapacityRecord, error) {
 	value, err := a.capacity.Capacity(ctx, principal)
 	if err != nil {

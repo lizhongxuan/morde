@@ -22,6 +22,8 @@ MORDE HARNESS · MUSE 对照设计
 
 **R21 长输入现状与历史只读审计：**C-01 已在本地为 initial message、followup、steer 与 revision batch 接入 receipt-backed 有界 source reference；Worker 按连续前缀有界分批，Runtime 校验 marker，delivery-applied 回执和 checkpoint 沿用原文身份，授权 Broker 按页读取来源。loopback PostgreSQL 集成以 1 MiB+1 字节合成原文验证 Store receipt 与 `CloudDSHToolBroker.Execute` 连续分页重建并核对首/中/尾锚点；R21 PostgreSQL 定向组 4/4、app 定向组和 DSH Runtime 249/249 通过。这些是本地自动化/fixture 证据，不代表真实 PC/当前服务/DSH 链路或真实模型语义已通过。
 
+**步骤 4 复验状态（2026-11-26）：**当前快照 App 8 KiB 字节/rune、Worker 128 KiB 帧边界、1 MiB+1 首条/追问/修改/恢复 source reference、PostgreSQL receipt + Broker 连续分页原文重建、DSH Runtime 全量 255/255 均通过。个人记忆历史、owner/revision cursor、授权撤销、规则候选显式启用、遗忘正文清除/历史抑制及 checkpoint/摘要失效的 PostgreSQL 定向组通过（34.147s）。这些自动化说明本地代码合同和恢复路径成立，不证明真实 DSH 会按语义选择历史工具或模型已读全文。PC+真实 DSH/DeepSeek 语义、跨端记忆体验待验；相关 TODO 保持未勾选。详见[步骤 4 验证记录](../../验证记录/Morde_Harness_最终流程测试用例.md#step-4-long-context-memory-2026-11-26)。
+
 **C-01 集成前历史只读审计（2026-11-25）：**当时源码审计发现 Task 首轮将完整 pending message 作为 `initial_message`，Worker 与 Runtime 的全文帧均限制 128 KiB；128 KiB–8 MiB 输入会在首轮失败。旧 delivery ledger 记录消息身份和投递阶段，checkpoint 按原文/附件/模式精确匹配，直接将同 message ID 换成短 prompt 可能导致恢复校验失败或结果 unknown。公共合同 v1 §4 已定义原文哈希、manifest 指针、表示摘要、delivery applied 与 checkpoint 恢复身份；上述“receipt/checkpoint 实现缺失”只描述 C-01 集成前状态。旧全文帧的 128 KiB+1 边界测试仍会拒绝原样传入的大正文，但当前系统通过 receipt-backed 引用投递长消息，不再受该旧边界等同限制。8 MiB 上传也不表示模型可处理 8 MiB；预算及模型窗口约束仍然有效。实际 PC 成功提交、真实 DSH/模型首中尾/全文语义及预算边界仍待验收。
 
 **R21 初始消息边界回归：**Worker 与 Runtime 子进程两层回归验证 128 KiB UTF-8 正文的首/中/尾锚点进入合成模型请求，128 KiB+1 的多字节正文在模型/工具调用前拒绝。该组只验证旧全文帧边界，不单独证明 128 KiB 以上可用或真实模型理解；当前长文可用性由 C-01 receipt-backed 引用及分页读取实现，真实 PC/DSH 语义仍待验证。
@@ -449,6 +451,8 @@ Task 完成前在锁内重检 pending/applied steer 与完成候选 fence；该 
 用户要求根据 GitHub 代码画业务流程图时，按授权读取相关源码，交付可核对的仓库版本和代码位置，并在原对话或 Morde PC 客户端内提供可读图形；不能把仅有图表代码视为图形交付。`ChatMarkdownContent.tsx` 已接入 `ChatMermaid`；E-01 在实际 PC + 本地合成消息中验证了四节点流程图和可展开源码，这只证明呈现能力。授权 GitHub 仓库的版本/位置核对、真实 DSH 源码分析与 T57 交付仍待验，按 R23-A / T57 分层记录。
 
 用户要求分析或修复代码时，Agent 按授权范围读取、定位、修改并执行适用检查；在原对话给出结论、变更及验证事实，文件交付附关键要点。无法执行或未通过的检查及其原因必须可见，不将结果待验证说成修复成功。软件修复的门禁冲突和落地见一体化方案 R25 / T58；这属于用户交办的普通任务，不是自动发现并修改任意项目的功能。
+
+**2026-11-26 步骤 7 局部落地：**Task Plan 提示现明确“按变更/风险选检、用户/项目必需检查先执行、失败或不可运行时按未满足交付”；原对话回执由服务端按 Task/Plan 修订读取 typed check replay，展示范围、执行记录、要求 ID/来源及覆盖与要求集完整性状态。文档分析/GitHub 流程图的交付提示要求提供关键结论、实际位置和未覆盖范围，不得补造引用。当前没有可信要求集完整性写入方，H07 仍 pending；结论与 Task detail locator 的逐条服务端绑定、真实 PC/DSH/模型分析及 T57–T59 仍待验，不能把提示或本地 fixture 当作验收通过。
 
 晚到验证 FAIL 与确需告知的持久等待，应分别绑定独立、可去重的事实身份；与首次结果发布的竞争、模型调用和重启恢复按[复杂链路交付设计](<五会话并发实施/01-复杂链路设计与交接.md#terminal-validation>)定稿。该方案尚未实现，审批/澄清继续使用既有卡片。
 

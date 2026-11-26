@@ -147,6 +147,10 @@ type AdminUserPageService interface {
 	ListUserPage(context.Context, identity.Principal, *identity.AccountStatus, int, int) (app.AdminPage[AdminUserRecord], error)
 }
 
+type AdminUserPasswordResetService interface {
+	ResetPassword(context.Context, identity.Principal, string, identity.AccountStatus, string) error
+}
+
 type AdminConsoleService interface {
 	AgentStates(context.Context, identity.Principal) (map[string]int64, error)
 	Installations(context.Context, identity.Principal, string, int, int) (app.AdminPage[app.AdminInstallation], error)

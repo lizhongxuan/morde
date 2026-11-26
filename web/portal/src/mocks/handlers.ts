@@ -63,7 +63,7 @@ type GoalBody = components["schemas"]["GoalBody"];
 type PersonalMutationReceipt = components["schemas"]["PersonalMutationReceipt"];
 type UserPreferences = components["schemas"]["UserPreferences"];
 type Notification = components["schemas"]["Notification"];
-type ClientInstallation = components["schemas"]["ClientInstallation"];
+type ClientInstallation = components["schemas"]["ClientInstallation"] & { revoked_at?: string | null };
 type AdminWorkspace = components["schemas"]["AdminWorkspace"];
 type VisibleAdminWorkspace = Omit<Workspace, "state"> & { state: "ready" | "deleting" };
 type ModelAccountBudget = { owner_id: string; configured: boolean; token_limit: number; max_concurrent: number; used_tokens: number; in_flight: number; has_unknown: boolean };
@@ -975,6 +975,14 @@ function revokeUserSessions(userId: string) {
     if (typeof localStorage !== "undefined") localStorage.removeItem(`${sessionStoragePrefix}${sessionId}`);
   }
 }
+function revokeUserClientInstallations(userId: string) {
+  const revokedAt = now();
+  for (const client of clients) {
+    if (clientOwners.get(client.id) !== userId || client.revoked) continue;
+    client.revoked = true;
+    client.revoked_at = revokedAt;
+  }
+}
 
 const unauthenticated = () => failure("unauthenticated", "请先登录", 401);
 // Keep this first so protected handlers cannot run before the session check.
@@ -984,7 +992,7 @@ const sessionGuard = http.all("/api/*", ({ request, cookies }) => {
   const user = sessionUser(cookies);
   if (!user) return unauthenticated();
   if (user.must_change_password && !(path === "/api/me" || path === "/api/me/password")) {
-    return failure("forbidden", "请先修改超级管理员密码", 403);
+    return failure("forbidden", "请先修改账号密码", 403);
   }
 });
 
@@ -1170,10 +1178,6 @@ export const handlers = [
     const password = account?.password ?? (user ? passwords.get(user.id) : undefined);
     if (!user || body.password !== password) return failure("unauthenticated", "用户名或密码错误", 401);
     if (user.status !== "approved") return failure(`account_${user.status === "pending" ? "pending" : user.status === "rejected" ? "rejected" : "disabled"}`, "账号当前状态不允许登录", 403);
-    const hostname = new URL(request.url).hostname;
-    if (user.must_change_password && body.password === "admin" && hostname !== "localhost" && hostname !== "127.0.0.1" && hostname !== "[::1]" && hostname !== "::1") {
-      return failure("unauthenticated", "用户名或密码错误", 401);
-    }
     ensureMockDefaultHost(user);
     const displayUser = user;
     const sessionId = globalThis.crypto?.randomUUID?.() ?? id("s");
@@ -1713,15 +1717,19 @@ export const handlers = [
   http.get("/api/nudges", () => json(adminNudgePolicy.enabled ? adminNudgePolicy : { ...adminNudgePolicy, url: "", text_zh: "", text_en: "" })),
   http.post("/api/me/password", async ({ request, cookies }) => {
     const user = sessionUser(cookies)!;
-    if (user.name !== "admin" || user.role !== "super_admin") return failure("forbidden", "只有超级管理员可以修改此密码", 403);
     const body = await request.json().catch(() => ({})) as { current_password?: string; new_password?: string };
-    const account = loginAccounts.get("admin");
-    if (!body.current_password || body.current_password !== account?.password) return failure("unauthenticated", "当前密码错误", 401);
-    if (!body.new_password || body.new_password.length < 8 || body.new_password.length > 72) return failure("invalid_argument", "新密码长度必须为 8 至 72 个字符", 400);
+    const account = [...loginAccounts.values()].find((item) => item.user.id === user.id);
+    const currentPassword = account?.password ?? passwords.get(user.id);
+    if (!body.current_password || body.current_password !== currentPassword) return failure("unauthenticated", "当前密码错误", 401);
+    const passwordBytes = new TextEncoder().encode(body.new_password ?? "").length;
+    if (!body.new_password || passwordBytes < 8 || passwordBytes > 72) return failure("invalid_argument", "新密码长度必须为 8 至 72 字节", 400);
     user.must_change_password = false;
     passwords.set(user.id, body.new_password);
-    loginAccounts.set("admin", { user, password: body.new_password });
+    for (const [name, item] of loginAccounts) {
+      if (item.user.id === user.id) loginAccounts.set(name, { user, password: body.new_password });
+    }
     revokeUserSessions(user.id);
+    revokeUserClientInstallations(user.id);
     return empty({ "Set-Cookie": `${sessionCookieName}=; Path=/; Max-Age=0; SameSite=Lax` });
   }),
   http.get("/api/clients", ({ cookies }) => json({ items: clients.filter((client) => clientOwners.get(client.id) === sessionUser(cookies)!.id) })),
@@ -1730,6 +1738,7 @@ export const handlers = [
     const client = clients.find((item) => item.id === params.clientId && clientOwners.get(item.id) === user.id);
     if (!client) return failure("not_found", "客户端不存在", 404);
     client.revoked = true;
+    client.revoked_at = now();
     auditLogs.unshift({ id: auditLogs.length + 1, at: now(), actor_id: user.id, actor_kind: "user", action: "client.revoke", target: String(params.clientId), detail: { platform: client.platform }, ip: "127.0.0.1" });
     persistAssistantState();
     return empty();
@@ -3437,7 +3446,7 @@ export const handlers = [
     if (!page) return failure("invalid_argument", "分页参数无效", 400);
     const owned = clients.filter((client) => clientOwners.get(client.id) === String(params.userId));
     const items = owned.slice(page.offset, page.offset + page.limit).map((client) => ({ id: client.id, display_name: client.display_name, platform: client.platform,
-      created_at: client.created_at, last_used_at: client.last_used_at, expires_at: client.expires_at, revoked_at: null, online: false }));
+      created_at: client.created_at, last_used_at: client.last_used_at, expires_at: client.expires_at, revoked_at: client.revoked_at ?? null, online: false }));
     return json({ items, total: owned.length, ...page });
   }),
   http.get("/api/admin/users/:userId/authorizations", ({ request, cookies }) => {
@@ -3686,6 +3695,29 @@ export const handlers = [
     auditLogs.unshift({ id: auditLogs.length + 1, at: now(), actor_id: actor.id, actor_kind: "user", action: "user.update", target: user.id, detail: { ...(body.status ? { status: body.status } : {}), ...(body.role ? { role: body.role } : {}), ...(body.quota ? { quota: body.quota } : {}), ...(body.default_host_resources ? { default_host_resources: body.default_host_resources } : {}) }, ip: "127.0.0.1" });
     persistAssistantState();
     return json(userWithUsage(user));
+  }),
+  http.post("/api/admin/users/:userId/password", async ({ params, request, cookies }) => {
+    const actor = sessionUser(cookies)!;
+    if (actor.role !== "super_admin") return failure("forbidden", "只有超级管理员可以重置用户密码", 403);
+    const user = users.find((item) => item.id === String(params.userId));
+    if (!user) return failure("not_found", "用户不存在", 404);
+    const body = await request.json().catch(() => null) as { expected_status?: string; new_password?: string } | null;
+    if (!body || Object.keys(body).some((key) => key !== "expected_status" && key !== "new_password") ||
+      !body.expected_status || !validAccountStatus(body.expected_status)) return failure("invalid_argument", "密码重置请求无效", 400);
+    if (body.expected_status !== user.status) return failure("conflict", "账号状态已变化，请刷新列表", 409);
+    const passwordBytes = new TextEncoder().encode(body.new_password ?? "").length;
+    if (!body.new_password || passwordBytes < 8 || passwordBytes > 72) return failure("invalid_argument", "新密码长度必须为 8 至 72 字节", 400);
+    user.must_change_password = true;
+    passwords.set(user.id, body.new_password);
+    for (const [name, item] of loginAccounts) {
+      if (item.user.id === user.id) loginAccounts.set(name, { user, password: body.new_password });
+    }
+    revokeUserClientInstallations(user.id);
+    revokeUserSessions(user.id);
+    auditLogs.unshift({ id: auditLogs.length + 1, at: now(), actor_id: actor.id, actor_kind: "user", action: "user.update", target: user.id,
+      detail: { password_reset: true, must_change_password: true }, ip: "127.0.0.1" });
+    persistAssistantState();
+    return empty();
   }),
   http.get("/api/admin/capacity", ({ cookies }) => isAdmin(sessionUser(cookies)!) ? json({ limit: capacityLimit, allocated: capacityUsage(), hosts_by_state: hostsByState() }) : failure("forbidden", "没有执行此操作的权限", 403)),
   http.get("/api/admin/audit", ({ request, cookies }) => {

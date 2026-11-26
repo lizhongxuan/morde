@@ -281,6 +281,60 @@ func (s *UserService) Update(ctx context.Context, principal identity.Principal, 
 	return userSummary(user, usage), nil
 }
 
+// ResetPassword lets a super administrator set a temporary password for any
+// account. The target must change it before using client applications again.
+func (s *UserService) ResetPassword(ctx context.Context, principal identity.Principal, userID string,
+	expectedStatus identity.AccountStatus, newPassword string) error {
+	if principal.Kind != identity.KindSession || principal.Role != identity.RoleSuperAdmin ||
+		!domain.ValidUserID(principal.UserID) || !domain.ValidTokenID(principal.TokenID) ||
+		principal.HostScope != "" || len(principal.HostIDs) != 0 || len(principal.Scopes) != 0 {
+		return domain.NewError(domain.CodeForbidden, "super administrator session required")
+	}
+	actor, err := s.users.GetUserByID(ctx, principal.UserID)
+	if err != nil || actor.Role != identity.RoleSuperAdmin || actor.Status != identity.StatusApproved || actor.MustChangePassword {
+		return domain.NewError(domain.CodeForbidden, "approved super administrator session required")
+	}
+	if !domain.ValidUserID(userID) || !validStatus(expectedStatus) {
+		return domain.InvalidArgument("user", "user id and expected status are required")
+	}
+	target, err := s.users.GetUserByID(ctx, userID)
+	if err != nil {
+		return err
+	}
+	if target.Status != expectedStatus {
+		return domain.NewError(domain.CodeConflict, "account status changed; refresh the user list")
+	}
+	resetter, ok := s.users.(UserPasswordResetStore)
+	if !ok {
+		return domain.NewError(domain.CodeUnsupported, "password reset storage is unavailable")
+	}
+	passwordHash, err := hashPassword(newPassword)
+	if err != nil {
+		return err
+	}
+	var disableRelay func(context.Context) error
+	if s.workspaceSyncController != nil {
+		disableRelay = func(gateCtx context.Context) error {
+			return s.workspaceSyncController.DisableWorkspaceSyncNodeRelay(gateCtx, userID)
+		}
+	}
+	if err := resetter.ResetUserPasswordWithAudit(ctx, principal.UserID, expectedStatus, userID, string(passwordHash), audit.Entry{
+		ActorID: principal.UserID, ActorKind: audit.ActorSession, Action: audit.ActionUserUpdate,
+		Target: userID, Detail: map[string]any{"password_reset": true, "must_change_password": true},
+	}, disableRelay); err != nil {
+		return err
+	}
+	if s.hub != nil {
+		s.hub.CloseOwner(userID)
+	}
+	if s.workspaceSyncController != nil {
+		if err := s.workspaceSyncController.ReconcileWorkspaceSyncNodeOwner(ctx, userID); err != nil {
+			return domain.NewError(domain.CodeUpstreamError, "workspace sync node could not confirm account credential revocation")
+		}
+	}
+	return nil
+}
+
 func authorizeAdmin(principal identity.Principal) error {
 	if principal.Kind == identity.KindSystem && principal.Role.IsAdmin() && principal.UserID == "" {
 		return nil

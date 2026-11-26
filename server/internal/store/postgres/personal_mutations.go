@@ -124,6 +124,11 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 			return personal.MutationReceipt{}, err
 		}
 	}
+	if mutation.ObjectType == personal.ObjectTypeSkillCandidate && !mutation.Delete {
+		if err := validatePersonalSkillCandidateMutationInTx(ctx, tx, instanceID, mutation, objectExists, previousBody); err != nil {
+			return personal.MutationReceipt{}, err
+		}
+	}
 	if mutation.Delete && mutation.ObjectType == personal.ObjectTypeMemory {
 		var previousMemory struct {
 			Content string `json:"content"`
@@ -310,6 +315,60 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 	}
 	if personal.ValidateObjectBody(personal.ObjectTypeMemory, next.SourceMemoryID, sourceBody) != nil {
 		return domain.NewError(domain.CodeInternal, "stored rule candidate source memory is invalid")
+	}
+	return nil
+}
+
+func validatePersonalSkillCandidateMutationInTx(ctx context.Context, tx pgx.Tx, instanceID string,
+	mutation personal.Mutation, objectExists bool, previousBody []byte) error {
+	var next personal.SkillCandidateBody
+	if err := json.Unmarshal(mutation.Body, &next); err != nil ||
+		personal.ValidateObjectBody(personal.ObjectTypeSkillCandidate, mutation.ObjectID, mutation.Body) != nil {
+		return domain.NewError(domain.CodeInvalidArgument, "personal skill candidate is invalid")
+	}
+	if !objectExists {
+		if next.Status != personal.SkillCandidatePending {
+			return domain.NewError(domain.CodeForbidden, "a skill candidate must pass validation and explicit approval before activation")
+		}
+		var count int
+		if err := tx.QueryRow(ctx, `SELECT count(*) FROM account_object_versions
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND NOT is_deleted`,
+			instanceID, mutation.OwnerID, personal.ObjectTypeSkillCandidate).Scan(&count); err != nil {
+			return fmt.Errorf("count personal skill candidates: %w", err)
+		}
+		if count >= personal.MaxSkillCandidateCount {
+			return domain.NewError(domain.CodeQuotaExceeded, "personal skill candidate limit is reached")
+		}
+		return nil
+	}
+
+	var previous personal.SkillCandidateBody
+	if err := json.Unmarshal(previousBody, &previous); err != nil ||
+		personal.ValidateObjectBody(personal.ObjectTypeSkillCandidate, mutation.ObjectID, previousBody) != nil {
+		return domain.NewError(domain.CodeInternal, "stored personal skill candidate is invalid")
+	}
+	if previous.Status == personal.SkillCandidateActive {
+		return domain.NewError(domain.CodeConflict, "an active skill must be revoked and proposed again before it can change")
+	}
+	contentChanged := next.Scope != previous.Scope || next.Name != previous.Name ||
+		next.Description != previous.Description || next.Content != previous.Content
+	switch previous.Status {
+	case personal.SkillCandidatePending:
+		if contentChanged && next.Status != personal.SkillCandidatePending {
+			return domain.NewError(domain.CodeConflict, "validate the current unchanged skill candidate")
+		}
+		if next.Status != personal.SkillCandidatePending && next.Status != personal.SkillCandidateValidated {
+			return domain.NewError(domain.CodeForbidden, "a skill candidate cannot skip validation")
+		}
+	case personal.SkillCandidateValidated:
+		if contentChanged {
+			return domain.NewError(domain.CodeConflict, "a validated skill cannot change before activation; delete and propose it again")
+		}
+		if next.Status != personal.SkillCandidateValidated && next.Status != personal.SkillCandidateActive {
+			return domain.NewError(domain.CodeForbidden, "a validated skill can only be explicitly activated")
+		}
+	default:
+		return domain.NewError(domain.CodeConflict, "personal skill candidate state is invalid")
 	}
 	return nil
 }

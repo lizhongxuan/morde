@@ -3,12 +3,14 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain/task"
 )
 
 type conversationResultDeliveryFacts struct {
@@ -18,6 +20,8 @@ type conversationResultDeliveryFacts struct {
 	nonSuccessOperations  int
 	unversionedOperations int
 	hasArtifacts          bool
+	validationPlan        *task.Plan
+	validationReplay      *app.TaskValidationReplayEvidence
 }
 
 type conversationResultApprovalFact struct {
@@ -53,12 +57,16 @@ func conversationResultDeliveryFactsInTx(ctx context.Context, tx pgx.Tx, ownerID
 	source app.ConversationTaskResultSource) (conversationResultDeliveryFacts, error) {
 	facts := conversationResultDeliveryFacts{approvals: make([]conversationResultApprovalFact, 0)}
 	var currentRevision, desiredRevision int64
-	if err := tx.QueryRow(ctx, `SELECT current_revision,desired_revision FROM tasks
-WHERE id=$1 AND owner_id=$2 FOR SHARE`, source.TaskID, ownerID).Scan(&currentRevision, &desiredRevision); err != nil {
+	var initiatorID, conversationID string
+	if err := tx.QueryRow(ctx, `SELECT current_revision,desired_revision,initiator_id,conversation_id FROM tasks
+WHERE id=$1 AND owner_id=$2 FOR SHARE`, source.TaskID, ownerID).Scan(&currentRevision, &desiredRevision, &initiatorID, &conversationID); err != nil {
 		return facts, fmt.Errorf("lock Task for result delivery facts: %w", err)
 	}
 	if currentRevision != source.TaskRevision || desiredRevision != source.TaskRevision {
 		return facts, fmt.Errorf("task revision changed while loading result delivery facts")
+	}
+	if err := loadConversationResultPlanValidationFactsInTx(ctx, tx, ownerID, initiatorID, conversationID, source, &facts); err != nil {
+		return facts, err
 	}
 
 	rows, err := tx.Query(ctx, `SELECT id,version,COALESCE(task_revision,-1),call_id,tool_name,request_hash,status,decision,
@@ -224,6 +232,37 @@ WHERE artifact.task_id=$1 FOR SHARE OF artifact,step)`, source.TaskID).Scan(&fac
 		return facts, fmt.Errorf("lock Task artifact references for result receipt: %w", err)
 	}
 	return facts, nil
+}
+
+func loadConversationResultPlanValidationFactsInTx(ctx context.Context, tx pgx.Tx, ownerID, initiatorID, conversationID string,
+	source app.ConversationTaskResultSource, facts *conversationResultDeliveryFacts) error {
+	plan, err := latestTaskPlan(ctx, tx, source.TaskID, source.TaskRevision)
+	if err != nil {
+		return fmt.Errorf("read current fix plan for result receipt: %w", err)
+	}
+	if plan == nil || plan.FixPlan == nil {
+		return nil
+	}
+	resultDigest := sha256.Sum256([]byte(source.Content))
+	// Replay assembly uses the Task/revision/source identity only. The receipt
+	// path does not claim or extend a review lease.
+	claim := app.TaskValidationReviewClaim{OwnerID: ownerID, InitiatorID: initiatorID, ConversationID: conversationID,
+		TaskID: source.TaskID, TaskRevision: source.TaskRevision, ResultEventSequence: source.EventSequence,
+		ResultSHA256: resultDigest[:], ClaimGeneration: 1, LeaseOwner: "conversation-result-receipt"}
+	if !app.ValidTaskValidationReviewClaim(claim) {
+		return fmt.Errorf("Task result identity is invalid for validation receipt")
+	}
+	current, err := readTaskValidationReplayTask(ctx, tx, claim)
+	if err != nil {
+		return fmt.Errorf("read current Task identity for validation receipt: %w", err)
+	}
+	replay, err := loadTaskValidationPlanCheckReplay(ctx, tx, claim, *plan, current)
+	if err != nil {
+		return fmt.Errorf("read current typed check facts for result receipt: %w", err)
+	}
+	facts.validationPlan = plan
+	facts.validationReplay = replay
+	return nil
 }
 
 func effectiveConversationApprovalDecision(status, decision string, expired bool) string {
@@ -452,7 +491,8 @@ WHERE task_id=$1 AND status IN ('queued','running','waiting_user','unknown') ORD
 }
 
 func conversationResultDeliveryFactLines(source app.ConversationTaskResultSource, facts conversationResultDeliveryFacts) []string {
-	lines := make([]string, 0, len(facts.approvals)+2)
+	lines := make([]string, 0, len(facts.approvals)+len(facts.validationReplayChecks())+3)
+	lines = append(lines, conversationResultValidationFactLines(source, facts)...)
 	for index, approval := range facts.approvals {
 		toolName := strings.Join(strings.Fields(approval.toolName), " ")
 		if toolName == "" {
@@ -478,6 +518,149 @@ func conversationResultDeliveryFactLines(source app.ConversationTaskResultSource
 		lines = append(lines, "产物请在 Task 详情打开；授权下载接口会重新校验权限和内容可用性")
 	}
 	return lines
+}
+
+func (facts conversationResultDeliveryFacts) validationReplayChecks() []app.TaskValidationReplayCheckEvidence {
+	if facts.validationReplay == nil {
+		return nil
+	}
+	return facts.validationReplay.Checks
+}
+
+func conversationResultValidationFactLines(source app.ConversationTaskResultSource, facts conversationResultDeliveryFacts) []string {
+	plan, replay := facts.validationPlan, facts.validationReplay
+	if plan == nil || plan.FixPlan == nil {
+		return nil
+	}
+	state := app.TaskValidationReplayPending
+	if replay != nil && replay.State != "" {
+		state = replay.State
+	}
+	lines := []string{fmt.Sprintf("%s r%d 修复验证 Plan r%d：H07 %s；要求集完整性 %s；最终 Workspace 快照 %s",
+		source.TaskID, source.TaskRevision, plan.Revision, state,
+		conversationResultValidationFactState(replay != nil && replay.RequirementSetVerified),
+		conversationResultValidationFactState(replay != nil && replay.FinalWorkspaceSnapshotVerified))}
+	if replay == nil || !replay.RequirementSetVerified {
+		lines = append(lines, "该计划没有可信的要求集完整性证明；已列检查不能代表所有用户/项目要求均已覆盖")
+	}
+	checksByID := make(map[string]app.TaskValidationReplayCheckEvidence)
+	if replay != nil {
+		for _, check := range replay.Checks {
+			checksByID[check.CheckID] = check
+		}
+	}
+	for _, step := range plan.Steps {
+		check := step.VerificationCheck
+		if check == nil {
+			continue
+		}
+		fact, found := checksByID[step.ID]
+		status := "无可绑定的执行回执"
+		if found {
+			switch {
+			case fact.OperationID == "":
+				status = "无可绑定的执行回执"
+			case fact.Status == app.TaskValidationReplayFail:
+				status = fmt.Sprintf("执行失败（退出码 %d，超时 %t）", fact.ExitCode, fact.TimedOut)
+			case fact.Status == app.TaskValidationReplayPass:
+				status = "命令退出码 0；实际覆盖范围 " + conversationResultValidationFactState(fact.ActualCoverageVerified)
+			default:
+				status = "存在操作记录，但执行结果或身份尚未完整核验"
+			}
+		}
+		basis := "风险选择（非用户/项目明确要求）"
+		sourceRef := ""
+		if check.Basis == task.PlanVerificationCheckRequired {
+			basis = "计划声明为必需"
+			requirementIDs := make([]string, 0, len(check.RequirementIDs))
+			for _, id := range check.RequirementIDs {
+				requirementIDs = append(requirementIDs, string(id))
+			}
+			sourceRef = "要求 " + strings.Join(requirementIDs, ", ") + " → " +
+				conversationResultRequirementSourceSummary(plan, *check, found && fact.RequirementSourceVerified)
+		}
+		scope := string(check.ScopeMode)
+		if scope == "" {
+			scope = "范围未记录"
+		}
+		line := fmt.Sprintf("%s r%d Plan r%d 检查 %s（%s/%s，%s）：%s；范围：%s",
+			source.TaskID, source.TaskRevision, plan.Revision, step.ID, check.Kind, basis, scope, status,
+			conversationResultValidationScope(check.CoveragePaths, check.Selectors))
+		if sourceRef != "" {
+			line += "；来源 " + sourceRef
+		}
+		if found && fact.OperationID != "" {
+			line += fmt.Sprintf("；执行记录 %s（步骤序号 %d）", fact.OperationID, fact.RunSequence)
+		}
+		lines = append(lines, line)
+	}
+	if replay != nil && len(replay.PlanStepsWithoutChecks) > 0 {
+		lines = append(lines, "未绑定检查的计划步骤："+strings.Join(replay.PlanStepsWithoutChecks, ", "))
+	}
+	return lines
+}
+
+func conversationResultRequirementSourceSummary(plan *task.Plan, check task.PlanVerificationCheck, verified bool) string {
+	verification := "来源未核验"
+	if verified {
+		verification = "来源已核验"
+	}
+	sources := make([]string, 0, len(check.RequirementIDs))
+	if plan.RequirementManifest != nil {
+		obligations := make(map[task.PlanVerificationRequirementID]task.PlanVerificationObligation,
+			len(plan.RequirementManifest.Obligations))
+		for _, obligation := range plan.RequirementManifest.Obligations {
+			obligations[obligation.ID] = obligation
+		}
+		for _, id := range check.RequirementIDs {
+			if obligation, ok := obligations[id]; ok {
+				sources = append(sources, conversationResultRequirementSourceLocation(obligation.Source))
+			} else {
+				sources = append(sources, string(id)+"（来源缺失）")
+			}
+		}
+	} else if check.RequirementSource != nil {
+		sources = append(sources, conversationResultRequirementSourceLocation(*check.RequirementSource))
+	}
+	if len(sources) == 0 {
+		return "用户/项目来源缺失（" + verification + "）"
+	}
+	return strings.Join(sources, ", ") + "（" + verification + "）"
+}
+
+func conversationResultRequirementSourceLocation(source task.PlanVerificationRequirementSource) string {
+	switch source.Kind {
+	case task.PlanVerificationRequirementUserMessage:
+		return "用户消息 " + source.MessageID
+	case task.PlanVerificationRequirementProjectFile:
+		if source.WorkspaceRevision == nil {
+			return "项目文件 " + source.WorkspacePath + "（版本缺失）"
+		}
+		return fmt.Sprintf("Workspace r%d:%s", *source.WorkspaceRevision, source.WorkspacePath)
+	default:
+		return "未知来源"
+	}
+}
+
+func conversationResultValidationScope(paths, selectors []string) string {
+	parts := make([]string, 0, 2)
+	if len(paths) > 0 {
+		parts = append(parts, "路径 "+strings.Join(paths, ", "))
+	}
+	if len(selectors) > 0 {
+		parts = append(parts, "选择器 "+strings.Join(selectors, ", "))
+	}
+	if len(parts) == 0 {
+		return "未记录"
+	}
+	return strings.Join(parts, "；")
+}
+
+func conversationResultValidationFactState(verified bool) string {
+	if verified {
+		return "已验证"
+	}
+	return "待验证"
 }
 
 func conversationResultUnversionedSuffix(count int) string {

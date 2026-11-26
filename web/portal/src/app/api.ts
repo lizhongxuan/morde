@@ -513,6 +513,7 @@ export const portalApi = {
   adminUserAuthorizations: async (id: string, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/authorizations', { params: { path: { id }, query: { limit: 25, offset } } })),
   adminUserModelCalls: async (id: string, offset = 0) => unwrapApiResponse(await api.GET('/api/admin/users/{id}/model-usage/ledger', { params: { path: { id }, query: { limit: 25, offset } } })),
   updateUser: async (id: string, body: components['schemas']['UpdateUserRequest']) => unwrapApiResponse(await api.PATCH('/api/admin/users/{id}', { params: { path: { id } }, body })),
+  resetAdminUserPassword: async (id: string, body: components['schemas']['AdminResetUserPasswordRequest']) => unwrapApiResponse(await api.POST('/api/admin/users/{id}/password', { params: { path: { id } }, body })),
   adminUnknownModelUsage: async (ownerID: string) => unwrapApiResponse(await api.GET('/api/admin/model-usage/unknown', {
     params: { query: { owner_id: ownerID, limit: 100 } },
   })),

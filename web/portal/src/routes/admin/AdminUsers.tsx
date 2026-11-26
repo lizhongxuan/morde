@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, type FormEvent } from 'react';
 import { Link } from 'react-router';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, portalApi } from '../../app/api';
@@ -7,6 +7,7 @@ import { useAuth } from '../../app/auth';
 import { useToast } from '../../app/toast';
 import { useNetworkReadNotice } from '../../app/use-network-read-notice';
 import { FloatingError } from '../../components/FloatingError';
+import { Modal } from '../../components/Modal';
 
 type AccountStatus = 'pending' | 'rejected' | 'approved' | 'disabled';
 type AdminUser = Awaited<ReturnType<typeof portalApi.adminUsers>>['items'][number];
@@ -33,6 +34,9 @@ export function AdminUsers() {
   const { notify } = useToast();
   const [filter, setFilter] = useState<AccountStatus | 'all'>('all');
   const [offset, setOffset] = useState(0);
+  const [passwordTarget, setPasswordTarget] = useState<AdminUser | null>(null);
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
   const query = useQuery({
     queryKey: ['admin', 'users', filter, offset],
     queryFn: () => portalApi.adminUsers(filter === 'all' ? undefined : filter, offset),
@@ -46,6 +50,24 @@ export function AdminUsers() {
     },
     onError: (error) => notify(errorDetails(error).message, 'error'),
   });
+  const resetPassword = useMutation({
+    mutationFn: ({ item, password }: { item: AdminUser; password: string }) => portalApi.resetAdminUserPassword(item.id, {
+      expected_status: item.status,
+      new_password: password,
+    }),
+    onSuccess: (_result, variables) => {
+      setPasswordTarget(null);
+      setNewPassword('');
+      setConfirmPassword('');
+      if (variables.item.id === current?.id) {
+        window.location.assign('/admin/login');
+        return;
+      }
+      notify('密码已重置。用户下次登录后需要先修改密码。', 'success');
+      void client.invalidateQueries({ queryKey: ['admin', 'users'] });
+    },
+    onError: (error) => notify(errorDetails(error).message, 'error'),
+  });
 
   const changeStatus = (item: AdminUser, status: AccountStatus) => update.mutate({
     id: item.id,
@@ -55,6 +77,26 @@ export function AdminUsers() {
     id: item.id,
     body: { expected_status: item.status, role: item.role === 'admin' ? 'user' : 'admin' },
   });
+  const submitPasswordReset = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!passwordTarget || resetPassword.isPending) return;
+    const bytes = new TextEncoder().encode(newPassword).length;
+    if (bytes < 8 || bytes > 72) {
+      notify('密码长度必须为 8 至 72 字节。', 'error');
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      notify('两次输入的密码不一致。', 'error');
+      return;
+    }
+    resetPassword.mutate({ item: passwordTarget, password: newPassword });
+  };
+  const closePasswordReset = () => {
+    if (resetPassword.isPending) return;
+    setPasswordTarget(null);
+    setNewPassword('');
+    setConfirmPassword('');
+  };
 
   return <section className="admin-content design-panel">
     <div className="design-panel-header"><div><h2>用户列表</h2><p>审核账号并管理权限。</p></div><button type="button" className="button button-secondary" disabled={query.isFetching} onClick={() => void query.refetch()}>刷新数据</button></div>
@@ -69,6 +111,7 @@ export function AdminUsers() {
       {query.data?.items.map((item) => {
         const protectedAdmin = item.role === 'super_admin';
         const self = item.id === current?.id;
+        const canResetPassword = current?.role === 'super_admin';
         const canChangeRole = item.status === 'approved' && !protectedAdmin && !self;
         return <tr key={item.id}>
           <td><Link className="admin-table-link" to={`/admin/users/${encodeURIComponent(item.id)}`}><strong>{item.name}</strong><small className="table-sub mono">{item.id}</small></Link></td>
@@ -78,10 +121,13 @@ export function AdminUsers() {
           <td>{formatMemory(item.usage.mem_mib)} / {formatMemory(item.quota.mem_mib)}</td>
           <td>{formatDate(item.created_at)}</td>
           <td>
-            {protectedAdmin ? <span className="muted" aria-label="admin 账号受保护">受保护的超级管理员</span> : self ? <span className="muted">当前账号</span> : <div className="inline-actions">
-              {nextStatusActions(item.status).map((action) => <button key={action.status} type="button" className={`button ${action.danger ? 'button-danger-quiet' : 'button-secondary'} button-small`} disabled={update.isPending} onClick={() => changeStatus(item, action.status)}>{action.label}</button>)}
-              {canChangeRole && <button type="button" className="button button-secondary button-small" disabled={update.isPending} onClick={() => changeRole(item)}>{item.role === 'admin' ? '撤销管理员' : '设为管理员'}</button>}
-            </div>}
+            <div className="inline-actions">
+              {protectedAdmin ? <span className="muted" aria-label="admin 账号受保护">受保护的超级管理员</span> : self ? <span className="muted">当前账号</span> : <>
+                {nextStatusActions(item.status).map((action) => <button key={action.status} type="button" className={`button ${action.danger ? 'button-danger-quiet' : 'button-secondary'} button-small`} disabled={update.isPending || resetPassword.isPending} onClick={() => changeStatus(item, action.status)}>{action.label}</button>)}
+                {canChangeRole && <button type="button" className="button button-secondary button-small" disabled={update.isPending || resetPassword.isPending} onClick={() => changeRole(item)}>{item.role === 'admin' ? '撤销管理员' : '设为管理员'}</button>}
+              </>}
+              {canResetPassword && <button type="button" className="button button-secondary button-small" disabled={resetPassword.isPending || update.isPending} onClick={() => { setPasswordTarget(item); setNewPassword(''); setConfirmPassword(''); resetPassword.reset(); }}>修改密码</button>}
+            </div>
           </td>
         </tr>;
       })}
@@ -94,5 +140,23 @@ export function AdminUsers() {
     </nav>}
     {(query.isPending || (networkError && !query.data)) && <div className="loading-card" role="status">正在加载用户…</div>}
     {query.isError && !networkError && <FloatingError className="error-card" role="alert">{errorDetails(query.error).message}<button type="button" className="button button-secondary" onClick={() => void query.refetch()}>重试</button></FloatingError>}
+    {passwordTarget && <Modal title={`修改 ${passwordTarget.name} 的密码`} onClose={closePasswordReset}>
+      <form className="form-stack" onSubmit={submitPasswordReset}>
+        <div className="notice notice-warning" role="note">
+          <p>新密码会立即生效，并使该账号现有登录和客户端凭据失效。用户下次需先登录 Portal 修改密码，之后才能使用 PC 或 iOS 客户端。</p>
+          {passwordTarget.id === current?.id && <p>这是当前超级管理员账号；保存后会退出登录，需要使用新密码重新登录并完成修改。</p>}
+        </div>
+        <label htmlFor="admin-reset-password">新密码</label>
+        <input id="admin-reset-password" type="password" autoComplete="new-password" minLength={8} maxLength={72} required value={newPassword} onChange={(event) => setNewPassword(event.target.value)} />
+        <label htmlFor="admin-reset-password-confirm">再次输入新密码</label>
+        <input id="admin-reset-password-confirm" type="password" autoComplete="new-password" minLength={8} maxLength={72} required value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} />
+        <div className="form-actions">
+          <button type="button" className="button button-secondary" disabled={resetPassword.isPending} onClick={closePasswordReset}>取消</button>
+          <button type="submit" className="button button-primary" disabled={resetPassword.isPending || !newPassword || !confirmPassword}>
+            {resetPassword.isPending ? '正在保存…' : '重置密码'}
+          </button>
+        </div>
+      </form>
+    </Modal>}
   </section>;
 }

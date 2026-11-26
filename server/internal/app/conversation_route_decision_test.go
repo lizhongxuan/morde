@@ -99,6 +99,11 @@ func TestConversationRouteModelRequestKeepsMinimumWindowOutputBudget(t *testing.
 	if review.MaxOutputTokens != 512 {
 		t.Fatalf("result review route output budget differs from the minimum-window default: MaxOutputTokens=%d", review.MaxOutputTokens)
 	}
+	for _, required := range []string{"source positions explicitly present", "Never invent a source position", "not read or could not be located"} {
+		if !strings.Contains(review.Instructions, required) {
+			t.Errorf("result review instructions omit source-bound delivery rule %q", required)
+		}
+	}
 }
 
 func TestConversationRouteInvalidOutputStoresOnlyMetadata(t *testing.T) {

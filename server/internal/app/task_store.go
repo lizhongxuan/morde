@@ -535,6 +535,7 @@ type CloudDSHSkillReadCommit struct {
 	CallID               string
 	SkillID              string
 	SkillVersion         string
+	PersonalSkillRevision int64
 	BundleVersion        string
 	SourceRef            string
 	ContentSHA256        string

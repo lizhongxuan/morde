@@ -428,6 +428,43 @@ describe('PersonalData', () => {
     expect((activation?.[3] as { status: string } | undefined)?.status).toBe('active');
   });
 
+  it('requires server validation and explicit approval before a personal Skill can be read', async () => {
+    const user = userEvent.setup();
+    apiMocks.snapshot.mockResolvedValue({ watermark: 1, items: [], next_cursor: null });
+    renderPage();
+    await screen.findByText(/保存后自动更新云端/);
+    await user.click(screen.getByRole('link', { name: '记忆' }));
+    await user.type(screen.getByLabelText('名称'), '周报整理');
+    await user.type(screen.getByLabelText('用途说明'), '按固定顺序整理本周进展');
+    await user.type(screen.getByLabelText('工作流内容'), '先列出完成项，再列风险和下周计划。');
+    await user.click(screen.getByRole('button', { name: '保存为未启用候选' }));
+
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledTimes(1));
+    const [type, id, revision, candidate] = apiMocks.replace.mock.calls[0] as [string, string, number, {
+      scope: string; status: string; name: string; description: string; content: string;
+    }];
+    expect(type).toBe('skill_candidate');
+    expect(id).toMatch(/^sk_[0-9a-f]{8}$/);
+    expect(revision).toBe(0);
+    expect(candidate).toEqual({ scope: 'personal', status: 'candidate', name: '周报整理',
+      description: '按固定顺序整理本周进展', content: '先列出完成项，再列风险和下周计划。' });
+
+    await user.click(await screen.findByRole('button', { name: '运行格式校验' }));
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledTimes(2));
+    expect((apiMocks.replace.mock.calls[1]?.[3] as { status: string } | undefined)?.status).toBe('validated');
+    expect(await screen.findByRole('button', { name: '确认并启用' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: '确认并启用' }));
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledTimes(3));
+    expect((apiMocks.replace.mock.calls[2]?.[3] as { status: string } | undefined)?.status).toBe('active');
+
+    await user.click(screen.getByRole('button', { name: '撤销启用并删除' }));
+    await waitFor(() => expect(apiMocks.delete).toHaveBeenCalledWith(
+      'skill_candidate', id, expect.any(Number), expect.any(String), 'service-personal-test', currentUser.id,
+    ));
+    expect(apiMocks.submitTask).not.toHaveBeenCalled();
+  });
+
   it('edits an existing memory with its current revision', async () => {
     const user = userEvent.setup();
     apiMocks.snapshot.mockResolvedValue({

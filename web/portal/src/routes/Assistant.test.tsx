@@ -205,7 +205,10 @@ function failedConversationMessage(overrides: Record<string, unknown> = {}): Con
 }
 
 describe('Assistant durable tasks', () => {
-  beforeAll(() => server.listen());
+  beforeAll(() => {
+    Object.defineProperty(Element.prototype, 'scrollIntoView', { configurable: true, value: vi.fn() });
+    server.listen();
+  });
   beforeEach(() => {
     availableModelsResponse = defaultAvailableModels;
     acceptedMessageSequence = 0;
