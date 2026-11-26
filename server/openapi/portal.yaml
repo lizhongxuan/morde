@@ -8127,7 +8127,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         default: { $ref: '#/components/responses/Error' }
-  /api/admin/users/{user_id}/tasks/{task_id}/workflow-trace:
+  /api/admin/users/{id}/tasks/{task_id}/workflow-trace:
     get:
       tags: [Admin]
       operationId: getAdminTaskWorkflowTrace
@@ -8135,7 +8135,7 @@ paths:
       description: Reads Task, route, Agent, model-call, operation, approval, validation, conversation-delivery and Host ledger facts from one database snapshot. It exposes only ledger metadata and hashes, preserves unavailable relationships as gaps, and does not infer Task success or a quality score. PC-side observation remains unavailable until its adapter is provided. Administrators only.
       security: [{ portalSession: [] }]
       parameters:
-        - { name: user_id, in: path, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        - { name: id, in: path, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
         - { name: task_id, in: path, required: true, schema: { type: string, minLength: 8, maxLength: 40, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{7,39}$' } }
       responses:
         '200':

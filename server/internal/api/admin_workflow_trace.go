@@ -19,14 +19,14 @@ func (h *api) registerAdminWorkflowTrace(group *gin.RouterGroup) {
 	if h.deps.WorkflowTraces == nil {
 		return
 	}
-	group.GET("/admin/users/:user_id/tasks/:task_id/workflow-trace", h.getAdminTaskWorkflowTrace)
+	group.GET("/admin/users/:id/tasks/:task_id/workflow-trace", h.getAdminTaskWorkflowTrace)
 }
 
 func (h *api) getAdminTaskWorkflowTrace(c *gin.Context) {
 	if _, ok := requireAdmin(c); !ok {
 		return
 	}
-	trace, err := h.deps.WorkflowTraces.GetTaskWorkflowTrace(c.Request.Context(), c.Param("task_id"), c.Param("user_id"))
+	trace, err := h.deps.WorkflowTraces.GetTaskWorkflowTrace(c.Request.Context(), c.Param("task_id"), c.Param("id"))
 	if err != nil {
 		writeError(c, err)
 		return
