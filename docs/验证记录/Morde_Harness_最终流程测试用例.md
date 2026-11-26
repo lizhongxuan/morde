@@ -2766,3 +2766,12 @@ Tokenizer 与 token 统计来源：
 - **部署门禁：**正式更新脚本通过 P0 smoke，记录为 pass=5、fail=0、exception=5；T01/T26/T36 需要独立测试 PostgreSQL DSN，T10/T43 需要真实 PC/DSH。服务构建与原子切换成功，数据库迁移从 254 升到 257，更新后 `current=257/latest=257`；`morde-portal.service=active`、`/healthz=ok`、`/readyz=200`。服务器 HTTPS 拉取超时后，按授权经临时 Git bundle 传入目标提交完成发布；远端 Git remote 已恢复，临时 bundle/裸仓库已删除。
 - **PC 登录观察：**在 `make pc` 隔离源码 profile 中进入账号登录流程。该时间段服务器日志出现一次 `/api/auth/client-login` 200 和后续若干 session API 200；CUA 可视画面却仍显示“暂时无法连接 Morde”，可访问树则保留登录表单，且无法唯一绑定窗口/profile。没有发送消息、创建 Task 或操作 Host。该混合证据只说明服务端有成功认证和会话请求，不能证明当前窗口已登录或客户端完整连通；不关闭 A02-3、T43、E01/E02 的实机验收。
 - **安全与清理：**没有修改管理员密码、数据库账号或业务数据；临时部署 bundle 已清理。此次没有访问用户对话正文。
+
+<a id="postgresql-oom-recovery-2026-11-27"></a>
+### 2026-11-27 PostgreSQL OOM 恢复与 PC 阻塞
+
+- **故障证据：**01:44 CST 内核记录 `cloudhost-postgres` cgroup OOM kill（原 Docker memory limit 768 MiB），PostgreSQL 收到 SIGKILL 后进入自动恢复；约 1 秒后数据库 ready。Portal worker 在数据库恢复期间退出，systemd 随后重启 Portal。同期 `/api/tasks/{id}` 与 `client-web-session` 有 401，不能把这段故障期的认证失败归因到凭据或 R17 业务逻辑。
+- **恢复动作：**按用户授权在线执行 `docker update --memory=2g --memory-swap=2g cloudhost-postgres`，不重启容器、不触碰数据库文件；容器 start time 未改变，memory 与 memory+swap 上限均核实为 2 GiB，`pg_isready` 成功，Portal active，`/healthz=ok`、`/readyz=200`。`memory.events` 的 OOM 计数是累计值，未将累计计数解释成修复后新增事件。
+- **防复发：**Compose 中为 PostgreSQL 固定 `mem_limit: 2g`、`memswap_limit: 2g`，部署说明记录 8 GiB 主机的预算和排障原则；使用合成环境变量运行 `docker compose ... config -q`，配置解析通过。服务器运行的 Portal 代码仍为 `f976369e`；Compose 配置是之后新增的发布内容，不需要为本次内存在线调整重启业务容器。
+- **PC / R17 验收：**用户要求新开源码 `make pc`。OOM 恢复后新建独立 profile `/tmp/morde-pc-oom-followup-20261127` 并启动客户端；CUA 可访问树与截图仍对应不上，截图显示云端离线卡片，无法把窗口确定绑定到该 profile。没有提交消息、创建 Task 或生成 PC delivery observation。R17/D02-3、A02-3 与真实 PC/DSH 验收继续未完成，不能标记通过。
+- **影响：**数据库服务经自动恢复后当前健康；此次修正不证明长期内存稳定性或完成压力测试。应观察 OOM 事件增量和实际客户端/DSH 链路；若仍复现，依据 Postgres 日志、连接数与容器 memory 指标继续定位。
