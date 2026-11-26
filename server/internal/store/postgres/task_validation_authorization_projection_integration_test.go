@@ -104,6 +104,32 @@ WHERE task_id=$1 AND role='user' AND delivery_status='applied' ORDER BY sequence
 	}
 	assertCurrentVerdict(app.TaskValidationPass)
 
+	// A reviewed verdict is valid only for the exact result event it reviewed.
+	// If that event's content digest no longer matches the review receipt, all
+	// projections and any later conversation receipt must fail closed to pending.
+	staleEvent, err := f.store.pool.Exec(ctx, `UPDATE task_events SET result_content_sha256=$3
+WHERE task_id=$1 AND sequence=$2`, current.Task.ID, event.Sequence, hashBytes("different result event content"))
+	if err != nil || staleEvent.RowsAffected() != 1 {
+		t.Fatalf("make reviewed result event stale: err=%v", err)
+	}
+	var staleReceiptState app.TaskValidationState
+	if err := f.store.WithTx(ctx, func(tx pgx.Tx) error {
+		var err error
+		staleReceiptState, err = conversationTaskResultValidationStateInTx(ctx, tx, current.Task.OwnerID, source)
+		return err
+	}); err != nil || staleReceiptState != app.TaskValidationPending {
+		t.Fatalf("stale result event receipt validation=%q err=%v; want pending", staleReceiptState, err)
+	}
+	if _, err := f.store.GetTask(ctx, current.Task.ID, current.Task.OwnerID); err == nil {
+		t.Fatal("Task detail accepted validation evidence for a stale result event")
+	}
+	restoredEvent, err := f.store.pool.Exec(ctx, `UPDATE task_events SET result_content_sha256=$3
+WHERE task_id=$1 AND sequence=$2`, current.Task.ID, event.Sequence, hashBytes(result))
+	if err != nil || restoredEvent.RowsAffected() != 1 {
+		t.Fatalf("restore reviewed result event digest: err=%v", err)
+	}
+	assertCurrentVerdict(app.TaskValidationPass)
+
 	var responseCallID string
 	if err := f.store.pool.QueryRow(ctx, `SELECT execution_model_call_id FROM task_validation_reviews WHERE task_id=$1`, current.Task.ID).Scan(&responseCallID); err != nil {
 		t.Fatal(err)
