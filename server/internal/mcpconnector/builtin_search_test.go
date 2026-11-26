@@ -21,8 +21,8 @@ func TestBuiltinSearchRejectsUnsafeConfigurationAndArguments(t *testing.T) {
 	if !validBuiltinSearxngURL("http://127.0.0.1:8189") {
 		t.Fatal("rejected fixed loopback endpoint")
 	}
-	if !validBuiltinSearchArguments("searxng_web_search", json.RawMessage(`{"query":"news","time_range":"week","categories":"news"}`)) {
-		t.Fatal("rejected the bounded news category")
+	if !validBuiltinSearchArguments("searxng_web_search", json.RawMessage(`{"query":"!mgn news","time_range":"week"}`)) {
+		t.Fatal("rejected the bounded Morde news engine query")
 	}
 	for _, input := range []struct{ name, args string }{
 		{"other", `{"query":"news"}`},
@@ -186,7 +186,7 @@ func TestBuiltinSearchWithLocalSearxng(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := client.CallTool(context.Background(), "searxng_web_search", json.RawMessage(`{"query":"artificial intelligence news","time_range":"week","categories":"news"}`))
+	result, err := client.CallTool(context.Background(), "searxng_web_search", json.RawMessage(`{"query":"!mgn artificial intelligence news","time_range":"week"}`))
 	if err != nil || result.IsError || result.UnsupportedContent || len(result.Text) == 0 || !strings.Contains(strings.Join(result.Text, "\n"), "https://") {
 		t.Fatalf("public news search failed or returned no source links: err=%v isError=%t unsupported=%t text=%q", err, result.IsError, result.UnsupportedContent, strings.Join(result.Text, "\n"))
 	}

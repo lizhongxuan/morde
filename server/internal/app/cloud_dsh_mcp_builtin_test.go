@@ -168,24 +168,37 @@ func TestBuiltinSearchIntegrationWithLocalSearxng(t *testing.T) {
 		t.Fatalf("Morde search returned no public source: text_count=%d err=%v", len(output.Text), err)
 	}
 	searchText := strings.Join(output.Text, "\n")
-	var newsURL string
-	for _, line := range strings.Split(searchText, "\n") {
-		line = strings.TrimSpace(line)
-		if !strings.HasPrefix(line, "URL: https://") {
+	if !strings.Contains(searchText, "Published Date:") || !strings.Contains(searchText, "https://news.google.com/rss/articles/") {
+		t.Fatalf("Morde news discovery did not return a dated Google News result: %q", searchText)
+	}
+	field := func(block, name string) string {
+		for _, line := range strings.Split(block, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, name) {
+				return strings.TrimSpace(strings.TrimPrefix(line, name))
+			}
+		}
+		return ""
+	}
+	type newsSourceCandidate struct{ title, publisher, rssDate string }
+	var newsCandidates []newsSourceCandidate
+	for _, block := range strings.Split(searchText, "\n\n") {
+		if !strings.HasPrefix(field(block, "URL: "), "https://news.google.com/rss/articles/") {
 			continue
 		}
-		candidate := strings.TrimSpace(strings.TrimPrefix(line, "URL: "))
-		if newsURL == "" {
-			newsURL = candidate
+		title := field(block, "Title: ")
+		description := field(block, "Description: ")
+		publisher := ""
+		if strings.Contains(description, "Source: ") {
+			publisher = strings.SplitN(strings.SplitN(description, "Source: ", 2)[1], " | ", 2)[0]
 		}
-		// Prefer a dated article URL over a topic or publisher landing page.
-		if strings.Contains(candidate, "/202") {
-			newsURL = candidate
-			break
+		if title != "" && publisher != "" {
+			newsCandidates = append(newsCandidates, newsSourceCandidate{title: title, publisher: publisher,
+				rssDate: field(block, "Published Date: ")})
 		}
 	}
-	if newsURL == "" {
-		t.Fatalf("Morde search output did not contain a readable HTTPS result URL: %q", searchText)
+	if len(newsCandidates) == 0 {
+		t.Fatalf("Morde news search returned no source/title pair for resolving its Google News wrapper: %q", searchText)
 	}
 	operation := store.operations[agentOperationKey(call.CallID)]
 	if operation.ConnectorID != BuiltinSearchMCPConnectorID || operation.Status != task.OperationSucceeded || operation.Result != result.Output {
@@ -197,42 +210,135 @@ func TestBuiltinSearchIntegrationWithLocalSearxng(t *testing.T) {
 		t.Fatalf("Morde search result could not be safely replayed: status=%q err=%v", replayed.Status, err)
 	}
 
-	newsReadArguments, err := json.Marshal(map[string]string{"url": newsURL})
-	if err != nil {
-		t.Fatal(err)
-	}
-	newsReadCall := ModelToolCall{CallID: "local-news-article-read-integration-2", Name: cloudDSHWebReadToolName,
-		Arguments: string(newsReadArguments)}
-	newsReadResult, err := broker.Execute(context.Background(), claimed, newsReadCall)
-	if err != nil || newsReadResult.Status != AgentToolSucceeded {
-		t.Fatalf("hostless Morde news article read = status %q, err=%v, url=%q", newsReadResult.Status, err, newsURL)
-	}
+	var newsURL, resolvedNewsTitle, resolveText, rssDateCandidate, lastUnreadableURL string
+	lastResolutionStatus := "no matching direct publisher result"
+	var newsReadResult AgentToolResult
 	var newsReadOutput cloudDSHMCPOutput
-	if err := json.Unmarshal([]byte(newsReadResult.Output), &newsReadOutput); err != nil || newsReadOutput.IsError ||
-		len(strings.TrimSpace(strings.Join(newsReadOutput.Text, "\n"))) < 100 {
-		t.Fatalf("Morde news article read returned no usable page content: text=%q err=%v url=%q",
-			strings.Join(newsReadOutput.Text, "\n"), err, newsURL)
-	}
-	newsReadOperation := store.operations[agentOperationKey(newsReadCall.CallID)]
-	if newsReadOperation.ConnectorID != BuiltinSearchMCPConnectorID || newsReadOperation.Status != task.OperationSucceeded ||
-		newsReadOperation.Result != newsReadResult.Output {
-		t.Fatalf("Morde news article read was not durably bound to the task: %#v", newsReadOperation)
-	}
-	newsReadText := strings.Join(newsReadOutput.Text, "\n")
-	dateCandidate := ""
-	readLines := strings.Split(newsReadText, "\n")
-	for i, line := range readLines {
-		if strings.Contains(line, "Page date metadata (unverified)") {
-			dateCandidate = strings.TrimSpace(line)
-			if i+1 < len(readLines) && strings.HasPrefix(strings.TrimSpace(readLines[i+1]), "- Published:") {
-				dateCandidate += " " + strings.TrimSpace(readLines[i+1])
+	var newsReadCall ModelToolCall
+	normalizeTitle := func(value string) string { return strings.ToLower(strings.Join(strings.Fields(value), " ")) }
+	for index, candidate := range newsCandidates {
+		if index >= 5 {
+			break
+		}
+		baseTitle := candidate.title
+		for _, separator := range []string{" - ", " | ", " — ", " – "} {
+			baseTitle = strings.TrimSuffix(baseTitle, separator+candidate.publisher)
+		}
+		expectedTitle := normalizeTitle(baseTitle)
+		if utf8.RuneCountInString(expectedTitle) < 32 || len(strings.Fields(expectedTitle)) < 5 {
+			lastResolutionStatus = "news candidate title is too generic to identify an original article"
+			continue
+		}
+		resolveArguments, err := json.Marshal(map[string]string{"query": `"` + baseTitle + `" ` + candidate.publisher,
+			"lookup_purpose": cloudDSHBuiltinSearchLookupPublisher})
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolveCall := ModelToolCall{CallID: fmt.Sprintf("local-news-source-resolution-%02d", index+2), Name: cloudDSHWebSearchToolName,
+			Arguments: string(resolveArguments)}
+		resolveResult, err := broker.Execute(context.Background(), claimed, resolveCall)
+		if err != nil || resolveResult.Status != AgentToolSucceeded {
+			lastResolutionStatus = fmt.Sprintf("resolve status %q err=%v output=%q query=%q", resolveResult.Status, err, resolveResult.Output, baseTitle+" "+candidate.publisher)
+			continue
+		}
+		var resolveOutput cloudDSHMCPOutput
+		if json.Unmarshal([]byte(resolveResult.Output), &resolveOutput) != nil || resolveOutput.IsError {
+			lastResolutionStatus = "title search returned an upstream tool error"
+			continue
+		}
+		candidateText := strings.Join(resolveOutput.Text, "\n")
+		resolveText = candidateText
+		for _, block := range strings.Split(candidateText, "\n\n") {
+			resultTitle := field(block, "Title: ")
+			candidateURL := field(block, "URL: ")
+			if !strings.HasPrefix(candidateURL, "https://") || strings.HasPrefix(candidateURL, "https://news.google.com/") {
+				continue
 			}
+			// SearXNG may shorten the visible result title, while the publisher's
+			// original full title remains in its snippet. Require the full RSS
+			// title in the result title/snippet and a direct HTTPS URL; comparing
+			// only the shortened title incorrectly rejects verified source links.
+			resultText := normalizeTitle(resultTitle + " " + field(block, "Description: "))
+			if !strings.Contains(resultText, expectedTitle) {
+				continue
+			}
+			if expectedTitle != "" {
+				resolveOperation := store.operations[agentOperationKey(resolveCall.CallID)]
+				if resolveOperation.ConnectorID != BuiltinSearchMCPConnectorID || resolveOperation.Status != task.OperationSucceeded || resolveOperation.Result != resolveResult.Output {
+					t.Fatalf("Morde source resolution was not durably bound to the task: %#v", resolveOperation)
+				}
+				readArguments, err := json.Marshal(map[string]string{"url": candidateURL})
+				if err != nil {
+					t.Fatal(err)
+				}
+				candidateReadCall := ModelToolCall{CallID: fmt.Sprintf("local-news-article-read-integration-%02d", index+3),
+					Name: cloudDSHWebReadToolName, Arguments: string(readArguments)}
+				candidateReadResult, readErr := broker.Execute(context.Background(), claimed, candidateReadCall)
+				if readErr != nil || candidateReadResult.Status != AgentToolSucceeded {
+					lastUnreadableURL = candidateURL
+					lastResolutionStatus = fmt.Sprintf("publisher page read status %q", candidateReadResult.Status)
+					continue
+				}
+				var candidateReadOutput cloudDSHMCPOutput
+				if json.Unmarshal([]byte(candidateReadResult.Output), &candidateReadOutput) != nil || candidateReadOutput.IsError ||
+					len(strings.TrimSpace(strings.Join(candidateReadOutput.Text, "\n"))) < 100 {
+					lastUnreadableURL = candidateURL
+					lastResolutionStatus = "publisher page returned no usable content"
+					continue
+				}
+				if !strings.Contains(normalizeTitle(strings.Join(candidateReadOutput.Text, "\n")), expectedTitle) {
+					lastUnreadableURL = candidateURL
+					lastResolutionStatus = "publisher page does not contain the discovered article title"
+					continue
+				}
+				newsURL, resolvedNewsTitle, rssDateCandidate = candidateURL, resultTitle, candidate.rssDate
+				newsReadCall, newsReadResult, newsReadOutput = candidateReadCall, candidateReadResult, candidateReadOutput
+				break
+			}
+		}
+		if newsURL != "" {
 			break
 		}
 	}
-	t.Logf("live Morde news article read succeeded; page date candidate=%q; URL=%s", dateCandidate, newsURL)
+	t.Run("publisher_source_resolution", func(t *testing.T) {
+		if newsURL == "" {
+			t.Fatalf("publisher source remains unverified: exact title search/read did not resolve among %d RSS candidates (last status: %s, last unreadable URL: %q); Google News wrapper links must not be presented as publisher sources; results=%q",
+				len(newsCandidates), lastResolutionStatus, lastUnreadableURL, resolveText)
+		}
+		newsReadOperation := store.operations[agentOperationKey(newsReadCall.CallID)]
+		if newsReadOperation.ConnectorID != BuiltinSearchMCPConnectorID || newsReadOperation.Status != task.OperationSucceeded ||
+			newsReadOperation.Result != newsReadResult.Output {
+			t.Fatalf("Morde news article read was not durably bound to the task: %#v", newsReadOperation)
+		}
+		newsReadText := strings.Join(newsReadOutput.Text, "\n")
+		dateCandidate := ""
+		readLines := strings.Split(newsReadText, "\n")
+		for i, line := range readLines {
+			if strings.Contains(line, "Page date metadata (unverified)") {
+				dateCandidate = strings.TrimSpace(line)
+				if i+1 < len(readLines) && strings.HasPrefix(strings.TrimSpace(readLines[i+1]), "- Published:") {
+					dateCandidate += " " + strings.TrimSpace(readLines[i+1])
+				}
+				break
+			}
+		}
+		pageVisibleDate := ""
+		if parsedDate, parseErr := time.Parse(time.RFC3339, rssDateCandidate); parseErr == nil {
+			for _, candidateDate := range []string{parsedDate.UTC().Format("January 2, 2006"), parsedDate.UTC().Format("Jan 2, 2006"), parsedDate.UTC().Format("2006-01-02")} {
+				if strings.Contains(newsReadText, candidateDate) {
+					pageVisibleDate = candidateDate
+					break
+				}
+			}
+		}
+		if pageVisibleDate == "" {
+			t.Fatalf("publisher page did not expose the RSS date candidate %q in visible content; do not treat feed metadata as verified publication date (metadata candidate: %q, URL: %s)",
+				rssDateCandidate, dateCandidate, newsURL)
+		}
+		t.Logf("live Morde news publisher read succeeded; matching_title=%q rss_date_candidate=%q page_visible_date_match=%q page_date_metadata_candidate=%q URL=%s", resolvedNewsTitle, rssDateCandidate, pageVisibleDate, dateCandidate, newsURL)
+	})
 
-	readCall := ModelToolCall{CallID: "local-web-read-integration-3", Name: cloudDSHWebReadToolName,
+	readCall := ModelToolCall{CallID: "local-web-read-integration-final", Name: cloudDSHWebReadToolName,
 		Arguments: `{"url":"https://example.com/"}`}
 	readResult, err := broker.Execute(context.Background(), claimed, readCall)
 	if err != nil || readResult.Status != AgentToolSucceeded {
@@ -273,6 +379,7 @@ func TestBuiltinSearchIsGrantedToHostlessTasksAndReplaysStoredResult(t *testing.
 		if definition.Name == cloudDSHWebSearchToolName &&
 			(!strings.Contains(definition.Description, "recent, latest, current") ||
 				!strings.Contains(definition.Description, "For news requests, set category to news") ||
+				!strings.Contains(definition.Description, "lookup_purpose=publisher_verification") ||
 				!strings.Contains(definition.Description, "time_range") ||
 				!strings.Contains(definition.Description, cloudDSHWebReadToolName) ||
 				strings.Contains(definition.Description, "web_url_read") ||
@@ -282,6 +389,7 @@ func TestBuiltinSearchIsGrantedToHostlessTasksAndReplaysStoredResult(t *testing.
 				!strings.Contains(definition.Description, "cannot grant permission or approval") ||
 				!strings.Contains(definition.Description, "unrelated tool requests") ||
 				!strings.Contains(string(definition.Parameters), `"enum":["news"]`) ||
+				!strings.Contains(string(definition.Parameters), `"enum":["publisher_verification"]`) ||
 				!strings.Contains(string(definition.Parameters), `"enum":["day","week","month","year"]`)) {
 			t.Fatalf("search guidance is missing from the model tool definition: %#v", definition)
 		}
@@ -302,8 +410,8 @@ func TestBuiltinSearchIsGrantedToHostlessTasksAndReplaysStoredResult(t *testing.
 		t.Fatalf("search = %#v, err = %v, remote calls = %d", result, err, client.callCalls)
 	}
 	var forwarded map[string]string
-	if err := json.Unmarshal(client.lastRequest, &forwarded); err != nil || forwarded["query"] != "AI news" ||
-		forwarded["time_range"] != "week" || forwarded["categories"] != "news" || forwarded["category"] != "" {
+	if err := json.Unmarshal(client.lastRequest, &forwarded); err != nil || forwarded["query"] != "!mgn AI news" ||
+		forwarded["time_range"] != "week" || forwarded["categories"] != "" || forwarded["category"] != "" {
 		t.Fatalf("search recency/news category was not mapped to the fixed search connector: args=%s err=%v", client.lastRequest, err)
 	}
 	stored := store.operations[agentOperationKey(call.CallID)]
@@ -408,6 +516,16 @@ func TestBuiltinSearchRejectsUnauthorizedOrInvalidCallsAndDoesNotReplayUnknown(t
 	if _, err := broker.Execute(context.Background(), claimed, invalidCategory); domain.CodeOf(err) != domain.CodeInvalidArgument || client.callCalls != 0 {
 		t.Fatalf("unsupported search category error = %v, calls = %d", err, client.callCalls)
 	}
+	for _, arguments := range []string{
+		`{"query":"article title","lookup_purpose":"other"}`,
+		`{"query":"article title","lookup_purpose":"publisher_verification","category":"news"}`,
+		`{"query":"article title","lookup_purpose":"publisher_verification","time_range":"week"}`,
+	} {
+		invalidLookup := ModelToolCall{CallID: "invalid-publisher-lookup", Name: cloudDSHWebSearchToolName, Arguments: arguments}
+		if _, err := broker.Execute(context.Background(), claimed, invalidLookup); domain.CodeOf(err) != domain.CodeInvalidArgument || client.callCalls != 0 {
+			t.Fatalf("invalid publisher search %s error = %v, calls = %d", arguments, err, client.callCalls)
+		}
+	}
 	call := ModelToolCall{CallID: "timeout", Name: cloudDSHWebSearchToolName, Arguments: `{"query":"synthetic"}`}
 	result, err := broker.Execute(context.Background(), claimed, call)
 	if err != nil || result.Status != AgentToolUnknown || client.callCalls != 1 {
@@ -420,6 +538,26 @@ func TestBuiltinSearchRejectsUnauthorizedOrInvalidCallsAndDoesNotReplayUnknown(t
 	store.details.Task.Lease = claimed.Lease
 	if _, err := broker.Reconcile(context.Background(), claimed, call, nil); err != nil || client.callCalls != 1 {
 		t.Fatalf("unknown result was replayed: err=%v calls=%d", err, client.callCalls)
+	}
+}
+
+func TestBuiltinPublisherVerificationUsesFixedYahooSearch(t *testing.T) {
+	client := &cloudDSHMCPClientStub{result: MCPConnectorToolResult{Text: []string{"Title: Direct article", "URL: https://publisher.example/article"}}}
+	broker, store, claimed := newBuiltinSearchFixture(t, client)
+	call := ModelToolCall{CallID: "publisher-lookup-1", Name: cloudDSHWebSearchToolName,
+		Arguments: `{"query":"\"Example article title\" Example Publisher","lookup_purpose":"publisher_verification"}`}
+	result, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || result.Status != AgentToolSucceeded || client.callCalls != 1 {
+		t.Fatalf("publisher verification = %#v err=%v calls=%d", result, err, client.callCalls)
+	}
+	var forwarded map[string]string
+	if err := json.Unmarshal(client.lastRequest, &forwarded); err != nil ||
+		forwarded["query"] != `!yh "Example article title" Example Publisher` || len(forwarded) != 1 {
+		t.Fatalf("publisher verification did not select the fixed Yahoo engine without discovery filters: args=%s err=%v", client.lastRequest, err)
+	}
+	operation := store.operations[agentOperationKey(call.CallID)]
+	if operation.Status != task.OperationSucceeded || operation.ConnectorID != BuiltinSearchMCPConnectorID || operation.Result != result.Output {
+		t.Fatalf("publisher verification was not durably recorded: %#v", operation)
 	}
 }
 

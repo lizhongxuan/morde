@@ -697,6 +697,11 @@ func taskToolInputSummary(name, rawArguments string) string {
 	case strings.HasPrefix(name, "morde_workspace_"):
 		return "Workspace request; file contents and write payloads are omitted."
 	case name == cloudDSHWebSearchToolName:
+		var originalInput struct {
+			LookupPurpose string          `json:"lookup_purpose"`
+			Query         json.RawMessage `json:"query"`
+		}
+		_ = json.Unmarshal([]byte(rawArguments), &originalInput)
 		arguments, _, err := builtinSearchArguments(name, rawArguments)
 		if err == nil {
 			var input struct {
@@ -706,16 +711,29 @@ func taskToolInputSummary(name, rawArguments string) string {
 			}
 			if json.Unmarshal(arguments, &input) == nil {
 				if query := decodeSafeString(input.Query, 512); query != "" {
+					if originalInput.LookupPurpose == cloudDSHBuiltinSearchLookupPublisher {
+						if sourceQuery := decodeSafeString(originalInput.Query, 512); sourceQuery != "" {
+							return "Publisher source search: " + sourceQuery + "."
+						}
+						return "Publisher source search request; query was omitted because it could not be safely displayed."
+					}
 					newsCategory := decodeSafeString(input.Categories, 16) == "news"
+					if strings.HasPrefix(query, "!mgn ") {
+						query = strings.TrimSpace(strings.TrimPrefix(query, "!mgn "))
+						newsCategory = true
+					}
+					if query == "" {
+						return "News search request; query was omitted because it could not be safely displayed."
+					}
 					if timeRange := decodeSafeString(input.TimeRange, 16); timeRange != "" {
 						details := []string{"time range: " + timeRange}
 						if newsCategory {
-							details = append([]string{"category: news"}, details...)
+							return "News search: " + query + " (" + strings.Join(details, "; ") + ")."
 						}
 						return "Search query: " + query + " (" + strings.Join(details, "; ") + ")."
 					}
 					if newsCategory {
-						return "Search query: " + query + " (category: news)."
+						return "News search: " + query + "."
 					}
 					return "Search query: " + query
 				}

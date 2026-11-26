@@ -159,6 +159,12 @@ if [[ "$version_seen" != true ]]; then
   exit 1
 fi
 
+if ! curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:8189/config | \
+  node -e 'let s="";process.stdin.on("data",c=>s+=c);process.stdin.on("end",()=>{try{const c=JSON.parse(s);const news=c.engines.find(x=>x.shortcut==="mgn");const publisher=c.engines.find(x=>x.shortcut==="yh");process.exitCode=news?.name==="morde google news rss"&&news.categories?.includes("news")&&publisher?.name==="yahoo"?0:1}catch{process.exitCode=1}})'; then
+  printf 'SearXNG is running, but the required Morde news discovery or publisher verification engine is not loaded.\n' >&2
+  exit 1
+fi
+
 search_seen=false
 while (( SECONDS < ready_deadline )); do
   if response="$(curl -fsSG --connect-timeout 1 --max-time 2 --data-urlencode 'q=morde startup health check' \

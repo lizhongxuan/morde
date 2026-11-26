@@ -53,8 +53,15 @@ func TestTaskToolInputSummaryShowsOnlyValidatedSearchQuery(t *testing.T) {
 	if got := taskToolInputSummary(cloudDSHWebSearchToolName, `{"query":"AI news","time_range":"week"}`); got != "Search query: AI news (time range: week)." {
 		t.Fatalf("safe search input summary = %q", got)
 	}
-	if got := taskToolInputSummary(cloudDSHWebSearchToolName, `{"query":"AI news","category":"news","time_range":"week"}`); got != "Search query: AI news (category: news; time range: week)." {
+	if got := taskToolInputSummary(cloudDSHWebSearchToolName, `{"query":"AI news","category":"news","time_range":"week"}`); got != "News search: AI news (time range: week)." {
 		t.Fatalf("safe news search input summary = %q", got)
+	}
+	if got := taskToolInputSummary(cloudDSHWebSearchToolName, `{"query":"!mgn AI news","time_range":"week"}`); got != "News search: AI news (time range: week)." {
+		t.Fatalf("internal news engine marker leaked into search activity summary: %q", got)
+	}
+	if got := taskToolInputSummary(cloudDSHWebSearchToolName,
+		`{"query":"\"Example article\" Example Publisher","lookup_purpose":"publisher_verification"}`); got != "Publisher source search: \"Example article\" Example Publisher." {
+		t.Fatalf("publisher verification source search was summarized incorrectly: %q", got)
 	}
 	credential := "sk-proj-" + strings.Repeat("A", 40)
 	got := taskToolInputSummary(cloudDSHWebSearchToolName, `{"query":"`+credential+`"}`)

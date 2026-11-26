@@ -735,8 +735,8 @@ func TestConversationRouteModelActionIsPreservedAcrossSemanticRewrites(t *testin
 		{name: "status paraphrase", content: "这件事目前到哪一步了？", output: `{"action":"status","task_id":"q1234567"}`, want: ConversationRouteStatus},
 		{name: "stop paraphrase", content: "把这项工作结束掉。", output: `{"action":"stop","task_id":"q1234567"}`, want: ConversationRouteStop},
 		{name: "stop all paraphrase", content: "把还没有结束的工作全部撤掉。", output: `{"action":"stop_all"}`, want: ConversationRouteStopAll},
-		{name: "tool paraphrase", content: "有没有关于日本央行利率政策的最新公开信息？", output: `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`, want: ConversationRouteTool},
-		{name: "news tool requests news category", content: "帮我搜索今天的 AI 新闻", output: `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"AI news","category":"news","time_range":"day"}}`, want: ConversationRouteTool},
+		{name: "tool paraphrase", content: "请帮我查找日本央行利率政策的公开网页", output: `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`, want: ConversationRouteTool},
+		{name: "news routes to multi-step task", content: "帮我搜索今天的 AI 新闻", output: `{"action":"new","explicit_new":false,"dependency_task_ids":[]}`, want: ConversationRouteNew},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			value := ConversationRouteContext{ActorID: "u1234567", Content: test.content, Candidates: []ConversationRouteCandidate{candidate}}
@@ -749,10 +749,6 @@ func TestConversationRouteModelActionIsPreservedAcrossSemanticRewrites(t *testin
 			}
 			if test.name == "new without restart phrase" && decision.ExplicitNew {
 				t.Fatalf("message wording changed the model explicit_new bit: %+v", decision)
-			}
-			if test.name == "news tool requests news category" &&
-				decision.ToolArguments != `{"query":"AI news","category":"news","time_range":"day"}` {
-				t.Fatalf("direct route changed the Morde tool argument contract before persistence: %s", decision.ToolArguments)
 			}
 		})
 	}
@@ -1027,7 +1023,7 @@ func TestConversationRouteDirectReplyRequiresValidTargetlessText(t *testing.T) {
 }
 
 func TestConversationRouteDirectToolIsExplicitAndReadOnly(t *testing.T) {
-	value := ConversationRouteContext{ActorID: "u1234567", Content: "请搜索公开网站关于日本央行利率政策的最新信息"}
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "请搜索公开网站关于日本央行利率政策的说明页"}
 	for _, test := range []struct {
 		name   string
 		output string
@@ -1046,8 +1042,29 @@ func TestConversationRouteDirectToolIsExplicitAndReadOnly(t *testing.T) {
 	request, err := ConversationRouteModelRequest(value)
 	if err != nil || !strings.Contains(request.Instructions, `"tool_name"`) ||
 		!strings.Contains(request.Instructions, `"morde_web_search"`) || !strings.Contains(request.Instructions, `action "tool"`) ||
-		!strings.Contains(request.Instructions, `category="news"`) {
+		!strings.Contains(request.Instructions, `For news, current/recent/latest facts`) ||
+		!strings.Contains(request.Instructions, `use action "new"`) {
 		t.Fatalf("direct tool contract missing from model request: err=%v instructions=%s", err, request.Instructions)
+	}
+	if ValidConversationRouteDirectToolCall(cloudDSHWebSearchToolName,
+		json.RawMessage(`{"query":"AI news","category":"news","time_range":"day"}`)) {
+		t.Fatal("news search was allowed onto the one-call path that cannot read and verify source pages")
+	}
+	newsAsDirectTool := ParseConversationRouteDecisionForContext(
+		`{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"AI news","category":"news","time_range":"day"}}`,
+		ConversationRouteContext{ActorID: value.ActorID, Content: "帮我搜索今天的 AI 新闻"})
+	if newsAsDirectTool.Action != ConversationRouteNew {
+		t.Fatalf("structured news search was not promoted to a source-verifying Task: %+v", newsAsDirectTool)
+	}
+	publisherLookupArgs := json.RawMessage(`{"query":"\"Example article\" Publisher","lookup_purpose":"publisher_verification"}`)
+	if ValidConversationRouteDirectToolCall(cloudDSHWebSearchToolName, publisherLookupArgs) {
+		t.Fatal("publisher verification was allowed onto the one-call path without a Task Agent")
+	}
+	publisherLookup := ParseConversationRouteDecisionForContext(
+		`{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"\"Example article\" Publisher","lookup_purpose":"publisher_verification"}}`,
+		ConversationRouteContext{ActorID: value.ActorID, Content: "核实这条新闻的发布来源"})
+	if publisherLookup.Action != ConversationRouteNew {
+		t.Fatalf("structured publisher verification was not promoted to a Task: %+v", publisherLookup)
 	}
 	mixedControl := value
 	mixedControl.Content += "，顺便停止当前任务"

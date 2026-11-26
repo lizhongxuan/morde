@@ -400,6 +400,61 @@ func TestSelectedMCPRevocationDuringDiscoveryDoesNotExposeCatalog(t *testing.T) 
 	}
 }
 
+func TestSelectedMCPCallFailsClosedWhenSelectionChangesAfterDiscovery(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*cloudDSHMCPStoreStub)
+	}{
+		{
+			name: "grant revoked",
+			mutate: func(store *cloudDSHMCPStoreStub) {
+				revokedAt := time.Now().UTC()
+				store.grants[0].RevokedAt = &revokedAt
+			},
+		},
+		{
+			name: "connector revision changed",
+			mutate: func(store *cloudDSHMCPStoreStub) {
+				connector := store.values["k1234567"]
+				connector.Revision++
+				store.values[connector.ID] = connector
+			},
+		},
+		{
+			name: "credential version changed",
+			mutate: func(store *cloudDSHMCPStoreStub) {
+				connector := store.values["k1234567"]
+				connector.CredentialVersion++
+				store.values[connector.ID] = connector
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			client := &cloudDSHMCPClientStub{
+				tools:  []MCPConnectorToolDefinition{{Name: "lookup", InputSchema: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}`)}},
+				result: MCPConnectorToolResult{Text: []string{"synthetic result"}},
+			}
+			broker, store, claimed := selectedMCPTestFixture(t, client)
+			discoverSelectedMCPForTest(t, broker, claimed, "k1234567")
+			if client.listCalls != 1 || len(store.grants[0].ToolSchema) == 0 {
+				t.Fatalf("connector was not discovered and selected before mutation: list_calls=%d grant=%+v", client.listCalls, store.grants[0])
+			}
+
+			test.mutate(store)
+			call := selectedMCPCallForTest(t, "changed-selection-"+test.name, "k1234567", "lookup", `{"query":"local"}`)
+			result, err := broker.Execute(context.Background(), claimed, call)
+			const wantOutput = "所选 MCP 连接器暂不可用或权限已变化，请检查连接后再试。"
+			if err != nil || result.Status != AgentToolFailed || result.Output != wantOutput {
+				t.Fatalf("changed MCP selection result = %+v, err=%v; want explicit authorization/state failure", result, err)
+			}
+			if client.listCalls != 1 || client.callCalls != 0 || len(store.operations) != 0 {
+				t.Fatalf("changed MCP selection reached remote or created operation: list_calls=%d call_calls=%d operations=%d",
+					client.listCalls, client.callCalls, len(store.operations))
+			}
+		})
+	}
+}
+
 func TestGitHubMCPReadOnlyProfileRestrictsCatalogAndExecution(t *testing.T) {
 	client := &recordingSelectedMCPClient{cloudDSHMCPClientStub: &cloudDSHMCPClientStub{tools: []MCPConnectorToolDefinition{
 		{Name: "get_me", InputSchema: json.RawMessage(`{"type":"object","additionalProperties":false}`)},

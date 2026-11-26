@@ -8,3 +8,17 @@ server:
 search:
   formats: [html, json]
 
+# Google News RSS is a bounded news-only source with usable publication times.
+# Keep it behind SearXNG so the existing Broker authorization and result limits
+# remain in force. The Task Agent must still open original publisher pages to
+# verify dates before presenting current-news claims.
+engines:
+  - name: morde google news rss
+    engine: morde_google_news_rss
+    shortcut: mgn
+    categories: news
+    language: en-US
+    time_range_support: true
+    paging: false
+    timeout: 12.0
+
