@@ -2433,3 +2433,21 @@ Tokenizer 与 token 统计来源：
 - **实际 PC：**以隔离 profile 执行 `MORDE_TEST_USER_DATA=/tmp/morde-step9-pc-20261126 make pc`，从当前源码构建并启动 Electron `morde-pc`。观察到登录界面提示“用户名或密码错误，请重试”；未发消息、搜索、复杂任务、审批请求或同步文件。已停止本轮进程并清除本轮隔离 profile。PC 业务验收环境阻塞：需提供有效测试账号及可用服务，并核对服务/客户端版本，再从实际 PC 入口重验。
 - **未解除问题：**PC 登录认证失败；只读复核显示 Portal 与 DSH Guardian 为 active、`/healthz` 返回 ok，Portal 15:03 有一次 exit 记录但根因未知。默认云电脑 `hdqokxzv` generation 6 仍为 `stopped / restore_failed`、当前 generation 无活动 lease；须读取启动 stderr、修复同一 Host 恢复根因并验证其原 Workspace ready；T43 `q95bzz7n` 是 `waiting_user / dsh_recovery_unresolved`，T57 `qfbwyq4f` 已 cancelled、`q06u34qw` 等待 DSH 恢复，另有 `routing_action_unavailable / invalid_argument` 且未创建 Task，须对账 ledger/Provider 用量与 Runtime 状态并修复恢复/路由后再提交新任务。H07 缺 Runtime runner、package/test inventory、版本/selector/scope coverage receipt、Linux parser、Runtime→Portal operation binding 和 PC manifest 复核入口，故 `RequirementSetVerified=false` / `actual_coverage_verified=false` 时保持 pending。T44 跨端和实际文件夹同步、T57 GitHub 版本/源码定位到可读图、T58 实际 PC 代码修复、T59 来源定位本轮均未验；T58/T59 仍缺实现/验收，不以自动化或流程图目标代替。
 - **复验条件：**当前全量服务端 `make test`、`make race`、`go vet` 与 7 项目标 PostgreSQL 回归已有稳定快照结果；仍需消除或正式分类 46 项 lint 诊断；A-02 当前完整 `make it` 已通过且与全包源码指纹一致。PC 实机复验需登录可用、真实服务可达；Host 场景需原默认 Host/Workspace ready；H07 需 runner 与端到端 proof producer 接通。所有条件满足前，不勾选相应 TODO。
+
+### 本轮续验合并记录（2026-11-26）
+
+- **当前快照：**服务端/客户端代码为 HEAD `07fecb1d`；本轮文档另有未提交更新。实现切片包括 R26 在 PC Assistant 安全呈现 TaskStepDetail 来源位置、M06-03 对陈旧结果事件拒绝旧 PASS 的 PostgreSQL 回归、Worker 测试专用的有界脱敏 DSH 启动诊断。对应细节见 [步骤 4 TODO](../muse_docs/muse_steps/实施任务TODO/04-工具执行与工作项.md)、[步骤 6 TODO](../muse_docs/muse_steps/实施任务TODO/06-验证.md)、[步骤 9 TODO](../muse_docs/muse_steps/实施任务TODO/09-失败限流与恢复.md)。
+- **客户端回归：**Portal 全量 71 个测试文件、952/952 通过；Portal typecheck、Assistant 目标 ESLint、`build:pc` 通过；桌面客户端测试 293/293，桌面构建及 Portal/Workbench 构建通过。Runtime 全量测试 255/255 通过。Vite bundle size warning 保留为构建提示，不是失败。
+- **定向服务端回归：**M06-03 PostgreSQL 陈旧结果事件用例通过；六项 DSH/Node/PostgreSQL 恢复测试通过，Worker 中三个 DSH/PostgreSQL 选定用例通过。Worker 单包 `go test -json -count=1 ./internal/worker` 退出码 0：465 个顶层用例中 459 通过、6 跳过。
+- **全量集成结果：**第一次 `CH_TEST_DATABASE_URL=<loopback> GOPROXY=off GOSUMDB=off make it` 退出码 2；PostgreSQL 包通过（1320.983s），Worker 包失败（347.812s）。当时命令输出过长且被截断，未留存可核实的首个失败测试名，不据此推断根因。随后单包 Worker 无缓存复跑通过；第二次等价整仓运行 `CH_TEST_DATABASE_URL=<loopback> GOPROXY=off GOSUMDB=off go test -json -timeout=45m ./...` 退出码 0：40 个有测试包通过，6 个无测试文件包跳过；PostgreSQL 包 1378.896s，Worker 包 359.191s。OpenSandbox 场景因未配置 `CH_OSB_URL` / `CH_OSB_API_KEY` 而跳过。保留首次失败记录；第二次通过说明未复现，不证明首次失败原因已修复。
+- **实际 PC：**仅启动本地源码 `morde-pc` 的隔离 profile；它显示了账号既有云端主会话。为避免在既有会话写入测试数据，本轮立即停止，没有发送消息、创建 Task、审批、上传或修改任何云端数据。来源 UI、新闻搜索、长输入和失败恢复均未通过 PC 用户流程验收。
+- **发布：**本轮未运行生产 smoke、未推送代码、未连接或更新服务器。当前 PC/DSH 端到端验收仍缺，因此不把局部代码与自动化通过标成 Muse 复刻完成，也不部署这组尚未实机验收的 UI 变化。
+- **结论：**TODO 未整体收口。M04-06、M06-03、M09-01/M09-07 保持进行中或待验；多个步骤仍受 PC 测试账号、真实 DSH/Guardian、默认云端 Host 和 Runtime H07 runner coverage receipt 缺失影响。下一轮先取得不含既有数据的 PC 测试会话/账号与可运行本地服务，再按一体化 TODO 的依赖顺序逐个闭环；全量通过不能替代这些端到端条件。
+
+### PC 初始/重置密码登录修复（2026-11-26）
+
+- **问题：**初次登录或管理员重置密码后的账号必须先改密；旧客户端登录流程提前拒绝 `MustChangePassword` 用户，鉴权层也拦截了客户端创建改密用短期 Web session 的唯一入口。PC 因而把强制改密显示成登录错误。
+- **实现：**允许这类 Client 凭据仅建立受限改密 Web session 或退出；其余 Client/Device API 仍禁止。首次改密前不创建默认 Host。PC 的拒绝错误改为“请先修改密码”，管理员重置密码说明明确 PC 与 Portal 都可登录后改密。
+- **验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/api -count=1`、`go test ./internal/app -count=1` 均通过；`cd clients/desktop/harness/desktop && npm test` 293/293；`cd web/portal && npm test -- --run src/routes/admin/AdminUsers.test.tsx` 8/8。未连接生产数据库执行密码验证。
+- **本地 P0 smoke：**`/tmp/morde-smoke-record-20261126.json` 对 HEAD `07fecb1d` 记录 pass=5、fail=0、exception=5。T01/T26/T36 因无 `CH_TEST_DATABASE_URL` 而例外，T10/T43 需要实际 PC/DSH。此前整仓隔离 PostgreSQL 集成通过是另一项独立证据，不把本次冒烟例外改记通过。
+- **边界：**登录修复已提交于 `771c6865`，尚未推送/部署；实际 PC 登录和强制改密页面未验。未修改账号密码、未尝试使用生产账号、未创建远端消息或 Task，也未使用提供的模型 API key。

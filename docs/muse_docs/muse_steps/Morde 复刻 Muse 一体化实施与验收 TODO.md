@@ -345,3 +345,10 @@ R25/R26 横跨第 2、4–6 项：A/B/D 可先对齐修复计划、适用验证�
 - **实际 PC：**`MORDE_TEST_USER_DATA=/tmp/morde-step9-pc-20261126 make pc` 构建并启动当前源码 Electron 客户端，看到登录页和“用户名或密码错误，请重试”。未发送真实对话、未发起审批、未创建 Task、未同步文件；本轮 PC 业务验收被认证/可用服务阻塞。解除条件：提供可用测试账号和对应服务，记录实际服务/客户端版本，再从 `make pc` 入口重验真实回复、搜索、复杂任务、审批、长输入、失败恢复和同步。
 - **具体阻塞与解除条件：**只读复核显示 Portal 与 DSH Guardian 为 active、`/healthz` 返回 ok；Portal 15:03 有一次 exit 记录，根因未知。默认云电脑 `hdqokxzv` generation 6 仍为 `stopped / restore_failed`，当前 generation 无活动 lease；先读取同一 Host 的启动 stderr 并修复恢复根因，确认原 Host/Workspace `ready` 后才能验收 T16–T18，不盲目切换或重试。T43 Task `q95bzz7n` 为 `waiting_user / dsh_recovery_unresolved`；T57 原 Task `qfbwyq4f` 已取消，安全重查 `q06u34qw` 仍等待恢复；另有路由错误 `routing_action_unavailable / invalid_argument` 且未创建 Task。需先按账本与 Provider/DSH 恢复记录对账并修复路由/恢复，再提交新请求。H07 仍缺 Runtime 实际 runner、包/测试 inventory、版本、selector 与 scope receipt producer、Linux receipt parser、Runtime→Portal operation binding 和 PC manifest 复核 UI；齐备并经跨层测试前保持 pending。T57 需真实授权 GitHub 版本/位置和可读流程图；T58、T59 本轮未运行，需在隔离项目通过实际 PC + 真实 DSH 分别完成修复和来源定位验收。T44 跨端/文件同步本轮未执行；解除条件为登录可用、默认 Host ready 且 PC 同步目标 API 正常。
 - **复验顺序：**完整服务端 make test/race、go vet 及目标 PostgreSQL lifecycle 回归已在本轮稳定源码指纹上完成；剩余服务端检查为消除或正式分类 46 项 lint 诊断；A-02 当前完整 `make it` 已通过且与全包源码指纹一致。每个新增运行记录退出码、环境、工作树指纹和开始/结束时间。完成这些回归仍不替代 PC/DSH/Host/跨端实机验收。
+
+### 2026-11-26 主会话续验：R26、M06-03 与全量集成
+
+- **代码切片：**当前 `release` HEAD `07fecb1d` 的 R26 在 PC Assistant 受限呈现 TaskStepDetail 来源位置；M06-03 增加陈旧结果事件拒绝旧 PASS 的 PostgreSQL 回归；M09 辅助项增加有界脱敏 DSH 启动诊断测试。此处不改变 H07、T57–T59 或任何 PC/DSH 端到端验收状态。
+- **验证：**Portal 71 文件 952/952、typecheck、Assistant 目标 ESLint、`build:pc` 通过；Desktop 293/293 和构建通过；Runtime 255/255。M06 PostgreSQL 定向用例通过。Worker 单包无缓存 465 个顶层用例中 459 通过、6 跳过。
+- **整仓结果：**首次全量 `make it` 中 PostgreSQL 包通过（1320.983s），Worker 包失败（347.812s）；其后单包 Worker 通过。第二次等价整仓 `go test -json -timeout=45m ./...` 退出码 0，40 个有测试包通过、6 个无测试文件包跳过；PostgreSQL 1378.896s、Worker 359.191s。OpenSandbox 因专用环境未配置跳过；首次失败没有可核实的单项原因，保留为未复现记录。
+- **PC/发布边界：**隔离源码 PC 载入账号既有主会话后立即停止，没有发送消息或创建 Task；因此没有真实 UI 业务验收。本轮没有生产 smoke、push 或部署。T01–T59 分类未重算，原矩阵仍需按真实验收逐项收口。
