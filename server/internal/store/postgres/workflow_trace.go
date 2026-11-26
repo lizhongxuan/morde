@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/evaluation"
@@ -37,6 +38,13 @@ type workflowTraceOperationRecord struct {
 	executionKind, executionID, requestHash, connectorID         string
 	taskRevision                                                 int64
 	approvalVersion                                              int64
+}
+
+type workflowTraceDeliveryObservationTarget struct {
+	nodeID       string
+	sourceID     string
+	taskRevision int64
+	pcEligible   bool
 }
 
 func newWorkflowTraceBuilder(taskID string, revision, eventSequence int64, capturedAt time.Time) *workflowTraceBuilder {
@@ -270,8 +278,12 @@ auth_kind,auth_token_id,auth_scopes,auth_version,model_id,objective,created_at,u
 		if err := addWorkflowTraceHost(ctx, tx, builder, taskRow, taskNode, taskSource); err != nil {
 			return err
 		}
-		builder.addGap(evaluation.WorkflowStageProvenance, "pc_observation_adapter", evaluation.WorkflowGapUnavailable, nil, taskSource)
-		builder.addGap(evaluation.WorkflowStageAuthorization, "current_external_authorization_fence_not_reconstructed", evaluation.WorkflowGapUnknown, nil, taskSource)
+		if err := addWorkflowTraceRuntime(ctx, tx, builder, taskRow, taskNode, taskSource); err != nil {
+			return err
+		}
+		if err := addWorkflowTraceCurrentAuthorization(ctx, tx, builder, taskRow); err != nil {
+			return err
+		}
 		trace, err = builder.finish()
 		return err
 	})
@@ -1193,6 +1205,7 @@ func workflowValidationNodeState(state, verdict string) evaluation.WorkflowNodeS
 }
 
 func addWorkflowTraceDeliveries(ctx context.Context, tx pgx.Tx, builder *workflowTraceBuilder, taskRow workflowTraceTask, taskNode string) error {
+	deliveryTargets := make(map[string]workflowTraceDeliveryObservationTarget)
 	var count int64
 	if err := tx.QueryRow(ctx, `SELECT count(*) FROM conversation_messages WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='assistant'`, taskRow.ID, taskRow.OwnerID, taskRow.ConversationID).Scan(&count); err != nil {
 		return fmt.Errorf("count workflow assistant deliveries: %w", err)
@@ -1238,6 +1251,7 @@ ORDER BY sequence,id LIMIT $4`, taskRow.ID, taskRow.OwnerID, taskRow.Conversatio
 		}
 		state := workflowDeliveryNodeState(deliveryStatus, outputStatus)
 		nodeID := builder.addNode(evaluation.WorkflowNodeDelivery, state, taskRow.ID+":message:"+id, sourceID)
+		deliveryTargets[id] = workflowTraceDeliveryObservationTarget{nodeID: nodeID, sourceID: sourceID, taskRevision: revision}
 		if deliveryStatus == "applied" && (outputStatus == "completed" || outputStatus == "") {
 			builder.addEdge(evaluation.WorkflowEdgeDelivered, taskNode, nodeID, sourceID)
 		} else {
@@ -1303,6 +1317,10 @@ WHERE o.task_id=$1 AND o.owner_id=$2 ORDER BY o.id LIMIT $3`, taskRow.ID, taskRo
 		nodeID := builder.addNode(evaluation.WorkflowNodeDelivery, workflowOutboxDeliveryState(state, messageStatus), taskRow.ID+":outbox:"+id, sourceID)
 		if state == "published" && messageID != "" && messageStatus == "applied" {
 			builder.addEdge(evaluation.WorkflowEdgeDelivered, taskNode, nodeID, sourceID)
+			if target, ok := deliveryTargets[messageID]; ok && target.taskRevision == revision {
+				target.pcEligible = true
+				deliveryTargets[messageID] = target
+			}
 		} else {
 			builder.addGap(evaluation.WorkflowStageDelivery, "terminal delivery lacks a confirmed published conversation message: "+id, evaluation.WorkflowGapUnknown, nil, sourceID)
 		}
@@ -1314,6 +1332,82 @@ WHERE o.task_id=$1 AND o.owner_id=$2 ORDER BY o.id LIMIT $3`, taskRow.ID, taskRo
 	rows.Close()
 	if rowsErr != nil {
 		return fmt.Errorf("iterate workflow terminal delivery records: %w", rowsErr)
+	}
+	return addWorkflowTracePCDeliveryObservations(ctx, tx, builder, taskRow, deliveryTargets)
+}
+
+func addWorkflowTracePCDeliveryObservations(ctx context.Context, tx pgx.Tx, builder *workflowTraceBuilder,
+	taskRow workflowTraceTask, deliveryTargets map[string]workflowTraceDeliveryObservationTarget) error {
+	var count int64
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM task_pc_delivery_observations
+WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3`, taskRow.ID, taskRow.OwnerID, taskRow.ConversationID).Scan(&count); err != nil {
+		return fmt.Errorf("count workflow PC delivery observations: %w", err)
+	}
+	countSource, err := builder.addCountSource(evaluation.WorkflowSourcePCObservation,
+		"db://task_pc_delivery_observations/task/"+taskRow.ID+"/count", count)
+	if err != nil {
+		return err
+	}
+	workflowTruncatedGap(builder, evaluation.WorkflowStageDelivery, "PC delivery observations", count, countSource)
+	rows, err := tx.Query(ctx, `SELECT observation.client_installation_id,observation.message_id,observation.task_revision,observation.observed_at,
+message.role,COALESCE(message.delivery_status,''),COALESCE(message.output_status,''),COALESCE(message.output_task_revision,-1),
+COALESCE(message.output_result_event_sequence,0),COALESCE(delivery.state,''),COALESCE(delivery.task_revision,-1)
+FROM task_pc_delivery_observations observation
+LEFT JOIN conversation_messages message ON message.id=observation.message_id
+  AND message.task_id=observation.task_id AND message.owner_id=observation.owner_id AND message.conversation_id=observation.conversation_id
+LEFT JOIN task_terminal_delivery_outbox delivery ON delivery.task_id=message.task_id AND delivery.owner_id=message.owner_id
+  AND delivery.conversation_id=message.conversation_id AND delivery.published_message_id=message.id
+WHERE observation.task_id=$1 AND observation.owner_id=$2 AND observation.conversation_id=$3
+ORDER BY observation.observed_at,observation.client_installation_id,observation.message_id LIMIT $4`,
+		taskRow.ID, taskRow.OwnerID, taskRow.ConversationID, workflowTraceFactLimit)
+	if err != nil {
+		return fmt.Errorf("read workflow PC delivery observations: %w", err)
+	}
+	observed := make(map[string]struct{})
+	for rows.Next() {
+		var installationID, messageID, role, deliveryStatus, outputStatus, outboxState string
+		var revision, messageRevision, resultEventSequence, outboxRevision int64
+		var observedAt time.Time
+		if err := rows.Scan(&installationID, &messageID, &revision, &observedAt, &role, &deliveryStatus, &outputStatus,
+			&messageRevision, &resultEventSequence, &outboxState, &outboxRevision); err != nil {
+			rows.Close()
+			return err
+		}
+		sourceID, err := builder.addSource(evaluation.WorkflowSourcePCObservation,
+			"db://task_pc_delivery_observations/"+taskRow.ID+"/"+messageID+"/"+installationID+"/"+fmt.Sprint(revision), struct {
+				TaskID               string    `json:"task_id"`
+				MessageID            string    `json:"message_id"`
+				TaskRevision         int64     `json:"task_revision"`
+				ClientInstallationID string    `json:"client_installation_id"`
+				ObservedAt           time.Time `json:"observed_at"`
+			}{taskRow.ID, messageID, revision, installationID, observedAt})
+		if err != nil {
+			rows.Close()
+			return err
+		}
+		target, exists := deliveryTargets[messageID]
+		if !exists || !target.pcEligible || revision != messageRevision || revision != outboxRevision ||
+			role != "assistant" || deliveryStatus != "applied" || outputStatus != "completed" || resultEventSequence < 1 || outboxState != "published" {
+			builder.addGap(evaluation.WorkflowStageDelivery, "PC observation does not match a published assistant Task result: "+messageID,
+				evaluation.WorkflowGapUnknown, nil, sourceID)
+			continue
+		}
+		builder.addNode(evaluation.WorkflowNodeDelivery, evaluation.WorkflowNodeCompleted,
+			taskRow.ID+":message:"+messageID, sourceID)
+		observed[messageID] = struct{}{}
+	}
+	rowsErr := rows.Err()
+	rows.Close()
+	if rowsErr != nil {
+		return fmt.Errorf("iterate workflow PC delivery observations: %w", rowsErr)
+	}
+	for messageID, target := range deliveryTargets {
+		if target.pcEligible {
+			if _, ok := observed[messageID]; !ok {
+				builder.addGap(evaluation.WorkflowStageDelivery, "PC visible-area observation is absent for published reply: "+messageID,
+					evaluation.WorkflowGapUnknown, nil, target.sourceID, countSource)
+			}
+		}
 	}
 	return nil
 }
@@ -1407,6 +1501,100 @@ func workflowHostNodeState(state string) evaluation.WorkflowNodeState {
 		return evaluation.WorkflowNodePending
 	case "failed", "deleted", "deleting":
 		return evaluation.WorkflowNodeUnavailable
+	default:
+		return evaluation.WorkflowNodeUnknown
+	}
+}
+
+func addWorkflowTraceRuntime(ctx context.Context, tx pgx.Tx, builder *workflowTraceBuilder, taskRow workflowTraceTask,
+	taskNode, taskSource string) error {
+	locator := "db://account_agent_runtimes/conversation/" + taskRow.ConversationID + "/current"
+	var serviceInstanceID string
+	if err := tx.QueryRow(ctx, `SELECT instance_id::text FROM service_identity WHERE singleton=true`).Scan(&serviceInstanceID); errors.Is(err, pgx.ErrNoRows) {
+		sourceID, addErr := builder.addSource(evaluation.WorkflowSourceRuntimeSnapshot, locator, struct {
+			Available bool `json:"available"`
+		}{false})
+		if addErr != nil {
+			return addErr
+		}
+		builder.addGap(evaluation.WorkflowStageRuntime, "current account Runtime record is unavailable", evaluation.WorkflowGapUnavailable, nil, sourceID)
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("read workflow Runtime service identity: %w", err)
+	}
+
+	var runtimeID, state string
+	var generation, runtimeSequence, controlVersion int64
+	var leaseExpiresAt pgtype.Timestamptz
+	var leaseActive bool
+	var updatedAt time.Time
+	err := tx.QueryRow(ctx, `SELECT runtime_id,runtime_generation,state,runtime_sequence,control_version,
+lease_expires_at,COALESCE(lease_expires_at>transaction_timestamp(),false),updated_at
+FROM account_agent_runtimes
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND conversation_id=$3`,
+		serviceInstanceID, taskRow.OwnerID, taskRow.ConversationID).Scan(
+		&runtimeID, &generation, &state, &runtimeSequence, &controlVersion, &leaseExpiresAt, &leaseActive, &updatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		sourceID, addErr := builder.addSource(evaluation.WorkflowSourceRuntimeSnapshot, locator, struct {
+			Available         bool   `json:"available"`
+			ServiceInstanceID string `json:"service_instance_id"`
+		}{false, serviceInstanceID})
+		if addErr != nil {
+			return addErr
+		}
+		builder.addGap(evaluation.WorkflowStageRuntime, "current conversation Runtime snapshot is unavailable", evaluation.WorkflowGapUnavailable, nil, sourceID)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read workflow Runtime snapshot: %w", err)
+	}
+
+	expiry := ""
+	if leaseExpiresAt.Valid {
+		expiry = leaseExpiresAt.Time.UTC().Format(time.RFC3339Nano)
+	}
+	sourceID, err := builder.addSource(evaluation.WorkflowSourceRuntimeSnapshot,
+		"db://account_agent_runtimes/"+serviceInstanceID+"/"+runtimeID+"/"+fmt.Sprint(generation), struct {
+			ServiceInstanceID string    `json:"service_instance_id"`
+			ConversationID    string    `json:"conversation_id"`
+			RuntimeID         string    `json:"runtime_id"`
+			Generation        int64     `json:"runtime_generation"`
+			State             string    `json:"state"`
+			RuntimeSequence   int64     `json:"runtime_sequence"`
+			ControlVersion    int64     `json:"control_version"`
+			LeaseExpiresAt    string    `json:"lease_expires_at,omitempty"`
+			LeaseActive       bool      `json:"lease_active"`
+			UpdatedAt         time.Time `json:"updated_at"`
+		}{serviceInstanceID, taskRow.ConversationID, runtimeID, generation, state, runtimeSequence,
+			controlVersion, expiry, leaseActive, updatedAt})
+	if err != nil {
+		return err
+	}
+	runtimeNode := builder.addNode(evaluation.WorkflowNodeRuntime, workflowRuntimeNodeState(state, leaseActive),
+		taskRow.ConversationID+":"+runtimeID+":"+fmt.Sprint(generation), sourceID)
+	builder.addEdge(evaluation.WorkflowEdgeTargets, taskNode, runtimeNode, taskSource, sourceID)
+	// This row describes the current account Runtime lease. It does not capture
+	// the DSH process tree or prove the historical process state for this Task.
+	builder.addGap(evaluation.WorkflowStageRuntime, "DSH process/session snapshot is not captured by the account Runtime registry",
+		evaluation.WorkflowGapUnknown, nil, sourceID)
+	return nil
+}
+
+func workflowRuntimeNodeState(state string, leaseActive bool) evaluation.WorkflowNodeState {
+	if !leaseActive && (state == "starting" || state == "running" || state == "stopping") {
+		return evaluation.WorkflowNodeUnknown
+	}
+	switch state {
+	case "starting":
+		return evaluation.WorkflowNodePending
+	case "running":
+		return evaluation.WorkflowNodeRunning
+	case "stopping":
+		return evaluation.WorkflowNodeWaiting
+	case "stopped":
+		return evaluation.WorkflowNodeUnavailable
+	case "failed":
+		return evaluation.WorkflowNodeFailed
 	default:
 		return evaluation.WorkflowNodeUnknown
 	}

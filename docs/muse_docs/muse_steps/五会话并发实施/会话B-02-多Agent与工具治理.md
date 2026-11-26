@@ -39,6 +39,7 @@
 - **受控实测：**`TestBuiltinSearchIntegrationWithLocalSearxng` 最新运行通过（4.75s）。固定版 MCP → Morde Broker → 本机 SearXNG `!mgn` 实际发现近一周候选，随后通过 `!yh` 按完整标题/发布方解析到 MIT News 直接文章并由 `morde_web_read` 读取；返回正文包含完整标题和 `November 20, 2026`，与 RSS 日期候选 `2026-11-20T20:00:00+00:00` 的 UTC 日期相符。操作写入 Morde MCP 账本并可安全 checkpoint 回放。该证据验证来源候选查询和页面读取；它不证明真实模型已完成新闻相关性判断、独立日期判断或自然语言总结，RSS 时间仍不是已验证日期。
 - **搜索/TLS：**同一固定 SearXNG 容器曾观察到 Google CSE 限流、DuckDuckGo CAPTCHA、Brave engine crash；Yahoo 本次搜索可用。对发布方页面的 HTTPS 请求使用默认严格证书验证成功；未关闭 TLS、未去掉 `time_range`，没有把聚合链接当成来源。不同搜索引擎/网站仍会变化，setup 仅能证明所需引擎加载，不能保证外网长期可用。
 - **定向验证：**后续运行记录在[步骤 2 最新验证](../../../验证记录/Morde_Harness_最终流程测试用例.md#step-2-local-route-news-plan-2026-11-26)。源码 `morde-pc` 在隔离 profile 下启动并显示登录页；本机 Portal 7080/7180 与 DSH 未运行，未登录或发送对话。新闻端到端语义、普通问答账本、追问 Task/revision 权威关联与复杂计划恢复仍待验；B02-0 保持未勾选。本步骤没有启动其他任务。
+- **2026-11-26 当前轮复验：**最新 App/Worker/MCP 搜索与路由定向组、补丁 10 项、离线 RSS 引擎 4 项和独立 PostgreSQL 路由/计划 16 项通过；公开服务健康检查与 Google News RSS 均为 HTTP 200，系统默认 TLS 校验通过。实际源码 Electron 在独立 profile 下仍停在登录页；本机无 Portal/DSH/SearXNG 监听，未发送消息或创建 Task。真实模型新闻总结、来源日期判断、追问目标绑定和计划恢复仍待有认证且连通 DSH 的实际 PC 现场证据，B02-0 不勾选。PostgreSQL 编译时发现的既有 H07 未提交实现只有两处 Go 短变量声明语法错误，本轮仅修复语法；H07 专项验收仍 pending。
 
 - [x] **B02-1 本地多 Agent 协作与结果汇总（R03 本地范围）。**复用现有 DSH 委派与 root → coordinator → worker 两层持久子会话；独立模型回合并行，计划依赖按已结算子任务解锁，工具权限不超过直接父级。失败和 unknown 作为结果交回父级，未确认结果不报成功；重启后沿用原身份和 checkpoint 对账。
 - [ ] **B02-1-PC 实际体验验收。**用实际 `morde-pc` 与真实模型验证语义委派、用户可见结果及 T10/T43；本地合成模型/工具不能替代。
@@ -103,3 +104,15 @@
 - **基线：**当前 `HEAD=07fecb1d`；本轮未修改 B-02 源码，也未连接远端或启动 Portal/DSH/PC。
 - **复验：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run 'AgentChildSession|SelectedMCP|BuiltinSearch|DSHSkill|CloudDSH.*Skill' -count=1 -timeout=8m` 通过（1.060s）；Worker 工具上限、父级 allowlist、嵌套委派和已存选择不扩张 4 项通过（0.847s）；`cd runtime/morde-cloud-runtime && node --test --test-concurrency=1 --test-name-pattern='nudges the Agent after three identical tool calls' test/runtime.test.mjs` 通过（1/1，1.598s）。
 - **结论与待办：**未发现可在 B-02 文件边界内安全独立修复的新问题，不能因本地合同回归通过而勾选实际体验验收。B02-0、B02-1-PC、B02-2-PC、B02-3/4/5/6b/7-PC 仍需按各自验收条件补真实 PC、DSH/模型及稳定 Skill 交接证据；PostgreSQL/重启场景沿用上文已有记录，本轮没有重跑。
+
+### 2026-11-26 步骤 2 本机新闻来源复验
+
+- 完整 `TestBuiltinSearchIntegrationWithLocalSearxng` 在当前工作树通过（10.94s）。固定版本机 SearXNG 与 Morde MCP/Broker 完成 `!mgn` 新闻发现、`!yh` 精确标题/发布方查找及 `morde_web_read` 原文读取；返回 MIT News 直接 HTTPS 文章，正文标题匹配候选、正文可见日期与 RSS 日期候选同日。各操作的持久化结果已核对；首条搜索结果的 checkpoint replay 比对一致。测试后清理本机容器和网络。
+- 这是本机受控工具/来源链路证据，不代表真实模型/DSH 已在 PC 端生成可靠新闻摘要，也不证明生产端搜索开启或外网长期稳定。较早的失败记录仍作为波动证据保留；B02-0 继续待真实模型与 PC 端来源展示验收。
+
+### 2026-11-26 步骤 2 搜索出口只读复核
+
+- Portal `/healthz` 为 HTTP 200；本机到 Google News RSS 的只读请求 HTTP 200、TLS 校验通过。服务器 `eth0` resolver 对 Google 首页的 DNS 回答被 ARIN 登记为 Meta 的地址，对 Yahoo / DuckDuckGo 搜索域名的回答被登记为 Twitter 的地址；`/etc/hosts` 无匹配覆盖，Google Public DNS over HTTPS 返回不同的官方服务地址。服务器 `news.google.com` 解析属 Google 地址范围但 443 超时；Bing 查询未返回可验证结果。服务器 `cloud_dsh.builtin_search.enabled=false`，SearXNG 为 `Exited (0)`。
+- `dig` 直询 eth0 DNS `100.100.2.136/.138` 无 UDP 响应；直询系统级配置 `223.5.5.5/.6` 有响应但给出与公共 DoH 不同、彼此不一致的部分搜索域名地址。未切换 DNS，也未绕过服务商策略。
+- 直接查询 resolver 显示 eth0 的 `100.100.2.136/.138` 无 DNS 响应；系统级配置的 `223.5.5.5/.6` 对搜索域名返回与公共 DoH 不同、且彼此不一致的 A 记录。未切换 DNS 或绕过服务商策略。
+- 因此服务器并非完全断网，但当前存在 DNS 回答异常线索、搜索目标连接失败及内置搜索服务关闭；超时发生在 TLS 握手前，不能归因于证书验证。没有改远端 DNS/网络；生产新闻与 PC/DSH 语义验收保持待验，B02-0 不勾选。

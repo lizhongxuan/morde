@@ -63,6 +63,7 @@ type Deps struct {
 	Control                      ControlService
 	ExecutionControl             ExecutionControlService
 	Tasks                        TaskService
+	TaskPCDeliveryObservations   TaskPCDeliveryObservationService
 	Codex                        CodexService
 	TaskArtifactContent          TaskArtifactContentEndpointService
 	TaskMedia                    TaskMediaService
@@ -226,6 +227,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 		group.GET("/tasks/:id/media/:operation_id/preview", h.getTaskMediaPreview)
 	}
 	h.registerTaskWorkbenchObservationTickets(group, deps.TaskObservationTickets)
+	h.registerTaskPCDeliveryObservations(group, deps.TaskPCDeliveryObservations)
 	h.registerResources(group)
 	h.registerAgentWorkspaceFiles(group, deps.AgentWorkspaceFiles)
 	h.registerWorkspaceSync(group, deps.WorkspaceSync, deps.WorkspaceSyncDevices)

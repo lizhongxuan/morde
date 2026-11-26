@@ -16,6 +16,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
 )
@@ -321,6 +322,226 @@ func TestPostgresScheduleCanBeUnbound(t *testing.T) {
 	if err := store.pool.QueryRow(ctx, `SELECT host_id IS NULL FROM schedules WHERE id=$1`, value.ID).Scan(&isNull); err != nil || !isNull {
 		t.Fatalf("schedule host_id null = %t, err=%v", isNull, err)
 	}
+}
+
+func TestPostgresSchedulePersonalRuleBindingIsExplicitOwnerAndRevisionScoped(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	otherOwner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	principal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(owner.ID)}
+	binding := createActiveSchedulePersonalRuleForTest(t, ctx, store, owner.ID, principal)
+
+	runAt := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
+	timing := schedule.Timing{Kind: schedule.TimingOnce, RunAt: runAt.Format(time.RFC3339), TimeZone: "UTC"}
+	staleSelection := binding
+	staleSelection.CandidateRevision--
+	staleValue, staleRecord := newPostgresScheduleWithRuleForTest(t, owner.ID, "", timing, schedule.MisfireRunOnce,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted}, staleSelection)
+	if _, _, err := store.CreateSchedule(ctx, staleValue, staleRecord); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("create schedule with stale rule revision error = %v, want conflict", err)
+	}
+	foreignValue, foreignRecord := newPostgresScheduleWithRuleForTest(t, otherOwner.ID, "", timing, schedule.MisfireRunOnce,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted}, binding)
+	if _, _, err := store.CreateSchedule(ctx, foreignValue, foreignRecord); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("cross-owner schedule rule binding error = %v, want conflict", err)
+	}
+
+	created, _ := createPostgresScheduleWithRule(t, ctx, store, owner.ID, "", timing, schedule.MisfireRunOnce,
+		[]schedule.NotificationEvent{schedule.NotifyCompleted}, binding)
+	wantBinding := schedule.PersonalRuleBinding{CandidateID: binding.CandidateID, CandidateRevision: binding.CandidateRevision,
+		SourceMemoryID: "m_abcdef01", SourceMemoryRevision: 1}
+	if created.PersonalRule == nil || *created.PersonalRule != wantBinding {
+		t.Fatalf("created Schedule personal rule = %#v, want server-resolved snapshot %#v", created.PersonalRule, wantBinding)
+	}
+
+	runAtValue, err := schedule.FirstOccurrence(timing, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, committed, err := store.CommitScheduleOccurrence(ctx, app.ScheduleOccurrenceCommit{
+		ScheduleID: created.ID, OwnerID: owner.ID, ExpectedVersion: created.Version, ExpectedEpoch: created.ExecutionEpoch,
+		Occurrence: schedule.Occurrence{Key: runAtValue.Key, ScheduledAt: runAtValue.ScheduledAt,
+			CheckAt: runAtValue.CheckAt, Status: schedule.RunQueued},
+		NotificationEvents: created.NotificationEvents,
+	})
+	if err != nil || !committed || run.TaskID == nil || run.PersonalRule == nil || *run.PersonalRule != wantBinding ||
+		run.PersonalRuleValidationStatus != schedule.PersonalRuleValidated || run.PersonalRuleValidatedAt == nil {
+		t.Fatalf("commit explicitly bound schedule run = %#v committed=%t err=%v", run, committed, err)
+	}
+
+	claimed, found, err := store.ClaimNextTask(ctx, "schedule-personal-rule-context-worker", 30*time.Second)
+	if err != nil || !found || claimed.ID != *run.TaskID {
+		t.Fatalf("claim bound scheduled Task: found=%t task=%#v err=%v", found, claimed, err)
+	}
+	items, hasMore, err := store.ListScheduledPersonalContext(ctx, owner.ID, run.ID, *run.TaskID, true, 100)
+	if err != nil || hasMore {
+		t.Fatalf("read explicitly selected scheduled personal context: items=%#v has_more=%t err=%v", items, hasMore, err)
+	}
+	if !containsScheduledPersonalObject(items, personal.ObjectTypeRuleCandidate, binding.CandidateID, binding.CandidateRevision) ||
+		!containsScheduledPersonalObject(items, personal.ObjectTypeMemory, "m_abcdef01", 1) {
+		t.Fatalf("scheduled context does not contain the selected rule and exact source revision: %#v", items)
+	}
+	rule, err := store.GetScheduledPersonalContextObject(ctx, owner.ID, run.ID, *run.TaskID,
+		personal.ObjectTypeRuleCandidate, binding.CandidateID)
+	if err != nil || rule.Revision != binding.CandidateRevision {
+		t.Fatalf("read bound scheduled rule: revision=%d err=%v", rule.Revision, err)
+	}
+	if _, err := store.GetScheduledPersonalContextObject(ctx, owner.ID, run.ID, *run.TaskID,
+		personal.ObjectTypeRuleCandidate, "r_00000002"); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("read unbound candidate for scheduled run error = %v, want forbidden", err)
+	}
+	if _, _, err := store.ListScheduledPersonalContext(ctx, otherOwner.ID, run.ID, *run.TaskID, true, 100); domain.CodeOf(err) != domain.CodeUnauthenticated {
+		t.Fatalf("cross-owner scheduled context read error = %v, want unauthenticated", err)
+	}
+	if _, err := store.GetSchedule(ctx, otherOwner.ID, created.ID); domain.CodeOf(err) != domain.CodeNotFound {
+		t.Fatalf("cross-owner schedule read error = %v, want not_found", err)
+	}
+}
+
+func TestPostgresSchedulePersonalRuleRevocationStopsActiveRunAndDisablesFutureSchedule(t *testing.T) {
+	for _, revokeSource := range []bool{false, true} {
+		t.Run(map[bool]string{false: "candidate deletion", true: "source revision update"}[revokeSource], func(t *testing.T) {
+			store, _ := newTemporaryStore(t)
+			ctx := context.Background()
+			owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+			principal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(owner.ID)}
+			binding := createActiveSchedulePersonalRuleForTest(t, ctx, store, owner.ID, principal)
+
+			futureTiming := schedule.Timing{Kind: schedule.TimingDaily,
+				StartsOn: time.Now().UTC().AddDate(0, 0, 1).Format("2006-01-02"), LocalTime: "09:00", TimeZone: "UTC"}
+			futureSchedule, _ := createPostgresScheduleWithRule(t, ctx, store, owner.ID, "", futureTiming,
+				schedule.MisfireSkip, []schedule.NotificationEvent{schedule.NotifyCompleted}, binding)
+
+			runAt := time.Now().UTC().Add(-2 * time.Second).Truncate(time.Second)
+			onceTiming := schedule.Timing{Kind: schedule.TimingOnce, RunAt: runAt.Format(time.RFC3339), TimeZone: "UTC"}
+			activeSchedule, _ := createPostgresScheduleWithRule(t, ctx, store, owner.ID, "", onceTiming,
+				schedule.MisfireRunOnce, []schedule.NotificationEvent{schedule.NotifyCompleted}, binding)
+			occurrence, err := schedule.FirstOccurrence(onceTiming, time.Now().UTC())
+			if err != nil {
+				t.Fatal(err)
+			}
+			run, committed, err := store.CommitScheduleOccurrence(ctx, app.ScheduleOccurrenceCommit{
+				ScheduleID: activeSchedule.ID, OwnerID: owner.ID, ExpectedVersion: activeSchedule.Version,
+				ExpectedEpoch: activeSchedule.ExecutionEpoch,
+				Occurrence: schedule.Occurrence{Key: occurrence.Key, ScheduledAt: occurrence.ScheduledAt,
+					CheckAt: occurrence.CheckAt, Status: schedule.RunQueued},
+				NotificationEvents: activeSchedule.NotificationEvents,
+			})
+			if err != nil || !committed || run.TaskID == nil {
+				t.Fatalf("create active bound run before revocation: run=%#v committed=%t err=%v", run, committed, err)
+			}
+
+			var mutation personal.Mutation
+			if revokeSource {
+				mutation = personalContentMutationForTest(t, owner.ID, 90, personal.Object{
+					ObjectType: personal.ObjectTypeMemory, ObjectID: "m_abcdef01",
+					Body: json.RawMessage(`{"content":"updated source memory"}`),
+				}, 1)
+			} else {
+				mutation = personal.Mutation{OwnerID: owner.ID, MutationID: "schedule-rule-revoke-001",
+					ObjectType: personal.ObjectTypeRuleCandidate, ObjectID: binding.CandidateID,
+					BaseRevision: binding.CandidateRevision, Delete: true}
+				mutation.RequestHash, err = personal.HashMutationContent(mutation)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := store.ApplyPersonalMutation(ctx, principal, mutation); err != nil {
+				t.Fatalf("revoke bound personal rule: %v", err)
+			}
+
+			var validationStatus string
+			var revokedAt bool
+			var taskStatus string
+			if err := store.pool.QueryRow(ctx, `SELECT r.personal_rule_validation_status,r.personal_rule_revoked_at IS NOT NULL,t.status
+FROM schedule_runs r JOIN tasks t ON t.id=r.task_id AND t.owner_id=r.owner_id
+WHERE r.id=$1 AND r.owner_id=$2`, run.ID, owner.ID).Scan(&validationStatus, &revokedAt, &taskStatus); err != nil {
+				t.Fatal(err)
+			}
+			if validationStatus != string(schedule.PersonalRuleRevoked) || !revokedAt || taskStatus != string(task.StatusCancelling) {
+				t.Fatalf("revoked run/task state = validation:%s revoked_at:%t task:%s; want revoked/true/cancelling", validationStatus, revokedAt, taskStatus)
+			}
+			var pendingCancel int
+			if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM task_stop_requests WHERE task_id=$1 AND action='cancel' AND status='pending'`, *run.TaskID).Scan(&pendingCancel); err != nil || pendingCancel != 1 {
+				t.Fatalf("revoked Task pending cancellation count = %d, err=%v; want 1", pendingCancel, err)
+			}
+			loadedFuture, err := store.GetSchedule(ctx, owner.ID, futureSchedule.ID)
+			if err != nil || loadedFuture.Status != schedule.StatusDisabled || loadedFuture.NextCheckAt != nil || loadedFuture.NextOccurrenceKey != "" {
+				t.Fatalf("future Schedule after rule revocation = %#v err=%v; want disabled with no next occurrence", loadedFuture, err)
+			}
+			if _, err := store.GetScheduledPersonalContextObject(ctx, owner.ID, run.ID, *run.TaskID,
+				personal.ObjectTypeRuleCandidate, binding.CandidateID); domain.CodeOf(err) != domain.CodeUnauthenticated {
+				t.Fatalf("scheduled rule context after revocation error = %v, want unauthenticated", err)
+			}
+		})
+	}
+}
+
+func createActiveSchedulePersonalRuleForTest(t *testing.T, ctx context.Context, store *Store, ownerID string,
+	principal identity.Principal) schedule.PersonalRuleBinding {
+	t.Helper()
+	source := personal.Object{ObjectType: personal.ObjectTypeMemory, ObjectID: "m_abcdef01",
+		Body: json.RawMessage(`{"content":"prefers source-backed weekly summaries"}`)}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, ownerID, 80, source, 0)); err != nil {
+		t.Fatalf("create scheduled rule source memory: %v", err)
+	}
+	candidate := personal.Object{ObjectType: personal.ObjectTypeRuleCandidate, ObjectID: "r_00000001",
+		Body: json.RawMessage(`{"scope":"personal","status":"candidate","source_memory_id":"m_abcdef01","source_memory_revision":1}`)}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, ownerID, 81, candidate, 0)); err != nil {
+		t.Fatalf("create scheduled rule candidate: %v", err)
+	}
+	for index, status := range []string{personal.RuleCandidateValidated, personal.RuleCandidateActive} {
+		candidate.Body = json.RawMessage(`{"scope":"personal","status":"` + status + `","source_memory_id":"m_abcdef01","source_memory_revision":1}`)
+		if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, ownerID, 82+index, candidate, int64(index+1))); err != nil {
+			t.Fatalf("advance scheduled rule candidate to %s: %v", status, err)
+		}
+	}
+	return schedule.PersonalRuleBinding{CandidateID: candidate.ObjectID, CandidateRevision: 3}
+}
+
+func createPostgresScheduleWithRule(t *testing.T, ctx context.Context, store *Store, ownerID, hostID string,
+	timing schedule.Timing, policy schedule.MisfirePolicy, events []schedule.NotificationEvent,
+	binding schedule.PersonalRuleBinding) (schedule.Schedule, app.IdempotencyRecord) {
+	t.Helper()
+	value, record := newPostgresScheduleWithRuleForTest(t, ownerID, hostID, timing, policy, events, binding)
+	created, replayed, err := store.CreateSchedule(ctx, value, record)
+	if err != nil || replayed || created.ID != value.ID {
+		t.Fatalf("create explicitly bound Schedule = %#v replayed=%t err=%v", created, replayed, err)
+	}
+	return created, record
+}
+
+func newPostgresScheduleWithRuleForTest(t *testing.T, ownerID, hostID string, timing schedule.Timing,
+	policy schedule.MisfirePolicy, events []schedule.NotificationEvent,
+	binding schedule.PersonalRuleBinding) (schedule.Schedule, app.IdempotencyRecord) {
+	t.Helper()
+	occurrence, err := schedule.FirstOccurrence(timing, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := mustID(t, schedule.NewID)
+	value := schedule.Schedule{
+		ID: id, OwnerID: ownerID, Version: 1, Status: schedule.StatusEnabled, ExecutionEpoch: 1,
+		HostID: hostID, ModelID: "model-test", Title: "Scheduled rule display title", Objective: "scheduled rule objective",
+		Timing: timing, Budget: task.Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000},
+		Authorization: task.Authorization{Kind: string(identity.KindSession), TokenID: testSessionTokenID(ownerID)},
+		MisfirePolicy: policy, NotificationEvents: events, NextOccurrenceKey: occurrence.Key,
+		NextRunAt: occurrence.ScheduledAt, NextCheckAt: &occurrence.CheckAt,
+		PersonalRule: &schedule.PersonalRuleBinding{CandidateID: binding.CandidateID, CandidateRevision: binding.CandidateRevision},
+	}
+	record := testIdempotency(ownerID, "schedule.create", "schedule-rule-create-"+id)
+	record.ResourceID = id
+	return value, record
+}
+
+func containsScheduledPersonalObject(items []personal.Object, objectType, objectID string, revision int64) bool {
+	for _, item := range items {
+		if item.ObjectType == objectType && item.ObjectID == objectID && item.Revision == revision {
+			return true
+		}
+	}
+	return false
 }
 
 func TestPostgresScheduleOccurrenceMustMatchCurrentOccurrence(t *testing.T) {

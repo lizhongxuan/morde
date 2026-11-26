@@ -826,7 +826,7 @@ func serve(ctx context.Context, configPath string) error {
 		Tokens: tokenAdapter{service: tokens}, ClientLogin: clientLogin,
 		Notifications: notificationService,
 		Control:       controlService, ExecutionControl: executionControlService, Tasks: executionAdapters.tasks, TaskArtifactContent: tasks, TaskFileFetch: tasks,
-		TaskObservationTickets: tasks, Conversations: conversations, Codex: codexService,
+		TaskObservationTickets: tasks, TaskPCDeliveryObservations: tasks, Conversations: conversations, Codex: codexService,
 		ProjectConversations:           projectConversations,
 		ProjectConversationAttachments: projectConversationAttachments,
 		ProjectWorkItems:               projectWorkItems,

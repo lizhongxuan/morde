@@ -6044,6 +6044,29 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/pc-delivery-observations:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    post:
+      tags: [Tasks]
+      operationId: observeTaskReplyInPC
+      summary: Record a desktop client-visible Task reply
+      description: Accepts only a client web session bound to an active desktop installation and a completed, published assistant message for this Task and revision. The server records its own observation time and installation identity; request bodies contain no message content.
+      security: [{ portalSession: [] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskPCDeliveryObservationRequest' }
+      responses:
+        '204': { description: The PC-visible observation was recorded idempotently. }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/workspace-view-deletions:
     parameters:
       - name: id
@@ -13360,6 +13383,13 @@ components:
         task_id: { $ref: '#/components/schemas/TaskId' }
         host_id: { $ref: '#/components/schemas/HostId' }
         expires_at: { type: string, format: date-time }
+    TaskPCDeliveryObservationRequest:
+      type: object
+      additionalProperties: false
+      required: [message_id, task_revision]
+      properties:
+        message_id: { $ref: '#/components/schemas/MessageId' }
+        task_revision: { type: integer, format: int64, minimum: 0, description: Exact revision represented by the completed assistant message. }
     TaskWorkbenchObservationSnapshot:
       type: object
       additionalProperties: false
@@ -14044,7 +14074,7 @@ components:
       required: [id, kind, locator]
       properties:
         id: { type: string, maxLength: 128 }
-        kind: { type: string, enum: [task_ledger, agent_ledger, model_call_ledger, operation_ledger, approval_ledger, validation_ledger, conversation_output, pc_observation, runtime_snapshot, host_snapshot, route_result, local_test, code_inspection, evaluation_run] }
+        kind: { type: string, enum: [task_ledger, agent_ledger, model_call_ledger, operation_ledger, approval_ledger, validation_ledger, conversation_output, pc_observation, authorization_snapshot, runtime_snapshot, host_snapshot, route_result, local_test, code_inspection, evaluation_run] }
         locator: { type: string, maxLength: 1024 }
         sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
       additionalProperties: false
@@ -14053,7 +14083,7 @@ components:
       required: [id, kind, state, source_ids]
       properties:
         id: { type: string, maxLength: 128 }
-        kind: { type: string, enum: [route, task, agent, model_call, operation, approval, validation, delivery, host, authorization] }
+        kind: { type: string, enum: [route, task, agent, model_call, operation, approval, validation, delivery, host, runtime, authorization] }
         state: { type: string, enum: [started, running, settled, completed, failed, waiting, waiting_user, pending, approved, rejected, expired, cancelled, unknown, unavailable] }
         source_ids: { type: array, minItems: 1, items: { type: string, maxLength: 128 } }
       additionalProperties: false
@@ -14072,7 +14102,7 @@ components:
       required: [id, stage, scope, state, source_ids]
       properties:
         id: { type: string, maxLength: 128 }
-        stage: { type: string, enum: [route, task, agent, model_call, operation, approval, verification, delivery, host, authorization, provenance] }
+        stage: { type: string, enum: [route, task, agent, model_call, operation, approval, verification, delivery, host, runtime, authorization, provenance] }
         scope: { type: string, maxLength: 512 }
         state: { type: string, enum: [absent, not_run, unavailable, unknown] }
         count: { type: integer, minimum: 0 }

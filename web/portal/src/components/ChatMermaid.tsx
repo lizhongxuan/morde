@@ -156,25 +156,26 @@ type RenderState = { status: 'loading' } | { status: 'error' } | { status: 'succ
 export function ChatMermaid({ source }: { source: string }) {
   const reactId = useId();
   const diagramId = `morde-mermaid-${reactId.replace(/[^a-zA-Z0-9_-]/g, '')}`;
-  const [renderState, setRenderState] = useState<RenderState>({ status: 'loading' });
+  const [renderResult, setRenderResult] = useState<{ source: string; state: RenderState }>({
+    source: '',
+    state: { status: 'loading' },
+  });
   const [copyMessage, setCopyMessage] = useState('');
+  const renderState = !hasSafeFlowchartSource(source)
+    ? { status: 'error' } as const
+    : renderResult.source === source ? renderResult.state : { status: 'loading' } as const;
 
   useEffect(() => {
     let cancelled = false;
 
-    if (!hasSafeFlowchartSource(source)) {
-      setRenderState({ status: 'error' });
-      return () => { cancelled = true; };
-    }
-
-    setRenderState({ status: 'loading' });
+    if (!hasSafeFlowchartSource(source)) return () => { cancelled = true; };
     void renderFlowchart(diagramId, source)
       .then((svg) => parseSafeSvg(svg))
       .then((diagram) => {
-        if (!cancelled) setRenderState({ status: 'success', diagram });
+        if (!cancelled) setRenderResult({ source, state: { status: 'success', diagram } });
       })
       .catch(() => {
-        if (!cancelled) setRenderState({ status: 'error' });
+        if (!cancelled) setRenderResult({ source, state: { status: 'error' } });
       });
 
     return () => { cancelled = true; };

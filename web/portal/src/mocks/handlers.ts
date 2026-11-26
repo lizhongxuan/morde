@@ -1980,6 +1980,27 @@ export const handlers = [
       return failure("invalid_argument", "计划定义无效", 400);
     }
     const timestamp = now();
+    let personalRule: Schedule["personal_rule"] = null;
+    if (body.personal_rule) {
+      const candidate = personalObjects.get(personalObjectKey(user.id, "rule_candidate", body.personal_rule.candidate_id))?.value;
+      const candidateBody = candidate?.body as { scope?: string; status?: string; source_memory_id?: string; source_memory_revision?: number } | undefined;
+      const sourceMemoryID = candidateBody?.source_memory_id;
+      const sourceMemoryRevision = candidateBody?.source_memory_revision;
+      const source = sourceMemoryID
+        ? personalObjects.get(personalObjectKey(user.id, "memory", sourceMemoryID))?.value
+        : undefined;
+      if (!candidate || candidate.revision !== body.personal_rule.candidate_revision || candidateBody?.scope !== "personal" ||
+        candidateBody.status !== "active" || !sourceMemoryID || typeof sourceMemoryRevision !== "number" || !Number.isSafeInteger(sourceMemoryRevision) ||
+        source?.revision !== sourceMemoryRevision) {
+        return failure("conflict", "个人规则来源已变化或不可用", 409);
+      }
+      const candidateID = candidate.object_id;
+      const candidateRevision = candidate.revision;
+      personalRule = {
+        candidate_id: candidateID, candidate_revision: candidateRevision,
+        source_memory_id: sourceMemoryID, source_memory_revision: sourceMemoryRevision,
+      };
+    }
     const value: Schedule = {
       id: id("j"), version: 1, status: "enabled", host_id: body.host_id, model_id: body.model_id,
       title: body.title ?? body.objective.trim(), objective: body.objective,
@@ -1987,6 +2008,7 @@ export const handlers = [
       timing: body.timing, budget: body.budget, misfire_policy: body.misfire_policy ?? "skip",
       notification_events: body.notification_events ?? ["completed", "failed", "waiting_user"],
       observation: body.observation ?? null,
+      personal_rule: personalRule,
       next_run_at: body.timing.kind === "once" ? body.timing.run_at : new Date(Date.now() + 60_000).toISOString(),
       last_run: null, current_run: null, created_at: timestamp, updated_at: timestamp,
     };

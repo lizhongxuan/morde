@@ -28,6 +28,7 @@ type cloudDSHScheduledPersonalContextStub struct {
 	ownerID       string
 	runID         string
 	taskID        string
+	boundRuleID   string
 	items         []personal.Object
 	objects       map[string]personal.Object
 	listCalls     int
@@ -42,6 +43,9 @@ func (s *cloudDSHScheduledPersonalContextStub) ListScheduledPersonalContext(_ co
 	items := make([]personal.Object, 0, len(s.items))
 	for _, item := range s.items {
 		if item.ObjectType == personal.ObjectTypeMemory && !includeMemory {
+			continue
+		}
+		if item.ObjectType == personal.ObjectTypeRuleCandidate && item.ObjectID != s.boundRuleID {
 			continue
 		}
 		items = append(items, item)
@@ -246,6 +250,11 @@ func TestCloudDSHScheduledPersonalContextUsesExactRunAndHonorsMemoryOptOut(t *te
 	proof := strings.TrimPrefix(initial[strings.LastIndex(initial, "\n")+1:], CloudDSHMemoryProofPrefix)
 	if proof == "" || strings.Contains(proof, "prefers concise answers") || broker.ValidatePersonalMemoryProof(context.Background(), claimed, proof, nil) != nil {
 		t.Fatalf("scheduled memory proof missing, exposed data, or invalid: %q", proof)
+	}
+	reader.boundRuleID = "r_00000001"
+	withBoundRule, err := broker.InitialContext(context.Background(), claimed)
+	if err != nil || !strings.Contains(withBoundRule, "r_00000001") {
+		t.Fatalf("explicitly bound scheduled rule was not included: context=%q err=%v", withBoundRule, err)
 	}
 
 	setting.Revision++

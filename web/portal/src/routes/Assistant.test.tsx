@@ -3023,6 +3023,35 @@ describe('Assistant durable tasks', () => {
     expect(await screen.findByRole('status', { name: 'Morde 正在思考' })).toBeInTheDocument();
   });
 
+  it('replaces route thinking with the saved failure after a status refresh, without replaying an unknown call', async () => {
+    const failed = failedConversationMessage({ content: '搜索今天的新闻' });
+    const processing = { ...failed, routing_status: 'processing' as const, routing_failure_reason: undefined };
+    mockCommon({ conversations: [conversation], messages: [processing] });
+    const messageList = vi.mocked(portalApi.conversationMessages);
+    messageList.mockReset().mockResolvedValueOnce({ items: [processing], next_cursor: null })
+      .mockResolvedValue({ items: [failed], next_cursor: null });
+    vi.mocked(portalApi.conversationMessageRetryEligibility).mockResolvedValue({
+      retry_eligible: false, retry_reason: 'reconciliation_required',
+    } as unknown as Awaited<ReturnType<typeof portalApi.conversationMessageRetryEligibility>>);
+    const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing');
+    renderPage();
+
+    expect(await screen.findByRole('status', { name: 'Morde 正在思考' })).toBeInTheDocument();
+    const originalArticle = await screen.findByRole('article', { name: '你的消息' });
+    expect(originalArticle).toHaveAttribute('id', `conversation-message-${encodeURIComponent(failed.id)}`);
+    await waitFor(() => expect(messageList).toHaveBeenCalledTimes(2), { timeout: 5_000 });
+
+    const failureRow = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    expect(within(failureRow).getByText('刚才没能处理你的消息')).toBeInTheDocument();
+    expect(within(failureRow).getByText('暂时无法确定具体原因，原消息已保留。')).toBeInTheDocument();
+    expect(failureRow).not.toHaveTextContent('model_unavailable');
+    expect(within(failureRow).getByText('上次共享模型调用仍待对账；完成对账前不会重复处理。')).toBeInTheDocument();
+    expect(within(failureRow).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Morde 正在思考' })).not.toBeInTheDocument();
+    expect(screen.getByRole('article', { name: '你的消息' })).toHaveAttribute('id', originalArticle.id);
+    expect(retry).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['等待审核', { status: 'waiting_user' as const, waiting_reason: 'approval', pending_request: {
       id: 'k1234567', version: 1, kind: 'approval' as const, status: 'pending' as const, title: '确认操作', object: '工作区',
@@ -4225,6 +4254,60 @@ describe('Assistant durable tasks', () => {
     expect(within(activity).queryByText('docs/public.md:-1')).not.toBeInTheDocument();
     expect(within(activity).queryByText('工作区修订 -1')).not.toBeInTheDocument();
     expect(within(activity).queryByText('f'.repeat(64))).not.toBeInTheDocument();
+  });
+
+  it('shows each result claim only the source locations linked to that claim', async () => {
+    const firstClaim = '登录模块读取身份。';
+    const secondClaim = '支付模块创建订单。';
+    const result = `${firstClaim}${secondClaim}`;
+    const resultBytes = new TextEncoder().encode(result);
+    const splitByte = new TextEncoder().encode(firstClaim).length;
+    const stepID = 's1234567';
+    const revision = 3;
+    const completedTask: Task = {
+      ...task,
+      status: 'completed',
+      result,
+      finished_at: timestamp,
+      current_revision: revision,
+      desired_revision: revision,
+      event_sequence: 8,
+      steps: [{ id: stepID, sequence: 2, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run Hostless Workspace tool: morde_workspace_search', summary: '文件搜索完成', created_at: timestamp }],
+      validation_detail: {
+        task_revision: revision,
+        event_sequence: 8,
+        result_sha256: 'a'.repeat(64),
+        claims: [
+          { claim_id: 'claim-auth', start_byte: 0, end_byte: splitByte,
+            evidence_refs: [{ kind: 'action', id: stepID, task_revision: revision, sequence: 2 }],
+            source_location_state: 'mapped', source_location_ids: ['source-auth'] },
+          { claim_id: 'claim-payment', start_byte: splitByte, end_byte: resultBytes.length,
+            evidence_refs: [{ kind: 'result', id: stepID, task_revision: revision, sequence: 2 }],
+            source_location_state: 'mapped', source_location_ids: ['source-payment'] },
+        ],
+        source_locations: [
+          { id: 'source-auth', kind: 'workspace_file', workspace_id: 'w1234567', path: 'docs/auth.md',
+            revision, state: 'immutable_workspace_revision', content_sha256: 'b'.repeat(64) },
+          { id: 'source-payment', kind: 'workspace_file', workspace_id: 'w1234567', path: 'docs/payment.md',
+            revision, state: 'immutable_workspace_revision', content_sha256: 'c'.repeat(64) },
+        ],
+      },
+    };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(completedTask);
+    renderPage();
+
+    const activity = await findTaskActivity(task.id);
+    const sourceSection = within(activity).getByRole('region', { name: '结论与来源位置' });
+    const claims = Array.from(sourceSection.querySelectorAll(':scope > ol > li'));
+    expect(claims).toHaveLength(2);
+    expect(claims[0]).toHaveTextContent(firstClaim);
+    expect(claims[0]).toHaveTextContent('docs/auth.md');
+    expect(claims[0]).not.toHaveTextContent('docs/payment.md');
+    expect(claims[1]).toHaveTextContent(secondClaim);
+    expect(claims[1]).toHaveTextContent('docs/payment.md');
+    expect(claims[1]).not.toHaveTextContent('docs/auth.md');
   });
 
   it('does not show web result evidence for an unconfirmed step', async () => {

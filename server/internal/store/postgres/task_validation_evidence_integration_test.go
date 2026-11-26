@@ -1002,6 +1002,15 @@ func TestPostgresTaskValidationEvidenceResolvesArtifactSourceCall(t *testing.T) 
 }
 
 func TestPostgresTaskValidationArtifactEvidenceTracksCurrentWorkspaceFile(t *testing.T) {
+	testPostgresTaskValidationArtifactEvidenceTracksCurrentWorkspaceFile(t, false)
+}
+
+func TestPostgresTaskValidationWorkspaceUpdateRacesReviewCompletion(t *testing.T) {
+	testPostgresTaskValidationArtifactEvidenceTracksCurrentWorkspaceFile(t, true)
+}
+
+func testPostgresTaskValidationArtifactEvidenceTracksCurrentWorkspaceFile(t *testing.T, raceWorkspaceUpdate bool) {
+	t.Helper()
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
@@ -1055,12 +1064,17 @@ func TestPostgresTaskValidationArtifactEvidenceTracksCurrentWorkspaceFile(t *tes
 	if err != nil || replayed {
 		t.Fatalf("start Task Agent: lease=%+v replayed=%t err=%v", started.Fence, replayed, err)
 	}
-	if _, err := store.pool.Exec(ctx, `INSERT INTO model_connections
+	for _, model := range []struct{ id, name, endpoint, model string }{
+		{"p1234567", "validation artifact execution model", "https://api.openai.com/v1", "gpt-6-luna"},
+		{"p2234567", "validation artifact reviewer model", "https://api.deepseek.com", "deepseek-flash"},
+	} {
+		if _, err := store.pool.Exec(ctx, `INSERT INTO model_connections
 (id,owner_id,name,base_url,model_name,api_key_cipher,checked_at,capability_text)
-VALUES ('p1234567',NULL,'validation artifact execution model','https://api.openai.com/v1','gpt-6-luna',
-decode(repeat('00',29),'hex'),clock_timestamp(),true)
-ON CONFLICT (id) DO UPDATE SET base_url=EXCLUDED.base_url,model_name=EXCLUDED.model_name,checked_at=clock_timestamp(),capability_text=true`); err != nil {
-		t.Fatalf("seed execution model connection: %v", err)
+VALUES ($1,NULL,$2,$3,$4,decode(repeat('00',29),'hex'),clock_timestamp(),true)
+ON CONFLICT (id) DO UPDATE SET base_url=EXCLUDED.base_url,model_name=EXCLUDED.model_name,checked_at=clock_timestamp(),capability_text=true`,
+			model.id, model.name, model.endpoint, model.model); err != nil {
+			t.Fatalf("seed %s connection: %v", model.name, err)
+		}
 	}
 	executionModel := seedTaskValidationExecutionModelResponse(t, store, started.Fence)
 	stepID := mustID(t, domain.NewStepID)
@@ -1107,6 +1121,12 @@ ON CONFLICT (id) DO UPDATE SET base_url=EXCLUDED.base_url,model_name=EXCLUDED.mo
 	if err != nil {
 		t.Fatal(err)
 	}
+	changed := []byte("wrong")
+	if raceWorkspaceUpdate {
+		runTaskValidationWorkspaceUpdateRace(t, store, ctx, created.Task.ID, owner.ID, workspaceValue.ID, path, changed,
+			contentProof, executionModel, details.ValidationEvidence)
+		return
+	}
 	if _, err := store.pool.Exec(ctx, `UPDATE task_validation_reviews
 SET state='reviewed',validation_state='PASS',execution_model_call_id=$5,
     reviewer_session_id='fixture_reviewer',execution_model_id='paaaaaaa',execution_connection_version=clock_timestamp(),
@@ -1123,7 +1143,6 @@ SET state='reviewed',validation_state='PASS',execution_model_call_id=$5,
 	if err != nil || details.Validation.State != app.TaskValidationPass {
 		t.Fatalf("current committed Workspace file validation = %#v err=%v; want PASS", details.Validation, err)
 	}
-	changed := []byte("wrong")
 	if _, err := store.pool.Exec(ctx, `INSERT INTO workspace_revisions(workspace_id,revision,file_count,total_bytes)
 VALUES ($1,1,1,$2)`, workspaceValue.ID, len(changed)); err != nil {
 		t.Fatal(err)
@@ -1139,6 +1158,111 @@ WHERE workspace_id=$1 AND file_path=$2`, workspaceValue.ID, path); err != nil {
 	details, err = store.GetTask(ctx, created.Task.ID, owner.ID)
 	if err != nil || details.Validation.State != app.TaskValidationPending {
 		t.Fatalf("changed current Workspace file validation = %#v err=%v; want pending", details.Validation, err)
+	}
+}
+
+func runTaskValidationWorkspaceUpdateRace(t *testing.T, store *Store, ctx context.Context, taskID, ownerID, workspaceID, path string,
+	changed []byte, proof app.TaskValidationReviewArtifactContentProof, executionModel app.TaskValidationReviewModel,
+	evidence *app.TaskValidationEvidenceRecord) {
+	t.Helper()
+	claims, err := store.ClaimTaskValidationReviews(ctx, "workspace-race-reviewer", 30*time.Second, 1)
+	if err != nil || len(claims) != 1 {
+		t.Fatalf("claim Workspace race review: claims=%+v err=%v", claims, err)
+	}
+	completion := taskValidationReviewCompletionFixture(t, store, claims[0], evidence)
+	completion.ExecutionModel = executionModel
+	completion.ArtifactContentProofs = []app.TaskValidationReviewArtifactContentProof{proof}
+	completion.ReviewerModel.SessionID = completion.SessionID
+	completion.ReviewerModel.ThroughSequence = 0
+	completion.ReviewerModel, completion.ResponseText = settleTaskValidationReviewModelResponse(t, store, claims[0], completion.ReviewerModel, completion.Report)
+
+	writer, err := store.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin concurrent Workspace update: %v", err)
+	}
+	defer func() { _ = writer.Rollback(context.Background()) }()
+	var currentRevision int64
+	if err := writer.QueryRow(ctx, `SELECT revision FROM workspaces WHERE id=$1 FOR UPDATE`, workspaceID).Scan(&currentRevision); err != nil || currentRevision != 0 {
+		t.Fatalf("lock current Workspace revision=%d err=%v; want revision 0", currentRevision, err)
+	}
+	changedHash := sha256.Sum256(changed)
+	changedDigest := hex.EncodeToString(changedHash[:])
+	chunks, err := json.Marshal([]workspace.Chunk{{SHA256: changedDigest, SizeBytes: int64(len(changed))}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Exec(ctx, `INSERT INTO workspace_revisions(workspace_id,revision,file_count,total_bytes)
+VALUES ($1,1,1,$2)`, workspaceID, len(changed)); err != nil {
+		t.Fatalf("insert concurrent Workspace revision: %v", err)
+	}
+	updated, err := writer.Exec(ctx, `UPDATE workspace_revision_files SET valid_to_revision=1
+WHERE workspace_id=$1 AND file_path=$2 AND valid_to_revision IS NULL`, workspaceID, path)
+	if err != nil || updated.RowsAffected() != 1 {
+		t.Fatalf("close prior Workspace manifest row: rows=%d err=%v", updated.RowsAffected(), err)
+	}
+	if _, err := writer.Exec(ctx, `INSERT INTO workspace_revision_files
+(workspace_id,valid_from_revision,file_path,folded_path,size_bytes,sha256,mode,chunks)
+VALUES ($1,1,$2,lower($2),$3,$4,420,$5::jsonb)`, workspaceID, path, len(changed), changedDigest, chunks); err != nil {
+		t.Fatalf("insert changed Workspace manifest row: %v", err)
+	}
+	if _, err := writer.Exec(ctx, `UPDATE workspaces SET revision=1 WHERE id=$1 AND revision=0`, workspaceID); err != nil {
+		t.Fatalf("advance concurrent Workspace revision: %v", err)
+	}
+
+	type completionResult struct {
+		updated bool
+		err     error
+	}
+	completed := make(chan completionResult, 1)
+	started := make(chan struct{})
+	go func() {
+		close(started)
+		updated, err := store.CompleteTaskValidationReview(ctx, completion)
+		completed <- completionResult{updated: updated, err: err}
+	}()
+	<-started
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var blockedOnWorkspace bool
+		if err := store.pool.QueryRow(ctx, `SELECT EXISTS (
+SELECT 1 FROM pg_stat_activity
+WHERE datname=current_database() AND wait_event_type='Lock'
+  AND query LIKE '%SELECT owner_id FROM workspaces WHERE id=$1 FOR SHARE%')`).Scan(&blockedOnWorkspace); err != nil {
+			t.Fatalf("observe validation waiting for Workspace fence: %v", err)
+		}
+		if blockedOnWorkspace {
+			break
+		}
+		select {
+		case result := <-completed:
+			t.Fatalf("validation completion did not wait for Workspace fence: updated=%t err=%v", result.updated, result.err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("validation completion did not reach the Workspace share lock while the concurrent update held its row lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := writer.Commit(ctx); err != nil {
+		t.Fatalf("commit concurrent Workspace update: %v", err)
+	}
+	var result completionResult
+	select {
+	case result = <-completed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("validation completion did not resume after the Workspace update committed")
+	}
+	if result.err != nil || !result.updated {
+		t.Fatalf("complete review after Workspace update: updated=%t err=%v; want a persisted pending review", result.updated, result.err)
+	}
+	var reviewState, validationState string
+	if err := store.pool.QueryRow(ctx, `SELECT state,COALESCE(validation_state,'') FROM task_validation_reviews WHERE task_id=$1`, taskID).
+		Scan(&reviewState, &validationState); err != nil || reviewState != "reviewed" || validationState != string(app.TaskValidationPending) {
+		t.Fatalf("concurrent Workspace update persisted review state=%q validation=%q err=%v; want reviewed/pending", reviewState, validationState, err)
+	}
+	details, err := store.GetTask(ctx, taskID, ownerID)
+	if err != nil || details.Validation.State != app.TaskValidationPending {
+		t.Fatalf("concurrent Workspace update Task validation = %#v err=%v; want pending", details.Validation, err)
 	}
 }
 
@@ -1376,6 +1500,94 @@ VALUES ($1,$2,1,'tool','succeeded','operation','synthetic',0,$3,$4,$5,'binding-s
 			}
 			if facts.ApprovalHistoryVerified {
 				t.Fatalf("mismatched %s approval hash was accepted", test.name)
+			}
+		})
+	}
+}
+
+func TestPostgresTaskValidationUnresolvedApprovalCannotPass(t *testing.T) {
+	f := newResultAggregationFixture(t)
+	ctx := context.Background()
+	for _, status := range []string{"pending", "rejected", "expired", "cancelled"} {
+		t.Run(status, func(t *testing.T) {
+			value := f.createTask(t, f.ownerID, "verify an operation with "+status+" approval")
+			approvalStatus := status
+			if approvalStatus == "pending" || approvalStatus == "cancelled" {
+				// Use a valid request row while attaching a succeeded
+				// operation receipt. This inconsistent history must remain
+				// unverified rather than being inferred from the tool step.
+				approvalStatus = "approved"
+			}
+			approval := insertConversationResultTestApproval(t, f, value.ID, 0, approvalStatus,
+				"call-unresolved-"+status, "morde_workspace_write")
+			if status == "pending" {
+				if _, err := f.store.pool.Exec(ctx, `UPDATE task_pending_requests
+SET status='pending',decision='',responded_at=NULL,expires_at=clock_timestamp()+interval '5 minutes'
+WHERE id=$1`, approval.id); err != nil {
+					t.Fatalf("restore pending approval state: %v", err)
+				}
+			} else if status == "cancelled" {
+				if _, err := f.store.pool.Exec(ctx, `UPDATE task_pending_requests
+SET status='cancelled',decision='',responded_at=clock_timestamp(),expires_at=NULL
+WHERE id=$1`, approval.id); err != nil {
+					t.Fatalf("cancel approval request: %v", err)
+				}
+			}
+			insertConversationResultTestWorkspacePublish(t, f, value.ID, "succeeded", 0, approval)
+			sessionID := "validation-approval-" + status
+			if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_agent_sessions(task_id,owner_id,session_id,task_revision)
+VALUES ($1,$2,$3,0)`, value.ID, f.ownerID, sessionID); err != nil {
+				t.Fatalf("insert Task Agent session: %v", err)
+			}
+			stepID := mustID(t, domain.NewStepID)
+			if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_steps
+(id,task_id,sequence,kind,status,title,summary,task_revision,tool_call_key,tool_name,request_digest,agent_session_id)
+VALUES ($1,$2,1,'tool','succeeded','operation','synthetic',0,$3,$4,$5,$6)`,
+				stepID, value.ID, approval.callID, approval.tool, approval.hash, sessionID); err != nil {
+				t.Fatalf("insert successful Task step: %v", err)
+			}
+
+			tx, err := f.store.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			facts := app.TaskValidationVerdictFacts{}
+			if err := loadTaskValidationExecutionFacts(ctx, tx,
+				app.TaskValidationReviewClaim{TaskID: value.ID, TaskRevision: value.TaskRevision}, &facts); err != nil {
+				t.Fatalf("load Task validation execution facts: %v", err)
+			}
+			if facts.IrreversibleAction != app.TaskValidationFactPresent || facts.ApprovalHistoryVerified {
+				t.Fatalf("%s approval facts = %+v; want an irreversible action with unverified approval", status, facts)
+			}
+
+			// Assume every other hard check is independently satisfied so this
+			// approval gap alone must keep a PASS recommendation pending.
+			facts.TaskExecution = app.TaskValidationFactPresent
+			facts.EvidenceContentVerified = true
+			facts.ClarificationHistoryKnown = true
+			facts.RepeatedError = app.TaskValidationFactAbsent
+			facts.CorrectionRecordVerified = true
+			facts.ReplayVerified = true
+			checkIDs := []app.TaskHardCheckID{
+				app.TaskHardCheckConclusionFirst, app.TaskHardCheckEvidence, app.TaskHardCheckIndependent,
+				app.TaskHardCheckClarification, app.TaskHardCheckApproval, app.TaskHardCheckCorrection,
+				app.TaskHardCheckReplay,
+			}
+			findings := make([]app.TaskValidationReviewFinding, 0, len(checkIDs))
+			for _, id := range checkIDs {
+				findings = append(findings, app.TaskValidationReviewFinding{
+					ID: id, Assessment: app.TaskValidationReviewSupports,
+				})
+			}
+			report := app.TaskValidationReviewReport{Recommendation: app.TaskValidationPass, Findings: findings}
+			evaluations := app.EvaluateTaskValidationReview(report, facts)
+			if evaluations[4].ID != app.TaskHardCheckApproval ||
+				evaluations[4].Outcome != app.TaskValidationCheckPending {
+				t.Fatalf("%s approval check = %+v; want H05 pending", status, evaluations[4])
+			}
+			if summary := app.SummarizeTaskValidationEvaluations(evaluations); summary.State == app.TaskValidationPass {
+				t.Fatalf("%s approval produced PASS despite unverified approval history", status)
 			}
 		})
 	}

@@ -23,20 +23,21 @@ const (
 type WorkflowSourceKind string
 
 const (
-	WorkflowSourceTaskLedger         WorkflowSourceKind = "task_ledger"
-	WorkflowSourceAgentLedger        WorkflowSourceKind = "agent_ledger"
-	WorkflowSourceModelCallLedger    WorkflowSourceKind = "model_call_ledger"
-	WorkflowSourceOperationLedger    WorkflowSourceKind = "operation_ledger"
-	WorkflowSourceApprovalLedger     WorkflowSourceKind = "approval_ledger"
-	WorkflowSourceValidationLedger   WorkflowSourceKind = "validation_ledger"
-	WorkflowSourceConversationOutput WorkflowSourceKind = "conversation_output"
-	WorkflowSourcePCObservation      WorkflowSourceKind = "pc_observation"
-	WorkflowSourceRuntimeSnapshot    WorkflowSourceKind = "runtime_snapshot"
-	WorkflowSourceHostSnapshot       WorkflowSourceKind = "host_snapshot"
-	WorkflowSourceRouteResult        WorkflowSourceKind = "route_result"
-	WorkflowSourceLocalTest          WorkflowSourceKind = "local_test"
-	WorkflowSourceCodeInspection     WorkflowSourceKind = "code_inspection"
-	WorkflowSourceEvaluationRun      WorkflowSourceKind = "evaluation_run"
+	WorkflowSourceTaskLedger            WorkflowSourceKind = "task_ledger"
+	WorkflowSourceAgentLedger           WorkflowSourceKind = "agent_ledger"
+	WorkflowSourceModelCallLedger       WorkflowSourceKind = "model_call_ledger"
+	WorkflowSourceOperationLedger       WorkflowSourceKind = "operation_ledger"
+	WorkflowSourceApprovalLedger        WorkflowSourceKind = "approval_ledger"
+	WorkflowSourceValidationLedger      WorkflowSourceKind = "validation_ledger"
+	WorkflowSourceConversationOutput    WorkflowSourceKind = "conversation_output"
+	WorkflowSourcePCObservation         WorkflowSourceKind = "pc_observation"
+	WorkflowSourceAuthorizationSnapshot WorkflowSourceKind = "authorization_snapshot"
+	WorkflowSourceRuntimeSnapshot       WorkflowSourceKind = "runtime_snapshot"
+	WorkflowSourceHostSnapshot          WorkflowSourceKind = "host_snapshot"
+	WorkflowSourceRouteResult           WorkflowSourceKind = "route_result"
+	WorkflowSourceLocalTest             WorkflowSourceKind = "local_test"
+	WorkflowSourceCodeInspection        WorkflowSourceKind = "code_inspection"
+	WorkflowSourceEvaluationRun         WorkflowSourceKind = "evaluation_run"
 )
 
 type WorkflowNodeKind string
@@ -51,6 +52,7 @@ const (
 	WorkflowNodeValidation WorkflowNodeKind = "validation"
 	WorkflowNodeDelivery   WorkflowNodeKind = "delivery"
 	WorkflowNodeHost       WorkflowNodeKind = "host"
+	WorkflowNodeRuntime    WorkflowNodeKind = "runtime"
 	WorkflowNodeAuth       WorkflowNodeKind = "authorization"
 )
 
@@ -103,6 +105,7 @@ const (
 	WorkflowStageVerification  WorkflowStage = "verification"
 	WorkflowStageDelivery      WorkflowStage = "delivery"
 	WorkflowStageHost          WorkflowStage = "host"
+	WorkflowStageRuntime       WorkflowStage = "runtime"
 	WorkflowStageAuthorization WorkflowStage = "authorization"
 	WorkflowStageProvenance    WorkflowStage = "provenance"
 )
@@ -348,8 +351,10 @@ func workflowNodeSourcesMatch(dataClass WorkflowDataClass, kind WorkflowNodeKind
 		return workflowSourceIDsMatch(dataClass, ids, sources, WorkflowSourceConversationOutput, WorkflowSourcePCObservation)
 	case WorkflowNodeHost:
 		return workflowSourceIDsMatch(dataClass, ids, sources, WorkflowSourceHostSnapshot, WorkflowSourceRuntimeSnapshot, WorkflowSourcePCObservation)
+	case WorkflowNodeRuntime:
+		return workflowSourceIDsMatch(dataClass, ids, sources, WorkflowSourceRuntimeSnapshot)
 	case WorkflowNodeAuth:
-		return workflowSourceIDsMatch(dataClass, ids, sources, WorkflowSourceTaskLedger, WorkflowSourceAgentLedger,
+		return workflowSourceIDsMatch(dataClass, ids, sources, WorkflowSourceAuthorizationSnapshot, WorkflowSourceTaskLedger, WorkflowSourceAgentLedger,
 			WorkflowSourceModelCallLedger, WorkflowSourceOperationLedger, WorkflowSourceApprovalLedger, WorkflowSourceRouteResult)
 	default:
 		return false
@@ -386,9 +391,9 @@ func workflowEdgeSourcesMatch(dataClass WorkflowDataClass, kind WorkflowEdgeKind
 	case WorkflowEdgeRouted:
 		allowed = []WorkflowSourceKind{WorkflowSourceRouteResult}
 	case WorkflowEdgeTargets:
-		allowed = []WorkflowSourceKind{WorkflowSourceTaskLedger, WorkflowSourceHostSnapshot}
+		allowed = []WorkflowSourceKind{WorkflowSourceTaskLedger, WorkflowSourceHostSnapshot, WorkflowSourceRuntimeSnapshot}
 	case WorkflowEdgeAuthorized:
-		allowed = []WorkflowSourceKind{WorkflowSourceTaskLedger, WorkflowSourceAgentLedger,
+		allowed = []WorkflowSourceKind{WorkflowSourceAuthorizationSnapshot, WorkflowSourceTaskLedger, WorkflowSourceAgentLedger,
 			WorkflowSourceModelCallLedger, WorkflowSourceOperationLedger, WorkflowSourceApprovalLedger, WorkflowSourceRouteResult}
 	default:
 		return false
@@ -458,7 +463,7 @@ func validWorkflowSourceKind(value WorkflowSourceKind) bool {
 	switch value {
 	case WorkflowSourceTaskLedger, WorkflowSourceAgentLedger, WorkflowSourceModelCallLedger,
 		WorkflowSourceOperationLedger, WorkflowSourceApprovalLedger, WorkflowSourceValidationLedger,
-		WorkflowSourceConversationOutput, WorkflowSourcePCObservation, WorkflowSourceRuntimeSnapshot,
+		WorkflowSourceConversationOutput, WorkflowSourcePCObservation, WorkflowSourceAuthorizationSnapshot, WorkflowSourceRuntimeSnapshot,
 		WorkflowSourceHostSnapshot, WorkflowSourceRouteResult, WorkflowSourceLocalTest,
 		WorkflowSourceCodeInspection, WorkflowSourceEvaluationRun:
 		return true
@@ -470,7 +475,8 @@ func validWorkflowSourceKind(value WorkflowSourceKind) bool {
 func validWorkflowNodeKind(value WorkflowNodeKind) bool {
 	switch value {
 	case WorkflowNodeRoute, WorkflowNodeTask, WorkflowNodeAgent, WorkflowNodeModelCall,
-		WorkflowNodeOperation, WorkflowNodeApproval, WorkflowNodeValidation, WorkflowNodeDelivery, WorkflowNodeHost, WorkflowNodeAuth:
+		WorkflowNodeOperation, WorkflowNodeApproval, WorkflowNodeValidation, WorkflowNodeDelivery, WorkflowNodeHost,
+		WorkflowNodeRuntime, WorkflowNodeAuth:
 		return true
 	default:
 		return false
@@ -504,7 +510,7 @@ func validWorkflowStage(value WorkflowStage) bool {
 	switch value {
 	case WorkflowStageRoute, WorkflowStageTask, WorkflowStageAgent, WorkflowStageModelCall,
 		WorkflowStageOperation, WorkflowStageApproval, WorkflowStageVerification, WorkflowStageDelivery,
-		WorkflowStageHost, WorkflowStageAuthorization, WorkflowStageProvenance:
+		WorkflowStageHost, WorkflowStageRuntime, WorkflowStageAuthorization, WorkflowStageProvenance:
 		return true
 	default:
 		return false

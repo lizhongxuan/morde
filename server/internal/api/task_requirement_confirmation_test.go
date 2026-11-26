@@ -36,11 +36,13 @@ func TestConfirmTaskRequirementManifestRequiresAuthenticatedStrictIdempotentRequ
 	gin.SetMode(gin.TestMode)
 	service := &taskRequirementConfirmationAPITestService{taskServiceStub: &taskServiceStub{}, result: app.TaskRequirementManifestConfirmation{
 		TaskID: "q1234567", TaskRevision: 3, PlanRevision: 2, PlanEventSequence: 19,
-		ManifestDigest: strings.Repeat("a", 64), ConfirmedAt: time.Date(2026, 11, 26, 1, 2, 3, 0, time.UTC),
+		ManifestDigest: strings.Repeat("a", 64), RequirementsCompleteAttested: true,
+		AttestedAt:  confirmationTestTime(time.Date(2026, 11, 26, 1, 2, 3, 0, time.UTC)),
+		ConfirmedAt: time.Date(2026, 11, 26, 1, 2, 3, 0, time.UTC),
 	}}
 	principal := identity.Principal{UserID: testUserID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testTokenID}
 	engine := taskRequirementConfirmationTestRouter(service, &principal)
-	body := `{"expected_task_revision":3,"expected_plan_revision":2,"expected_plan_event_sequence":19}`
+	body := `{"expected_task_revision":3,"expected_plan_revision":2,"expected_plan_event_sequence":19,"requirements_complete_attested":true}`
 	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/requirement-manifest/confirm", strings.NewReader(body))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("If-Match", `"`+strings.Repeat("a", 64)+`"`)
@@ -52,7 +54,7 @@ func TestConfirmTaskRequirementManifestRequiresAuthenticatedStrictIdempotentRequ
 	}
 	if service.principal.UserID != principal.UserID || service.principal.Kind != principal.Kind || service.taskID != "q1234567" ||
 		service.input.TaskRevision != 3 || service.input.PlanRevision != 2 || service.input.PlanEventSequence != 19 ||
-		service.input.ManifestDigest != strings.Repeat("a", 64) || service.input.IdempotencyKey != "confirm-plan-19" {
+		service.input.ManifestDigest != strings.Repeat("a", 64) || !service.input.RequirementsCompleteAttested || service.input.IdempotencyKey != "confirm-plan-19" {
 		t.Fatalf("confirmation service received wrong authenticated fence: principal=%+v task=%q input=%+v",
 			service.principal, service.taskID, service.input)
 	}
@@ -63,6 +65,8 @@ func TestConfirmTaskRequirementManifestRequiresAuthenticatedStrictIdempotentRequ
 		t.Fatalf("confirmation response leaked internal auth or implied verification: %s", responseBody)
 	}
 }
+
+func confirmationTestTime(value time.Time) *time.Time { return &value }
 
 func TestConfirmTaskRequirementManifestRejectsUnauthenticatedMalformedAndMissingIdempotency(t *testing.T) {
 	gin.SetMode(gin.TestMode)

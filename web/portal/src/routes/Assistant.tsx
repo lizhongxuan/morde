@@ -1219,6 +1219,63 @@ function TaskStream({ task, conversationID, onState }: {
   return null;
 }
 
+function PCDeliveryVisibilityObservation(props: { taskID: string; messageID: string; taskRevision: number }) {
+  const { taskID, messageID, taskRevision } = props;
+  useEffect(() => {
+    const target = document.getElementById(`conversation-message-${encodeURIComponent(messageID)}`);
+    if (!target || typeof IntersectionObserver === 'undefined') return;
+
+    let visible = false;
+    let observed = false;
+    let inFlight = false;
+    let attempts = 0;
+    let timer: number | undefined;
+    const schedule = () => {
+      if (!visible || document.visibilityState !== 'visible' || observed || inFlight || attempts >= 3 || timer !== undefined) return;
+      timer = window.setTimeout(() => {
+        timer = undefined;
+        attempts += 1;
+        inFlight = true;
+        void portalApi.observeTaskReplyInPC(taskID, messageID, taskRevision)
+          .then(() => { observed = true; })
+          .catch((error: unknown) => {
+            const retryable = !(error instanceof ApiError) || error.status === 429 || error.status >= 500;
+            if (retryable && attempts < 3 && visible && document.visibilityState === 'visible') {
+              timer = window.setTimeout(() => { timer = undefined; schedule(); }, attempts * 1000);
+            }
+          })
+          .finally(() => { inFlight = false; });
+      }, 700);
+    };
+    const observer = new IntersectionObserver((entries) => {
+      const entry = entries.find((item) => item.target === target);
+      visible = Boolean(entry?.isIntersecting && entry.intersectionRatio >= 0.25);
+      if (!visible && timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      } else {
+        schedule();
+      }
+    }, { threshold: [0.25] });
+    const onVisibilityChange = () => {
+      if (document.visibilityState !== 'visible' && timer !== undefined) {
+        window.clearTimeout(timer);
+        timer = undefined;
+      } else {
+        schedule();
+      }
+    };
+    observer.observe(target);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    return () => {
+      observer.disconnect();
+      document.removeEventListener('visibilitychange', onVisibilityChange);
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [messageID, taskID, taskRevision]);
+  return null;
+}
+
 export function Assistant() {
   const outletContext = useOutletContext<AssistantOutletContext | null>();
   const client = useQueryClient();
@@ -3818,6 +3875,10 @@ export function Assistant() {
                       {message.role === 'assistant' ? <ChatMarkdown content={message.content} />
                         : <UserMessageContent content={message.content} attachmentIDs={message.attachment_ids ?? []} />}
                     </article>
+                    {message.role === 'assistant' && message.task_id && message.delivery_status === 'applied'
+                      && message.output_status === 'completed' && typeof message.output_task_revision === 'number'
+                      && Number.isSafeInteger(message.output_task_revision) && typeof message.output_result_event_sequence === 'number'
+                      && <PCDeliveryVisibilityObservation taskID={message.task_id} messageID={message.id} taskRevision={message.output_task_revision} />}
                     <div className="chat-message-meta">
                       <time className="chat-message-time" dateTime={message.created_at}
                         aria-label={`${message.role === 'assistant' ? '回复' : '消息'}时间：${formatDate(message.created_at)}`}>{formatDate(message.created_at)}</time>

@@ -653,6 +653,36 @@ func TestScheduleCreateAppliesDefaultsAndUsesIdempotencyRecord(t *testing.T) {
 	}
 }
 
+func TestScheduleCreateRequiresExplicitPersonalRuleSelectionAndHashesIt(t *testing.T) {
+	store := newScheduleServiceStoreFake()
+	service := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})
+	principal := scheduleServicePrincipal()
+
+	plain := validScheduleCommand()
+	createdPlain, err := service.Create(context.Background(), principal, plain, "schedule-rule-opt-in-plain")
+	if err != nil || createdPlain.PersonalRule != nil || store.values[createdPlain.ID].PersonalRule != nil {
+		t.Fatalf("schedule without explicit rule selection = %#v, %v; want no binding", createdPlain.PersonalRule, err)
+	}
+
+	selected := validScheduleCommand()
+	selected.PersonalRule = &schedule.PersonalRuleSelection{CandidateID: "r_00000001", CandidateRevision: 3}
+	created, err := service.Create(context.Background(), principal, selected, "schedule-rule-opt-in-selected")
+	if err != nil || created.PersonalRule == nil || created.PersonalRule.CandidateID != selected.PersonalRule.CandidateID ||
+		created.PersonalRule.CandidateRevision != selected.PersonalRule.CandidateRevision ||
+		created.PersonalRule.SourceMemoryID != "" || created.PersonalRule.SourceMemoryRevision != 0 {
+		t.Fatalf("explicit schedule rule selection = %#v, %v; want only caller-selected candidate identity", created.PersonalRule, err)
+	}
+	if stored := store.values[created.ID].PersonalRule; stored == nil || *stored != *created.PersonalRule {
+		t.Fatalf("schedule store input personal rule = %#v, want %#v", stored, created.PersonalRule)
+	}
+
+	changed := selected
+	changed.PersonalRule = &schedule.PersonalRuleSelection{CandidateID: "r_00000001", CandidateRevision: 4}
+	if _, err := service.Create(context.Background(), principal, changed, "schedule-rule-opt-in-selected"); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("reusing schedule idempotency key with changed rule revision error = %v, want idempotency_conflict", err)
+	}
+}
+
 func TestScheduleCreateKeepsDisplayTitleSeparateAndHashesIt(t *testing.T) {
 	store := newScheduleServiceStoreFake()
 	service := newTestScheduleService(t, store, &scheduleServiceAuthorizerFake{}, &scheduleServiceModelCatalogFake{configured: true})

@@ -203,6 +203,12 @@ export const portalApi = {
           ...(actorID ? { 'X-Morde-Actor-ID': actorID } : {}) } } : {}) },
     }));
   },
+  observeTaskReplyInPC: async (taskID: string, messageID: string, taskRevision: number) => {
+    const response = await requestFetch(`/api/tasks/${encodeURIComponent(taskID)}/pc-delivery-observations`, {
+      method: 'POST', body: JSON.stringify({ message_id: messageID, task_revision: taskRevision }),
+    });
+    if (!response.ok) await throwResponseError(response);
+  },
   conversationMessageRetryEligibility: async (conversationID: string, messageID: string, serviceInstanceID: string, actorID: string) => {
     if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
     return unwrapApiResponse(await api.GET('/api/conversations/{id}/messages/{message_id}/retry-eligibility', {
