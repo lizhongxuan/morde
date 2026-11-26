@@ -116,7 +116,7 @@ func (s *Store) LoginClient(ctx context.Context, requested identity.ClientInstal
 				return domain.NewError(domain.CodeNotFound, "client installation not found")
 			}
 			if installation.RevokedAt != nil {
-				return identity.ErrInvalidCredential
+				return revokedClientLoginError(legacyAndroid)
 			}
 		} else if renewalID != "" {
 			installation, err = scanClientInstallation(tx.QueryRow(ctx, `SELECT id,owner_id,display_name,platform,
@@ -128,7 +128,7 @@ func (s *Store) LoginClient(ctx context.Context, requested identity.ClientInstal
 				return domain.NewError(domain.CodeNotFound, "client installation not found")
 			}
 			if installation.RevokedAt != nil {
-				return identity.ErrInvalidCredential
+				return revokedClientLoginError(legacyAndroid)
 			}
 			var bound bool
 			if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM client_login_attempts WHERE installation_id=$1)`, renewalID).Scan(&bound); err != nil {
@@ -204,6 +204,16 @@ func (s *Store) LoginClient(ctx context.Context, requested identity.ClientInstal
 		return nil
 	})
 	return installation, issued, err
+}
+
+// Call only after the transaction has rechecked the authenticated account.
+func revokedClientLoginError(legacyAndroid bool) error {
+	if legacyAndroid {
+		return identity.ErrInvalidCredential
+	}
+	err := domain.NewError(domain.CodeConflict, "client login state changed")
+	err.Details["reason"] = "client_login_state_changed"
+	return err
 }
 
 func legacyAndroidInstanceID(ownerID, installationID string) string {
