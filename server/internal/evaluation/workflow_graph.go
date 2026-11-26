@@ -51,6 +51,7 @@ const (
 	WorkflowNodeValidation WorkflowNodeKind = "validation"
 	WorkflowNodeDelivery   WorkflowNodeKind = "delivery"
 	WorkflowNodeHost       WorkflowNodeKind = "host"
+	WorkflowNodeAuth       WorkflowNodeKind = "authorization"
 )
 
 type WorkflowNodeState string
@@ -75,16 +76,19 @@ const (
 type WorkflowEdgeKind string
 
 const (
-	WorkflowEdgeCreated   WorkflowEdgeKind = "created"
-	WorkflowEdgeHandoff   WorkflowEdgeKind = "handoff"
-	WorkflowEdgeInvoked   WorkflowEdgeKind = "invoked"
-	WorkflowEdgeReturned  WorkflowEdgeKind = "returned"
-	WorkflowEdgeApproved  WorkflowEdgeKind = "approved"
-	WorkflowEdgeRejected  WorkflowEdgeKind = "rejected"
-	WorkflowEdgeVerified  WorkflowEdgeKind = "verified"
-	WorkflowEdgeDelivered WorkflowEdgeKind = "delivered"
-	WorkflowEdgeResumed   WorkflowEdgeKind = "resumed"
-	WorkflowEdgeRouted    WorkflowEdgeKind = "routed"
+	WorkflowEdgeCreated           WorkflowEdgeKind = "created"
+	WorkflowEdgeHandoff           WorkflowEdgeKind = "handoff"
+	WorkflowEdgeInvoked           WorkflowEdgeKind = "invoked"
+	WorkflowEdgeReturned          WorkflowEdgeKind = "returned"
+	WorkflowEdgeApproved          WorkflowEdgeKind = "approved"
+	WorkflowEdgeRejected          WorkflowEdgeKind = "rejected"
+	WorkflowEdgeVerified          WorkflowEdgeKind = "verified"
+	WorkflowEdgeDelivered         WorkflowEdgeKind = "delivered"
+	WorkflowEdgeResumed           WorkflowEdgeKind = "resumed"
+	WorkflowEdgeRouted            WorkflowEdgeKind = "routed"
+	WorkflowEdgeTargets           WorkflowEdgeKind = "targets"
+	WorkflowEdgeAuthorized        WorkflowEdgeKind = "authorized"
+	WorkflowEdgeApprovalRequested WorkflowEdgeKind = "approval_requested"
 )
 
 type WorkflowStage string
@@ -260,6 +264,12 @@ func ValidateWorkflowTrace(trace WorkflowTrace) error {
 		if edge.Kind == WorkflowEdgeHandoff && (from.Kind != WorkflowNodeAgent || to.Kind != WorkflowNodeAgent || edge.From == edge.To) {
 			return fmt.Errorf("workflow handoff edge %q must connect distinct agents", edge.ID)
 		}
+		if edge.Kind == WorkflowEdgeApprovalRequested && (from.Kind != WorkflowNodeOperation || to.Kind != WorkflowNodeApproval) {
+			return fmt.Errorf("workflow approval-request edge %q must connect an operation to an approval", edge.ID)
+		}
+		if (edge.Kind == WorkflowEdgeApproved || edge.Kind == WorkflowEdgeRejected) && (from.Kind != WorkflowNodeApproval || to.Kind != WorkflowNodeOperation) {
+			return fmt.Errorf("workflow approval decision edge %q must connect an approval to an operation", edge.ID)
+		}
 	}
 
 	gapIDs := make(map[string]struct{}, len(trace.Gaps))
@@ -338,12 +348,27 @@ func workflowNodeSourcesMatch(dataClass WorkflowDataClass, kind WorkflowNodeKind
 		return workflowSourceIDsMatch(dataClass, ids, sources, WorkflowSourceConversationOutput, WorkflowSourcePCObservation)
 	case WorkflowNodeHost:
 		return workflowSourceIDsMatch(dataClass, ids, sources, WorkflowSourceHostSnapshot, WorkflowSourceRuntimeSnapshot, WorkflowSourcePCObservation)
+	case WorkflowNodeAuth:
+		return workflowSourceIDsMatch(dataClass, ids, sources, WorkflowSourceTaskLedger, WorkflowSourceAgentLedger,
+			WorkflowSourceModelCallLedger, WorkflowSourceOperationLedger, WorkflowSourceApprovalLedger, WorkflowSourceRouteResult)
 	default:
 		return false
 	}
 }
 
 func workflowEdgeSourcesMatch(dataClass WorkflowDataClass, kind WorkflowEdgeKind, ids []string, sources map[string]WorkflowSource) bool {
+	if kind == WorkflowEdgeApprovalRequested {
+		operationSource, approvalSource := false, false
+		for _, id := range ids {
+			switch sources[id].Kind {
+			case WorkflowSourceOperationLedger:
+				operationSource = true
+			case WorkflowSourceApprovalLedger:
+				approvalSource = true
+			}
+		}
+		return operationSource && approvalSource
+	}
 	var allowed []WorkflowSourceKind
 	switch kind {
 	case WorkflowEdgeCreated, WorkflowEdgeResumed:
@@ -360,6 +385,11 @@ func workflowEdgeSourcesMatch(dataClass WorkflowDataClass, kind WorkflowEdgeKind
 		allowed = []WorkflowSourceKind{WorkflowSourceConversationOutput}
 	case WorkflowEdgeRouted:
 		allowed = []WorkflowSourceKind{WorkflowSourceRouteResult}
+	case WorkflowEdgeTargets:
+		allowed = []WorkflowSourceKind{WorkflowSourceTaskLedger, WorkflowSourceHostSnapshot}
+	case WorkflowEdgeAuthorized:
+		allowed = []WorkflowSourceKind{WorkflowSourceTaskLedger, WorkflowSourceAgentLedger,
+			WorkflowSourceModelCallLedger, WorkflowSourceOperationLedger, WorkflowSourceApprovalLedger, WorkflowSourceRouteResult}
 	default:
 		return false
 	}
@@ -440,7 +470,7 @@ func validWorkflowSourceKind(value WorkflowSourceKind) bool {
 func validWorkflowNodeKind(value WorkflowNodeKind) bool {
 	switch value {
 	case WorkflowNodeRoute, WorkflowNodeTask, WorkflowNodeAgent, WorkflowNodeModelCall,
-		WorkflowNodeOperation, WorkflowNodeApproval, WorkflowNodeValidation, WorkflowNodeDelivery, WorkflowNodeHost:
+		WorkflowNodeOperation, WorkflowNodeApproval, WorkflowNodeValidation, WorkflowNodeDelivery, WorkflowNodeHost, WorkflowNodeAuth:
 		return true
 	default:
 		return false
@@ -463,7 +493,7 @@ func validWorkflowEdgeKind(value WorkflowEdgeKind) bool {
 	switch value {
 	case WorkflowEdgeCreated, WorkflowEdgeHandoff, WorkflowEdgeInvoked, WorkflowEdgeReturned,
 		WorkflowEdgeApproved, WorkflowEdgeRejected, WorkflowEdgeVerified, WorkflowEdgeDelivered,
-		WorkflowEdgeResumed, WorkflowEdgeRouted:
+		WorkflowEdgeResumed, WorkflowEdgeRouted, WorkflowEdgeTargets, WorkflowEdgeAuthorized, WorkflowEdgeApprovalRequested:
 		return true
 	default:
 		return false

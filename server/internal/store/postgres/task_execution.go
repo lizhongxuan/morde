@@ -274,9 +274,36 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		if err != nil {
 			return err
 		}
-		plan, err := latestTaskPlan(ctx, tx, row.ID, *projected[0].CurrentRevision)
+		plan, planEventSequence, err := latestTaskPlanWithSequence(ctx, tx, row.ID, *projected[0].CurrentRevision)
 		if err != nil {
 			return err
+		}
+		var planEventSequencePointer *int64
+		var requirementManifestConfirmation *app.TaskRequirementManifestConfirmation
+		if plan != nil {
+			sequence := planEventSequence
+			planEventSequencePointer = &sequence
+			if plan.RequirementManifest != nil {
+				digest, digestErr := plan.RequirementManifestDigest()
+				if digestErr != nil {
+					return domain.NewError(domain.CodeInvalidState, "stored task requirement manifest is invalid")
+				}
+				authorized, authErr := requireCurrentTaskAuthorization(ctx, tx, row)
+				if authErr != nil {
+					return authErr
+				}
+				if authorized {
+					confirmation, found, confirmationErr := readTaskRequirementManifestConfirmationForPlan(ctx, tx,
+						row.OwnerID, row.ID, *projected[0].CurrentRevision, plan.Revision, planEventSequence,
+						row.AuthVersion, digest)
+					if confirmationErr != nil {
+						return confirmationErr
+					}
+					if found {
+						requirementManifestConfirmation = &confirmation
+					}
+				}
+			}
 		}
 		billing, err := s.taskBilling(ctx, tx, row.ID, projected[0].InitiatorID, projected[0].ProjectID)
 		if err != nil {
@@ -290,7 +317,8 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 			ScheduleObservation: scheduleObservation, Steps: steps, Agents: agents,
 			BatchItems: mapRows(items, taskBatchItemDomain), Artifacts: mapRows(artifacts, taskArtifactDomain),
 			PendingRequest: pendingRequest, ClarificationRequests: clarifications,
-			StopRequest: stopRequest, StopOperationIDs: stopOperationIDs, Plan: plan, Billing: &billing,
+			StopRequest: stopRequest, StopOperationIDs: stopOperationIDs, Plan: plan, PlanEventSequence: planEventSequencePointer,
+			RequirementManifestConfirmation: requirementManifestConfirmation, Billing: &billing,
 		}
 		return nil
 	})

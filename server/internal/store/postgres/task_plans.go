@@ -113,21 +113,27 @@ FOR SHARE`, source.MessageID, current.ID, current.OwnerID, current.ConversationI
 }
 
 func latestTaskPlan(ctx context.Context, tx pgx.Tx, taskID string, taskRevision int64) (*task.Plan, error) {
+	plan, _, err := latestTaskPlanWithSequence(ctx, tx, taskID, taskRevision)
+	return plan, err
+}
+
+func latestTaskPlanWithSequence(ctx context.Context, tx pgx.Tx, taskID string, taskRevision int64) (*task.Plan, int64, error) {
 	var payload []byte
-	err := tx.QueryRow(ctx, `SELECT payload FROM task_events WHERE task_id=$1 AND event_type='task.plan'
-AND payload #>> '{plan,task_revision}'=$2 ORDER BY sequence DESC LIMIT 1`, taskID, fmt.Sprint(taskRevision)).Scan(&payload)
+	var planEventSequence int64
+	err := tx.QueryRow(ctx, `SELECT sequence,payload FROM task_events WHERE task_id=$1 AND event_type='task.plan'
+AND payload #>> '{plan,task_revision}'=$2 ORDER BY sequence DESC LIMIT 1`, taskID, fmt.Sprint(taskRevision)).Scan(&planEventSequence, &payload)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, nil
+		return nil, 0, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read latest task plan: %w", err)
+		return nil, 0, fmt.Errorf("read latest task plan: %w", err)
 	}
 	var event appTaskPlanEvent
-	if len(payload) > 64<<10 || json.Unmarshal(payload, &event) != nil || event.Plan.Validate() != nil ||
+	if planEventSequence < 1 || len(payload) > 64<<10 || json.Unmarshal(payload, &event) != nil || event.Plan.Validate() != nil ||
 		event.Plan.TaskRevision != taskRevision || event.PlanRevision != event.Plan.Revision || event.TaskRevision != taskRevision {
-		return nil, domain.NewError(domain.CodeInvalidState, "stored task plan is invalid")
+		return nil, 0, domain.NewError(domain.CodeInvalidState, "stored task plan is invalid")
 	}
-	return &event.Plan, nil
+	return &event.Plan, planEventSequence, nil
 }
 
 type appTaskPlanEvent struct {

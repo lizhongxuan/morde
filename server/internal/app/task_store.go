@@ -107,28 +107,30 @@ type TaskK2Projection struct {
 }
 
 type TaskDetails struct {
-	Task                     task.Task
-	Dependencies             []Dependency
-	ChildJobs                []ChildJob
-	ResultReview             *ResultReview
-	Validation               TaskValidationSummary
-	ValidationEvidence       *TaskValidationEvidenceRecord
-	AssistantMessage         *AssistantMessageSnapshot
-	CurrentRevisionStarted   *bool
-	ResultMessagePending     bool
-	ResultMessagePublished   bool
-	ScheduleObservation      *schedule.ObservationSpec
-	Steps                    []task.Step
-	Agents                   []TaskAgentExecution
-	BatchItems               []task.BatchItem
-	Artifacts                []task.Artifact
-	PendingRequest           *task.PendingRequest
-	ClarificationRequests    []task.ClarificationRequest
-	StopRequest              *task.StopRequest
-	StopOperationIDs         []string
-	Plan                     *task.Plan
-	ValidationReplayEvidence *TaskValidationReplayEvidence `json:"-"`
-	Billing                  *TaskBilling
+	Task                            task.Task
+	Dependencies                    []Dependency
+	ChildJobs                       []ChildJob
+	ResultReview                    *ResultReview
+	Validation                      TaskValidationSummary
+	ValidationEvidence              *TaskValidationEvidenceRecord
+	AssistantMessage                *AssistantMessageSnapshot
+	CurrentRevisionStarted          *bool
+	ResultMessagePending            bool
+	ResultMessagePublished          bool
+	ScheduleObservation             *schedule.ObservationSpec
+	Steps                           []task.Step
+	Agents                          []TaskAgentExecution
+	BatchItems                      []task.BatchItem
+	Artifacts                       []task.Artifact
+	PendingRequest                  *task.PendingRequest
+	ClarificationRequests           []task.ClarificationRequest
+	StopRequest                     *task.StopRequest
+	StopOperationIDs                []string
+	Plan                            *task.Plan
+	PlanEventSequence               *int64
+	RequirementManifestConfirmation *TaskRequirementManifestConfirmation
+	ValidationReplayEvidence        *TaskValidationReplayEvidence `json:"-"`
+	Billing                         *TaskBilling
 }
 
 type TaskBilling struct {

@@ -128,13 +128,25 @@ type TaskValidationEvidenceClaimRecord struct {
 	EndByte               int32                                `json:"end_byte"`
 	EvidenceRefs          []TaskValidationEvidenceRefRecord    `json:"evidence_refs"`
 	PerformanceComparison *TaskValidationPerformanceComparison `json:"performance_comparison,omitempty"`
+	SourceLocationState   string                               `json:"source_location_state,omitempty"`
+	SourceLocationIDs     []string                             `json:"source_location_ids,omitempty"`
 }
 
+const (
+	TaskValidationSourceLocationsMapped      = "mapped"
+	TaskValidationSourceLocationsPartial     = "partial"
+	TaskValidationSourceLocationsUnavailable = "unavailable"
+	TaskValidationSourceLocationsRestricted  = "restricted"
+	TaskValidationSourceLocationsNone        = "no_locator"
+	TaskValidationSourceLocationsTruncated   = "truncated"
+)
+
 type TaskValidationEvidenceRecord struct {
-	TaskRevision  int64                               `json:"task_revision"`
-	EventSequence int64                               `json:"event_sequence"`
-	ResultSHA256  string                              `json:"result_sha256"`
-	Claims        []TaskValidationEvidenceClaimRecord `json:"claims"`
+	TaskRevision    int64                               `json:"task_revision"`
+	EventSequence   int64                               `json:"event_sequence"`
+	ResultSHA256    string                              `json:"result_sha256"`
+	Claims          []TaskValidationEvidenceClaimRecord `json:"claims"`
+	SourceLocations []TaskStepSourceLocation            `json:"source_locations,omitempty"`
 }
 
 type TaskHardCheckClaim struct {
@@ -279,6 +291,19 @@ func ValidateTaskValidationEvidenceRecord(result string, record TaskValidationEv
 	if record.TaskRevision < 0 || record.EventSequence < 1 || len(record.ResultSHA256) != 64 || strings.ToLower(record.ResultSHA256) != record.ResultSHA256 {
 		return domain.InvalidArgument("validation_evidence", "task validation evidence record is invalid")
 	}
+	if len(record.SourceLocations) > maxTaskValidationSourceLocations {
+		return domain.InvalidArgument("validation_evidence", "task validation source locations exceed their limit")
+	}
+	availableSourceLocations := make(map[string]struct{}, len(record.SourceLocations))
+	for _, location := range record.SourceLocations {
+		if !validTaskStepSourceLocationDocument(location) {
+			return domain.InvalidArgument("validation_evidence", "task validation source location is invalid")
+		}
+		if _, duplicate := availableSourceLocations[location.ID]; duplicate {
+			return domain.InvalidArgument("validation_evidence", "task validation source location is duplicated")
+		}
+		availableSourceLocations[location.ID] = struct{}{}
+	}
 	digest := sha256.Sum256([]byte(result))
 	if record.ResultSHA256 != hex.EncodeToString(digest[:]) {
 		return domain.InvalidArgument("validation_evidence", "task validation evidence result digest does not match")
@@ -290,6 +315,13 @@ func ValidateTaskValidationEvidenceRecord(result string, record TaskValidationEv
 		}
 		input := TaskResultClaim{ID: claim.ID, StartByte: claim.StartByte, EndByte: claim.EndByte,
 			EvidenceRefs: make([]TaskValidationEvidenceRef, 0, len(claim.EvidenceRefs))}
+		if claim.SourceLocationState != "" {
+			if !validTaskValidationSourceLocationMapping(claim.SourceLocationState, claim.SourceLocationIDs, availableSourceLocations) {
+				return domain.InvalidArgument("validation_evidence", "task validation source location mapping is invalid")
+			}
+		} else if len(claim.SourceLocationIDs) != 0 {
+			return domain.InvalidArgument("validation_evidence", "task validation source location mapping is invalid")
+		}
 		if comparison := claim.PerformanceComparison; comparison != nil {
 			input.PerformanceComparison = &TaskResultPerformanceComparison{
 				Metric: comparison.Metric, Unit: comparison.Unit, Before: comparison.Before, After: comparison.After,
@@ -321,10 +353,49 @@ func ValidateTaskValidationEvidenceRecord(result string, record TaskValidationEv
 		return err
 	}
 	encoded, err := json.Marshal(record)
-	if err != nil || len(encoded) > MaxTaskValidationEvidenceBytes {
+	maxBytes := MaxTaskValidationEvidenceBytes
+	if len(record.SourceLocations) > 0 {
+		maxBytes = maxTaskValidationEvidenceResponseBytes
+	}
+	if err != nil || len(encoded) > maxBytes {
 		return domain.InvalidArgument("validation_evidence", "task validation evidence record exceeds the limit")
 	}
 	return nil
+}
+
+const (
+	maxTaskValidationSourceLocations       = 32
+	maxTaskValidationEvidenceResponseBytes = 256 << 10
+)
+
+func validTaskValidationSourceLocationMapping(state string, ids []string, available map[string]struct{}) bool {
+	if len(ids) > maxTaskValidationSourceLocations {
+		return false
+	}
+	seen := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		if !validTaskStepSourceLocationID(id) {
+			return false
+		}
+		if _, exists := available[id]; !exists {
+			return false
+		}
+		if _, duplicate := seen[id]; duplicate {
+			return false
+		}
+		seen[id] = struct{}{}
+	}
+	switch state {
+	case TaskValidationSourceLocationsMapped:
+		return len(ids) > 0
+	case TaskValidationSourceLocationsPartial:
+		return len(ids) > 0
+	case TaskValidationSourceLocationsUnavailable, TaskValidationSourceLocationsRestricted,
+		TaskValidationSourceLocationsNone, TaskValidationSourceLocationsTruncated:
+		return len(ids) == 0
+	default:
+		return false
+	}
 }
 
 // SafeTaskValidationCallID keeps only bounded identifier-safe characters in evidence details.

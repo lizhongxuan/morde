@@ -666,8 +666,113 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 			details.Steps[index].DetailState = "restricted"
 		}
 	}
-	details.ValidationEvidence = restrictTaskValidationEvidence(details.ValidationEvidence, details.Steps, !workspaceVisible, artifactsHidden)
+	validationEvidence, err := s.attachTaskValidationSourceLocations(ctx, principal, details, details.ValidationEvidence)
+	if err != nil {
+		return TaskDetails{}, err
+	}
+	details.ValidationEvidence = restrictTaskValidationEvidence(validationEvidence, details.Steps, !workspaceVisible, artifactsHidden)
 	return details, nil
+}
+
+// attachTaskValidationSourceLocations derives the locators for each result
+// claim from the exact same-revision step evidence the claim already cites.
+// Locator details stay behind the normal Task/Workspace authorization path.
+func (s *TaskService) attachTaskValidationSourceLocations(ctx context.Context, principal identity.Principal,
+	details TaskDetails, evidence *TaskValidationEvidenceRecord) (*TaskValidationEvidenceRecord, error) {
+	if evidence == nil {
+		return nil, nil
+	}
+	result := *evidence
+	result.Claims = append([]TaskValidationEvidenceClaimRecord(nil), evidence.Claims...)
+	result.SourceLocations = make([]TaskStepSourceLocation, 0, maxTaskValidationSourceLocations)
+	steps := make(map[string]task.Step, len(details.Steps))
+	for _, step := range details.Steps {
+		steps[step.ID] = step
+	}
+	detailByStep := make(map[string]TaskStepDetail)
+	locationsByID := make(map[string]TaskStepSourceLocation)
+	for claimIndex := range result.Claims {
+		claim := &result.Claims[claimIndex]
+		claimLocationIDs := make(map[string]struct{})
+		unavailable, restricted := false, false
+		truncated := false
+		refs := append([]TaskValidationEvidenceRefRecord(nil), claim.EvidenceRefs...)
+		if comparison := claim.PerformanceComparison; comparison != nil {
+			refs = append(refs, comparison.BaselineRef, comparison.AfterRef)
+		}
+		seenSteps := make(map[string]struct{})
+		for _, ref := range refs {
+			if ref.Kind != TaskValidationEvidenceAction && ref.Kind != TaskValidationEvidenceBaseline &&
+				ref.Kind != TaskValidationEvidenceResult && ref.Kind != TaskValidationEvidenceBeforeAfter {
+				continue
+			}
+			if _, duplicate := seenSteps[ref.ID]; duplicate {
+				continue
+			}
+			seenSteps[ref.ID] = struct{}{}
+			step, exists := steps[ref.ID]
+			if !exists || step.TaskRevision == nil || *step.TaskRevision != evidence.TaskRevision {
+				unavailable = true
+				continue
+			}
+			detail, loaded := detailByStep[step.ID]
+			if !loaded {
+				var err error
+				detail, err = s.taskStepDetailFromDetails(ctx, principal, details, details.Task.ID, step.ID)
+				if err != nil {
+					return nil, err
+				}
+				detailByStep[step.ID] = detail
+			}
+			if detail.DetailState == "restricted" {
+				restricted = true
+				continue
+			}
+			if detail.DetailState != "available" {
+				unavailable = true
+				continue
+			}
+			for _, location := range detail.SourceLocations {
+				if _, exists := locationsByID[location.ID]; exists {
+					claimLocationIDs[location.ID] = struct{}{}
+					continue
+				}
+				if len(locationsByID) >= maxTaskValidationSourceLocations {
+					truncated = true
+					continue
+				}
+				locationsByID[location.ID] = location
+				claimLocationIDs[location.ID] = struct{}{}
+			}
+		}
+		claim.SourceLocationIDs = make([]string, 0, len(claimLocationIDs))
+		for id := range claimLocationIDs {
+			claim.SourceLocationIDs = append(claim.SourceLocationIDs, id)
+		}
+		sort.Strings(claim.SourceLocationIDs)
+		switch {
+		case len(claim.SourceLocationIDs) > 0 && (unavailable || restricted || truncated):
+			claim.SourceLocationState = TaskValidationSourceLocationsPartial
+		case len(claim.SourceLocationIDs) > 0:
+			claim.SourceLocationState = TaskValidationSourceLocationsMapped
+		case restricted:
+			claim.SourceLocationState = TaskValidationSourceLocationsRestricted
+		case unavailable:
+			claim.SourceLocationState = TaskValidationSourceLocationsUnavailable
+		case truncated:
+			claim.SourceLocationState = TaskValidationSourceLocationsTruncated
+		default:
+			claim.SourceLocationState = TaskValidationSourceLocationsNone
+		}
+	}
+	result.SourceLocations = make([]TaskStepSourceLocation, 0, len(locationsByID))
+	for _, location := range locationsByID {
+		result.SourceLocations = append(result.SourceLocations, location)
+	}
+	sort.Slice(result.SourceLocations, func(i, j int) bool {
+		return result.SourceLocations[i].ID < result.SourceLocations[j].ID
+	})
+	return &result, nil
 }
 
 // GetTaskValidationReviewSnapshot reads only the still-current Task result and

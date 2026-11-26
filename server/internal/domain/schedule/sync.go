@@ -22,6 +22,7 @@ type SyncDefinition struct {
 	MisfirePolicy      MisfirePolicy           `json:"misfire_policy"`
 	NotificationEvents []NotificationEvent     `json:"notification_events"`
 	Observation        *ObservationSpec        `json:"observation,omitempty"`
+	PersonalRule       *PersonalRuleBinding    `json:"personal_rule,omitempty"`
 }
 
 type SyncBudget struct {
@@ -45,7 +46,7 @@ func NewSyncDefinition(value Schedule) SyncDefinition {
 		Timing:             value.Timing, Budget: SyncBudget{ActiveSeconds: value.Budget.ActiveSeconds,
 			ToolCalls: value.Budget.ToolCalls, ModelTokens: value.Budget.ModelTokens},
 		MisfirePolicy: value.MisfirePolicy, NotificationEvents: append([]NotificationEvent(nil), value.NotificationEvents...),
-		Observation: value.Observation,
+		Observation: value.Observation, PersonalRule: value.PersonalRule,
 	}
 }
 
@@ -82,6 +83,10 @@ func ValidateSyncDefinition(id string, value SyncDefinition) error {
 		if err := value.Observation.Validate(); err != nil {
 			return err
 		}
+	}
+	if value.PersonalRule != nil && (!validRuleBindingID(value.PersonalRule.CandidateID) || value.PersonalRule.CandidateRevision < 1 ||
+		value.PersonalRule.SourceMemoryID == "" || value.PersonalRule.SourceMemoryRevision < 1) {
+		return errors.New("schedule sync personal rule binding is invalid")
 	}
 	return nil
 }

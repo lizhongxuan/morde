@@ -18,6 +18,7 @@ type ScheduleRun = components['schemas']['ScheduleRun'];
 type ScheduleCreateRequest = components['schemas']['ScheduleCreateRequest'];
 type ScheduleUpdateRequest = components['schemas']['ScheduleUpdateRequest'];
 type ScheduleFields = Omit<ScheduleCreateRequest, 'observation' | 'host_id'> & { host_id?: string | null };
+type ScheduleRuleOption = { candidateID: string; revision: number; sourceMemoryID: string; sourceMemoryRevision: number; label: string };
 type Host = Awaited<ReturnType<typeof portalApi.hosts>>['items'][number];
 type AvailableModel = Awaited<ReturnType<typeof loadAvailableModels>>['items'][number];
 
@@ -33,6 +34,26 @@ function makeID(prefix: string) {
 function toGoalRecord(value: PersonalObject): GoalRecord | null {
   if (value.object_type !== 'goal') return null;
   return { ...value, object_type: 'goal', body: value.body as GoalBody };
+}
+
+function scheduleRuleOptions(objects: PersonalObject[]): ScheduleRuleOption[] {
+  const memorySetting = objects.find((item) => item.object_type === 'skill_setting' && item.object_id === 'builtin_memory');
+  const memoryEnabled = !memorySetting || (memorySetting.body as { enabled?: boolean }).enabled !== false;
+  if (!memoryEnabled) return [];
+  const memories = new Map(objects.filter((item) => item.object_type === 'memory').map((item) => [item.object_id, item.revision]));
+  return objects.flatMap((item) => {
+    if (item.object_type !== 'rule_candidate') return [];
+    const body = item.body as unknown as { scope?: string; status?: string; source_memory_id?: string; source_memory_revision?: number };
+    if (body.status !== 'active' || !body.source_memory_id || !Number.isSafeInteger(body.source_memory_revision) ||
+      memories.get(body.source_memory_id) !== body.source_memory_revision) return [];
+    return [{
+      candidateID: item.object_id,
+      revision: item.revision,
+      sourceMemoryID: body.source_memory_id,
+      sourceMemoryRevision: body.source_memory_revision!,
+      label: `${body.scope || '个人'} · ${item.object_id} v${item.revision} · 来源记忆 v${body.source_memory_revision}`,
+    }];
+  });
 }
 
 function forbidden(error: unknown) {
@@ -52,7 +73,7 @@ function runStatusLabel(status: ScheduleRun['status']) {
 }
 
 function skipReasonLabel(reason: NonNullable<ScheduleRun['skip_reason']>) {
-  return ({ dst_gap: '夏令时跳过', overlap: '与上次运行重叠', authorization_ended: '授权已结束' })[reason];
+  return ({ dst_gap: '夏令时跳过', overlap: '与上次运行重叠', authorization_ended: '授权已结束', personal_rule_revoked: '个人规则或来源已撤销' })[reason];
 }
 
 function isActiveRun(run: ScheduleRun | null) {
@@ -81,6 +102,13 @@ export function GoalsAndSchedules() {
     queryFn: ({ pageParam }) => portalApi.schedules(pageParam ? { cursor: pageParam } : {}),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (page) => page.next_cursor || undefined,
+  });
+  const personalData = useInfiniteQuery({
+    queryKey: ['schedule-personal-data'],
+    queryFn: ({ pageParam }) => portalApi.personalDataSnapshot(pageParam, 100),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (page) => page.next_cursor || undefined,
+    enabled: activeView === 'schedules',
   });
   const hosts = useQuery({ queryKey: ['hosts'], queryFn: portalApi.hosts });
   const preferences = useQuery({ queryKey: ['user-preferences'], queryFn: portalApi.preferences, retry: false, enabled: activeView === 'schedules' });
@@ -193,6 +221,7 @@ export function GoalsAndSchedules() {
 
   const goalRecords = (goals.data?.pages.flatMap((page) => page.items.map(toGoalRecord).filter((item): item is GoalRecord => item !== null)) ?? []);
   const scheduleRecords = schedules.data?.pages.flatMap((page) => page.items) ?? [];
+  const ruleOptions = scheduleRuleOptions(personalData.data?.pages.flatMap((page) => page.items) ?? []);
   const hostItems = hosts.data?.items ?? [];
   const defaultHostID = preferences.data?.default_host_id ?? null;
   const defaultHost = defaultHostID ? hostItems.find((host) => host.id === defaultHostID) ?? null : null;
@@ -273,6 +302,12 @@ export function GoalsAndSchedules() {
         hosts={hostItems}
         defaultHost={defaultHost}
         models={modelItems}
+        personalRules={ruleOptions}
+        personalRulesLoading={personalData.isPending}
+        personalRulesError={personalData.isError}
+        personalRulesHasMore={personalData.hasNextPage}
+        personalRulesLoadingMore={personalData.isFetchingNextPage}
+        onLoadMorePersonalRules={() => void personalData.fetchNextPage()}
         busy={scheduleCreate.isPending || scheduleUpdate.isPending}
         onCancel={() => setScheduleForm(null)}
         onSubmit={(fields) => scheduleForm.mode === 'create'
@@ -304,6 +339,7 @@ export function GoalsAndSchedules() {
                 <div className="schedule-card-heading"><div><h3>{schedule.title}</h3><span className={`status ${schedule.status === 'enabled' ? 'status-running' : schedule.status === 'completed' ? 'status-ready' : ''}`}>{scheduleStatusLabel(schedule.status)}</span></div><span className="muted">版本 {schedule.version}</span></div>
                 <p className="schedule-card-meta">执行内容：{schedule.objective}</p>
                 <p className="schedule-card-meta">{timingLabel(schedule.timing)} · 主机：{schedule.host_id ? hostItems.find((host) => host.id === schedule.host_id)?.name ?? schedule.host_id : '无（文本计划）'} · 模型：{modelItems.find((model) => model.id === schedule.model_id)?.name ?? schedule.model_id}</p>
+                {schedule.personal_rule && <p className="schedule-card-meta">已绑定个人规则 {schedule.personal_rule.candidate_id} v{schedule.personal_rule.candidate_revision} · 来源记忆 {schedule.personal_rule.source_memory_id} v{schedule.personal_rule.source_memory_revision}</p>}
                 <dl className="schedule-facts"><div><dt>下次运行</dt><dd>{schedule.next_run_at ? formatDate(schedule.next_run_at) : '无'}</dd></div><div><dt>当前运行</dt><dd>{schedule.current_run ? runStatusLabel(schedule.current_run.status) : '未运行'}</dd></div><div><dt>上次运行</dt><dd>{schedule.last_run ? `${runStatusLabel(schedule.last_run.status)} · ${formatDate(schedule.last_run.updated_at)}` : '尚无记录'}</dd></div><div><dt>运行预算</dt><dd>{schedule.budget.active_seconds} 秒 · {schedule.budget.tool_calls} 次工具调用 · {schedule.budget.model_tokens.toLocaleString()} tokens</dd></div></dl>
                 <div className="schedule-actions">
                   {!scheduleWriteDenied && schedule.status !== 'completed' && !(schedule.status === 'enabled' && currentRunActive) && <button type="button" className="button button-secondary" disabled={scheduleAction.isPending} onClick={() => scheduleAction.mutate({ id: schedule.id, action: schedule.status === 'enabled' ? 'disable' : 'enable' })}>{schedule.status === 'enabled' ? '停用' : '启用'}</button>}
@@ -325,7 +361,7 @@ export function GoalsAndSchedules() {
                         gap={8}
                         ariaLabel={`${schedule.title}运行记录`}
                         className="schedule-run-pagination"
-                        renderItem={(run) => <div className="schedule-run-row"><span>{run.scheduled_at ? formatDate(run.scheduled_at) : formatDate(run.created_at)} · {runStatusLabel(run.status)}{run.skip_reason ? ` · ${skipReasonLabel(run.skip_reason)}` : ''}</span><span>计划版本 {run.schedule_version}{run.task_id ? ` · 任务 ${run.task_id}` : ''}</span></div>}
+                        renderItem={(run) => <div className="schedule-run-row"><span>{run.scheduled_at ? formatDate(run.scheduled_at) : formatDate(run.created_at)} · {runStatusLabel(run.status)}{run.skip_reason ? ` · ${skipReasonLabel(run.skip_reason)}` : ''}</span><span>计划版本 {run.schedule_version}{run.task_id ? ` · 任务 ${run.task_id}` : ''}{run.personal_rule && ` · 规则 ${run.personal_rule.candidate_id} v${run.personal_rule.candidate_revision} / 来源 ${run.personal_rule.source_memory_id} v${run.personal_rule.source_memory_revision}`}{run.personal_rule_validation_status === 'validated' && ` · 来源校验通过${run.personal_rule_validated_at ? ` ${formatDate(run.personal_rule_validated_at)}` : ''}`}{run.personal_rule_validation_status === 'revoked' && ` · 来源已撤销${run.personal_rule_revoked_at ? ` ${formatDate(run.personal_rule_revoked_at)}` : ''}`}</span></div>}
                       />
                       : <p>还没有运行记录。</p>}
                   {runs.isError && runs.data && <FloatingError inline className="error-inline" role="alert">运行记录刷新失败，当前仍显示最近一次确认的数据。{errorDetails(runs.error).message}<button type="button" className="button button-small button-secondary" onClick={() => void runs.refetch()}>重试</button></FloatingError>}
@@ -358,11 +394,18 @@ function GoalEditorForm({ initial, busy, onCancel, onSubmit }: { initial?: GoalB
   </form>;
 }
 
-function ScheduleEditor({ initial, hosts, defaultHost, models, busy, onCancel, onSubmit }: {
+function ScheduleEditor({ initial, hosts, defaultHost, models, personalRules, personalRulesLoading, personalRulesError,
+  personalRulesHasMore, personalRulesLoadingMore, onLoadMorePersonalRules, busy, onCancel, onSubmit }: {
   initial: Schedule | null;
   hosts: Host[];
   defaultHost: Host | null;
   models: AvailableModel[];
+  personalRules: ScheduleRuleOption[];
+  personalRulesLoading: boolean;
+  personalRulesError: boolean;
+  personalRulesHasMore: boolean;
+  personalRulesLoadingMore: boolean;
+  onLoadMorePersonalRules: () => void;
   busy: boolean;
   onCancel: () => void;
   onSubmit: (fields: ScheduleFields) => void;
@@ -383,6 +426,7 @@ function ScheduleEditor({ initial, hosts, defaultHost, models, busy, onCancel, o
   const [modelTokens, setModelTokens] = useState(initial?.budget.model_tokens ?? 10000);
   const [misfirePolicy, setMisfirePolicy] = useState<components['schemas']['ScheduleMisfirePolicy']>(initial?.misfire_policy ?? 'skip');
   const [notificationEvents, setNotificationEvents] = useState<components['schemas']['ScheduleNotificationEvent'][]>(initial?.notification_events ?? ['completed', 'failed', 'waiting_user']);
+  const [personalRuleID, setPersonalRuleID] = useState(initial?.personal_rule?.candidate_id ?? '');
   const [formError, setFormError] = useState('');
 
   const toggleWeekday = (day: number) => setWeekdays((current) => current.includes(day) ? current.filter((value) => value !== day) : [...current, day].sort((a, b) => a - b));
@@ -406,6 +450,15 @@ function ScheduleEditor({ initial, hosts, defaultHost, models, busy, onCancel, o
       const hostField = initial
         ? hostID === (initial.host_id ?? '') ? {} : { host_id: hostID || null }
         : { host_id: defaultHost?.id ?? null };
+      const selectedRule = personalRules.find((rule) => rule.candidateID === personalRuleID);
+      const initialRuleRevision = initial?.personal_rule?.candidate_id === personalRuleID
+        ? initial.personal_rule.candidate_revision
+        : undefined;
+      const selectedRuleRevision = selectedRule?.revision ?? initialRuleRevision;
+      if (personalRuleID && selectedRuleRevision === undefined) {
+        setFormError('无法确认所选个人规则版本，请重试加载个人数据。');
+        return;
+      }
       onSubmit({
         ...hostField,
         model_id: modelID,
@@ -415,6 +468,7 @@ function ScheduleEditor({ initial, hosts, defaultHost, models, busy, onCancel, o
         budget: { active_seconds: Number(activeSeconds), tool_calls: Number(toolCalls), model_tokens: Number(modelTokens) },
         misfire_policy: misfirePolicy,
         notification_events: notificationEvents,
+        personal_rule: personalRuleID ? { candidate_id: personalRuleID, candidate_revision: selectedRuleRevision! } : null,
       });
     } catch (error) {
       setFormError(error instanceof Error ? error.message : '运行时间无效，请检查日期、时间和时区。');
@@ -430,6 +484,14 @@ function ScheduleEditor({ initial, hosts, defaultHost, models, busy, onCancel, o
           : '未设置默认云端电脑，此计划仅使用模型，不会操作电脑。'}</p>}
       <label>模型<select value={modelID} required onChange={(event) => setModelID(event.target.value)}>{initial && !models.some((model) => model.id === initial.model_id) && <option value={initial.model_id}>{initial.model_id}</option>}{models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.model_name}</option>)}</select></label>
       <label className="schedule-form-wide">计划内容<textarea value={objective} maxLength={32768} rows={3} required onChange={(event) => setObjective(event.target.value)} placeholder="描述计划运行时需要完成的工作" /></label>
+      <label className="schedule-form-wide">运行时继承个人规则<select value={personalRuleID} onChange={(event) => setPersonalRuleID(event.target.value)}>
+        <option value="">不绑定个人规则</option>
+        {initial?.personal_rule && !personalRules.some((rule) => rule.candidateID === initial.personal_rule?.candidate_id) && <option value={initial.personal_rule.candidate_id}>当前绑定：{initial.personal_rule.candidate_id} v{initial.personal_rule.candidate_revision}（当前有效列表中不可用）</option>}
+        {personalRules.map((rule) => <option key={rule.candidateID} value={rule.candidateID}>{rule.label}</option>)}
+      </select><span className="muted">只使用此处选定的规则及其精确来源版本。规则、来源记忆或记忆授权变更后，计划会停用并请求停止在途运行。</span></label>
+      {personalRulesLoading && <p className="muted" role="status">正在读取可用个人规则…</p>}
+      {personalRulesError && <p className="notice notice-warning" role="alert">个人数据暂时无法读取。已有绑定仍会按服务端当前版本校验；可清除绑定后保存。</p>}
+      {personalRulesHasMore && <button type="button" className="button button-secondary" disabled={personalRulesLoadingMore} onClick={onLoadMorePersonalRules}>{personalRulesLoadingMore ? '正在加载…' : '加载更多个人规则'}</button>}
     </div>
     <fieldset className="fieldset">
       <legend>运行频率</legend>

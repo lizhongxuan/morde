@@ -83,6 +83,7 @@ type Deps struct {
 	ModelGateway                 ModelGateway
 	ModelUsageAdmin              ModelUsageAdmin
 	BlindEvaluations             BlindEvaluationManager
+	WorkflowTraces               WorkflowTraceReader
 	Hub                          app.HubConnectionService
 	Devices                      deviceService
 	PersonalData                 personalDataService
@@ -261,6 +262,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerAdmin(group)
 	h.registerAdminQualityActivity(group)
 	h.registerBlindEvaluationRoutes(group)
+	h.registerAdminWorkflowTrace(group)
 	h.registerAdminControls(group)
 	h.registerAdminOperations(group)
 	h.registerAdminRecords(group)

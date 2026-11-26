@@ -128,6 +128,11 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 		Observation: command.Observation, ExecutionPolicy: command.executionPolicy, NextOccurrenceKey: first.Key, NextRunAt: first.ScheduledAt,
 		NextCheckAt: &first.CheckAt,
 	}
+	if command.PersonalRule != nil {
+		value.PersonalRule = &schedule.PersonalRuleBinding{
+			CandidateID: command.PersonalRule.CandidateID, CandidateRevision: command.PersonalRule.CandidateRevision,
+		}
+	}
 	if value.Observation != nil {
 		value.ObservationConfigHash = value.Observation.ConfigHash()
 	}
@@ -145,8 +150,10 @@ func (s *ScheduleService) Create(ctx context.Context, principal identity.Princip
 		Observation        *schedule.ObservationSpec
 		MisfirePolicy      schedule.MisfirePolicy
 		NotificationEvents []schedule.NotificationEvent
+		PersonalRule       *schedule.PersonalRuleSelection
 		ExecutionPolicy    schedule.ExecutionPolicy
-	}{command.HostID, command.ModelID, value.Title, command.Objective, command.FileDeliveryIntent, command.Timing, command.Budget, command.Observation, command.MisfirePolicy, command.NotificationEvents, command.executionPolicy})
+	}{command.HostID, command.ModelID, value.Title, command.Objective, command.FileDeliveryIntent, command.Timing, command.Budget,
+		command.Observation, command.MisfirePolicy, command.NotificationEvents, command.PersonalRule, command.executionPolicy})
 	if err != nil {
 		return schedule.Schedule{}, err
 	}
@@ -222,6 +229,14 @@ func (s *ScheduleService) Update(ctx context.Context, principal identity.Princip
 	}
 	if command.NotificationEvents != nil {
 		current.NotificationEvents = append([]schedule.NotificationEvent(nil), (*command.NotificationEvents)...)
+	}
+	if command.PersonalRuleSet {
+		current.PersonalRule = nil
+		if command.PersonalRule != nil {
+			current.PersonalRule = &schedule.PersonalRuleBinding{
+				CandidateID: command.PersonalRule.CandidateID, CandidateRevision: command.PersonalRule.CandidateRevision,
+			}
+		}
 	}
 	if stringsTrim(current.Title) == "" || len(stringsTrim(current.Title)) > 32768 ||
 		stringsTrim(current.Objective) == "" || len(stringsTrim(current.Objective)) > 32768 {

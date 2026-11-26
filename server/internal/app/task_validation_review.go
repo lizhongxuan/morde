@@ -103,6 +103,7 @@ type TaskValidationReviewStepDetail struct {
 	Truncated       bool                            `json:"truncated"`
 	ShellExecution  *TaskStepShellExecutionEvidence `json:"shell_execution,omitempty"`
 	ContentEvidence *TaskStepContentEvidence        `json:"content_evidence,omitempty"`
+	SourceLocations []TaskStepSourceLocation        `json:"source_locations,omitempty"`
 }
 
 type TaskValidationReviewArtifact struct {

@@ -34,6 +34,7 @@ type CreateScheduleCommand struct {
 	Observation        *schedule.ObservationSpec
 	MisfirePolicy      schedule.MisfirePolicy
 	NotificationEvents []schedule.NotificationEvent
+	PersonalRule       *schedule.PersonalRuleSelection
 	executionPolicy    schedule.ExecutionPolicy
 }
 
@@ -50,6 +51,8 @@ type UpdateScheduleCommand struct {
 	Observation        *schedule.ObservationSpec
 	MisfirePolicy      *schedule.MisfirePolicy
 	NotificationEvents *[]schedule.NotificationEvent
+	PersonalRuleSet    bool
+	PersonalRule       *schedule.PersonalRuleSelection
 }
 
 type ScheduleActionCommand struct {

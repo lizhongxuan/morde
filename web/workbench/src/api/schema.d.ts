@@ -8270,6 +8270,7 @@ export interface components {
             misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events: components["schemas"]["ScheduleNotificationEvent"][];
             observation?: components["schemas"]["ScheduleObservation"];
+            personal_rule?: components["schemas"]["SchedulePersonalRuleBinding"] | null;
         } & unknown;
         GoalCreateRequest: {
             id: components["schemas"]["GoalId"];
@@ -8305,6 +8306,7 @@ export interface components {
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
             observation?: components["schemas"]["ScheduleObservation"] | null;
+            personal_rule?: components["schemas"]["SchedulePersonalRuleSelection"] | null;
         } & unknown;
         ScheduleUpdateRequest: {
             /** Format: int64 */
@@ -8325,6 +8327,7 @@ export interface components {
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
             observation?: components["schemas"]["ScheduleObservation"] | null;
+            personal_rule?: components["schemas"]["SchedulePersonalRuleSelection"] | null;
         };
         ScheduleActionRequest: {
             /** @enum {string} */
@@ -8337,7 +8340,22 @@ export interface components {
         /** @enum {string} */
         ScheduleRunStatus: "queued" | "running" | "waiting_user" | "pausing" | "paused" | "stopping" | "completed" | "failed" | "cancelled" | "skipped" | "missed";
         /** @enum {string} */
-        ScheduleRunSkipReason: "dst_gap" | "overlap" | "authorization_ended";
+        ScheduleRunSkipReason: "dst_gap" | "overlap" | "authorization_ended" | "personal_rule_revoked";
+        /** @enum {string} */
+        SchedulePersonalRuleValidationStatus: "not_bound" | "validated" | "revoked";
+        SchedulePersonalRuleSelection: {
+            candidate_id: string;
+            /** Format: int64 */
+            candidate_revision: number;
+        };
+        SchedulePersonalRuleBinding: {
+            candidate_id: string;
+            /** Format: int64 */
+            candidate_revision: number;
+            source_memory_id: string;
+            /** Format: int64 */
+            source_memory_revision: number;
+        };
         ScheduleRun: {
             id: components["schemas"]["ScheduleRunId"];
             schedule_id: components["schemas"]["ScheduleId"];
@@ -8353,6 +8371,12 @@ export interface components {
             task_id: components["schemas"]["TaskId"] | null;
             notification_events: components["schemas"]["ScheduleNotificationEvent"][];
             observation: components["schemas"]["ScheduleObservation"] | null;
+            personal_rule: components["schemas"]["SchedulePersonalRuleBinding"] | null;
+            personal_rule_validation_status: components["schemas"]["SchedulePersonalRuleValidationStatus"];
+            /** Format: date-time */
+            personal_rule_validated_at: string | null;
+            /** Format: date-time */
+            personal_rule_revoked_at: string | null;
             /** @enum {string} */
             observation_outcome: "unknown" | "baseline" | "changed" | "no_change";
             /** Format: date-time */
@@ -8383,6 +8407,7 @@ export interface components {
             misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events: components["schemas"]["ScheduleNotificationEvent"][];
             observation: components["schemas"]["ScheduleObservation"] | null;
+            personal_rule: components["schemas"]["SchedulePersonalRuleBinding"] | null;
             /** Format: date-time */
             next_run_at: string | null;
             last_run: components["schemas"]["ScheduleRun"] | null;
@@ -9744,6 +9769,8 @@ export interface components {
             expected_plan_revision: number;
             /** Format: int64 */
             expected_plan_event_sequence: number;
+            /** @constant */
+            requirements_complete_attested: true;
         };
         TaskRequirementManifestConfirmation: {
             task_id: components["schemas"]["TaskId"];
@@ -9754,8 +9781,19 @@ export interface components {
             /** Format: int64 */
             plan_event_sequence: number;
             manifest_digest: string;
+            /** @constant */
+            requirements_complete_attested: true;
+            /** Format: date-time */
+            attested_at: string;
             /** Format: date-time */
             confirmed_at: string;
+        };
+        TaskRequirementManifestStatus: {
+            manifest_digest: string;
+            /** @constant */
+            requirements_complete_attested: true;
+            /** Format: date-time */
+            attested_at: string;
         };
         TaskStepRetryRequest: {
             /** Format: int64 */
@@ -10179,6 +10217,9 @@ export interface components {
             steps: components["schemas"]["TaskStep"][];
             /** @description Latest advisory plan for the current Task revision. It never grants authorization; prior revisions remain in the task event history. */
             plan?: components["schemas"]["TaskPlan"] | null;
+            /** Format: int64 */
+            plan_event_sequence?: number;
+            requirement_manifest_confirmation?: components["schemas"]["TaskRequirementManifestStatus"];
             /** @description Task-scoped model call totals from the authorized account/project usage ledger. Costs retain currency and rate snapshot versions; unknown */
             billing?: components["schemas"]["TaskBilling"];
             agents?: components["schemas"]["TaskAgentExecution"][];

@@ -839,6 +839,7 @@ func serve(ctx context.Context, configPath string) error {
 		Projects:               projects, ProjectContent: projects,
 		ModelConnections: modelConnections, MCPConnectors: mcpConnectors, ModelGateway: modelGateway, ModelUsageAdmin: modelUsageAdmin,
 		BlindEvaluations: blindEvaluations,
+		WorkflowTraces:   store,
 		Hub:              hubService, Devices: deviceService, PersonalData: personalDataService, PersonalSync: personalSyncService,
 		Goals: goalService, Schedules: executionAdapters.schedules,
 		PersonalDataQuota: personalDataQuotaService, PersonalDataQuotaUser: personalDataQuotaUserService,

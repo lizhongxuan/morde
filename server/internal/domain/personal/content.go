@@ -122,7 +122,7 @@ func ValidateObjectBody(objectType, objectID string, body []byte) error {
 	}
 	if objectType == ObjectTypeSchedule {
 		var value schedule.SyncDefinition
-		if !decodePersonalObject(body, &value, "status", "host_id", "model_id", "title", "objective", "file_delivery_intent", "timing", "budget", "misfire_policy", "notification_events", "observation") {
+		if !decodePersonalObject(body, &value, "status", "host_id", "model_id", "title", "objective", "file_delivery_intent", "timing", "budget", "misfire_policy", "notification_events", "observation", "personal_rule") {
 			return invalidPersonalBody()
 		}
 		var fields map[string]json.RawMessage

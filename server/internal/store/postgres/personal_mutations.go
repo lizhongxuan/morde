@@ -79,6 +79,16 @@ func applyPersonalMutationInTx(ctx context.Context, tx pgx.Tx, principal identit
 	} else if found {
 		return replay, nil
 	}
+	candidateID, sourceMemoryID, allBoundRules := personalRuleRevocationTarget(mutation)
+	if candidateID != "" || sourceMemoryID != "" || allBoundRules {
+		if err := lockSchedulePersonalRuleOwner(ctx, tx, mutation.OwnerID); err != nil {
+			return personal.MutationReceipt{}, err
+		}
+	}
+	revokedSchedules, err := lockSchedulesForPersonalRuleRevocation(ctx, tx, mutation.OwnerID, mutation)
+	if err != nil {
+		return personal.MutationReceipt{}, err
+	}
 	if _, err := lockAccountChangeCounter(ctx, tx, instanceID, mutation.OwnerID); err != nil {
 		return personal.MutationReceipt{}, err
 	}
@@ -146,6 +156,9 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 		}
 	}
 	if err := validatePersonalAttachmentReferenceInTx(ctx, tx, instanceID, mutation.OwnerID, mutation, allowedNewAttachmentID); err != nil {
+		return personal.MutationReceipt{}, err
+	}
+	if err := revokePersonalRuleSchedulesInTx(ctx, tx, mutation.OwnerID, revokedSchedules, mutation); err != nil {
 		return personal.MutationReceipt{}, err
 	}
 	previousAttachmentBytes, err := personalAttachmentUsageBytesInTx(ctx, tx, instanceID, mutation.OwnerID)

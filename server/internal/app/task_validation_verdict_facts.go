@@ -220,11 +220,11 @@ func EvaluateTaskValidationReplay(hasFixPlan bool, gate TestGateResult, evidence
 // older unit helpers and are never serialized into the review prompt.
 type TaskValidationReplayEvidence struct {
 	State TaskValidationReplayState `json:"state"`
-	// RequirementSetVerified means an independent, server-validated fact proves
-	// that the current obligation set completely and faithfully maps the
-	// authoritative user/project requirement sources. An authenticated user's
-	// confirmation of one candidate manifest digest does not establish that
-	// completeness or semantic match.
+	// RequirementSetVerified is true only after an authenticated user explicitly
+	// attests that the exact current obligation set is complete and accurate, and
+	// Store revalidates its source identities and exhaustive required-check
+	// mappings in the replay transaction. A candidate manifest digest alone is
+	// not a completeness attestation.
 	RequirementSetVerified bool `json:"requirement_set_verified"`
 	// FinalWorkspaceSnapshotVerified is set only when the delivered Task
 	// Workspace still matches the snapshot on which all checks ran.

@@ -21,7 +21,7 @@ func (s *Store) ListScheduledPersonalContext(ctx context.Context, ownerID, runID
 	}
 	objectTypes := []string{personal.ObjectTypeProfile, personal.ObjectTypeSoul, personal.ObjectTypeGoal}
 	if includeMemory {
-		objectTypes = append(objectTypes, personal.ObjectTypeMemory)
+		objectTypes = append(objectTypes, personal.ObjectTypeMemory, personal.ObjectTypeRuleCandidate)
 	}
 	var result []personal.Object
 	var hasMore bool
@@ -39,9 +39,20 @@ JOIN personal_objects p ON p.service_instance_id=v.service_instance_id AND p.own
   AND p.object_type=v.object_type AND p.object_id=v.object_id
 WHERE v.service_instance_id=$1::uuid AND v.owner_id=$2 AND v.object_type=ANY($3::text[])
   AND NOT v.is_deleted AND p.body IS NOT NULL
-ORDER BY CASE v.object_type WHEN 'profile' THEN 0 WHEN 'memory' THEN 1 WHEN 'soul' THEN 2 WHEN 'goal' THEN 3 ELSE 4 END,
+  AND (v.object_type <> 'rule_candidate' OR EXISTS (
+    SELECT 1 FROM schedule_runs r WHERE r.id=$5 AND r.owner_id=$2 AND r.task_id=$6
+      AND r.personal_rule_binding->>'candidate_id'=v.object_id
+      AND (r.personal_rule_binding->>'candidate_revision')::bigint=v.revision
+  ))
+ORDER BY CASE
+  WHEN v.object_type='profile' THEN 0
+  WHEN v.object_type='memory' AND v.object_id=(SELECT r.personal_rule_binding->>'source_memory_id' FROM schedule_runs r WHERE r.id=$5 AND r.task_id=$6) THEN 1
+  WHEN v.object_type='rule_candidate' THEN 2
+  WHEN v.object_type='memory' THEN 3
+  WHEN v.object_type='soul' THEN 4
+  WHEN v.object_type='goal' THEN 5 ELSE 6 END,
   v.object_id
-LIMIT $4`, instanceID, ownerID, objectTypes, limit+1)
+LIMIT $4`, instanceID, ownerID, objectTypes, limit+1, runID, taskID)
 		if err != nil {
 			return fmt.Errorf("query scheduled personal context: %w", err)
 		}
@@ -83,7 +94,8 @@ func (s *Store) GetScheduledPersonalContextObject(ctx context.Context, ownerID, 
 		return personal.Object{}, domain.InvalidArgument("scheduled_context", "scheduled personal object request is invalid")
 	}
 	switch objectType {
-	case personal.ObjectTypeProfile, personal.ObjectTypeSoul, personal.ObjectTypeMemory, personal.ObjectTypeGoal, personal.ObjectTypeSkillSetting:
+	case personal.ObjectTypeProfile, personal.ObjectTypeSoul, personal.ObjectTypeMemory, personal.ObjectTypeGoal, personal.ObjectTypeSkillSetting,
+		personal.ObjectTypeRuleCandidate:
 	default:
 		return personal.Object{}, domain.NewError(domain.CodeForbidden, "scheduled personal object type is not available")
 	}
@@ -91,6 +103,15 @@ func (s *Store) GetScheduledPersonalContextObject(ctx context.Context, ownerID, 
 	err := s.withPersonalSnapshot(ctx, func(tx pgx.Tx) error {
 		if err := authorizeScheduledPersonalContextInTx(ctx, tx, ownerID, runID, taskID); err != nil {
 			return err
+		}
+		if objectType == personal.ObjectTypeRuleCandidate {
+			binding, err := scheduledRunPersonalRuleBindingInTx(ctx, tx, ownerID, runID, taskID)
+			if err != nil {
+				return err
+			}
+			if binding == nil || binding.CandidateID != objectID {
+				return domain.NewError(domain.CodeForbidden, "scheduled personal rule is not authorized")
+			}
 		}
 		instanceID, err := serviceInstanceIDInTx(ctx, tx)
 		if err != nil {
@@ -144,7 +165,41 @@ WHERE r.id=$1 AND r.owner_id=$2 AND r.task_id=$3
 	if !scheduleTaskScopeStringsValidForHost(scopes, hostBound) {
 		return domain.NewError(domain.CodeUnauthenticated, "scheduled personal context authorization is unavailable")
 	}
+	binding, err := scheduledRunPersonalRuleBindingInTx(ctx, tx, ownerID, runID, taskID)
+	if err != nil {
+		return err
+	}
+	if binding != nil {
+		valid, err := schedulePersonalRuleBindingValidInTx(ctx, tx, ownerID, binding)
+		if err != nil {
+			return err
+		}
+		if !valid {
+			return domain.NewError(domain.CodeUnauthenticated, "scheduled personal rule authorization is unavailable")
+		}
+	}
 	return nil
+}
+
+func scheduledRunPersonalRuleBindingInTx(ctx context.Context, tx pgx.Tx, ownerID, runID, taskID string) (*schedule.PersonalRuleBinding, error) {
+	var encoded []byte
+	err := tx.QueryRow(ctx, `SELECT personal_rule_binding FROM schedule_runs
+WHERE id=$1 AND owner_id=$2 AND task_id=$3`, runID, ownerID, taskID).Scan(&encoded)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, domain.NewError(domain.CodeUnauthenticated, "scheduled personal context authorization is unavailable")
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read scheduled personal rule binding: %w", err)
+	}
+	if len(encoded) == 0 {
+		return nil, nil
+	}
+	var binding schedule.PersonalRuleBinding
+	if err := json.Unmarshal(encoded, &binding); err != nil || binding.CandidateID == "" || binding.CandidateRevision < 1 ||
+		binding.SourceMemoryID == "" || binding.SourceMemoryRevision < 1 {
+		return nil, domain.NewError(domain.CodeInternal, "stored scheduled personal rule binding is invalid")
+	}
+	return &binding, nil
 }
 
 var _ interface {

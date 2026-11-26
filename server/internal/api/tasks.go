@@ -187,24 +187,32 @@ type taskValidationResponse struct {
 
 type taskResponse struct {
 	taskSummaryResponse
-	EventSequence          int64                             `json:"event_sequence"`
-	Result                 *string                           `json:"result"`
-	ValidationDetail       *app.TaskValidationEvidenceRecord `json:"validation_detail,omitempty"`
-	CurrentRevisionStarted *bool                             `json:"current_revision_started,omitempty"`
-	ResultMessagePending   bool                              `json:"result_message_pending,omitempty"`
-	ResultMessagePublished bool                              `json:"result_message_published,omitempty"`
-	WaitingReason          *string                           `json:"waiting_reason"`
-	Steps                  []taskStepResponse                `json:"steps"`
-	Agents                 []taskAgentResponse               `json:"agents,omitempty"`
-	BatchItems             []taskBatchItemResponse           `json:"batch_items"`
-	Artifacts              []taskArtifactResponse            `json:"artifacts"`
-	PendingRequest         *taskPendingRequestResponse       `json:"pending_request"`
-	ClarificationRequest   *taskClarificationRequestResponse `json:"clarification_request"`
-	StopRequest            *taskStopRequestResponse          `json:"stop_request"`
-	AssistantMessage       *taskAssistantMessageResponse     `json:"assistant_message"`
-	FinishedAt             *time.Time                        `json:"finished_at"`
-	Plan                   *task.Plan                        `json:"plan,omitempty"`
-	Billing                *taskBillingResponse              `json:"billing,omitempty"`
+	EventSequence                   int64                                  `json:"event_sequence"`
+	Result                          *string                                `json:"result"`
+	ValidationDetail                *app.TaskValidationEvidenceRecord      `json:"validation_detail,omitempty"`
+	CurrentRevisionStarted          *bool                                  `json:"current_revision_started,omitempty"`
+	ResultMessagePending            bool                                   `json:"result_message_pending,omitempty"`
+	ResultMessagePublished          bool                                   `json:"result_message_published,omitempty"`
+	WaitingReason                   *string                                `json:"waiting_reason"`
+	Steps                           []taskStepResponse                     `json:"steps"`
+	Agents                          []taskAgentResponse                    `json:"agents,omitempty"`
+	BatchItems                      []taskBatchItemResponse                `json:"batch_items"`
+	Artifacts                       []taskArtifactResponse                 `json:"artifacts"`
+	PendingRequest                  *taskPendingRequestResponse            `json:"pending_request"`
+	ClarificationRequest            *taskClarificationRequestResponse      `json:"clarification_request"`
+	StopRequest                     *taskStopRequestResponse               `json:"stop_request"`
+	AssistantMessage                *taskAssistantMessageResponse          `json:"assistant_message"`
+	FinishedAt                      *time.Time                             `json:"finished_at"`
+	Plan                            *task.Plan                             `json:"plan,omitempty"`
+	PlanEventSequence               *int64                                 `json:"plan_event_sequence,omitempty"`
+	RequirementManifestConfirmation *taskRequirementManifestStatusResponse `json:"requirement_manifest_confirmation,omitempty"`
+	Billing                         *taskBillingResponse                   `json:"billing,omitempty"`
+}
+
+type taskRequirementManifestStatusResponse struct {
+	ManifestDigest               string     `json:"manifest_digest"`
+	RequirementsCompleteAttested bool       `json:"requirements_complete_attested"`
+	AttestedAt                   *time.Time `json:"attested_at,omitempty"`
 }
 
 type taskFileFetchResponse struct {
@@ -629,18 +637,21 @@ type taskStepRetryRequest struct {
 }
 
 type taskRequirementManifestConfirmationRequest struct {
-	TaskRevision      int64 `json:"expected_task_revision"`
-	PlanRevision      int64 `json:"expected_plan_revision"`
-	PlanEventSequence int64 `json:"expected_plan_event_sequence"`
+	TaskRevision                 int64 `json:"expected_task_revision"`
+	PlanRevision                 int64 `json:"expected_plan_revision"`
+	PlanEventSequence            int64 `json:"expected_plan_event_sequence"`
+	RequirementsCompleteAttested bool  `json:"requirements_complete_attested"`
 }
 
 type taskRequirementManifestConfirmationResponse struct {
-	TaskID            string    `json:"task_id"`
-	TaskRevision      int64     `json:"task_revision"`
-	PlanRevision      int64     `json:"plan_revision"`
-	PlanEventSequence int64     `json:"plan_event_sequence"`
-	ManifestDigest    string    `json:"manifest_digest"`
-	ConfirmedAt       time.Time `json:"confirmed_at"`
+	TaskID                       string     `json:"task_id"`
+	TaskRevision                 int64      `json:"task_revision"`
+	PlanRevision                 int64      `json:"plan_revision"`
+	PlanEventSequence            int64      `json:"plan_event_sequence"`
+	ManifestDigest               string     `json:"manifest_digest"`
+	RequirementsCompleteAttested bool       `json:"requirements_complete_attested"`
+	AttestedAt                   *time.Time `json:"attested_at,omitempty"`
+	ConfirmedAt                  time.Time  `json:"confirmed_at"`
 }
 
 func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
@@ -709,9 +720,17 @@ func (h *api) confirmTaskRequirementManifest(service TaskRequirementConfirmation
 		}
 		confirmation, err := service.ConfirmTaskRequirementManifest(c.Request.Context(), principal, taskID,
 			app.TaskRequirementManifestConfirmationInput{TaskRevision: request.TaskRevision, PlanRevision: request.PlanRevision,
-				PlanEventSequence: request.PlanEventSequence, ManifestDigest: manifestDigest, IdempotencyKey: idempotencyKey})
+				PlanEventSequence: request.PlanEventSequence, ManifestDigest: manifestDigest,
+				RequirementsCompleteAttested: request.RequirementsCompleteAttested, IdempotencyKey: idempotencyKey})
 		if err != nil {
 			writeError(c, err)
+			return
+		}
+		if !confirmation.RequirementsCompleteAttested || confirmation.AttestedAt == nil ||
+			confirmation.ManifestDigest != manifestDigest || confirmation.TaskID != taskID ||
+			confirmation.TaskRevision != request.TaskRevision || confirmation.PlanRevision != request.PlanRevision ||
+			confirmation.PlanEventSequence != request.PlanEventSequence {
+			writeError(c, domain.NewError(domain.CodeInternal, "task requirement attestation is invalid"))
 			return
 		}
 		c.Header("Cache-Control", "no-store")
@@ -721,7 +740,8 @@ func (h *api) confirmTaskRequirementManifest(service TaskRequirementConfirmation
 		c.JSON(http.StatusOK, taskRequirementManifestConfirmationResponse{
 			TaskID: confirmation.TaskID, TaskRevision: confirmation.TaskRevision, PlanRevision: confirmation.PlanRevision,
 			PlanEventSequence: confirmation.PlanEventSequence, ManifestDigest: confirmation.ManifestDigest,
-			ConfirmedAt: confirmation.ConfirmedAt,
+			RequirementsCompleteAttested: confirmation.RequirementsCompleteAttested,
+			AttestedAt:                   confirmation.AttestedAt, ConfirmedAt: confirmation.ConfirmedAt,
 		})
 	}
 }
@@ -1532,7 +1552,18 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		Result: stringPointer(value.Task.Result), CurrentRevisionStarted: value.CurrentRevisionStarted, ResultMessagePending: value.ResultMessagePending,
 		ResultMessagePublished: value.ResultMessagePublished, WaitingReason: stringPointer(value.Task.WaitingReason),
 		Steps: make([]taskStepResponse, 0, len(value.Steps)), Agents: make([]taskAgentResponse, 0, len(value.Agents)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
-		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt, Plan: value.Plan, Billing: billing,
+		Artifacts: make([]taskArtifactResponse, 0, len(value.Artifacts)), FinishedAt: value.Task.FinishedAt, Plan: value.Plan,
+		PlanEventSequence: value.PlanEventSequence, Billing: billing,
+	}
+	if value.RequirementManifestConfirmation != nil {
+		if value.Plan == nil || value.Plan.RequirementManifest == nil || !value.RequirementManifestConfirmation.RequirementsCompleteAttested ||
+			value.RequirementManifestConfirmation.ManifestDigest != value.Plan.RequirementManifest.Digest || value.RequirementManifestConfirmation.AttestedAt == nil {
+			return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
+		}
+		response.RequirementManifestConfirmation = &taskRequirementManifestStatusResponse{
+			ManifestDigest:               value.RequirementManifestConfirmation.ManifestDigest,
+			RequirementsCompleteAttested: true, AttestedAt: value.RequirementManifestConfirmation.AttestedAt,
+		}
 	}
 	if evidence := value.ValidationEvidence; evidence != nil {
 		if value.Task.CurrentRevision == nil || evidence.TaskRevision != *value.Task.CurrentRevision || evidence.EventSequence > value.Task.EventSequence ||

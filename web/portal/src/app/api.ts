@@ -246,6 +246,19 @@ export const portalApi = {
     throw new Error('任务页数超过读取上限');
   },
   task: async (id: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}', { params: { path: { id } } })),
+  confirmTaskRequirementManifest: async (id: string,
+    body: components['schemas']['TaskRequirementManifestConfirmationRequest'], manifestDigest: string, idempotencyKey: string) => {
+    const confirmation = unwrapApiResponse(await api.POST('/api/tasks/{id}/requirement-manifest/confirm', {
+      params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey, 'If-Match': `"${manifestDigest}"` } }, body,
+    }));
+    if (confirmation.task_id !== id || confirmation.task_revision !== body.expected_task_revision ||
+      confirmation.plan_revision !== body.expected_plan_revision || confirmation.plan_event_sequence !== body.expected_plan_event_sequence ||
+      confirmation.manifest_digest !== manifestDigest || confirmation.requirements_complete_attested !== true ||
+      !Number.isFinite(Date.parse(confirmation.attested_at)) || !Number.isFinite(Date.parse(confirmation.confirmed_at))) {
+      throw new Error('服务端没有确认当前任务要求清单，请重新读取任务状态。');
+    }
+    return confirmation;
+  },
   taskApprovals: async (options: { conversationID?: string; cursor?: string } = {}): Promise<components['schemas']['TaskApprovalPage']> =>
     unwrapApiResponse(await api.GET('/api/me/task-approvals', { params: { query: {
       limit: 100, ...(options.conversationID ? { conversation_id: options.conversationID } : {}),

@@ -10,34 +10,38 @@ import (
 )
 
 type TaskRequirementManifestConfirmationInput struct {
-	TaskRevision      int64
-	PlanRevision      int64
-	PlanEventSequence int64
-	ManifestDigest    string
-	IdempotencyKey    string
+	TaskRevision                 int64
+	PlanRevision                 int64
+	PlanEventSequence            int64
+	ManifestDigest               string
+	RequirementsCompleteAttested bool
+	IdempotencyKey               string
 }
 
 type TaskRequirementManifestConfirmationCommand struct {
-	TaskID             string
-	ActorUserID        string
-	ActorPrincipalKind string
-	TaskRevision       int64
-	PlanRevision       int64
-	PlanEventSequence  int64
-	ManifestDigest     string
-	IdempotencyKey     string
+	TaskID                       string
+	ActorUserID                  string
+	ActorPrincipalKind           string
+	TaskRevision                 int64
+	PlanRevision                 int64
+	PlanEventSequence            int64
+	ManifestDigest               string
+	RequirementsCompleteAttested bool
+	IdempotencyKey               string
 }
 
 type TaskRequirementManifestConfirmation struct {
-	TaskID                   string    `json:"task_id"`
-	TaskRevision             int64     `json:"task_revision"`
-	PlanRevision             int64     `json:"plan_revision"`
-	PlanEventSequence        int64     `json:"plan_event_sequence"`
-	ManifestDigest           string    `json:"manifest_digest"`
-	ConfirmedByUserID        string    `json:"confirmed_by_user_id"`
-	ConfirmedByPrincipalKind string    `json:"confirmed_by_principal_kind"`
-	TaskAuthorizationVersion int64     `json:"task_authorization_version"`
-	ConfirmedAt              time.Time `json:"confirmed_at"`
+	TaskID                       string     `json:"task_id"`
+	TaskRevision                 int64      `json:"task_revision"`
+	PlanRevision                 int64      `json:"plan_revision"`
+	PlanEventSequence            int64      `json:"plan_event_sequence"`
+	ManifestDigest               string     `json:"manifest_digest"`
+	ConfirmedByUserID            string     `json:"confirmed_by_user_id"`
+	ConfirmedByPrincipalKind     string     `json:"confirmed_by_principal_kind"`
+	TaskAuthorizationVersion     int64      `json:"task_authorization_version"`
+	ConfirmedAt                  time.Time  `json:"confirmed_at"`
+	RequirementsCompleteAttested bool       `json:"requirements_complete_attested"`
+	AttestedAt                   *time.Time `json:"attested_at,omitempty"`
 }
 
 type TaskRequirementManifestConfirmationStore interface {
@@ -53,7 +57,7 @@ func (s *TaskService) ConfirmTaskRequirementManifest(ctx context.Context, princi
 		return TaskRequirementManifestConfirmation{}, err
 	}
 	if !domain.ValidTaskID(taskID) || input.TaskRevision < 0 || input.PlanRevision < 1 || input.PlanEventSequence < 1 ||
-		!validTaskRequirementManifestDigest(input.ManifestDigest) {
+		!validTaskRequirementManifestDigest(input.ManifestDigest) || !input.RequirementsCompleteAttested {
 		return TaskRequirementManifestConfirmation{}, domain.InvalidArgument("task_requirement_manifest_confirmation", "confirmation fence or idempotency key is invalid")
 	}
 	if err := validateIdempotencyKey(input.IdempotencyKey); err != nil {
@@ -81,7 +85,8 @@ func (s *TaskService) ConfirmTaskRequirementManifest(ctx context.Context, princi
 	return store.ConfirmTaskRequirementManifest(ctx, TaskRequirementManifestConfirmationCommand{
 		TaskID: taskID, ActorUserID: principal.UserID, ActorPrincipalKind: string(principal.Kind),
 		TaskRevision: input.TaskRevision, PlanRevision: input.PlanRevision, PlanEventSequence: input.PlanEventSequence,
-		ManifestDigest: input.ManifestDigest, IdempotencyKey: input.IdempotencyKey,
+		ManifestDigest: input.ManifestDigest, RequirementsCompleteAttested: input.RequirementsCompleteAttested,
+		IdempotencyKey: input.IdempotencyKey,
 	})
 }
 

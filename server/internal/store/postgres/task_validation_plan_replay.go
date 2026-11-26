@@ -19,6 +19,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/store/postgres/sqlcgen"
 )
 
 type taskValidationReplayTask struct {
@@ -134,10 +135,11 @@ func loadTaskValidationPlanCheckReplay(ctx context.Context, tx pgx.Tx, claim app
 	if evidence == nil {
 		return nil, nil
 	}
-	// No trusted source-completeness and semantic-attestation writer exists
-	// yet. The exact-digest candidate confirmation is not sufficient to assert
-	// that the plan covers every explicit requirement, so H07 must stay pending.
-	evidence.RequirementSetVerified = false
+	requirementSetVerified, err := taskValidationRequirementSetVerified(ctx, tx, claim, current, plan)
+	if err != nil {
+		return nil, err
+	}
+	evidence.RequirementSetVerified = requirementSetVerified
 	checkIDs := make([]string, 0, len(plan.Steps))
 	for _, step := range plan.Steps {
 		if step.VerificationCheck != nil {
@@ -243,6 +245,80 @@ ORDER BY b.created_at,COALESCE(step.sequence,0)`, claim.OwnerID, claim.TaskID, c
 	}
 	evidence.State = app.EvaluateTaskValidationPlanReplay(plan, evidence)
 	return evidence, nil
+}
+
+func taskValidationRequirementSetVerified(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim,
+	current taskValidationReplayTask, plan task.Plan) (bool, error) {
+	manifest := plan.RequirementManifest
+	if manifest == nil || plan.Validate() != nil {
+		return false, nil
+	}
+	digest, err := plan.RequirementManifestDigest()
+	if err != nil || !validTaskRequirementConfirmationDigest(digest) || digest != manifest.Digest {
+		return false, nil
+	}
+	var eventSequence int64
+	err = tx.QueryRow(ctx, `SELECT sequence FROM task_events
+WHERE task_id=$1 AND event_type='task.plan' AND payload #>> '{plan,task_revision}'=$2
+  AND payload #>> '{plan,revision}'=$3 ORDER BY sequence DESC LIMIT 1`, claim.TaskID,
+		fmt.Sprint(claim.TaskRevision), fmt.Sprint(plan.Revision)).Scan(&eventSequence)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, fmt.Errorf("read current H07 plan event sequence: %w", err)
+	}
+	taskRow, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: claim.TaskID, OwnerID: claim.OwnerID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read current Task authorization for H07 requirement attestation: %w", err)
+	}
+	if taskRow.CurrentRevision != claim.TaskRevision || taskRow.DesiredRevision != claim.TaskRevision ||
+		taskRow.AuthVersion != current.authVersion {
+		return false, nil
+	}
+	authorized, err := requireCurrentTaskAuthorization(ctx, tx, taskRow)
+	if err != nil || !authorized {
+		return false, err
+	}
+	confirmation, found, err := readTaskRequirementManifestConfirmationForPlan(ctx, tx, claim.OwnerID, claim.TaskID,
+		claim.TaskRevision, plan.Revision, eventSequence, current.authVersion, digest)
+	if err != nil || !found || !confirmation.RequirementsCompleteAttested {
+		return false, err
+	}
+	seenRequirements := make(map[task.PlanVerificationRequirementID]struct{}, len(manifest.Obligations))
+	for _, obligation := range manifest.Obligations {
+		if obligation.ID == "" {
+			return false, nil
+		}
+		if _, exists := seenRequirements[obligation.ID]; exists {
+			return false, nil
+		}
+		seenRequirements[obligation.ID] = struct{}{}
+		verified, err := taskValidationRequirementSourceVerified(ctx, tx, claim, current, obligation.Source)
+		if err != nil || !verified {
+			return false, err
+		}
+	}
+	mappedRequirements := make(map[task.PlanVerificationRequirementID]struct{}, len(seenRequirements))
+	for _, step := range plan.Steps {
+		check := step.VerificationCheck
+		if check == nil || check.Basis != task.PlanVerificationCheckRequired {
+			continue
+		}
+		for _, id := range check.RequirementIDs {
+			if _, exists := seenRequirements[id]; !exists {
+				return false, nil
+			}
+			mappedRequirements[id] = struct{}{}
+		}
+	}
+	if len(mappedRequirements) != len(seenRequirements) {
+		return false, nil
+	}
+	return true, nil
 }
 
 type taskValidationReplayHostFence struct {

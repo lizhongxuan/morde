@@ -48,6 +48,7 @@ type TaskStep = Task['steps'][number];
 type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
 type TaskStepDetailWithExecution = Omit<TaskStepDetail, 'execution'> & { execution?: TaskStepDetail['execution'] | null };
 type TaskStepSourceLocation = NonNullable<TaskStepDetail['source_locations']>[number];
+type TaskValidationClaim = NonNullable<Task['validation_detail']>['claims'][number];
 type TaskArtifact = Task['artifacts'][number];
 type ClarificationInteraction = {
   clarificationID: string;
@@ -831,6 +832,127 @@ function renderTaskStepSourceLocation(source: TaskStepSourceLocation, index: num
   }
 
   return <li key={key}>该来源位置类型暂不支持展示。</li>;
+}
+
+function taskValidationClaimText(result: string | null, claim: TaskValidationClaim): string | null {
+  if (!result || !Number.isSafeInteger(claim.start_byte) || !Number.isSafeInteger(claim.end_byte) ||
+    claim.start_byte < 0 || claim.end_byte <= claim.start_byte) return null;
+  try {
+    const bytes = new TextEncoder().encode(result);
+    if (claim.end_byte > bytes.length) return null;
+    return new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice(claim.start_byte, claim.end_byte));
+  } catch {
+    return null;
+  }
+}
+
+function taskValidationSourceLocationStateText(state: TaskValidationClaim['source_location_state']): string {
+  switch (state) {
+    case 'mapped': return '已关联此结论引用步骤中的来源位置。位置本身不代表内容或结论已独立核实。';
+    case 'partial': return '只有部分引用步骤的位置可用；另有位置缺失、不可读取或受限。';
+    case 'unavailable': return '引用步骤的来源位置未记录、已过期或无法读取。';
+    case 'restricted': return '引用步骤的来源位置受当前 Workspace 权限限制。';
+    case 'no_locator': return '引用步骤没有可展示的来源位置。';
+    case 'truncated': return '来源位置数量超过展示上限，当前无法列出位置。';
+    default: return '来源映射未记录。';
+  }
+}
+
+function TaskResultSources({ task }: { task: Task }) {
+  const evidence = task.validation_detail;
+  if (!task.result) return null;
+  if (!evidence?.claims.length) return <section className="task-activity-k2 task-result-sources" aria-label="结论与来源位置">
+    <h3>结论与来源位置</h3>
+    <p role="status">逐条结论与来源位置的映射未记录。</p>
+  </section>;
+  const locationsByID = new Map((evidence.source_locations ?? []).map((source) => [source.id, source]));
+  return <section className="task-activity-k2 task-result-sources" aria-label="结论与来源位置">
+    <h3>结论与来源位置</h3>
+    <p>每条结论的定位来自它引用的同一修订工具步骤。网页请求地址和 Workspace 实时目录各自保留原有的版本限制。</p>
+    <ol>
+      {evidence.claims.map((claim) => {
+        const text = taskValidationClaimText(task.result, claim);
+        const locations = (claim.source_location_ids ?? []).map((id) => locationsByID.get(id)).filter((source): source is TaskStepSourceLocation => source !== undefined);
+        return <li key={claim.claim_id}>
+          <p><strong>结论</strong> {text ? safeTaskActivityText(text, 1_000).value : '结论文本暂不可读取。'}</p>
+          <p role="status">{taskValidationSourceLocationStateText(claim.source_location_state)}</p>
+          {locations.length > 0 && <ul>{locations.map((source, index) => renderTaskStepSourceLocation(source, index))}</ul>}
+        </li>;
+      })}
+    </ol>
+  </section>;
+}
+
+function TaskRequirementManifestReview({ task }: { task: Task }) {
+  const queryClient = useQueryClient();
+  const [attested, setAttested] = useState(false);
+  const idempotency = useRef<{ fence: string; key: string } | null>(null);
+  const mutation = useMutation({
+    mutationFn: () => {
+      const plan = task.plan;
+      const manifest = plan?.requirement_manifest;
+      const planEventSequence = task.plan_event_sequence;
+      if (!plan || !manifest || task.current_revision !== plan.task_revision ||
+        !Number.isSafeInteger(planEventSequence) || (planEventSequence ?? 0) < 1 || !/^[0-9a-f]{64}$/u.test(manifest.digest)) {
+        throw new Error('当前计划版本暂不可确认，请刷新任务状态。');
+      }
+      const fence = `${task.id}:${plan.task_revision}:${plan.revision}:${planEventSequence}:${manifest.digest}`;
+      const currentIdempotency = idempotency.current;
+      const idempotencyKey = currentIdempotency?.fence === fence ? currentIdempotency.key : newIdempotencyKey();
+      idempotency.current = { fence, key: idempotencyKey };
+      return portalApi.confirmTaskRequirementManifest(task.id, {
+        expected_task_revision: plan.task_revision,
+        expected_plan_revision: plan.revision,
+        expected_plan_event_sequence: planEventSequence!,
+        requirements_complete_attested: true,
+      }, manifest.digest, idempotencyKey);
+    },
+    onSuccess: async () => {
+      setAttested(false);
+      idempotency.current = null;
+      await queryClient.invalidateQueries({ queryKey: ['task', task.id] });
+    },
+  });
+  const plan = task.plan;
+  const manifest = plan?.requirement_manifest;
+  if (!plan || !manifest) return null;
+  const savedConfirmation = task.requirement_manifest_confirmation;
+  const confirmed = savedConfirmation?.manifest_digest === manifest.digest &&
+    savedConfirmation.requirements_complete_attested === true && Number.isFinite(Date.parse(savedConfirmation.attested_at));
+  const ready = task.current_revision === plan.task_revision && Number.isSafeInteger(task.plan_event_sequence) &&
+    (task.plan_event_sequence ?? 0) > 0 && /^[0-9a-f]{64}$/u.test(manifest.digest);
+  const checkKindLabel: Record<string, string> = {
+    test: '测试', build: '构建', lint: 'Lint', typecheck: '类型检查', other: '其他检查',
+  };
+  return <section className="task-activity-k2 task-activity-requirements" aria-label="验证要求清单审阅">
+    <h3>验证要求清单</h3>
+    <p>请逐条核对要求、范围和来源。确认后，服务端会按当前 Task、计划修订、来源身份和清单摘要保存你的完整性声明；计划变化后必须重新确认。</p>
+    {manifest.obligations.length > 0 ? <ol>
+      {manifest.obligations.map((obligation) => {
+        const source = obligation.source;
+        return <li key={obligation.id}>
+          <strong>{obligation.statement}</strong>
+          <span>{checkKindLabel[obligation.kind] ?? '验证'} · {obligation.scope_mode === 'full_suite' ? '全量范围' : '定向范围'}</span>
+          <small>覆盖范围：{obligation.coverage_paths.join('、')}{obligation.selectors?.length ? ` · 选择器：${obligation.selectors.join('、')}` : ''}</small>
+          {source.kind === 'user_message'
+            ? <small>需求来源：<a href={`#conversation-message-${encodeURIComponent(source.message_id)}`}>对话消息 {source.message_id}</a></small>
+            : <small>需求来源：项目文件 {source.workspace_path} · Workspace 修订 {source.workspace_revision}</small>}
+        </li>;
+      })}
+    </ol> : <p role="status">当前候选清单为空。只有确认没有适用的明确验证要求时，才继续确认。</p>}
+    {confirmed
+      ? <p className="task-requirement-confirmed" role="status">已确认此版本的要求清单完整且准确 · {formatDate(savedConfirmation.attested_at)}</p>
+      : <>
+        <label className="task-requirement-attestation">
+          <input type="checkbox" checked={attested} onChange={(event) => setAttested(event.currentTarget.checked)} disabled={!ready || mutation.isPending} />
+          <span>我已逐条核对，确认此清单覆盖本任务适用的用户与项目要求，并准确表达其验证范围。</span>
+        </label>
+        {!ready && <p role="status">计划版本或来源摘要正在更新，暂不能确认。</p>}
+        {mutation.isError && <p role="alert">确认未完成：{errorDetails(mutation.error).message}</p>}
+        <button type="button" className="button button-small button-primary" disabled={!ready || !attested || mutation.isPending}
+          onClick={() => mutation.mutate()}>{mutation.isPending ? '正在保存确认…' : '确认要求完整且准确'}</button>
+      </>}
+  </section>;
 }
 
 function taskActivityIsExecuting(status: string): boolean {
@@ -3309,6 +3431,7 @@ export function Assistant() {
           {taskStatus}
         </span>
       </header>
+      <TaskRequirementManifestReview task={task} />
       {projection && (projection.dependencies.length > 0 || projection.child_jobs.length > 0) && <section className="task-activity-k2" aria-label="任务依赖与子任务">
         <h3>任务依赖与子任务</h3>
         {projection.dependencies.map((dependency) => <p key={`${dependency.task_id}:${dependency.required_revision}`}>
@@ -3337,6 +3460,7 @@ export function Assistant() {
         </li>)}</ul>}
         {hasUnverifiedArtifacts && <p role="status">有成果尚未通过完整核验，当前不提供下载。可查看相关工作项。</p>}
       </section>}
+      <TaskResultSources task={task} />
       <section className="task-detail-work" aria-label="任务工作项">
         {groups.length ? groups.map((group) => <section className="task-agent-group" key={group.id}>
           <h4><strong>{group.title}</strong><span aria-hidden="true" /></h4>

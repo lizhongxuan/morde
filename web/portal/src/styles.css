@@ -445,6 +445,21 @@ tbody tr:last-child td { border-bottom: 0; }
 .task-activity-k2 li { display: grid; gap: 3px; line-height: 1.4; }
 .task-activity-k2 li > span { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
 .task-activity-k2 small { color: var(--muted); overflow-wrap: anywhere; }
+.task-result-sources > p { margin: 4px 0 8px; color: var(--muted); }
+.task-result-sources > ol { margin: 0; padding-left: 22px; display: grid; gap: 12px; }
+.task-result-sources > ol > li { padding-left: 2px; }
+.task-result-sources > ol > li > p { margin: 2px 0; overflow-wrap: anywhere; }
+.task-result-sources > ol > li > ul { margin-top: 6px; }
+.task-activity-requirements > p { margin: 0 0 8px; color: var(--muted); font-size: .84rem; line-height: 1.5; }
+.task-activity-requirements ol { margin: 8px 0 12px; padding-left: 22px; display: grid; gap: 10px; }
+.task-activity-requirements li { min-width: 0; padding: 0 0 9px; border-bottom: 1px solid var(--line); }
+.task-activity-requirements li strong { line-height: 1.45; overflow-wrap: anywhere; }
+.task-activity-requirements li > span,
+.task-activity-requirements li > small { display: block; color: var(--muted); font-size: .78rem; line-height: 1.45; }
+.task-requirement-attestation { display: flex; align-items: flex-start; gap: 8px; margin: 10px 0; font-size: .84rem; line-height: 1.5; }
+.task-requirement-attestation input { flex: 0 0 auto; margin-top: 3px; accent-color: var(--brand); }
+.task-activity-requirements .task-requirement-confirmed { color: var(--success); font-weight: 650; }
+.task-activity-requirements > .button { margin-top: 2px; }
 .task-activity-review p { margin: 7px 0 4px; font-size: .88rem; }
 .task-activity-review details { margin-top: 8px; }
 .task-activity-review details > :last-child { margin-top: 6px; }

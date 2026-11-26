@@ -5669,7 +5669,7 @@ paths:
       tags: [Tasks]
       operationId: confirmTaskRequirementManifest
       summary: Confirm the exact current Task verification requirement manifest
-      description: Requires an authenticated Task reader and an Idempotency-Key. This records only an explicit positive confirmation of the exact current server-resolved plan manifest; it does not verify that the manifest is complete or mark H07 verified. Task revision, plan revision, plan event sequence, digest, and current authorization are rechecked transactionally. Stale, cancelled, unauthorized, or changed plans are rejected.
+      description: Requires an authenticated Task reader and an Idempotency-Key. The user attests that the reviewed candidate manifest is complete and accurately represents the applicable Task requirements. The server separately rechecks each source identity and digest before using this attestation for H07. Task revision, plan revision, plan event sequence, digest, and current authorization are rechecked transactionally. Stale, cancelled, unauthorized, or changed plans are rejected.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       parameters:
         - { $ref: '#/components/parameters/IdempotencyKey' }
@@ -5685,7 +5685,7 @@ paths:
             schema: { $ref: '#/components/schemas/TaskRequirementManifestConfirmationRequest' }
       responses:
         '200':
-          description: Persisted confirmation fact for the exact current manifest.
+          description: Persisted user completeness attestation for the exact current manifest.
           headers:
             Cache-Control: { schema: { type: string, const: no-store } }
             ETag: { schema: { type: string, pattern: '^"[0-9a-f]{64}"$' } }
@@ -8126,6 +8126,29 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/users/{user_id}/tasks/{task_id}/workflow-trace:
+    get:
+      tags: [Admin]
+      operationId: getAdminTaskWorkflowTrace
+      summary: Read a source-bound workflow trace for a Task
+      description: Reads Task, route, Agent, model-call, operation, approval, validation, conversation-delivery and Host ledger facts from one database snapshot. It exposes only ledger metadata and hashes, preserves unavailable relationships as gaps, and does not infer Task success or a quality score. PC-side observation remains unavailable until its adapter is provided. Administrators only.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: user_id, in: path, required: true, schema: { type: string, minLength: 1, maxLength: 128 } }
+        - { name: task_id, in: path, required: true, schema: { type: string, minLength: 8, maxLength: 40, pattern: '^[A-Za-z0-9][A-Za-z0-9_-]{7,39}$' } }
+      responses:
+        '200':
+          description: Source-bound execution graph with explicit coverage gaps
+          headers:
+            Cache-Control:
+              schema: { type: string, const: no-store }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WorkflowTrace' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
   /api/admin/evaluation-batches:
     post:
@@ -11327,6 +11350,7 @@ components:
           uniqueItems: true
           items: { $ref: '#/components/schemas/ScheduleNotificationEvent' }
         observation: { $ref: '#/components/schemas/ScheduleObservation' }
+        personal_rule: { oneOf: [{ $ref: '#/components/schemas/SchedulePersonalRuleBinding' }, { type: 'null' }] }
     GoalCreateRequest:
       type: object
       additionalProperties: false
@@ -11385,6 +11409,9 @@ components:
           uniqueItems: true
           items: { $ref: '#/components/schemas/ScheduleNotificationEvent' }
         observation: { oneOf: [{ $ref: '#/components/schemas/ScheduleObservation' }, { type: 'null' }] }
+        personal_rule:
+          oneOf: [{ $ref: '#/components/schemas/SchedulePersonalRuleSelection' }, { type: 'null' }]
+          description: Optional explicit opt-in to one active personal rule revision. The server resolves and stores the exact source memory revision.
     ScheduleUpdateRequest:
       type: object
       additionalProperties: false
@@ -11407,6 +11434,9 @@ components:
           uniqueItems: true
           items: { $ref: '#/components/schemas/ScheduleNotificationEvent' }
         observation: { oneOf: [{ $ref: '#/components/schemas/ScheduleObservation' }, { type: 'null' }] }
+        personal_rule:
+          oneOf: [{ $ref: '#/components/schemas/SchedulePersonalRuleSelection' }, { type: 'null' }]
+          description: Omission preserves the current binding; null removes it; an object replaces it with one explicitly selected candidate revision.
     ScheduleActionRequest:
       type: object
       additionalProperties: false
@@ -11416,11 +11446,28 @@ components:
         expected_version: { type: integer, format: int64, minimum: 1 }
         current_run_action: { type: string, enum: [continue, cancel] }
     ScheduleRunStatus: { type: string, enum: [queued, running, waiting_user, pausing, paused, stopping, completed, failed, cancelled, skipped, missed] }
-    ScheduleRunSkipReason: { type: string, enum: [dst_gap, overlap, authorization_ended] }
+    ScheduleRunSkipReason: { type: string, enum: [dst_gap, overlap, authorization_ended, personal_rule_revoked] }
+    SchedulePersonalRuleValidationStatus: { type: string, enum: [not_bound, validated, revoked] }
+    SchedulePersonalRuleSelection:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, candidate_revision]
+      properties:
+        candidate_id: { type: string, pattern: '^r_[a-z0-9]{8}$' }
+        candidate_revision: { type: integer, format: int64, minimum: 1 }
+    SchedulePersonalRuleBinding:
+      type: object
+      additionalProperties: false
+      required: [candidate_id, candidate_revision, source_memory_id, source_memory_revision]
+      properties:
+        candidate_id: { type: string, pattern: '^r_[a-z0-9]{8}$' }
+        candidate_revision: { type: integer, format: int64, minimum: 1 }
+        source_memory_id: { type: string, minLength: 1, maxLength: 128 }
+        source_memory_revision: { type: integer, format: int64, minimum: 1 }
     ScheduleRun:
       type: object
       additionalProperties: false
-      required: [id, schedule_id, schedule_version, occurrence_key, scheduled_at, coalesced_count, status, skip_reason, task_id, notification_events, observation, observation_outcome, created_at, updated_at, finished_at]
+      required: [id, schedule_id, schedule_version, occurrence_key, scheduled_at, coalesced_count, status, skip_reason, task_id, notification_events, observation, personal_rule, personal_rule_validation_status, personal_rule_validated_at, personal_rule_revoked_at, observation_outcome, created_at, updated_at, finished_at]
       properties:
         id: { $ref: '#/components/schemas/ScheduleRunId' }
         schedule_id: { $ref: '#/components/schemas/ScheduleId' }
@@ -11435,6 +11482,10 @@ components:
           type: array
           items: { $ref: '#/components/schemas/ScheduleNotificationEvent' }
         observation: { oneOf: [{ $ref: '#/components/schemas/ScheduleObservation' }, { type: 'null' }] }
+        personal_rule: { oneOf: [{ $ref: '#/components/schemas/SchedulePersonalRuleBinding' }, { type: 'null' }] }
+        personal_rule_validation_status: { $ref: '#/components/schemas/SchedulePersonalRuleValidationStatus' }
+        personal_rule_validated_at: { type: [string, 'null'], format: date-time }
+        personal_rule_revoked_at: { type: [string, 'null'], format: date-time }
         observation_outcome: { type: string, enum: [unknown, baseline, changed, no_change] }
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
@@ -11442,7 +11493,7 @@ components:
     Schedule:
       type: object
       additionalProperties: false
-      required: [id, version, status, host_id, model_id, title, objective, file_delivery_intent, timing, budget, misfire_policy, notification_events, observation, next_run_at, last_run, current_run, created_at, updated_at]
+      required: [id, version, status, host_id, model_id, title, objective, file_delivery_intent, timing, budget, misfire_policy, notification_events, observation, personal_rule, next_run_at, last_run, current_run, created_at, updated_at]
       allOf:
         - if:
             required: [observation]
@@ -11467,6 +11518,7 @@ components:
           type: array
           items: { $ref: '#/components/schemas/ScheduleNotificationEvent' }
         observation: { oneOf: [{ $ref: '#/components/schemas/ScheduleObservation' }, { type: 'null' }] }
+        personal_rule: { oneOf: [{ $ref: '#/components/schemas/SchedulePersonalRuleBinding' }, { type: 'null' }] }
         next_run_at: { type: [string, 'null'], format: date-time }
         last_run: { oneOf: [{ $ref: '#/components/schemas/ScheduleRun' }, { type: 'null' }] }
         current_run: { oneOf: [{ $ref: '#/components/schemas/ScheduleRun' }, { type: 'null' }] }
@@ -12818,6 +12870,8 @@ components:
         end_byte: { type: integer, minimum: 1, description: Exclusive UTF-8 byte offset into the SHA-256-bound Task result. }
         evidence_refs: { type: array, minItems: 1, maxItems: 64, items: { $ref: '#/components/schemas/TaskValidationEvidenceRef' } }
         performance_comparison: { $ref: '#/components/schemas/TaskValidationPerformanceComparison' }
+        source_location_state: { type: string, enum: [mapped, partial, unavailable, restricted, no_locator, truncated], description: Server-derived locator availability for the exact evidence steps cited by this claim; this is not a correctness verdict. }
+        source_location_ids: { type: array, maxItems: 32, items: { type: string, pattern: '^src_[a-f0-9]{32}$' }, description: References into the response's deduplicated source_locations list. }
     TaskValidationEvidenceDetail:
       type: object
       additionalProperties: false
@@ -12827,6 +12881,7 @@ components:
         event_sequence: { type: integer, format: int64, minimum: 1 }
         result_sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
         claims: { type: array, minItems: 1, maxItems: 64, items: { $ref: '#/components/schemas/TaskValidationEvidenceClaim' } }
+        source_locations: { type: array, maxItems: 32, items: { $ref: '#/components/schemas/TaskStepSourceLocation' }, description: Server-validated locators used by claim source_location_ids. Workspace paths are returned only when the reader is authorized for the Task Workspace. }
     TaskSummary:
       type: object
       required: [id, owner_id, initiator_id, execution_location, conversation_id, model_id, objective, status, queue_priority, current_step, step_count, completed_step_count, budget, usage, dependencies, child_jobs, result_review, created_at, updated_at]
@@ -12972,20 +13027,23 @@ components:
     TaskRequirementManifestConfirmationRequest:
       type: object
       additionalProperties: false
-      required: [expected_task_revision, expected_plan_revision, expected_plan_event_sequence]
+      required: [expected_task_revision, expected_plan_revision, expected_plan_event_sequence, requirements_complete_attested]
       properties:
         expected_task_revision: { type: integer, format: int64, minimum: 0 }
         expected_plan_revision: { type: integer, format: int64, minimum: 1 }
         expected_plan_event_sequence: { type: integer, format: int64, minimum: 1 }
+        requirements_complete_attested: { type: boolean, const: true, description: Authenticated user declaration that the reviewed obligation list is complete and faithfully expresses the applicable requirements. }
     TaskRequirementManifestConfirmation:
       type: object
-      required: [task_id, task_revision, plan_revision, plan_event_sequence, manifest_digest, confirmed_at]
+      required: [task_id, task_revision, plan_revision, plan_event_sequence, manifest_digest, requirements_complete_attested, attested_at, confirmed_at]
       properties:
         task_id: { $ref: '#/components/schemas/TaskId' }
         task_revision: { type: integer, format: int64, minimum: 0 }
         plan_revision: { type: integer, format: int64, minimum: 1 }
         plan_event_sequence: { type: integer, format: int64, minimum: 1 }
         manifest_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        requirements_complete_attested: { type: boolean, const: true }
+        attested_at: { type: string, format: date-time }
         confirmed_at: { type: string, format: date-time }
     TaskStepRetryRequest:
       type: object
@@ -13345,6 +13403,8 @@ components:
             waiting_reason: { type: [string, 'null'], description: 'Reason for waiting; model_context_limit means the full model request exceeded its input limit and the original message remains available.' }
             steps: { type: array, items: { $ref: '#/components/schemas/TaskStep' } }
             plan: { oneOf: [{ $ref: '#/components/schemas/TaskPlan' }, { type: 'null' }], description: Latest advisory plan for the current Task revision. It never grants authorization; prior revisions remain in the task event history. }
+            plan_event_sequence: { type: integer, format: int64, minimum: 1, description: Durable Task event sequence for the current plan, used as a confirmation precondition. }
+            requirement_manifest_confirmation: { $ref: '#/components/schemas/TaskRequirementManifestStatus', description: Present only for a current plan manifest with a matching authenticated user completeness attestation. }
             billing: { $ref: '#/components/schemas/TaskBilling', description: Task-scoped model call totals from the authorized account/project usage ledger. Costs retain currency and rate snapshot versions; unknown, estimates and BYOK remain distinct. }
             agents: { type: array, items: { $ref: '#/components/schemas/TaskAgentExecution' } }
             batch_items: { type: array, items: { $ref: '#/components/schemas/TaskBatchItem' } }
@@ -13360,6 +13420,14 @@ components:
       properties:
         items: { type: array, items: { $ref: '#/components/schemas/TaskSummary' } }
         next_cursor: { type: [string, 'null'] }
+    TaskRequirementManifestStatus:
+      type: object
+      additionalProperties: false
+      required: [manifest_digest, requirements_complete_attested, attested_at]
+      properties:
+        manifest_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        requirements_complete_attested: { type: boolean, const: true }
+        attested_at: { type: string, format: date-time }
     TaskApprovalPage:
       type: object
       additionalProperties: false
@@ -13954,6 +14022,61 @@ components:
         pending_reason: { type: string }
         review_count: { type: integer, minimum: 0 }
         arbitration_count: { type: integer, minimum: 0 }
+      additionalProperties: false
+    WorkflowTrace:
+      type: object
+      required: [version, trace_id, data_class, captured_at, coverage, coverage_source_ids, sources, nodes, edges, gaps]
+      properties:
+        version: { type: integer, const: 1 }
+        trace_id: { type: string, maxLength: 128 }
+        run_id: { type: string, maxLength: 128 }
+        data_class: { type: string, enum: [synthetic, live-scripted, live-observed] }
+        captured_at: { type: string, format: date-time }
+        coverage: { type: string, enum: [declared_complete, partial, unknown] }
+        coverage_source_ids: { type: array, maxItems: 256, items: { type: string, maxLength: 128 } }
+        sources: { type: array, minItems: 1, maxItems: 256, items: { $ref: '#/components/schemas/WorkflowSource' } }
+        nodes: { type: array, minItems: 1, maxItems: 1024, items: { $ref: '#/components/schemas/WorkflowNode' } }
+        edges: { type: array, maxItems: 2048, items: { $ref: '#/components/schemas/WorkflowEdge' } }
+        gaps: { type: array, maxItems: 256, items: { $ref: '#/components/schemas/WorkflowGap' } }
+      additionalProperties: false
+    WorkflowSource:
+      type: object
+      required: [id, kind, locator]
+      properties:
+        id: { type: string, maxLength: 128 }
+        kind: { type: string, enum: [task_ledger, agent_ledger, model_call_ledger, operation_ledger, approval_ledger, validation_ledger, conversation_output, pc_observation, runtime_snapshot, host_snapshot, route_result, local_test, code_inspection, evaluation_run] }
+        locator: { type: string, maxLength: 1024 }
+        sha256: { type: string, pattern: '^[a-f0-9]{64}$' }
+      additionalProperties: false
+    WorkflowNode:
+      type: object
+      required: [id, kind, state, source_ids]
+      properties:
+        id: { type: string, maxLength: 128 }
+        kind: { type: string, enum: [route, task, agent, model_call, operation, approval, validation, delivery, host, authorization] }
+        state: { type: string, enum: [started, running, settled, completed, failed, waiting, waiting_user, pending, approved, rejected, expired, cancelled, unknown, unavailable] }
+        source_ids: { type: array, minItems: 1, items: { type: string, maxLength: 128 } }
+      additionalProperties: false
+    WorkflowEdge:
+      type: object
+      required: [id, from, to, kind, source_ids]
+      properties:
+        id: { type: string, maxLength: 128 }
+        from: { type: string, maxLength: 128 }
+        to: { type: string, maxLength: 128 }
+        kind: { type: string, enum: [created, handoff, invoked, returned, approved, rejected, verified, delivered, resumed, routed, targets, authorized, approval_requested] }
+        source_ids: { type: array, minItems: 1, items: { type: string, maxLength: 128 } }
+      additionalProperties: false
+    WorkflowGap:
+      type: object
+      required: [id, stage, scope, state, source_ids]
+      properties:
+        id: { type: string, maxLength: 128 }
+        stage: { type: string, enum: [route, task, agent, model_call, operation, approval, verification, delivery, host, authorization, provenance] }
+        scope: { type: string, maxLength: 512 }
+        state: { type: string, enum: [absent, not_run, unavailable, unknown] }
+        count: { type: integer, minimum: 0 }
+        source_ids: { type: array, items: { type: string, maxLength: 128 } }
       additionalProperties: false
     AdminQuality:
       type: object
