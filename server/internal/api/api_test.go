@@ -305,16 +305,21 @@ func (s *tokenServiceStub) DeleteAPIKey(_ context.Context, p identity.Principal,
 }
 
 type adminServiceStub struct {
-	users     []AdminUserRecord
-	user      AdminUserRecord
-	capacity  CapacityRecord
-	audits    []AuditRecord
-	err       error
-	principal identity.Principal
-	status    *identity.AccountStatus
-	updatedID string
-	updated   UpdateAdminUserCommand
-	auditQ    AuditQuery
+	users                  []AdminUserRecord
+	user                   AdminUserRecord
+	capacity               CapacityRecord
+	audits                 []AuditRecord
+	err                    error
+	principal              identity.Principal
+	status                 *identity.AccountStatus
+	updatedID              string
+	updated                UpdateAdminUserCommand
+	passwordResetID        string
+	passwordResetStatus    identity.AccountStatus
+	passwordResetValue     string
+	passwordResetPrincipal identity.Principal
+	passwordResetErr       error
+	auditQ                 AuditQuery
 }
 
 type adminWorkspaceServiceStub struct {
@@ -343,6 +348,16 @@ func (s *adminServiceStub) ListUsers(_ context.Context, p identity.Principal, st
 func (s *adminServiceStub) UpdateUser(_ context.Context, p identity.Principal, id string, command UpdateAdminUserCommand) (AdminUserRecord, error) {
 	s.principal, s.updatedID, s.updated = p, id, command
 	return s.user, s.err
+}
+func (s *adminServiceStub) ResetPassword(_ context.Context, p identity.Principal, id string, expectedStatus identity.AccountStatus, newPassword string) error {
+	s.passwordResetPrincipal, s.passwordResetID, s.passwordResetStatus, s.passwordResetValue = p, id, expectedStatus, newPassword
+	if s.passwordResetErr != nil {
+		return s.passwordResetErr
+	}
+	if p.Role != identity.RoleSuperAdmin {
+		return domain.NewError(domain.CodeForbidden, "super administrator session required")
+	}
+	return nil
 }
 func (s *adminServiceStub) Capacity(_ context.Context, p identity.Principal) (CapacityRecord, error) {
 	s.principal = p
@@ -1239,7 +1254,6 @@ func TestPasswordChangeAccessRouteIsNarrowlyScoped(t *testing.T) {
 		{kind: identity.KindClient, method: http.MethodGet, path: "/api/me", allow: true},
 		{kind: identity.KindClient, method: http.MethodPost, path: "/api/auth/client-web-session", allow: true},
 		{kind: identity.KindClient, method: http.MethodPost, path: "/api/auth/client-logout", allow: true},
-		{kind: identity.KindClient, method: http.MethodGet, path: "/api/me", allow: false},
 		{kind: identity.KindClient, method: http.MethodGet, path: "/api/me/preferences", allow: false},
 		{kind: identity.KindDevice, method: http.MethodPost, path: "/api/workspaces/:id/sync-sessions", allow: false},
 		{kind: identity.KindAPIKey, method: http.MethodPost, path: "/api/auth/client-web-session", allow: false},
@@ -1247,6 +1261,33 @@ func TestPasswordChangeAccessRouteIsNarrowlyScoped(t *testing.T) {
 		if got := passwordChangeAccessRoute(tc.kind, tc.method, tc.path); got != tc.allow {
 			t.Errorf("passwordChangeAccessRoute(%q, %q, %q) = %t, want %t", tc.kind, tc.method, tc.path, got, tc.allow)
 		}
+	}
+}
+
+func TestAdminPasswordResetRouteRequiresSuperAdminAndValidatesPayload(t *testing.T) {
+	services := newServices()
+	services.verifier.role = identity.RoleSuperAdmin
+	router := newRouter(t, services, Options{CookieSecure: true})
+	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
+	response := requestWithCookieBody(router, http.MethodPost, "/api/admin/users/u2345678/password",
+		`{"expected_status":"approved","new_password":"a-secure-password"}`, cookie, "https://portal.example.test")
+	if response.Code != http.StatusNoContent || services.admin.passwordResetID != "u2345678" ||
+		services.admin.passwordResetStatus != identity.StatusApproved || services.admin.passwordResetValue != "a-secure-password" ||
+		services.admin.passwordResetPrincipal.Role != identity.RoleSuperAdmin {
+		t.Fatalf("super admin reset = %d %s id=%q status=%q principal=%#v", response.Code, response.Body,
+			services.admin.passwordResetID, services.admin.passwordResetStatus, services.admin.passwordResetPrincipal)
+	}
+	invalid := requestWithCookieBody(router, http.MethodPost, "/api/admin/users/u2345678/password",
+		`{"expected_status":"approved","new_password":"short"}`, cookie, "https://portal.example.test")
+	if invalid.Code != http.StatusBadRequest {
+		t.Fatalf("short reset password = %d %s, want 400", invalid.Code, invalid.Body)
+	}
+	services.verifier.role = identity.RoleAdmin
+	router = newRouter(t, services, Options{CookieSecure: true})
+	denied := requestWithCookieBody(router, http.MethodPost, "/api/admin/users/u2345678/password",
+		`{"expected_status":"approved","new_password":"a-secure-password"}`, cookie, "https://portal.example.test")
+	if denied.Code != http.StatusForbidden {
+		t.Fatalf("admin reset = %d %s, want 403", denied.Code, denied.Body)
 	}
 }
 

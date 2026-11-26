@@ -556,7 +556,7 @@ paths:
       tags: [Auth]
       operationId: login
       summary: Log in to the portal
-      description: Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. An account marked for a password change receives a restricted session until it changes its password.
+      description: Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. Initial or reset passwords do not require a loopback connection; an account marked for a password change receives a restricted session until it changes its password, with no access to other APIs or onboarding side effects.
       security: []
       requestBody:
         required: true

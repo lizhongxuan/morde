@@ -154,6 +154,27 @@ func TestCredentialLoginEnsuresOneStoppedHostBeforeIssuingSession(t *testing.T) 
 	}
 }
 
+func TestInitialAdminCanLogInRemotelyButMustChangePasswordBeforeOnboarding(t *testing.T) {
+	service, users, hosts, _, _, _ := newCredentialFixture(t)
+	initialAdmin := users.values["u1234567"]
+	initialAdmin.Name = "admin"
+	initialAdmin.Role = identity.RoleSuperAdmin
+	initialAdmin.MustChangePassword = true
+	users.values[initialAdmin.ID] = initialAdmin
+
+	result, err := service.Login(context.Background(), "admin", "correct horse", "198.51.100.27")
+	if err != nil {
+		t.Fatalf("remote initial-admin login = %v", err)
+	}
+	if !result.User.MustChangePassword || len(hosts.values) != 0 {
+		t.Fatalf("initial-admin login must be restricted without onboarding side effects: user=%#v hosts=%#v", result.User, hosts.values)
+	}
+	principal, err := service.VerifySession(context.Background(), result.Credential)
+	if err != nil || principal.Role != identity.RoleSuperAdmin || !principal.MustChangePassword {
+		t.Fatalf("remote initial-admin session = %#v, %v", principal, err)
+	}
+}
+
 func (s *credentialHosts) GetHost(_ context.Context, id string) (host.Host, error) {
 	for _, value := range s.values {
 		if value.ID == id {

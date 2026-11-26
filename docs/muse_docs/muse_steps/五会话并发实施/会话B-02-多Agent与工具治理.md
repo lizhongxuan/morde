@@ -97,3 +97,9 @@
 ### 2026-11-26 步骤 9：总体状态
 
 - B02-1/2/6a/7 的本地合同与自动化已完成，PC/真实 DSH 子项仍未完成；B02-3 的个人 Skill 候选状态机、同步对象和 active read 已有本地实现及域/App/PG 回归，但 R15 完整用户审核与真实 Runtime 体验未通过。B02-0、B02-1-PC、B02-2-PC、B02-3/4/5/6b/7-PC 保持未勾选。
+
+### 2026-11-26 当前工作树 B-02 复验
+
+- **基线：**当前 `HEAD=07fecb1d`；本轮未修改 B-02 源码，也未连接远端或启动 Portal/DSH/PC。
+- **复验：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run 'AgentChildSession|SelectedMCP|BuiltinSearch|DSHSkill|CloudDSH.*Skill' -count=1 -timeout=8m` 通过（1.060s）；Worker 工具上限、父级 allowlist、嵌套委派和已存选择不扩张 4 项通过（0.847s）；`cd runtime/morde-cloud-runtime && node --test --test-concurrency=1 --test-name-pattern='nudges the Agent after three identical tool calls' test/runtime.test.mjs` 通过（1/1，1.598s）。
+- **结论与待办：**未发现可在 B-02 文件边界内安全独立修复的新问题，不能因本地合同回归通过而勾选实际体验验收。B02-0、B02-1-PC、B02-2-PC、B02-3/4/5/6b/7-PC 仍需按各自验收条件补真实 PC、DSH/模型及稳定 Skill 交接证据；PostgreSQL/重启场景沿用上文已有记录，本轮没有重跑。

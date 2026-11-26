@@ -305,7 +305,7 @@ export interface paths {
         put?: never;
         /**
          * Log in to the portal
-         * @description Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. The default admin/admin credential is accepted only from a loopback client and receives a restricted password-change session.
+         * @description Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. Initial or reset passwords do not require a loopback connection; an account marked for a password change receives a restricted session until it changes its password, with no access to other APIs or onboarding side effects.
          */
         post: operations["login"];
         delete?: never;
@@ -2999,6 +2999,35 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-eligibility": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Check whether an accepted message can be retried
+         * @description Returns the current advisory eligibility for retrying this message. The retry-processing POST rechecks authorization and route state transactionally, so eligibility may change before it is called.
+         */
+        get: operations["getProjectConversationMessageRetryEligibility"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/attachments/{client_attachment_id}": {
         parameters: {
             query?: never;
@@ -3679,6 +3708,34 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/conversations/{id}/messages/{message_id}/retry-eligibility": {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Check whether an accepted message can be retried
+         * @description Returns the current advisory eligibility for retrying this message. The retry-processing POST rechecks authorization and route state transactionally, so eligibility may change before it is called.
+         */
+        get: operations["getConversationMessageRetryEligibility"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/conversations/{id}/messages/{message_id}/variants": {
         parameters: {
             query?: never;
@@ -3849,6 +3906,28 @@ export interface paths {
         get: operations["getTask"];
         put?: never;
         post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/requirement-manifest/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm the exact current Task verification requirement manifest
+         * @description Requires an authenticated Task reader and an Idempotency-Key. This records only an explicit positive confirmation of the exact current server-resolved plan manifest; it does not verify that the manifest is complete or mark H07 verified. Task revision, plan revision, plan event sequence, digest, and current authorization are rechecked transactionally. Stale, cancelled, unauthorized, or changed plans are rejected.
+         */
+        post: operations["confirmTaskRequirementManifest"];
         delete?: never;
         options?: never;
         head?: never;
@@ -4418,7 +4497,7 @@ export interface paths {
         put?: never;
         /**
          * Create and enable a schedule
-         * @description Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
+         * @description Requires an enabled Owner execution gate and an Idempotency-Key. Omit host_id or set it to null to create a hostless schedule. Browser observation requires a Host. `file_delivery_intent` is structured and defaults to `none`; schedules currently cannot require file delivery because they do not bind a Workspace, and `unclear` must be clarified before saving. Authorization is derived from the current session or a separate schedule grant; credentials are never included in responses or sync snapshots.
          */
         post: operations["createSchedule"];
         delete?: never;
@@ -4443,7 +4522,7 @@ export interface paths {
         get: operations["getSchedule"];
         /**
          * Update a schedule definition at the expected version
-         * @description Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host.
+         * @description Omit host_id to keep the current Host, or set it to null to remove the Host association. When removing a Host from a schedule with browser observation, also set observation to null. Browser observation requires a Host. Omitted `file_delivery_intent` preserves the current structured intent; schedules currently support `none` only.
          */
         put: operations["updateSchedule"];
         post?: never;
@@ -4520,7 +4599,7 @@ export interface paths {
             header?: never;
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -4563,7 +4642,7 @@ export interface paths {
         };
         /**
          * Read revision history for a personal memory
-         * @description Requires an approved Portal Session or active Client credential. Returns current and prior memory revisions newest first. Historical bodies that were never retained are null and are never reconstructed. A body is restorable only when present and its recorded provenance is still authorized. Suppressed or invalid provenance withholds the body and all source references. Existing PUT with base_revision and Idempotency-Key is used to restore an available body. Missing, deleted, or inaccessible memories return not_found. Prior history bodies count toward personal-data quota and are purged when the memory is deleted.
+         * @description Requires an approved Portal Session or active Client credential. Returns current and prior memory revisions newest first. Historical bodies that were never retained are null and are never reconstructed. A body is restorable only when present and its recorded provenance is still authorized. Suppressed or invalid provenance withholds the body, source references, and superseding revision relationship. Existing PUT with base_revision and Idempotency-Key is used to restore an available body. Missing, deleted, or inaccessible memories return not_found. Prior history bodies count toward personal-data quota and are purged when the memory is deleted.
          */
         get: operations["getPersonalMemoryHistory"];
         put?: never;
@@ -5217,8 +5296,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Safely recover an uncertain Host restore
-         * @description Rechecks remote sandbox state. Existing sandboxes are adopted; a new create is queued only after an administrator confirms the external issue is fixed and no matching sandbox exists.
+         * Safely recover a failed or uncertain Host restore
+         * @description Rechecks remote sandbox state for the expected runtime generation. A single matching running or pending sandbox is adopted. For a failed Host with reason lost, replacement requires a complete successful sandbox listing with no active candidate and the saved sandbox confirmed not found or terminated; a failed or ambiguous candidate in this state requires manual review. For other recoverable failure reasons, a failed sandbox may be replaced after explicit confirmation. Recovery keeps the same Host and Workspace/Profile volumes and advances the runtime generation when creating a replacement.
          */
         post: operations["recoverAdminHost"];
         delete?: never;
@@ -5301,6 +5380,28 @@ export interface paths {
          * @description Requires an approved administrator's unbound Portal session. On the first transition from pending or rejected to approved, a configured default platform model budget is created in the same transaction as the status change and audit. If no default is configured, approval succeeds without granting a platform model budget. Disabling and restoring an account does not grant or reset a budget.
          */
         patch: operations["updateUser"];
+        trace?: never;
+    };
+    "/api/admin/users/{id}/password": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Reset an account password
+         * @description Requires a super administrator's approved Portal session. The new password takes effect immediately, invalidates the target account's existing sessions and client credentials, and requires the user to change it in the Portal before using a client application.
+         */
+        post: operations["resetAdminUserPassword"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
         trace?: never;
     };
     "/api/admin/users/{id}/personal-data-quota": {
@@ -6587,9 +6688,9 @@ export interface components {
         TokenId: string;
         ClientInstallationId: string;
         /** @enum {string} */
-        PersonalMutationObjectType: "profile" | "memory" | "soul" | "diary" | "goal" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        PersonalMutationObjectType: "profile" | "memory" | "rule_candidate" | "skill_candidate" | "soul" | "diary" | "goal" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
         /** @enum {string} */
-        PersonalObjectType: "profile" | "memory" | "soul" | "diary" | "goal" | "schedule" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
+        PersonalObjectType: "profile" | "memory" | "rule_candidate" | "skill_candidate" | "soul" | "diary" | "goal" | "schedule" | "feed_post" | "feed_preferences" | "idea_mark" | "library_item" | "skill_setting" | "connector_setting";
         /** @description Path-free opaque identifier; exact accepted values depend on object_type. The server rejects . and .. and enforces each type's allowlist. */
         PersonalObjectId: string;
         GoalId: string;
@@ -8159,6 +8260,11 @@ export interface components {
             title: string;
             /** @description Execution objective must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes. */
             objective: string;
+            /**
+             * @description Structured output intent. Omission from legacy sync definitions means none; schedules currently only execute with none because they have no Workspace binding.
+             * @enum {string}
+             */
+            file_delivery_intent: "none" | "required" | "unclear";
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
             misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
@@ -8189,6 +8295,11 @@ export interface components {
             title?: string;
             /** @description Required execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes. */
             objective: string;
+            /**
+             * @description Structured output intent; never inferred from objective text. Omission means none. Schedules currently have no Workspace binding, so required is rejected; unclear must be clarified before saving.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
@@ -8204,6 +8315,11 @@ export interface components {
             title?: string;
             /** @description Optional execution objective update; when supplied it must be non-empty after trimming and is limited to 1–32768 UTF-8 bytes. */
             objective?: string;
+            /**
+             * @description Structured output intent; never inferred from objective text. Omission preserves the current value. Schedules currently have no Workspace binding, so required is rejected; unclear must be clarified before saving.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
             timing?: components["schemas"]["ScheduleTiming"];
             budget?: components["schemas"]["ScheduleBudget"];
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
@@ -8257,6 +8373,11 @@ export interface components {
             title: string;
             /** @description Stored execution objective, non-empty after trimming and limited to 1–32768 UTF-8 bytes. */
             objective: string;
+            /**
+             * @description Structured output intent selected when the schedule is defined. Currently only none can execute because schedules have no Workspace binding.
+             * @enum {string}
+             */
+            file_delivery_intent: "none" | "required" | "unclear";
             timing: components["schemas"]["ScheduleTiming"];
             budget: components["schemas"]["ScheduleBudget"];
             misfire_policy: components["schemas"]["ScheduleMisfirePolicy"];
@@ -8354,6 +8475,11 @@ export interface components {
             source_status: "available" | "unrecorded" | "unavailable";
             /** @description Only currently authorized source references are returned; withheld provenance yields an empty array. */
             sources: components["schemas"]["PersonalMemoryHistorySource"][];
+            /**
+             * Format: int64
+             * @description Nearest newer revision for a readable historical revision; null for the current revision or when provenance is withheld.
+             */
+            superseded_by_revision: number | null;
         };
         PersonalMemoryHistoryPage: {
             items: components["schemas"]["PersonalMemoryRevision"][];
@@ -9101,6 +9227,7 @@ export interface components {
             routing_failure_reason?: "model_unavailable" | "routing_context_unavailable" | "routing_action_unavailable" | "message_too_long";
             /** @description True only after the Main Agent chose to acknowledge this message and its associated background Task actually started. Clients cannot set this field. */
             agent_acknowledged?: boolean;
+            tool_activity?: components["schemas"]["ConversationToolActivity"];
             /**
              * @description Status of a persisted streamed assistant message.
              * @enum {string}
@@ -9131,6 +9258,12 @@ export interface components {
             delivery_status: "pending" | "applied" | "unknown";
             /** Format: date-time */
             created_at: string;
+        };
+        /** @description Status of this user's short-lived read-only web call; no internal Task identity is exposed. */
+        ConversationToolActivity: {
+            /** @enum {string} */
+            tool: "web_search" | "web_read";
+            status: components["schemas"]["TaskStepStatus"];
         };
         ConversationMessage: components["schemas"]["ConversationMessageBase"] & {
             attachment_ids?: components["schemas"]["PersonalAttachmentId"][];
@@ -9178,6 +9311,17 @@ export interface components {
             message: components["schemas"]["ConversationMessage"];
             /** @description True when an identical message receipt was returned. */
             replayed: boolean;
+        };
+        ConversationMessageRetryEligibility: {
+            /** @description Whether the saved source message currently passes the server retry gate. */
+            retry_eligible: boolean;
+            /** @enum {string} */
+            retry_reason: "retry_available" | "route_not_failed" | "task_already_created" | "message_too_long" | "reconciliation_required" | "route_processing" | "result_review_not_retryable" | "result_review_outcome_unknown" | "retry_limit_reached";
+            /**
+             * @description A previous personal model call has an unknown outcome. A new attempt is independent and does not prove the previous call settled.
+             * @enum {string}
+             */
+            retry_warning?: "previous_personal_model_call_outcome_unknown";
         };
         CreateConversationMessageVariantRequest: {
             /** @enum {string} */
@@ -9294,7 +9438,7 @@ export interface components {
         /** @enum {string} */
         TaskQueuePriority: "pinned" | "normal" | "background";
         /** @enum {string} */
-        TaskStepStatus: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "unknown";
+        TaskStepStatus: "queued" | "running" | "waiting_user" | "succeeded" | "failed" | "cancelled" | "unknown";
         TaskBudgetRequest: {
             active_seconds: number;
             tool_calls: number;
@@ -9483,7 +9627,7 @@ export interface components {
             title: string;
             summary: string;
             /** @enum {string|null} */
-            failure_reason?: "not_dispatched" | "tool_failed_after_dispatch" | "side_effect_unknown" | "authorization_changed" | "resource_changed" | "connector_rate_limited" | null;
+            failure_reason?: "not_dispatched" | "tool_failed_after_dispatch" | "tool_execution_failed" | "side_effect_unknown" | "authorization_changed" | "resource_changed" | "connector_rate_limited" | null;
             /** @description True only when persisted evidence confirms this exact failed operation is safe to retry and any connector retry-after window has elapsed. */
             retryable: boolean;
             /**
@@ -9511,6 +9655,71 @@ export interface components {
             completion_criteria: string[];
             /** @enum {string} */
             status: "pending" | "in_progress" | "completed" | "blocked";
+            /**
+             * @description Omitted on legacy plans means verification applicability is unknown and H07 must remain pending. New fix plan submissions classify every step.
+             * @enum {string}
+             */
+            verification_applicability?: "check" | "not_applicable";
+            /** @description Typed check identity for H07. A declared coverage path is plan scope, not proof of actual test coverage. */
+            verification_check?: {
+                /** @enum {string} */
+                kind: "test" | "build" | "lint" | "typecheck" | "other";
+                /**
+                 * @description Required checks cite an explicit user message or project file; risk_selected checks are chosen for this task.
+                 * @enum {string}
+                 */
+                basis: "required" | "risk_selected";
+                command: string;
+                /** @enum {string} */
+                scope_mode?: "full_suite" | "targeted";
+                coverage_paths: string[];
+                selectors?: string[];
+                requirement_ids?: string[];
+                requirement_source?: {
+                    /** @enum {string} */
+                    kind: "user_message" | "project_file";
+                    message_id?: string;
+                    workspace_path?: string;
+                    /** Format: int64 */
+                    workspace_revision?: number;
+                    /** @description Canonical digest stored in the plan; new plan-tool submissions have the server resolve the source and compute this value. */
+                    content_sha256: string;
+                };
+            };
+        };
+        /** @description Canonical persisted source identity. Submission-only locator/token fields are never stored in a Plan event. */
+        TaskPlanRequirementSource: components["schemas"]["TaskPlanUserMessageRequirementSource"] | components["schemas"]["TaskPlanProjectFileRequirementSource"];
+        TaskPlanUserMessageRequirementSource: {
+            /** @constant */
+            kind: "user_message";
+            message_id: string;
+            content_sha256: string;
+        };
+        TaskPlanProjectFileRequirementSource: {
+            /** @constant */
+            kind: "project_file";
+            workspace_path: string;
+            /** Format: int64 */
+            workspace_revision: number;
+            content_sha256: string;
+        };
+        TaskPlanRequirementObligation: {
+            id: string;
+            statement: string;
+            /** @enum {string} */
+            kind: "test" | "build" | "lint" | "typecheck" | "other";
+            /** @enum {string} */
+            scope_mode: "full_suite" | "targeted";
+            coverage_paths: string[];
+            selectors?: string[];
+            source: components["schemas"]["TaskPlanRequirementSource"];
+        };
+        TaskPlanRequirementManifest: {
+            /** @constant */
+            version: 1;
+            obligations: components["schemas"]["TaskPlanRequirementObligation"][];
+            /** @description Server-computed digest of the canonical candidate manifest. It does not prove completeness. */
+            digest: string;
         };
         TaskPlan: {
             /** Format: int64 */
@@ -9524,8 +9733,29 @@ export interface components {
              */
             cost_estimate_state: "unknown";
             steps: components["schemas"]["TaskPlanStep"][];
+            requirement_manifest?: components["schemas"]["TaskPlanRequirementManifest"];
             /** Format: date-time */
             created_at?: string;
+        };
+        TaskRequirementManifestConfirmationRequest: {
+            /** Format: int64 */
+            expected_task_revision: number;
+            /** Format: int64 */
+            expected_plan_revision: number;
+            /** Format: int64 */
+            expected_plan_event_sequence: number;
+        };
+        TaskRequirementManifestConfirmation: {
+            task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            task_revision: number;
+            /** Format: int64 */
+            plan_revision: number;
+            /** Format: int64 */
+            plan_event_sequence: number;
+            manifest_digest: string;
+            /** Format: date-time */
+            confirmed_at: string;
         };
         TaskStepRetryRequest: {
             /** Format: int64 */
@@ -9582,6 +9812,82 @@ export interface components {
             input: string | null;
             result: string | null;
             truncated: boolean;
+            execution?: components["schemas"]["TaskStepExecution"];
+            content_evidence?: components["schemas"]["TaskStepContentEvidence"];
+            /** @description Server-derived source locations from successful tool reads. Workspace paths are returned only to readers authorized for the Task Workspace. These locations are not yet a claim-to-source correctness verdict. */
+            source_locations?: components["schemas"]["TaskStepSourceLocation"][];
+        };
+        TaskStepSourceLocation: {
+            /** @description Stable server-derived identity bound to Task owner, Task, step, revision, tool call, and this source locator. */
+            id: string;
+            /** @enum {string} */
+            kind: "public_web_page" | "workspace_file" | "workspace_search_match";
+            /**
+             * Format: uri
+             * @description Canonical HTTPS request URI with query and fragment removed; present only for public_web_page.
+             */
+            uri?: string;
+            /** @description Bound Task Workspace ID; present only for Workspace locators. */
+            workspace_id?: string;
+            /**
+             * Format: int64
+             * @description Workspace revision requested by the successful read. For live_directory state this is the Task checkpoint revision, not an immutable content version.
+             */
+            revision?: number;
+            /** @description Normalized */
+            path?: string;
+            /** @description One-based line number for a Workspace search match. */
+            line?: number;
+            /** @description Immutable Workspace manifest digest; absent for live-directory reads. */
+            manifest_sha256?: string;
+            /** @enum {string} */
+            state: "requested_uri_only" | "immutable_workspace_revision" | "live_workspace_directory";
+            /** @description Captured web output digest or verified Workspace file-content digest associated with this locator. */
+            content_sha256: string;
+        };
+        /** @description Bounded, persisted excerpt from a successful built-in web search/read result, returned only after Task access and evidence identity checks. Treat preview text as untrusted web content; it is not a structured citation list. SHA-256 covers the full captured text before preview truncation. */
+        TaskStepContentEvidence: {
+            /** @description SHA-256 of the full captured result text. */
+            sha256: string;
+            /** @description UTF-8-safe */
+            preview: string;
+            /** @description True when the preview contains only a prefix of the full captured result text. */
+            truncated: boolean;
+        };
+        /** @description Bounded, redacted execution details for an authorized Task reader; absent fields are unavailable or not applicable. */
+        TaskStepExecution: {
+            location?: string;
+            parameters?: string;
+            command?: string;
+            working_directory?: string;
+            /** Format: int64 */
+            duration_ms?: number;
+            exit_code?: number;
+            timed_out?: boolean;
+            /** @description Redacted captured output within the encrypted detail budget. */
+            stdout?: string;
+            /** @description Redacted captured output within the encrypted detail budget. */
+            stderr?: string;
+            /** @description Original byte count only when the Host returned the complete output without redaction. */
+            stdout_total_bytes?: number;
+            /** @description Original byte count only when the Host returned the complete output without redaction. */
+            stderr_total_bytes?: number;
+            /** @description Bytes omitted from the complete */
+            stdout_omitted_bytes?: number;
+            /** @description Bytes omitted from the complete */
+            stderr_omitted_bytes?: number;
+            /** @description True when either the Host/Runtime truncated captured output or the server detail-size limit omitted redacted output. */
+            stdout_truncated?: boolean;
+            /** @description True when either the Host/Runtime truncated captured output or the server detail-size limit omitted redacted output. */
+            stderr_truncated?: boolean;
+            /** @description True only when the Host/Runtime reported that stdout was truncated before the server received it. */
+            stdout_runtime_truncated?: boolean;
+            /** @description True only when the Host/Runtime reported that stderr was truncated before the server received it. */
+            stderr_runtime_truncated?: boolean;
+            /** @description True only when the server omitted captured stdout to stay within the encrypted step-detail size limit. */
+            stdout_detail_truncated?: boolean;
+            /** @description True only when the server omitted captured stderr to stay within the encrypted step-detail size limit. */
+            stderr_detail_truncated?: boolean;
         };
         TaskBatchItem: {
             id: components["schemas"]["BatchItemId"];
@@ -9640,6 +9946,25 @@ export interface components {
             expires_at: string | null;
             /** @description Present only while an image */
             media_preview_operation_id?: components["schemas"]["OperationId"];
+            /** @description Evidence anchor for the action, "step:<step-id>" of the step whose command and output justify it. Empty for approvals created before E05. */
+            evidence_pointer?: string;
+            /**
+             * Format: int64
+             * @description Trusted cost of this exact action in micro-units. Null when no trusted per-action cost source exists; never a fabricated 0.
+             */
+            this_cost_micros?: number | null;
+            /**
+             * Format: int64
+             * @description Trusted cumulative cost of the task in micro-units at the moment the card was created. Null when any cost component is unknown.
+             */
+            total_cost_micros?: number | null;
+            /**
+             * @description Action-matrix category that required this approval. Empty for approvals created before E05.
+             * @enum {string}
+             */
+            trigger_rule?: "host_sensitive_tool" | "external_mcp_tool" | "workspace_live_write" | "media_publish";
+            /** @description What happens if the user rejects the action. Empty when the approval text did not state one. */
+            rejection_consequence?: string;
         };
         /** @description A known disclosure includes its evidence-backed summary. Unknown and not_applicable disclosures have a null summary. */
         TaskApprovalTextDisclosure: {
@@ -9674,6 +9999,8 @@ export interface components {
             id: components["schemas"]["ClarificationId"];
             version: number;
             question: string;
+            /** @description Opaque clarification identity used by clients to select any structured answer fields. Clients must not infer clarification type from question text. */
+            call_id: string;
         };
         TaskStopRequest: {
             id: string;
@@ -9911,6 +10238,25 @@ export interface components {
             /** Format: date-time */
             created_at: string;
             media_preview_operation_id?: components["schemas"]["OperationId"];
+            /** @description Evidence anchor for the action, "step:<step-id>" of the step whose command and output justify it. Empty for approvals created before E05. */
+            evidence_pointer?: string;
+            /**
+             * Format: int64
+             * @description Trusted cost of this exact action in micro-units. Null when no trusted per-action cost source exists; never a fabricated 0.
+             */
+            this_cost_micros?: number | null;
+            /**
+             * Format: int64
+             * @description Trusted cumulative cost of the task in micro-units at the moment the card was created. Null when any cost component is unknown.
+             */
+            total_cost_micros?: number | null;
+            /**
+             * @description Action-matrix category that required this approval. Empty for approvals created before E05.
+             * @enum {string}
+             */
+            trigger_rule?: "host_sensitive_tool" | "external_mcp_tool" | "workspace_live_write" | "media_publish";
+            /** @description What happens if the user rejects the action. Empty when the approval text did not state one. */
+            rejection_consequence?: string;
         };
         ConversationActiveTask: components["schemas"]["TaskSummary"] & {
             /** Format: int64 */
@@ -9934,6 +10280,11 @@ export interface components {
             application_id?: string;
             model_id: string;
             objective: string;
+            /**
+             * @description Structured output intent for the Task. Omission means none. `required` requires workspace_id. `unclear` opens a versioned clarification; it is never inferred from objective text.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             budget?: components["schemas"]["TaskBudgetRequest"] | null;
             batch_items?: components["schemas"]["TaskBatchItemInput"][];
@@ -9941,6 +10292,11 @@ export interface components {
         TaskBatchItemInput: {
             key: string;
             input: string;
+            /**
+             * @description Structured output intent for this batch item. Omission means none. `required` requires workspace_id. `unclear` opens a versioned clarification targeted to this item and its current attempt.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required" | "unclear";
         };
         /** @description retry_batch_item requires batch_item_id only. Pause, resume and cancel require expected_status. expected_current_revision and expected_desired_revision are optional together; when both are present, both task revisions are compared atomically before applying the action. Legacy clients may omit both revision fields. Supplying only one is invalid. set_priority requires queue_priority and expected_event_sequence and is accepted only while the task is queued. Priority changes are idempotent and append a task.priority event. Supplying fields for a different action is invalid. */
         TaskActionRequest: {
@@ -9970,6 +10326,11 @@ export interface components {
             clarification_id: components["schemas"]["ClarificationId"];
             clarification_version: number;
             answer: string;
+            /**
+             * @description Required only when answering a file delivery clarification. This structured choice is authoritative; it is not inferred from answer text. `required` requires the Task to have a Workspace.
+             * @enum {string}
+             */
+            file_delivery_intent?: "none" | "required";
         };
         TaskApprovalResponseRequest: {
             version: number;
@@ -10057,7 +10418,7 @@ export interface components {
         AdminHostRecoveryRequest: {
             /** Format: int64 */
             runtime_generation: number;
-            /** @description Confirm that the external issue is fixed before creating a replacement sandbox. */
+            /** @description Confirm an administrator reviewed the remote state and the external issue is fixed before creating a replacement sandbox; adoption does not create or replace a sandbox. */
             confirm_retry: boolean;
         };
         AdminHostRecoveryResult: {
@@ -10749,6 +11110,10 @@ export interface components {
             role?: components["schemas"]["UserRole"];
             quota?: components["schemas"]["Quota"];
             default_host_resources?: components["schemas"]["HostResourcesTarget"];
+        };
+        AdminResetUserPasswordRequest: {
+            expected_status: components["schemas"]["AccountStatus"];
+            new_password: string;
         };
     };
     responses: {
@@ -15863,6 +16228,40 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getProjectConversationMessageRetryEligibility: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current advisory retry eligibility */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageRetryEligibility"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     getProjectConversationAttachmentUpload: {
         parameters: {
             query?: never;
@@ -17188,6 +17587,39 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getConversationMessageRetryEligibility: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Current advisory retry eligibility */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ConversationMessageRetryEligibility"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
     createConversationMessageVariant: {
         parameters: {
             query?: never;
@@ -17486,6 +17918,43 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    confirmTaskRequirementManifest: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Strong quoted lowercase SHA-256 ETag of the candidate manifest, for example "<64 lowercase hex characters>". The server recomputes this digest from the current Plan event. */
+                "If-Match": string;
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskRequirementManifestConfirmationRequest"];
+            };
+        };
+        responses: {
+            /** @description Persisted confirmation fact for the exact current manifest. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskRequirementManifestConfirmation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };
@@ -18607,7 +19076,7 @@ export interface operations {
             header?: never;
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -18641,7 +19110,7 @@ export interface operations {
             };
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -18681,7 +19150,7 @@ export interface operations {
             };
             path: {
                 type: components["schemas"]["PersonalMutationObjectType"];
-                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
+                /** @description Identifier rules depend on type. profile and feed_preferences use default; memory uses global, user, or m_<8 lowercase hex characters; skill_setting uses builtin_<non-empty id>; connector_setting uses catalogue_<non-empty id>. skill_candidate uses sk_<8 lowercase hexadecimal characters. Other enabled types use a path-free opaque identifier. The server also rejects . and ..; schedule uses its dedicated API rather than this mutation route. */
                 id: components["schemas"]["PersonalObjectId"];
             };
             cookie?: never;
@@ -20050,6 +20519,36 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    resetAdminUserPassword: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["UserId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AdminResetUserPasswordRequest"];
+            };
+        };
+        responses: {
+            /** @description Password reset and account credentials revoked */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     getAdminPersonalDataQuota: {
         parameters: {
             query?: never;
@@ -21076,7 +21575,7 @@ export interface operations {
                         items: {
                             owner_id: components["schemas"]["UserId"];
                             /** @enum {string} */
-                            source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
+                            source: "client" | "chat" | "task" | "probe" | "route" | "compaction" | "review" | "terminal_delivery";
                             call_id: string;
                             model_id: string;
                             provider_model: string;
@@ -21109,7 +21608,7 @@ export interface operations {
                 "application/json": {
                     owner_id: components["schemas"]["UserId"];
                     /** @enum {string} */
-                    source: "client" | "chat" | "task" | "route" | "probe" | "compaction";
+                    source: "client" | "chat" | "task" | "probe" | "route" | "compaction" | "review" | "terminal_delivery";
                     call_id: string;
                     /** Format: int64 */
                     input_tokens: number;

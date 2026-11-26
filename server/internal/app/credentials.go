@@ -132,8 +132,10 @@ func (s *CredentialService) Login(ctx context.Context, name, password, ip string
 	if err != nil {
 		return LoginResult{}, err
 	}
-	if err := s.ensureDefaultHost(ctx, user); err != nil {
-		return LoginResult{}, err
+	if !user.MustChangePassword {
+		if err := s.ensureDefaultHost(ctx, user); err != nil {
+			return LoginResult{}, err
+		}
 	}
 	expires := time.Now().Add(s.options.SessionTTL)
 	token, credential, err := issueCredential(ctx, s.tokens, user.ID, identity.KindSession, "", "session", expires)
