@@ -15,8 +15,18 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/dshguardian"
 	"morde/server/internal/evaluation"
 )
+
+type WorkflowTraceTaskProcessSnapshotReader interface {
+	SnapshotTaskProcess(context.Context, app.AccountAgentRuntimeFence, app.AgentInstanceFence) (dshguardian.TaskProcessSnapshot, error)
+}
+
+type workflowTraceTaskProcessIdentity struct {
+	runtimeFence app.AccountAgentRuntimeFence
+	taskFence    app.AgentInstanceFence
+}
 
 const workflowTraceFactLimit = 16
 
@@ -204,8 +214,10 @@ func (s *Store) GetTaskWorkflowTrace(ctx context.Context, taskID, ownerID string
 		return evaluation.WorkflowTrace{}, domain.NewError(domain.CodeNotFound, "task not found")
 	}
 	var trace evaluation.WorkflowTrace
+	var taskRow workflowTraceTask
+	var taskNode, taskSource string
+	var processIdentity *workflowTraceTaskProcessIdentity
 	err := s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
-		var taskRow workflowTraceTask
 		err := tx.QueryRow(ctx, `SELECT id,owner_id,conversation_id,COALESCE(host_id,''),status,current_revision,desired_revision,event_seq,
 agent_generation,COALESCE(agent_session_id,''),auth_kind,auth_token_id,auth_scopes,auth_version,model_id,objective,created_at,updated_at
 FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).Scan(
@@ -221,7 +233,7 @@ FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).Scan(
 		}
 		builder := newWorkflowTraceBuilder(taskRow.ID, taskRow.CurrentRevision, taskRow.EventSequence, time.Now())
 		objectiveDigest := sha256.Sum256([]byte(taskRow.Objective))
-		taskSource, err := builder.addSource(evaluation.WorkflowSourceTaskLedger, "db://tasks/"+taskRow.ID, struct {
+		taskSource, err = builder.addSource(evaluation.WorkflowSourceTaskLedger, "db://tasks/"+taskRow.ID, struct {
 			TaskID               string    `json:"task_id"`
 			OwnerID              string    `json:"owner_id"`
 			ConversationID       string    `json:"conversation_id"`
@@ -245,7 +257,7 @@ FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).Scan(
 		if err != nil {
 			return err
 		}
-		taskNode := builder.addNode(evaluation.WorkflowNodeTask, workflowTaskNodeState(taskRow.Status), taskRow.ID, taskSource)
+		taskNode = builder.addNode(evaluation.WorkflowNodeTask, workflowTaskNodeState(taskRow.Status), taskRow.ID, taskSource)
 		authSource, err := builder.addSource(evaluation.WorkflowSourceTaskLedger, "db://tasks/"+taskRow.ID+"/authorization", struct {
 			AuthorizationKind    string   `json:"authorization_kind"`
 			AuthorizationTokenID string   `json:"authorization_token_id,omitempty"`
@@ -291,10 +303,17 @@ FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).Scan(
 		if err := addWorkflowTraceCurrentAuthorization(ctx, tx, builder, taskRow); err != nil {
 			return err
 		}
+		processIdentity, err = loadWorkflowTraceTaskProcessIdentity(ctx, tx, taskRow)
+		if err != nil {
+			return err
+		}
 		trace, err = builder.finish()
 		return err
 	})
-	return trace, err
+	if err != nil {
+		return evaluation.WorkflowTrace{}, err
+	}
+	return s.addWorkflowTraceTaskProcessSnapshot(ctx, trace, taskRow, taskNode, taskSource, processIdentity)
 }
 
 func workflowTaskNodeState(status string) evaluation.WorkflowNodeState {
@@ -1667,8 +1686,6 @@ WHERE session.task_id=$1 AND session.owner_id=$2 AND session.session_id=$3 AND s
 		builder.addGap(evaluation.WorkflowStageRuntime, "recent root DSH session heartbeat conflicts with the Agent instance state or lease",
 			evaluation.WorkflowGapUnknown, nil, sourceID)
 	}
-	builder.addGap(evaluation.WorkflowStageRuntime, "root DSH session heartbeat records recent runtime activity, not direct process-tree state or PID",
-		evaluation.WorkflowGapUnknown, nil, sourceID)
 	return nil
 }
 
@@ -1693,6 +1710,160 @@ func addWorkflowTraceDSHSessionRuntimeUnavailable(builder *workflowTraceBuilder,
 	builder.addGap(evaluation.WorkflowStageRuntime, "root DSH session heartbeat snapshot is unavailable",
 		evaluation.WorkflowGapUnavailable, nil, sourceID)
 	return nil
+}
+
+func (s *Store) SetWorkflowTraceTaskProcessSnapshotReader(reader WorkflowTraceTaskProcessSnapshotReader) {
+	// Portal wires this once during startup, before its HTTP server begins
+	// serving requests. A nil reader keeps the source visible as unavailable.
+	s.workflowTraceTaskProcessSnapshotter = reader
+}
+
+func loadWorkflowTraceTaskProcessIdentity(ctx context.Context, tx pgx.Tx,
+	taskRow workflowTraceTask) (*workflowTraceTaskProcessIdentity, error) {
+	var serviceInstanceID, runtimeID, runtimeLeaseOwner, runtimeState string
+	var runtimeGeneration, runtimeLeaseVersion, executionEpoch int64
+	var runtimeLeaseActive bool
+	err := tx.QueryRow(ctx, `SELECT service.instance_id::text,runtime.runtime_id,runtime.runtime_generation,
+runtime.lease_owner,runtime.lease_version,runtime.execution_epoch,runtime.state,
+COALESCE(runtime.lease_expires_at>transaction_timestamp(),false)
+FROM service_identity service
+JOIN account_agent_runtimes runtime ON runtime.service_instance_id=service.instance_id
+WHERE service.singleton=true AND runtime.owner_id=$1 AND runtime.conversation_id=$2`,
+		taskRow.OwnerID, taskRow.ConversationID).Scan(&serviceInstanceID, &runtimeID, &runtimeGeneration,
+		&runtimeLeaseOwner, &runtimeLeaseVersion, &executionEpoch, &runtimeState, &runtimeLeaseActive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read workflow Task process Runtime fence: %w", err)
+	}
+	if runtimeState != string(app.AccountAgentRuntimeRunning) || !runtimeLeaseActive {
+		return nil, nil
+	}
+	runtimeFence := app.AccountAgentRuntimeFence{ServiceInstanceID: serviceInstanceID,
+		ConversationID: taskRow.ConversationID, OwnerID: taskRow.OwnerID, RuntimeID: runtimeID,
+		RuntimeGeneration: runtimeGeneration, LeaseOwner: runtimeLeaseOwner, LeaseVersion: runtimeLeaseVersion,
+		ExecutionEpoch: executionEpoch}
+	if runtimeFence.Validate() != nil {
+		return nil, nil
+	}
+
+	var initiatorID, agentInstanceID, agentSessionID, supervisorID, agentLeaseOwner string
+	var agentGeneration, agentLeaseVersion, authorizationVersion int64
+	var engineVersion, profileVersion string
+	err = tx.QueryRow(ctx, `SELECT task.initiator_id,instance.agent_instance_id,instance.agent_generation,
+instance.agent_session_id,instance.supervisor_id,instance.lease_owner,instance.lease_version,instance.auth_version,
+instance.engine_version,instance.profile_version
+FROM tasks task
+JOIN task_agent_instances instance ON instance.task_id=task.id AND instance.owner_id=task.owner_id
+WHERE task.id=$1 AND task.owner_id=$2 AND task.conversation_id=$3
+  AND task.agent_generation=$4 AND task.agent_session_id=$5
+  AND instance.agent_generation=task.agent_generation AND instance.agent_instance_id=task.agent_instance_id
+  AND instance.agent_session_id=task.agent_session_id AND instance.auth_version=task.auth_version
+  AND instance.state='active' AND instance.lease_expires_at>transaction_timestamp()
+  AND instance.service_instance_id=$6::uuid AND instance.account_runtime_id=$7
+  AND instance.account_runtime_generation=$8`, taskRow.ID, taskRow.OwnerID, taskRow.ConversationID,
+		taskRow.AgentGeneration, taskRow.AgentSessionID, serviceInstanceID, runtimeID, runtimeGeneration).Scan(
+		&initiatorID, &agentInstanceID, &agentGeneration, &agentSessionID, &supervisorID, &agentLeaseOwner,
+		&agentLeaseVersion, &authorizationVersion, &engineVersion, &profileVersion)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read workflow Task process Agent fence: %w", err)
+	}
+	taskFence := app.AgentInstanceFence{TaskID: taskRow.ID, OwnerID: taskRow.OwnerID, InitiatorID: initiatorID,
+		AgentInstanceID: agentInstanceID, AgentGeneration: agentGeneration, AgentSessionID: agentSessionID,
+		SupervisorID: supervisorID, LeaseOwner: agentLeaseOwner, LeaseVersion: agentLeaseVersion,
+		AuthorizationVersion: authorizationVersion, EngineVersion: engineVersion, ProfileVersion: profileVersion}
+	if taskFence.Validate() != nil {
+		return nil, nil
+	}
+	return &workflowTraceTaskProcessIdentity{runtimeFence: runtimeFence, taskFence: taskFence}, nil
+}
+
+func (s *Store) addWorkflowTraceTaskProcessSnapshot(ctx context.Context, trace evaluation.WorkflowTrace,
+	taskRow workflowTraceTask, taskNode, taskSource string, identity *workflowTraceTaskProcessIdentity) (evaluation.WorkflowTrace, error) {
+	locator := fmt.Sprintf("guardian://task-processes/%s/%d", taskRow.ID, taskRow.AgentGeneration)
+	fact := struct {
+		TaskID            string                           `json:"task_id"`
+		TaskRevision      int64                            `json:"task_revision"`
+		AgentGeneration   int64                            `json:"agent_generation"`
+		IdentityAvailable bool                             `json:"identity_available"`
+		Available         bool                             `json:"available"`
+		ObservedAt        time.Time                        `json:"observed_at"`
+		RuntimeFence      *app.AccountAgentRuntimeFence    `json:"runtime_fence,omitempty"`
+		TaskFence         *app.AgentInstanceFence          `json:"task_fence,omitempty"`
+		Snapshot          *dshguardian.TaskProcessSnapshot `json:"snapshot,omitempty"`
+		UnavailableReason string                           `json:"unavailable_reason,omitempty"`
+	}{TaskID: taskRow.ID, TaskRevision: taskRow.CurrentRevision, AgentGeneration: taskRow.AgentGeneration,
+		ObservedAt: time.Now().UTC()}
+	gapState := evaluation.WorkflowGapUnknown
+	nodeState := evaluation.WorkflowNodeUnknown
+	if identity == nil {
+		fact.UnavailableReason = "exact active account Runtime and Task Agent fences are unavailable"
+		gapState = evaluation.WorkflowGapUnavailable
+	} else {
+		fact.IdentityAvailable = true
+		runtimeFence, taskFence := identity.runtimeFence, identity.taskFence
+		fact.RuntimeFence = &runtimeFence
+		fact.TaskFence = &taskFence
+		if s.workflowTraceTaskProcessSnapshotter == nil {
+			fact.UnavailableReason = "Guardian process snapshot adapter is not configured"
+			gapState = evaluation.WorkflowGapUnavailable
+		} else {
+			snapshot, err := s.workflowTraceTaskProcessSnapshotter.SnapshotTaskProcess(ctx, runtimeFence, taskFence)
+			if err == nil && snapshot.RuntimeFence == runtimeFence && snapshot.TaskFence == taskFence &&
+				dshguardian.ValidateTaskProcessSnapshot(snapshot) == nil {
+				fact.Available = true
+				fact.Snapshot = &snapshot
+			} else {
+				fact.UnavailableReason = "Guardian process snapshot is incomplete or its fenced identity changed"
+			}
+		}
+	}
+	if identity != nil {
+		locator = fmt.Sprintf("guardian://task-processes/%s/%s/%d/%d", identity.runtimeFence.RuntimeID,
+			taskRow.ID, identity.runtimeFence.RuntimeGeneration, identity.taskFence.AgentGeneration)
+	}
+	builder := workflowTraceBuilderFromTrace(trace)
+	sourceID, err := builder.addSource(evaluation.WorkflowSourceRuntimeSnapshot, locator, fact)
+	if err != nil {
+		return evaluation.WorkflowTrace{}, err
+	}
+	nodeID := builder.addNode(evaluation.WorkflowNodeRuntime, nodeState,
+		taskRow.ID+":os-process-tree:"+fmt.Sprint(taskRow.AgentGeneration), sourceID)
+	builder.addEdge(evaluation.WorkflowEdgeTargets, taskNode, nodeID, taskSource, sourceID)
+	if !fact.Available {
+		builder.addGap(evaluation.WorkflowStageRuntime, "OS process tree for Task generation "+fmt.Sprint(taskRow.AgentGeneration),
+			gapState, nil, sourceID)
+	}
+	return builder.finish()
+}
+
+func workflowTraceBuilderFromTrace(trace evaluation.WorkflowTrace) *workflowTraceBuilder {
+	builder := &workflowTraceBuilder{trace: trace, sources: make(map[string]evaluation.WorkflowSource),
+		coverage: make(map[string]struct{}), nodes: make(map[string]int), edges: make(map[string]struct{}),
+		gaps: make(map[string]struct{}), agentNodes: make(map[string]string), routeNodes: make(map[string]string),
+		modelNodes: make(map[string]string), modelSources: make(map[string]string)}
+	for _, source := range trace.Sources {
+		builder.sources[source.ID] = source
+	}
+	for _, sourceID := range trace.CoverageSourceIDs {
+		builder.coverage[sourceID] = struct{}{}
+	}
+	for index, node := range trace.Nodes {
+		builder.nodes[node.ID] = index
+	}
+	for _, edge := range trace.Edges {
+		builder.edges[edge.ID] = struct{}{}
+	}
+	for _, gap := range trace.Gaps {
+		builder.gaps[gap.ID] = struct{}{}
+	}
+	builder.trace.CoverageSourceIDs = nil
+	builder.trace.Sources = nil
+	return builder
 }
 
 func workflowRuntimeNodeState(state string, leaseActive bool) evaluation.WorkflowNodeState {

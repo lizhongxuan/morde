@@ -57,6 +57,32 @@ type TaskProcessGuard struct {
 	ExpiresAt          time.Time                    `json:"expires_at"`
 }
 
+// TaskProcessSnapshot is a read-only, bounded view of the process leaders in
+// one Guardian-isolated Task cgroup. It deliberately omits process names,
+// command lines, environment, file descriptors, and task content.
+type TaskProcessSnapshot struct {
+	RuntimeFence       app.AccountAgentRuntimeFence `json:"runtime_fence"`
+	TaskFence          app.AgentInstanceFence       `json:"task_fence"`
+	RuntimeContainerID string                       `json:"runtime_container_id"`
+	CapturedAt         time.Time                    `json:"captured_at"`
+	RootPID            int                          `json:"root_pid"`
+	RootStartTimeTick  uint64                       `json:"root_start_time_ticks"`
+	Complete           bool                         `json:"complete"`
+	Processes          []TaskProcessSnapshotEntry   `json:"processes"`
+	IntegritySHA256    string                       `json:"integrity_sha256"`
+}
+
+// TaskProcessSnapshotEntry contains only the identifiers needed to review a
+// scoped process tree. ParentPID is zero when the parent is outside the
+// Guardian-isolated Task cgroup.
+type TaskProcessSnapshotEntry struct {
+	PID                int    `json:"pid"`
+	ParentPID          int    `json:"parent_pid,omitempty"`
+	ParentOutsideScope bool   `json:"parent_outside_scope,omitempty"`
+	State              string `json:"state"`
+	StartTimeTick      uint64 `json:"start_time_ticks"`
+}
+
 // TaskSandboxGuard pins one OpenSandbox container to a durable Morde Task
 // lifecycle. It is registered only after the provider has created the exact
 // running container; stop attestations use a separate signing key.

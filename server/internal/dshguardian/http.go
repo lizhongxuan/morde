@@ -253,6 +253,27 @@ func (s *Service) handleTaskProcessArm(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) handleTaskProcess(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/v1/task-processes/snapshot" {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var request struct {
+			RuntimeFence app.AccountAgentRuntimeFence `json:"runtime_fence"`
+			TaskFence    app.AgentInstanceFence       `json:"task_fence"`
+		}
+		if err := readBody(r, &request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid Task process snapshot request")
+			return
+		}
+		snapshot, err := s.SnapshotTaskProcess(r.Context(), request.RuntimeFence, request.TaskFence)
+		if err != nil {
+			writeError(w, http.StatusConflict, "Guardian could not capture an exact Task process snapshot")
+			return
+		}
+		writeJSON(w, http.StatusOK, snapshot)
+		return
+	}
 	if r.URL.Path == "/v1/task-processes/ack-stop" {
 		if r.Method != http.MethodPost {
 			http.NotFound(w, r)
@@ -614,6 +635,25 @@ func (c *Client) StopTaskProcess(ctx context.Context, guard TaskProcessGuard) (a
 	var result app.AccountAgentTaskStopAttestation
 	if err := c.do(ctx, http.MethodPost, taskProcessPath(guard, "stop"), guard, &result, http.StatusOK); err != nil {
 		return app.AccountAgentTaskStopAttestation{}, err
+	}
+	return result, nil
+}
+
+func (c *Client) SnapshotTaskProcess(ctx context.Context, runtimeFence app.AccountAgentRuntimeFence,
+	taskFence app.AgentInstanceFence) (TaskProcessSnapshot, error) {
+	request := struct {
+		RuntimeFence app.AccountAgentRuntimeFence `json:"runtime_fence"`
+		TaskFence    app.AgentInstanceFence       `json:"task_fence"`
+	}{RuntimeFence: runtimeFence, TaskFence: taskFence}
+	var result TaskProcessSnapshot
+	if err := c.do(ctx, http.MethodPost, "/v1/task-processes/snapshot", request, &result, http.StatusOK); err != nil {
+		return TaskProcessSnapshot{}, err
+	}
+	if err := ValidateTaskProcessSnapshot(result); err != nil {
+		return TaskProcessSnapshot{}, fmt.Errorf("Guardian returned an invalid Task process snapshot: %w", err)
+	}
+	if result.RuntimeFence != runtimeFence || result.TaskFence != taskFence {
+		return TaskProcessSnapshot{}, errors.New("Guardian Task process snapshot fence does not match the request")
 	}
 	return result, nil
 }

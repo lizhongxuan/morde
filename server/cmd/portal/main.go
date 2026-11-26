@@ -34,6 +34,7 @@ import (
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/workspace"
+	"morde/server/internal/dshguardian"
 	"morde/server/internal/gateway"
 	"morde/server/internal/httpserver"
 	"morde/server/internal/mcp"
@@ -1065,6 +1066,9 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	guardian, err := worker.NewUnixSocketDockerCloudDSHGuardian(cfg.GuardianSocket)
 	if err != nil {
 		return nil, err
+	}
+	if snapshotReader, ok := guardian.(dshguardian.TaskProcessSnapshotReader); ok {
+		store.SetWorkflowTraceTaskProcessSnapshotReader(snapshotReader)
 	}
 	supervisor, err := worker.NewDockerCloudDSHSupervisor(worker.DockerCloudDSHSupervisorOptions{
 		DockerHost: cfg.DockerHost, Image: cfg.Image, NodePath: cfg.NodePath, ScriptPath: cfg.ScriptPath,
