@@ -290,7 +290,7 @@ func (p hostProcessInspector) readTaskProcessSnapshotRecord(hostPID int, namespa
 	if err != nil {
 		return taskProcessSnapshotRecord{}, fmt.Errorf("read Task process identity: %w", err)
 	}
-	state, hostParentPID, startTimeTick, err := parseProcSnapshotStat(first)
+	_, hostParentPID, startTimeTick, err := parseProcSnapshotStat(first)
 	if err != nil {
 		return taskProcessSnapshotRecord{}, err
 	}
