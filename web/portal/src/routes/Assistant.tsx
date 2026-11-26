@@ -45,6 +45,7 @@ type ConversationMessagesData = { pages: ConversationMessagePage[]; pageParams: 
 type TaskSummary = Awaited<ReturnType<typeof portalApi.tasks>>['items'][number];
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
 type TaskStep = Task['steps'][number];
+type TaskPlanStep = NonNullable<Task['plan']>['steps'][number];
 type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
 type TaskStepDetailWithExecution = Omit<TaskStepDetail, 'execution'> & { execution?: TaskStepDetail['execution'] | null };
 type TaskStepSourceLocation = NonNullable<TaskStepDetail['source_locations']>[number];
@@ -916,10 +917,30 @@ function TaskRequirementManifestReview({ task }: { task: Task }) {
   const plan = task.plan;
   const manifest = plan?.requirement_manifest;
   if (!plan || !manifest) return null;
+  const obligationsByID = new Map(manifest.obligations.map((obligation) => [obligation.id, obligation]));
+  const checksByObligation = new Map<string, Array<{ stepID: string; stepTitle: string; check: NonNullable<TaskPlanStep['verification_check']> }>>();
+  const duplicateObligationIDs = obligationsByID.size !== manifest.obligations.length;
+  let invalidRequiredCheckMapping = false;
+  for (const step of plan.steps) {
+    const check = step.verification_check;
+    if (check?.basis !== 'required') continue;
+    const requirementIDs = check.requirement_ids ?? [];
+    if (requirementIDs.length === 0 || requirementIDs.some((id) => !obligationsByID.has(id))) {
+      invalidRequiredCheckMapping = true;
+    }
+    for (const requirementID of requirementIDs) {
+      if (!obligationsByID.has(requirementID)) continue;
+      const entries = checksByObligation.get(requirementID) ?? [];
+      entries.push({ stepID: step.id, stepTitle: step.title, check });
+      checksByObligation.set(requirementID, entries);
+    }
+  }
+  const mappingReady = !duplicateObligationIDs && !invalidRequiredCheckMapping && manifest.obligations.every((obligation) =>
+    checksByObligation.get(obligation.id)?.length === 1);
   const savedConfirmation = task.requirement_manifest_confirmation;
-  const confirmed = savedConfirmation?.manifest_digest === manifest.digest &&
+  const confirmed = mappingReady && savedConfirmation?.manifest_digest === manifest.digest &&
     savedConfirmation.requirements_complete_attested === true && Number.isFinite(Date.parse(savedConfirmation.attested_at));
-  const ready = task.current_revision === plan.task_revision && Number.isSafeInteger(task.plan_event_sequence) &&
+  const ready = mappingReady && task.current_revision === plan.task_revision && Number.isSafeInteger(task.plan_event_sequence) &&
     (task.plan_event_sequence ?? 0) > 0 && /^[0-9a-f]{64}$/u.test(manifest.digest);
   const checkKindLabel: Record<string, string> = {
     test: '测试', build: '构建', lint: 'Lint', typecheck: '类型检查', other: '其他检查',
@@ -937,9 +958,22 @@ function TaskRequirementManifestReview({ task }: { task: Task }) {
           {source.kind === 'user_message'
             ? <small>需求来源：<a href={`#conversation-message-${encodeURIComponent(source.message_id)}`}>对话消息 {source.message_id}</a></small>
             : <small>需求来源：项目文件 {source.workspace_path} · Workspace 修订 {source.workspace_revision}</small>}
+          <small>对应检查：</small>
+          {checksByObligation.get(obligation.id)?.length === 1
+            ? checksByObligation.get(obligation.id)?.map((entry) => <small key={entry.stepID}>
+              {safeTaskActivityText(entry.stepTitle, 160).value}（步骤 {safeTaskActivityText(entry.stepID, 40).value}）· {checkKindLabel[entry.check.kind] ?? '其他检查'} ·
+              {entry.check.scope_mode === 'full_suite' ? '全量范围' : '定向范围'}
+              {` · 命令：${safeTaskActivityText(entry.check.command, 1_024).value}`}
+              {` · 覆盖：${entry.check.coverage_paths.map((path) => safeTaskActivityText(path, 512).value).join('、')}`}
+              {entry.check.selectors?.length ? ` · 选择器：${entry.check.selectors.map((selector) => safeTaskActivityText(selector, 256).value).join('、')}` : ''}
+            </small>)
+            : <small role="alert">没有且仅有一个对应的必需检查；此要求不能用于完整性确认。</small>}
         </li>;
       })}
     </ol> : <p role="status">当前候选清单为空。只有确认没有适用的明确验证要求时，才继续确认。</p>}
+    {duplicateObligationIDs && <p role="alert">要求清单包含重复的 obligation ID，无法安全确认。</p>}
+    {invalidRequiredCheckMapping && <p role="alert">计划包含未映射要求或未知要求 ID；服务端不能据此判定要求集完整。</p>}
+    {!mappingReady && !duplicateObligationIDs && !invalidRequiredCheckMapping && <p role="alert">每条要求都必须对应且只对应一个必需检查；当前映射不完整，暂不能确认。</p>}
     {confirmed
       ? <p className="task-requirement-confirmed" role="status">已确认此版本的要求清单完整且准确 · {formatDate(savedConfirmation.attested_at)}</p>
       : <>
