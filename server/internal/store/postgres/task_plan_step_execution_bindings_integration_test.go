@@ -11,6 +11,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/hub"
 	"morde/server/internal/domain/task"
 )
 
@@ -268,6 +269,85 @@ func TestPostgresTaskPlanStepOperationDispatchWithoutPlanPreservesBehavior(t *te
 		0, "", task.OperationDispatched)); err != nil {
 		t.Fatalf("dispatch without plan metadata: %v", err)
 	}
+}
+
+func TestPostgresTaskPlanStepHubCommandDispatchBindsAtomicallyAndChecksDependencies(t *testing.T) {
+	fixture := createS03RunningAgentTask(t, newRouteActionsTestFixture(t), "plan-step-hub-command-binding", true)
+	ctx := context.Background()
+	current := fixture.task
+	targetID := mustID(t, domain.NewClientInstallationID)
+	if _, err := fixture.route.store.pool.Exec(ctx, `INSERT INTO client_installations (id,owner_id,display_name,platform,expires_at)
+VALUES ($1,$2,'Task target','desktop',clock_timestamp()+interval '1 day')`, targetID, current.OwnerID); err != nil {
+		t.Fatal(err)
+	}
+	plan := task.Plan{TaskRevision: *current.CurrentRevision, Revision: 1, Goal: "Run dependent Hub commands",
+		Scope: "Use the assigned computer", VerificationMethod: "Check the durable command result", CostEstimateState: "unknown",
+		Steps: []task.PlanStep{
+			{ID: "source", Title: "Run source command", Status: task.PlanStepPending,
+				CompletionCriteria: []string{"source command completed"}, Outputs: []string{"source result"}},
+			{ID: "followup", Title: "Run dependent command", Status: task.PlanStepPending, DependsOn: []string{"source"},
+				CompletionCriteria: []string{"dependent command completed"}, Outputs: []string{"followup result"}},
+		}}
+	current = commitTaskPlanForStepBinding(t, fixture, plan, "plan-binding-hub-plan")
+	toolName := "morde_hub_command_" + targetID + "_v1"
+
+	newOperation := func(callID, stepID string) (app.TaskHubOperation, app.TaskToolCallProgress) {
+		t.Helper()
+		digest := sha256.Sum256([]byte(toolName + ":" + callID))
+		toolCall := taskPlanBindingToolCall(fixture, current, callID, toolName, digest[:])
+		return app.TaskHubOperation{OwnerID: current.OwnerID, TaskID: current.ID,
+			Key: app.AgentOperationKey(callID), ToolName: toolName, TargetInstallationID: targetID,
+			Action: hub.ActionCommand, TaskAuthorizationVersion: current.Authorization.Version,
+			TargetGrantVersion: 1, LeaseVersion: current.Lease.Version, RequestHash: hashBytes("hub request:" + callID),
+			Status: task.OperationPrepared, AgentSessionID: toolCall.AgentSessionID, CallID: callID,
+			ToolCallDigest: append([]byte(nil), digest[:]...), PlanTaskRevision: *current.CurrentRevision,
+			PlanRevision: 1, PlanStepID: stepID}, toolCall
+	}
+
+	followup, followupCall := newOperation("call-plan-hub-followup", "followup")
+	followup, replayed, err := fixture.route.store.PrepareTaskHubOperation(ctx, followup, current.Lease.Owner)
+	if err != nil || replayed {
+		t.Fatalf("prepare dependent Hub command = %#v replayed=%t err=%v", followup, replayed, err)
+	}
+	commitToolCallStepForPlanBindingWithStatus(t, fixture, current, followupCall, "plan-hub-followup", task.StepRunning, "")
+	if err := fixture.route.store.MarkTaskHubOperationDispatched(ctx, followup, current.Lease.Owner); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("dependent Hub dispatch without settled prerequisite = %v; want conflict", err)
+	}
+	var bindingCount int
+	if err := fixture.route.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_plan_step_execution_bindings
+WHERE task_id=$1 AND execution_kind='hub_operation'`, current.ID).Scan(&bindingCount); err != nil || bindingCount != 0 {
+		t.Fatalf("blocked dependent dispatch wrote %d Hub bindings, err=%v; want none", bindingCount, err)
+	}
+	var status string
+	if err := fixture.route.store.pool.QueryRow(ctx, `SELECT status FROM task_hub_operations WHERE owner_id=$1 AND task_id=$2 AND operation_key=$3`,
+		current.OwnerID, current.ID, followup.Key).Scan(&status); err != nil || status != string(task.OperationPrepared) {
+		t.Fatalf("blocked dependent Hub operation status=%q err=%v; want prepared", status, err)
+	}
+
+	source, sourceCall := newOperation("call-plan-hub-source", "source")
+	source, replayed, err = fixture.route.store.PrepareTaskHubOperation(ctx, source, current.Lease.Owner)
+	if err != nil || replayed {
+		t.Fatalf("prepare source Hub command = %#v replayed=%t err=%v", source, replayed, err)
+	}
+	stepID := commitToolCallStepForPlanBindingWithStatus(t, fixture, current, sourceCall, "plan-hub-source", task.StepRunning, "")
+	if err := fixture.route.store.MarkTaskHubOperationDispatched(ctx, source, current.Lease.Owner); err != nil {
+		t.Fatalf("dispatch source Hub command: %v", err)
+	}
+	if err := fixture.route.store.CompleteTaskHubOperation(ctx, source, current.Lease.Owner, task.OperationSucceeded, hashBytes("source result")); err != nil {
+		t.Fatalf("settle source Hub command: %v", err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET status='succeeded'
+WHERE task_id=$1 AND id=$2`, current.ID, stepID); err != nil {
+		t.Fatalf("settle source TaskStep: %v", err)
+	}
+	if err := fixture.route.store.MarkTaskHubOperationDispatched(ctx, followup, current.Lease.Owner); err != nil {
+		t.Fatalf("dispatch dependent Hub command after prerequisite settlement: %v", err)
+	}
+	if err := fixture.route.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_plan_step_execution_bindings
+WHERE task_id=$1 AND execution_kind='hub_operation' AND plan_step_id IN ('source','followup')`, current.ID).Scan(&bindingCount); err != nil || bindingCount != 2 {
+		t.Fatalf("Hub command plan binding count=%d err=%v; want one per dispatched step", bindingCount, err)
+	}
+	assertTaskPlanReadiness(t, fixture.route.store, current, 1, "followup", true, "")
 }
 
 func TestPostgresTaskPlanStepMCPBindingUsesOperationLedger(t *testing.T) {

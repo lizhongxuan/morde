@@ -19,6 +19,7 @@ const MAX_ABANDONED_RESPONSES = 4096
 const MAX_DELEGATE_TITLE_BYTES = 256
 const MAX_DELEGATE_OBJECTIVE_BYTES = 32 * 1024
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/
+const TASK_TURN_MESSAGE_ID = /^m[a-z0-9]{7}$/
 const CHECKPOINT_TIMEOUT_MS = 30_000
 const TOOL_RESULT_TIMEOUT_MS = 6 * 60_000
 const CHILD_RESULT_TIMEOUT_MS = 6 * 60_000
@@ -718,10 +719,12 @@ export class WorkerIPC {
     this.abandonPending(this.pending, id, pending)
   }
 
-  async toolCall(identity, through, callID, name, args, signal, { recovering = false, onWaiting, onTimeout } = {}) {
+  async toolCall(identity, through, callID, name, args, signal,
+    { recovering = false, currentTaskTurnMessageID = '', onWaiting, onTimeout } = {}) {
     if (this.cancelled) throw abortError()
     if (!Number.isSafeInteger(through) || through < 0 || typeof callID !== 'string' || !callID ||
-        Buffer.byteLength(callID) > 256 || typeof name !== 'string' || !name || !isObject(args)) {
+        Buffer.byteLength(callID) > 256 || typeof name !== 'string' || !name || !isObject(args) ||
+        currentTaskTurnMessageID !== '' && !TASK_TURN_MESSAGE_ID.test(currentTaskTurnMessageID)) {
       throw new Error('invalid tool call')
     }
     signal?.throwIfAborted()
@@ -743,7 +746,8 @@ export class WorkerIPC {
     this.pending.set(id, pending)
     signal?.addEventListener('abort', abort, { once: true })
     try {
-      await this.send({ type: 'tool_call', id, ...identity, through_seq: through, call_id: callID, name, arguments: args })
+      await this.send({ type: 'tool_call', id, ...identity, through_seq: through, call_id: callID, name, arguments: args,
+        ...(currentTaskTurnMessageID === '' ? {} : { current_task_turn_message_id: currentTaskTurnMessageID }) })
       if (this.pending.get(id) === pending) notifyIPCWaiting(onWaiting)
       return await result.promise
     } catch (error) {

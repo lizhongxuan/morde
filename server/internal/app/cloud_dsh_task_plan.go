@@ -45,17 +45,26 @@ type CloudDSHTaskPlanReceiptReader interface {
 	GetCloudDSHTaskPlanReceipt(context.Context, string, string, string, string) (task.Plan, error)
 }
 
-// CloudDSHTaskPlanRequirementSourceResolver resolves a plan-tool locator to
-// the canonical source identity and digest using the current Task boundary.
-// The model-provided digest is never the source of truth.
+// CloudDSHTaskPlanRequirementSourceResolver resolves a server-bound plan-tool
+// locator or verified message identity to the canonical source identity and
+// digest using the current Task boundary. The model-provided digest is never
+// the source of truth.
 type CloudDSHTaskPlanRequirementSourceResolver interface {
 	ResolveCloudDSHTaskPlanRequirementSource(context.Context, task.Task, task.PlanVerificationRequirementSource) (task.PlanVerificationRequirementSource, error)
 }
 
 func cloudDSHTaskPlanDefinition() AgentToolDefinition {
 	return AgentToolDefinition{ModelTool: ModelTool{Name: cloudDSHTaskPlanToolName,
-		Description: "When a complex task has multiple dependent steps, the main Agent should save a plan before doing the work and revise it when the approach changes. Do not call for simple questions. A plan never requests confirmation or expands permissions; cost is always marked unknown unless separately verified by the application. A submitted plan must carry a complete brief: scope and verification_method are required, and the step completion_criteria together form the acceptance criteria. A plan without them is rejected; complete the missing fields from the task context and resubmit instead of asking the user. For each step in a fix plan, set verification_applicability to check and include a bounded exact verification_check, or set it to not_applicable; do not omit this classification. The verification check includes a bounded exact command and explicit workspace-relative coverage_paths. Set basis to required only when a user message or project file explicitly requires that check. For user_message sources, use locator=current_task_input for the Task's initial accepted user input. morde_current_conversation_history_search is bounded by the Task's fixed through_sequence and can omit messages accepted after Task start. Use a later applied message_id only if the exact ID is present in this Task's authorized input or search results; the server resolves its content and SHA-256. Never infer or invent an ID or ask the user for an internal ID or hash; if the source is unavailable, leave its provenance unresolved rather than claiming it is verified. Project-file sources are accepted only when the server can resolve their immutable snapshot; if resolution fails, keep the required check explicit and do not relabel it risk_selected. Set risk_selected only for checks chosen by risk without claiming they were explicitly required. This metadata is advisory and never authorizes or executes a tool. Older plans without verification_check remain readable and mean unknown verification applicability, not that no checks are required. An optional fix_plan marks the task as a bug fix: it lists the minimal changed files, risks and alternatives, each at most 8 items of at most 512 characters. A fix_plan may carry an optional root_cause: the located root cause summary with the failing reproduction output (at most 4096 characters) and the code lines it points at (at most 8 workspace-relative path:line references); a root cause without any of the three pieces is rejected. A fix task may change files within its authorized scope before verification; H07 separately evaluates each planned check and does not treat a red test as a universal prerequisite.",
-		Parameters:  json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string","minLength":1,"maxLength":2048},"scope":{"type":"string","maxLength":2048},"verification_method":{"type":"string","maxLength":1024},"fix_plan":{"type":"object","properties":{"changed_files":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"risks":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"alternatives":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"root_cause":{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":1024},"repro_output":{"type":"string","minLength":1,"maxLength":4096},"code_lines":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":512}}},"required":["summary","repro_output","code_lines"],"additionalProperties":false}},"additionalProperties":false},"steps":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":40},"title":{"type":"string","minLength":1,"maxLength":160},"description":{"type":"string","maxLength":1024},"depends_on":{"type":"array","maxItems":8,"items":{"type":"string"}},"outputs":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"completion_criteria":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"verification_applicability":{"type":"string","enum":["check","not_applicable"]},"verification_check":{"type":"object","properties":{"kind":{"type":"string","enum":["test","build","lint","typecheck","other"]},"basis":{"type":"string","enum":["required","risk_selected"]},"command":{"type":"string","minLength":1,"maxLength":1024},"coverage_paths":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":512}},"requirement_source":{"type":"object","properties":{"kind":{"type":"string","enum":["user_message","project_file"]},"locator":{"type":"string","enum":["current_task_input"]},"message_id":{"type":"string","pattern":"^m[a-z0-9]{7}$"},"workspace_path":{"type":"string","maxLength":512},"workspace_revision":{"type":"integer","minimum":0},"content_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}},"required":["kind"],"additionalProperties":false}},"required":["kind","basis","command","coverage_paths"],"additionalProperties":false}},"required":["id","title","status"],"additionalProperties":false}}},"required":["goal","steps"],"additionalProperties":false}`)}, RequiredScope: identity.ScopeTaskRead}
+		Description: strings.TrimSpace(`Use only for complex, multi-step tasks; do not call for simple questions. Save a complete brief with scope, verification_method and acceptance criteria in step completion_criteria; fill known context instead of asking the user. Plans never request confirmation or expand permissions; cost remains unknown unless app-verified. Revise when the approach changes.
+
+For every fix-plan step set verification_applicability to check or not_applicable. A check needs an exact bounded command and explicit Workspace-relative coverage_paths. Set basis=required only for checks explicitly requested by the user or project, and include all of them; never claim full verification after omitting one. Other checks are risk_selected by task risk. H07 may stay pending until coverage completeness is independently verified; the plan alone does not prove it.
+
+For user_message, use locator=current_task_input (initial accepted Task input), locator=current_task_turn_input (direct user input attached to this call), or locator=history_search_result with the exact history_result_token from authorized morde_current_conversation_history_search results. Search uses the Task's fixed through_sequence and can omit messages accepted after Task start. Never infer or invent an ID or ask the user for an internal ID/hash. The server resolves identity and computes SHA from trusted input or the re-read message.
+
+For project_file, use path and revision from an authorized immutable Workspace read. The server verifies the snapshot and computes the digest; if resolution fails, keep the source unverified and do not relabel it risk_selected. This metadata never authorizes tool execution. Old plans without typed checks retain unknown applicability.
+
+Optional fix_plan lists up to 8 changed files, risks and alternatives; root_cause needs a summary, reproduction output and up to 8 workspace-relative code locations. Fixes may edit within authorized scope before verification. H07 evaluates checks; a failing baseline is not a universal prerequisite.`),
+		Parameters: json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string","minLength":1,"maxLength":2048},"scope":{"type":"string","maxLength":2048},"verification_method":{"type":"string","maxLength":1024},"fix_plan":{"type":"object","properties":{"changed_files":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"risks":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"alternatives":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"root_cause":{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":1024},"repro_output":{"type":"string","minLength":1,"maxLength":4096},"code_lines":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":512}}},"required":["summary","repro_output","code_lines"],"additionalProperties":false}},"additionalProperties":false},"steps":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":40},"title":{"type":"string","minLength":1,"maxLength":160},"description":{"type":"string","maxLength":1024},"depends_on":{"type":"array","maxItems":8,"items":{"type":"string"}},"outputs":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"completion_criteria":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"verification_applicability":{"type":"string","enum":["check","not_applicable"]},"verification_check":{"type":"object","properties":{"kind":{"type":"string","enum":["test","build","lint","typecheck","other"]},"basis":{"type":"string","enum":["required","risk_selected"]},"command":{"type":"string","minLength":1,"maxLength":1024},"coverage_paths":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":512}},"requirement_source":{"type":"object","properties":{"kind":{"type":"string","enum":["user_message","project_file"]},"locator":{"type":"string","enum":["current_task_input","current_task_turn_input","history_search_result"]},"history_result_token":{"type":"string","minLength":1,"maxLength":2048},"workspace_path":{"type":"string","maxLength":512},"workspace_revision":{"type":"integer","minimum":0}},"required":["kind"],"additionalProperties":false}},"required":["kind","basis","command","coverage_paths"],"additionalProperties":false}},"required":["id","title","status"],"additionalProperties":false}}},"required":["goal","steps"],"additionalProperties":false}`)}, RequiredScope: identity.ScopeTaskRead}
 }
 
 // requireCompleteTaskPlanBrief is the write gate (E01): a task that already
@@ -116,6 +125,7 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 	}
 	plan := task.Plan{TaskRevision: *current.CurrentRevision, Goal: input.Goal, Scope: input.Scope,
 		VerificationMethod: input.VerificationMethod, CostEstimateState: "unknown", Steps: input.Steps, FixPlan: input.FixPlan}
+	clearTaskTurnInputModelClaims(&plan)
 	var checkpointPlan *task.Plan
 	if recovering && checkpointOutput != nil {
 		var replay task.Plan
@@ -152,7 +162,7 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 			return AgentToolResult{}, err
 		}
 	}
-	if err := b.resolveTaskPlanRequirementSources(ctx, current, &plan, recovering); err != nil {
+	if err := b.resolveTaskPlanRequirementSources(ctx, current, &plan, recovering, call.CurrentTaskTurnMessageID); err != nil {
 		if result, handled, gateErr := b.advisoryGateResult(ctx, current, details, call, recovering, checkpointOutput,
 			"Task plan is invalid; no action was executed."); handled {
 			return result, gateErr
@@ -284,7 +294,27 @@ func preserveCheckpointProjectFileSources(input *task.Plan, checkpoint task.Plan
 	return nil
 }
 
-func (b *CloudDSHToolBroker) resolveTaskPlanRequirementSources(ctx context.Context, current task.Task, plan *task.Plan, recovering bool) error {
+func clearTaskTurnInputModelClaims(plan *task.Plan) {
+	if plan == nil {
+		return
+	}
+	for stepIndex := range plan.Steps {
+		check := plan.Steps[stepIndex].VerificationCheck
+		if check == nil || check.RequirementSource == nil ||
+			check.RequirementSource.Locator != task.PlanVerificationRequirementCurrentTaskTurnInputLocator {
+			continue
+		}
+		source := *check.RequirementSource
+		source.MessageID = ""
+		source.ContentSHA256 = ""
+		checkCopy := *check
+		checkCopy.RequirementSource = &source
+		plan.Steps[stepIndex].VerificationCheck = &checkCopy
+	}
+}
+
+func (b *CloudDSHToolBroker) resolveTaskPlanRequirementSources(ctx context.Context, current task.Task, plan *task.Plan, recovering bool,
+	currentTaskTurnMessageID string) error {
 	if plan == nil {
 		return domain.InvalidArgument("task_plan.requirement_source", "task plan is missing")
 	}
@@ -295,6 +325,36 @@ func (b *CloudDSHToolBroker) resolveTaskPlanRequirementSources(ctx context.Conte
 			continue
 		}
 		source := check.RequirementSource
+		expectedMessageID := ""
+		expectedContentSHA256 := ""
+		if source.Kind == task.PlanVerificationRequirementUserMessage &&
+			source.Locator == task.PlanVerificationRequirementCurrentTaskTurnInputLocator {
+			if !domain.ValidMessageID(currentTaskTurnMessageID) {
+				return domain.NewError(domain.CodeInvalidState, "current task-turn message identity is unavailable")
+			}
+			trustedSource := *source
+			trustedSource.Locator = ""
+			trustedSource.MessageID = currentTaskTurnMessageID
+			trustedSource.ContentSHA256 = ""
+			source = &trustedSource
+		}
+		if source.Kind == task.PlanVerificationRequirementUserMessage &&
+			source.Locator == task.PlanVerificationRequirementHistorySearchResultLocator {
+			verifiedSource, err := b.resolveCloudDSHTaskPlanHistorySource(ctx, current, source.HistoryResultToken)
+			if err != nil {
+				return err
+			}
+			if verifiedSource.Kind != task.PlanVerificationRequirementUserMessage || !domain.ValidMessageID(verifiedSource.MessageID) ||
+				verifiedSource.Locator != "" || verifiedSource.HistoryResultToken != "" {
+				return domain.NewError(domain.CodeInvalidState, "history source proof resolver returned a non-canonical source")
+			}
+			// The Store re-reads the canonical user message and computes its
+			// current digest. Compare that digest to the signed search-result
+			// digest before persisting the Store's canonical source receipt.
+			expectedMessageID = verifiedSource.MessageID
+			expectedContentSHA256 = verifiedSource.ContentSHA256
+			source = &verifiedSource
+		}
 		// A canonical project-file source in a recovered plan is already bound
 		// by its durable plan receipt. New submissions are resolved from the
 		// immutable Workspace snapshot below; model-provided hashes are ignored.
@@ -323,7 +383,9 @@ func (b *CloudDSHToolBroker) resolveTaskPlanRequirementSources(ctx context.Conte
 		if err != nil {
 			return err
 		}
-		if resolved.Kind != source.Kind || resolved.Locator != "" {
+		if resolved.Kind != source.Kind || resolved.Locator != "" || resolved.HistoryResultToken != "" ||
+			(expectedMessageID != "" && resolved.MessageID != expectedMessageID) ||
+			(expectedContentSHA256 != "" && resolved.ContentSHA256 != expectedContentSHA256) {
 			return domain.NewError(domain.CodeInvalidState, "task plan requirement source resolver returned a non-canonical source")
 		}
 		checkCopy := *check

@@ -107,28 +107,28 @@ type TaskK2Projection struct {
 }
 
 type TaskDetails struct {
-	Task                   task.Task
-	Dependencies           []Dependency
-	ChildJobs              []ChildJob
-	ResultReview           *ResultReview
-	Validation             TaskValidationSummary
-	ValidationEvidence     *TaskValidationEvidenceRecord
-	AssistantMessage       *AssistantMessageSnapshot
-	CurrentRevisionStarted *bool
-	ResultMessagePending   bool
-	ResultMessagePublished bool
-	ScheduleObservation    *schedule.ObservationSpec
-	Steps                  []task.Step
-	Agents                 []TaskAgentExecution
-	BatchItems             []task.BatchItem
-	Artifacts              []task.Artifact
-	PendingRequest         *task.PendingRequest
-	ClarificationRequests  []task.ClarificationRequest
-	StopRequest            *task.StopRequest
-	StopOperationIDs       []string
-	Plan                   *task.Plan
+	Task                     task.Task
+	Dependencies             []Dependency
+	ChildJobs                []ChildJob
+	ResultReview             *ResultReview
+	Validation               TaskValidationSummary
+	ValidationEvidence       *TaskValidationEvidenceRecord
+	AssistantMessage         *AssistantMessageSnapshot
+	CurrentRevisionStarted   *bool
+	ResultMessagePending     bool
+	ResultMessagePublished   bool
+	ScheduleObservation      *schedule.ObservationSpec
+	Steps                    []task.Step
+	Agents                   []TaskAgentExecution
+	BatchItems               []task.BatchItem
+	Artifacts                []task.Artifact
+	PendingRequest           *task.PendingRequest
+	ClarificationRequests    []task.ClarificationRequest
+	StopRequest              *task.StopRequest
+	StopOperationIDs         []string
+	Plan                     *task.Plan
 	ValidationReplayEvidence *TaskValidationReplayEvidence `json:"-"`
-	Billing                *TaskBilling
+	Billing                  *TaskBilling
 }
 
 type TaskBilling struct {
@@ -259,6 +259,24 @@ type TaskStepContentEvidence struct {
 	Truncated bool   `json:"truncated"`
 }
 
+// TaskStepSourceLocation is a server-derived source locator exposed with an
+// authorized Task step. Workspace entries may identify an immutable revision
+// or a live-directory read; the latter has no immutable manifest identity.
+// A requested_uri_only web entry records the submitted URL, not the redirect
+// target or an independently verified page version.
+type TaskStepSourceLocation struct {
+	ID             string `json:"id"`
+	Kind           string `json:"kind"`
+	URI            string `json:"uri,omitempty"`
+	WorkspaceID    string `json:"workspace_id,omitempty"`
+	Revision       *int64 `json:"revision,omitempty"`
+	Path           string `json:"path,omitempty"`
+	Line           *int   `json:"line,omitempty"`
+	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	State          string `json:"state"`
+	ContentSHA256  string `json:"content_sha256"`
+}
+
 // TaskStepExecution contains only bounded, redacted details visible to the
 // authorized Task reader. Nil fields were not recorded or do not apply.
 type TaskStepExecution struct {
@@ -289,6 +307,7 @@ type TaskStepDetailDocument struct {
 	Result               string                          `json:"result"`
 	ShellExecution       *TaskStepShellExecutionEvidence `json:"shell_execution,omitempty"`
 	ContentEvidence      *TaskStepContentEvidence        `json:"content_evidence,omitempty"`
+	SourceLocations      []TaskStepSourceLocation        `json:"source_locations,omitempty"`
 	Execution            *TaskStepExecution              `json:"execution,omitempty"`
 	ExecutionWorkspaceID string                          `json:"execution_workspace_id,omitempty"`
 }
@@ -306,6 +325,7 @@ type TaskStepDetail struct {
 	Execution       *TaskStepExecution              `json:"execution,omitempty"`
 	ShellExecution  *TaskStepShellExecutionEvidence `json:"-"`
 	ContentEvidence *TaskStepContentEvidence        `json:"content_evidence,omitempty"`
+	SourceLocations []TaskStepSourceLocation        `json:"source_locations,omitempty"`
 }
 
 type TaskStepDetailReader interface {

@@ -549,6 +549,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			if err != nil {
 				return ModelResponse{}, err
 			}
+			attachCurrentTaskTurnMessageID(&response, call.Request.CurrentTaskTurnMessageID)
 			if err := taskDelivery.ValidateTaskModelDelivery(ctx, reservation); err != nil {
 				return ModelResponse{}, err
 			}
@@ -586,6 +587,8 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		return ModelResponse{}, err
 	}
 	request := call.Request
+	currentTaskTurnMessageID := request.CurrentTaskTurnMessageID
+	request.CurrentTaskTurnMessageID = ""
 	request.Endpoint = endpoint.Endpoint
 	dispatchCtx, cancelDispatch := context.WithTimeout(ctx, ModelCallTimeout)
 	defer cancelDispatch()
@@ -660,6 +663,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	response, callErr := s.client.Complete(providerCtx, request)
 	finishProvider()
+	if call.Source == ModelCallTask {
+		attachCurrentTaskTurnMessageID(&response, currentTaskTurnMessageID)
+	}
 	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: call.CallID, Usage: response.Usage,
 		ProviderReportedModel: response.ProviderReportedModel,
 		Unknown:               callErr != nil || !response.Usage.Known, Summary: call.Summary}
@@ -857,6 +863,18 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		response.TaskValidationReview = &model
 	}
 	return response, nil
+}
+
+func attachCurrentTaskTurnMessageID(response *ModelResponse, messageID string) {
+	if response == nil {
+		return
+	}
+	if !domain.ValidMessageID(messageID) {
+		messageID = ""
+	}
+	for index := range response.ToolCalls {
+		response.ToolCalls[index].CurrentTaskTurnMessageID = messageID
+	}
 }
 
 func projectUsageReservation(request ModelRequest, reservedTokens int64) project.Usage {

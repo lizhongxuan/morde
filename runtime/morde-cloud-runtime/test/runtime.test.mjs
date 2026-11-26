@@ -5474,10 +5474,19 @@ async function captureFailedToolSession(tool, argumentsJSON, callID = 'call_retr
   return pages
 }
 
-async function captureInterruptedToolSession(tool, argumentsJSON = '{"workspace_id":"w1234567","path":"notes.txt","content":"saved"}', beforeKill) {
+async function captureInterruptedToolSession(tool, argumentsJSON = '{"workspace_id":"w1234567","path":"notes.txt","content":"saved"}', inspectInterruptedCall,
+  currentTaskTurnMessageID = '') {
   const pages = []
+  let interruptedCall
   const { child, frames } = launch((frame, proc) => {
-    if (frame.type === 'ready') send(proc, { ...start, tools: [tool] })
+    if (frame.type === 'ready') {
+      const startFrame = { ...start, tools: [tool] }
+      if (currentTaskTurnMessageID) {
+        delete startFrame.prompt
+        startFrame.initial_message = { message_id: currentTaskTurnMessageID, content: 'Follow-up source identity test.', attachment_ids: [] }
+      }
+      send(proc, startFrame)
+    }
     if (frame.type === 'checkpoint') {
       pages.push({ from_seq: frame.from_seq, through_seq: frame.through_seq, payload: frame.payload, sha256: frame.sha256 })
       send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
@@ -5486,23 +5495,25 @@ async function captureInterruptedToolSession(tool, argumentsJSON = '{"workspace_
       const chunks = [
         { type: 'tool-call-delta', index: 0, id: 'call_interrupted_1', name: tool.name, argumentsDelta: argumentsJSON },
         { type: 'usage', usage: { inputTokens: 3, outputTokens: 2 } },
-        { type: 'finish', reason: { kind: 'tool-calls' } },
+        { type: 'finish', reason: { kind: 'tool-calls' },
+          ...(currentTaskTurnMessageID ? { replayState: { response: { morde_task_turn_message_id: currentTaskTurnMessageID } } } : {}) },
       ]
       chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
       send(proc, { type: 'model_end', id: frame.id, ok: true })
     }
     if (frame.type === 'tool_call') {
-      beforeKill?.(frame)
+      interruptedCall = frame
       proc.kill('SIGKILL')
     }
   })
   const [code, signal] = await once(child, 'close')
-  assert.equal(signal, 'SIGKILL')
+  assert.equal(signal, 'SIGKILL', `child did not reach the interrupted tool call; failures: ${JSON.stringify(frames.filter(frame => frame.type === 'failed'))}`)
   assert.ok(frames.some(frame => frame.type === 'tool_call'))
   const events = pages.flatMap(page => JSON.parse(page.payload).events)
   assert.ok(events.some(event => event.type === 'tool/call' && event.data.callId === 'call_interrupted_1'))
   assert.equal(events.some(event => event.type === 'tool/result' && event.data.message?.toolCallId === 'call_interrupted_1'), false)
   assert.equal(code, null)
+  inspectInterruptedCall?.(interruptedCall)
   return pages
 }
 
@@ -5766,32 +5777,59 @@ async function captureScreenshotResultInterrupted(image, tool = screenshotTool, 
   return { pages, frames }
 }
 
-test('reconciles an interrupted tool call before resuming the dsh model', async () => {
+test('reconciles an interrupted current-message MCP read before resuming the dsh model', async () => {
+  const currentTaskTurnMessageID = 'm7654321'
+  const sourceContent = 'Follow-up source identity test.'
+  const pageContent = [...sourceContent].slice(0, 14).join('')
+  const nextRuneOffset = [...pageContent].length
+  const sourcePage = {
+    message_id: currentTaskTurnMessageID, rune_offset: 0, next_rune_offset: nextRuneOffset, content: pageContent,
+  }
   const tool = {
-    name: 'file_write', description: 'Write a file in the task workspace.',
+    name: 'morde_read_current_conversation_message', description: 'Read a verified fragment of the current long message.',
     parameters: {
-      type: 'object', properties: { workspace_id: { type: 'string' }, path: { type: 'string' }, content: { type: 'string' } },
-      required: ['workspace_id', 'path', 'content'], additionalProperties: false,
+      type: 'object', properties: { message_id: { type: 'string' }, sha256: { type: 'string' }, rune_offset: { type: 'integer' } },
+      required: ['message_id', 'sha256', 'rune_offset'], additionalProperties: false,
     },
   }
-  const pages = await captureInterruptedToolSession(tool)
+  const sourceSHA256 = createHash('sha256').update(sourceContent, 'utf8').digest('hex')
+  const pages = await captureInterruptedToolSession(tool,
+    JSON.stringify({ message_id: currentTaskTurnMessageID, sha256: sourceSHA256, rune_offset: 0 }), frame => {
+      assert.equal(frame.name, 'morde_read_current_conversation_message')
+      assert.equal(frame.current_task_turn_message_id, currentTaskTurnMessageID,
+        'live source-read IPC keeps the trusted follow-up identity')
+    }, currentTaskTurnMessageID)
+  const sourceEvent = pages.flatMap(page => JSON.parse(page.payload).events)
+    .find(event => event.type === 'assistant/message' && event.data.message.content.some(block => block.type === 'tool-call'))
+  assert.equal(sourceEvent?.data.message.source.replayState.response.morde_task_turn_message_id, currentTaskTurnMessageID)
+  const recoveryCalls = []
+  const pageOutput = JSON.stringify(sourcePage)
   const resumed = await resumeSession(pages, { tools: [tool], holdResponsesUntilWaiting: true, onToolCall: frame => {
-    assert.equal(frame.call_id, 'call_interrupted_1')
-    assert.equal(frame.name, 'file_write')
-    assert.deepEqual(frame.arguments, { workspace_id: 'w1234567', path: 'notes.txt', content: 'saved' })
-    return { status: 'succeeded', output: '{"bytes_written":5}' }
+    recoveryCalls.push(frame)
+    return { status: 'succeeded', output: pageOutput }
   } })
   assert.equal(resumed.code, 0, `frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
   assert.equal(resumed.frames.filter(frame => frame.type === 'tool_call').length, 1)
+  assert.equal(recoveryCalls.length, 1)
+  assert.equal(recoveryCalls[0].call_id, 'call_interrupted_1')
+  assert.equal(recoveryCalls[0].name, 'morde_read_current_conversation_message')
+  assert.deepEqual(recoveryCalls[0].arguments,
+    { message_id: currentTaskTurnMessageID, sha256: sourceSHA256, rune_offset: 0 })
+  assert.equal(recoveryCalls[0].current_task_turn_message_id, currentTaskTurnMessageID,
+    'recovery restores the same trusted source identity')
   const recoveryActivities = resumed.frames.filter(frame => frame.type === 'agent_activity' && frame.phase === 'tool' &&
     frame.activity_id === 'call_interrupted_1')
   assert.deepEqual(recoveryActivities.map(frame => frame.state), ['started', 'waiting', 'completed'])
   assert.equal(resumed.modelCalls, 1)
   assert.ok(resumed.frames.findIndex(frame => frame.type === 'tool_call') < resumed.frames.findIndex(frame => frame.type === 'model'))
+  const recoveredToolMessage = resumed.modelRequests[0].messages
+    .find(message => message.role === 'tool' && message.toolCallId === 'call_interrupted_1')
+  assert.equal(recoveredToolMessage?.content[0]?.text, pageOutput,
+    'the next model request receives the recovered current-message page result')
   const recoveryResults = resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)
     .filter(event => event.type === 'tool/result' && event.data.message?.toolCallId === 'call_interrupted_1')
   assert.equal(recoveryResults.length, 1)
-  assert.equal(recoveryResults[0].data.message.content[0].text, '{"bytes_written":5}')
+  assert.equal(recoveryResults[0].data.message.content[0].text, pageOutput)
   const callSeq = pages.flatMap(page => JSON.parse(page.payload).events).find(event => event.type === 'tool/call').seq
   assert.deepEqual(recoveryResults[0].sourceEventSeqs, [callSeq])
 })
@@ -5975,6 +6013,7 @@ test('a mismatched v4 target does not release a pending delegated child recovery
 })
 
 test('reconciles an interrupted MCP IPC call from the task ledger before the model resumes', async () => {
+  const currentTaskTurnMessageID = 'm7654321'
   const tool = {
     name: 'mcp__linear__create_issue', description: 'Create an issue through the task-granted connector.',
     parameters: {
@@ -5986,24 +6025,39 @@ test('reconciles an interrupted MCP IPC call from the task ledger before the mod
   const operationLedger = new Map()
   const pages = await captureInterruptedToolSession(tool, '{"title":"Keep OAuth token server-side"}', frame => {
     assert.equal(frame.name, tool.name)
+    assert.equal(frame.current_task_turn_message_id, currentTaskTurnMessageID,
+      'live MCP IPC carries the current Task turn message ID')
     remoteDispatches++
     operationLedger.set(frame.call_id, { status: 'succeeded', output: '{"issue_id":"MOR-17"}' })
-  })
+  }, currentTaskTurnMessageID)
+  const sourceEvent = pages.flatMap(page => JSON.parse(page.payload).events)
+    .find(event => event.type === 'assistant/message' && event.data.message.content.some(block => block.type === 'tool-call'))
+  assert.equal(sourceEvent?.data.message.source.replayState.response.morde_task_turn_message_id, currentTaskTurnMessageID,
+    'the checkpoint retains the replay metadata needed by the MCP wrapper')
+  const reconciledCalls = []
   const resumed = await resumeSession(pages, {
     tools: [tool],
     onToolCall: frame => {
-      assert.equal(frame.call_id, 'call_interrupted_1')
-      assert.equal(frame.name, tool.name)
-      assert.deepEqual(frame.arguments, { title: 'Keep OAuth token server-side' })
+      reconciledCalls.push(frame)
       // Model the broker resolving the dispatched call from its durable ledger.
       return operationLedger.get(frame.call_id)
     },
   })
   assert.equal(resumed.code, 0, `frames: ${resumed.frames.map(frame => frame.type).join(', ')}`)
   assert.equal(resumed.frames.filter(frame => frame.type === 'tool_call').length, 1)
+  assert.equal(reconciledCalls.length, 1)
+  assert.equal(reconciledCalls[0].call_id, 'call_interrupted_1')
+  assert.equal(reconciledCalls[0].name, tool.name)
+  assert.deepEqual(reconciledCalls[0].arguments, { title: 'Keep OAuth token server-side' })
+  assert.equal(reconciledCalls[0].current_task_turn_message_id, currentTaskTurnMessageID,
+    'Morde MCP recovery restores the same current Task turn message ID')
   assert.equal(resumed.modelCalls, 1)
   assert.equal(remoteDispatches, 1, 'recovery must not issue a second connector request')
   assert.ok(resumed.frames.findIndex(frame => frame.type === 'tool_call') < resumed.frames.findIndex(frame => frame.type === 'model'))
+  const recoveredToolMessage = resumed.modelRequests[0].messages
+    .find(message => message.role === 'tool' && message.toolCallId === 'call_interrupted_1')
+  assert.equal(recoveredToolMessage?.content[0]?.text, '{"issue_id":"MOR-17"}',
+    'the model resumes with the ledger-reconciled MCP result')
 })
 
 test('a revoked MCP grant blocks an interrupted call before IPC or model resume', async () => {

@@ -2104,8 +2104,11 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 	if !fileIntent.Valid() {
 		return domain.InvalidArgument("route_decision", "file delivery intent is invalid")
 	}
+	var workspaceOwnerID string
+	var workspaceProjectResourceVersion *int64
 	if fileIntent == task.FileDeliveryRequired {
-		if err := validateConversationRouteWorkspaceInputSnapshot(ctx, tx, claim); err != nil {
+		workspaceOwnerID, workspaceProjectResourceVersion, err = validateConversationRouteWorkspaceInputSnapshot(ctx, tx, claim)
+		if err != nil {
 			return err
 		}
 	}
@@ -2116,7 +2119,8 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 	if fileIntent == task.FileDeliveryUnclear {
 		workspaceSnapshotAvailable := false
 		if claim.Input.WorkspaceID != "" && (claim.Input.WorkspaceInputRevision != nil || len(claim.Input.WorkspaceContextDigest) != 0) {
-			if err := validateConversationRouteWorkspaceInputSnapshot(ctx, tx, claim); err != nil {
+			workspaceOwnerID, workspaceProjectResourceVersion, err = validateConversationRouteWorkspaceInputSnapshot(ctx, tx, claim)
+			if err != nil {
 				return err
 			}
 			workspaceSnapshotAvailable = true
@@ -2128,13 +2132,15 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 		initialStatus, initialEventType = task.StatusWaitingUser, "task.waiting_user"
 		initialWaitingReason, initialCurrentStep = "clarification_required", initialSteps[1].ID
 	}
-	var workspaceID, workspaceOwnerID string
+	var workspaceID string
 	var inputRevision, workspaceCheckpointRevision *int64
 	var contextDigest []byte
 	if fileIntent == task.FileDeliveryRequired || (fileIntent == task.FileDeliveryUnclear && claim.Input.WorkspaceID != "" &&
 		claim.Input.WorkspaceInputRevision != nil && len(claim.Input.WorkspaceContextDigest) == 32) {
 		workspaceID = claim.Input.WorkspaceID
-		workspaceOwnerID = claim.Message.ActorID
+		if workspaceOwnerID == "" {
+			workspaceOwnerID = claim.Message.ActorID
+		}
 		revision := *claim.Input.WorkspaceInputRevision
 		inputRevision = &revision
 		checkpointRevision := revision
@@ -2144,7 +2150,8 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 	value := task.Task{ID: taskID, OwnerID: claim.Message.OwnerID, InitiatorID: claim.Message.ActorID,
 		ProjectID: claim.Input.ProjectID, ConversationID: claim.Message.ConversationID, ModelID: modelID,
 		WorkspaceID: workspaceID, WorkspaceOwnerID: workspaceOwnerID, InputRevision: inputRevision,
-		WorkspaceCheckpointRevision: workspaceCheckpointRevision, ContextDigest: contextDigest,
+		WorkspaceProjectResourceVersion: workspaceProjectResourceVersion,
+		WorkspaceCheckpointRevision:     workspaceCheckpointRevision, ContextDigest: contextDigest,
 		Objective: objective, Status: initialStatus, WaitingReason: initialWaitingReason, CurrentStep: initialCurrentStep,
 		Authorization: claim.Authorization, Budget: claim.Input.Budget,
 		ExecutionLocation: "server", FileDeliveryIntent: fileIntent, CheckpointThroughSequence: -1}
@@ -2274,14 +2281,26 @@ FROM conversation_message_routes WHERE message_id=$1 AND owner_id=$2 AND actor_i
 		len(claim.Input.ClientAttachmentIDs) == 0 && !reclassifyingDirectReply)
 }
 
-func validateConversationRouteWorkspaceInputSnapshot(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) error {
+func validateConversationRouteWorkspaceInputSnapshot(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim) (string, *int64, error) {
 	input := claim.Input
-	if input.ProjectID != "" || claim.Message.ActorID != claim.Message.OwnerID {
-		return domain.InvalidArgument("workspace_id", "a project Workspace requires an authorized project selection")
-	}
 	if !domain.ValidWorkspaceID(input.WorkspaceID) || input.WorkspaceInputRevision == nil || *input.WorkspaceInputRevision < 0 ||
 		len(input.WorkspaceContextDigest) != 32 {
-		return domain.InvalidArgument("workspace_id", "file delivery requires a valid Workspace input revision and context digest")
+		if input.ProjectID != "" {
+			return "", nil, domain.InvalidArgument("workspace_id", "a project Workspace requires an authorized project selection")
+		}
+		return "", nil, domain.InvalidArgument("workspace_id", "file delivery requires a valid Workspace input revision and context digest")
+	}
+	workspaceOwnerID := claim.Message.ActorID
+	var projectResourceVersion *int64
+	if input.ProjectID != "" {
+		ownerID, version, err := lockProjectTaskWorkspaceAccess(ctx, tx, input.ProjectID, claim.Message.ActorID, input.WorkspaceID, false)
+		if err != nil {
+			return "", nil, err
+		}
+		workspaceOwnerID = ownerID
+		projectResourceVersion = &version
+	} else if claim.Message.ActorID != claim.Message.OwnerID {
+		return "", nil, domain.InvalidArgument("workspace_id", "a personal Workspace must belong to the message owner")
 	}
 	var ownerID, state string
 	var revision int64
@@ -2289,28 +2308,28 @@ func validateConversationRouteWorkspaceInputSnapshot(ctx context.Context, tx pgx
 	err := tx.QueryRow(ctx, `SELECT owner_id,state,revision,deleted_at IS NOT NULL FROM workspaces WHERE id=$1 FOR SHARE`,
 		input.WorkspaceID).Scan(&ownerID, &state, &revision, &deleted)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return domain.NewError(domain.CodeNotFound, "workspace not found")
+		return "", nil, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
 	if err != nil {
-		return fmt.Errorf("lock selected conversation Workspace: %w", err)
+		return "", nil, fmt.Errorf("lock selected conversation Workspace: %w", err)
 	}
-	if ownerID != claim.Message.ActorID {
-		return domain.NewError(domain.CodeNotFound, "workspace not found")
+	if ownerID != workspaceOwnerID {
+		return "", nil, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
 	if state != string(workspace.StateReady) || deleted {
-		return domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace is not ready for a file delivery Task")
+		return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace is not ready for a file delivery Task")
 	}
 	if revision != *input.WorkspaceInputRevision {
-		return domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace changed after the conversation receipt")
+		return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace changed after the conversation receipt")
 	}
 	actualDigest, err := conversationRouteWorkspaceManifestDigest(ctx, tx, input.WorkspaceID, revision)
 	if err != nil {
-		return domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace input manifest is unavailable or stale")
+		return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace input manifest is unavailable or stale")
 	}
 	if !bytes.Equal(actualDigest, input.WorkspaceContextDigest) {
-		return domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace context digest is stale")
+		return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "selected Workspace context digest is stale")
 	}
-	return nil
+	return workspaceOwnerID, projectResourceVersion, nil
 }
 
 func conversationRouteWorkspaceManifestDigest(ctx context.Context, tx pgx.Tx, workspaceID string, revision int64) ([]byte, error) {

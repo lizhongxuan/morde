@@ -562,6 +562,79 @@ final class IOS03SimulatorAcceptanceUITests: XCTestCase {
     }
 
     @MainActor
+    func testE02ReadsExistingPCConversationWithoutSending() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let username = environment["MORDE_E02_TEST_USERNAME"], !username.isEmpty,
+              let password = environment["MORDE_E02_TEST_PASSWORD"], !password.isEmpty,
+              let conversationID = environment["MORDE_E02_CONVERSATION_ID"], !conversationID.isEmpty,
+              let expectedText = environment["MORDE_E02_EXPECTED_TEXT"], !expectedText.isEmpty,
+              let configuredOrigin = environment["MORDE_E02_PORTAL_ORIGIN"],
+              var components = URLComponents(string: configuredOrigin),
+              components.scheme?.lowercased() == "https",
+              components.host?.lowercased() == "portal.120.25.178.93.sslip.io",
+              components.port == nil || components.port == 443,
+              components.user == nil, components.password == nil,
+              components.query == nil, components.fragment == nil,
+              components.path.isEmpty || components.path == "/" else {
+            throw XCTSkip("Set E-02 test credentials, the target Portal origin, conversation, and expected text.")
+        }
+        components.path = ""
+        guard let portalOrigin = components.string else {
+            throw XCTSkip("The E-02 Portal origin is invalid.")
+        }
+
+        let app = XCUIApplication(bundleIdentifier: "io.morde.app")
+        app.launchArguments = ["-morde.server", portalOrigin]
+        app.launch()
+
+        let usernameField = app.textFields["morde.auth.username"]
+        let authenticatedMenu = app.buttons["morde.nav.menu"]
+        let authenticationGate = app.descendants(matching: .any).matching(NSPredicate(
+            format: "identifier == %@ OR identifier == %@", "morde.auth.username", "morde.nav.menu"
+        )).firstMatch
+        XCTAssertTrue(authenticationGate.waitForExistence(timeout: 20),
+                      "The app should show the configured Portal sign-in screen or an authenticated session.")
+        if usernameField.exists {
+            usernameField.tap()
+            usernameField.typeText(username)
+            let passwordField = app.secureTextFields["morde.auth.password"]
+            XCTAssertTrue(passwordField.waitForExistence(timeout: 5))
+            passwordField.tap()
+            passwordField.typeText(password)
+            app.buttons["morde.auth.submit"].tap()
+        } else {
+            XCTAssertTrue(authenticatedMenu.exists,
+                          "An existing authenticated session should still expose native chat navigation.")
+        }
+
+        let composer = app.textFields["morde.chat.composer"]
+        XCTAssertTrue(composer.waitForExistence(timeout: 40),
+                      "The native client should finish sign-in and open chat.")
+        let menu = app.buttons["morde.nav.menu"]
+        XCTAssertTrue(menu.waitForExistence(timeout: 10))
+        menu.tap()
+        let conversation = app.buttons["morde.nav.drawer.conversation-\(conversationID)"]
+        XCTAssertTrue(conversation.waitForExistence(timeout: 30),
+                      "The PC conversation should be available in the same account's native conversation list.")
+        conversation.tap()
+
+        let existingMessages = app.staticTexts.matching(NSPredicate(
+            format: "identifier BEGINSWITH %@ AND label CONTAINS %@",
+            "morde.chat.message.content.", expectedText
+        ))
+        let existingMessage = existingMessages.firstMatch
+        XCTAssertTrue(existingMessage.waitForExistence(timeout: 40),
+                      "The PC message should load into the native client's conversation history.")
+        XCTAssertEqual(existingMessages.count, 1,
+                       "The same PC message should appear only once in the native history.")
+        XCTAssertTrue(existingMessage.label.contains(expectedText),
+                      "The native client should render the expected text from the persisted PC message.")
+        XCTAssertTrue(composer.exists)
+        XCTAssertEqual(composer.value as? String, composer.placeholderValue,
+                       "The read-only cross-client check must leave the composer empty.")
+    }
+
+    @MainActor
     func testC10PortalMessagePersistsAcrossAppRestart() async throws {
         guard let username = ProcessInfo.processInfo.environment["MORDE_C10_TEST_USERNAME"],
               !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,

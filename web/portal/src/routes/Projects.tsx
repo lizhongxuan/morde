@@ -70,6 +70,11 @@ function retryEligibilityReasonText(reason: string): string {
   }
 }
 
+function retryEligibilityAllowsDispatch(eligibility: { retry_eligible: boolean; retry_reason: string; retry_warning?: string } | undefined): boolean {
+  return eligibility?.retry_eligible === true && eligibility.retry_reason === 'retry_available'
+    && (!eligibility.retry_warning || eligibility.retry_warning === 'previous_personal_model_call_outcome_unknown');
+}
+
 function roleLabel(role: ProjectRole) {
   return ({ owner: '负责人', member: '成员', viewer: '只读成员' })[role];
 }
@@ -276,11 +281,12 @@ function UserProjects() {
   const selectedVariantMap = new Map(Object.entries(selectedMessageVariantVersions).map(([groupID, version]) => [groupID, version]));
   const projectVariantTimeline = buildMessageVariantTimeline(projectConversationMessages as ProjectVersionableMessage[], selectedVariantMap);
   const visibleProjectConversationMessages = projectVariantTimeline.items;
+  const canOperateProjectConversation = members.some((member) => member.user_id === user?.id && member.role !== 'viewer');
   useLayoutEffect(() => {
     currentProjectRetryIdentity.current = { actorID: user?.id, serviceInstanceID: projectTaskCapabilitiesQuery.data?.service_instance_id };
   }, [projectTaskCapabilitiesQuery.data?.service_instance_id, user?.id]);
   const projectRetryCandidateMessages = visibleProjectConversationMessages.filter((message) =>
-    isUnlinkedProjectRetryFailure(message) && Boolean(user?.id) && message.actor_id === user?.id);
+    isUnlinkedProjectRetryFailure(message) && canOperateProjectConversation && Boolean(user?.id) && message.actor_id === user?.id);
   const projectRetryEligibilityQueries = useQueries({ queries: projectRetryCandidateMessages.map((message) => {
     const actorID = user!.id;
     const serviceInstanceID = projectTaskCapabilitiesQuery.data?.service_instance_id ?? '';
@@ -483,7 +489,7 @@ function UserProjects() {
       const instanceID = projectTaskCapabilitiesQuery.data?.service_instance_id;
       const message = visibleProjectConversationMessages.find((item) => item.id === target.messageID && item.conversation_id === target.conversationID);
       if (!actorID || !instanceID || target.projectID !== projectID || !message || !isUnlinkedProjectRetryFailure(message)
-        || message.actor_id !== actorID || projectTaskMock
+        || message.actor_id !== actorID || !canOperateProjectConversation || projectTaskMock
         || !projectTaskCapabilitiesQuery.data?.supported_features.includes('conversation_auto_routing_v1')) {
         throw new Error('此消息、账号或服务状态尚未通过安全重试检查。');
       }
@@ -499,7 +505,14 @@ function UserProjects() {
         if (currentProjectRetryIdentity.current.actorID !== actorID || currentProjectRetryIdentity.current.serviceInstanceID !== instanceID) {
           throw new Error('账号或服务身份已变化；未发送重试请求。');
         }
-        if (!eligibility.retry_eligible) throw new Error(retryEligibilityReasonText(eligibility.retry_reason));
+        if (!retryEligibilityAllowsDispatch(eligibility)) {
+          const unknownWarning = eligibility.retry_eligible && eligibility.retry_reason === 'retry_available'
+            && eligibility.retry_warning;
+          if (unknownWarning) {
+            throw new Error('服务端返回尚未支持的重试警告；为避免重复操作，暂不重试。');
+          }
+          throw new Error(retryEligibilityReasonText(eligibility.retry_reason));
+        }
         if (eligibility.retry_warning && eligibility.retry_warning !== target.confirmedWarning) {
           setUnknownProjectRetryConfirmation({ messageID: target.messageID, warning: eligibility.retry_warning });
           return null;
@@ -1043,7 +1056,8 @@ function UserProjects() {
                         const retryAccepted = retryAcceptedMessageIDs.has(message.id);
                         const retryAcceptedStatus = retryAccepted && ['failed', 'pending', 'processing'].includes(message.routing_status ?? '')
                           ? '正在重新处理消息' : null;
-                        const retryCandidate = isUnlinkedProjectRetryFailure(message) && message.actor_id === user?.id;
+                        const retryCandidate = isUnlinkedProjectRetryFailure(message) && canOperateProjectConversation
+                          && message.actor_id === user?.id;
                         const retryEligibilityQuery = projectRetryEligibilityByMessageID.get(message.id);
                         const projectRetryCapabilityReady = !projectTaskMock && Boolean(projectTaskCapabilitiesQuery.data?.service_instance_id
                           && projectTaskCapabilitiesQuery.data.supported_features.includes('conversation_auto_routing_v1'));
@@ -1054,10 +1068,14 @@ function UserProjects() {
                                 : !retryEligibilityQuery.data.retry_eligible ? retryEligibilityReasonText(retryEligibilityQuery.data.retry_reason)
                                   : retryEligibilityQuery.data.retry_warning === 'previous_personal_model_call_outcome_unknown'
                                     ? '上一次个人模型调用结果仍未知；新的尝试可能产生重复调用，确认后才会继续。'
-                                    : '服务端确认这条消息当前可以重试。';
+                                    : retryEligibilityQuery.data.retry_warning
+                                      ? '服务端返回尚未支持的重试警告；为避免重复操作，暂不重试。'
+                                      : retryEligibilityQuery.data.retry_reason !== 'retry_available'
+                                        ? retryEligibilityReasonText(retryEligibilityQuery.data.retry_reason)
+                                        : '服务端确认这条消息当前可以重试。';
                         const canRetryProjectMessage = retryCandidate && projectRetryCapabilityReady && !retryAccepted
                           && retryEligibilityQuery?.isSuccess === true && !retryEligibilityQuery.isFetching
-                          && retryEligibilityQuery.data.retry_eligible;
+                          && retryEligibilityAllowsDispatch(retryEligibilityQuery.data);
                         const messageStatus = message.duplicate_of_message_id
                           ? `重复请求 · 原消息 ${message.duplicate_of_message_id}${message.related_task_id
                             ? ` · Task ${message.related_task_id} · 状态 ${task?.status ?? '待核对'}` : ''}`

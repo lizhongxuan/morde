@@ -13,6 +13,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/hub"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/store/postgres/sqlcgen"
 )
@@ -146,6 +147,7 @@ type appTaskPlanEvent struct {
 
 const (
 	planStepExecutionOperation = "operation"
+	planStepExecutionHub       = "hub_operation"
 	planStepExecutionMCP       = "mcp_connector"
 	planStepExecutionChild     = "child_session"
 	planStepExecutionReadTool  = "read_tool"
@@ -167,6 +169,7 @@ const (
 type taskPlanStepExecutionBinding struct {
 	kind                 string
 	executionID          string
+	planStepID           string
 	agentSessionID       string
 	callID               string
 	toolName             string
@@ -698,6 +701,75 @@ func admitCloudDSHTaskPlanStepOperationDispatchInTx(ctx context.Context, tx pgx.
 	return requireExistingTaskPlanStepOperationBindingInTx(ctx, tx, fence, planStepID, binding)
 }
 
+// admitCloudDSHTaskPlanStepHubOperationDispatchInTx applies the same dependency
+// fence to a server Hub command. The durable Hub row and the plan binding are
+// committed with the prepared-to-dispatched transition by the caller.
+func admitCloudDSHTaskPlanStepHubOperationDispatchInTx(ctx context.Context, tx pgx.Tx, current task.Task,
+	operation app.TaskHubOperation) error {
+	if current.CurrentRevision == nil || *current.CurrentRevision < 0 || current.DesiredRevision == nil ||
+		*current.DesiredRevision != *current.CurrentRevision {
+		return taskPlanStepBindingConflict(planStepReadinessTaskRevisionStale)
+	}
+	if current.ID != operation.TaskID || current.OwnerID != operation.OwnerID || operation.Action != hub.ActionCommand ||
+		(operation.PlanRevision == 0) != (operation.PlanStepID == "") {
+		return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
+	}
+	plan, err := latestTaskPlan(ctx, tx, current.ID, *current.CurrentRevision)
+	if err != nil {
+		return err
+	}
+	if plan == nil {
+		if operation.PlanRevision != 0 || operation.PlanStepID != "" || operation.PlanTaskRevision != 0 ||
+			operation.AgentSessionID != "" || operation.CallID != "" || len(operation.ToolCallDigest) != 0 {
+			return taskPlanStepBindingConflict(planStepReadinessPlanMissing)
+		}
+		return nil
+	}
+	if operation.PlanRevision < 1 || operation.PlanStepID == "" {
+		return taskPlanStepBindingConflict(planStepReadinessStepMissing)
+	}
+	if operation.PlanRevision != plan.Revision {
+		return taskPlanStepBindingConflict(planStepReadinessPlanRevisionStale)
+	}
+	if operation.PlanTaskRevision != *current.CurrentRevision || operation.CallID == "" ||
+		operation.Key != app.AgentOperationKey(operation.CallID) || len(operation.ToolCallDigest) != sha256.Size ||
+		operation.ToolName == "" {
+		return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
+	}
+	toolCall := app.TaskToolCallProgress{AgentSessionID: operation.AgentSessionID,
+		AuthorizationVersion: operation.TaskAuthorizationVersion, TaskRevision: operation.PlanTaskRevision,
+		CallKey: operation.CallID, ToolName: operation.ToolName,
+		RequestDigest: append([]byte(nil), operation.ToolCallDigest...)}
+	if !validPlanStepToolCall(current, operation.PlanRevision, operation.PlanStepID, toolCall) {
+		return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
+	}
+	fence, blocked, err := taskPlanStepBindingFenceInTx(ctx, tx, current, operation.PlanRevision, operation.PlanStepID,
+		toolCall.AuthorizationVersion, true)
+	if err != nil {
+		return err
+	}
+	if blocked != "" {
+		return taskPlanStepBindingConflict(blocked)
+	}
+	binding := taskPlanStepExecutionBinding{kind: planStepExecutionHub, executionID: operation.Key,
+		planStepID: operation.PlanStepID, agentSessionID: toolCall.AgentSessionID, callID: toolCall.CallKey, toolName: toolCall.ToolName,
+		requestDigest: toolCall.RequestDigest, authorizationVersion: toolCall.AuthorizationVersion}
+	if err := verifyTaskPlanStepExecutionSource(ctx, tx, fence, &binding); err != nil {
+		return err
+	}
+	if operation.Status == task.OperationPrepared {
+		ready, reason, err := taskPlanStepDependenciesReadyInTx(ctx, tx, fence, operation.PlanStepID)
+		if err != nil {
+			return err
+		}
+		if !ready {
+			return taskPlanStepBindingConflict(reason)
+		}
+		return persistTaskPlanStepExecutionBindingInTx(ctx, tx, fence, operation.PlanStepID, binding)
+	}
+	return requireExistingTaskPlanStepOperationBindingInTx(ctx, tx, fence, operation.PlanStepID, binding)
+}
+
 // admitCloudDSHInternalFileEvidenceReadDispatchInTx admits the Runtime's
 // read-only Workspace verification operation only when it names exact durable
 // successful file_write sources. If a plan exists, every source must already
@@ -1027,6 +1099,36 @@ FOR SHARE OF op,step`, binding.executionID, fence.ownerID, binding.agentSessionI
 			stepSequence <= fence.planTaskStepSequence || !validTaskPlanOperationStatus(status) || !validTaskPlanStepStatus(stepStatus) {
 			return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
 		}
+	case planStepExecutionHub:
+		var status, action, agentSessionID, callID, toolName, stepAgentSessionID, stepCallID, stepToolName, stepStatus, stepID string
+		var taskRevision, planRevision, stepTaskRevision, stepSequence int64
+		var planStepID string
+		var toolCallDigest, stepRequestDigest []byte
+		err := tx.QueryRow(ctx, `SELECT op.status,op.action,op.plan_task_revision,op.plan_revision,op.plan_step_id,
+op.agent_session_id,op.call_id,op.tool_name,op.tool_call_digest,step.id,step.task_revision,step.status,
+step.agent_session_id,step.tool_call_key,step.tool_name,step.request_digest,step.sequence
+FROM task_hub_operations op JOIN tasks task ON task.id=op.task_id AND task.owner_id=op.owner_id
+JOIN task_steps step ON step.task_id=op.task_id AND step.agent_session_id=op.agent_session_id
+ AND step.task_revision=op.plan_task_revision AND step.tool_call_key=op.call_id AND step.tool_name=op.tool_name
+WHERE op.owner_id=$1 AND op.task_id=$2 AND op.operation_key=$3
+FOR SHARE OF op,step`, fence.ownerID, fence.taskID, binding.executionID).Scan(&status, &action, &taskRevision,
+			&planRevision, &planStepID, &agentSessionID, &callID, &toolName, &toolCallDigest, &stepID,
+			&stepTaskRevision, &stepStatus, &stepAgentSessionID, &stepCallID, &stepToolName, &stepRequestDigest, &stepSequence)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
+		}
+		if err != nil {
+			return fmt.Errorf("verify task plan Hub operation identity: %w", err)
+		}
+		if binding.executionID != app.AgentOperationKey(binding.callID) || action != "command" ||
+			taskRevision != fence.taskRevision || planRevision != fence.planRevision || planStepID != binding.planStepID ||
+			agentSessionID != binding.agentSessionID || callID != binding.callID || toolName != binding.toolName ||
+			!bytes.Equal(toolCallDigest, binding.requestDigest) || stepTaskRevision != fence.taskRevision ||
+			stepAgentSessionID != binding.agentSessionID || stepCallID != binding.callID || stepToolName != binding.toolName ||
+			!bytes.Equal(stepRequestDigest, binding.requestDigest) || stepSequence <= fence.planTaskStepSequence ||
+			!domain.ValidStepID(stepID) || !validTaskPlanOperationStatus(status) || !validTaskPlanStepStatus(stepStatus) {
+			return taskPlanStepBindingConflict(planStepReadinessEvidenceMissing)
+		}
 	case planStepExecutionMCP:
 		var status, callID, toolName, connectorID, agentSessionID, stepCallID, stepToolName, stepStatus string
 		var taskRevision, stepTaskRevision, stepSequence int64
@@ -1131,7 +1233,7 @@ func sameTaskPlanStepExecutionBinding(a, b taskPlanStepExecutionBinding) bool {
 
 func loadTaskPlanStepBindings(ctx context.Context, tx pgx.Tx, fence taskPlanStepBindingFence,
 	planStepID string) ([]taskPlanStepExecutionBinding, error) {
-	rows, err := tx.Query(ctx, `SELECT execution_kind,execution_id,agent_session_id,call_id,tool_name,connector_id,
+	rows, err := tx.Query(ctx, `SELECT plan_step_id,execution_kind,execution_id,agent_session_id,call_id,tool_name,connector_id,
 child_step_id,parent_step_id,request_digest,authorization_version,result_digest,task_step_id
 FROM task_plan_step_execution_bindings WHERE owner_id=$1 AND task_id=$2 AND task_revision=$3 AND plan_revision=$4
  AND plan_step_id=$5 ORDER BY execution_kind,execution_id`, fence.ownerID, fence.taskID, fence.taskRevision,
@@ -1143,7 +1245,7 @@ FROM task_plan_step_execution_bindings WHERE owner_id=$1 AND task_id=$2 AND task
 	bindings := make([]taskPlanStepExecutionBinding, 0)
 	for rows.Next() {
 		var value taskPlanStepExecutionBinding
-		if err := rows.Scan(&value.kind, &value.executionID, &value.agentSessionID, &value.callID, &value.toolName,
+		if err := rows.Scan(&value.planStepID, &value.kind, &value.executionID, &value.agentSessionID, &value.callID, &value.toolName,
 			&value.connectorID, &value.childStepID, &value.parentStepID, &value.requestDigest,
 			&value.authorizationVersion, &value.resultDigest, &value.taskStepID); err != nil {
 			return nil, fmt.Errorf("scan task plan step execution binding: %w", err)
@@ -1183,6 +1285,36 @@ WHERE op.id=$1 AND op.task_id=$4`, binding.executionID, fence.ownerID, binding.a
 			stepToolName != binding.toolName || !bytes.Equal(requestDigest, binding.requestDigest) ||
 			!bytes.Equal(operationRequestDigest, binding.requestDigest) ||
 			stepSequence <= fence.planTaskStepSequence || !validTaskPlanOperationStatus(operationStatus) || !validTaskPlanStepStatus(stepStatus) {
+			return planStepReadinessEvidenceMissing, nil
+		}
+		return taskPlanOperationSettlementReason(operationStatus, stepStatus), nil
+	case planStepExecutionHub:
+		var operationStatus, action, planStepID, agentSessionID, callID, toolName, stepAgentSessionID, stepCallID, stepToolName, stepStatus string
+		var planTaskRevision, planRevision, stepTaskRevision, stepSequence int64
+		var toolCallDigest, stepRequestDigest []byte
+		err := tx.QueryRow(ctx, `SELECT op.status,op.action,op.plan_task_revision,op.plan_revision,op.plan_step_id,
+op.agent_session_id,op.call_id,op.tool_name,op.tool_call_digest,step.task_revision,step.agent_session_id,
+step.tool_call_key,step.tool_name,step.request_digest,step.sequence,step.status
+FROM task_hub_operations op JOIN tasks task ON task.id=op.task_id AND task.owner_id=op.owner_id
+JOIN task_steps step ON step.task_id=op.task_id AND step.agent_session_id=op.agent_session_id
+ AND step.task_revision=op.plan_task_revision AND step.tool_call_key=op.call_id AND step.tool_name=op.tool_name
+WHERE op.owner_id=$1 AND op.task_id=$2 AND op.operation_key=$3`, fence.ownerID, fence.taskID,
+			binding.executionID).Scan(&operationStatus, &action, &planTaskRevision, &planRevision, &planStepID,
+			&agentSessionID, &callID, &toolName, &toolCallDigest, &stepTaskRevision, &stepAgentSessionID,
+			&stepCallID, &stepToolName, &stepRequestDigest, &stepSequence, &stepStatus)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return planStepReadinessEvidenceMissing, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("read task plan Hub operation settlement: %w", err)
+		}
+		if binding.executionID != app.AgentOperationKey(binding.callID) || action != "command" ||
+			planTaskRevision != fence.taskRevision || planRevision != fence.planRevision || planStepID != binding.planStepID ||
+			agentSessionID != binding.agentSessionID || callID != binding.callID || toolName != binding.toolName ||
+			!bytes.Equal(toolCallDigest, binding.requestDigest) ||
+			stepAgentSessionID != binding.agentSessionID || stepCallID != binding.callID || stepToolName != binding.toolName ||
+			!bytes.Equal(stepRequestDigest, binding.requestDigest) || stepSequence <= fence.planTaskStepSequence ||
+			!validTaskPlanOperationStatus(operationStatus) || !validTaskPlanStepStatus(stepStatus) {
 			return planStepReadinessEvidenceMissing, nil
 		}
 		return taskPlanOperationSettlementReason(operationStatus, stepStatus), nil

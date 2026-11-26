@@ -258,6 +258,47 @@ describe('Workspaces', () => {
     expect(uploadProject).not.toHaveBeenCalled();
   });
 
+  it('explains a failed default computer recovery and blocks project sync without a blind retry', async () => {
+    const failedHost = { ...defaultProjectHost, state: 'stopped' as const, state_reason: 'restore_failed' };
+    const blockedTarget = { ...projectTarget, hostState: 'stopped' as const,
+      blockedMessage: '默认云端电脑未运行，当前已暂停项目同步。启动后可重试；不会切换到其他电脑。' };
+    const selectProjectDirectory = vi.fn();
+    const uploadProject = vi.fn();
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([blockedTarget]), selectProjectDirectory, uploadProject });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost(failedHost);
+    renderWorkspaces();
+
+    expect(await screen.findByText(/默认云端电脑上次恢复失败，文件同步已暂停/)).toBeInTheDocument();
+    expect(screen.getByText(/确认修复后再恢复；不会自动重试或切换到其他电脑/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '云端电脑页面' })).toHaveAttribute('href', '/hosts');
+    expect(screen.queryByText(/启动后可重试/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '开始同步' })).not.toBeInTheDocument();
+    expect(selectProjectDirectory).not.toHaveBeenCalled();
+    expect(uploadProject).not.toHaveBeenCalled();
+  });
+
+  it('asks to reconcile an unknown default computer recovery before project sync', async () => {
+    const unknownHost = { ...defaultProjectHost, state: 'stopped' as const, state_reason: 'restore_unknown' };
+    const blockedTarget = { ...projectTarget, hostState: 'stopped' as const,
+      blockedMessage: '默认云端电脑未运行，当前已暂停项目同步。启动后可重试；不会切换到其他电脑。' };
+    const selectProjectDirectory = vi.fn();
+    const uploadProject = vi.fn();
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([blockedTarget]), selectProjectDirectory, uploadProject });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost(unknownHost);
+    renderWorkspaces();
+
+    expect(await screen.findByText(/默认云端电脑恢复结果待核对，文件同步已暂停/)).toBeInTheDocument();
+    expect(screen.getByText(/确认前不要重试；不会自动切换到其他电脑/)).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: '云端电脑页面' })).toHaveAttribute('href', '/hosts');
+    expect(screen.queryByText(/启动后可重试/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: '选择本机目录' })).not.toBeInTheDocument();
+    expect(selectProjectDirectory).not.toHaveBeenCalled();
+    expect(uploadProject).not.toHaveBeenCalled();
+  });
+
   it('does not create a selection or start upload when the local directory picker is cancelled', async () => {
     const selectProjectDirectory = vi.fn().mockResolvedValue(null);
     const uploadProject = vi.fn();

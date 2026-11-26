@@ -322,6 +322,12 @@ describe('Projects API integration', () => {
     const ownMessage = (await screen.findByText(own.content)).closest<HTMLElement>('article')!;
     const otherMessage = (await screen.findByText(other.content)).closest<HTMLElement>('article')!;
     expect(within(otherMessage).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+    expect(projectApi.projectConversationMessageRetryEligibility).toHaveBeenCalledWith(
+      project.id, projectConversation.id, own.id, readyCapabilities.service_instance_id, owner.user_id,
+    );
+    expect(projectApi.projectConversationMessageRetryEligibility).not.toHaveBeenCalledWith(
+      project.id, projectConversation.id, other.id, readyCapabilities.service_instance_id, owner.user_id,
+    );
     await user.click(within(ownMessage).getByRole('button', { name: '重新处理这条消息' }));
     await screen.findByText('连接中断');
     await user.click(within(ownMessage).getByRole('button', { name: '重新处理这条消息' }));
@@ -336,11 +342,112 @@ describe('Projects API integration', () => {
   it('explains an oversized project message without offering an ineffective retry', async () => {
     vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([{ ...projectHistoryMessage, task_id: undefined,
       routing_status: 'failed', routing_failure_reason: 'message_too_long', delivery_status: 'pending' }]);
+    vi.mocked(projectApi.projectConversationMessageRetryEligibility).mockResolvedValue({ retry_eligible: false, retry_reason: 'message_too_long' });
     renderProjects();
     await openProject();
     const explanation = await screen.findByText(/消息及上下文超过当前模型输入上限/);
     expect(explanation).toHaveTextContent('原文已保留；请缩短后重新发送');
     expect(within(explanation.closest<HTMLElement>('article')!).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+  });
+
+  it('fails closed on project eligibility errors, unsupported reasons, and unknown warnings', async () => {
+    const own = { ...projectHistoryMessage, task_id: undefined, routing_status: 'failed' as const, delivery_status: 'pending' as const };
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([own]);
+    vi.mocked(projectApi.projectConversationMessageRetryEligibility).mockRejectedValue(new Error('eligibility unavailable'));
+    renderProjects();
+    await openProject();
+    const ownMessage = (await screen.findByText(own.content)).closest<HTMLElement>('article')!;
+    expect(await within(ownMessage).findByText('暂时无法确认重试资格；原消息已保留，请稍后重新核对。')).toBeInTheDocument();
+    expect(within(ownMessage).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+
+    cleanup();
+    vi.clearAllMocks();
+    vi.spyOn(projectApi, 'projectConversationMessages').mockResolvedValue([own]);
+    vi.spyOn(projectApi, 'projectConversationMessageRetryEligibility').mockResolvedValue({ retry_eligible: true, retry_reason: 'future_reason' } as unknown as Awaited<ReturnType<typeof projectApi.projectConversationMessageRetryEligibility>>);
+    renderProjects();
+    await openProject();
+    const unsupportedMessage = (await screen.findByText(own.content)).closest<HTMLElement>('article')!;
+    expect(await within(unsupportedMessage).findByText('服务端暂时无法确认这条消息是否可以重试；原消息仍已保留。')).toBeInTheDocument();
+    expect(within(unsupportedMessage).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+  });
+
+  it('keeps the project retry unavailable while eligibility is loading', async () => {
+    const own = { ...projectHistoryMessage, task_id: undefined, routing_status: 'failed' as const, delivery_status: 'pending' as const };
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([own]);
+    type RetryEligibility = Awaited<ReturnType<typeof projectApi.projectConversationMessageRetryEligibility>>;
+    let resolveEligibility: ((value: RetryEligibility) => void) | undefined;
+    vi.mocked(projectApi.projectConversationMessageRetryEligibility).mockImplementationOnce(() => new Promise((resolve) => { resolveEligibility = resolve; }));
+    renderProjects();
+    await openProject();
+
+    const ownMessage = (await screen.findByText(own.content)).closest<HTMLElement>('article')!;
+    expect(await within(ownMessage).findByText('正在核对服务端重试条件；核对完成前不会发送重试。')).toBeInTheDocument();
+    expect(within(ownMessage).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+    act(() => resolveEligibility?.({ retry_eligible: true, retry_reason: 'retry_available' }));
+    expect(await within(ownMessage).findByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
+  });
+
+  it('requires confirmation for a project retry with an unknown personal model-call outcome', async () => {
+    const own = { ...projectHistoryMessage, task_id: undefined, routing_status: 'failed' as const, delivery_status: 'pending' as const };
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([own]);
+    vi.mocked(projectApi.projectConversationMessageRetryEligibility).mockResolvedValue({ retry_eligible: true, retry_reason: 'retry_available',
+      retry_warning: 'previous_personal_model_call_outcome_unknown' });
+    const retry = vi.spyOn(projectApi, 'retryProjectConversationMessageProcessing').mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    renderProjects();
+    await openProject();
+
+    const ownMessage = (await screen.findByText(own.content)).closest<HTMLElement>('article')!;
+    await user.click(await within(ownMessage).findByRole('button', { name: '重新处理这条消息' }));
+    expect(retry).not.toHaveBeenCalled();
+    const dialog = await screen.findByRole('dialog', { name: '上一次模型调用结果未知' });
+    expect(dialog).toHaveTextContent('可能产生重复调用');
+    await user.click(within(dialog).getByRole('button', { name: '确认后重试' }));
+
+    await waitFor(() => expect(retry).toHaveBeenCalledOnce());
+    expect(projectApi.projectConversationMessageRetryEligibility).toHaveBeenCalledWith(
+      project.id, projectConversation.id, own.id, readyCapabilities.service_instance_id, owner.user_id,
+    );
+    expect(vi.mocked(projectApi.projectConversationMessageRetryEligibility).mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(retry).toHaveBeenCalledWith(project.id, projectConversation.id, own.id, expect.any(String),
+      readyCapabilities.service_instance_id, owner.user_id);
+  });
+
+  it('blocks a project retry if the fresh eligibility check introduces an unknown warning', async () => {
+    const own = { ...projectHistoryMessage, task_id: undefined, routing_status: 'failed' as const, delivery_status: 'pending' as const };
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([own]);
+    const eligibility = vi.mocked(projectApi.projectConversationMessageRetryEligibility);
+    eligibility.mockResolvedValueOnce({ retry_eligible: true, retry_reason: 'retry_available' });
+    eligibility.mockResolvedValueOnce({ retry_eligible: true, retry_reason: 'retry_available', retry_warning: 'future_warning' } as unknown as Awaited<ReturnType<typeof projectApi.projectConversationMessageRetryEligibility>>);
+    const retry = vi.spyOn(projectApi, 'retryProjectConversationMessageProcessing');
+    const user = userEvent.setup();
+    renderProjects();
+    await openProject();
+
+    const ownMessage = (await screen.findByText(own.content)).closest<HTMLElement>('article')!;
+    await user.click(await within(ownMessage).findByRole('button', { name: '重新处理这条消息' }));
+    expect(await screen.findByText('服务端返回尚未支持的重试警告；为避免重复操作，暂不重试。')).toBeInTheDocument();
+    expect(retry).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog', { name: '上一次模型调用结果未知' })).not.toBeInTheDocument();
+  });
+
+  it('does not query project retry eligibility for duplicate messages or a read-only actor', async () => {
+    const duplicate = { ...projectHistoryMessage, task_id: undefined, duplicate_of_message_id: 'mprior01',
+      routing_status: 'failed' as const, delivery_status: 'pending' as const };
+    vi.mocked(projectApi.projectConversationMessages).mockResolvedValue([duplicate]);
+    renderProjects();
+    await openProject();
+    await screen.findByText(duplicate.content);
+    expect(projectApi.projectConversationMessageRetryEligibility).not.toHaveBeenCalled();
+
+    cleanup();
+    vi.clearAllMocks();
+    vi.spyOn(projectApi, 'projectConversationMessages').mockResolvedValue([{ ...duplicate, duplicate_of_message_id: undefined }]);
+    vi.spyOn(projectApi, 'members').mockResolvedValue([{ ...owner, role: 'viewer' }, teammate]);
+    renderProjects();
+    await openProject();
+    await screen.findByText(duplicate.content);
+    expect(projectApi.projectConversationMessageRetryEligibility).not.toHaveBeenCalled();
   });
 
   it('uses the capability-gated work-item query and idempotent claim endpoint', async () => {

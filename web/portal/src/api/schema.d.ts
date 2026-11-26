@@ -5274,8 +5274,8 @@ export interface paths {
         get?: never;
         put?: never;
         /**
-         * Safely recover an uncertain Host restore
-         * @description Rechecks remote sandbox state. Existing sandboxes are adopted; a new create is queued only after an administrator confirms the external issue is fixed and no matching sandbox exists.
+         * Safely recover a failed or uncertain Host restore
+         * @description Rechecks remote sandbox state for the expected runtime generation. A single matching running or pending sandbox is adopted. For a failed Host with reason lost, replacement requires a complete successful sandbox listing with no active candidate and the saved sandbox confirmed not found or terminated; a failed or ambiguous candidate in this state requires manual review. For other recoverable failure reasons, a failed sandbox may be replaced after explicit confirmation. Recovery keeps the same Host and Workspace/Profile volumes and advances the runtime generation when creating a replacement.
          */
         post: operations["recoverAdminHost"];
         delete?: never;
@@ -9711,6 +9711,36 @@ export interface components {
             truncated: boolean;
             execution?: components["schemas"]["TaskStepExecution"];
             content_evidence?: components["schemas"]["TaskStepContentEvidence"];
+            /** @description Server-derived source locations from successful tool reads. Workspace paths are returned only to readers authorized for the Task Workspace. These locations are not yet a claim-to-source correctness verdict. */
+            source_locations?: components["schemas"]["TaskStepSourceLocation"][];
+        };
+        TaskStepSourceLocation: {
+            /** @description Stable server-derived identity bound to Task owner, Task, step, revision, tool call, and this source locator. */
+            id: string;
+            /** @enum {string} */
+            kind: "public_web_page" | "workspace_file" | "workspace_search_match";
+            /**
+             * Format: uri
+             * @description Canonical HTTPS request URI with query and fragment removed; present only for public_web_page.
+             */
+            uri?: string;
+            /** @description Bound Task Workspace ID; present only for Workspace locators. */
+            workspace_id?: string;
+            /**
+             * Format: int64
+             * @description Workspace revision requested by the successful read. For live_directory state this is the Task checkpoint revision, not an immutable content version.
+             */
+            revision?: number;
+            /** @description Normalized */
+            path?: string;
+            /** @description One-based line number for a Workspace search match. */
+            line?: number;
+            /** @description Immutable Workspace manifest digest; absent for live-directory reads. */
+            manifest_sha256?: string;
+            /** @enum {string} */
+            state: "requested_uri_only" | "immutable_workspace_revision" | "live_workspace_directory";
+            /** @description Captured web output digest or verified Workspace file-content digest associated with this locator. */
+            content_sha256: string;
         };
         /** @description Bounded, persisted excerpt from a successful built-in web search/read result, returned only after Task access and evidence identity checks. Treat preview text as untrusted web content; it is not a structured citation list. SHA-256 covers the full captured text before preview truncation. */
         TaskStepContentEvidence: {
@@ -10285,7 +10315,7 @@ export interface components {
         AdminHostRecoveryRequest: {
             /** Format: int64 */
             runtime_generation: number;
-            /** @description Confirm that the external issue is fixed before creating a replacement sandbox. */
+            /** @description Confirm an administrator reviewed the remote state and the external issue is fixed before creating a replacement sandbox; adoption does not create or replace a sandbox. */
             confirm_retry: boolean;
         };
         AdminHostRecoveryResult: {

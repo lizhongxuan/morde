@@ -2213,3 +2213,46 @@ Tokenizer 与 token 统计来源：
 ### A-01 T57 / q06 latest read-only snapshot correction (2026-11-25 12:31 UTC)
 
 旧 Task `qfbwyq4f` 已取消，模型副作用与 Task/Host 操作计数为 0。另一个 Task `q06u34qw` 仍为 `waiting_user / dsh_recovery_unresolved`；最新账本有 1 条 settled `deepseek-flash` 调用，但没有持久化响应、流式派发或工具操作。较早“q06 执行期模型调用为 0”的记录属于先前快照，不能代表 12:31 状态。PC 未显示已应用助手消息内容；未重发、恢复或改任务状态。该计数不证明模型分析结果已交付，具体失败原因仍未知。
+
+### A-01 T57 Task lease 与 CloudDSH recovery 源码审计（2026-11-25）
+
+生产 TaskWorker 配置 lease 30 秒、poll 500 毫秒，续租间隔为 lease/3（10 秒）。Store 续租只改 lease 与 `updated_at`，不会递增 `event_seq`；过期 Task 重新认领时 lease version/event_seq 递增并写 `task.status`。当前 CloudDSH 恢复态将 `errCloudDSHConnectionInterrupted` 排除于 `PauseRecovery`；若该错误使 `ExecuteTask` 返回，Task 仍为 `running`，lease 到期后可再次认领，产生与约 30 秒事件/generation 节奏相符的模式。若执行器 goroutine 未返回，则 TaskWorker 仍会续租；`runAgentRequest` 在 Runtime frame 出错时会等待工具 goroutine 结果，但 T57 没有工具调用账本，不能据此归因。Guardian Runtime stop 会清空 `failure_reason`，所以 stopped/空原因也不能反推先前未发生错误。该只读源码路径审计不能识别 qfbwyq4f 的历史子错误；没有改代码、运行测试、操作 PC 或远端。D 需在 CloudDSH recovery 边界评估有界重试与安全 pause，A 不改 Store 通用 lease-reclaim 语义。完整行号与 TODO 状态见五会话并发实施/A-01 基线记录。
+
+### A-01 Mermaid 与 H07 文档状态复核（2026-11-25）
+
+- `ChatMarkdownContent.tsx` 当前已把 Mermaid 代码块交给 `ChatMermaid`；E-01 的实际 `morde-pc` 合成消息记录了图形与源码展开。最终流程设计和 AI 对话目标体验文档均保留该本地呈现事实，同时把真实 GitHub 版本/位置核对、真实 DSH 源码分析及 T57 交付列为待验；AI 体验文档也区分 R21 本地 receipt-backed 长文实现与真实 DSH/模型语义待验。并发总览中的文档同步待办据此完成。
+- 修正 06-验证 TODO 的过期表述：Runtime export、shell receipt v2 与 final proof 的摘要域已统一为 `morde-task-workspace-snapshot-v1`，组件级 App/Worker/Runtime/定向 PostgreSQL 回归通过；真实 DSH Host→Portal proof、实际 coverage 与完整要求集合仍未验证，H07 继续 pending。
+- 本轮仅同步本地文档；核对 Mermaid 相关当前表述与代码后，`rg -n -i "Runtime export 与 shell receipt 摘要域不兼容|没有 Mermaid 渲染" docs/muse_docs/muse_steps` 无命中，`git diff --check` 通过。没有运行代码测试或操作 PC/远端；上述历史 PC/组件回归不代表本轮产生了新的端到端证据。
+
+### A-01 远端操作范围纠正（2026-11-25）
+
+- 当前执行要求是仅在本地修改、不外发或上传文件；用户先前授权的远端范围是源码 `make pc` 连接指定测试站验收和只读查日志。E-02 的最新执行报告确认，在收到本范围纠正前，已通过 SCP 将一个 Host 恢复测试补丁暂存至测试主机 `/tmp`。这是文件传输，不是部署或验收；E 报告未替换 Portal 二进制、未重启服务或恢复 Host。另据 E 后续报告，E 按用户先前明确指示更新了管理员口令哈希一行，但 PC 登录仍失败；因此不再声称并发任务期间没有远端数据库变更。
+- A 已要求停止所有后续远端命令、传输、部署、恢复、清理及远端核查。E 补录：已完成 SCP 返回码为 0，报告传输 74,941,304 字节；远端文件 SHA-256 未核实。文件仍留在远端 `/tmp`，主线程不再连接、校验或清理该文件，也不声称其完整性。
+- A 本轮没有部署主站或应用 schema 迁移；E 上述口令哈希写入属于单独的账号处理，并未修复 schema drift。A01-3/4/6 的 H07 真实 DSH/PC 结果、审批 POST 和完整要求清单仍未验收。此纠正不把本地组件回归或候选健康检查视为通过。
+
+### A-01 R25 授权历史搜索结果来源绑定（2026-11-25）
+
+- **实现：**history search 仅给已授权、处于当前 Task 历史水位内的用户消息结果签发 `history_result_token`；assistant 结果没有该 token，签名密钥不可用时不产生 token。HMAC payload 绑定 service instance、Task/owner/initiator/project/conversation/session、Task revision、authorization version、conversation scope/digest/watermark、消息 ID/sequence 和正文 SHA，并使用专属 MAC domain。checkpoint replay 会重验 token 与当前 Task 上下文。Task Plan 新提交只接受 token locator；模型直接提交历史 raw `message_id` 或任意 hash 会被拒绝。App 验证 token 后将 canonical message ID 与签名摘要交给 Store；Store 重新读取已 applied 用户消息并重算摘要，App 比较重算值后持久化 canonical ID/SHA，临时 token 不进入持久计划。
+- **定向回归：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestCloudDSHCurrentHistorySearchReturnsStableSourceProofsForUserMatches|TestCloudDSHTaskPlanHistorySourceProof.*|TestTaskPlanHistorySearchResultRequiresSignedTokenAndStoreRehash|TestTaskPlanSubmissionRejectsRawHistoricalMessageID|TestTaskPlanCurrentTaskTurnInput.*)$' -count=1 -timeout=8m` 通过（0.764 秒）；覆盖用户/assistant 结果差异、签名与上下文绑定、篡改拒绝、历史水位、无签名密钥、checkpoint replay、Store 内容重读/摘要不匹配、拒绝 raw ID 及当前轮来源 metadata。
+- **包级回归：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -count=1 -timeout=8m` 通过（28.956 秒，包含专属 MAC domain），`go test ./internal/domain/task -count=1 -timeout=8m` 通过（0.365 秒）。此前 B 的 App 计划/路由与 Domain Plan 定向组、Worker `ConversationRoute` 组也通过，记录在 B-01 TODO。
+- **状态边界：**这些测试证明本地 token/source contract 和持久化前 Store rehash 路径，不证明生产 DSH/PC 真实模型能正确保留与提交 token。H07 的完整要求清单、实际 coverage、真实 DSH/PC 语义链路仍未验证；A01-3/A01-6 继续未完成。仅修改本地代码和文档，没有连接、部署或修改远端。
+
+### A-01 项目 Workspace route 文件交付快照（2026-11-25）
+
+- **实现：**Store `ApplyConversationRoute` 在 route `new/required` 与带已选 Workspace 快照的 `new/unclear` 中，于同一事务复核项目成员、active Workspace resource/version、共享 Host grant、Workspace owner/ready 状态、输入 revision 和 manifest digest。Task 插入路径重验 resource 并持久化 project resource version 与 Task grant fence。缺少 Workspace 选择仍 fail-closed，旧 Task 的 revision 更新流程保持原栅栏。
+- **隔离 PostgreSQL：**使用本地 loopback PostgreSQL 16.15 临时库（端口 55497，容器在测试后停止），运行 `cd server && CH_TEST_DATABASE_URL=<loopback temporary PostgreSQL DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^(TestConversationRouteProjectRequiredBindsAuthorizedWorkspaceInputSnapshot|TestConversationRouteProjectUnclearRetainsAuthorizedWorkspaceInputSnapshot|TestConversationRouteProjectWorkspaceFileDeliveryFailsClosed|TestConversationRouteNewTaskUsesStructuredFileDeliveryIntent|TestConversationRouteNewUnclearBindsWorkspaceForRequiredClarification)$' -count=1 -timeout=10m -v` 通过（14.840 秒，5 个顶层测试；包含 project valid/stale digest 两个子项、`unclear` snapshot retain、无 Workspace 选择拒绝和个人 route 回归）。
+- **状态边界：**本地 Store/数据库事务合同已验证；项目 Workspace 选择入口在真实 PC/DSH 与端到端文件交付仍待验。该回归不证明云端 Host 可用，也不改变 A01-3/4/6 的端到端未完成状态。测试仅用本机隔离临时数据库，未连接或写入远端。
+
+### A-01 当前共享快照定向复验（2026-11-25）
+
+- Hub plan-step dispatch：App 定向组（Hub metadata、selector persistence、Task fence）通过（1.404 秒），App 全包通过（29.910 秒）；PostgreSQL 16.15 隔离实例 `127.0.0.1:55463` 上 `TestPostgresTaskPlanStepHubCommandDispatchBindsAtomicallyAndChecksDependencies` 通过（2.730 秒），Store 包 compile-only 检查通过（0.901 秒）。临时容器已停止。
+- Task detail schema drift：PostgreSQL 16.15 隔离实例 `127.0.0.1:55464` 上 `TestPendingRequestCostMigrationRepairsAppliedVersionSchemaDrift` 通过（3.174 秒），覆盖 Goose 00248 后物理列缺失、00249 修复、PendingRequest Store 写读及 `GET /api/tasks/:id` / `GET /api/me/task-approvals` HTTP 序列化。临时容器已停止。
+- 历史费用保留加强：将迁移前种入 `current_cost_micros=54321` 的历史审批记录，迁移后确认该值保留且新 `this_cost_micros` 仍为 NULL；同一测试继续覆盖新请求的 Store 与 HTTP GET 往返。隔离 PostgreSQL 16.15 `127.0.0.1:55465` 上重跑通过（2.771 秒）；容器已停止。首次运行因历史 fixture Task 抢先被 Claim 的测试准备顺序失败，修正为预先 claim 并拆分 owner 后通过。
+- `gofmt -d server/internal/store/postgres/pending_request_cost_migration_integration_test.go` 与 `git diff --check` 均无输出。此轮 A 本地复验没有运行实际 PC/真实 DSH，也没有连接或修改远端；PC 审批 POST、部署迁移和真实 DSH dispatch 仍待验。
+
+### A-01 共享工作树最终本地复验（2026-11-25）
+
+- `cd server && GOPROXY=off GOSUMDB=off make test` 全服务端单测通过；App 包 29.142 秒。该命令未设置 `CH_TEST_DATABASE_URL`，因此 PostgreSQL 集成用例未由此命令执行；成本迁移历史值保留和 Hub 原子 dispatch 的隔离 PostgreSQL 回归见本记录上方 A-01 条目。
+- `cd server && make generate` 通过，`sqlcgen` 无额外差异。`go vet ./internal/app ./internal/api`、`go test ./internal/store/postgres -run '^$' -count=1`、根目录 `git diff --check` 和已改 Go 文件 `gofmt -d` 通过；`golangci-lint --new-from-rev=HEAD` 为 0 issues。
+- 全仓 `cd server && make lint` 报告 46 项共享工作树 lint 问题，包含 errcheck、errorlint、格式、ineffassign、staticcheck 和 unused；不全部归因于 A-01。修复本轮 A-owned Hub 测试裸 error 断言及 R26 detail De Morgan 告警后，改动行 lint 为 0；全仓 lint 仍失败。
+- H07 `RequirementSetVerified` 仍无可信生产写入者，义务字段、完整映射和用户确认需 A/B/D/E 对齐。PC 审批 POST、真实 DSH/Host 检查和 R26 结论来源展示仍未验收，A01-3/4/6 保持未完成。A 本轮只改本地文件，没有部署、上传或修改远端环境；E 先前报告的 `/tmp` 暂存与单行口令哈希更新按上方远端范围说明保留；E 最近的只读审计另报告登录 401 且无 `auth.login_failed` 事件，无法区分密码校验与客户端安装重放拒绝，当前登录状态未确认。

@@ -3165,7 +3165,8 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				toolCallID = cloudDSHNamespacedToolCallID(value.ID, state.identity.SessionID, frame.CallID)
 			}
 			call := app.ModelToolCall{CallID: toolCallID, Name: frame.Name, Arguments: string(arguments),
-				TaskFence: cloudDSHModelFencePointer(fence, state.identity.SessionID, state.through)}
+				CurrentTaskTurnMessageID: frame.CurrentTaskTurnMessageID,
+				TaskFence:                cloudDSHModelFencePointer(fence, state.identity.SessionID, state.through)}
 			var result app.AgentToolResult
 			recoveredPersonalResult := false
 			if recoveryCall {

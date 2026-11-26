@@ -943,30 +943,31 @@ type cloudDSHIdentity struct {
 type cloudDSHFrame struct {
 	Type string `json:"type"`
 	cloudDSHIdentity
-	Version             int             `json:"version,omitempty"`
-	Engine              string          `json:"engine,omitempty"`
-	EngineVer           string          `json:"engine_version,omitempty"`
-	ID                  string          `json:"id,omitempty"`
-	From                *int64          `json:"from_seq,omitempty"`
-	Through             *int64          `json:"through_seq,omitempty"`
-	ObservationSequence *int64          `json:"observation_sequence,omitempty"`
-	TaskRevision        *int64          `json:"task_revision,omitempty"`
-	Payload             string          `json:"payload,omitempty"`
-	SHA256              string          `json:"sha256,omitempty"`
-	Request             json.RawMessage `json:"request,omitempty"`
-	CallID              string          `json:"call_id,omitempty"`
-	RequestKind         string          `json:"request_kind,omitempty"`
-	RequestDigest       string          `json:"request_digest,omitempty"`
-	Name                string          `json:"name,omitempty"`
-	Arguments           json.RawMessage `json:"arguments,omitempty"`
-	State               string          `json:"state,omitempty"`
-	Status              string          `json:"status,omitempty"`
-	Phase               string          `json:"phase,omitempty"`
-	ActivityID          string          `json:"activity_id,omitempty"`
-	Code                string          `json:"code,omitempty"`
-	Reason              string          `json:"reason,omitempty"`
-	Summary             string          `json:"summary,omitempty"`
-	JobID               string          `json:"job_id,omitempty"`
+	Version                  int             `json:"version,omitempty"`
+	Engine                   string          `json:"engine,omitempty"`
+	EngineVer                string          `json:"engine_version,omitempty"`
+	ID                       string          `json:"id,omitempty"`
+	From                     *int64          `json:"from_seq,omitempty"`
+	Through                  *int64          `json:"through_seq,omitempty"`
+	ObservationSequence      *int64          `json:"observation_sequence,omitempty"`
+	TaskRevision             *int64          `json:"task_revision,omitempty"`
+	Payload                  string          `json:"payload,omitempty"`
+	SHA256                   string          `json:"sha256,omitempty"`
+	Request                  json.RawMessage `json:"request,omitempty"`
+	CallID                   string          `json:"call_id,omitempty"`
+	CurrentTaskTurnMessageID string          `json:"current_task_turn_message_id,omitempty"`
+	RequestKind              string          `json:"request_kind,omitempty"`
+	RequestDigest            string          `json:"request_digest,omitempty"`
+	Name                     string          `json:"name,omitempty"`
+	Arguments                json.RawMessage `json:"arguments,omitempty"`
+	State                    string          `json:"state,omitempty"`
+	Status                   string          `json:"status,omitempty"`
+	Phase                    string          `json:"phase,omitempty"`
+	ActivityID               string          `json:"activity_id,omitempty"`
+	Code                     string          `json:"code,omitempty"`
+	Reason                   string          `json:"reason,omitempty"`
+	Summary                  string          `json:"summary,omitempty"`
+	JobID                    string          `json:"job_id,omitempty"`
 }
 
 type cloudDSHRead struct {
@@ -1019,7 +1020,8 @@ func readCloudDSHFrames(ctx context.Context, source io.Reader, out chan<- cloudD
 // the required keys for a frame type. The task runtime reports a failure
 // reason on "failed" frames; older runtimes omit it.
 var cloudDSHFrameOptionalFields = map[string][]string{
-	"failed": {"reason"},
+	"failed":    {"reason"},
+	"tool_call": {"current_task_turn_message_id"},
 }
 
 func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
@@ -1090,6 +1092,12 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 	for _, name := range required {
 		if _, ok := keys[name]; !ok {
 			return cloudDSHFrame{}, errors.New("missing dsh frame field")
+		}
+	}
+	if frame.Type == "tool_call" {
+		if _, exists := keys["current_task_turn_message_id"]; exists &&
+			(!validCloudDSHJSONStringField(keys, "current_task_turn_message_id") || !domain.ValidMessageID(frame.CurrentTaskTurnMessageID)) {
+			return cloudDSHFrame{}, errors.New("invalid dsh current Task turn message identity")
 		}
 	}
 	if !validCloudDSHObservationFrame(frame, keys) {
@@ -1575,9 +1583,24 @@ func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, i
 	if len(response.ToolCalls) > 0 {
 		finishReason = "tool-calls"
 	}
+	finishChunk := map[string]any{"type": "finish", "reason": map[string]any{"kind": finishReason}}
+	if len(response.ToolCalls) > 0 {
+		messageID := response.ToolCalls[0].CurrentTaskTurnMessageID
+		if messageID != "" {
+			if !domain.ValidMessageID(messageID) {
+				return errors.New("dsh model response source identity is invalid")
+			}
+			for _, call := range response.ToolCalls[1:] {
+				if call.CurrentTaskTurnMessageID != messageID {
+					return errors.New("dsh model response source identities do not match")
+				}
+			}
+			finishChunk["replayState"] = map[string]any{"response": map[string]any{"morde_task_turn_message_id": messageID}}
+		}
+	}
 	chunks = append(chunks,
 		map[string]any{"type": "usage", "usage": map[string]any{"inputTokens": response.Usage.InputTokens, "outputTokens": response.Usage.OutputTokens}},
-		map[string]any{"type": "finish", "reason": map[string]any{"kind": finishReason}},
+		finishChunk,
 	)
 	frame := func(kind string) map[string]any {
 		return map[string]any{"type": kind, "task_id": identity.TaskID, "owner_id": identity.OwnerID,

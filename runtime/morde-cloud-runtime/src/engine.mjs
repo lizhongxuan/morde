@@ -184,7 +184,8 @@ function mordeMCPToolDefinition(sessionDurable, tool, onError, { recovering = fa
           }
           const response = await sessionDurable.ipc.toolCall(
             sessionDurable.identity, sessionDurable.through, execution.callId, tool.name, args, execution.signal,
-            { recovering, onWaiting, onTimeout },
+            { recovering, currentTaskTurnMessageID: execution.currentTaskTurnMessageID ??
+              sessionDurable.currentTaskTurnMessageIDs.get(execution.callId) ?? '', onWaiting, onTimeout },
           )
           if (response === RECOVERY_TOOL_SUPERSEDED) return response
           if (!validMordeMCPToolResult(response)) throw new Error('Morde MCP broker returned an invalid result')
@@ -194,6 +195,8 @@ function mordeMCPToolDefinition(sessionDurable, tool, onError, { recovering = fa
       } catch (error) {
         onError?.(error, execution)
         throw error
+      } finally {
+        sessionDurable.currentTaskTurnMessageIDs.delete(execution.callId)
       }
     },
   }
@@ -386,6 +389,15 @@ function sameImageRefs(left, right) {
     ref.bytes === right[index].bytes && ref.width === right[index].width && ref.height === right[index].height)
 }
 
+function currentTaskTurnMessageIDFromReplayState(replayState) {
+  const response = replayState?.response
+  if (!isObject(response) || !Object.hasOwn(response, 'morde_task_turn_message_id')) return ''
+  if (!exactKeys(response, ['morde_task_turn_message_id']) || !MESSAGE_ID.test(response.morde_task_turn_message_id ?? '')) {
+    throw new Error('checkpointed DSH task turn source identity is invalid')
+  }
+  return response.morde_task_turn_message_id
+}
+
 function recoveryToolCalls(events, tools) {
   const allowed = new Map((tools ?? []).map(tool => [tool.name, tool]))
   const calls = new Map()
@@ -410,6 +422,7 @@ function recoveryToolCalls(events, tools) {
       openStep = null
     } else if (event.type === 'assistant/message' && event.data.message.role === 'assistant') {
       if (openTurn !== event.data.turn || openStep !== event.data.step) throw new Error('checkpointed dsh assistant call is outside its open step')
+      const currentTaskTurnMessageID = currentTaskTurnMessageIDFromReplayState(event.data.message.source?.replayState)
       for (const block of event.data.message.content) {
         if (block.type !== 'tool-call') continue
         const tool = allowed.get(block.name)
@@ -419,6 +432,7 @@ function recoveryToolCalls(events, tools) {
         const args = JSON.parse(block.arguments)
         if (!isObject(args) || calls.has(block.id)) throw new Error('checkpointed dsh tool call identity is invalid')
         calls.set(block.id, { id: block.id, name: block.name, definition: tool, arguments: block.arguments, args,
+          currentTaskTurnMessageID,
           turn: event.data.turn, step: event.data.step, callSeq: undefined, resultText: undefined, resultImages: undefined, resultUnknown: false })
       }
     } else if (event.type === 'tool/call') {
@@ -1026,6 +1040,7 @@ export class DurableSession {
     this.through = -1
     this.digest = start.resume === true ? start.checkpoint_sha256 : ''
     this.lastModelThrough = -1
+    this.currentTaskTurnMessageIDs = new Map()
     this.failure = undefined
     this.serial = Promise.resolve()
     this.restored = undefined
@@ -1322,7 +1337,8 @@ export class DurableSession {
         }
       } else if (isMordeMCPTool(call.definition)) {
         const definition = mordeMCPToolDefinition(this, call.definition, undefined, { recovering: true })
-        const value = await definition.execute(call.args, { callId: call.id, signal })
+        const value = await definition.execute(call.args, { callId: call.id, signal,
+          currentTaskTurnMessageID: call.currentTaskTurnMessageID })
         if (value === RECOVERY_TOOL_SUPERSEDED) {
           supersededDuringRecovery = true
         } else {
@@ -1339,7 +1355,7 @@ export class DurableSession {
       } else {
         const result = await this.runActivity('tool', call.id, signal, (onWaiting, onTimeout) =>
           this.ipc.toolCall(this.identity, this.through, call.id, call.name, call.args, signal,
-            { recovering: true, onWaiting, onTimeout }))
+            { recovering: true, currentTaskTurnMessageID: call.currentTaskTurnMessageID, onWaiting, onTimeout }))
         if (result === RECOVERY_TOOL_SUPERSEDED) {
           supersededDuringRecovery = true
         } else {
@@ -1392,7 +1408,7 @@ export class DurableSession {
     this.stepRetryDispatched = true
     const result = await this.runActivity('tool', retry.retry_call_id, signal, (onWaiting, onTimeout) =>
       this.ipc.toolCall(this.identity, retry.checkpoint_through_seq, retry.retry_call_id, retry.tool_name, source.args, signal,
-        { onWaiting, onTimeout }))
+        { currentTaskTurnMessageID: source.currentTaskTurnMessageID, onWaiting, onTimeout }))
     if (!validMordeMCPToolResult(result)) throw new Error('step retry broker returned an invalid result')
     return result
   }
@@ -1801,18 +1817,24 @@ export async function runAgent(ipc, frame) {
             }
             try {
               if (tool.name === DELEGATE_TOOL) {
+                sessionDurable.currentTaskTurnMessageIDs.delete(exec.callId)
                 return await sessionDurable.runActivity('subagent', exec.callId, exec.signal, (onWaiting, onTimeout) =>
                   runDelegation(sessionDurable, agent, exec.callId, args, exec.signal, undefined, false, onWaiting, onTimeout))
               }
-              return await sessionDurable.runActivity('tool', exec.callId, exec.signal, (onWaiting, onTimeout) => {
+              return await sessionDurable.runActivity('tool', exec.callId, exec.signal, async (onWaiting, onTimeout) => {
                 if (sessionDurable.modelDeliveryVersion !== sessionDurable.messageDeliveryVersion) {
                   return { status: 'failed', output: STALE_MODEL_TOOL_MESSAGE, images: [] }
                 }
                 if (sessionDurable.superseded || sessionDurable.terminalFailureReason) {
                   return { status: 'failed', output: sessionDurable.terminalFailureReason ?? sessionDurable.supersedeReason ?? STALE_MODEL_TOOL_MESSAGE, images: [] }
                 }
-                return ipc.toolCall(sessionDurable.identity, sessionDurable.through, exec.callId, tool.name, args, exec.signal,
-                  { onWaiting, onTimeout })
+                const currentTaskTurnMessageID = sessionDurable.currentTaskTurnMessageIDs.get(exec.callId) ?? ''
+                try {
+                  return await ipc.toolCall(sessionDurable.identity, sessionDurable.through, exec.callId, tool.name, args, exec.signal,
+                    { currentTaskTurnMessageID, onWaiting, onTimeout })
+                } finally {
+                  sessionDurable.currentTaskTurnMessageIDs.delete(exec.callId)
+                }
               })
             } catch (error) {
               onError(error, exec)
@@ -2231,6 +2253,8 @@ export async function runAgent(ipc, frame) {
       await sessionDurable.runActivity('model', id, options.signal, async () => {
         for await (const chunk of ipc.streamModel(sessionDurable.identity, id, requestThrough, request, options.signal)) chunks.push(chunk)
       })
+      const finishChunk = chunks.findLast(chunk => chunk.type === 'finish')
+      const currentTaskTurnMessageID = currentTaskTurnMessageIDFromReplayState(finishChunk?.replayState)
       if (deliveryVersion !== sessionDurable.messageDeliveryVersion) {
         const text = 'A new task input arrived during this model call. Re-evaluate the current task before taking action.'
         yield { type: 'block-start', index: 0, blockType: 'text' }
@@ -2240,6 +2264,11 @@ export async function runAgent(ipc, frame) {
         if (usage) yield usage
         yield { type: 'finish', reason: { kind: 'stop' } }
         return
+      }
+      const toolCallIDs = new Set(chunks.filter(chunk => chunk.type === 'tool-call-delta').map(chunk => chunk.id))
+      for (const callID of toolCallIDs) sessionDurable.currentTaskTurnMessageIDs.delete(callID)
+      if (currentTaskTurnMessageID !== '') {
+        for (const callID of toolCallIDs) sessionDurable.currentTaskTurnMessageIDs.set(callID, currentTaskTurnMessageID)
       }
       yield* chunks
     }

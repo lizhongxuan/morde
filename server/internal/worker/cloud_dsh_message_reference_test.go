@@ -7,8 +7,10 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain/task"
@@ -351,6 +353,149 @@ func TestCloudDSHRevisionBatchCarriesOneMiBSourceReferenceInOrder(t *testing.T) 
 		reference.SourceSHA256 != hex.EncodeToString(sha256Sum(content)) || reference.Mode != app.AgentMessageDeliverySteer {
 		t.Fatalf("revision source reference lost receipt identity, digest, or delivery mode: %+v", reference)
 	}
+}
+
+func TestCloudDSHLongInitialAndRevisionReferencesResumeInOrderWithoutDuplicateDelivery(t *testing.T) {
+	const initialID, revisionID, followupID = "minit001", "mrev0001", "mrev0002"
+	const initialHead, revisionHead = "RECOVERY-INITIAL-START=", "RECOVERY-REVISION-START="
+	const sourceBytes = (1 << 20) + 1
+	initialContent := initialHead + strings.Repeat("i", sourceBytes-len(initialHead))
+	revisionContent := revisionHead + strings.Repeat("r", sourceBytes-len(revisionHead))
+	if len(initialContent) != sourceBytes || len(revisionContent) != sourceBytes {
+		t.Fatalf("recovery source sizes = %d/%d; want %d each", len(initialContent), len(revisionContent), sourceBytes)
+	}
+	initial := app.AgentConversationMessage{ID: initialID, Content: initialContent, Initial: true,
+		Mode: app.AgentMessageDeliveryFollowup}
+	revision := app.AgentConversationMessage{ID: revisionID, Content: revisionContent, RevisionUpdate: true,
+		Mode: app.AgentMessageDeliverySteer}
+	followup := app.AgentConversationMessage{ID: followupID, Content: "A short follow-up after the revision.", RevisionUpdate: true,
+		Mode: app.AgentMessageDeliveryFollowup}
+
+	executor, supervisor, _, checkpoints, models, value := cloudDSHFixture(t)
+	value.Objective = app.ConversationRouteTaskMessageObjective(initial.ID, initial.Content)
+	checkpoints.pending = []app.AgentConversationMessage{initial}
+	referenceCheckpoints := &cloudDSHReferenceTestCheckpoints{cloudDSHTestCheckpoints: checkpoints, task: value}
+	executor.options.Checkpoints = referenceCheckpoints
+	if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("initial long-reference Task result = %v", err)
+	}
+	if len(models.calls) != 1 {
+		t.Fatalf("initial long-reference Task made %d model calls, want 1", len(models.calls))
+	}
+	initialRefsBefore := cloudDSHMessageReferenceEnvelopesByID(t, models.calls[0].RawRequest, initial.ID)
+	initialRefBefore, hasInitialBefore := initialRefsBefore[initial.ID]
+	initialFence := checkpointFenceForSession(supervisor.launch.Fence, supervisor.launch.Fence.AgentSessionID)
+	expectedInitialRef, err := cloudDSHTestReference(initial, value, initialFence)
+	if err != nil || !hasInitialBefore || !reflect.DeepEqual(initialRefBefore, expectedInitialRef) {
+		t.Fatalf("initial model call did not receive canonical long source references: %+v", initialRefsBefore)
+	}
+
+	// Recreate the Worker wrapper and resume from its saved checkpoint. The
+	// initial message is already applied in that checkpoint; only the new
+	// revision and follow-up remain pending. Recovery must preserve the original
+	// marker in history and deliver each new input once, in order.
+	previous := supervisor.launch.Fence
+	tail := checkpoints.commands[len(checkpoints.commands)-1]
+	value.AgentInstanceID, value.AgentGeneration, value.AgentSessionID = previous.AgentInstanceID, previous.AgentGeneration, previous.AgentSessionID
+	value.AgentEngineVersion, value.AgentProfileVersion = previous.EngineVersion, previous.ProfileVersion
+	value.CheckpointThroughSequence, value.CheckpointDigest = tail.Through, append([]byte(nil), tail.Digest...)
+	value.Lease.Version++
+	expires := time.Now().Add(time.Minute)
+	value.Lease.ExpiresAt = &expires
+	checkpoints.pending = []app.AgentConversationMessage{revision, followup}
+	resumedExecutor, err := NewCloudDSHExecutor(executor.options)
+	if err != nil {
+		t.Fatalf("recreate Worker executor for checkpoint resume: %v", err)
+	}
+	if err := resumedExecutor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		t.Fatalf("resumed long-reference Task result = %v", err)
+	}
+	if len(models.calls) != 2 {
+		t.Fatalf("recovered Worker made %d model calls, want one resumed call", len(models.calls)-1)
+	}
+
+	resumedRefs := cloudDSHMessageReferenceEnvelopesByID(t, models.calls[1].RawRequest, initial.ID, revision.ID)
+	initialRefAfter, hasInitialAfter := resumedRefs[initial.ID]
+	revisionRefAfter, hasRevisionAfter := resumedRefs[revision.ID]
+	if !hasInitialAfter || !hasRevisionAfter || !reflect.DeepEqual(initialRefAfter, initialRefBefore) ||
+		revisionRefAfter.Mode != revision.Mode || revisionRefAfter.SourceSHA256 != hex.EncodeToString(sha256Sum(revision.Content)) {
+		t.Fatalf("checkpoint recovery changed source ID/hash/representation/mode: before=%+v after=%+v",
+			initialRefsBefore, resumedRefs)
+	}
+	checkpointFence := checkpointFenceForSession(supervisor.launch.Fence, supervisor.launch.Fence.AgentSessionID)
+	expectedRevisionRef, err := cloudDSHTestReference(revision, value, checkpointFence)
+	if err != nil || !reflect.DeepEqual(revisionRefAfter, expectedRevisionRef) {
+		t.Fatalf("recovered revision source reference = %+v; expected %+v; err=%v", revisionRefAfter, expectedRevisionRef, err)
+	}
+	if got := cloudDSHMessageIDsInOrder(t, models.calls[1].RawRequest, initial.ID, revision.ID, followup.ID); strings.Join(got, ",") !=
+		strings.Join([]string{initial.ID, revision.ID, followup.ID}, ",") {
+		t.Fatalf("recovery delivery lost, duplicated, or reordered pending inputs: %v", got)
+	}
+	if strings.Contains(string(models.calls[1].RawRequest), initial.Content) || strings.Contains(string(models.calls[1].RawRequest), revision.Content) {
+		t.Fatal("checkpoint recovery exposed a long original message instead of its source reference")
+	}
+}
+
+func cloudDSHMessageReferenceEnvelopesByID(t *testing.T, raw []byte, messageIDs ...string) map[string]app.AgentMessageReferenceEnvelope {
+	t.Helper()
+	var request struct {
+		Messages []struct {
+			ID      string `json:"id"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &request); err != nil {
+		t.Fatalf("decode model request references: %v", err)
+	}
+	wanted := make(map[string]struct{}, len(messageIDs))
+	for _, id := range messageIDs {
+		wanted[id] = struct{}{}
+	}
+	result := make(map[string]app.AgentMessageReferenceEnvelope, len(messageIDs))
+	for _, message := range request.Messages {
+		if _, ok := wanted[message.ID]; !ok {
+			continue
+		}
+		for _, block := range message.Content {
+			if !strings.HasPrefix(block.Text, app.AgentMessageReferenceMarkerPrefix+" ") {
+				continue
+			}
+			reference, err := app.ParseAgentMessageReferenceEnvelope(block.Text)
+			if err != nil || reference.MessageID != message.ID {
+				t.Fatalf("parse %s source reference: reference=%+v err=%v", message.ID, reference, err)
+			}
+			if _, duplicate := result[message.ID]; duplicate {
+				t.Fatalf("model request contains duplicate source reference for %s", message.ID)
+			}
+			result[message.ID] = reference
+		}
+	}
+	return result
+}
+
+func cloudDSHMessageIDsInOrder(t *testing.T, raw []byte, messageIDs ...string) []string {
+	t.Helper()
+	var request struct {
+		Messages []struct {
+			ID string `json:"id"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(raw, &request); err != nil {
+		t.Fatalf("decode model request message order: %v", err)
+	}
+	wanted := make(map[string]struct{}, len(messageIDs))
+	for _, id := range messageIDs {
+		wanted[id] = struct{}{}
+	}
+	var result []string
+	for _, message := range request.Messages {
+		if _, ok := wanted[message.ID]; ok {
+			result = append(result, message.ID)
+		}
+	}
+	return result
 }
 
 func findCloudDSHReferenceMarker(value any) (string, bool) {

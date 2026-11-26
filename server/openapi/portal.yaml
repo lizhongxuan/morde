@@ -12905,6 +12905,25 @@ components:
         execution: { $ref: '#/components/schemas/TaskStepExecution' }
         content_evidence:
           $ref: '#/components/schemas/TaskStepContentEvidence'
+        source_locations:
+          type: array
+          maxItems: 30
+          description: Server-derived source locations from successful tool reads. Workspace paths are returned only to readers authorized for the Task Workspace. These locations are not yet a claim-to-source correctness verdict.
+          items: { $ref: '#/components/schemas/TaskStepSourceLocation' }
+    TaskStepSourceLocation:
+      type: object
+      required: [id, kind, state, content_sha256]
+      properties:
+        id: { type: string, pattern: '^src_[0-9a-f]{32}$', description: 'Stable server-derived identity bound to Task owner, Task, step, revision, tool call, and this source locator.' }
+        kind: { type: string, enum: [public_web_page, workspace_file, workspace_search_match] }
+        uri: { type: string, format: uri, maxLength: 2048, description: Canonical HTTPS request URI with query and fragment removed; present only for public_web_page. }
+        workspace_id: { type: string, pattern: '^w[a-z0-9]{7,63}$', description: Bound Task Workspace ID; present only for Workspace locators. }
+        revision: { type: integer, format: int64, minimum: 0, description: 'Workspace revision requested by the successful read. For live_directory state this is the Task checkpoint revision, not an immutable content version.' }
+        path: { type: string, minLength: 1, maxLength: 4096, description: Normalized, nonsensitive Workspace-relative path. }
+        line: { type: integer, minimum: 1, description: One-based line number for a Workspace search match. }
+        manifest_sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: Immutable Workspace manifest digest; absent for live-directory reads. }
+        state: { type: string, enum: [requested_uri_only, immutable_workspace_revision, live_workspace_directory] }
+        content_sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: 'Captured web output digest or verified Workspace file-content digest associated with this locator.' }
     TaskStepContentEvidence:
       type: object
       description: Bounded, persisted excerpt from a successful built-in web search/read result, returned only after Task access and evidence identity checks. Treat preview text as untrusted web content; it is not a structured citation list. SHA-256 covers the full captured text before preview truncation.

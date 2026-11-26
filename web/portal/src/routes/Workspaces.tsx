@@ -78,6 +78,16 @@ const workspaceDiffDisplayLabel: Record<WorkspaceRevisionDiff['changes'][number]
   metadata_only: '仅元数据', not_applicable: '无正文',
 };
 
+function projectSyncHostUnavailableMessage(host: Host): string {
+  if (host.state_reason === 'restore_failed') {
+    return '默认云端电脑上次恢复失败，文件同步已暂停。请联系管理员检查失败原因，确认修复后再恢复；不会自动重试或切换到其他电脑。';
+  }
+  if (host.state_reason === 'restore_unknown') {
+    return '默认云端电脑恢复结果待核对，文件同步已暂停。请先核实当前运行状态，确认前不要重试；不会自动切换到其他电脑。';
+  }
+  return `默认云端电脑当前${hostStateLabel[host.state] || host.state}，同步已暂停。请先恢复默认电脑；不会切换到其他电脑。`;
+}
+
 function portalProjectBridge(): PortalProjectBridge | undefined {
   if (typeof window === 'undefined') return undefined;
   return (window as Window & { morde?: PortalProjectBridge }).morde;
@@ -853,7 +863,11 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
         {defaultHostID && hosts.isPending && <FloatingNotice className="notice-info">正在核对默认云端电脑和文件目录…</FloatingNotice>}
         {defaultHostID && hosts.isError && <div className="error-inline" role="alert">无法核对默认云端电脑及其文件目录，文件同步已暂停。<button type="button" className="button button-secondary button-small" onClick={() => void hosts.refetch()}>重试</button></div>}
         {defaultHostID && hosts.isSuccess && !configuredDefaultHost && <p className="notice notice-warning" role="status">默认云端电脑不可用或已失去访问权限。请先检查默认电脑设置；文件同步不会改用其他电脑。</p>}
-        {configuredDefaultHost && configuredDefaultHost.state !== 'running' && <p className="notice notice-warning" role="status">默认云端电脑当前{hostStateLabel[configuredDefaultHost.state] || configuredDefaultHost.state}，同步已暂停。请先恢复默认电脑。</p>}
+        {configuredDefaultHost && configuredDefaultHost.state !== 'running' && <p className="notice notice-warning" role="status">
+          {projectSyncHostUnavailableMessage(configuredDefaultHost)}{' '}
+          {(configuredDefaultHost.state_reason === 'restore_failed' || configuredDefaultHost.state_reason === 'restore_unknown')
+            && <Link to="/hosts">云端电脑页面</Link>}
+        </p>}
         {configuredDefaultHost?.state === 'running' && configuredDefaultHost.workspace_runtime_online !== true && <p className="notice notice-warning" role="status">默认云端电脑的文件服务未确认在线，文件同步已暂停。</p>}
         {configuredDefaultHost && !configuredDefaultWorkspace && <p className="notice notice-warning" role="status">默认云端电脑的文件目录未就绪或无法唯一确认，文件同步已暂停。</p>}
         {configuredDefaultWorkspace && !configuredDefaultWorkspaceReady && <p className="notice notice-warning" role="status">默认云端电脑的文件状态未确认完成或存在冲突，文件同步已暂停。</p>}
@@ -867,7 +881,9 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
             <div><strong>{configuredDefaultProjectTarget.hostName} · 默认电脑</strong><span>{hostStateLabel[configuredDefaultHost?.state ?? configuredDefaultProjectTarget.hostState] || configuredDefaultProjectTarget.hostState} · 已有项目 {configuredDefaultProjectTarget.folders.length} 个</span></div>
           </div>
           <p className="muted">目标目录：~/workspace/project/&lt;项目名&gt;/</p>
-          {configuredDefaultProjectTarget.blockedMessage && <small className="table-sub">{configuredDefaultProjectTarget.blockedMessage}</small>}
+          {configuredDefaultProjectTarget.blockedMessage
+            && configuredDefaultHost?.state_reason !== 'restore_failed' && configuredDefaultHost?.state_reason !== 'restore_unknown'
+            && <small className="table-sub">{configuredDefaultProjectTarget.blockedMessage}</small>}
         </article>}
         {selectedProjectTarget && !selectedProjectTargetUnavailable && <div className="form-stack" style={{ marginTop: 10 }}>
             <div className="inline-actions">

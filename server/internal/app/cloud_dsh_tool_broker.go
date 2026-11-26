@@ -411,6 +411,12 @@ func (b *CloudDSHToolBroker) Definitions(ctx context.Context, claimed task.Task)
 			if err != nil {
 				return nil, err
 			}
+			if details.Plan != nil {
+				hubDefinitions, err = addPlanStepArgumentToHubOperationTools(hubDefinitions, details.Plan.Revision)
+				if err != nil {
+					return nil, err
+				}
+			}
 			available := maxCloudDSHToolDefinitions - len(definitions) - 1
 			if available >= len(selectedMCP) {
 				available -= len(selectedMCP)
@@ -680,6 +686,67 @@ func cloudDSHPlanStepReadTool(name string) bool {
 	default:
 		return false
 	}
+}
+
+func cloudDSHPlanStepOperationTool(name string) bool {
+	tool, _, _, ok := parseHubTaskToolName(name)
+	return ok && tool.action == hub.ActionCommand
+}
+
+func addPlanStepArgumentToHubOperationTools(definitions []AgentToolDefinition, planRevision int64) ([]AgentToolDefinition, error) {
+	if planRevision < 1 {
+		return nil, domain.NewError(domain.CodeInvalidState, "Hub operation tool plan revision is invalid")
+	}
+	for index := range definitions {
+		if !cloudDSHPlanStepOperationTool(definitions[index].Name) {
+			continue
+		}
+		var schema map[string]json.RawMessage
+		if json.Unmarshal(definitions[index].Parameters, &schema) != nil || schema == nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "Hub operation tool schema is invalid")
+		}
+		var properties map[string]json.RawMessage
+		if json.Unmarshal(schema["properties"], &properties) != nil || properties == nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "Hub operation tool schema properties are invalid")
+		}
+		properties[cloudDSHPlanStepIDArgumentName] = json.RawMessage(`{"type":"string","pattern":"^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$","description":"ID of the current persisted plan step this operation performs."}`)
+		revision, err := json.Marshal(map[string]any{"type": "integer", "enum": []int64{planRevision},
+			"description": "Current persisted plan revision; copy the provided value exactly."})
+		if err != nil {
+			return nil, fmt.Errorf("encode Hub operation plan revision schema: %w", err)
+		}
+		properties[cloudDSHPlanRevisionArgumentName] = revision
+		encodedProperties, err := json.Marshal(properties)
+		if err != nil {
+			return nil, fmt.Errorf("encode Hub operation plan metadata schema: %w", err)
+		}
+		schema["properties"] = encodedProperties
+		var required []string
+		if rawRequired, exists := schema["required"]; exists && json.Unmarshal(rawRequired, &required) != nil {
+			return nil, domain.NewError(domain.CodeInvalidState, "Hub operation tool required fields are invalid")
+		}
+		for _, name := range []string{cloudDSHPlanStepIDArgumentName, cloudDSHPlanRevisionArgumentName} {
+			found := false
+			for _, existing := range required {
+				found = found || existing == name
+			}
+			if !found {
+				required = append(required, name)
+			}
+		}
+		encodedRequired, err := json.Marshal(required)
+		if err != nil {
+			return nil, fmt.Errorf("encode Hub operation plan metadata required fields: %w", err)
+		}
+		schema["required"] = encodedRequired
+		encodedSchema, err := json.Marshal(schema)
+		if err != nil {
+			return nil, fmt.Errorf("encode Hub operation tool schema: %w", err)
+		}
+		definitions[index].Parameters = encodedSchema
+		definitions[index].Description += " Include morde_plan_step_id for the current persisted plan step that owns this command and copy morde_plan_revision exactly from the current plan."
+	}
+	return definitions, nil
 }
 
 func cloudDSHPlanMCPTool(name string) bool {
@@ -1359,7 +1426,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		if planStepMetadata.HasStepID {
 			ctx = withCloudDSHMCPPlanStepMetadata(ctx, planStepMetadata)
 		}
-	} else if cloudDSHPlanStepReadTool(call.Name) {
+	} else if cloudDSHPlanStepReadTool(call.Name) || cloudDSHPlanStepOperationTool(call.Name) {
 		var err error
 		planStepMetadata, err = extractCloudDSHPlanStepArguments(call.Arguments)
 		if err != nil {
@@ -1367,7 +1434,7 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		}
 		call.Arguments = string(planStepMetadata.BusinessArgs)
 	} else if hasCloudDSHPlanStepMetadata(call.Arguments) {
-		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "plan step metadata is only valid for Host, MCP, or direct read tools")
+		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "plan step metadata is only valid for Host, MCP, direct read, or Hub command tools")
 	}
 	if cloudDSHGoalFollowupReadOnlyTask(claimed) && !goalFollowupReadOnlyToolAllowed(call.Name) {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "tool is not available to read-only Goal follow-up Tasks")
@@ -1499,6 +1566,9 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 			return b.executePlanStepRead(ctx, claimed, call, planStepMetadata, func() (AgentToolResult, error) {
 				return b.executeHubTaskAction(ctx, claimed, call, recovering, checkpointOutput)
 			})
+		}
+		if cloudDSHPlanStepOperationTool(call.Name) {
+			return b.executeHubTaskActionWithPlanStep(ctx, claimed, call, planStepMetadata, recovering, checkpointOutput)
 		}
 		return b.executeHubTaskAction(ctx, claimed, call, recovering, checkpointOutput)
 	}
@@ -1929,7 +1999,7 @@ func (b *CloudDSHToolBroker) executePlanStepRead(ctx context.Context, claimed ta
 	if !ok {
 		return AgentToolResult{}, domain.NewError(domain.CodeUnsupported, "Task plan direct-read admission is unavailable")
 	}
-	toolCall, err := cloudDSHPlanStepReadToolCallProgress(ctx, details.Task, call)
+	toolCall, err := cloudDSHToolCallProgress(ctx, details.Task, call)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
@@ -1950,7 +2020,7 @@ func (b *CloudDSHToolBroker) executePlanStepRead(ctx context.Context, claimed ta
 	return result, nil
 }
 
-func cloudDSHPlanStepReadToolCallProgress(ctx context.Context, current task.Task, call ModelToolCall) (TaskToolCallProgress, error) {
+func cloudDSHToolCallProgress(ctx context.Context, current task.Task, call ModelToolCall) (TaskToolCallProgress, error) {
 	activity, ok := cloudDSHToolActivityFromContext(ctx)
 	if !ok || activity.call.TaskFence == nil || activity.call.CallID != call.CallID || activity.call.Name != call.Name ||
 		!validCloudDSHToolActivityFence(ctx, activity.current, activity.call) || len(activity.digest) != sha256.Size ||
@@ -1959,12 +2029,12 @@ func cloudDSHPlanStepReadToolCallProgress(ctx context.Context, current task.Task
 		activity.current.AgentGeneration != current.AgentGeneration || !sameTaskInputRevision(activity.current.CurrentRevision, current.CurrentRevision) ||
 		!sameCloudDSHAuthorization(activity.current.Authorization, current.Authorization) ||
 		activity.current.Lease.Owner != current.Lease.Owner || activity.current.Lease.Version != current.Lease.Version {
-		return TaskToolCallProgress{}, domain.NewError(domain.CodeInvalidState, "direct read DSH call identity is unavailable")
+		return TaskToolCallProgress{}, domain.NewError(domain.CodeInvalidState, "DSH tool call identity is unavailable")
 	}
 	fence := activity.call.TaskFence
 	if activity.current.CurrentRevision == nil || fence.TaskID != current.ID || fence.OwnerID != current.OwnerID ||
 		fence.AgentSessionID != current.AgentSessionID || fence.AuthorizationVersion != current.Authorization.Version {
-		return TaskToolCallProgress{}, domain.NewError(domain.CodeInvalidState, "direct read DSH call fence changed")
+		return TaskToolCallProgress{}, domain.NewError(domain.CodeInvalidState, "DSH tool call fence changed")
 	}
 	return TaskToolCallProgress{
 		AgentSessionID: fence.AgentSessionID, AgentInstanceID: fence.AgentInstanceID,

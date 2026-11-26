@@ -20,6 +20,7 @@ const MAX_LATE_COORDINATOR_RESPONSES = 4096
 const MAX_DELEGATE_OBJECTIVE_BYTES = 32 * 1024
 const MAX_TOOL_OUTPUT_BYTES = 1024 * 1024
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/
+const TASK_TURN_MESSAGE_ID = /^m[a-z0-9]{7}$/
 const SHUTDOWN_TIMEOUT_MS = 5_000
 const RUNTIME_CWD = fileURLToPath(new URL('..', import.meta.url))
 const MORDE_WORKSPACE_DIR = '/workspace'
@@ -1672,10 +1673,13 @@ export class AccountRuntime {
             !validTaskAgentObservation(frame, task)) throw new Error('invalid task agent activity observation')
         if (frame.type === 'tool_call') {
           if (!ID.test(frame.id) || !ID.test(frame.call_id) || typeof frame.name !== 'string' ||
-              !TOOL_NAME.test(frame.name) || task.pendingToolCalls.has(frame.id) || this.lateToolResults.has(frame.id)) {
+              !TOOL_NAME.test(frame.name) ||
+              Object.hasOwn(frame, 'current_task_turn_message_id') && !TASK_TURN_MESSAGE_ID.test(frame.current_task_turn_message_id ?? '') ||
+              task.pendingToolCalls.has(frame.id) || this.lateToolResults.has(frame.id)) {
             throw new Error('invalid task tool call identity')
           }
-          task.pendingToolCalls.set(frame.id, { callID: frame.call_id, sessionID: frame.session_id, name: frame.name })
+          task.pendingToolCalls.set(frame.id, { callID: frame.call_id, sessionID: frame.session_id, name: frame.name,
+            currentTaskTurnMessageID: frame.current_task_turn_message_id ?? '' })
         }
         const pendingResponse = pendingTaskResponse(frame, task)
         if (pendingResponse) {

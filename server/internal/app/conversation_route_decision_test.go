@@ -202,6 +202,8 @@ func TestConversationRouteModelRequestsUseConsistentJSONFieldContract(t *testing
 				`It may be true only for new, update, or join actions`,
 				`"acknowledge" is the only acceptance signal`,
 				`For action "new" or "update", include the string field "file_delivery_intent"`,
+				`including Mermaid diagrams or flowcharts shown inline in the chat`,
+				`Use "required" only when the user requests a file to be delivered, downloaded, exported, or saved, or a Workspace artifact`,
 				`Empty string means no explicit override`,
 				conversationRouteExplicitNewInstructions,
 				`Only action "tool" may set tool_name/tool_arguments`,

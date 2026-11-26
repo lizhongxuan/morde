@@ -91,21 +91,31 @@ const (
 	PlanVerificationRequirementProjectFile PlanVerificationRequirementSourceKind = "project_file"
 )
 
-const PlanVerificationRequirementCurrentTaskInputLocator = "current_task_input"
+const (
+	PlanVerificationRequirementCurrentTaskInputLocator     = "current_task_input"
+	PlanVerificationRequirementCurrentTaskTurnInputLocator = "current_task_turn_input"
+	PlanVerificationRequirementHistorySearchResultLocator  = "history_search_result"
+	PlanVerificationRequirementHistoryResultTokenMaxBytes  = 2048
+)
 
 // PlanVerificationRequirementSource identifies the source that makes a
 // verification check mandatory. The server must independently resolve the
 // referenced message or file and verify its digest before treating a required
-// check as applicable.
+// check as applicable. A history result token is accepted only at the tool
+// boundary and is never part of a persisted canonical source.
 type PlanVerificationRequirementSource struct {
 	Kind PlanVerificationRequirementSourceKind `json:"kind"`
 	// Locator is accepted only on a new plan-tool submission. The Store resolves
 	// it to an immutable message ID before the plan is validated or persisted.
-	Locator           string `json:"locator,omitempty"`
-	MessageID         string `json:"message_id,omitempty"`
-	WorkspacePath     string `json:"workspace_path,omitempty"`
-	WorkspaceRevision *int64 `json:"workspace_revision,omitempty"`
-	ContentSHA256     string `json:"content_sha256,omitempty"`
+	Locator string `json:"locator,omitempty"`
+	// HistoryResultToken proves that a later user message came from this Task's
+	// authorized, watermark-bounded history-search result. It is tool-input only
+	// and must be cleared after App verification, before a plan is persisted.
+	HistoryResultToken string `json:"history_result_token,omitempty"`
+	MessageID          string `json:"message_id,omitempty"`
+	WorkspacePath      string `json:"workspace_path,omitempty"`
+	WorkspaceRevision  *int64 `json:"workspace_revision,omitempty"`
+	ContentSHA256      string `json:"content_sha256,omitempty"`
 }
 
 // PlanVerificationCheck describes one check whose execution may contribute
@@ -226,10 +236,10 @@ func (p Plan) ValidateSubmission() error {
 	return nil
 }
 
-// ValidateSubmissionInput validates the locator form accepted at the DSH
-// tool boundary. It allows a required source to omit its digest because the
-// Store resolves and hashes that source before ValidateSubmission is called.
-// It never makes an unresolved locator valid as a persisted Plan.
+// ValidateSubmissionInput validates source locators accepted at the DSH tool
+// boundary. It allows server-resolved locators to omit their digest because
+// the App and Store resolve and hash the source before ValidateSubmission is
+// called. It never makes an unresolved locator valid as a persisted Plan.
 func (p Plan) ValidateSubmissionInput() error {
 	input := p
 	input.Steps = append([]PlanStep(nil), p.Steps...)
@@ -243,6 +253,7 @@ func (p Plan) ValidateSubmissionInput() error {
 			return errors.New("task plan verification requirement source locator is invalid")
 		}
 		source.Locator = ""
+		source.HistoryResultToken = ""
 		if source.Kind == PlanVerificationRequirementUserMessage && source.MessageID == "" {
 			// This placeholder is confined to the validation copy. The submitted
 			// plan still has no message ID until the Store resolves its locator.
@@ -282,7 +293,7 @@ func validPlanVerificationCheckKind(value PlanVerificationCheckKind) bool {
 }
 
 func (source PlanVerificationRequirementSource) valid() bool {
-	if source.Locator != "" || !validPlanSHA256(source.ContentSHA256) {
+	if source.Locator != "" || source.HistoryResultToken != "" || !validPlanSHA256(source.ContentSHA256) {
 		return false
 	}
 	switch source.Kind {
@@ -302,15 +313,24 @@ func (source PlanVerificationRequirementSource) validSubmissionInput() bool {
 	}
 	switch source.Kind {
 	case PlanVerificationRequirementUserMessage:
-		if source.WorkspacePath != "" || source.WorkspaceRevision != nil {
+		if source.WorkspacePath != "" || source.WorkspaceRevision != nil || source.ContentSHA256 != "" {
 			return false
 		}
-		if source.Locator == PlanVerificationRequirementCurrentTaskInputLocator {
-			return source.MessageID == ""
+		if source.Locator == PlanVerificationRequirementCurrentTaskTurnInputLocator {
+			return source.MessageID == "" && source.HistoryResultToken == ""
 		}
-		return source.Locator == "" && domain.ValidMessageID(source.MessageID)
+		if source.Locator == PlanVerificationRequirementCurrentTaskInputLocator {
+			return source.MessageID == "" && source.HistoryResultToken == ""
+		}
+		if source.Locator == PlanVerificationRequirementHistorySearchResultLocator {
+			return source.MessageID == "" && planText(source.HistoryResultToken, 1, PlanVerificationRequirementHistoryResultTokenMaxBytes)
+		}
+		// New submissions never accept model-supplied raw message IDs. Initial
+		// and current-turn locators are bound by the server; historical messages
+		// must carry a signed token issued with an authorized search result.
+		return false
 	case PlanVerificationRequirementProjectFile:
-		return source.Locator == "" && source.MessageID == "" &&
+		return source.Locator == "" && source.HistoryResultToken == "" && source.MessageID == "" &&
 			validPlanRelativePath(source.WorkspacePath, false) && source.WorkspaceRevision != nil && *source.WorkspaceRevision >= 0
 	default:
 		return false

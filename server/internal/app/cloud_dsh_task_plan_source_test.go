@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
@@ -27,7 +28,7 @@ func (s *taskPlanSourceWorkspaceStore) GetWorkspaceManifestPageForOwner(ctx cont
 	if ownerID != s.workspace.OwnerID {
 		return workspace.ManifestPage{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
-	return s.syncServiceStore.GetWorkspaceManifestPage(ctx, workspaceID, revision, prefix, after, limit)
+	return s.GetWorkspaceManifestPage(ctx, workspaceID, revision, prefix, after, limit)
 }
 
 func (s *taskPlanSourceWorkspaceStore) GetWorkspaceChangePageForOwner(ctx context.Context, ownerID, workspaceID string,
@@ -35,7 +36,7 @@ func (s *taskPlanSourceWorkspaceStore) GetWorkspaceChangePageForOwner(ctx contex
 	if ownerID != s.workspace.OwnerID {
 		return workspace.ChangePage{}, domain.NewError(domain.CodeNotFound, "workspace not found")
 	}
-	return s.syncServiceStore.GetWorkspaceChangePage(ctx, workspaceID, revision, after, limit)
+	return s.GetWorkspaceChangePage(ctx, workspaceID, revision, after, limit)
 }
 
 type taskPlanProjectGuardStore struct {
@@ -89,6 +90,14 @@ func taskPlanSourceArguments(locator string, messageID string, kind string) stri
 		`"command":"go test ./...","coverage_paths":["server"],"requirement_source":` + string(encoded) + `}}]}`
 }
 
+func taskPlanHistorySourceArguments(token string) string {
+	arguments := taskPlanSourceArguments(task.PlanVerificationRequirementHistorySearchResultLocator, "",
+		string(task.PlanVerificationRequirementUserMessage))
+	encodedToken, _ := json.Marshal(token)
+	needle := `"locator":"` + task.PlanVerificationRequirementHistorySearchResultLocator + `"`
+	return strings.Replace(arguments, needle, needle+`,"history_result_token":`+string(encodedToken), 1)
+}
+
 func resolvedUserTaskPlanSource(source task.PlanVerificationRequirementSource) (task.PlanVerificationRequirementSource, error) {
 	if source.Kind != task.PlanVerificationRequirementUserMessage {
 		return task.PlanVerificationRequirementSource{}, domain.NewError(domain.CodeUnsupported, "project source unavailable")
@@ -107,28 +116,21 @@ func resolvedUserTaskPlanSource(source task.PlanVerificationRequirementSource) (
 
 func TestTaskPlanSubmissionResolvesUserSourceBeforeValidationAndPersistence(t *testing.T) {
 	for _, test := range []struct {
-		name      string
-		locator   string
-		messageID string
-		modelSHA  string
+		name    string
+		locator string
 	}{
 		{name: "current task input", locator: task.PlanVerificationRequirementCurrentTaskInputLocator},
-		{name: "exact message ID", messageID: "m7654321", modelSHA: strings.Repeat("0", 64)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			store, broker, current := newTaskPlanSourceTestBroker(t, resolvedUserTaskPlanSource)
-			arguments := taskPlanSourceArguments(test.locator, test.messageID, string(task.PlanVerificationRequirementUserMessage))
-			if test.modelSHA != "" {
-				arguments = strings.Replace(arguments, `"message_id":"`+test.messageID+`"`,
-					`"message_id":"`+test.messageID+`","content_sha256":"`+test.modelSHA+`"`, 1)
-			}
+			arguments := taskPlanSourceArguments(test.locator, "", string(task.PlanVerificationRequirementUserMessage))
 			call := briefPlanCall(current, "plan-source-"+strings.ReplaceAll(test.name, " ", "-"), arguments)
 			result, err := broker.Execute(context.Background(), current, call)
 			if err != nil || result.Status != AgentToolSucceeded {
 				t.Fatalf("source-backed plan submission = %#v, %v", result, err)
 			}
-			if len(store.inputs) != 1 || store.inputs[0].ContentSHA256 != test.modelSHA {
-				t.Fatalf("resolver input = %+v; want model digest %q passed only as untrusted input", store.inputs, test.modelSHA)
+			if len(store.inputs) != 1 || store.inputs[0].ContentSHA256 != "" {
+				t.Fatalf("resolver input = %+v; want the unresolved source without a model digest", store.inputs)
 			}
 			var output task.Plan
 			if err := json.Unmarshal([]byte(result.Output), &output); err != nil {
@@ -151,6 +153,181 @@ func TestTaskPlanSubmissionResolvesUserSourceBeforeValidationAndPersistence(t *t
 			}
 			t.Fatal("canonical plan was not persisted")
 		})
+	}
+}
+
+func TestTaskPlanHistorySearchResultRequiresSignedTokenAndStoreRehash(t *testing.T) {
+	for _, mismatch := range []string{"", "digest", "message ID"} {
+		name := "canonical source"
+		switch mismatch {
+		case "digest":
+			name = "changed source bytes"
+		case "message ID":
+			name = "different resolved message ID"
+		}
+		t.Run(name, func(t *testing.T) {
+			store, broker, current := newTaskPlanSourceTestBroker(t, resolvedUserTaskPlanSource)
+			content := "verified source body"
+			contentDigest := sha256.Sum256([]byte(content))
+			current.ConversationID = "c1234567"
+			current.ConversationContext = &task.ConversationContext{OwnerID: current.OwnerID, InitiatorID: current.InitiatorID,
+				ConversationID: current.ConversationID, Scope: "personal", ThroughSequence: 15,
+				Digest: []byte(strings.Repeat("z", sha256.Size))}
+			store.details.Task = current
+			if !cloudDSHTaskPlanHistoryCurrentTaskValid("11111111-1111-1111-1111-111111111111", current) {
+				t.Fatalf("history source test Task is not eligible: %+v", current)
+			}
+			if err := broker.SetHistorySearchCursorSigning("11111111-1111-1111-1111-111111111111", []byte(strings.Repeat("k", sha256.Size))); err != nil {
+				t.Fatal(err)
+			}
+			match := cloudDSHCurrentHistoryMatch{MessageID: "m7654321", Role: conversation.RoleUser,
+				Content: content, Sequence: 12, ContentSHA256: hex.EncodeToString(contentDigest[:])}
+			token, err := broker.signCloudDSHTaskPlanHistorySource(current, match)
+			if err != nil || token == "" {
+				t.Fatalf("sign authorized history result token=%q err=%v", token, err)
+			}
+			if mismatch != "" {
+				store.resolve = func(source task.PlanVerificationRequirementSource) (task.PlanVerificationRequirementSource, error) {
+					canonical, err := resolvedUserTaskPlanSource(source)
+					if err != nil {
+						return task.PlanVerificationRequirementSource{}, err
+					}
+					switch mismatch {
+					case "digest":
+						changedDigest := sha256.Sum256([]byte("changed source bytes"))
+						canonical.ContentSHA256 = hex.EncodeToString(changedDigest[:])
+					case "message ID":
+						canonical.MessageID = "m1111111"
+					}
+					return canonical, nil
+				}
+			}
+			call := briefPlanCall(current, "plan-history-source-"+name, taskPlanHistorySourceArguments(token))
+			result, err := broker.Execute(context.Background(), current, call)
+			if len(store.inputs) != 1 {
+				t.Fatalf("Store resolver inputs = %+v; want one canonical historical message source", store.inputs)
+			}
+			resolvedInput := store.inputs[0]
+			if resolvedInput.Kind != task.PlanVerificationRequirementUserMessage || resolvedInput.Locator != "" ||
+				resolvedInput.HistoryResultToken != "" || resolvedInput.MessageID != match.MessageID ||
+				resolvedInput.ContentSHA256 != match.ContentSHA256 {
+				t.Fatalf("Store did not receive signed canonical identity and expected digest: %+v", resolvedInput)
+			}
+			if mismatch != "" {
+				if err != nil || result.Status != AgentToolFailed {
+					t.Fatalf("changed history source bytes were accepted: result=%#v err=%v", result, err)
+				}
+				for _, progress := range store.committedTaskProgress {
+					if progress.CloudDSHTaskPlan != nil {
+						t.Fatal("plan with a changed history source digest was persisted")
+					}
+				}
+				return
+			}
+			if err != nil || result.Status != AgentToolSucceeded {
+				t.Fatalf("signed history source plan submission = %#v, %v", result, err)
+			}
+			var output task.Plan
+			if err := json.Unmarshal([]byte(result.Output), &output); err != nil {
+				t.Fatal(err)
+			}
+			canonicalSource := output.Steps[0].VerificationCheck.RequirementSource
+			if canonicalSource == nil || canonicalSource.MessageID != match.MessageID || canonicalSource.Locator != "" ||
+				canonicalSource.HistoryResultToken != "" || canonicalSource.ContentSHA256 != match.ContentSHA256 || output.ValidateSubmission() != nil {
+				t.Fatalf("history token was not reduced to canonical persisted source: %+v", canonicalSource)
+			}
+			for _, progress := range store.committedTaskProgress {
+				if commit := progress.CloudDSHTaskPlan; commit != nil {
+					committed := commit.Plan.Steps[0].VerificationCheck.RequirementSource
+					if committed == nil || committed.MessageID != match.MessageID || committed.HistoryResultToken != "" ||
+						committed.ContentSHA256 != match.ContentSHA256 {
+						t.Fatalf("persisted history source is not canonical: %+v", committed)
+					}
+					return
+				}
+			}
+			t.Fatal("signed history source plan was not persisted")
+		})
+	}
+}
+
+func TestTaskPlanSubmissionRejectsRawHistoricalMessageID(t *testing.T) {
+	store, broker, current := newTaskPlanSourceTestBroker(t, resolvedUserTaskPlanSource)
+	arguments := taskPlanSourceArguments("", "m7654321", string(task.PlanVerificationRequirementUserMessage))
+	result, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-raw-history-id", arguments))
+	if err != nil || result.Status != AgentToolFailed || len(store.inputs) != 0 {
+		t.Fatalf("raw historical message ID submission = %#v err=%v resolver inputs=%+v; want fail before Store", result, err, store.inputs)
+	}
+	for _, progress := range store.committedTaskProgress {
+		if progress.CloudDSHTaskPlan != nil {
+			t.Fatal("plan with a model-supplied raw historical message ID was persisted")
+		}
+	}
+}
+
+func TestTaskPlanCurrentTaskTurnInputUsesTrustedCallMetadata(t *testing.T) {
+	const (
+		trustedMessageID = "m7654321"
+		modelMessageID   = "m1234567"
+		modelDigest      = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	)
+	store, broker, current := newTaskPlanSourceTestBroker(t, resolvedUserTaskPlanSource)
+	arguments := taskPlanSourceArguments(task.PlanVerificationRequirementCurrentTaskTurnInputLocator, "",
+		string(task.PlanVerificationRequirementUserMessage))
+	arguments = strings.Replace(arguments, `"locator":"`+task.PlanVerificationRequirementCurrentTaskTurnInputLocator+`"`,
+		`"locator":"`+task.PlanVerificationRequirementCurrentTaskTurnInputLocator+`","message_id":"`+modelMessageID+
+			`","content_sha256":"`+modelDigest+`"`, 1)
+	call := briefPlanCall(current, "plan-current-turn-source", arguments)
+	call.CurrentTaskTurnMessageID = trustedMessageID
+	result, err := broker.Execute(context.Background(), current, call)
+	if err != nil || result.Status != AgentToolSucceeded {
+		t.Fatalf("current-turn source plan submission = %#v, %v", result, err)
+	}
+	if len(store.inputs) != 1 {
+		t.Fatalf("resolver inputs = %+v; want one trusted source", store.inputs)
+	}
+	resolverInput := store.inputs[0]
+	if resolverInput.Kind != task.PlanVerificationRequirementUserMessage || resolverInput.Locator != "" ||
+		resolverInput.MessageID != trustedMessageID || resolverInput.MessageID == modelMessageID || resolverInput.ContentSHA256 != "" {
+		t.Fatalf("resolver received model-controlled or non-canonical source identity: %+v", resolverInput)
+	}
+	var output task.Plan
+	if err := json.Unmarshal([]byte(result.Output), &output); err != nil {
+		t.Fatalf("decode canonical plan result: %v", err)
+	}
+	source := output.Steps[0].VerificationCheck.RequirementSource
+	if source == nil || source.MessageID != trustedMessageID || source.MessageID == modelMessageID ||
+		source.ContentSHA256 == "" || source.ContentSHA256 == modelDigest || output.ValidateSubmission() != nil {
+		t.Fatalf("plan did not retain the server-resolved current-turn source: %+v", source)
+	}
+	for _, progress := range store.committedTaskProgress {
+		if commit := progress.CloudDSHTaskPlan; commit != nil {
+			committed := commit.Plan.Steps[0].VerificationCheck.RequirementSource
+			if committed == nil || committed.MessageID != trustedMessageID || committed.ContentSHA256 != source.ContentSHA256 {
+				t.Fatalf("persisted source differs from canonical output: %+v", committed)
+			}
+			return
+		}
+	}
+	t.Fatal("canonical current-turn source plan was not persisted")
+}
+
+func TestTaskPlanCurrentTaskTurnInputRejectsMissingTrustedMessageID(t *testing.T) {
+	store, broker, current := newTaskPlanSourceTestBroker(t, resolvedUserTaskPlanSource)
+	arguments := taskPlanSourceArguments(task.PlanVerificationRequirementCurrentTaskTurnInputLocator, "",
+		string(task.PlanVerificationRequirementUserMessage))
+	arguments = strings.Replace(arguments, `"locator":"`+task.PlanVerificationRequirementCurrentTaskTurnInputLocator+`"`,
+		`"locator":"`+task.PlanVerificationRequirementCurrentTaskTurnInputLocator+`","message_id":"m1234567","content_sha256":"`+
+			strings.Repeat("a", 64)+`"`, 1)
+	call := briefPlanCall(current, "plan-current-turn-source-missing-id", arguments)
+	result, err := broker.Execute(context.Background(), current, call)
+	if err != nil || result.Status != AgentToolFailed || len(store.inputs) != 0 {
+		t.Fatalf("missing trusted current-turn identity result = %#v err=%v inputs=%+v", result, err, store.inputs)
+	}
+	for _, progress := range store.committedTaskProgress {
+		if progress.CloudDSHTaskPlan != nil {
+			t.Fatal("current-turn source was persisted without trusted message metadata")
+		}
 	}
 }
 
@@ -379,15 +556,20 @@ func TestLegacyProjectSourcePlanReplayDoesNotResolveOrChangeCanonicalReceipt(t *
 
 func TestTaskPlanRequirementSourceToolSchemaUsesServerResolvedDigest(t *testing.T) {
 	definition := cloudDSHTaskPlanDefinition()
+	if descriptionBytes := len([]byte(definition.Description)); descriptionBytes > 2048 {
+		t.Fatalf("task-plan tool description is %d bytes; CloudDSH Worker permits at most 2048", descriptionBytes)
+	}
 	if _, err := validateAgentTools([]AgentToolDefinition{definition}); err != nil {
 		t.Fatalf("task plan tool schema is invalid: %v", err)
 	}
 	if !strings.Contains(definition.Description, cloudDSHCurrentHistorySearchToolName) ||
 		!strings.Contains(definition.Description, "locator=current_task_input") ||
+		!strings.Contains(definition.Description, "locator=history_search_result") ||
+		!strings.Contains(definition.Description, "history_result_token") ||
 		!strings.Contains(definition.Description, "fixed through_sequence") ||
 		!strings.Contains(definition.Description, "can omit messages accepted after Task start") ||
 		!strings.Contains(definition.Description, "Never infer or invent an ID") {
-		t.Fatalf("plan source instructions do not provide a truthful ID lookup path: %s", definition.Description)
+		t.Fatalf("plan source instructions do not describe trusted source resolution: %s", definition.Description)
 	}
 	var schema map[string]any
 	if err := json.Unmarshal(definition.Parameters, &schema); err != nil {
@@ -399,17 +581,24 @@ func TestTaskPlanRequirementSourceToolSchemaUsesServerResolvedDigest(t *testing.
 	check := stepItem["properties"].(map[string]any)["verification_check"].(map[string]any)
 	source := check["properties"].(map[string]any)["requirement_source"].(map[string]any)
 	sourceProperties := source["properties"].(map[string]any)
-	if _, ok := sourceProperties["content_sha256"]; !ok {
-		t.Fatal("source schema does not expose optional canonical digest")
+	historyToken, ok := sourceProperties["history_result_token"].(map[string]any)
+	if !ok {
+		t.Fatal("source schema does not expose authorized history result token")
 	}
-	for _, required := range source["required"].([]any) {
-		if required == "content_sha256" {
-			t.Fatal("plan tool still requires the model to compute a source digest")
+	if historyToken["minLength"] != float64(1) || historyToken["maxLength"] != float64(task.PlanVerificationRequirementHistoryResultTokenMaxBytes) {
+		t.Fatalf("history result token bounds = %+v", historyToken)
+	}
+	for _, untrusted := range []string{"message_id", "content_sha256"} {
+		if _, ok := sourceProperties[untrusted]; ok {
+			t.Fatalf("plan tool exposes model-controlled canonical field %q", untrusted)
 		}
 	}
 	locator := sourceProperties["locator"].(map[string]any)
-	if values := locator["enum"].([]any); len(values) != 1 || values[0] != task.PlanVerificationRequirementCurrentTaskInputLocator {
-		t.Fatalf("current task input locator schema = %+v", locator)
+	if values := locator["enum"].([]any); len(values) != 3 ||
+		values[0] != task.PlanVerificationRequirementCurrentTaskInputLocator ||
+		values[1] != task.PlanVerificationRequirementCurrentTaskTurnInputLocator ||
+		values[2] != task.PlanVerificationRequirementHistorySearchResultLocator {
+		t.Fatalf("server-resolved task input locator schema = %+v", locator)
 	}
 }
 

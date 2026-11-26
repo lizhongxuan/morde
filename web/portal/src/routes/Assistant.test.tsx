@@ -175,7 +175,12 @@ function mockCommon(options: { conversations?: Conversation[]; messages?: Conver
   vi.spyOn(portalApi, 'ensureMainConversation').mockResolvedValue({ status: 'ready', conversation_id: conversation.id, version: 1 });
   vi.spyOn(portalApi, 'setMainConversation').mockImplementation(async (conversationID) => ({ status: 'ready', conversation_id: conversationID, version: 2 }));
   vi.spyOn(portalApi, 'conversationMessages').mockResolvedValue({ items: options.messages ?? [], next_cursor: null });
-  vi.spyOn(portalApi, 'conversationMessageRetryEligibility').mockResolvedValue({ retry_eligible: true, retry_reason: 'retry_available' });
+  vi.spyOn(portalApi, 'conversationMessageRetryEligibility').mockImplementation(async (_conversationID, messageID) => {
+    const failed = options.messages?.find((item) => item.id === messageID);
+    return failed?.routing_failure_reason === 'message_too_long'
+      ? { retry_eligible: false, retry_reason: 'message_too_long' }
+      : { retry_eligible: true, retry_reason: 'retry_available' };
+  });
   vi.spyOn(portalApi, 'conversationPreview').mockResolvedValue({ items: [], next_cursor: null });
   vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
   vi.spyOn(portalApi, 'conversationTasks').mockResolvedValue({ items: [], next_cursor: null, pending_count: 0 });
@@ -3065,6 +3070,7 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByText('模型暂时不可用或用量待核对')).not.toBeInTheDocument();
     expect(screen.queryByText('消息处理失败，原消息已保留。')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+    expect(portalApi.conversationMessageRetryEligibility).not.toHaveBeenCalled();
   });
 
   it('does not offer a route retry when a failed message already belongs to a task', async () => {
@@ -3076,6 +3082,7 @@ describe('Assistant durable tasks', () => {
     await screen.findByText(taskLinked.content);
     expect(screen.queryByText('消息处理失败，原消息已保留。')).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+    expect(portalApi.conversationMessageRetryEligibility).not.toHaveBeenCalled();
   });
 
   it('keeps a failed route bubble free of status and retry controls', async () => {
@@ -3087,25 +3094,25 @@ describe('Assistant durable tasks', () => {
     expect(within(article).queryByRole('status')).not.toBeInTheDocument();
     expect(within(article).queryByRole('button')).not.toBeInTheDocument();
     const statusRow = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
-    expect(within(statusRow).getByText('消息已保存但尚未处理')).toBeInTheDocument();
+    expect(within(statusRow).getByText('刚才没能处理你的消息')).toBeInTheDocument();
     expect(await within(statusRow).findByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
     expect(retry).not.toHaveBeenCalled();
   });
 
   it.each([
-    ['model_unavailable', '系统报告：模型暂时不可用或用量待核对', '确认模型可用性和用量后，可以重新处理这条消息。', true],
-    ['routing_context_unavailable', '系统报告：消息上下文暂时无法读取', '可以安全重试，让系统重新读取会话上下文并处理原消息。', true],
-    ['routing_action_unavailable', '系统报告：处理状态暂时无法更新', '可以安全重试，让系统重新检查消息处理状态。', true],
-    ['message_too_long', '系统报告：消息及上下文超过当前模型输入上限，原文已保留；请缩短后重新发送。',
+    ['model_unavailable', '暂时无法确定具体原因，原消息已保留。', '', true],
+    ['routing_context_unavailable', '暂时无法获取完整的会话上下文，原消息已保留。', '', true],
+    ['routing_action_unavailable', '暂时无法完成消息处理，原消息已保留。', '', true],
+    ['message_too_long', '消息内容或上下文超过当前处理上限，原消息已保留。',
       '原文已保留；请缩短后重新发送，不能重试这条原文。', false],
   ] as const)('shows a separate Morde status row and truthful next step for %s', async (reason, mappedReason, nextStep, retryAllowed) => {
     mockCommon({ conversations: [conversation], messages: [failedConversationMessage({ routing_failure_reason: reason })] });
     renderPage();
 
     const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
-    expect(within(row).getByText('消息已保存但尚未处理')).toBeInTheDocument();
+    expect(within(row).getByText('刚才没能处理你的消息')).toBeInTheDocument();
     expect(within(row).getByText(mappedReason)).toBeInTheDocument();
-    expect(within(row).getByText(nextStep)).toBeInTheDocument();
+    if (nextStep) expect(within(row).getByText(nextStep)).toBeInTheDocument();
     if (retryAllowed) expect(await within(row).findByRole('button', { name: '重新处理这条消息' })).toBeInTheDocument();
     else expect(within(row).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
     const article = await screen.findByRole('article', { name: '你的消息' });
@@ -3123,6 +3130,7 @@ describe('Assistant durable tasks', () => {
     const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
     expect(within(row).getByText(nextStep)).toBeInTheDocument();
     expect(within(row).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+    expect(portalApi.conversationMessageRetryEligibility).not.toHaveBeenCalled();
   });
 
   it('does not offer retry when the service has not confirmed automatic message routing', async () => {
@@ -3187,14 +3195,14 @@ describe('Assistant durable tasks', () => {
       expect(localStorage.getItem(`morde:message-processing-retry:${confirmed.service_instance_id}:u1234567::${conversation.id}:${failed.id}`)).toBeNull();
     });
 
-  it('reuses one idempotency key after an uncertain retry and clears it only when routing leaves failed', async () => {
+  it('reuses the key after an uncertain retry but starts a fresh retry after confirmed acceptance', async () => {
     const failed = failedConversationMessage();
     const serviceInstanceID = clientContract.capabilities.cloud_execution.service_instance_id;
     let rejectFirstAttempt: ((reason?: unknown) => void) | undefined;
     const firstAttempt = new Promise<void>((_resolve, reject) => { rejectFirstAttempt = reject; });
     mockCommon({ conversations: [conversation], messages: [failed] });
     const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing')
-      .mockImplementationOnce(() => firstAttempt).mockResolvedValueOnce(undefined);
+      .mockImplementationOnce(() => firstAttempt).mockResolvedValue(undefined);
     const user = userEvent.setup();
     const { client } = renderPage();
 
@@ -3217,7 +3225,13 @@ describe('Assistant durable tasks', () => {
     await user.click(retryButton);
     await waitFor(() => expect(retry).toHaveBeenCalledTimes(2));
     expect(retry).toHaveBeenNthCalledWith(2, conversation.id, failed.id, key, serviceInstanceID, authUser.id);
-    await waitFor(() => expect(localStorage.getItem(storageKey)).toBe(key));
+    await waitFor(() => expect(localStorage.getItem(storageKey)).toBeNull());
+
+    // The accepted attempt may fail again before the UI observes pending.
+    // A new click must not replay the previous 202 response forever.
+    await user.click(await within(row).findByRole('button', { name: '重新处理这条消息' }));
+    await waitFor(() => expect(retry).toHaveBeenCalledTimes(3));
+    expect(retry.mock.calls[2]?.[2]).not.toBe(key);
 
     const queryKey = ['conversation-messages', conversation.id] as const;
     await waitFor(() => expect(client.getQueryData(queryKey)).toBeDefined());
@@ -3236,6 +3250,112 @@ describe('Assistant durable tasks', () => {
     await screen.findByText(message.content);
     expect(screen.queryByRole('group', { name: 'Morde 的消息处理状态' })).not.toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+    expect(portalApi.conversationMessageRetryEligibility).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['route_not_failed', '服务端确认这条消息当前不再处于失败状态'],
+    ['task_already_created', '服务端确认这条消息已关联任务'],
+    ['message_too_long', '原文超过当前处理限制'],
+    ['reconciliation_required', '上次共享模型调用仍待对账'],
+    ['route_processing', '这条消息仍在处理中'],
+    ['result_review_not_retryable', '这条结果复核不支持从原消息重试'],
+    ['result_review_outcome_unknown', '结果复核调用状态仍未知'],
+    ['retry_limit_reached', '这条消息已达到重试次数上限'],
+    ['future_reason', '服务端暂时无法确认这条消息是否可以重试'],
+  ])('fails closed for server ineligibility reason %s', async (reason, explanation) => {
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage()] });
+    vi.mocked(portalApi.conversationMessageRetryEligibility).mockResolvedValue({ retry_eligible: false, retry_reason: reason } as unknown as Awaited<ReturnType<typeof portalApi.conversationMessageRetryEligibility>>);
+    renderPage();
+
+    const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    expect(await within(row).findByText(new RegExp(explanation))).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+  });
+
+  it('keeps retry unavailable while eligibility is loading or its request fails', async () => {
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage()] });
+    type RetryEligibility = Awaited<ReturnType<typeof portalApi.conversationMessageRetryEligibility>>;
+    let resolveEligibility: ((value: RetryEligibility) => void) | undefined;
+    vi.mocked(portalApi.conversationMessageRetryEligibility).mockImplementationOnce(() => new Promise((resolve) => { resolveEligibility = resolve; }));
+    const { unmount } = renderPage();
+
+    const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    expect(within(row).getByText('正在核对服务端重试条件；核对完成前不会发送重试。')).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+    unmount();
+    resolveEligibility?.({ retry_eligible: true, retry_reason: 'retry_available' });
+
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage()] });
+    vi.mocked(portalApi.conversationMessageRetryEligibility).mockRejectedValue(new Error('eligibility unavailable'));
+    renderPage();
+    const failedRow = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    expect(await within(failedRow).findByText('暂时无法确认重试资格；原消息已保留，请稍后重新核对。')).toBeInTheDocument();
+    expect(within(failedRow).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+  });
+
+  it('lets the user recheck a temporary eligibility failure without sending a retry', async () => {
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage()] });
+    const eligibility = vi.mocked(portalApi.conversationMessageRetryEligibility);
+    eligibility.mockRejectedValueOnce(new Error('network unavailable'))
+      .mockResolvedValue({ retry_eligible: true, retry_reason: 'retry_available' });
+    const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing');
+    const user = userEvent.setup();
+    renderPage();
+
+    const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    await user.click(await within(row).findByRole('button', { name: '重新检查' }));
+    expect(await within(row).findByRole('button', { name: '重新处理这条消息' })).toBeEnabled();
+    expect(eligibility).toHaveBeenCalledTimes(2);
+    expect(retry).not.toHaveBeenCalled();
+  });
+
+  it('requires explicit confirmation for an unknown personal model-call outcome before a fresh eligibility check and retry', async () => {
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage()] });
+    const eligibility = vi.mocked(portalApi.conversationMessageRetryEligibility);
+    eligibility.mockResolvedValue({ retry_eligible: true, retry_reason: 'retry_available',
+      retry_warning: 'previous_personal_model_call_outcome_unknown' });
+    const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing').mockResolvedValue(undefined);
+    const user = userEvent.setup();
+    renderPage();
+
+    const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    expect(await within(row).findByText(/上一次个人模型调用结果仍未知/)).toBeInTheDocument();
+    await user.click(await within(row).findByRole('button', { name: '重新处理这条消息' }));
+    expect(retry).not.toHaveBeenCalled();
+    expect(await screen.findByRole('dialog', { name: '上一次模型调用结果未知' })).toHaveTextContent('可能产生重复调用');
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: '确认后重试' }));
+
+    await waitFor(() => expect(retry).toHaveBeenCalledOnce());
+    expect(eligibility.mock.calls.length).toBeGreaterThanOrEqual(2);
+    expect(retry).toHaveBeenCalledWith(conversation.id, 'm2345678', expect.any(String),
+      clientContract.capabilities.cloud_execution.service_instance_id, authUser.id);
+  });
+
+  it('rejects an unknown reason even when the server marks it eligible', async () => {
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage()] });
+    vi.mocked(portalApi.conversationMessageRetryEligibility).mockResolvedValue({ retry_eligible: true, retry_reason: 'future_reason' } as unknown as Awaited<ReturnType<typeof portalApi.conversationMessageRetryEligibility>>);
+    renderPage();
+
+    const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    expect(await within(row).findByText('服务端暂时无法确认这条消息是否可以重试；原消息仍已保留。')).toBeInTheDocument();
+    expect(within(row).queryByRole('button', { name: '重新处理这条消息' })).not.toBeInTheDocument();
+  });
+
+  it('blocks a retry if the fresh eligibility check introduces an unknown warning', async () => {
+    mockCommon({ conversations: [conversation], messages: [failedConversationMessage()] });
+    const eligibility = vi.mocked(portalApi.conversationMessageRetryEligibility);
+    eligibility.mockResolvedValueOnce({ retry_eligible: true, retry_reason: 'retry_available' });
+    eligibility.mockResolvedValueOnce({ retry_eligible: true, retry_reason: 'retry_available', retry_warning: 'future_warning' } as unknown as Awaited<ReturnType<typeof portalApi.conversationMessageRetryEligibility>>);
+    const retry = vi.spyOn(portalApi, 'retryConversationMessageProcessing');
+    const user = userEvent.setup();
+    renderPage();
+
+    const row = await screen.findByRole('group', { name: 'Morde 的消息处理状态' });
+    await user.click(await within(row).findByRole('button', { name: '重新处理这条消息' }));
+    expect(await screen.findByText('服务端返回尚未支持的重试警告；为避免重复操作，暂不重试。')).toBeInTheDocument();
+    expect(retry).not.toHaveBeenCalled();
+    expect(screen.queryByRole('dialog', { name: '上一次模型调用结果未知' })).not.toBeInTheDocument();
   });
 
   it('shows failed result review status without a task-level retry action', async () => {

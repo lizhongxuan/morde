@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -35,7 +36,7 @@ func TestTaskStepDetailIsBoundToItsIdentityAndTruncatedSafely(t *testing.T) {
 		t.Fatal("step detail ciphertext decrypted for a different owner")
 	}
 	var decoded TaskStepDetailDocument
-	if err := json.Unmarshal(plain, &decoded); err != nil || decoded != document {
+	if err := json.Unmarshal(plain, &decoded); err != nil || !reflect.DeepEqual(decoded, document) {
 		t.Fatalf("decoded detail=%+v err=%v", decoded, err)
 	}
 	truncated, wasTruncated := truncateTaskDetail(strings.Repeat("a", 4096)+"界", false)
@@ -93,6 +94,146 @@ func TestTaskToolContentEvidenceCapturesBoundedPublicWebResult(t *testing.T) {
 	}
 }
 
+func TestTaskToolSourceLocationsRecordOnlySuccessfulWebReadRequestURI(t *testing.T) {
+	encoded, err := json.Marshal(cloudDSHMCPOutput{Text: []string{"Read public source passage."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidence := taskToolContentEvidence(cloudDSHWebReadToolName, AgentToolResult{Status: AgentToolSucceeded, Output: string(encoded)})
+	if evidence == nil {
+		t.Fatal("successful web-read output did not produce content evidence")
+	}
+	locations := taskToolSourceLocations(cloudDSHWebReadToolName, `{"url":"https://Example.test/docs/page?campaign=private-value"}`, evidence)
+	if len(locations) != 1 || locations[0].Kind != taskStepSourceLocationKindPublicWebPage ||
+		locations[0].URI != "https://example.test/docs/page" || locations[0].State != taskStepSourceLocationStateRequestedURIOnly ||
+		locations[0].ContentSHA256 != evidence.SHA256 {
+		t.Fatalf("web-read source location=%+v; want query-free requested URI bound to content", locations)
+	}
+	if got := taskToolSourceLocations(cloudDSHWebReadToolName,
+		`{"url":"https://example.test/docs/page?token=secret-value"}`, evidence); len(got) != 0 {
+		t.Fatalf("credential-bearing source URL was persisted: %+v", got)
+	}
+	if got := taskToolSourceLocations(cloudDSHWebSearchToolName, `{"query":"public source"}`, evidence); len(got) != 0 {
+		t.Fatalf("search query was misrepresented as a read locator: %+v", got)
+	}
+	if got := taskToolSourceLocations(cloudDSHWebReadToolName, `{"url":"https://user:secret@example.test/page"}`, evidence); len(got) != 0 {
+		t.Fatalf("credential-bearing URL authority was persisted: %+v", got)
+	}
+}
+
+func TestTaskToolWorkspaceSourceLocationsUseVerifiedReadAndSearchReceipts(t *testing.T) {
+	const workspaceID = "w1234567"
+	inputRevision, checkpointRevision := int64(4), int64(8)
+	current := task.Task{ID: "q1234567", OwnerID: "u1234567", WorkspaceID: workspaceID,
+		InputRevision: &inputRevision, WorkspaceCheckpointRevision: &checkpointRevision}
+	content := "Project source line.\nAnother line."
+	contentDigest := sha256.Sum256([]byte(content))
+	manifestDigest := strings.Repeat("a", 64)
+	readOutput, err := json.Marshal(cloudDSHWorkspaceReadOutput{WorkspaceID: workspaceID, Revision: 6,
+		SourceMode: cloudDSHWorkspaceSourceModeImmutableRevision, ManifestSHA256: manifestDigest,
+		Path: "docs/source.md", SizeBytes: int64(len(content)), SHA256: hex.EncodeToString(contentDigest[:]), Content: content})
+	if err != nil {
+		t.Fatal(err)
+	}
+	locations := taskToolWorkspaceSourceLocations(cloudDSHWorkspaceReadToolName,
+		`{"expected_revision":6,"path":"docs/source.md"}`, AgentToolResult{Status: AgentToolSucceeded, Output: string(readOutput)}, current)
+	if len(locations) != 1 || locations[0].Kind != taskStepSourceLocationKindWorkspaceFile ||
+		locations[0].WorkspaceID != workspaceID || locations[0].Revision == nil || *locations[0].Revision != 6 ||
+		locations[0].Path != "docs/source.md" || locations[0].State != taskStepSourceLocationStateWorkspaceRevision ||
+		locations[0].ManifestSHA256 != manifestDigest || locations[0].ContentSHA256 != hex.EncodeToString(contentDigest[:]) {
+		t.Fatalf("immutable Workspace read locator=%+v", locations)
+	}
+
+	badRead, _ := json.Marshal(cloudDSHWorkspaceReadOutput{WorkspaceID: workspaceID, Revision: 6,
+		SourceMode: cloudDSHWorkspaceSourceModeImmutableRevision, ManifestSHA256: manifestDigest,
+		Path: "docs/source.md", SizeBytes: int64(len(content)), SHA256: strings.Repeat("0", 64), Content: content})
+	if got := taskToolWorkspaceSourceLocations(cloudDSHWorkspaceReadToolName,
+		`{"expected_revision":6,"path":"docs/source.md"}`, AgentToolResult{Status: AgentToolSucceeded, Output: string(badRead)}, current); len(got) != 0 {
+		t.Fatalf("Workspace read with content digest mismatch created a locator: %+v", got)
+	}
+	if got := taskToolWorkspaceSourceLocations(cloudDSHWorkspaceReadToolName,
+		`{"expected_revision":6,"path":".env"}`, AgentToolResult{Status: AgentToolSucceeded, Output: string(readOutput)}, current); len(got) != 0 {
+		t.Fatalf("sensitive Workspace path created a locator: %+v", got)
+	}
+
+	searchOutput, err := json.Marshal(cloudDSHWorkspaceSearchOutput{WorkspaceID: workspaceID, Revision: 6,
+		SourceMode: cloudDSHWorkspaceSourceModeImmutableRevision, ManifestSHA256: manifestDigest,
+		Complete: true, Matches: []cloudDSHWorkspaceSearchMatch{{Path: "docs/source.md", Line: 2,
+			ContentSHA256: hex.EncodeToString(contentDigest[:]), Text: "Another line."}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	locations = taskToolWorkspaceSourceLocations(cloudDSHWorkspaceSearchToolName,
+		`{"expected_revision":6,"query":"line"}`, AgentToolResult{Status: AgentToolSucceeded, Output: string(searchOutput)}, current)
+	if len(locations) != 1 || locations[0].Kind != taskStepSourceLocationKindWorkspaceSearchMatch ||
+		locations[0].Line == nil || *locations[0].Line != 2 || locations[0].Path != "docs/source.md" ||
+		locations[0].ContentSHA256 != hex.EncodeToString(contentDigest[:]) {
+		t.Fatalf("Workspace search locator=%+v", locations)
+	}
+
+	liveRead, _ := json.Marshal(cloudDSHWorkspaceReadOutput{WorkspaceID: workspaceID, Revision: 6,
+		SourceMode: cloudDSHWorkspaceSourceModeLiveDirectory, Path: "docs/source.md", SizeBytes: int64(len(content)),
+		SHA256: hex.EncodeToString(contentDigest[:]), Content: content})
+	locations = taskToolWorkspaceSourceLocations(cloudDSHWorkspaceReadToolName,
+		`{"expected_revision":6,"path":"docs/source.md"}`, AgentToolResult{Status: AgentToolSucceeded, Output: string(liveRead)}, current)
+	if len(locations) != 1 || locations[0].State != taskStepSourceLocationStateWorkspaceLive || locations[0].ManifestSHA256 != "" {
+		t.Fatalf("live Workspace locator overstated an immutable revision: %+v", locations)
+	}
+	if got := taskToolWorkspaceSourceLocations(cloudDSHWorkspaceReadToolName,
+		`{"expected_revision":9,"path":"docs/source.md"}`, AgentToolResult{Status: AgentToolSucceeded, Output: string(liveRead)}, current); len(got) != 0 {
+		t.Fatalf("out-of-checkpoint Workspace revision created a locator: %+v", got)
+	}
+	if got := taskToolWorkspaceSourceLocations(cloudDSHWorkspaceReadToolName,
+		`{"expected_revision":6,"path":"docs/source.md"}`, AgentToolResult{Status: AgentToolFailed, Output: string(readOutput)}, current); len(got) != 0 {
+		t.Fatalf("failed Workspace read created a locator: %+v", got)
+	}
+}
+
+func TestTaskToolCallProgressPersistsWorkspaceSourceLocationWithoutFileContent(t *testing.T) {
+	sealer, err := NewSealer(bytes.Repeat([]byte{14}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ownerID, taskID, stepID, workspaceID = "u1234567", "q1234567", "s1234567", "w1234567"
+	const leaseOwner, agentID, sessionID = "lease-owner", "agent_1", "session_1"
+	const leaseVersion, generation, authorizationVersion, revision int64 = 4, 2, 3, 5
+	inputRevision, checkpointRevision := int64(4), int64(8)
+	current := task.Task{ID: taskID, OwnerID: ownerID, InitiatorID: ownerID, WorkspaceID: workspaceID,
+		InputRevision: &inputRevision, WorkspaceCheckpointRevision: &checkpointRevision,
+		AgentInstanceID: agentID, AgentGeneration: generation, AgentSessionID: sessionID, CurrentRevision: int64Pointer(revision),
+		Authorization: task.Authorization{Version: authorizationVersion}, Lease: task.Lease{Owner: leaseOwner, Version: leaseVersion}}
+	callID := "workspace-read-call"
+	call := ModelToolCall{CallID: callID, Name: cloudDSHWorkspaceReadToolName, Arguments: `{"expected_revision":6,"path":"docs/source.md"}`,
+		TaskFence: &ModelTaskFence{TaskID: taskID, OwnerID: ownerID, InitiatorID: ownerID, LeaseOwner: leaseOwner,
+			LeaseVersion: leaseVersion, AgentInstanceID: agentID, AgentGeneration: generation, AgentSessionID: sessionID,
+			AuthorizationVersion: authorizationVersion}}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, sealer)
+	content := "Private Workspace file contents must not be copied into step evidence."
+	digest := sha256.Sum256([]byte(content))
+	output, _ := json.Marshal(cloudDSHWorkspaceReadOutput{WorkspaceID: workspaceID, Revision: 6,
+		SourceMode: cloudDSHWorkspaceSourceModeImmutableRevision, ManifestSHA256: strings.Repeat("b", 64),
+		Path: "docs/source.md", SizeBytes: int64(len(content)), SHA256: hex.EncodeToString(digest[:]), Content: content})
+	ctx = withTaskToolWorkspaceSourceLocations(ctx, current, call.Name, AgentToolResult{Status: AgentToolSucceeded, Output: string(output)})
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok {
+		t.Fatal("valid Workspace read did not produce task activity")
+	}
+	progress, err := taskToolCallProgress(activity, task.Step{ID: stepID, Status: task.StepSucceeded, Summary: "Read completed."})
+	if err != nil || progress == nil || progress.DetailState != "available" {
+		t.Fatalf("Workspace read task progress=%+v err=%v", progress, err)
+	}
+	plain, err := sealer.OpenWithAAD(progress.DetailCiphertext, taskStepDetailAAD(ownerID, taskID, stepID, revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail TaskStepDetailDocument
+	if json.Unmarshal(plain, &detail) != nil || len(detail.SourceLocations) != 1 || !validTaskStepSourceLocationID(detail.SourceLocations[0].ID) ||
+		detail.SourceLocations[0].ID != taskStepSourceLocationID(ownerID, taskID, stepID, revision, callID, detail.SourceLocations[0]) ||
+		detail.SourceLocations[0].Path != "docs/source.md" || strings.Contains(string(plain), content) {
+		t.Fatalf("sealed Workspace detail did not persist only stable source metadata: %+v", detail)
+	}
+}
+
 func TestTaskToolContentEvidenceExcludesWorkspaceReads(t *testing.T) {
 	result := AgentToolResult{Status: AgentToolSucceeded, Output: `{"content":"private Workspace bytes"}`}
 	if taskToolContentEvidence(cloudDSHWorkspaceReadToolName, result) != nil {
@@ -139,6 +280,56 @@ func TestTaskToolCallProgressSealsValidatedSearchQuery(t *testing.T) {
 	if err := json.Unmarshal(plain, &detail); err != nil || detail.Input != "Search query: AI news (time range: week)." ||
 		detail.ContentEvidence == nil || !strings.Contains(detail.ContentEvidence.Preview, "Example public source") {
 		t.Fatalf("sealed search detail = %+v, err=%v", detail, err)
+	}
+}
+
+func TestTaskToolCallProgressPersistsRequestOnlyWebReadLocation(t *testing.T) {
+	sealer, err := NewSealer(bytes.Repeat([]byte{13}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const ownerID, taskID, stepID = "u1234567", "q1234567", "s1234567"
+	const leaseOwner, agentID, sessionID = "lease-owner", "agent_1", "session_1"
+	const leaseVersion, generation, authorizationVersion, revision int64 = 4, 2, 3, 5
+	current := task.Task{ID: taskID, OwnerID: ownerID, InitiatorID: ownerID, AgentInstanceID: agentID,
+		AgentGeneration: generation, AgentSessionID: sessionID, CurrentRevision: int64Pointer(revision),
+		Authorization: task.Authorization{Version: authorizationVersion}, Lease: task.Lease{Owner: leaseOwner, Version: leaseVersion}}
+	call := ModelToolCall{CallID: "read-call-1", Name: cloudDSHWebReadToolName,
+		Arguments: `{"url":"https://Example.test/docs/source?tracking=private-value"}`,
+		TaskFence: &ModelTaskFence{TaskID: taskID, OwnerID: ownerID, InitiatorID: ownerID, LeaseOwner: leaseOwner,
+			LeaseVersion: leaseVersion, AgentInstanceID: agentID, AgentGeneration: generation, AgentSessionID: sessionID,
+			AuthorizationVersion: authorizationVersion}}
+	ctx := withCloudDSHToolActivity(context.Background(), current, call, sealer)
+	output, err := json.Marshal(cloudDSHMCPOutput{Text: []string{"Source passage."}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx = withTaskToolContentEvidence(ctx, call.Name, AgentToolResult{Status: AgentToolSucceeded, Output: string(output)})
+	activity, ok := cloudDSHToolActivityFromContext(ctx)
+	if !ok {
+		t.Fatal("valid web-read call did not produce task activity")
+	}
+	progress, err := taskToolCallProgress(activity, task.Step{ID: stepID, Status: task.StepSucceeded, Summary: "Read completed."})
+	if err != nil || progress == nil || progress.DetailState != "available" {
+		t.Fatalf("web-read task progress=%+v err=%v", progress, err)
+	}
+	plain, err := sealer.OpenWithAAD(progress.DetailCiphertext, taskStepDetailAAD(ownerID, taskID, stepID, revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var detail TaskStepDetailDocument
+	if json.Unmarshal(plain, &detail) != nil || len(detail.SourceLocations) != 1 ||
+		detail.SourceLocations[0].URI != "https://example.test/docs/source" ||
+		detail.SourceLocations[0].State != taskStepSourceLocationStateRequestedURIOnly ||
+		detail.ContentEvidence == nil || detail.SourceLocations[0].ContentSHA256 != detail.ContentEvidence.SHA256 ||
+		strings.Contains(string(plain), "private-value") {
+		t.Fatalf("sealed web-read detail did not retain a safe, digest-bound locator: %+v", detail)
+	}
+	invalid := detail
+	invalid.SourceLocations = append([]TaskStepSourceLocation(nil), detail.SourceLocations...)
+	invalid.SourceLocations[0].ContentSHA256 = strings.Repeat("0", 64)
+	if validTaskStepDetailDocument(invalid) {
+		t.Fatal("source location with a mismatched content digest was accepted")
 	}
 }
 
@@ -438,7 +629,12 @@ func TestTaskServiceReturnsBoundWebContentEvidenceToAuthorizedTaskReader(t *test
 	}
 	contentDigest := sha256.Sum256([]byte("source passage"))
 	contentEvidence := &TaskStepContentEvidence{SHA256: hex.EncodeToString(contentDigest[:]), Preview: "source passage"}
-	document := TaskStepDetailDocument{Object: cloudDSHWebReadToolName, Input: "Read authorized source.", Result: "Read completed.", ContentEvidence: contentEvidence}
+	callID := "web-read-call-1"
+	locations := []TaskStepSourceLocation{{Kind: taskStepSourceLocationKindPublicWebPage, URI: "https://example.test/docs/source",
+		State: taskStepSourceLocationStateRequestedURIOnly, ContentSHA256: contentEvidence.SHA256}}
+	locations[0].ID = taskStepSourceLocationID(ownerID, taskID, stepID, revision, callID, locations[0])
+	document := TaskStepDetailDocument{Object: cloudDSHWebReadToolName, Input: "Read authorized source.", Result: "Read completed.",
+		ContentEvidence: contentEvidence, SourceLocations: locations}
 	ciphertext, digest, size, err := sealTaskStepDetail(sealer, ownerID, taskID, stepID, revision, document)
 	if err != nil {
 		t.Fatal(err)
@@ -446,7 +642,8 @@ func TestTaskServiceReturnsBoundWebContentEvidenceToAuthorizedTaskReader(t *test
 	revisionValue := revision
 	store := &taskStepDetailStoreStub{
 		details: TaskDetails{Task: task.Task{ID: taskID, OwnerID: ownerID},
-			Steps: []task.Step{{ID: stepID, ToolName: cloudDSHWebReadToolName, Status: task.StepSucceeded, TaskRevision: &revisionValue, DetailState: "available"}}},
+			Steps: []task.Step{{ID: stepID, ToolName: cloudDSHWebReadToolName, Status: task.StepSucceeded, TaskRevision: &revisionValue,
+				ToolCallKey: callID, DetailState: "available"}}},
 		record: TaskStepDetailRecord{TaskID: taskID, OwnerID: ownerID, StepID: stepID, TaskRevision: revision,
 			Ciphertext: ciphertext, SHA256: digest, ContentEvidenceSHA256: contentDigest[:], SizeBytes: size},
 	}
@@ -456,8 +653,10 @@ func TestTaskServiceReturnsBoundWebContentEvidenceToAuthorizedTaskReader(t *test
 		t.Fatal(err)
 	}
 	detail, err := service.GetStepDetail(context.Background(), taskTestPrincipal(), taskID, stepID)
-	if err != nil || detail.ContentEvidence == nil || *detail.ContentEvidence != *contentEvidence {
-		t.Fatalf("web content evidence available to authorized Task reader = %+v, err=%v", detail.ContentEvidence, err)
+	if err != nil || detail.ContentEvidence == nil || *detail.ContentEvidence != *contentEvidence || len(detail.SourceLocations) != 1 ||
+		detail.SourceLocations[0] != locations[0] {
+		t.Fatalf("web content evidence/source location available to authorized Task reader = %+v/%+v, err=%v",
+			detail.ContentEvidence, detail.SourceLocations, err)
 	}
 	if authorizer.calls != 1 || authorizer.lastScope != taskReadScope {
 		t.Fatalf("web content evidence reader authorization calls=%d scope=%q, want one task-read authorization", authorizer.calls, authorizer.lastScope)
@@ -465,13 +664,84 @@ func TestTaskServiceReturnsBoundWebContentEvidenceToAuthorizedTaskReader(t *test
 	encoded, err := json.Marshal(detail)
 	var publicDetail struct {
 		ContentEvidence *TaskStepContentEvidence `json:"content_evidence"`
+		SourceLocations []TaskStepSourceLocation `json:"source_locations"`
 	}
 	if err != nil || json.Unmarshal(encoded, &publicDetail) != nil || publicDetail.ContentEvidence == nil ||
-		*publicDetail.ContentEvidence != *contentEvidence {
-		t.Fatalf("authorized TaskStepDetail omitted persisted web content evidence: %s, err=%v", encoded, err)
+		*publicDetail.ContentEvidence != *contentEvidence || len(publicDetail.SourceLocations) != 1 || publicDetail.SourceLocations[0] != locations[0] {
+		t.Fatalf("authorized TaskStepDetail omitted persisted web content evidence/source location: %s, err=%v", encoded, err)
+	}
+	legacyDocument := document
+	legacyDocument.SourceLocations = append([]TaskStepSourceLocation(nil), document.SourceLocations...)
+	legacyDocument.SourceLocations[0].ID = ""
+	if _, _, _, err := sealTaskStepDetail(sealer, ownerID, taskID, stepID, revision, legacyDocument); err == nil {
+		t.Fatal("new Task step details accepted a source location without a stable ID")
+	}
+	legacyPlain, err := json.Marshal(legacyDocument)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyCiphertext, err := sealer.SealWithAAD(legacyPlain, taskStepDetailAAD(ownerID, taskID, stepID, revision))
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyDigest := sha256.Sum256(legacyPlain)
+	store.record.Ciphertext, store.record.SHA256, store.record.SizeBytes = legacyCiphertext, legacyDigest[:], int32(len(legacyPlain))
+	legacyDetail, err := service.GetStepDetail(context.Background(), taskTestPrincipal(), taskID, stepID)
+	if err != nil || len(legacyDetail.SourceLocations) != 1 || legacyDetail.SourceLocations[0].ID != locations[0].ID {
+		t.Fatalf("legacy request-only locator did not receive a stable read-time ID: %+v err=%v", legacyDetail.SourceLocations, err)
 	}
 	store.record.ContentEvidenceSHA256 = make([]byte, sha256.Size)
 	if _, err := service.GetStepDetail(context.Background(), taskTestPrincipal(), taskID, stepID); domain.CodeOf(err) != domain.CodeInvalidState {
 		t.Fatalf("mismatched content evidence identity error = %v, want invalid state", err)
+	}
+}
+
+func TestTaskServiceReturnsWorkspaceSourceLocationsOnlyToAuthorizedWorkspaceReaders(t *testing.T) {
+	const ownerID, taskID, stepID, workspaceID, callID = "u1234567", "q1234567", "s1234567", "w1234567", "workspace-read-call"
+	const revision = int64(3)
+	sealer, err := NewSealer(bytes.Repeat([]byte{15}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	contentDigest := strings.Repeat("c", 64)
+	locations := []TaskStepSourceLocation{{Kind: taskStepSourceLocationKindWorkspaceFile, WorkspaceID: workspaceID,
+		Revision: int64Pointer(6), Path: "docs/private-project.md", ManifestSHA256: strings.Repeat("d", 64),
+		State: taskStepSourceLocationStateWorkspaceRevision, ContentSHA256: contentDigest}}
+	locations[0].ID = taskStepSourceLocationID(ownerID, taskID, stepID, revision, callID, locations[0])
+	document := TaskStepDetailDocument{Object: cloudDSHWorkspaceReadToolName, Input: "Workspace source read.", Result: "Read completed.",
+		SourceLocations: locations}
+	ciphertext, digest, size, err := sealTaskStepDetail(sealer, ownerID, taskID, stepID, revision, document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revisionValue := revision
+	store := &taskStepDetailStoreStub{
+		details: TaskDetails{Task: task.Task{ID: taskID, OwnerID: ownerID, WorkspaceID: workspaceID, WorkspaceOwnerID: ownerID},
+			Steps: []task.Step{{ID: stepID, ToolName: cloudDSHWorkspaceReadToolName, Status: task.StepSucceeded, TaskRevision: &revisionValue,
+				ToolCallKey: callID, DetailState: "available"}}},
+		record: TaskStepDetailRecord{TaskID: taskID, OwnerID: ownerID, StepID: stepID, TaskRevision: revision,
+			Ciphertext: ciphertext, SHA256: digest, SizeBytes: size},
+		workspace: workspace.Workspace{ID: workspaceID, OwnerID: ownerID, State: workspace.StateReady},
+	}
+	authorizer := &taskAuthorizerStub{}
+	service := &TaskService{store: store, authorizer: authorizer, executionAuthorizer: authorizer}
+	if err := service.SetTaskStepDetailSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	detail, err := service.GetStepDetail(context.Background(), taskTestPrincipal(), taskID, stepID)
+	if err != nil || detail.DetailState != "available" || len(detail.SourceLocations) != 1 || !reflect.DeepEqual(detail.SourceLocations[0], locations[0]) {
+		t.Fatalf("authorized Workspace reader source locations=%+v state=%q err=%v", detail.SourceLocations, detail.DetailState, err)
+	}
+	encoded, err := json.Marshal(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "project.md contents") {
+		t.Fatal("Workspace source locator exposed file contents")
+	}
+	store.workspace.OwnerID = "u7654321"
+	detail, err = service.GetStepDetail(context.Background(), taskTestPrincipal(), taskID, stepID)
+	if err != nil || detail.DetailState != "restricted" || len(detail.SourceLocations) != 0 {
+		t.Fatalf("Workspace source location escaped Workspace visibility: %+v err=%v", detail, err)
 	}
 }

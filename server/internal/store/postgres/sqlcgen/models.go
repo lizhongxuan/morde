@@ -2067,6 +2067,12 @@ type TaskHubOperation struct {
 	SyncSessionID            pgtype.Text        `json:"sync_session_id"`
 	SyncRevision             pgtype.Int8        `json:"sync_revision"`
 	TaskRevision             int64              `json:"task_revision"`
+	AgentSessionID           string             `json:"agent_session_id"`
+	CallID                   string             `json:"call_id"`
+	ToolCallDigest           []byte             `json:"tool_call_digest"`
+	PlanTaskRevision         int64              `json:"plan_task_revision"`
+	PlanRevision             int64              `json:"plan_revision"`
+	PlanStepID               string             `json:"plan_step_id"`
 }
 
 type TaskMcpConnectorGrant struct {
@@ -2272,6 +2278,7 @@ type TaskPlanStepExecutionBinding struct {
 	AuthorizationVersion int64              `json:"authorization_version"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	ResultDigest         []byte             `json:"result_digest"`
+	TaskStepID           string             `json:"task_step_id"`
 }
 
 type TaskRevisionIntent struct {

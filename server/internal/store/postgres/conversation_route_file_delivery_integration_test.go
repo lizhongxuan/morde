@@ -3,6 +3,7 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"strings"
@@ -11,6 +12,10 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/host"
+	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
 )
@@ -113,6 +118,204 @@ func TestConversationRouteProjectWorkspaceFileDeliveryFailsClosed(t *testing.T) 
 	}
 	if taskCount != 0 {
 		t.Fatalf("project route created %d Tasks without a supported project Workspace snapshot", taskCount)
+	}
+}
+
+type projectRouteWorkspaceFixture struct {
+	attachment projectAttachmentFixture
+	workspace  workspace.Workspace
+	resource   project.Resource
+	digest     []byte
+}
+
+func newProjectRouteWorkspaceFixture(t *testing.T) projectRouteWorkspaceFixture {
+	t.Helper()
+	ctx := context.Background()
+	attachment := newProjectAttachmentFixture(t)
+	selected := createTestWorkspace(t, ctx, attachment.store, attachment.owner.UserID, "project route input")
+	hostValue := createTestHost(t, ctx, attachment.store, attachment.owner.UserID,
+		app.Capacity{CPUMilli: 100_000, MemMiB: 200_000}, []string{selected.ID})
+	if _, err := attachment.store.pool.Exec(ctx, `UPDATE hosts SET state='running' WHERE id=$1`, hostValue.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attachment.store.pool.Exec(ctx, `UPDATE workspace_bindings SET state='active' WHERE host_id=$1 AND workspace_id=$2`,
+		hostValue.ID, selected.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attachment.store.UpsertHostMember(ctx, host.Member{HostID: hostValue.ID, OwnerID: attachment.owner.UserID,
+		UserID: attachment.member.UserID, Permissions: []host.Permission{host.PermissionWorkspaceFileRead}}); err != nil {
+		t.Fatal(err)
+	}
+	projectValue, err := attachment.store.GetProject(ctx, attachment.owner.UserID, attachment.projectID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resource, _, err := attachment.store.AddProjectResource(ctx, attachment.owner.UserID, project.Resource{
+		ProjectID: attachment.projectID, Kind: project.ResourceWorkspace, ResourceID: selected.ID, Version: 1,
+	}, projectValue.Version, "project-route-workspace-resource")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attachment.store.pool.Exec(ctx, `INSERT INTO model_connections
+(id,owner_id,name,base_url,model_name,api_key_cipher,capability_text,checked_at)
+VALUES ('p1234567',$1,'project route test','http://127.0.0.1','test',decode(repeat('01',29),'hex'),true,clock_timestamp())`,
+		attachment.member.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := attachment.store.pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`,
+		attachment.member.UserID); err != nil {
+		t.Fatal(err)
+	}
+	page, err := attachment.store.GetWorkspaceManifestPageForOwner(ctx, attachment.owner.UserID, selected.ID, selected.Revision, "", "", 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digestText, err := workspace.ManifestTreeWithMetadataSHA256(page.Files, page.EmptyDirectories, page.Directories)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest, err := hex.DecodeString(digestText)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return projectRouteWorkspaceFixture{attachment: attachment, workspace: selected, resource: resource, digest: digest}
+}
+
+func (f projectRouteWorkspaceFixture) receive(t *testing.T, clientID string, contextDigest []byte) app.ConversationRouteClaim {
+	t.Helper()
+	ctx := context.Background()
+	token, err := f.attachment.store.GetTokenByID(ctx, f.attachment.member.TokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	input := app.ConversationRoutingInput{ProjectID: f.attachment.projectID, ModelID: "p1234567", WorkspaceID: f.workspace.ID,
+		WorkspaceInputRevision: &f.workspace.Revision, WorkspaceContextDigest: append([]byte(nil), contextDigest...),
+		Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 5, ModelTokens: 1000}}
+	requestHash := sha256.Sum256([]byte(clientID))
+	message, _, err := f.attachment.store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{
+		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: f.attachment.owner.UserID,
+			ActorID: f.attachment.member.UserID, ConversationID: f.attachment.conversationID,
+			Role: conversation.RoleUser, Content: "请在项目中交付文件。"},
+		ServiceInstanceID: f.attachment.instanceID, ClientID: clientID, RequestHash: requestHash[:], Input: input,
+		Authorization: task.Authorization{Kind: string(identity.KindSession), TokenID: token.ID, Version: 1, ExpiresAt: &token.ExpiresAt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, found, err := f.attachment.store.ClaimConversationRoute(ctx, "project-route-workspace-test", time.Minute)
+	if err != nil || !found || claim.Message.ID != message.ID {
+		t.Fatalf("claim project Workspace message: found=%t err=%v", found, err)
+	}
+	return claim
+}
+
+func TestConversationRouteProjectRequiredBindsAuthorizedWorkspaceInputSnapshot(t *testing.T) {
+	for _, staleDigest := range []bool{false, true} {
+		name := "authorized project Workspace"
+		if staleDigest {
+			name = "stale manifest digest"
+		}
+		t.Run(name, func(t *testing.T) {
+			fixture := newProjectRouteWorkspaceFixture(t)
+			digest := fixture.digest
+			if staleDigest {
+				digest = bytes.Repeat([]byte("x"), sha256.Size)
+			}
+			clientID := "project-route-workspace-authorized"
+			if staleDigest {
+				clientID = "project-route-workspace-stale-digest"
+			}
+			claim := fixture.receive(t, clientID, digest)
+			snapshot, err := fixture.attachment.store.LoadConversationRouteSnapshot(context.Background(), claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot.Context.ModelID = claim.Input.ModelID
+			err = fixture.attachment.store.ApplyConversationRoute(context.Background(), claim, snapshot, app.ConversationRouteDecision{
+				Action: app.ConversationRouteNew, FileDeliveryIntent: task.FileDeliveryRequired,
+				ModelOutput: `{"action":"new","task_id":"","file_delivery_intent":"required"}`,
+			})
+			if staleDigest {
+				var domainErr *domain.Error
+				if !errors.As(err, &domainErr) || domainErr.Code != domain.CodeWorkspaceConflict {
+					t.Fatalf("ApplyConversationRoute() error = %v, want stale project manifest conflict", err)
+				}
+				var taskCount int
+				if err := fixture.attachment.store.pool.QueryRow(context.Background(),
+					`SELECT count(*) FROM conversation_messages WHERE id=$1 AND task_id IS NOT NULL`, claim.Message.ID).Scan(&taskCount); err != nil {
+					t.Fatal(err)
+				}
+				if taskCount != 0 {
+					t.Fatalf("stale project Workspace snapshot created %d Tasks", taskCount)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("apply project Workspace file-delivery route: %v", err)
+			}
+			var taskID, workspaceID, workspaceOwnerID string
+			var revision, checkpointRevision, resourceVersion int64
+			var contextDigest []byte
+			if err := fixture.attachment.store.pool.QueryRow(context.Background(), `SELECT t.id,t.workspace_id,t.workspace_owner_id,
+t.workspace_project_resource_version,t.input_revision,t.workspace_checkpoint_revision,t.context_digest
+FROM tasks t JOIN conversation_messages m ON m.task_id=t.id WHERE m.id=$1`, claim.Message.ID).Scan(&taskID, &workspaceID,
+				&workspaceOwnerID, &resourceVersion, &revision, &checkpointRevision, &contextDigest); err != nil {
+				t.Fatal(err)
+			}
+			if taskID == "" || workspaceID != fixture.workspace.ID || workspaceOwnerID != fixture.attachment.owner.UserID ||
+				resourceVersion != fixture.resource.Version || revision != fixture.workspace.Revision || checkpointRevision != fixture.workspace.Revision ||
+				!bytes.Equal(contextDigest, fixture.digest) {
+				t.Fatalf("project route Task snapshot = workspace=%q owner=%q resource=%d input=%d checkpoint=%d digest=%x",
+					workspaceID, workspaceOwnerID, resourceVersion, revision, checkpointRevision, contextDigest)
+			}
+			var grantFenceCount int
+			if err := fixture.attachment.store.pool.QueryRow(context.Background(),
+				`SELECT count(*) FROM task_workspace_grant_fences WHERE task_id=$1`, taskID).Scan(&grantFenceCount); err != nil {
+				t.Fatal(err)
+			}
+			if grantFenceCount != 1 {
+				t.Fatalf("project route Task grant fences = %d, want 1", grantFenceCount)
+			}
+		})
+	}
+}
+
+func TestConversationRouteProjectUnclearRetainsAuthorizedWorkspaceInputSnapshot(t *testing.T) {
+	fixture := newProjectRouteWorkspaceFixture(t)
+	claim := fixture.receive(t, "project-route-workspace-unclear", fixture.digest)
+	snapshot, err := fixture.attachment.store.LoadConversationRouteSnapshot(context.Background(), claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = claim.Input.ModelID
+	if err := fixture.attachment.store.ApplyConversationRoute(context.Background(), claim, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteNew, FileDeliveryIntent: task.FileDeliveryUnclear,
+		ModelOutput: `{"action":"new","task_id":"","file_delivery_intent":"unclear"}`,
+	}); err != nil {
+		t.Fatalf("apply project Workspace clarification route: %v", err)
+	}
+	var taskID, workspaceID, workspaceOwnerID, status, waitingReason string
+	var revision, checkpointRevision, resourceVersion int64
+	var contextDigest []byte
+	if err := fixture.attachment.store.pool.QueryRow(context.Background(), `SELECT t.id,t.workspace_id,t.workspace_owner_id,
+t.workspace_project_resource_version,t.input_revision,t.workspace_checkpoint_revision,t.context_digest,t.status,t.waiting_reason
+FROM tasks t JOIN conversation_messages m ON m.task_id=t.id WHERE m.id=$1`, claim.Message.ID).Scan(&taskID, &workspaceID,
+		&workspaceOwnerID, &resourceVersion, &revision, &checkpointRevision, &contextDigest, &status, &waitingReason); err != nil {
+		t.Fatal(err)
+	}
+	if taskID == "" || workspaceID != fixture.workspace.ID || workspaceOwnerID != fixture.attachment.owner.UserID ||
+		resourceVersion != fixture.resource.Version || revision != fixture.workspace.Revision || checkpointRevision != fixture.workspace.Revision ||
+		!bytes.Equal(contextDigest, fixture.digest) || status != string(task.StatusWaitingUser) || waitingReason != "clarification_required" {
+		t.Fatalf("project unclear route did not retain authorized Workspace snapshot: workspace=%q owner=%q resource=%d input=%d checkpoint=%d status=%q reason=%q digest=%x",
+			workspaceID, workspaceOwnerID, resourceVersion, revision, checkpointRevision, status, waitingReason, contextDigest)
+	}
+	var grantFenceCount int
+	if err := fixture.attachment.store.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM task_workspace_grant_fences WHERE task_id=$1`, taskID).Scan(&grantFenceCount); err != nil {
+		t.Fatal(err)
+	}
+	if grantFenceCount != 1 {
+		t.Fatalf("project unclear route Task grant fences = %d, want 1", grantFenceCount)
 	}
 }
 

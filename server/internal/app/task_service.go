@@ -918,11 +918,39 @@ func (s *TaskService) taskStepDetailFromDetails(ctx context.Context, principal i
 	if decoder.Decode(&document) != nil || !validTaskStepDetailDocument(document) {
 		return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step detail document is invalid")
 	}
+	workspaceEvidence := taskStepExecutionRequiresWorkspace(document.Execution)
+	for index := range document.SourceLocations {
+		source := document.SourceLocations[index]
+		expectedSourceID := taskStepSourceLocationID(record.OwnerID, taskID, stepID, record.TaskRevision, step.ToolCallKey, source)
+		if source.ID == "" && source.Kind == taskStepSourceLocationKindPublicWebPage {
+			// The first request-only detail payloads predate stable locator IDs.
+			// Derive the same deterministic ID when reading those encrypted records.
+			document.SourceLocations[index].ID = expectedSourceID
+		} else if expectedSourceID != source.ID {
+			return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step source location identity is invalid")
+		}
+		switch source.Kind {
+		case taskStepSourceLocationKindPublicWebPage:
+			if step.ToolName != cloudDSHWebReadToolName || step.Status != task.StepSucceeded {
+				return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step source location identity is invalid")
+			}
+		case taskStepSourceLocationKindWorkspaceFile, taskStepSourceLocationKindWorkspaceSearchMatch:
+			if (step.ToolName != cloudDSHWorkspaceReadToolName && step.ToolName != cloudDSHWorkspaceSearchToolName) ||
+				step.Status != task.StepSucceeded || source.WorkspaceID != details.Task.WorkspaceID {
+				return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step source location identity is invalid")
+			}
+			workspaceEvidence = true
+		default:
+			return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step source location identity is invalid")
+		}
+	}
 	if taskStepExecutionRequiresWorkspace(document.Execution) {
 		if document.ExecutionWorkspaceID == "" || document.ExecutionWorkspaceID != details.Task.WorkspaceID {
 			result.DetailState = "restricted"
 			return result, nil
 		}
+	}
+	if workspaceEvidence {
 		visible, err := s.taskWorkspaceDetailVisible(ctx, principal, details.Task)
 		if err != nil {
 			return TaskStepDetail{}, err
@@ -947,6 +975,7 @@ func (s *TaskService) taskStepDetailFromDetails(ctx context.Context, principal i
 	result.EventSequence = record.EventSequence
 	result.Object, result.Input, result.Result = &document.Object, &document.Input, &document.Result
 	result.ShellExecution, result.ContentEvidence = document.ShellExecution, document.ContentEvidence
+	result.SourceLocations = append([]TaskStepSourceLocation(nil), document.SourceLocations...)
 	result.Execution = document.Execution
 	if step.Status == task.StepUnknown || step.Status == task.StepCancelled {
 		message := "The tool result could not be confirmed and needs reconciliation."

@@ -100,6 +100,12 @@ type TaskHubOperation struct {
 	TaskAuthorizationVersion int64
 	TargetGrantVersion       int64
 	TaskRevision             int64
+	AgentSessionID           string
+	CallID                   string
+	ToolCallDigest           []byte
+	PlanTaskRevision         int64
+	PlanRevision             int64
+	PlanStepID               string
 	LeaseVersion             int64
 	RequestHash              []byte
 	ResultHash               []byte
@@ -420,6 +426,11 @@ func (b *CloudDSHToolBroker) hubTaskDefinitions(ctx context.Context, current tas
 }
 
 func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed task.Task, call ModelToolCall, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
+	return b.executeHubTaskActionWithPlanStep(ctx, claimed, call, cloudDSHPlanStepArguments{}, recovering, checkpointOutput)
+}
+
+func (b *CloudDSHToolBroker) executeHubTaskActionWithPlanStep(ctx context.Context, claimed task.Task, call ModelToolCall,
+	planStepMetadata cloudDSHPlanStepArguments, recovering bool, checkpointOutput *string) (AgentToolResult, error) {
 	if b.hub == nil {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Task Hub actions are unavailable")
 	}
@@ -436,6 +447,24 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 		return AgentToolResult{}, err
 	}
 	current := details.Task
+	var planRevision, planTaskRevision int64
+	var toolCallProgress TaskToolCallProgress
+	if tool.action == hub.ActionCommand {
+		planRevision, err = validateCloudDSHPlanStepSelection(details, planStepMetadata, "Hub command")
+		if err != nil {
+			return AgentToolResult{}, err
+		}
+		if planRevision > 0 {
+			if current.CurrentRevision == nil || *current.CurrentRevision < 0 {
+				return AgentToolResult{}, domain.NewError(domain.CodeConflict, "current Task revision is unavailable for the Hub command")
+			}
+			planTaskRevision = *current.CurrentRevision
+			toolCallProgress, err = cloudDSHToolCallProgress(ctx, current, call)
+			if err != nil {
+				return AgentToolResult{}, err
+			}
+		}
+	}
 	if current.HostID == "" && tool.action != hub.ActionFileFetch {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Task Hub actions require an assigned cloud Host")
 	}
@@ -490,6 +519,14 @@ func (b *CloudDSHToolBroker) executeHubTaskAction(ctx context.Context, claimed t
 		TargetInstallationID: targetID, Action: tool.action,
 		TaskAuthorizationVersion: current.Authorization.Version, TargetGrantVersion: grantVersion,
 		TaskRevision: taskRevision, LeaseVersion: current.Lease.Version, RequestHash: requestHash[:], Status: task.OperationPrepared,
+	}
+	if planRevision > 0 {
+		operation.AgentSessionID = toolCallProgress.AgentSessionID
+		operation.CallID = toolCallProgress.CallKey
+		operation.ToolCallDigest = append([]byte(nil), toolCallProgress.RequestDigest...)
+		operation.PlanTaskRevision = planTaskRevision
+		operation.PlanRevision = planRevision
+		operation.PlanStepID = planStepMetadata.StepID
 	}
 	if tool.action == hub.ActionFilePut {
 		operation.WorkspaceID, operation.WorkspacePath = writeRequest.WorkspaceID, writeRequest.Path

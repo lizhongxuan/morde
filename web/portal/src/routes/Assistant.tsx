@@ -147,6 +147,11 @@ function retryEligibilityReasonText(reason: string): string {
   }
 }
 
+function retryEligibilityAllowsDispatch(eligibility: { retry_eligible: boolean; retry_reason: string; retry_warning?: string } | undefined): boolean {
+  return eligibility?.retry_eligible === true && eligibility.retry_reason === 'retry_available'
+    && (!eligibility.retry_warning || eligibility.retry_warning === 'previous_personal_model_call_outcome_unknown');
+}
+
 function routingFailureNextStep(message: RoutingFailureMessage, actorMatches: boolean,
   capability: 'confirmed' | 'unsupported' | 'unknown', eligibility?: {
     isFetching: boolean;
@@ -160,13 +165,12 @@ function routingFailureNextStep(message: RoutingFailureMessage, actorMatches: bo
   if (!eligibility || eligibility.isFetching) return '正在核对服务端重试条件；核对完成前不会发送重试。';
   if (eligibility.isError || !eligibility.data) return '暂时无法确认重试资格；原消息已保留，请稍后重新核对。';
   if (!eligibility.data.retry_eligible) return retryEligibilityReasonText(eligibility.data.retry_reason);
+  if (eligibility.data.retry_reason !== 'retry_available') return retryEligibilityReasonText(eligibility.data.retry_reason);
   if (eligibility.data.retry_warning === 'previous_personal_model_call_outcome_unknown') {
     return '上一次个人模型调用结果仍未知；新的尝试可能产生重复调用，确认后才会继续。';
   }
-  if (message.routing_failure_reason === 'model_unavailable') return '确认模型可用性和用量后，可以重新处理这条消息。';
-  if (message.routing_failure_reason === 'routing_context_unavailable') return '可以安全重试，让系统重新读取会话上下文并处理原消息。';
-  if (message.routing_failure_reason === 'routing_action_unavailable') return '可以安全重试，让系统重新检查消息处理状态。';
-  return '原消息已保留，可以安全重试处理。';
+  if (eligibility.data.retry_warning) return '服务端返回尚未支持的重试警告；为避免重复操作，暂不重试。';
+  return '';
 }
 
 const fileDeliveryIntentClarificationCallIDs = new Set([
@@ -1641,13 +1645,27 @@ export function Assistant() {
         if (currentRetryIdentity.current.actorID !== actorID || currentRetryIdentity.current.serviceInstanceID !== serviceInstanceID) {
           throw new Error('账号或服务身份已变化；未发送重试请求。');
         }
-        if (!currentEligibility.retry_eligible) throw new Error(retryEligibilityReasonText(currentEligibility.retry_reason));
+        if (!retryEligibilityAllowsDispatch(currentEligibility)) {
+          const unknownWarning = currentEligibility.retry_eligible && currentEligibility.retry_reason === 'retry_available'
+            && currentEligibility.retry_warning;
+          if (unknownWarning) {
+            throw new Error('服务端返回尚未支持的重试警告；为避免重复操作，暂不重试。');
+          }
+          throw new Error(retryEligibilityReasonText(currentEligibility.retry_reason));
+        }
         if (currentEligibility.retry_warning && currentEligibility.retry_warning !== confirmedWarning) {
           setUnknownRetryConfirmation({ messageID, warning: currentEligibility.retry_warning });
           return null;
         }
         const key = processingRetryKey(serviceInstanceID, actorID, '', target.conversation_id, target.id);
         await portalApi.retryConversationMessageProcessing(target.conversation_id, target.id, key, serviceInstanceID, actorID);
+        // A confirmed 202 has consumed this key. If the new attempt fails
+        // before the next poll, its next retry must use a fresh key.
+        try {
+          clearProcessingRetryKey(serviceInstanceID, actorID, '', target.conversation_id, target.id);
+        } catch {
+          // A storage error must not turn a confirmed acceptance into a failure.
+        }
         return { conversationID: target.conversation_id, messageID: target.id };
       } finally {
         processingRetryInFlight.current.delete(messageID);
@@ -3576,7 +3594,7 @@ export function Assistant() {
                   const retryEligibilityQuery = routingRetryEligibilityByMessageID.get(message.id);
                   const canRetryRoutingFailure = showRoutingFailure && routingRetryActorMatches && routingRetryCapabilityConfirmed
                     && retryEligibilityQuery?.isSuccess === true && !retryEligibilityQuery.isFetching
-                    && retryEligibilityQuery.data.retry_eligible;
+                    && retryEligibilityAllowsDispatch(retryEligibilityQuery.data);
                   const retryingRoutingFailure = retryConversationMessageProcessing.isPending
                     && retryConversationMessageProcessing.variables?.messageID === message.id;
                   const routingFailureNextStepText = routingFailureNextStep(message, routingRetryActorMatches,
@@ -3610,17 +3628,27 @@ export function Assistant() {
                     {showRoutingFailure && <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的消息处理状态">
                       <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
                       <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
-                        <div className="chat-message-processing-status">
-                          <p role="status" aria-live="polite"><strong>消息已保存但尚未处理</strong></p>
-                          <p>系统报告：{routingFailureText(message.routing_failure_reason)}</p>
-                          <p>{routingFailureNextStepText}</p>
-                          {canRetryRoutingFailure && <button type="button" className="button button-secondary button-small"
+                        <div className="chat-message-processing-status" role="status" aria-live="polite">
+                          <strong className="chat-message-processing-title">刚才没能处理你的消息</strong>
+                          <p>{message.routing_failure_reason === 'message_too_long'
+                            ? '消息内容或上下文超过当前处理上限，原消息已保留。'
+                            : `${routingFailureText(message.routing_failure_reason)}，原消息已保留。`}</p>
+                          {routingFailureNextStepText && <p className="chat-message-processing-hint">{routingFailureNextStepText}</p>}
+                          {canRetryRoutingFailure && <button type="button" className="button button-secondary chat-message-processing-retry"
                             aria-label="重新处理这条消息" disabled={retryingRoutingFailure}
                             onClick={() => {
                               if (processingRetryInFlight.current.has(message.id)) return;
                               retryConversationMessageProcessing.mutate({ messageID: message.id });
-                            }}>{retryingRoutingFailure ? '正在重新处理…' : retryEligibilityQuery?.data.retry_warning
-                              ? '核对后重试' : '重新处理这条消息'}</button>}
+                            }}><MordeIcon name="refresh" />{retryingRoutingFailure ? '正在重试…' : retryEligibilityQuery?.data.retry_warning
+                              ? '核对后重试' : '再试一次'}</button>}
+                          {routingRetryActorMatches && message.routing_failure_reason !== 'message_too_long'
+                            && ((routingRetryCapabilityState === 'unknown' && !capabilities.isFetching)
+                              || (routingRetryCapabilityConfirmed && retryEligibilityQuery?.isError && !retryEligibilityQuery.isFetching))
+                            && <button type="button" className="button button-secondary chat-message-processing-retry"
+                              onClick={() => {
+                                if (!routingRetryCapabilityConfirmed) void capabilities.refetch();
+                                else void retryEligibilityQuery?.refetch();
+                              }}><MordeIcon name="refresh" />重新检查</button>}
                         </div>
                       </div>
                     </div>}

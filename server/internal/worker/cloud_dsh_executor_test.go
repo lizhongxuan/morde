@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -1044,6 +1045,237 @@ func cloudDSHFixture(t *testing.T) (*CloudDSHExecutor, *cloudDSHTestSupervisor, 
 	return executor, supervisor, store, checkpoints, models, value
 }
 
+type cloudDSHTaskPlanWorkerTestStore struct {
+	app.TaskStore
+	mu       sync.Mutex
+	details  app.TaskDetails
+	admitted []app.ModelToolCall
+	recovery []bool
+	progress []app.TaskProgress
+}
+
+func (s *cloudDSHTaskPlanWorkerTestStore) GetTask(ctx context.Context, taskID, ownerID string) (app.TaskDetails, error) {
+	if err := ctx.Err(); err != nil {
+		return app.TaskDetails{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if taskID != s.details.Task.ID || ownerID != s.details.Task.OwnerID {
+		return app.TaskDetails{}, errors.New("task not found")
+	}
+	details := s.details
+	details.Steps = append([]task.Step(nil), s.details.Steps...)
+	if details.Plan != nil {
+		plan := *details.Plan
+		details.Plan = &plan
+	}
+	return details, nil
+}
+
+func (s *cloudDSHTaskPlanWorkerTestStore) AdmitAgentToolCall(ctx context.Context, call app.ModelToolCall,
+	recovering bool) (app.AgentToolCallAdmission, error) {
+	if err := ctx.Err(); err != nil {
+		return app.AgentToolCallAdmission{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if call.TaskFence == nil || call.TaskFence.TaskID != s.details.Task.ID || call.TaskFence.OwnerID != s.details.Task.OwnerID {
+		return app.AgentToolCallAdmission{}, errors.New("Task tool admission fence does not match")
+	}
+	s.admitted = append(s.admitted, call)
+	s.recovery = append(s.recovery, recovering)
+	return app.AgentToolCallAdmission{Status: app.AgentToolCallAdmitted}, nil
+}
+
+func (s *cloudDSHTaskPlanWorkerTestStore) CommitTaskProgress(ctx context.Context, progress app.TaskProgress) (task.Event, error) {
+	if err := ctx.Err(); err != nil {
+		return task.Event{}, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	current := s.details.Task
+	if progress.TaskID != current.ID || progress.LeaseOwner != current.Lease.Owner || progress.LeaseVersion != current.Lease.Version {
+		return task.Event{}, errors.New("stale plan test progress")
+	}
+	s.progress = append(s.progress, progress)
+	s.details.Task.Status, s.details.Task.CurrentStep = progress.Status, progress.CurrentStep
+	s.details.Task.Result, s.details.Task.Usage = progress.Result, progress.Usage
+	s.details.Steps = append(s.details.Steps, progress.Steps...)
+	if progress.CloudDSHTaskPlan != nil {
+		plan := progress.CloudDSHTaskPlan.Plan
+		s.details.Plan = &plan
+	}
+	s.details.Task.EventSequence++
+	event := progress.Event
+	event.TaskID, event.Sequence = current.ID, s.details.Task.EventSequence
+	return event, nil
+}
+
+func (s *cloudDSHTaskPlanWorkerTestStore) bindAgentSession(sessionID string) {
+	s.mu.Lock()
+	s.details.Task.AgentSessionID = sessionID
+	s.mu.Unlock()
+}
+
+type cloudDSHTaskPlanWorkerBrokerProbe struct {
+	*app.CloudDSHToolBroker
+	definitions []app.AgentToolDefinition
+	executed    []app.ModelToolCall
+}
+
+func (b *cloudDSHTaskPlanWorkerBrokerProbe) Definitions(ctx context.Context, claimed task.Task) ([]app.AgentToolDefinition, error) {
+	definitions, err := b.CloudDSHToolBroker.Definitions(ctx, claimed)
+	b.definitions = append([]app.AgentToolDefinition(nil), definitions...)
+	return definitions, err
+}
+
+func (b *cloudDSHTaskPlanWorkerBrokerProbe) Execute(ctx context.Context, claimed task.Task,
+	call app.ModelToolCall) (app.AgentToolResult, error) {
+	b.executed = append(b.executed, call)
+	return b.CloudDSHToolBroker.Execute(ctx, claimed, call)
+}
+
+func cloudDSHTaskPlanWorkerFixture(t *testing.T, executor *CloudDSHExecutor, value *task.Task, models *cloudDSHTestModels) (*cloudDSHTaskPlanWorkerTestStore, *cloudDSHTaskPlanWorkerBrokerProbe) {
+	t.Helper()
+	revision := int64(1)
+	value.CurrentRevision = &revision
+	value.Authorization = task.Authorization{Kind: string(identity.KindSession), TokenID: "t1234567", Version: 1,
+		Scopes: []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit)}}
+	expires := time.Now().Add(time.Hour).UTC()
+	value.Authorization.ExpiresAt = &expires
+	store := &cloudDSHTaskPlanWorkerTestStore{details: app.TaskDetails{Task: *value}}
+	broker, err := app.NewCloudDSHToolBroker(store, &app.RuntimeToolExecutor{}, nil, nil)
+	if err != nil {
+		t.Fatalf("create Worker plan tool broker: %v", err)
+	}
+	probe := &cloudDSHTaskPlanWorkerBrokerProbe{CloudDSHToolBroker: broker}
+	definitions, err := probe.Definitions(context.Background(), *value)
+	if err != nil || !validCloudDSHToolDefinitions(definitions) {
+		var summary []string
+		for _, definition := range definitions {
+			summary = append(summary, fmt.Sprintf("%s description_bytes=%d parameters_bytes=%d individually_valid=%t",
+				definition.Name, len(definition.Description), len(definition.Parameters), validCloudDSHToolDefinitions([]app.AgentToolDefinition{definition})))
+		}
+		t.Fatalf("real plan Broker returned unavailable DSH tool definitions: count=%d definitions=%v err=%v", len(definitions), summary, err)
+	}
+	executor.options.Tools = probe
+	var nextResponse int
+	models.complete = func(ctx context.Context, call app.ModelCall) (app.ModelResponse, error) {
+		if call.Task == nil || call.Task.AgentSessionID == "" {
+			return app.ModelResponse{}, errors.New("DSH Worker did not bind the model call to its Task session")
+		}
+		store.bindAgentSession(call.Task.AgentSessionID)
+		if nextResponse >= len(models.responses) {
+			return app.ModelResponse{}, errors.New("scripted test model exhausted its responses")
+		}
+		response := models.responses[nextResponse]
+		nextResponse++
+		return response, nil
+	}
+	return store, probe
+}
+
+func cloudDSHModelRequestIncludesTool(t *testing.T, raw []byte, name string) bool {
+	t.Helper()
+	var request struct {
+		Tools []struct {
+			Name string `json:"name"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(raw, &request); err != nil {
+		t.Fatalf("decode DSH model request tool definitions: %v", err)
+	}
+	for _, tool := range request.Tools {
+		if tool.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// The tests run the CloudDSHExecutor and CloudDSHToolBroker with a scripted
+// ModelClient. They prove Worker-to-Broker dispatch and plan persistence, not
+// the Node DSH Runtime or production-model semantic tool selection.
+func TestCloudDSHWorkerPlanToolDispatchAndPersistencePath(t *testing.T) {
+	t.Run("scripted simple answer returns without plan dispatch", func(t *testing.T) {
+		executor, _, _, _, models, value := cloudDSHFixture(t)
+		value.Objective = "What is 2 + 2?"
+		models.responses = []app.ModelResponse{{Text: "4", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}}}
+		store, broker := cloudDSHTaskPlanWorkerFixture(t, executor, &value, models)
+		if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+			t.Fatalf("simple-answer Task result = %v", err)
+		}
+		if len(models.calls) != 1 || len(broker.executed) != 0 || len(store.admitted) != 0 || len(store.progress) != 0 || store.details.Plan != nil {
+			t.Fatalf("simple answer dispatched or persisted a plan: model_calls=%d broker_calls=%+v admitted=%+v progress=%+v plan=%+v",
+				len(models.calls), broker.executed, store.admitted, store.progress, store.details.Plan)
+		}
+		if !cloudDSHModelRequestIncludesTool(t, models.calls[0].RawRequest, "morde_task_plan_update") ||
+			!validCloudDSHModelRequest(models.calls[0].RawRequest, value.ModelID, cloudDSHExpectedRootDefinitions(broker.definitions)) {
+			t.Fatal("simple-answer model request did not carry the real broker's valid plan-tool definition")
+		}
+	})
+
+	t.Run("scripted complex-task plan call reaches broker and persists", func(t *testing.T) {
+		executor, _, _, _, models, value := cloudDSHFixture(t)
+		value.Objective = "Inspect the routing and persistence paths, then run the focused regression tests."
+		planArguments := `{"goal":"Verify the task routing and persistence path","scope":"Inspect the Worker and plan persistence path only","verification_method":"Run the focused Worker regression","steps":[{"id":"inspect","title":"Inspect the paths","status":"pending","completion_criteria":["Identify the routing and persistence code involved."]},{"id":"verify","title":"Verify the path","status":"pending","depends_on":["inspect"],"completion_criteria":["Run the focused Worker regression and record its result."]}]}`
+		models.responses = []app.ModelResponse{
+			{ToolCalls: []app.ModelToolCall{{CallID: "call_plan_1", Name: "morde_task_plan_update", Arguments: planArguments}},
+				StopReason: "tool_calls", Usage: app.ModelUsage{Known: true, InputTokens: 12, OutputTokens: 6}},
+			{Text: "The plan was saved.", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 18, OutputTokens: 3}},
+		}
+		store, broker := cloudDSHTaskPlanWorkerFixture(t, executor, &value, models)
+		if err := executor.ExecuteTask(context.Background(), value); !errors.Is(err, ErrCloudDSHCompletionPending) {
+			t.Fatalf("complex-plan Task result = %v", err)
+		}
+		if len(models.calls) != 2 || len(broker.executed) != 1 || broker.executed[0].Name != "morde_task_plan_update" ||
+			broker.executed[0].CallID != "call_plan_1" || len(store.admitted) != 2 || len(store.recovery) != 2 ||
+			store.recovery[0] || !store.recovery[1] ||
+			len(store.progress) != 1 || store.progress[0].CloudDSHTaskPlan == nil || store.progress[0].Event.Type != "task.plan" {
+			t.Fatalf("plan did not traverse DSH Worker, Broker and persistence: model_calls=%d broker_calls=%d admissions=%d progress=%d",
+				len(models.calls), len(broker.executed), len(store.admitted), len(store.progress))
+		}
+		for _, admitted := range store.admitted {
+			if admitted.Name != "morde_task_plan_update" || admitted.CallID != "call_plan_1" {
+				t.Fatalf("unexpected Task tool admission: name=%q call_id=%q", admitted.Name, admitted.CallID)
+			}
+		}
+		if !cloudDSHModelRequestIncludesTool(t, models.calls[0].RawRequest, "morde_task_plan_update") ||
+			!validCloudDSHModelRequest(models.calls[0].RawRequest, value.ModelID, cloudDSHExpectedRootDefinitions(broker.definitions)) {
+			t.Fatal("complex-task model request did not carry the real broker's valid plan-tool definition")
+		}
+		commit := store.progress[0].CloudDSHTaskPlan
+		if commit.TaskID != value.ID || commit.OwnerID != value.OwnerID || commit.AgentSessionID == "" ||
+			commit.AuthorizationVersion != value.Authorization.Version || commit.CallID != "call_plan_1" ||
+			commit.FingerprintSHA256 == "" || commit.Plan.Goal != "Verify the task routing and persistence path" ||
+			commit.Plan.Revision != 1 || store.details.Plan == nil || store.details.Plan.Goal != commit.Plan.Goal {
+			t.Fatalf("persisted Task plan commit is incomplete: %+v stored=%+v", commit, store.details.Plan)
+		}
+		var resumedRequest struct {
+			Messages []struct {
+				Role       string `json:"role"`
+				ToolCallID string `json:"toolCallId"`
+				Content    []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.Unmarshal(models.calls[1].RawRequest, &resumedRequest); err != nil {
+			t.Fatal(err)
+		}
+		foundPlanResult := false
+		for _, message := range resumedRequest.Messages {
+			if message.Role == "tool" && message.ToolCallID == "call_plan_1" && len(message.Content) == 1 &&
+				strings.Contains(message.Content[0].Text, commit.Plan.Goal) {
+				foundPlanResult = true
+			}
+		}
+		if !foundPlanResult {
+			t.Fatal("next DSH model request did not contain the persisted plan-tool result")
+		}
+	})
+}
+
 func TestCloudDSHExecutorRunsHostlessServerTaskWithoutCompletingIt(t *testing.T) {
 	t.Setenv("MORDE_TEST_PRIVATE_ENV", "private")
 	executor, supervisor, store, checkpoints, models, value := cloudDSHFixture(t)
@@ -1153,6 +1385,75 @@ func TestCloudDSHRequestTimeoutFrameRequiresExactFields(t *testing.T) {
 		if _, err := decodeCloudDSHFrame([]byte(raw)); err == nil {
 			t.Fatalf("invalid request timeout frame accepted: %s", raw)
 		}
+	}
+}
+
+func TestCloudDSHToolCallFrameAcceptsOnlyValidOptionalTaskTurnIdentity(t *testing.T) {
+	base := `"type":"tool_call","id":"model_123","task_id":"q1234567","owner_id":"u1234567","agent_id":"agent_1","generation":2,"authorization_version":1,"session_id":"session_1","through_seq":4,"call_id":"call_123","name":"plan_update","arguments":{}`
+	for _, test := range []struct {
+		name string
+		raw  string
+		want string
+		bad  bool
+	}{
+		{name: "legacy omission", raw: `{` + base + `}`},
+		{name: "valid trusted identity", raw: `{` + base + `,"current_task_turn_message_id":"m1234567"}`, want: "m1234567"},
+		{name: "empty identity rejected", raw: `{` + base + `,"current_task_turn_message_id":""}`, bad: true},
+		{name: "invalid identity rejected", raw: `{` + base + `,"current_task_turn_message_id":"not-a-message"}`, bad: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			frame, err := decodeCloudDSHFrame([]byte(test.raw))
+			if test.bad {
+				if err == nil {
+					t.Fatalf("invalid identity accepted: %s", test.raw)
+				}
+				return
+			}
+			if err != nil || frame.CurrentTaskTurnMessageID != test.want {
+				t.Fatalf("decoded frame = %+v, %v", frame, err)
+			}
+		})
+	}
+}
+
+func TestWriteCloudDSHModelPersistsSourceOnlyAsReplayMetadata(t *testing.T) {
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "agent_1", SessionID: "session_1", Generation: 2, AuthorizationVersion: 1}
+	reader, writer := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		done <- writeCloudDSHModel(context.Background(), writer, "model_123", identity, app.ModelResponse{
+			ToolCalls: []app.ModelToolCall{{CallID: "call_123", Name: "plan_update", Arguments: `{}`, CurrentTaskTurnMessageID: "m1234567"}},
+			Usage:     app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}, StopReason: "tool_calls",
+		})
+		_ = writer.Close()
+	}()
+	scanner := bufio.NewScanner(reader)
+	found := false
+	for scanner.Scan() {
+		var frame struct {
+			Type  string         `json:"type"`
+			Chunk map[string]any `json:"chunk"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Type == "model_chunk" && frame.Chunk["type"] == "finish" {
+			replayState, ok := frame.Chunk["replayState"].(map[string]any)
+			response, responseOK := replayState["response"].(map[string]any)
+			if !ok || !responseOK || response["morde_task_turn_message_id"] != "m1234567" {
+				t.Fatalf("finish replay source metadata = %#v", frame.Chunk)
+			}
+			found = true
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if !found {
+		t.Fatal("model finish did not persist source metadata for runtime recovery")
 	}
 }
 

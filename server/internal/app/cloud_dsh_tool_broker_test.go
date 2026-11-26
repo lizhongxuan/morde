@@ -268,6 +268,49 @@ func TestCloudDSHPlanMetadataIsExposedOnlyOnDirectReadTools(t *testing.T) {
 	}
 }
 
+func TestCloudDSHPlanMetadataIsExposedForHubCommand(t *testing.T) {
+	commandName := hubTaskToolName("morde_hub_command", "i7654321", 5)
+	readName := hubTaskToolName("morde_hub_files", "i7654321", 5)
+	definitions := []AgentToolDefinition{
+		{ModelTool: ModelTool{Name: commandName,
+			Parameters: json.RawMessage(`{"type":"object","properties":{"command":{"type":"string"},"timeout_ms":{"type":"integer"}},"required":["command","timeout_ms"],"additionalProperties":false}`)}},
+		{ModelTool: ModelTool{Name: readName,
+			Parameters: json.RawMessage(`{"type":"object","properties":{"path":{"type":"string"}},"additionalProperties":false}`)}},
+	}
+	got, err := addPlanStepArgumentToHubOperationTools(definitions, 7)
+	if err != nil {
+		t.Fatalf("addPlanStepArgumentToHubOperationTools() error = %v", err)
+	}
+	var commandSchema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+		Required   []string                   `json:"required"`
+	}
+	if err := json.Unmarshal(got[0].Parameters, &commandSchema); err != nil {
+		t.Fatal(err)
+	}
+	var revision struct {
+		Enum []int64 `json:"enum"`
+	}
+	if len(commandSchema.Properties[cloudDSHPlanStepIDArgumentName]) == 0 ||
+		len(commandSchema.Properties[cloudDSHPlanRevisionArgumentName]) == 0 ||
+		!containsString(commandSchema.Required, cloudDSHPlanStepIDArgumentName) ||
+		!containsString(commandSchema.Required, cloudDSHPlanRevisionArgumentName) ||
+		json.Unmarshal(commandSchema.Properties[cloudDSHPlanRevisionArgumentName], &revision) != nil ||
+		len(revision.Enum) != 1 || revision.Enum[0] != 7 {
+		t.Fatalf("Hub command schema lacks exact required plan metadata: %s", got[0].Parameters)
+	}
+	var readSchema struct {
+		Properties map[string]json.RawMessage `json:"properties"`
+	}
+	if err := json.Unmarshal(got[1].Parameters, &readSchema); err != nil {
+		t.Fatal(err)
+	}
+	if len(readSchema.Properties[cloudDSHPlanStepIDArgumentName]) != 0 ||
+		len(readSchema.Properties[cloudDSHPlanRevisionArgumentName]) != 0 {
+		t.Fatalf("Hub read tool received operation metadata: %s", got[1].Parameters)
+	}
+}
+
 func TestCloudDSHPlanStepReadAdmissionAndSettlement(t *testing.T) {
 	t.Run("missing or stale selector is rejected before read", func(t *testing.T) {
 		for name, metadata := range map[string]cloudDSHPlanStepArguments{

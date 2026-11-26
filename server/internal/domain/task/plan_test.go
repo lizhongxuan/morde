@@ -176,8 +176,10 @@ func TestPlanVerificationCheckValidation(t *testing.T) {
 func TestPlanSubmissionInputAllowsUnhashedRequirementLocators(t *testing.T) {
 	workspaceRevision := int64(9)
 	for name, source := range map[string]PlanVerificationRequirementSource{
-		"current task input":       {Kind: PlanVerificationRequirementUserMessage, Locator: PlanVerificationRequirementCurrentTaskInputLocator},
-		"exact user message":       {Kind: PlanVerificationRequirementUserMessage, MessageID: "m1234567"},
+		"current task input":      {Kind: PlanVerificationRequirementUserMessage, Locator: PlanVerificationRequirementCurrentTaskInputLocator},
+		"current task turn input": {Kind: PlanVerificationRequirementUserMessage, Locator: PlanVerificationRequirementCurrentTaskTurnInputLocator},
+		"history search result": {Kind: PlanVerificationRequirementUserMessage, Locator: PlanVerificationRequirementHistorySearchResultLocator,
+			HistoryResultToken: "signed.history.result.token"},
 		"project snapshot locator": {Kind: PlanVerificationRequirementProjectFile, WorkspacePath: "AGENTS.md", WorkspaceRevision: &workspaceRevision},
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -192,15 +194,42 @@ func TestPlanSubmissionInputAllowsUnhashedRequirementLocators(t *testing.T) {
 			if err := plan.ValidateSubmission(); err == nil {
 				t.Fatal("unresolved source locator was accepted as a persisted submission")
 			}
-			if source.Locator == PlanVerificationRequirementCurrentTaskInputLocator && source.MessageID != "" {
-				t.Fatal("input validation mutated the caller's source locator")
+			if source.Locator == PlanVerificationRequirementHistorySearchResultLocator && source.HistoryResultToken != "signed.history.result.token" {
+				t.Fatal("input validation mutated the caller's history source token")
 			}
 		})
 	}
 
 	for name, mutate := range map[string]func(*PlanVerificationRequirementSource){
-		"current locator with message ID":  func(source *PlanVerificationRequirementSource) { source.MessageID = "m1234567" },
-		"unknown locator":                  func(source *PlanVerificationRequirementSource) { source.Locator = "latest_message" },
+		"current locator with message ID": func(source *PlanVerificationRequirementSource) { source.MessageID = "m1234567" },
+		"unknown locator":                 func(source *PlanVerificationRequirementSource) { source.Locator = "latest_message" },
+		"raw user message ID": func(source *PlanVerificationRequirementSource) {
+			source.Locator, source.MessageID = "", "m1234567"
+		},
+		"history locator without token": func(source *PlanVerificationRequirementSource) {
+			source.Locator = PlanVerificationRequirementHistorySearchResultLocator
+		},
+		"history locator with raw message ID": func(source *PlanVerificationRequirementSource) {
+			source.Locator, source.HistoryResultToken, source.MessageID =
+				PlanVerificationRequirementHistorySearchResultLocator, "signed.history.result.token", "m1234567"
+		},
+		"history token too long": func(source *PlanVerificationRequirementSource) {
+			source.Locator, source.HistoryResultToken = PlanVerificationRequirementHistorySearchResultLocator,
+				strings.Repeat("x", PlanVerificationRequirementHistoryResultTokenMaxBytes+1)
+		},
+		"turn locator with message ID": func(source *PlanVerificationRequirementSource) {
+			source.Locator, source.MessageID = PlanVerificationRequirementCurrentTaskTurnInputLocator, "m1234567"
+		},
+		"turn locator with Workspace path": func(source *PlanVerificationRequirementSource) {
+			source.Locator, source.WorkspacePath = PlanVerificationRequirementCurrentTaskTurnInputLocator, "AGENTS.md"
+		},
+		"turn locator with Workspace revision": func(source *PlanVerificationRequirementSource) {
+			revision := int64(9)
+			source.Locator, source.WorkspaceRevision = PlanVerificationRequirementCurrentTaskTurnInputLocator, &revision
+		},
+		"turn locator with digest": func(source *PlanVerificationRequirementSource) {
+			source.Locator, source.ContentSHA256 = PlanVerificationRequirementCurrentTaskTurnInputLocator, strings.Repeat("a", 64)
+		},
 		"user message with Workspace path": func(source *PlanVerificationRequirementSource) { source.WorkspacePath = "AGENTS.md" },
 		"malformed optional digest":        func(source *PlanVerificationRequirementSource) { source.ContentSHA256 = "not-a-digest" },
 	} {

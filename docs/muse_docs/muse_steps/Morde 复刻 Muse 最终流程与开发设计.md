@@ -377,6 +377,8 @@ Host、外部 MCP 和 Workspace/media 的逐次审批绑定及 Broker 回归通�
 
 [`review` / `reviewInput`](<../../../server/internal/worker/task_validation_review_worker.go>)；[`EvaluateTaskValidationReview`](<../../../server/internal/app/task_validation_verdict.go>)；[`CompleteTaskValidationReview`](<../../../server/internal/store/postgres/task_validation_review.go>)；[`conversationTaskResultValidationStateInTx`](<../../../server/internal/store/postgres/conversation_result_review.go>)。
 
+2026-11-25 A 为 Task step detail/API 增加了稳定 `source_locations.id`。成功内置 web-read 保存 query-free 请求 URI、`requested_uri_only` 和同一读取内容 SHA；成功 Workspace snapshot read/search 保存 revision、manifest、路径、文件 SHA 和可用行号，live directory 则标为无不可变 manifest。Task detail 重验 locator 与 Task/step/tool-call 身份，并检查 Workspace 访问权限；locator 不含 Workspace 正文。网页请求 URI仍不代表最终重定向来源，当前没有将 locator 校验到每条结论；B/C 的最终来源、D 的 claim 映射及 PC 展示仍待接入和验收。未提供的版本和位置必须继续标为未知。
+
 #### 开源参考
 
 [Magentic-UI · `decide_verifier_class` / `diff_states`](<../../../project/magentic-ui/src/magentic_ui/teams/omniagent/_verifier.py>)：参考操作前后状态取证，不视为通用验收系统。独立换模型家族并非 Muse 已证实机制，不能替代硬门禁。

@@ -59,7 +59,8 @@ func parseDSHModelRequest(ctx context.Context, fence ModelTaskFence, modelID str
 	if decoder.Decode(&input) != nil || decoder.Decode(new(any)) != io.EOF || input.Provider != "morde" || input.Model != modelID || len(input.Messages) == 0 {
 		return invalid()
 	}
-	request := ModelRequest{MaxOutputTokens: 2048, Temperature: input.Temperature}
+	request := ModelRequest{MaxOutputTokens: 2048, Temperature: input.Temperature,
+		CurrentTaskTurnMessageID: currentTaskTurnMessageID(input.Messages)}
 	var instructions strings.Builder
 	if input.MaxTokens != nil {
 		request.MaxOutputTokens = *input.MaxTokens
@@ -150,4 +151,45 @@ func parseDSHModelRequest(ctx context.Context, fence ModelTaskFence, modelID str
 		request.Tools = append(request.Tools, ModelTool{Name: tool.Name, Description: tool.Description, Parameters: tool.Parameters})
 	}
 	return request, nil
+}
+
+// currentTaskTurnMessageID returns only the final user message's unique, valid DSH identity.
+// It never falls back to an earlier message when the final user identity is malformed.
+func currentTaskTurnMessageID(messages []dshModelMessage) string {
+	lastUser := -1
+	for index, message := range messages {
+		if message.Role == "user" {
+			lastUser = index
+		}
+	}
+	if lastUser < 0 || !dshUserMessageSource(messages[lastUser].Source) {
+		return ""
+	}
+	lastUserID := messages[lastUser].ID
+	if !domain.ValidMessageID(lastUserID) {
+		return ""
+	}
+	count := 0
+	for _, message := range messages {
+		if message.ID == lastUserID {
+			count++
+		}
+	}
+	if count != 1 {
+		return ""
+	}
+	return lastUserID
+}
+
+func dshUserMessageSource(raw json.RawMessage) bool {
+	if len(raw) == 0 || !validAgentJSONObject(raw, maxAgentToolArgsBytes) {
+		return false
+	}
+	var source struct {
+		Kind string `json:"kind"`
+	}
+	if json.Unmarshal(raw, &source) != nil {
+		return false
+	}
+	return source.Kind == "user"
 }

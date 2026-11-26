@@ -34,6 +34,11 @@ const (
 	cloudDSHWorkspaceSearchMaxSnippetRunes = 240
 )
 
+const (
+	cloudDSHWorkspaceSourceModeImmutableRevision = "immutable_revision"
+	cloudDSHWorkspaceSourceModeLiveDirectory     = "live_directory"
+)
+
 // IsHostlessWorkspaceWriteApproval marks an approval that is bound to a
 // Hostless server Task. These approvals intentionally carry no Host runtime
 // fence; the Task owner and exact call hash are the authorization boundary.
@@ -95,23 +100,27 @@ type cloudDSHWorkspaceListOutput struct {
 }
 
 type cloudDSHWorkspaceReadOutput struct {
-	WorkspaceID string `json:"workspace_id"`
-	Revision    int64  `json:"revision"`
-	Path        string `json:"path"`
-	SizeBytes   int64  `json:"size_bytes"`
-	SHA256      string `json:"sha256"`
-	Content     string `json:"content"`
+	WorkspaceID    string `json:"workspace_id"`
+	Revision       int64  `json:"revision"`
+	SourceMode     string `json:"source_mode"`
+	ManifestSHA256 string `json:"manifest_sha256,omitempty"`
+	Path           string `json:"path"`
+	SizeBytes      int64  `json:"size_bytes"`
+	SHA256         string `json:"sha256"`
+	Content        string `json:"content"`
 }
 
 type cloudDSHWorkspaceSearchMatch struct {
-	Path string `json:"path"`
-	Line int    `json:"line"`
-	Text string `json:"text"`
+	Path          string `json:"path"`
+	Line          int    `json:"line"`
+	ContentSHA256 string `json:"content_sha256"`
+	Text          string `json:"text"`
 }
 
 type cloudDSHWorkspaceSearchOutput struct {
 	WorkspaceID    string                         `json:"workspace_id"`
 	Revision       int64                          `json:"revision"`
+	SourceMode     string                         `json:"source_mode"`
 	ManifestSHA256 string                         `json:"manifest_sha256,omitempty"`
 	FilesScanned   int                            `json:"files_scanned"`
 	SkippedFiles   int                            `json:"skipped_files"`
@@ -389,6 +398,7 @@ func (t *cloudDSHWorkspaceTools) read(ctx context.Context, current task.Task, ar
 		return AgentToolResult{}, domain.NewError(domain.CodeWorkspaceConflict, "Workspace file is not valid UTF-8 text")
 	}
 	output, err := json.Marshal(cloudDSHWorkspaceReadOutput{WorkspaceID: snapshot.workspaceID, Revision: snapshot.revision,
+		SourceMode: cloudDSHWorkspaceSourceModeImmutableRevision, ManifestSHA256: snapshot.manifestSHA256,
 		Path: file.Path, SizeBytes: file.SizeBytes, SHA256: file.SHA256, Content: string(content)})
 	if err != nil {
 		return AgentToolResult{}, fmt.Errorf("encode Workspace read result: %w", err)
@@ -421,7 +431,8 @@ func (t *cloudDSHWorkspaceTools) search(ctx context.Context, current task.Task, 
 		return cloudDSHWorkspaceFailure(domain.NewError(domain.CodeInvalidArgument, "Workspace symbolic links cannot be traversed")), nil
 	}
 	output := cloudDSHWorkspaceSearchOutput{WorkspaceID: snapshot.workspaceID, Revision: snapshot.revision,
-		ManifestSHA256: snapshot.manifestSHA256, Complete: true, Matches: make([]cloudDSHWorkspaceSearchMatch, 0)}
+		SourceMode: cloudDSHWorkspaceSourceModeImmutableRevision, ManifestSHA256: snapshot.manifestSHA256,
+		Complete: true, Matches: make([]cloudDSHWorkspaceSearchMatch, 0)}
 	bytesScanned := 0
 	for _, file := range snapshot.files {
 		if cloudDSHWorkspacePathIsSensitive(file.Path) || !workspacePathWithinPrefix(file.Path, arguments.Prefix) ||
@@ -451,7 +462,7 @@ func (t *cloudDSHWorkspaceTools) search(ctx context.Context, current task.Task, 
 			if !strings.Contains(strings.ToLower(line), query) {
 				continue
 			}
-			output.Matches = append(output.Matches, cloudDSHWorkspaceSearchMatch{Path: file.Path, Line: lineNumber + 1,
+			output.Matches = append(output.Matches, cloudDSHWorkspaceSearchMatch{Path: file.Path, Line: lineNumber + 1, ContentSHA256: file.SHA256,
 				Text: truncateWorkspaceSearchSnippet(strings.TrimSpace(line), cloudDSHWorkspaceSearchMaxSnippetRunes)})
 			if len(output.Matches) >= arguments.MaxResults {
 				output.Complete = false
@@ -1031,6 +1042,9 @@ func (b *CloudDSHToolBroker) executeWorkspaceTool(ctx context.Context, claimed t
 	}
 	if result.Status == AgentToolUnknown {
 		return b.pauseUnknown(ctx, current, step, usage, operationKey, "The Workspace publish receipt could not be confirmed safely.")
+	}
+	if result.Status == AgentToolSucceeded {
+		ctx = withTaskToolWorkspaceSourceLocations(ctx, current, call.Name, result)
 	}
 	step.Status, step.Summary = task.StepSucceeded, "The Hostless Workspace tool completed and its result was checked."
 	if result.Status == AgentToolFailed {
