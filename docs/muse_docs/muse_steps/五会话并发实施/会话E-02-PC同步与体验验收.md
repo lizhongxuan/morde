@@ -26,7 +26,7 @@
   - [x] Host 恢复门控和 Postgres CAS 定向回归复跑（2026-11-25 15:48 UTC）：`cd server && go test -count=1 ./internal/app -run '^TestAdminRecovery'` 通过；同目录 `go test -count=1 ./internal/store/postgres -run 'TestBeginHostRestoreFailedLostRequiresExactCASAndNoOutstandingLease|TestAdoptFailedHostRestoreAcceptsLostWithExactSandboxIdentity'` 通过。验证本地精确 generation / sandbox 身份 / lease 门控，不证明测试站 gen6 根因已修复；没有远端写入。
   - [ ] T16–T18 首次 / 增量 / 修改 / 删除 / 冲突 / 恢复的真实云端验收。
   - 验收：T16–T18 覆盖首次同步、未点击不变化、再次点击后的新增 / 修改 / 删除、无反向同步；同步中本机变更显示待处理，部分应用 / unknown 先对账。冲突、源不可访问、失权 / 默认电脑不可用时保留内容并提示，不换目标。使用实际 `morde-pc`，真实云端按任务授权安排。
-- [ ] **E02-2 真实 PC + DSH 主链（基础回复已通过；T43 在 `waiting_user / dsh_recovery_unresolved` 阻塞）。**与 A 选择隔离账号和版本，实际执行 T43：会话 → 复杂任务 → 两个 worker → 搜索 / 文件 / 命令或指定电脑操作 → MCP Apps 审批 → 读回验证 → 原会话交付。
+- [ ] **E02-2 真实 PC + DSH 主链（此前基础回复仅是历史局部证据；本轮 PC 登录失败，T43 仍在 `waiting_user / dsh_recovery_unresolved`）。**与 A 选择隔离账号和版本，实际执行 T43：会话 → 复杂任务 → 两个 worker → 搜索 / 文件 / 命令或指定电脑操作 → MCP Apps 审批 → 读回验证 → 原会话交付。
   - [x] 只读账本复核（2026-11-25 10:39 UTC）：T43 Task `q95bzz7n` 仍为 `waiting_user / dsh_recovery_unresolved`，当前步 `suh20930`、event_seq=32、无活动 lease，最近事件为 `task.waiting_user`。默认 Host `hdqokxzv` 仍为 `failed/lost`、generation 5，租约至 16:12:10 UTC，last_active 为 2026-11-23 12:37:24 UTC；Host 活动 lease 为 0。Task 账本有 1 条 `deepseek-flash` 已结算模型调用（10,304 输入 / 52 输出 token）和 1 条加密响应记录；未解密或读取响应。无流式派发、Task 操作、Hub 操作或产物；Task Agent / Account Runtime generation 1 均 stopped。没有恢复、重试、批准或操作 Host。
   - [x] T43 / T57 相关 Task 当前状态只读复核（2026-11-25 15:41 UTC）：`q95bzz7n` 仍是 `waiting_user / dsh_recovery_unresolved`、event_seq=32、current_step=`suh20930`、无 lease；`q06u34qw` 仍是 `waiting_user / dsh_recovery_unresolved`、event_seq=4、current_step=`s6u1f8bb`、无 lease；旧 `qfbwyq4f` 仍为 `cancelled`、event_seq=119。只读取状态 / waiting_reason / 序号 / 时间字段，未读任务正文或模型响应，也未重放、批准或修改状态；T43/T57 继续未完成。
   - [x] Host `failed/lost` 恢复路径旧版本只读审计（2026-11-25 11:15 UTC）：当时管理员入口要求正 `runtime_generation` 和 `confirm_retry`（`server/internal/api/admin_host_recovery.go:23-45`）；服务只接受 generation > 1 且原因是 `orchestrator_error` 或 `ready_timeout`，Postgres 再核对 generation / reason / sandbox ID（当时源码 `host_recovery.go:113-127`、`tx_lifecycle.go:567-575`）。reconciler 将找不到活动 sandbox 的 Host 记为 `lost`，并为 generation > 1 保留 Workspace/profile volume（`worker.go:233-250,279-285`）。因此当时 generation 5 的 `hdqokxzv` 不在支持的恢复路径中；未请求恢复 API、改数据库或绕过状态门控。
@@ -106,3 +106,8 @@
 - 当前源码下 `cd clients/desktop/harness/desktop && node --test tests/morde-main-recovery.test.mjs tests/morde-sync.test.mjs` 通过（79/79）；`cd web/portal && npx vitest run --maxWorkers=1 src/routes/Workspaces.test.tsx` 通过（64/64）；`cd runtime/morde-sync && go test -count=1 ./...` 三个 Go 包通过。
 - 本轮源码 `make pc` 的构建/启动记录与 E-01 共用一次运行（隔离目录 `/tmp/morde-e01-fullchain-20261126`）；Portal / Workbench / 同步 helper / 桌面构建完成并到达 Electron 启动。本次 CUA 无法枚举或读取该新客户端窗口，故没有 E-02 UI 操作；只手动停止了本轮自己启动的客户端。未启动同步 fixture、未创建 Task/审批、未访问或写入远端，也未触碰其他 profile。
 - 此次只记录代码回归和源码构建，不替代实际 PC 交互。E02-1 的 T16–T18 与真实云同步、E02-2–7 的相应 DSH/跨端/来源验收仍保持未完成。
+
+### 2026-11-26 步骤 9：实际客户端阻塞
+
+- 使用 `MORDE_TEST_USER_DATA=/tmp/morde-step9-pc-20261126 make pc` 构建并启动源码客户端；可见登录 UI 报“用户名或密码错误”，无法进入普通用户流程。没有发送消息、创建 Task/审批、选择文件夹或发起同步；本地 profile 已清理。
+- T43 仍为 `waiting_user / dsh_recovery_unresolved`；默认云电脑最近已知 `hdqokxzv` generation 6 为 `stopped / restore_failed`，未重试。T16–T18/T44–T59 的相应 PC/DSH/云端场景按步骤 9 分类保持阻塞或未完成。

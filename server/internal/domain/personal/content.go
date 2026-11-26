@@ -157,7 +157,7 @@ func ValidateObjectBody(objectType, objectID string, body []byte) error {
 	case ObjectTypeRuleCandidate:
 		var value RuleCandidateBody
 		if !decodePersonalObject(body, &value, "scope", "status", "source_memory_id", "source_memory_revision") || value.Scope != "personal" ||
-			(value.Status != RuleCandidatePending && value.Status != RuleCandidateActive) ||
+			(value.Status != RuleCandidatePending && value.Status != RuleCandidateValidated && value.Status != RuleCandidateActive) ||
 			ValidateObjectIdentifier(ObjectTypeMemory, value.SourceMemoryID) != nil || value.SourceMemoryRevision < 1 {
 			return invalidPersonalBody()
 		}
@@ -315,6 +315,7 @@ func isMemoryEntryID(value string) bool {
 
 const (
 	RuleCandidatePending          = "candidate"
+	RuleCandidateValidated        = "validated"
 	RuleCandidateActive           = "active"
 	SkillCandidatePending         = "candidate"
 	SkillCandidateValidated       = "validated"

@@ -244,13 +244,19 @@ func TestValidateObjectBodyRejectsFieldLimitAndEnumViolations(t *testing.T) {
 }
 
 func TestValidatePersonalSkillCandidateBodyScopeStatusAndBounds(t *testing.T) {
-	valid := []byte(`{"scope":"personal","status":"candidate","name":"Weekly review","description":"Review goals and plans","content":"Read goals and list blockers."}`)
-	if err := ValidateObjectBody(ObjectTypeSkillCandidate, "sk_0123abcd", valid); err != nil {
-		t.Fatalf("valid personal Skill candidate rejected: %v", err)
+	valid := []string{
+		`{"scope":"personal","status":"candidate","name":"Weekly review","description":"Review goals and plans","content":"Read goals and list blockers."}`,
+		`{"scope":"personal","status":"validated","name":"Weekly review","description":"Review goals and plans","content":"Read goals and list blockers."}`,
+		`{"scope":"personal","status":"active","name":"Weekly review","description":"Review goals and plans","content":"Read goals and list blockers."}`,
+	}
+	for _, body := range valid {
+		if err := ValidateObjectBody(ObjectTypeSkillCandidate, "sk_0123abcd", []byte(body)); err != nil {
+			t.Errorf("valid personal Skill candidate rejected: %v; body=%s", err, body)
+		}
 	}
 	invalid := []string{
 		`{"scope":"project","status":"candidate","name":"x","description":"y","content":"z"}`,
-		`{"scope":"personal","status":"active","name":"x","description":"y","content":"z"}`,
+		`{"scope":"personal","status":"unknown","name":"x","description":"y","content":"z"}`,
 		`{"scope":"personal","status":"candidate","name":" x","description":"y","content":"z"}`,
 		`{"scope":"personal","status":"candidate","name":"x","description":"y","content":"  "}`,
 	}
@@ -262,9 +268,11 @@ func TestValidatePersonalSkillCandidateBodyScopeStatusAndBounds(t *testing.T) {
 }
 
 func TestValidatePersonalRuleCandidateRequiresPersonalScopeAndMemorySource(t *testing.T) {
-	valid := []byte(`{"scope":"personal","status":"candidate","source_memory_id":"global","source_memory_revision":1}`)
-	if err := ValidateObjectBody(ObjectTypeRuleCandidate, "r_abcdef01", valid); err != nil {
-		t.Fatalf("valid rule candidate rejected: %v", err)
+	for _, status := range []string{RuleCandidatePending, RuleCandidateValidated, RuleCandidateActive} {
+		body := []byte(`{"scope":"personal","status":"` + status + `","source_memory_id":"global","source_memory_revision":1}`)
+		if err := ValidateObjectBody(ObjectTypeRuleCandidate, "r_abcdef01", body); err != nil {
+			t.Errorf("valid rule candidate status %q rejected: %v", status, err)
+		}
 	}
 	for name, test := range map[string]struct {
 		id   string

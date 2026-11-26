@@ -396,7 +396,7 @@ describe('PersonalData', () => {
     expect(apiMocks.submitTask).not.toHaveBeenCalled();
   });
 
-  it('keeps rule candidates pending until explicit approval and binds them to the source memory revision', async () => {
+  it('validates a rule source revision before separate explicit approval', async () => {
     const user = userEvent.setup();
     apiMocks.snapshot.mockResolvedValue({
       watermark: 4,
@@ -418,12 +418,16 @@ describe('PersonalData', () => {
     expect(id).toMatch(/^r_[0-9a-f]{8}$/);
     expect(body).toEqual({ scope: 'personal', status: 'candidate',
       source_memory_id: 'm_abcdef01', source_memory_revision: 2 });
-    expect(await screen.findByText('待你审核')).toBeInTheDocument();
+    expect(await screen.findByText('待来源版本校验')).toBeInTheDocument();
     expect(apiMocks.submitTask).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole('button', { name: '确认并启用' }));
+    await user.click(screen.getByRole('button', { name: '验证来源版本' }));
     await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledTimes(2));
-    const activation = apiMocks.replace.mock.calls[1];
+    expect((apiMocks.replace.mock.calls[1]?.[3] as { status: string } | undefined)?.status).toBe('validated');
+
+    await user.click(screen.getByRole('button', { name: '确认并启用' }));
+    await waitFor(() => expect(apiMocks.replace).toHaveBeenCalledTimes(3));
+    const activation = apiMocks.replace.mock.calls[2];
     expect(activation?.[0]).toBe('rule_candidate');
     expect((activation?.[3] as { status: string } | undefined)?.status).toBe('active');
   });

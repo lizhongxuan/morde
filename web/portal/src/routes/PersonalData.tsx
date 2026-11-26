@@ -29,7 +29,7 @@ type ProfileBody = { name: string; avatar: 'dragon' | 'emoji'; emoji?: string; c
 type SoulBody = { name: string; emoji?: string; style?: string; lang?: string; content: string };
 type MemoryBody = { content: string; category?: string };
 type RuleCandidateBody = {
-  scope: 'personal'; status: 'candidate' | 'active';
+  scope: 'personal'; status: 'candidate' | 'validated' | 'active';
   source_memory_id: string; source_memory_revision: number;
 };
 type SkillCandidateBody = {
@@ -415,6 +415,10 @@ export function PersonalData() {
 
   const activateRuleCandidate = (item: PersonalObject) => {
     const body = item.body as RuleCandidateBody;
+    if (body.status !== 'validated') {
+      setActionError('请先完成来源版本校验，再单独确认启用。');
+      return;
+    }
     const source = state?.objects[personalObjectKey('memory', body.source_memory_id)];
     if (!source || source.revision !== body.source_memory_revision) {
       setActionError('来源记忆已变化；此候选不会生效，请从当前记忆重新提议。');
@@ -422,6 +426,18 @@ export function PersonalData() {
     }
     if (!window.confirm('启用后，Morde 会把这条规则作为个人对话中的常驻指引，在你的请求和现有权限范围内遵循；它不会授予工具权限、跳过审批或增加预算。确定启用吗？')) return;
     void saveObject('rule_candidate', item.object_id, { ...body, status: 'active' });
+  };
+
+  const validateRuleCandidate = (item: PersonalObject) => {
+    const body = item.body as RuleCandidateBody;
+    const source = state?.objects[personalObjectKey('memory', body.source_memory_id)];
+    if (!source || source.revision !== body.source_memory_revision) {
+      setActionError('来源记忆已变化；请从当前版本重新提议规则。');
+      return;
+    }
+    if (window.confirm('服务端会在保存验证状态的同一事务中复核来源记忆仍是指定版本。之后仍需单独确认启用。继续吗？')) {
+      void saveObject('rule_candidate', item.object_id, { ...body, status: 'validated' });
+    }
   };
 
   const deleteRuleCandidate = (item: PersonalObject) => {
@@ -719,17 +735,19 @@ export function PersonalData() {
       </form>}
       <section className="personal-data-setting" aria-labelledby="personal-rule-candidates-title">
         <h3 id="personal-rule-candidates-title">规则候选</h3>
-        <p className="muted">候选不会自动生效。启用前会检查来源记忆仍是同一版本；启用后可指导个人对话，但不能扩展现有权限或绕过审批。</p>
+        <p className="muted">候选不会自动生效。先验证来源记忆版本，再单独确认启用；启用后可指导个人对话，但不能扩展现有权限或绕过审批。</p>
         {ruleCandidateObjects.length === 0 ? <p className="muted">暂无规则候选。</p> : ruleCandidateObjects.map((item) => {
           const body = item.body as RuleCandidateBody;
           const source = state.objects[personalObjectKey('memory', body.source_memory_id)];
           const sourceCurrent = Boolean(source && source.revision === body.source_memory_revision);
           return <article className="model-connection-card" key={`${item.object_id}:${item.revision}`}>
             <div className="model-connection-main"><p>{sourceCurrent ? asString(source?.body.content) : '来源记忆已变化或不可用。'}</p><small>来源记忆：{body.source_memory_id} 第 {body.source_memory_revision} 版 · 范围：仅个人对话</small>
-              <p className="muted">{!sourceCurrent ? '来源已变化或不可用；此候选不会进入对话上下文。' : body.status === 'active' ? '已确认并启用' : '待你审核'}</p></div>
+              <p className="muted">{!sourceCurrent ? '来源已变化或不可用；此候选不会进入对话上下文。' : body.status === 'active' ? '已确认并启用' : body.status === 'validated' ? '来源版本已校验，待你确认' : '待来源版本校验'}</p></div>
             <div className="inline-actions">{body.status === 'candidate' && <button type="button" className="button button-primary"
-              disabled={!sourceCurrent || syncing} onClick={() => activateRuleCandidate(item)}>确认并启用</button>}
-              <button type="button" className="button button-secondary" disabled={syncing} onClick={() => deleteRuleCandidate(item)}>删除候选</button></div>
+              disabled={!sourceCurrent || syncing} onClick={() => validateRuleCandidate(item)}>验证来源版本</button>}
+              {body.status === 'validated' && <button type="button" className="button button-primary"
+                disabled={!sourceCurrent || syncing} onClick={() => activateRuleCandidate(item)}>确认并启用</button>}
+              <button type="button" className="button button-secondary" disabled={syncing} onClick={() => deleteRuleCandidate(item)}>{body.status === 'active' ? '撤销启用并删除' : '删除候选'}</button></div>
           </article>;
         })}
       </section>

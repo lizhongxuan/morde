@@ -15,6 +15,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -22,6 +23,7 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/record"
 	"morde/server/internal/domain/task"
 )
@@ -1182,25 +1184,27 @@ func (s *cloudDSHBrokerTaskStore) CommitTaskProgress(ctx context.Context, progre
 				continue
 			}
 			var stored struct {
-				SessionID         string `json:"agent_session_id"`
-				SkillID           string `json:"skill_id"`
-				SkillVersion      string `json:"skill_version"`
-				BundleVersion     string `json:"bundle_version"`
-				SourceRef         string `json:"source_ref"`
-				ContentSHA256     string `json:"content_sha256"`
-				OutputSHA256      string `json:"output_sha256"`
-				FingerprintSHA256 string `json:"fingerprint_sha256"`
+				SessionID             string `json:"agent_session_id"`
+				SkillID               string `json:"skill_id"`
+				SkillVersion          string `json:"skill_version"`
+				BundleVersion         string `json:"bundle_version"`
+				PersonalSkillRevision int64  `json:"personal_skill_revision"`
+				SourceRef             string `json:"source_ref"`
+				ContentSHA256         string `json:"content_sha256"`
+				OutputSHA256          string `json:"output_sha256"`
+				FingerprintSHA256     string `json:"fingerprint_sha256"`
 			}
 			if json.Unmarshal(payload.Detail["agent_session_id"], &stored.SessionID) != nil ||
 				json.Unmarshal(payload.Detail["skill_id"], &stored.SkillID) != nil ||
 				json.Unmarshal(payload.Detail["skill_version"], &stored.SkillVersion) != nil ||
 				json.Unmarshal(payload.Detail["bundle_version"], &stored.BundleVersion) != nil ||
+				json.Unmarshal(payload.Detail["personal_skill_revision"], &stored.PersonalSkillRevision) != nil ||
 				json.Unmarshal(payload.Detail["source_ref"], &stored.SourceRef) != nil ||
 				json.Unmarshal(payload.Detail["content_sha256"], &stored.ContentSHA256) != nil ||
 				json.Unmarshal(payload.Detail["output_sha256"], &stored.OutputSHA256) != nil ||
 				json.Unmarshal(payload.Detail["fingerprint_sha256"], &stored.FingerprintSHA256) != nil ||
 				stored.SessionID != read.AgentSessionID || stored.SkillID != read.SkillID || stored.SkillVersion != read.SkillVersion ||
-				stored.BundleVersion != read.BundleVersion || stored.SourceRef != read.SourceRef ||
+				stored.BundleVersion != read.BundleVersion || stored.PersonalSkillRevision != read.PersonalSkillRevision || stored.SourceRef != read.SourceRef ||
 				stored.ContentSHA256 != read.ContentSHA256 || stored.OutputSHA256 != read.OutputSHA256 ||
 				stored.FingerprintSHA256 != read.FingerprintSHA256 {
 				return task.Event{}, errors.New("skill replay fingerprint changed")
@@ -1421,6 +1425,19 @@ func TestCloudDSHToolBrokerReadsFixedNanoMuseSkillAndReplaysWithoutRecharging(t 
 			if definition.RequiredScope != identity.ScopeTaskRead || !validAgentJSONObject(definition.Parameters, maxAgentToolSchemaBytes) {
 				t.Fatalf("skill tool definition is invalid: %#v", definition)
 			}
+			var schema struct {
+				Properties map[string]struct {
+					Pattern string `json:"pattern"`
+				} `json:"properties"`
+			}
+			if err := json.Unmarshal(definition.Parameters, &schema); err != nil {
+				t.Fatalf("decode skill tool schema: %v", err)
+			}
+			skillIDPattern, err := regexp.Compile(schema.Properties["skill_id"].Pattern)
+			if err != nil || !skillIDPattern.MatchString("sk_0123abcd") || skillIDPattern.MatchString("sk_0123ABCD") ||
+				!strings.Contains(definition.Description, "active personal skill") || !strings.Contains(definition.Description, "permissions") {
+				t.Fatalf("skill tool does not admit controlled personal Skills: %+v", definition)
+			}
 			for _, id := range []string{"inbox-triage", "meeting-prep", "weekly-review"} {
 				if strings.Contains(definition.Description, id+":") {
 					t.Errorf("deprecated skill %q was exposed to new Tasks", id)
@@ -1487,6 +1504,72 @@ func TestCloudDSHToolBrokerReadsFixedNanoMuseSkillAndReplaysWithoutRecharging(t 
 		store.details.Task.Usage.ToolCalls != 2 || len(store.events) != 2 {
 		t.Fatalf("deprecated skill could not recover an existing checkpoint: result=%#v err=%v usage=%+v events=%d", legacyReplay, err,
 			store.details.Task.Usage, len(store.events))
+	}
+}
+
+func TestCloudDSHToolBrokerReadsOnlyAnActiveAuthorizedPersonalSkill(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, nil)
+	store := &cloudDSHBrokerTaskStore{runtimeToolTaskStore: fixture.store}
+	fixture.executor.store = store
+	store.details.Task.ExecutionLocation = "server"
+	store.details.Task.AgentInstanceID = "agent_personal_skill"
+	store.details.Task.AgentGeneration = 1
+	store.details.Task.AgentSessionID = "session_personal_skill"
+	store.details.Task.ConversationID = "c1234567"
+	store.details.Task.Authorization = task.Authorization{
+		Kind: string(identity.KindSession), TokenID: "t1234567", Version: 1,
+		Scopes: []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit)},
+	}
+	expires := time.Now().Add(time.Hour).UTC()
+	store.details.Task.Authorization.ExpiresAt = &expires
+	store.details.Task.ConversationContext = &task.ConversationContext{
+		OwnerID: store.details.Task.OwnerID, InitiatorID: store.details.Task.OwnerID,
+		ConversationID: store.details.Task.ConversationID, Scope: "personal",
+	}
+	const skillID = "sk_0123abcd"
+	const skillBody = `{"scope":"personal","status":"active","name":"Weekly review","description":"Review goals","content":"Read the current goals and draft next steps."}`
+	mutationStore := &personalMutationStoreStub{object: personal.Object{
+		ObjectType: personal.ObjectTypeSkillCandidate, ObjectID: skillID, Revision: 4, Body: json.RawMessage(skillBody),
+	}}
+	personalData, err := NewPersonalMutationService(mutationStore)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker, err := NewCloudDSHToolBroker(store, fixture.executor, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	broker.personalData = personalData
+	claimed := store.details.Task
+	call := ModelToolCall{CallID: "call_personal_skill_1", Name: cloudDSHSkillReadToolName,
+		Arguments: `{"skill_id":"` + skillID + `"}`}
+	result, err := broker.Execute(context.Background(), claimed, call)
+	if err != nil || result.Status != AgentToolSucceeded {
+		t.Fatalf("read active personal skill: result=%+v err=%v", result, err)
+	}
+	var output cloudDSHSkillReadOutput
+	if json.Unmarshal([]byte(result.Output), &output) != nil || output.SkillID != skillID || output.Version != "4" ||
+		output.BundleVersion != cloudDSHPersonalSkillBundleVersion || output.SourceRef != "personal://"+skillID+"/revision/4" ||
+		output.Content != "Read the current goals and draft next steps." {
+		t.Fatalf("personal Skill result metadata/content invalid: %+v", output)
+	}
+	if mutationStore.objectType != personal.ObjectTypeSkillCandidate || mutationStore.objectID != skillID ||
+		mutationStore.readPrincipal.UserID != claimed.OwnerID || len(store.committedTaskProgress) != 1 ||
+		store.committedTaskProgress[0].CloudDSHSkillRead.PersonalSkillRevision != 4 ||
+		strings.Contains(string(store.events[0].Payload), output.Content) {
+		t.Fatalf("personal Skill escaped owner scoping or durable read ledger: read=%+v progress=%+v event=%s",
+			mutationStore, store.committedTaskProgress, store.events[0].Payload)
+	}
+	var pending personal.SkillCandidateBody
+	if err := json.Unmarshal(mutationStore.object.Body, &pending); err != nil {
+		t.Fatal(err)
+	}
+	pending.Status = personal.SkillCandidateValidated
+	mutationStore.object.Body, _ = json.Marshal(pending)
+	call.CallID = "call_personal_skill_revoked"
+	if _, err := broker.Execute(context.Background(), claimed, call); domain.CodeOf(err) != domain.CodeForbidden ||
+		store.details.Task.Usage.ToolCalls != 1 || len(store.events) != 1 {
+		t.Fatalf("revoked personal Skill was loaded or charged: err=%v usage=%+v events=%d", err, store.details.Task.Usage, len(store.events))
 	}
 }
 
@@ -1592,7 +1675,9 @@ func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 	if len(cloudDSHSkillCatalog) != 29 || len(definition.Description) > 2048 ||
 		!strings.Contains(definition.Description, "Morde skill by ID") ||
 		strings.Contains(definition.Description, "Legacy Muse") || strings.Contains(definition.Description, "nanoMuse skill") {
-		t.Fatalf("skill catalog does not expose all built-ins: %d, %s", len(cloudDSHSkillCatalog), definition.Description)
+		t.Fatalf("skill catalog does not expose all built-ins: count=%d descriptionBytes=%d hasSkillByID=%v hasLegacy=%v hasNanoMuse=%v",
+			len(cloudDSHSkillCatalog), len(definition.Description), strings.Contains(definition.Description, "Morde skill by ID"),
+			strings.Contains(definition.Description, "Legacy Muse"), strings.Contains(definition.Description, "nanoMuse skill"))
 	}
 	for _, id := range []string{"weekly-review-planning", "markdown-docs", "translation"} {
 		if !strings.Contains(definition.Description, id) {
@@ -1601,11 +1686,15 @@ func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 	}
 	var schema struct {
 		Properties map[string]struct {
-			Enum []string `json:"enum"`
+			Pattern string `json:"pattern"`
 		} `json:"properties"`
 	}
 	if err := json.Unmarshal(definition.Parameters, &schema); err != nil {
 		t.Fatal(err)
+	}
+	skillIDPattern, err := regexp.Compile(schema.Properties["skill_id"].Pattern)
+	if err != nil {
+		t.Fatalf("compile skill ID pattern: %v", err)
 	}
 	var toolIDs []string
 	for _, skill := range cloudDSHSkillCatalog {
@@ -1627,25 +1716,33 @@ func TestCloudDSHSkillCatalogEmbedsEveryBuiltinWithFixedMetadata(t *testing.T) {
 			toolIDs = append(toolIDs, skill.id)
 		}
 	}
-	if len(schema.Properties["skill_id"].Enum) != len(toolIDs) {
-		t.Fatalf("skill tool allowlist differs from the embedded catalog: %#v", schema.Properties)
-	}
-	for index, id := range toolIDs {
-		if schema.Properties["skill_id"].Enum[index] != id {
-			t.Fatalf("skill tool allowlist differs from the embedded catalog: %#v", schema.Properties)
+	for _, id := range toolIDs {
+		if !skillIDPattern.MatchString(id) {
+			t.Fatalf("skill tool pattern does not allow built-in %q: %#v", id, schema.Properties)
 		}
+	}
+	if !skillIDPattern.MatchString("sk_0123abcd") || skillIDPattern.MatchString("sk_0123ABCD") || skillIDPattern.MatchString("../compare-options") {
+		t.Fatalf("skill tool pattern does not constrain personal IDs: %#v", schema.Properties)
 	}
 	for _, id := range []string{"office", "office-docx", "office-pptx", "office-xlsx", "office-render", "office-recalculate", "office-export-pdf"} {
-		found := false
-		for _, allowedID := range schema.Properties["skill_id"].Enum {
-			found = found || allowedID == id
-		}
-		if !found {
-			t.Errorf("Host skill ID %q is absent from the skill enum", id)
+		if !skillIDPattern.MatchString(id) {
+			t.Errorf("Host skill ID %q is absent from the skill pattern", id)
 		}
 	}
 	hostless := cloudDSHSkillReadDefinition(false)
-	if strings.Contains(string(hostless.Parameters), `"office"`) || strings.Contains(string(hostless.Parameters), `"office-xlsx"`) {
+	var hostlessSchema struct {
+		Properties map[string]struct {
+			Pattern string `json:"pattern"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal(hostless.Parameters, &hostlessSchema); err != nil {
+		t.Fatal(err)
+	}
+	hostlessPattern, err := regexp.Compile(hostlessSchema.Properties["skill_id"].Pattern)
+	if err != nil {
+		t.Fatalf("compile hostless skill ID pattern: %v", err)
+	}
+	if hostlessPattern.MatchString("office") || hostlessPattern.MatchString("office-xlsx") {
 		t.Fatalf("hostless skill tool exposes Office skills: %s", hostless.Parameters)
 	}
 }

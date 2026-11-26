@@ -8,18 +8,22 @@ import (
 	"encoding/json"
 	"io/fs"
 	"math"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/task"
 )
 
 const (
-	cloudDSHSkillReadToolName  = "nanomuse_skill_read"
-	cloudDSHSkillBundleVersion = "nanomuse-builtin-v1"
+	cloudDSHSkillReadToolName          = "nanomuse_skill_read"
+	cloudDSHSkillBundleVersion         = "nanomuse-builtin-v1"
+	cloudDSHPersonalSkillBundleVersion = "morde-personal-skill-v1"
 )
 
 // MaxCloudDSHSkillEventBytes bounds metadata saved in the client-visible Task event.
@@ -128,16 +132,21 @@ func cloudDSHSkillReadDefinition(hostAvailable bool) AgentToolDefinition {
 		}
 	}
 	if hasOfficeSkills {
-		descriptions = append(descriptions, "Office workflows require an authorized Host")
+		descriptions = append(descriptions, "Office workflows need Host authorization")
 	}
+	patterns := make([]string, 0, len(ids))
+	for _, id := range ids {
+		patterns = append(patterns, regexp.QuoteMeta(id))
+	}
+	patterns = append(patterns, `sk_[0-9a-f]{8}`)
 	parameters, _ := json.Marshal(map[string]any{
 		"type":       "object",
-		"properties": map[string]any{"skill_id": map[string]any{"type": "string", "enum": ids}},
+		"properties": map[string]any{"skill_id": map[string]any{"type": "string", "pattern": "^(?:" + strings.Join(patterns, "|") + ")$"}},
 		"required":   []string{"skill_id"}, "additionalProperties": false,
 	})
 	return AgentToolDefinition{
 		ModelTool: ModelTool{Name: cloudDSHSkillReadToolName,
-			Description: "Load a reviewed Morde skill by ID. Skills add no permissions. Available: " + strings.Join(descriptions, "; "),
+			Description: "Read Morde skill by ID or active personal skill from context. Skills grant no permissions; Task authorization applies. Built-ins: " + strings.Join(descriptions, "; "),
 			Parameters:  parameters},
 		RequiredScope: identity.ScopeTaskRead,
 	}
@@ -152,11 +161,12 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 	if decodeStrictRuntimeResult([]byte(call.Arguments), &arguments) != nil {
 		return AgentToolResult{}, domain.InvalidArgument("tool_call.arguments", "dsh skill arguments are invalid")
 	}
-	skill, ok := cloudDSHSkillForID(arguments.SkillID)
-	if !ok {
+	skill, builtin := cloudDSHSkillForID(arguments.SkillID)
+	personalSkillID := personal.ValidSkillCandidateID(arguments.SkillID)
+	if !builtin && !personalSkillID {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "Morde skill is not in the fixed allowlist")
 	}
-	if skill.deprecated && !recovering {
+	if builtin && skill.deprecated && !recovering {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "deprecated Morde skill is available only to recover an existing DSH checkpoint")
 	}
 	details, err := b.currentServerTask(ctx, claimed)
@@ -164,7 +174,7 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 		return AgentToolResult{}, err
 	}
 	current := details.Task
-	if skill.requiresHost && current.HostID == "" {
+	if builtin && skill.requiresHost && current.HostID == "" {
 		_, target, routed, targetErr := b.refreshDeferredTask(ctx, claimed)
 		if targetErr != nil || !routed || target.Unavailable || !domain.ValidHostID(target.HostID) {
 			return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "this Morde skill requires a configured authorized Host")
@@ -181,14 +191,32 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 	if err := b.authorizeSkillTask(ctx, current); err != nil {
 		return AgentToolResult{}, domain.NewError(domain.CodeForbidden, "task authorization does not allow Morde skills")
 	}
-	content, err := fs.ReadFile(cloudDSHSkillBundle, skill.resource)
-	if err != nil || len(content) == 0 || len(content) > maxAgentToolOutputBytes || !utf8.Valid(content) {
-		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "fixed Morde skill bundle is invalid")
+	var skillID, skillVersion, bundleVersion, sourceRef, eventSource string
+	var personalSkillRevision int64
+	var content []byte
+	if builtin {
+		content, err = fs.ReadFile(cloudDSHSkillBundle, skill.resource)
+		if err != nil {
+			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "fixed Morde skill bundle is invalid")
+		}
+		skillID, skillVersion, bundleVersion, sourceRef, eventSource = skill.id, skill.version, cloudDSHSkillBundleVersion, skill.sourceRef, "nanomuse_builtin"
+	} else {
+		var candidate personal.SkillCandidateBody
+		candidate, personalSkillRevision, err = b.activePersonalSkill(ctx, current, arguments.SkillID)
+		if err != nil {
+			return AgentToolResult{}, err
+		}
+		content = []byte(candidate.Content)
+		skillID, skillVersion, bundleVersion = arguments.SkillID, strconv.FormatInt(personalSkillRevision, 10), cloudDSHPersonalSkillBundleVersion
+		sourceRef, eventSource = "personal://"+skillID+"/revision/"+skillVersion, "morde_personal"
+	}
+	if len(content) == 0 || len(content) > maxAgentToolOutputBytes || !utf8.Valid(content) {
+		return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "Morde skill content is invalid")
 	}
 	contentHash := sha256.Sum256(content)
 	output, err := json.Marshal(cloudDSHSkillReadOutput{
-		SkillID: skill.id, Version: skill.version, BundleVersion: cloudDSHSkillBundleVersion,
-		SourceRef: skill.sourceRef, ContentSHA256: hex.EncodeToString(contentHash[:]),
+		SkillID: skillID, Version: skillVersion, BundleVersion: bundleVersion,
+		SourceRef: sourceRef, ContentSHA256: hex.EncodeToString(contentHash[:]),
 		ExecutionNotes: "Use only tools listed for this task. If web_search, web_fetch, or recall are unavailable, use only suitable already-authorized browser and Workspace tools or state the limitation; never invent tools or access paths outside the authorized Workspace.",
 		Content:        string(content),
 	})
@@ -199,8 +227,8 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 	commit := CloudDSHSkillReadCommit{
 		TaskID: current.ID, OwnerID: current.OwnerID, AgentSessionID: current.AgentSessionID,
 		AuthorizationVersion: current.Authorization.Version,
-		CallID:               call.CallID, SkillID: skill.id, SkillVersion: skill.version, BundleVersion: cloudDSHSkillBundleVersion,
-		SourceRef: skill.sourceRef, ContentSHA256: hex.EncodeToString(contentHash[:]),
+		CallID:               call.CallID, SkillID: skillID, SkillVersion: skillVersion, PersonalSkillRevision: personalSkillRevision, BundleVersion: bundleVersion,
+		SourceRef: sourceRef, ContentSHA256: hex.EncodeToString(contentHash[:]),
 		OutputSHA256: hex.EncodeToString(outputHash[:]),
 	}
 	commit.FingerprintSHA256 = cloudDSHSkillReadFingerprint(commit)
@@ -209,17 +237,22 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 		return AgentToolResult{}, domain.NewError(domain.CodeQuotaExceeded, "task tool call budget is exhausted")
 	}
 	usage.ToolCalls++
+	stepSummary := "Loaded the fixed, read-only skill bundle into the dsh session."
+	if personalSkillRevision > 0 {
+		stepSummary = "Loaded the explicitly activated, read-only personal skill revision into the dsh session."
+	}
 	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepSucceeded,
-		"Load Morde skill: "+skill.id, "Loaded the fixed, read-only skill bundle into the dsh session.")
+		"Load Morde skill: "+skillID, stepSummary)
 	if err != nil {
 		return AgentToolResult{}, err
 	}
 	detail := map[string]any{
-		"tool": cloudDSHSkillReadToolName, "phase": "skill_read", "source": "nanomuse_builtin",
+		"tool": cloudDSHSkillReadToolName, "phase": "skill_read", "source": eventSource,
 		"skill_call_id": commit.CallID, "agent_session_id": commit.AgentSessionID,
 		"authorization_version": commit.AuthorizationVersion, "skill_id": commit.SkillID,
 		"skill_version": commit.SkillVersion, "bundle_version": commit.BundleVersion,
-		"source_ref": commit.SourceRef, "content_sha256": commit.ContentSHA256,
+		"personal_skill_revision": commit.PersonalSkillRevision,
+		"source_ref":              commit.SourceRef, "content_sha256": commit.ContentSHA256,
 		"output_sha256": commit.OutputSHA256, "fingerprint_sha256": commit.FingerprintSHA256,
 	}
 	payload, err := agentStepEvent(step, usage, detail)
@@ -242,6 +275,32 @@ func (b *CloudDSHToolBroker) executeSkillRead(ctx context.Context, claimed task.
 		return AgentToolResult{}, err
 	}
 	return AgentToolResult{Status: AgentToolSucceeded, Output: string(output)}, nil
+}
+
+func (b *CloudDSHToolBroker) activePersonalSkill(ctx context.Context, current task.Task, skillID string) (personal.SkillCandidateBody, int64, error) {
+	if !personal.ValidSkillCandidateID(skillID) || b.personalData == nil || !cloudDSHPersonalContextEligible(current) {
+		return personal.SkillCandidateBody{}, 0, domain.NewError(domain.CodeForbidden, "personal skill is unavailable for this Task")
+	}
+	principal, ok := cloudDSHPersonalPrincipal(current)
+	if !ok {
+		return personal.SkillCandidateBody{}, 0, domain.NewError(domain.CodeForbidden, "personal skill is not authorized")
+	}
+	object, err := b.personalData.GetPersonalObject(ctx, principal, personal.ObjectTypeSkillCandidate, skillID)
+	if err != nil {
+		if domain.CodeOf(err) == domain.CodeNotFound {
+			return personal.SkillCandidateBody{}, 0, domain.NewError(domain.CodeForbidden, "personal skill is not active")
+		}
+		return personal.SkillCandidateBody{}, 0, err
+	}
+	var candidate personal.SkillCandidateBody
+	if object.ObjectType != personal.ObjectTypeSkillCandidate || object.ObjectID != skillID || object.Revision < 1 ||
+		personal.ValidateObjectBody(object.ObjectType, object.ObjectID, object.Body) != nil || json.Unmarshal(object.Body, &candidate) != nil {
+		return personal.SkillCandidateBody{}, 0, domain.NewError(domain.CodeInvalidState, "stored personal skill is invalid")
+	}
+	if candidate.Scope != "personal" || candidate.Status != personal.SkillCandidateActive {
+		return personal.SkillCandidateBody{}, 0, domain.NewError(domain.CodeForbidden, "personal skill is not active")
+	}
+	return candidate, object.Revision, nil
 }
 
 func sameCloudDSHAuthorization(current, claimed task.Authorization) bool {

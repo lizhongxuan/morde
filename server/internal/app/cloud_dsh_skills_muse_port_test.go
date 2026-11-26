@@ -33,15 +33,15 @@ func TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools(t *testing.T) {
 	definition := cloudDSHSkillReadDefinition(true)
 	var schema struct {
 		Properties map[string]struct {
-			Enum []string `json:"enum"`
+			Pattern string `json:"pattern"`
 		} `json:"properties"`
 	}
 	if err := json.Unmarshal(definition.Parameters, &schema); err != nil {
 		t.Fatalf("decode skill reader schema: %v", err)
 	}
-	allowedSkillIDs := make(map[string]struct{}, len(schema.Properties["skill_id"].Enum))
-	for _, id := range schema.Properties["skill_id"].Enum {
-		allowedSkillIDs[id] = struct{}{}
+	skillIDPattern, err := regexp.Compile(schema.Properties["skill_id"].Pattern)
+	if err != nil {
+		t.Fatalf("compile skill reader ID pattern: %v", err)
 	}
 
 	for _, id := range []string{"task-management", "knowledge-organization", "wide-research", "translation", "meeting-follow-up", "app-creation", "email-management", "meeting-preparation", "scheduling", "weekly-review-planning"} {
@@ -55,8 +55,8 @@ func TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools(t *testing.T) {
 			if !ok || metadata.ID != id || metadata.Version != skill.version || metadata.SourceRef != wantSourceRef {
 				t.Fatalf("skill metadata is not fixed for %q: %#v", id, metadata)
 			}
-			if _, ok := allowedSkillIDs[id]; !ok {
-				t.Fatalf("skill %q is not in the read tool's fixed enum", id)
+			if !skillIDPattern.MatchString(id) {
+				t.Fatalf("skill %q is not accepted by the read tool's ID pattern", id)
 			}
 
 			content, err := cloudDSHSkillBundle.ReadFile(skill.resource)
@@ -139,8 +139,13 @@ func TestMusePortSkillsAreEmbeddedAndUseOnlyMordeWorkspaceTools(t *testing.T) {
 			}
 		})
 	}
+	for _, id := range []string{"sk_0123abcd", "../compare-options", "sk_0123ABCD"} {
+		if skillIDPattern.MatchString(id) != (id == "sk_0123abcd") {
+			t.Errorf("skill reader ID pattern match for %q = %v", id, skillIDPattern.MatchString(id))
+		}
+	}
 	for _, id := range []string{"inbox-triage", "meeting-prep", "weekly-review"} {
-		if _, ok := allowedSkillIDs[id]; ok {
+		if skillIDPattern.MatchString(id) {
 			t.Errorf("legacy Muse skill %q remains available to new Tasks", id)
 		}
 	}

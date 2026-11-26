@@ -46,8 +46,10 @@
 - [ ] **B02-2-PC 实际体验验收。**使用 PC/真实 DSH 和模型核验按语义选工具、用户可见授权/取消反馈及真实工具副作用；R12 整体不因本地测试勾为完成。
 - [ ] **B02-3 受控 Skill 候选。**先完成 B02-1/2；C-02 的 R09 记忆 / 来源 / 授权合同稳定后实施 R15。核对现有 Skill 读取与 DSH 上游 provider 的接入、版本及隔离能力，适用时优先复用；候选只在授权范围内形成、验证、启用和撤销。
   - 验收：A01 覆盖未批准不可用、明确启用后可用、撤权即时失效、不同账号 / Task 隔离；插件兼容及许可证核对记录在案。新 schema 交 A。
-  - **2026-11-26 步骤 8 审查：**C-02 的记忆来源合同现已具备本地实现：owner/授权开关 revision、记忆对象 revision、来源与删除状态在读取和 checkpoint 恢复时复核；可作为本项设计输入。当前 29 个固定内嵌 Skill 通过 `nanomuse_skill_read` 进入 Morde Broker，回归已覆盖固定 ID/版本、内容哈希、Task 授权、事件记录和 checkpoint 幂等；这不是租户 Skill 候选。上游 DSH `dsh-skill`/`dsh-tool-skill` 为 `0.2.2-rc.1`、MIT，但未加入 Runtime 锁文件；`tool-skill` 直接由 DSH 加载内容，不经 Morde Skill Broker 与 Task event 账本，文件系统 provider 也不满足目录边界，故本轮不直接安装。仍缺动态候选对象、验证/确认/撤销和跨账号/Task 隔离的可运行合同；B02-3 不勾选。
+  - **2026-11-26 步骤 8 继续开发：**在 Morde 现有个人对象 API/Store 中接入 `skill_candidate` 严格类型、格式校验状态、明确启用、启用版本不可改和撤销；Personal Data 页面提供候选编辑/格式校验/确认/撤销。复用既有 `nanomuse_skill_read`，上下文只列 active Skill 元信息，Broker 按当前 owner 获取正文，Task 事件记录版本/摘要，PostgreSQL 同事务复核 owner 对象仍为同一 active revision。定向领域、App、PostgreSQL 回归见[步骤 8 记录](../../../验证记录/Morde_Harness_最终流程测试用例.md#step-8-controlled-skills-memory-evaluation-2026-11-26)。未直接安装 `dsh-tool-skill`/filesystem provider：上游 consumer 有自己的 Session catalog/loader，但未接 Morde Broker/Task 账本；filesystem provider 也不满足目录隔离。官方上游仍标注 developer preview 且快速变化，本轮不升级；新集成仍使用 DSH 唯一 Runtime。
+  - **仍待验：**R15 本地数据/API/Broker 切片已有代码，但 Portal 仅有组件/API mock；没有实际 `morde-pc`、真实 DSH/模型和跨重启端到端验收。B02-3 不勾选。
 - [ ] **B02-4 交接给 C 和 A。**交出 Skill 候选 / 启用 / 撤销的可运行合同给 C-02 的 R16，并将协作图、资源归属和测试结果交 A-02。
+  - **2026-11-26 步骤 8：**R15 的候选状态、owner/revision、Broker 读取与撤销栅栏已写入此 TODO 和[步骤 8 测试记录](../../../验证记录/Morde_Harness_最终流程测试用例.md#step-8-controlled-skills-memory-evaluation-2026-11-26)，C-02 可据此实施 R16；A-02 所需的工作图/资源与完整稳定快照证据尚未形成，故保留未勾选。
   - 验收：C 可在不等本文件所有 PC 实测关闭的情况下使用已稳定合同；未运行真实模型或 PC 的部分明确待验。
 - [ ] **B02-5 资料来源与工具边界（R26）。**复核 `cloud_dsh_mcp_builtin.go` 及文件/检索工具是否能传递真实来源、可用位置和不完整信息，按工具自身现有合同补缺；将 Runtime 调整交 C、权限和跨层字段交 A。
   - 验收：T57/T59 的本地受控来源与伪造授权样本中，正常分析仍可执行，资料内命令不能增加权限；无法读取和定位如实反馈。真实模型和实际 PC 分开记录。
@@ -75,13 +77,13 @@
 ### 2026-11-26 B-02 TODO 联合审计（本轮步骤 2 验证前快照；最新状态见下方）
 
 - **B02-0 当时进行中。**普通问答在源码 PC 曾收到 `2+2 → 4`，但未从权威账本确认这次会话没有创建 Task/选择 Host；当时新闻搜索未得到可核验来源；追问没有现场 settled decision 的目标 Task/revision 证据；复杂计划在 checkpoint reconciliation 停止。新闻工具链后来已补本地受控搜索和来源读取证据，但真实模型/PC 体验仍待验；详见下方“步骤 2 最新复核”。这里保留的是此前快照，不代表本轮最终状态。
-- **B02-1 未完成。**本地父级工具子集、会话隔离与 App/Worker 路径回归通过；仍缺真实两个 worker 的时间重叠、冲突资源协调、子结果逐级汇总及 PC/真实 DSH 证据。是否启动后续并行任务按用户的步骤安排执行；本轮未开始。
-- **B02-2 未完成。**64 项工具定义上限与重复调用提醒已做定向回归；预算及必需工具仲裁、重启后的工具集一致性、底层取消确认和 unknown 副作用不重放仍待验。
-- **B02-3 未完成。**受控 Skill 读取不等于候选审批、启用、撤销及跨账号/Task 隔离；且依赖 B02-1/2 和 C-02 R09。
+- **B02-1 整体未关闭；本地范围已完成，PC 项待验。**本地父级工具子集、会话隔离与 App/Worker/PG/Runtime 路径回归通过；仍缺真实 PC + DSH 两个 worker 的语义委派、用户可见汇总与资源冲突场景。是否启动后续并行任务按用户的步骤安排执行；本轮未开始。
+- **B02-2 整体未关闭；本地范围已完成，PC 项待验。**64 项工具定义上限与重复调用提醒已做定向回归；预算及必需工具仲裁、重启后的工具集一致性、底层取消确认、unknown 副作用不重放的真实 PC/DSH 体验仍待验。
+- **B02-3 未完成。**当前工作树已加入个人 Skill 候选同步类型、候选状态转移和 Broker 的 active Skill 读取，并通过域/App/定向 PG 回归；个人候选 UI、候选审核与跨账号/Task 的 PC + 真实 DSH 完整验收仍缺，不能据此关闭 R15。
 - **B02-4 未完成。**缺少可运行 R16 Skill 合同交接与 A-02 协作/资源验收交接记录；等待 B02-3 合同稳定。
 - **B02-5 未完成。**本地工具边界已有部分来源提示、日期校验和凭据过滤测试；T57/T59 正常与伪造授权样本、无法读取/定位时的端到端反馈及真实 PC/模型证据未完成。
-- **B02-6 未完成。**Store 已有子 Session 结算、取消、子树隔离和 checkpoint 绑定的局部能力，但缺少覆盖失败/unknown、撤权、陈旧修订、重复事件、进程重启后父级取得可回查事实的完整回归，以及真实 DSH/PC 终态。
-- **B02-7 未完成。**App/Worker 的选定 MCP、Skill schema、撤权和父级工具子集测试通过；仍缺真实 DSH/模型按语义选择已授权能力及 PC 对无匹配能力的用户反馈。
+- **B02-6 整体未关闭；B02-6a 本地已完成，B02-6b 待验。**Store 已有子 Session 结算、取消、子树隔离和 checkpoint 绑定的局部能力；仍缺真实 DSH/PC 的端到端 handoff、可回查事实和用户可见终态。
+- **B02-7 整体未关闭；本地范围已完成，PC 项待验。**App/Worker 的选定 MCP、Skill schema、撤权和父级工具子集测试通过；仍缺真实 DSH/模型按语义选择已授权能力及 PC 对无匹配能力的用户反馈。
 - **缺陷审计结论：**只读审计未确认可独立安全修复并关闭上述 TODO 的生产缺陷。曾提出的根 Session 委派工具集合可能扩大的疑点，经 `TestCloudDSHDelegateToolsAreRestrictedToParentDefinitions`、嵌套委派子集和不扩张已存储选择等定向回归未复现；不放宽任何授权门。测试主机/PC profile 与其他并行验收仍在协调，本轮没有远端写操作或 Store/PostgreSQL 集成操作。
 
 ### 2026-11-26 Step 5 本地自动化验证（最新）
@@ -91,3 +93,7 @@
 - **PostgreSQL 并发与计划依赖：**使用仅监听 `127.0.0.1:55477` 的一次性 `postgres:16.15` 容器。`CH_TEST_DATABASE_URL='postgres://postgres@127.0.0.1:55477/postgres?sslmode=disable' GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^(TestStep5IndependentAgentChildSpawnsPersistDistinctSessionsStepsAndEvents|TestStep5ConcurrentIdenticalAgentChildSpawnCreatesOneChild|TestStep5PlanBoundChildSuccessUnlocksAndUnknownBlocksDependencies|TestNestedAgentSessionsEnforceDepthSubtreeAndCancellation|TestNestedCancellationFencesAdmissionAndFinalDispatch|TestNestedCancellationRacesFinalDispatch|TestPostgresAgentChildPlanBindingIsAtomicVersionedAndIdempotent|TestPostgresTaskPlanStepChildBindingUsesSettledChildStep)$' -count=1 -timeout=10m` 通过（8 项，10.099s）；新增 3 项 `go test -race` 通过（6.350s）。测试后容器已停止并自动删除。
 - **DSH 子进程集成：**同一 `CH_TEST_DATABASE_URL` 下，`go test ./internal/worker -run '^(TestCloudDSHNestedCoordinatorRunsIndependentWorkersConcurrently|TestCloudDSHNestedWorkerFailureReachesCoordinator|TestCloudDSHNestedCompletedEffectIsNotRepeatedAfterRestart|TestCloudDSHNestedCancelledBackgroundWorkerDoesNotRestart|TestCloudDSHNestedTaskCancellationLeavesIndependentTaskRunning|TestCloudDSHBackgroundOutputContinuationAfterLeaseReclaim)$' -count=1 -timeout=12m` 通过（6 个入口，19.383s；失败汇总含 3 个分类子用例）。证据覆盖双 worker 模型回合实际重叠、失败/unknown 逐级交回、后台输出 lease reclaim 后续读、取消隔离和已完成副作用不重放。
 - **边界：**以上使用本地确定性合成模型/工具，不是 Provider 语义验收。共享 Host/Workspace Broker 操作仍串行；模型回合重叠不表示外部副作用并行。B02-1/2/6/7 的本地合同完成；B02-1-PC、B02-2-PC、B02-6b 及 R03/R12 的实际 PC/真实模型体验仍待验，未访问或修改远端。
+
+### 2026-11-26 步骤 9：总体状态
+
+- B02-1/2/6a/7 的本地合同与自动化已完成，PC/真实 DSH 子项仍未完成；B02-3 的个人 Skill 候选状态机、同步对象和 active read 已有本地实现及域/App/PG 回归，但 R15 完整用户审核与真实 Runtime 体验未通过。B02-0、B02-1-PC、B02-2-PC、B02-3/4/5/6b/7-PC 保持未勾选。

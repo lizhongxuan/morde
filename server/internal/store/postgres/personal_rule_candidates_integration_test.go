@@ -54,11 +54,24 @@ func TestPostgresPersonalRuleCandidateRequiresCurrentSourceAndExplicitActivation
 		t.Fatal(err)
 	}
 	approved.Status = personal.RuleCandidateActive
+	directBody, _ = json.Marshal(approved)
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 5,
+		personal.Object{ObjectType: personal.ObjectTypeRuleCandidate, ObjectID: candidate.ObjectID, Body: directBody}, 1)); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("direct activation without source validation error = %v, want forbidden", err)
+	}
+	approved.Status = personal.RuleCandidateValidated
+	validatedBody, _ := json.Marshal(approved)
+	validated, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 6,
+		personal.Object{ObjectType: personal.ObjectTypeRuleCandidate, ObjectID: candidate.ObjectID, Body: validatedBody}, 1))
+	if err != nil || validated.ResultRevision != 2 {
+		t.Fatalf("validate unchanged rule candidate = %+v, %v", validated, err)
+	}
+	approved.Status = personal.RuleCandidateActive
 	approvedBody, _ := json.Marshal(approved)
-	activated, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 5,
-		personal.Object{ObjectType: personal.ObjectTypeRuleCandidate, ObjectID: candidate.ObjectID, Body: approvedBody}, 1))
-	if err != nil || activated.ResultRevision != 2 {
-		t.Fatalf("approve unchanged candidate = %+v, %v", activated, err)
+	activated, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 7,
+		personal.Object{ObjectType: personal.ObjectTypeRuleCandidate, ObjectID: candidate.ObjectID, Body: approvedBody}, 2))
+	if err != nil || activated.ResultRevision != 3 {
+		t.Fatalf("explicitly activate validated rule candidate = %+v, %v", activated, err)
 	}
 	if _, err := store.GetPersonalObject(ctx, principal, personal.ObjectTypeRuleCandidate, candidate.ObjectID); err != nil {
 		t.Fatalf("read owner rule candidate: %v", err)
@@ -74,8 +87,8 @@ func TestPostgresPersonalRuleCandidateRequiresCurrentSourceAndExplicitActivation
 	}
 	disabled.Status = personal.RuleCandidatePending
 	disabledBody, _ := json.Marshal(disabled)
-	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 6,
-		personal.Object{ObjectType: personal.ObjectTypeRuleCandidate, ObjectID: candidate.ObjectID, Body: disabledBody}, 2)); domain.CodeOf(err) != domain.CodeConflict {
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 8,
+		personal.Object{ObjectType: personal.ObjectTypeRuleCandidate, ObjectID: candidate.ObjectID, Body: disabledBody}, 3)); domain.CodeOf(err) != domain.CodeConflict {
 		t.Fatalf("active rule demotion error = %v, want conflict", err)
 	}
 }

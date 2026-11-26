@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"reflect"
 	"strconv"
 	"testing"
@@ -24,6 +25,7 @@ func TestPostgresPersonalContentObjectsAreOwnerScopedVersionedAndSyncable(t *tes
 		{ObjectType: personal.ObjectTypeProfile, ObjectID: personal.ProfileObjectID, Body: json.RawMessage(`{"name":"Muse","avatar":"dragon"}`)},
 		{ObjectType: personal.ObjectTypeMemory, ObjectID: "global", Body: json.RawMessage(`{"content":"A selected memory.","category":"fact"}`)},
 		{ObjectType: personal.ObjectTypeRuleCandidate, ObjectID: "r_0123abcd", Body: json.RawMessage(`{"scope":"personal","status":"candidate","source_memory_id":"global","source_memory_revision":1}`)},
+		{ObjectType: personal.ObjectTypeSkillCandidate, ObjectID: "sk_0123abcd", Body: json.RawMessage(`{"scope":"personal","status":"candidate","name":"Weekly review","description":"Review goals and plans","content":"Read goals and list blockers."}`)},
 		{ObjectType: personal.ObjectTypeSoul, ObjectID: "default", Body: json.RawMessage(`{"name":"Muse","style":"warm","lang":"en","content":"Be clear."}`)},
 		{ObjectType: personal.ObjectTypeDiary, ObjectID: "2026-11-02", Body: json.RawMessage(`{"date":"2026-11-02","content":"<!-- 2026-11-02 12:00:00 -->\nA selected entry."}`)},
 		{ObjectType: personal.ObjectTypeFeedPost, ObjectID: "feedpost_2026-11-02-01", Body: json.RawMessage(`{"title":"A note","type":"reflection","created_at":"2026-11-02T12:00:00Z","liked":true,"body":"A selected post."}`)},
@@ -187,6 +189,94 @@ func TestPostgresPersonalContentObjectsAreOwnerScopedVersionedAndSyncable(t *tes
 	}
 }
 
+func TestPostgresPersonalSkillCandidateRequiresValidationBeforeActivation(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 4000, 8192)
+	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
+	candidate := personal.Object{
+		ObjectType: personal.ObjectTypeSkillCandidate,
+		ObjectID:   "sk_0123abcd",
+		Body:       json.RawMessage(`{"scope":"personal","status":"candidate","name":"Weekly review","description":"Review goals and plans","content":"Read goals and list blockers."}`),
+	}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 1, candidate, 0)); err != nil {
+		t.Fatalf("create pending skill candidate: %v", err)
+	}
+
+	directActivation := personal.Object{
+		ObjectType: personal.ObjectTypeSkillCandidate,
+		ObjectID:   "sk_abcdef01",
+		Body:       json.RawMessage(`{"scope":"personal","status":"active","name":"Weekly review","description":"Review goals and plans","content":"Read goals and list blockers."}`),
+	}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 2, directActivation, 0)); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("create active skill candidate error = %v, want forbidden", err)
+	}
+
+	active := personal.Object{
+		ObjectType: personal.ObjectTypeSkillCandidate,
+		ObjectID:   candidate.ObjectID,
+		Body:       json.RawMessage(`{"scope":"personal","status":"active","name":"Weekly review","description":"Review goals and plans","content":"Read goals and list blockers."}`),
+	}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 3, active, 1)); domain.CodeOf(err) != domain.CodeForbidden {
+		t.Fatalf("activate an unvalidated skill candidate error = %v, want forbidden", err)
+	}
+
+	validated := personal.Object{
+		ObjectType: personal.ObjectTypeSkillCandidate,
+		ObjectID:   candidate.ObjectID,
+		Body:       json.RawMessage(`{"scope":"personal","status":"validated","name":"Weekly review","description":"Review goals and plans","content":"Read goals and list blockers."}`),
+	}
+	if receipt, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 4, validated, 1)); err != nil || receipt.ResultRevision != 2 {
+		t.Fatalf("validate unchanged skill candidate = %+v, %v", receipt, err)
+	}
+	changedValidated := personal.Object{
+		ObjectType: personal.ObjectTypeSkillCandidate,
+		ObjectID:   candidate.ObjectID,
+		Body:       json.RawMessage(`{"scope":"personal","status":"active","name":"Weekly review","description":"Changed after validation","content":"Read goals and list blockers."}`),
+	}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 5, changedValidated, 2)); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("change validated skill before activation error = %v, want conflict", err)
+	}
+	if receipt, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 6, active, 2)); err != nil || receipt.ResultRevision != 3 {
+		t.Fatalf("activate validated skill candidate = %+v, %v", receipt, err)
+	}
+
+	changedActive := personal.Object{
+		ObjectType: personal.ObjectTypeSkillCandidate,
+		ObjectID:   candidate.ObjectID,
+		Body:       json.RawMessage(`{"scope":"personal","status":"active","name":"Weekly review","description":"Changed after activation","content":"Read goals and list blockers."}`),
+	}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 7, changedActive, 3)); domain.CodeOf(err) != domain.CodeConflict {
+		t.Fatalf("change active skill candidate error = %v, want conflict", err)
+	}
+}
+
+func TestPostgresPersonalSkillCandidateLimitIsEnforcedPerOwner(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createTestUser(t, store, 3, 4000, 8192)
+	principal := createPersonalReadSessionPrincipal(t, store, owner.ID)
+	for index := 0; index < personal.MaxSkillCandidateCount; index++ {
+		candidate := personal.Object{
+			ObjectType: personal.ObjectTypeSkillCandidate,
+			ObjectID:   fmt.Sprintf("sk_%08x", index),
+			Body:       json.RawMessage(`{"scope":"personal","status":"candidate","name":"Review","description":"Review goals","content":"Read goals and list blockers."}`),
+		}
+		if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, index+1, candidate, 0)); err != nil {
+			t.Fatalf("create personal Skill candidate %d: %v", index+1, err)
+		}
+	}
+	overLimit := personal.Object{
+		ObjectType: personal.ObjectTypeSkillCandidate,
+		ObjectID:   "sk_fffffffe",
+		Body:       json.RawMessage(`{"scope":"personal","status":"candidate","name":"Review","description":"Review goals","content":"Read goals and list blockers."}`),
+	}
+	if _, err := store.ApplyPersonalMutation(ctx, principal,
+		personalContentMutationForTest(t, owner.ID, personal.MaxSkillCandidateCount+1, overLimit, 0)); domain.CodeOf(err) != domain.CodeQuotaExceeded {
+		t.Fatalf("personal Skill candidate over limit error = %v, want quota_exceeded", err)
+	}
+}
+
 func personalContentMutationForTest(t *testing.T, ownerID string, sequence int, object personal.Object, revision int64) personal.Mutation {
 	t.Helper()
 	mutation := personal.Mutation{
@@ -228,6 +318,8 @@ func updatedPersonalContentBody(object personal.Object) json.RawMessage {
 		return json.RawMessage(`{"content":"Updated selected memory.","category":"fact"}`)
 	case personal.ObjectTypeRuleCandidate:
 		return json.RawMessage(`{"scope":"personal","status":"candidate","source_memory_id":"global","source_memory_revision":1}`)
+	case personal.ObjectTypeSkillCandidate:
+		return json.RawMessage(`{"scope":"personal","status":"candidate","name":"Weekly review","description":"Review goals and plans","content":"Read goals, list risks, and plan next steps."}`)
 	case personal.ObjectTypeSoul:
 		return json.RawMessage(`{"name":"Muse","style":"warm","lang":"en","content":"Be concise."}`)
 	case personal.ObjectTypeDiary:

@@ -283,16 +283,43 @@ func validatePersonalRuleCandidateMutationInTx(ctx context.Context, tx pgx.Tx, i
 			personal.ValidateObjectBody(personal.ObjectTypeRuleCandidate, mutation.ObjectID, previousBody) != nil {
 			return domain.NewError(domain.CodeInternal, "stored personal rule candidate is invalid")
 		}
-		if previous.Status != personal.RuleCandidatePending {
+		if previous.Status == personal.RuleCandidateActive {
 			return domain.NewError(domain.CodeConflict, "an active rule must be removed and proposed again before it can change")
 		}
-		if next.Status == personal.RuleCandidateActive &&
-			(next.Scope != previous.Scope || next.SourceMemoryID != previous.SourceMemoryID ||
-				next.SourceMemoryRevision != previous.SourceMemoryRevision) {
-			return domain.NewError(domain.CodeConflict, "review the unchanged candidate before activating it")
+		unchanged := next.Scope == previous.Scope && next.SourceMemoryID == previous.SourceMemoryID &&
+			next.SourceMemoryRevision == previous.SourceMemoryRevision
+		switch previous.Status {
+		case personal.RuleCandidatePending:
+			if next.Status == personal.RuleCandidateActive {
+				return domain.NewError(domain.CodeForbidden, "a rule candidate must pass source validation before explicit activation")
+			}
+			if next.Status != personal.RuleCandidatePending && next.Status != personal.RuleCandidateValidated {
+				return domain.NewError(domain.CodeForbidden, "a rule candidate cannot skip source validation")
+			}
+			if next.Status == personal.RuleCandidateValidated && !unchanged {
+				return domain.NewError(domain.CodeConflict, "validate the unchanged rule candidate")
+			}
+		case personal.RuleCandidateValidated:
+			if !unchanged {
+				return domain.NewError(domain.CodeConflict, "a validated rule cannot change before activation; delete and propose it again")
+			}
+			if next.Status != personal.RuleCandidateValidated && next.Status != personal.RuleCandidateActive {
+				return domain.NewError(domain.CodeForbidden, "a validated rule can only be explicitly activated")
+			}
+		default:
+			return domain.NewError(domain.CodeConflict, "personal rule candidate state is invalid")
 		}
 	}
 
+	var sourceBody []byte
+	if err := tx.QueryRow(ctx, `SELECT COALESCE(body::text,'') FROM personal_objects
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4 FOR SHARE`,
+		instanceID, mutation.OwnerID, personal.ObjectTypeMemory, next.SourceMemoryID).Scan(&sourceBody); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return domain.NewError(domain.CodeConflict, "the source memory is no longer available; create a new rule candidate")
+		}
+		return fmt.Errorf("read personal rule candidate source memory: %w", err)
+	}
 	var sourceRevision int64
 	var sourceDeleted bool
 	err := tx.QueryRow(ctx, `SELECT revision,is_deleted FROM account_object_versions
@@ -303,15 +330,6 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 	}
 	if err != nil {
 		return fmt.Errorf("check personal rule candidate source revision: %w", err)
-	}
-	var sourceBody []byte
-	if err := tx.QueryRow(ctx, `SELECT body::text FROM personal_objects
-WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id=$4 FOR SHARE`,
-		instanceID, mutation.OwnerID, personal.ObjectTypeMemory, next.SourceMemoryID).Scan(&sourceBody); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return domain.NewError(domain.CodeConflict, "the source memory is no longer available; create a new rule candidate")
-		}
-		return fmt.Errorf("read personal rule candidate source memory: %w", err)
 	}
 	if personal.ValidateObjectBody(personal.ObjectTypeMemory, next.SourceMemoryID, sourceBody) != nil {
 		return domain.NewError(domain.CodeInternal, "stored rule candidate source memory is invalid")

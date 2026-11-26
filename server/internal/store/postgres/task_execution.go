@@ -2005,6 +2005,9 @@ WHERE t.id=$1 AND t.owner_id=$2 AND ec.state='enabled' AND ec.epoch=t.execution_
 			if err := validateCloudDSHSkillReadEvent(progress.Event.Payload, *skillRead); err != nil {
 				return err
 			}
+			if err := validateCloudDSHPersonalSkillReadInTx(ctx, tx, *skillRead); err != nil {
+				return err
+			}
 			existing, found, err := findCloudDSHSkillReadEvent(ctx, tx, progress.TaskID, skillRead.AgentSessionID, skillRead.CallID)
 			if err != nil {
 				return err

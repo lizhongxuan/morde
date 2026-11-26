@@ -528,19 +528,19 @@ type CloudDSHTaskPlanCommit struct {
 // CloudDSHSkillReadCommit binds a fixed skill response to one durable dsh call.
 // The Task event stores source metadata and hashes; the skill text stays in the encrypted dsh checkpoint.
 type CloudDSHSkillReadCommit struct {
-	TaskID               string
-	OwnerID              string
-	AgentSessionID       string
-	AuthorizationVersion int64
-	CallID               string
-	SkillID              string
-	SkillVersion         string
+	TaskID                string
+	OwnerID               string
+	AgentSessionID        string
+	AuthorizationVersion  int64
+	CallID                string
+	SkillID               string
+	SkillVersion          string
 	PersonalSkillRevision int64
-	BundleVersion        string
-	SourceRef            string
-	ContentSHA256        string
-	OutputSHA256         string
-	FingerprintSHA256    string
+	BundleVersion         string
+	SourceRef             string
+	ContentSHA256         string
+	OutputSHA256          string
+	FingerprintSHA256     string
 }
 
 // CloudDSHPersonalMutationCommit binds a personal object update to one dsh

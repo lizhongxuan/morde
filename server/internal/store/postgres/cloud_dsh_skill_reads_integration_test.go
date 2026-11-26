@@ -5,13 +5,81 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"strconv"
 	"sync"
 	"testing"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/personal"
 	"morde/server/internal/domain/task"
 )
+
+func TestPostgresCloudDSHPersonalSkillReadRequiresCurrentActiveRevision(t *testing.T) {
+	store, _ := newTemporaryStore(t)
+	ctx := context.Background()
+	owner := createPreRetirementTestUser(t, store, 8, 20_000, 40_000)
+	principal := identity.Principal{UserID: owner.ID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: testSessionTokenID(owner.ID)}
+	const skillID = "sk_0123abcd"
+	const skillContent = "Read current goals and draft a short weekly review."
+	pending := personal.Object{ObjectType: personal.ObjectTypeSkillCandidate, ObjectID: skillID,
+		Body: json.RawMessage(`{"scope":"personal","status":"candidate","name":"Weekly review","description":"Review current goals","content":"` + skillContent + `"}`)}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 410, pending, 0)); err != nil {
+		t.Fatalf("create personal Skill candidate: %v", err)
+	}
+	validated := personal.Object{ObjectType: personal.ObjectTypeSkillCandidate, ObjectID: skillID,
+		Body: json.RawMessage(`{"scope":"personal","status":"validated","name":"Weekly review","description":"Review current goals","content":"` + skillContent + `"}`)}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 411, validated, 1)); err != nil {
+		t.Fatalf("validate personal Skill candidate: %v", err)
+	}
+	active := personal.Object{ObjectType: personal.ObjectTypeSkillCandidate, ObjectID: skillID,
+		Body: json.RawMessage(`{"scope":"personal","status":"active","name":"Weekly review","description":"Review current goals","content":"` + skillContent + `"}`)}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, personalContentMutationForTest(t, owner.ID, 412, active, 2)); err != nil {
+		t.Fatalf("activate personal Skill candidate: %v", err)
+	}
+
+	submission := newTestTaskSubmission(t, owner.ID, "", "personal-skill-read-task", "read active personal skill")
+	submission.Task.ExecutionLocation = "server"
+	created, err := store.SubmitTask(ctx, submission)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claimed, ok, err := store.ClaimNextTask(ctx, "personal-skill-read-worker", 20_000_000_000)
+	if err != nil || !ok || claimed.ID != created.Task.ID {
+		t.Fatalf("claim task: claimed=%t task=%+v err=%v", ok, claimed, err)
+	}
+	claimed.AgentSessionID = "session_personal_skill_read"
+	if _, err := store.pool.Exec(ctx, `UPDATE tasks SET agent_session_id=$2 WHERE id=$1`, claimed.ID, claimed.AgentSessionID); err != nil {
+		t.Fatal(err)
+	}
+	contentHash := sha256.Sum256([]byte(skillContent))
+	outputHash := sha256.Sum256([]byte(`{"content":"` + skillContent + `"}`))
+	progress := cloudDSHSkillReadProgress(t, claimed, "call_personal_skill_read_1", claimed.AgentSessionID,
+		strconv.FormatInt(3, 10), hex.EncodeToString(contentHash[:]), hex.EncodeToString(outputHash[:]))
+	read := *progress.CloudDSHSkillRead
+	read.SkillID, read.SkillVersion, read.PersonalSkillRevision = skillID, "3", 3
+	read.BundleVersion, read.SourceRef = "morde-personal-skill-v1", "personal://"+skillID+"/revision/3"
+	read.FingerprintSHA256 = postgresCloudDSHSkillReadFingerprint(read)
+	progress.CloudDSHSkillRead = &read
+	progress.Event.Payload = postgresCloudDSHSkillReadPayload(read)
+	if _, err := store.CommitTaskProgress(ctx, progress); err != nil {
+		t.Fatalf("commit active personal Skill read: %v", err)
+	}
+
+	deletion := personalContentMutationForTest(t, owner.ID, 413, active, 3)
+	deletion.Delete, deletion.Body = true, nil
+	deletion.RequestHash, err = personal.HashMutationContent(deletion)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.ApplyPersonalMutation(ctx, principal, deletion); err != nil {
+		t.Fatalf("revoke personal Skill: %v", err)
+	}
+	if _, err := store.CommitTaskProgress(ctx, progress); domain.CodeOf(err) != domain.CodeInvalidState {
+		t.Fatalf("replayed Task read after Skill revocation = %v, want invalid_state", err)
+	}
+}
 
 func TestPostgresCloudDSHSkillReadIsIdempotentAndFenced(t *testing.T) {
 	store, _ := newTemporaryStore(t)
@@ -140,7 +208,8 @@ func postgresCloudDSHSkillReadPayload(value app.CloudDSHSkillReadCommit) []byte 
 		"tool": "nanomuse_skill_read", "skill_call_id": value.CallID,
 		"agent_session_id": value.AgentSessionID, "authorization_version": value.AuthorizationVersion,
 		"skill_id": value.SkillID, "skill_version": value.SkillVersion,
-		"bundle_version": value.BundleVersion, "source_ref": value.SourceRef,
+		"personal_skill_revision": value.PersonalSkillRevision,
+		"bundle_version":          value.BundleVersion, "source_ref": value.SourceRef,
 		"content_sha256": value.ContentSHA256, "output_sha256": value.OutputSHA256,
 		"fingerprint_sha256": value.FingerprintSHA256,
 	}
