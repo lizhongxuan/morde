@@ -2762,7 +2762,7 @@ Tokenizer 与 token 统计来源：
 <a id="release-deploy-and-pc-check-2026-11-27"></a>
 ### 2026-11-27 release 部署与实际源码 PC 续验
 
-- **发布版本：**`release` commit `f976369e`（修复 Linux `process_task_linux.go` 未使用局部变量导致的 portal 编译失败）已推送并部署，服务器源码 checkout 当前为 `f976369e`。后续 `702ed4ad` 仅更新验证文档并已推送到 `release`，没有代码变化，因此未重复部署；服务器 GitHub `origin` 地址已恢复。
+- **发布版本：**`release` commit `f976369e`（修复 Linux `process_task_linux.go` 未使用局部变量导致的 Portal 编译失败）已部署，生产 Portal 二进制仍运行该版本。服务器源码 checkout 已快进同步到 `32889d76`，其中后续为 PostgreSQL Compose 内存上限配置与文档，没有重建/重启 Portal；Compose 预检因服务器 env file 缺少同步/归档变量而未通过。GitHub `origin` 地址已恢复。
 - **部署门禁：**正式更新脚本通过 P0 smoke，记录为 pass=5、fail=0、exception=5；T01/T26/T36 需要独立测试 PostgreSQL DSN，T10/T43 需要真实 PC/DSH。服务构建与原子切换成功，数据库迁移从 254 升到 257，更新后 `current=257/latest=257`；`morde-portal.service=active`、`/healthz=ok`、`/readyz=200`。服务器 HTTPS 拉取超时后，按授权经临时 Git bundle 传入目标提交完成发布；远端 Git remote 已恢复，临时 bundle/裸仓库已删除。
 - **PC 登录观察：**在 `make pc` 隔离源码 profile 中进入账号登录流程。该时间段服务器日志出现一次 `/api/auth/client-login` 200 和后续若干 session API 200；CUA 可视画面却仍显示“暂时无法连接 Morde”，可访问树则保留登录表单，且无法唯一绑定窗口/profile。没有发送消息、创建 Task 或操作 Host。该混合证据只说明服务端有成功认证和会话请求，不能证明当前窗口已登录或客户端完整连通；不关闭 A02-3、T43、E01/E02 的实机验收。
 - **安全与清理：**没有修改管理员密码、数据库账号或业务数据；临时部署 bundle 已清理。此次没有访问用户对话正文。
