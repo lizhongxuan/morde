@@ -2775,4 +2775,13 @@ Tokenizer 与 token 统计来源：
 - **防复发：**Compose 中为 PostgreSQL 固定 `mem_limit: 2g`、`memswap_limit: 2g`，部署说明记录 8 GiB 主机的预算和排障原则；使用合成环境变量运行 `docker compose ... config -q`，配置解析通过。服务器 env file 缺少 `CH_WORKSPACE_SYNC_CURRENT_FILES_DIR`、`CH_POSTGRES_WAL_ARCHIVE_DIR`、`CH_WORKSPACE_SYNC_RELAY_TOKEN`，因此使用服务器真实环境的 Compose 预检失败；没有执行 `compose up` 或容器重建。代码 checkout 已快进同步到 `release`，Portal 应用仍运行 `f976369e`；本次只改部署资源配置和文档，不需重启业务容器。
 - **PC / R17 验收：**用户要求新开源码 `make pc`，进程已启动。CUA 按 `io.morde.client` 查询时取得旧打包客户端 `dist/mac-arm64/morde-pc.app/.../app.asar`（此前截图白屏）；改按源码 Electron.app 路径读取时，窗口 URL 为源码 `clients/desktop/harness/desktop/resources/morde.html`，AX 树是登录表单、截图则显示“暂时无法连接 Morde”。点击截图中的“重试连接”返回 `noWindowsAvailable`。因此无法确认该源码窗口对应新 profile，也未能登录/发消息/建 Task/生成 PC delivery observation。由本会话启动的 `make pc` 收到 SIGINT 后退出。R17/D02-3、A02-3 与真实 PC/DSH 验收继续未完成，不能标记通过。
 - **隔离源码 PC 登录续验：**用户要求另开 `make pc`，本轮使用独立 profile `/tmp/morde-pc-r17-final-20261127`，确认对应 Electron renderer/helper 进程仍存活。源码页面 AX 初始显示登录表单；按用户此前对该 Portal 的授权输入账号并点击登录后，CUA 截图显示“暂时无法连接 Morde”，而同一 app binding 的 AX 仍显示登录表单。截图与 AX 状态互相矛盾，且 CUA 无法把观察唯一关联到该 profile，因此不据此认定登录或云端连接成功。没有发送对话消息、创建 Task、触发 Host 工具或写入 PC delivery observation。源码 `make pc` 保持打开；PC/R17 端到端验收仍阻塞，不能标记 PASS。
+- **隔离 profile 归属续核：**该 profile 仍有 Electron helper 进程，但根目录未发现 `credentials.bin` 或 `portal-local-origin.json`；因此不能把此前 CUA 的输入和点击算作该实例的登录尝试。此为窗口/profile 归属阻塞，不作为账号密码错误或服务端认证故障证据。
 - **影响：**数据库服务经自动恢复后当前健康；此次修正不证明长期内存稳定性或完成压力测试。应观察 OOM 事件增量和实际客户端/DSH 链路；若仍复现，依据 Postgres 日志、连接数与容器 memory 指标继续定位。
+
+<a id="m11-local-repro-and-pc-blocker-2026-11-27"></a>
+### M11 本地复现与 PC 阻塞复验（2026-11-27）
+
+- **代码快照：**`release` HEAD `d486dcbe`；本轮未改运行时代码，只重跑定向回归并更新 TODO 状态。
+- **验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^TestCloudDSHCurrentMessage(Reader|ReadDefinition|Search)' -count=1 -timeout=8m` 通过（1.692s）。这覆盖长消息分页读取/定义/检索的应用层回归；不覆盖真实模型语义，也不是 Workspace receipt 集成测试。
+- **TODO：**M11-02、M11-03 的本地合成复现和根因修复已有代码及既有回归证据，现标完成；M11-01（真实 PC/DSH 现象的可靠身份/顺序记录）与 M11-04（真实客户端/DSH 验收）保持未完成。
+- **PC profile 归属：**隔离 profile `/tmp/morde-pc-r17-final-20261127` 的 Electron helper 仍运行，但根目录未发现 `credentials.bin` 或 `portal-local-origin.json`。CUA AX 显示登录表单、截图显示云端离线卡，无法把输入/点击归属到该 profile；没有据此判断凭据错误，也没有提交对话消息、创建 Task 或触发 Host 操作。真实 PC/R17 验收继续 pending。

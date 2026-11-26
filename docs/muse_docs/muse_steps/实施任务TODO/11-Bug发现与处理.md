@@ -20,10 +20,10 @@
 
 ## 任务
 
-- [ ] **M11-01（部分完成：记录三条本地合成缺陷，实际 PC/DSH 现象待核对）发现并记录现象**：在对应步骤的任务文档记录版本、账号/会话/任务身份、环境、输入顺序、预期与实际结果；证据脱敏。验收：另一位开发者能确定受影响步骤与可复现入口，记录不包含凭据或外发内容。
-- [ ] **M11-02（部分完成：三条本地合成复现已跑红，依赖 M11-01）建立最小复现**：使用本地合成数据、受控模型和工具重现问题，涉及并发时记录交错顺序及状态变化。验收：修复前最小用例能稳定展示故障；环境受限时写明未验证而非猜测。
-- [ ] **M11-03（部分完成：本地 Broker 缺陷已修并新增回归，依赖 M11-02）确认根因并修复**：沿受影响的服务端、Runtime 与客户端调用链定位首次错误边界，在对应步骤任务内做最小完整修改。验收：原复现不再失败，同类调用者、隔离与幂等未被破坏。
-- [ ] **M11-04（部分完成：定向回归通过，PC/DSH 待验，依赖 M11-03）回归与记录**：为有风险的逻辑补一条可维护的回归测试，执行相关自动测试及实际客户端验收；把结果、限制和任务状态写回对应步骤。验收：相关测试通过，未能实测的 PC/iOS 或外部环境明确标待验证。
+- [ ] **M11-01（部分完成：三条本地合成缺陷已记入下方；实际 PC/DSH 问题仍待可靠复现）发现并记录现象**：在对应步骤的任务文档记录版本、账号/会话/任务身份、环境、输入顺序、预期与实际结果；证据脱敏。验收：另一位开发者能确定受影响步骤与可复现入口，记录不包含凭据或外发内容。当前本地样本是合成身份，不能替代真实 PC/DSH 现象记录。
+- [x] **M11-02（本地合成复现完成；依赖 M11-01 的本地缺陷记录）建立最小复现**：长消息 JSON 转义超限、同页多匹配遗漏、Workspace 写入后回执未知的本地样本均有修复前失败路径及最小复现说明；见下方 2026-11-24 / 2026-11-25 记录。2026-11-27 在 `release` 代码快照 `d486dcbe` 复跑长消息读取/定义/搜索定向组通过。此项只表示可重复的本地复现，不表示它们曾在真实 PC/DSH 上出现。
+- [x] **M11-03（本地根因修复完成；依赖 M11-02）确认根因并修复**：已修复长消息转义片段超限、同页检索的 `partial` 漏报及 Workspace 写入结果未知时可能误判的本地 Broker 路径；实现和对应调用者的 App/Worker/Store 回归记录在步骤 09/10。2026-11-27 当前 App 定向组通过；历史 Workspace receipt 定向回归见步骤 09 的 S09-45。未将本地结果外推为真实客户端根因。
+- [ ] **M11-04（本地定向回归通过；PC/DSH 实机验收待完成，依赖 M11-03）回归与记录**：为有风险的逻辑补一条可维护的回归测试，执行相关自动测试及实际客户端验收；把结果、限制和任务状态写回对应步骤。验收：相关测试通过，未能实测的 PC/iOS 或外部环境明确标待验证。当前隔离 `make pc` profile 仍运行，但 CUA 无法把窗口唯一绑定到该 profile；截图与 AX 状态矛盾，目标 profile 未发现登录凭据或本地 Portal origin 文件，故真实 PC/DSH 验收不勾选。
 
 ## 验收标准
 
@@ -46,6 +46,15 @@
 - **可复现缺陷：**本地受控 Store 在 commit 已应用后丢弃响应，并令回执查询失败；live Workspace 另在原子文件替换后注入 adapter error，或在写后注入快照读取失败。旧路径会把部分情形报告为确定失败，Agent 可能按新调用重写。
 - **修复与回归：**Hostless/live 写入现以持久回执和当前 live snapshot 对账；证据缺失或 pending 时停止并返回 unknown，同一 pinned call 恢复后已写内容不重复写入。确定的业务拒绝交回同一 Agent；模型意图仍由 Agent 判断，代码只执行身份、授权、revision、receipt 和副作用安全边界。定向 app 测试 7 个顶层/8 个子用例通过，详见步骤 09 的 S09-45。
 - **范围：**这是本地合成故障复现，不是实际 PC/DSH 现场。M11-01–04 仍未完成，真实用户界面与 durable Agent-first 终态解释待验。
+
+<a id="m11-local-stage-reverification-2026-11-27"></a>
+## 本地缺陷阶段复验（2026-11-27）
+
+- **代码快照：**`release` HEAD `d486dcbe`；本轮只复验测试并更新状态记录，没有改运行时代码。
+- **复验：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^TestCloudDSHCurrentMessage(Reader|ReadDefinition|Search)' -count=1 -timeout=8m` 通过（1.692s）。该组覆盖当前消息读取/检索边界，不代替 Workspace receipt 用例；Workspace unknown 对账仍引用已记录的 S09-45 定向证据。
+- **状态：**M11-02 与 M11-03 的本地最小复现、根因修复及代码回归证据齐备，已勾选。M11-01 仍缺可靠的真实 PC/DSH 现象身份/步骤记录；M11-04 仍缺可绑定到本次源码窗口的实际客户端与真实 DSH 验收，故保持未完成。
+- **本轮 PC 观察限制：**`/tmp/morde-pc-r17-final-20261127` 的 Electron helper 进程仍在，但 profile 根目录未发现 `credentials.bin` 或 `portal-local-origin.json`。CUA 的 AX 仍显示登录表单而截图显示离线卡，不能证明输入/点击针对该 profile，也不能据此判断账号或产品登录失败。没有提交消息、创建 Task 或触发 Host 操作。
+- **统一验证记录：**[M11 本地复现与 PC 阻塞复验](../../../验证记录/Morde_Harness_最终流程测试用例.md#m11-local-repro-and-pc-blocker-2026-11-27)。
 
 - **E03 失败测试先行门（2026-11-25）：**`Plan` 增加可选 `fix_plan` 字段（`server/internal/domain/task/plan.go`），有值即标记修 bug 任务；`morde_task_plan_update` 工具输入同步增加可选 `fix_plan`（changed_files/risks/alternatives，各 ≤8 条、各 ≤512 字符）。写操作门只落在 `CloudDSHToolBroker.execute()`（host `file_write`），与 E01 brief 门并排、先 brief 后失败测试；hostless 的 `morde_workspace_write` 豁免——该路径没有 shell 工具，失败测试永远跑不出来，设门会死锁全部 hostless 修 bug 任务，给 hostless 任务加跑测试的路是后续工作。失败测试记录是 shell 步骤的 `FailureReason="test_failed"`（`task_steps.failure_reason`，shell 跑测试且退出码非零或超时时由 `taskToolCallProgress` 打上），无记录的修 bug 任务写操作被拒并提示先跑红复现测试。只跑通过的测试、或只跑失败的非测试命令，均不放行；无 FixPlan 的任务不受影响。
 - **E06 最小 diff 约束（2026-11-25）：**允许集 = 任务计划里 `FixPlan.ChangedFiles`（agent 在修复方案中声明的最小改动集；E02 影响面清单是分析参考，不由本门直接读取）。写时门两处：host `file_write` 在 `CloudDSHToolBroker.execute()`、hostless `morde_workspace_write` 在 `executeWorkspaceTool()`，均与 E01 brief 门并排，顺序为 brief → 失败测试（仅 host）→ 最小 diff；路径比对前规范化（Clean、去前导 `/`、统一分隔符），集外文件拒绝本次写调用并提示把文件加进 `fix_plan.changed_files` 再写、不问用户。`ChangedFiles` 为空时允许集为空、任何写都被拒；无 FixPlan 的任务不受影响。完成时复核在 `Complete()`：host 路用 `agentFileWriteEvidence()` 汇总的改动文件、hostless 路用已验证产物路径、checkpoint 不一致分支同样复核，任一越界文件即以 `minimal_diff_violation` 暂停完成、不进交付。门逻辑在 `server/internal/app/cloud_dsh_minimal_diff_gate.go`，测试为 `cloud_dsh_minimal_diff_test.go`（表驱动、内存 fake）。
