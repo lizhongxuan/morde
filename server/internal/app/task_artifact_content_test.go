@@ -184,7 +184,7 @@ func TestOpenTaskValidationReviewArtifactContentRequiresExactEvidenceBinding(t *
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			service, store, reader, claim, artifact, _ := taskValidationReviewArtifactFixture(t)
-			test.mutate(&store.taskStoreStub.details)
+			test.mutate(&store.details)
 			if _, err := service.OpenTaskValidationReviewArtifactContent(context.Background(), claim, artifact.ID); domain.CodeOf(err) != test.want {
 				t.Fatalf("artifact read error = %v; want %s", err, test.want)
 			}
@@ -265,7 +265,7 @@ func TestOpenTaskValidationReviewArtifactContentRejectsTaskWorkspaceAccessAndVer
 	})
 	t.Run("workspace not visible", func(t *testing.T) {
 		service, store, reader, claim, artifact, _ := taskValidationReviewArtifactFixture(t)
-		store.syncServiceStore.workspace.OwnerID = "u7654321"
+		store.workspace.OwnerID = "u7654321"
 		if _, err := service.OpenTaskValidationReviewArtifactContent(context.Background(), claim, artifact.ID); domain.CodeOf(err) != domain.CodeNotFound {
 			t.Fatalf("inaccessible Workspace error = %v; want not found", err)
 		}
@@ -276,8 +276,8 @@ func TestOpenTaskValidationReviewArtifactContentRejectsTaskWorkspaceAccessAndVer
 	t.Run("task revision changed", func(t *testing.T) {
 		service, store, reader, claim, artifact, _ := taskValidationReviewArtifactFixture(t)
 		newRevision := claim.TaskRevision + 1
-		store.taskStoreStub.details.Task.CurrentRevision = &newRevision
-		store.taskStoreStub.details.Task.DesiredRevision = &newRevision
+		store.details.Task.CurrentRevision = &newRevision
+		store.details.Task.DesiredRevision = &newRevision
 		if _, err := service.OpenTaskValidationReviewArtifactContent(context.Background(), claim, artifact.ID); domain.CodeOf(err) != domain.CodeConflict {
 			t.Fatalf("stale Task revision error = %v; want conflict", err)
 		}
@@ -303,7 +303,7 @@ func TestOpenTaskValidationReviewArtifactContentRejectsInvalidOrUncommittedProof
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			service, store, reader, claim, artifact, _ := taskValidationReviewArtifactFixture(t)
-			test.mutate(&store.taskStoreStub.details.Artifacts[0])
+			test.mutate(&store.details.Artifacts[0])
 			if _, err := service.OpenTaskValidationReviewArtifactContent(context.Background(), claim, artifact.ID); domain.CodeOf(err) != test.want {
 				t.Fatalf("invalid artifact proof error = %v; want %s", err, test.want)
 			}

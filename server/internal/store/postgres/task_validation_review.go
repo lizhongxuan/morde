@@ -187,7 +187,7 @@ WHERE task.id=$1 AND task.owner_id=$2 AND task.status='completed'
 FOR UPDATE OF task`, claim.TaskID, claim.OwnerID, claim.TaskRevision, claim.ResultEventSequence, claim.ResultSHA256).
 			Scan(&result, &initiatorID, &conversationID)
 		if err != nil {
-			if err == pgx.ErrNoRows {
+			if errors.Is(err, pgx.ErrNoRows) {
 				return nil
 			}
 			return fmt.Errorf("lock current Task validation review result: %w", err)
@@ -878,7 +878,7 @@ func enqueueTaskValidationReviewInTx(ctx context.Context, tx pgx.Tx, ownerID, ta
 		err := tx.QueryRow(ctx, `SELECT call_id FROM task_model_call_responses
 WHERE owner_id=$1 AND task_id=$2 AND agent_session_id=$3 AND agent_root_session_id=$3
 ORDER BY through_sequence DESC,created_at DESC,call_id DESC LIMIT 1`, ownerID, taskID, rootSessionID).Scan(&callID)
-		if err != nil && err != pgx.ErrNoRows {
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return fmt.Errorf("read Task execution model response for review: %w", err)
 		}
 		if err == nil {

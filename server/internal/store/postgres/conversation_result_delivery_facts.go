@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -250,7 +251,7 @@ func loadConversationResultPlanValidationFactsInTx(ctx context.Context, tx pgx.T
 		TaskID: source.TaskID, TaskRevision: source.TaskRevision, ResultEventSequence: source.EventSequence,
 		ResultSHA256: resultDigest[:], ClaimGeneration: 1, LeaseOwner: "conversation-result-receipt"}
 	if !app.ValidTaskValidationReviewClaim(claim) {
-		return fmt.Errorf("Task result identity is invalid for validation receipt")
+		return errors.New("task result identity is invalid for validation receipt")
 	}
 	current, err := readTaskValidationReplayTask(ctx, tx, claim)
 	if err != nil {

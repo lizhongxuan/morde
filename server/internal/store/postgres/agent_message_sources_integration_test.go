@@ -133,7 +133,9 @@ func TestPostgresAgentMessageDeliveryReceiptsAndBoundedSourcePages(t *testing.T)
 		}
 	}
 
-	longContent := "HEAD-ANCHOR-0001" + strings.Repeat("用户资料🙂", 1<<15-2) +
+	// HTML-sensitive characters make the JSON tool result much larger than the
+	// source page. This forces the Broker to persist bounded rune fragments.
+	longContent := "HEAD-ANCHOR-0001" + strings.Repeat("<", 64<<10) + strings.Repeat("用户资料🙂", 1<<15-2-4096) +
 		"MID-ANCHOR-00001" + strings.Repeat("用户资料🙂", 1<<15-1) + "TAIL-ANCHOR-0001!"
 	if len(longContent) != (1<<20)+1 {
 		t.Fatalf("long source fixture bytes=%d, want %d", len(longContent), (1<<20)+1)
@@ -221,10 +223,44 @@ func TestPostgresAgentMessageDeliveryReceiptsAndBoundedSourcePages(t *testing.T)
 		if err != nil {
 			t.Fatal(err)
 		}
-		result, err := broker.Execute(ctx, toolTask, app.ModelToolCall{CallID: "r21_long_read_" + strconv.Itoa(toolCalls),
-			Name: "morde_read_current_conversation_message", Arguments: string(arguments), TaskFence: modelFence})
-		if err != nil || result.Status != app.AgentToolSucceeded {
-			t.Fatalf("Broker read long source at rune %d: result=%+v err=%v", offset, result, err)
+		call := app.ModelToolCall{CallID: "r21_long_read_" + strconv.Itoa(toolCalls),
+			Name: "morde_read_current_conversation_message", Arguments: string(arguments), TaskFence: modelFence}
+		result, err := broker.Execute(ctx, toolTask, call)
+		if err != nil || result.Status != app.AgentToolSucceeded || len(result.Output) > 64<<10 {
+			t.Fatalf("Broker read long source at rune %d: status=%s output_bytes=%d err=%v", offset, result.Status, len(result.Output), err)
+		}
+		if toolCalls == 0 {
+			if !strings.Contains(result.Output, `\u003c`) || !json.Valid([]byte(result.Output)) {
+				t.Fatal("escaped source fragment was not returned as valid bounded JSON")
+			}
+			beforeReplay, err := store.GetTask(ctx, claimed.ID, owner.ID)
+			if err != nil {
+				t.Fatalf("read persisted escaped-fragment state: %v", err)
+			}
+			if len(beforeReplay.Steps) == 0 || beforeReplay.Task.Usage.ToolCalls == 0 {
+				t.Fatalf("first escaped fragment was not durably accounted: steps=%d tool_calls=%d",
+					len(beforeReplay.Steps), beforeReplay.Task.Usage.ToolCalls)
+			}
+			rebuiltBroker, err := app.NewCloudDSHToolBroker(store, runtimeTools, nil, nil)
+			if err != nil {
+				t.Fatalf("rebuild Broker before checkpoint replay: %v", err)
+			}
+			if err := rebuiltBroker.SetAgentMessageSourceReader(checkpoints); err != nil {
+				t.Fatalf("restore source reader after Broker rebuild: %v", err)
+			}
+			checkpointOutput := result.Output
+			replayed, err := rebuiltBroker.Reconcile(ctx, toolTask, call, &checkpointOutput)
+			if err != nil || replayed.Status != app.AgentToolSucceeded || replayed.Output != checkpointOutput {
+				t.Fatalf("reconcile escaped fragment after Broker rebuild: status=%s err=%v", replayed.Status, err)
+			}
+			afterReplay, err := store.GetTask(ctx, claimed.ID, owner.ID)
+			if err != nil {
+				t.Fatalf("read state after escaped-fragment checkpoint replay: %v", err)
+			}
+			if len(afterReplay.Steps) != len(beforeReplay.Steps) || afterReplay.Task.Usage.ToolCalls != beforeReplay.Task.Usage.ToolCalls {
+				t.Fatalf("checkpoint replay duplicated durable work: steps=%d/%d tool_calls=%d/%d",
+					len(afterReplay.Steps), len(beforeReplay.Steps), afterReplay.Task.Usage.ToolCalls, beforeReplay.Task.Usage.ToolCalls)
+			}
 		}
 		var chunk struct {
 			MessageID      string `json:"message_id"`

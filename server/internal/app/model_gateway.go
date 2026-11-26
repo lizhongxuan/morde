@@ -261,13 +261,14 @@ func (s *ModelGatewayService) reserveModelCall(ctx context.Context, source Model
 	for {
 		var err error
 		if projectCall {
-			if source == ModelCallCompaction {
+			switch source {
+			case ModelCallCompaction:
 				_, _, err = s.projectBudget.reserveConversationSummaryModelCall(ctx, projectID, reservation, usage)
-			} else if source == ModelCallReview {
+			case ModelCallReview:
 				_, _, err = s.projectBudget.reserveTaskValidationReviewModelCall(ctx, projectID, reservation, usage)
-			} else if source == ModelCallTerminalDelivery {
+			case ModelCallTerminalDelivery:
 				_, _, err = s.projectBudget.reserveTaskTerminalDeliveryModelCall(ctx, projectID, reservation, usage)
-			} else {
+			default:
 				_, _, err = s.projectBudget.reserveTaskModelCall(ctx, projectID, reservation, usage)
 			}
 		} else {

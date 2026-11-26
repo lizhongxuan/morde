@@ -898,8 +898,8 @@ func restrictTaskValidationEvidence(value *TaskValidationEvidenceRecord, steps [
 		filtered.EvidenceRefs = make([]TaskValidationEvidenceRefRecord, 0, len(claim.EvidenceRefs))
 		comparisonVisible := func(ref TaskValidationEvidenceRefRecord) bool {
 			_, hidden := workspaceStepIDs[ref.ID]
-			return !(hidden && (ref.Kind == TaskValidationEvidenceBaseline || ref.Kind == TaskValidationEvidenceAction ||
-				ref.Kind == TaskValidationEvidenceResult || ref.Kind == TaskValidationEvidenceBeforeAfter))
+			return !hidden || (ref.Kind != TaskValidationEvidenceBaseline && ref.Kind != TaskValidationEvidenceAction &&
+				ref.Kind != TaskValidationEvidenceResult && ref.Kind != TaskValidationEvidenceBeforeAfter)
 		}
 		for _, ref := range claim.EvidenceRefs {
 			if hideArtifacts && ref.Kind == TaskValidationEvidenceSideEffect {
@@ -1023,7 +1023,7 @@ func (s *TaskService) taskStepDetailFromDetails(ctx context.Context, principal i
 	if decoder.Decode(&document) != nil || !validTaskStepDetailDocument(document) {
 		return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step detail document is invalid")
 	}
-	workspaceEvidence := taskStepExecutionRequiresWorkspace(document.Execution)
+	workspaceEvidence := taskStepExecutionRequiresWorkspace(step.ToolName, document.Execution)
 	for index := range document.SourceLocations {
 		source := document.SourceLocations[index]
 		expectedSourceID := taskStepSourceLocationID(record.OwnerID, taskID, stepID, record.TaskRevision, step.ToolCallKey, source)
@@ -1049,7 +1049,7 @@ func (s *TaskService) taskStepDetailFromDetails(ctx context.Context, principal i
 			return TaskStepDetail{}, domain.NewError(domain.CodeInvalidState, "task step source location identity is invalid")
 		}
 	}
-	if taskStepExecutionRequiresWorkspace(document.Execution) {
+	if taskStepExecutionRequiresWorkspace(step.ToolName, document.Execution) {
 		if document.ExecutionWorkspaceID == "" || document.ExecutionWorkspaceID != details.Task.WorkspaceID {
 			result.DetailState = "restricted"
 			return result, nil

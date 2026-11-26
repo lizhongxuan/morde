@@ -24,6 +24,9 @@ func TestBuiltinSearchRejectsUnsafeConfigurationAndArguments(t *testing.T) {
 	if !validBuiltinSearchArguments("searxng_web_search", json.RawMessage(`{"query":"!mgn news","time_range":"week"}`)) {
 		t.Fatal("rejected the bounded Morde news engine query")
 	}
+	if !validBuiltinSearchArguments("web_url_read", json.RawMessage(`{"url":"https://example.com/news","startChar":4800,"maxLength":2000}`)) {
+		t.Fatal("rejected a bounded public page window")
+	}
 	for _, input := range []struct{ name, args string }{
 		{"other", `{"query":"news"}`},
 		{"searxng_web_search", `{"query":"news","url":"http://127.0.0.1"}`},
@@ -34,6 +37,10 @@ func TestBuiltinSearchRejectsUnsafeConfigurationAndArguments(t *testing.T) {
 		{"web_url_read", `{"url":"file:///etc/passwd"}`},
 		{"web_url_read", `{"url":"http://example.com/news"}`},
 		{"web_url_read", `{"url":"https://user:password@example.com"}`},
+		{"web_url_read", `{"url":"https://example.com","startChar":-1}`},
+		{"web_url_read", `{"url":"https://example.com","startChar":100001}`},
+		{"web_url_read", `{"url":"https://example.com","maxLength":2401}`},
+		{"web_url_read", `{"url":"https://example.com","unexpected":true}`},
 	} {
 		if validBuiltinSearchArguments(input.name, json.RawMessage(input.args)) {
 			t.Errorf("accepted unsupported arguments for %s", input.name)

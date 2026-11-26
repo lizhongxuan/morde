@@ -90,7 +90,7 @@ WHERE task_id=$1 AND role='user' AND delivery_status='applied' ORDER BY sequence
 			t.Fatalf("Task list validation=%q err=%v; want %q", page.K2Projections[current.Task.ID].Validation.State, err, want)
 		}
 		facts, err := f.store.TaskEventChainFacts(ctx, current.Task.OwnerID, current.Task.ID)
-		if err != nil || facts.ValidationState != want && !(want == app.TaskValidationPending && facts.ValidationState == "") {
+		if err != nil || facts.ValidationState != want && (want != app.TaskValidationPending || facts.ValidationState != "") {
 			t.Fatalf("Task event chain validation=%q err=%v; want %q", facts.ValidationState, err, want)
 		}
 		var receiptState app.TaskValidationState

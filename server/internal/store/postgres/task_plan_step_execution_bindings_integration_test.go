@@ -757,6 +757,24 @@ FROM task_plan_step_execution_bindings WHERE task_id=$1 AND execution_kind='read
 		t.Fatalf("replay report settlement with the same digest: %v", err)
 	}
 	assertTaskPlanReadiness(t, fixture.route.store, current, 1, "final", true, "")
+
+	// Readiness must survive a fresh Store object over the same durable database
+	// state; it cannot rely on the original Store's in-memory state.
+	recoveredStore := New(fixture.route.store.pool)
+	recoveredDetails, err := recoveredStore.GetTask(ctx, current.ID, current.OwnerID)
+	if err != nil {
+		t.Fatalf("reload Task through a reconstructed Store: %v", err)
+	}
+	assertTaskPlanReadiness(t, recoveredStore, recoveredDetails.Task, 1, "final", true, "")
+
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET status='failed' WHERE task_id=$1 AND id=$2`, current.ID, reportStepID); err != nil {
+		t.Fatalf("change settled predecessor state: %v", err)
+	}
+	assertTaskPlanReadiness(t, recoveredStore, recoveredDetails.Task, 1, "final", false, planStepReadinessFailed)
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_steps SET status='succeeded' WHERE task_id=$1 AND id=$2`, current.ID, reportStepID); err != nil {
+		t.Fatalf("restore settled predecessor state: %v", err)
+	}
+	assertTaskPlanReadiness(t, recoveredStore, recoveredDetails.Task, 1, "final", true, "")
 	if err := fixture.route.store.SettleCloudDSHTaskPlanStepRead(ctx, current, 1, "report", reportCall,
 		taskPlanStepTestDigest("changed report result")); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
 		t.Fatalf("replay settled report read with a different result digest = %v; want idempotency conflict", err)

@@ -6,10 +6,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func TestPostgresTaskTerminalDeliveryFactsAreAuthorizedSummaries(t *testing.T) {

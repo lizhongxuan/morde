@@ -55,14 +55,14 @@ func NewTaskValidationReviewWorker(options TaskValidationReviewWorkerOptions) (*
 		strings.TrimSpace(options.WorkerID) != options.WorkerID || options.WorkerID == "" || len(options.WorkerID) > 128 ||
 		options.LeaseDuration < time.Second || options.LeaseDuration > 5*time.Minute || options.LeaseDuration%time.Second != 0 ||
 		options.PollInterval <= 0 || options.MaxConcurrent < 1 || options.MaxConcurrent > 16 || options.Logger == nil {
-		return nil, errors.New("Task validation review worker dependencies and bounds are required")
+		return nil, errors.New("task validation review worker dependencies and bounds are required")
 	}
 	return &TaskValidationReviewWorker{options: options}, nil
 }
 
 func (w *TaskValidationReviewWorker) Run(ctx context.Context) error {
 	if ctx == nil {
-		return errors.New("Task validation review worker context is required")
+		return errors.New("task validation review worker context is required")
 	}
 	var group sync.WaitGroup
 	for range w.options.MaxConcurrent {
@@ -94,7 +94,7 @@ func (w *TaskValidationReviewWorker) Run(ctx context.Context) error {
 
 func (w *TaskValidationReviewWorker) RunOnce(ctx context.Context) (bool, error) {
 	if ctx == nil {
-		return false, errors.New("Task validation review worker context is required")
+		return false, errors.New("task validation review worker context is required")
 	}
 	claims, err := w.options.Queue.ClaimTaskValidationReviews(ctx, w.options.WorkerID, w.options.LeaseDuration, 1)
 	if err != nil || len(claims) == 0 {
@@ -179,7 +179,7 @@ func (w *TaskValidationReviewWorker) review(ctx context.Context, claim app.TaskV
 				return err
 			}
 		case "checkpoint_read":
-			return errors.New("Task validation review requested an unavailable checkpoint")
+			return errors.New("task validation review requested an unavailable checkpoint")
 		case "model":
 			if frame.ThroughSequence != through || through < 0 {
 				return errors.New("DSH Task validation review model sequence is invalid")
@@ -199,7 +199,7 @@ func (w *TaskValidationReviewWorker) review(ctx context.Context, claim app.TaskV
 				len(response.Text) > app.MaxTaskValidationReviewReportBytes || !utf8.ValidString(response.Text) ||
 				response.TaskValidationReview == nil || response.TaskValidationReview.CallID != callID ||
 				response.TaskValidationReview.SessionID != sessionID || response.TaskValidationReview.ThroughSequence != through {
-				return errors.New("Task validation review model response is invalid")
+				return errors.New("task validation review model response is invalid")
 			}
 			if err := writeCloudDSHTaskValidationReviewModel(ctx, review, frame.ID, response); err != nil {
 				return err
@@ -246,7 +246,7 @@ func (w *TaskValidationReviewWorker) review(ctx context.Context, claim app.TaskV
 				return errors.Join(completeErr, cleanupErr)
 			}
 			if !completed {
-				return errors.Join(errors.New("Task validation review completion was not applied"), cleanupErr)
+				return errors.Join(errors.New("task validation review completion was not applied"), cleanupErr)
 			}
 			if cleanupErr != nil {
 				w.options.Logger.Warn("Task Workspace review snapshot fence cleanup failed after completion",
@@ -270,7 +270,7 @@ func (w *TaskValidationReviewWorker) reviewInput(ctx context.Context, claim app.
 		details.Task.ConversationID != claim.ConversationID || details.Task.Status != task.StatusCompleted ||
 		details.Task.CurrentRevision == nil || *details.Task.CurrentRevision != claim.TaskRevision ||
 		details.Task.DesiredRevision == nil || *details.Task.DesiredRevision != claim.TaskRevision {
-		return app.TaskValidationReviewInput{}, errors.New("Task validation review snapshot identity is invalid")
+		return app.TaskValidationReviewInput{}, errors.New("task validation review snapshot identity is invalid")
 	}
 	input := app.TaskValidationReviewInput{Objective: details.Task.Objective, Result: details.Task.Result, Evidence: details.ValidationEvidence}
 	// H07 uses only typed check evidence read from durable operation bindings.
@@ -291,7 +291,7 @@ func (w *TaskValidationReviewWorker) reviewInput(ctx context.Context, claim app.
 		strings.ContainsRune(input.Objective, '\x00') || input.Result == "" || len(input.Result) > app.MaxAssistantMessageBytes ||
 		!utf8.ValidString(input.Result) || strings.ContainsRune(input.Result, '\x00') ||
 		!cloudDSHDigest([]byte(input.Result), hex.EncodeToString(claim.ResultSHA256)) {
-		return app.TaskValidationReviewInput{}, errors.New("Task validation review snapshot is invalid")
+		return app.TaskValidationReviewInput{}, errors.New("task validation review snapshot is invalid")
 	}
 	if input.Evidence == nil {
 		return input, nil
@@ -299,7 +299,7 @@ func (w *TaskValidationReviewWorker) reviewInput(ctx context.Context, claim app.
 	if input.Evidence.TaskRevision != claim.TaskRevision || input.Evidence.EventSequence > claim.ResultEventSequence ||
 		input.Evidence.EventSequence != claim.ResultEventSequence || input.Evidence.ResultSHA256 != hex.EncodeToString(claim.ResultSHA256) ||
 		app.ValidateTaskValidationEvidenceRecord(input.Result, *input.Evidence) != nil {
-		return app.TaskValidationReviewInput{}, errors.New("Task validation review evidence snapshot is invalid")
+		return app.TaskValidationReviewInput{}, errors.New("task validation review evidence snapshot is invalid")
 	}
 	steps := make(map[string]task.Step, len(details.Steps))
 	for _, step := range details.Steps {
@@ -367,7 +367,7 @@ func (w *TaskValidationReviewWorker) reviewInput(ctx context.Context, claim app.
 			if detailErr != nil {
 				return app.TaskValidationReviewInput{}, detailErr
 			} else if detail.TaskID != claim.TaskID || detail.StepID != step.ID {
-				return app.TaskValidationReviewInput{}, errors.New("Task validation review step detail identity is invalid")
+				return app.TaskValidationReviewInput{}, errors.New("task validation review step detail identity is invalid")
 			} else if detail.DetailState == "available" {
 				item.State = "step_detail"
 				item.Step.Object, item.Step.Input, item.Step.Result = detail.Object, detail.Input, detail.Result
@@ -377,7 +377,7 @@ func (w *TaskValidationReviewWorker) reviewInput(ctx context.Context, claim app.
 				if detail.ContentEvidence != nil {
 					if step.Status != task.StepSucceeded || (step.ToolName != "morde_web_search" && step.ToolName != "morde_web_read") ||
 						!validReviewContentEvidence(detail.ContentEvidence) {
-						return app.TaskValidationReviewInput{}, errors.New("Task validation review content evidence is invalid")
+						return app.TaskValidationReviewInput{}, errors.New("task validation review content evidence is invalid")
 					}
 					item.Step.ContentEvidence = detail.ContentEvidence
 				}
@@ -385,7 +385,7 @@ func (w *TaskValidationReviewWorker) reviewInput(ctx context.Context, claim app.
 				item.Step.DetailState = detail.DetailState
 			}
 		default:
-			return app.TaskValidationReviewInput{}, errors.New("Task validation review evidence kind is invalid")
+			return app.TaskValidationReviewInput{}, errors.New("task validation review evidence kind is invalid")
 		}
 		input.EvidenceDetails = append(input.EvidenceDetails, item)
 	}
@@ -489,7 +489,7 @@ func readTaskValidationReviewArtifactContent(ctx context.Context, content app.Ta
 			_ = content.Body.Close()
 		}
 		return app.TaskValidationReviewArtifactContentEvidence{}, app.TaskValidationReviewArtifactContentProof{},
-			errors.New("Task validation review artifact content is invalid")
+			errors.New("task validation review artifact content is invalid")
 	}
 	if ctx == nil || content.Body == nil || content.SizeBytes != artifact.SizeBytes || content.SHA256 != artifact.SHA256 ||
 		content.MediaType != artifact.MediaType || content.SizeBytes < 0 ||
@@ -550,7 +550,7 @@ func readTaskValidationReviewArtifactContent(ctx context.Context, content app.Ta
 	readbackDigest := hex.EncodeToString(hasher.Sum(nil))
 	if closeErr != nil || total != content.SizeBytes || readbackDigest != content.SHA256 {
 		return app.TaskValidationReviewArtifactContentEvidence{}, app.TaskValidationReviewArtifactContentProof{},
-			errors.Join(errors.New("Task validation review artifact readback does not match its committed proof"), closeErr)
+			errors.Join(errors.New("task validation review artifact readback does not match its committed proof"), closeErr)
 	}
 
 	mediaType, _, _ := mime.ParseMediaType(content.MediaType)
@@ -608,7 +608,7 @@ func taskValidationReviewPrompt(input app.TaskValidationReviewInput) (string, er
 		Replay          *app.TaskValidationReplayEvidence        `json:"replay,omitempty"`
 	}{Objective: input.Objective, Result: input.Result, Evidence: input.Evidence, EvidenceDetails: input.EvidenceDetails, Replay: input.Replay})
 	if err != nil || len(packet) > cloudDSHMaxFrame/2-1024 {
-		return "", errors.New("Task validation review input exceeds its limit")
+		return "", errors.New("task validation review input exceeds its limit")
 	}
 	return "复核数据包（JSON）：\n" + string(packet), nil
 }

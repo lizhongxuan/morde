@@ -6,7 +6,7 @@
 
 **设计与交接：**按[多 Agent 与共享资源](<01-复杂链路设计与交接.md#agents-tools>)绑定父子身份、工具摘要与资源互斥；按[受控 Skill 设计](<01-复杂链路设计与交接.md#memory-skill>)核对来源版本和动态提供方式，不把模型选择或 Skill 当作授权。
 
-- [ ] **B02-0 普通问答、新闻搜索、追问续接与任务计划优先闭环（进行中）。**先收口这四类主链路：普通问答使用直接回复，不创建 Task 或要求选择 Host；新闻与时效请求进入 DSH Task，通过授权的只读搜索 / 阅读工具发现候选、读取发布方页面并核验来源和日期，失败时如实说明，不编造来源；追问按同一会话内经授权的 Task 与当前修订续接，不能重复建任务或误续接；复杂请求按需创建和更新计划，服务端校验 Task、计划、授权和来源，简单问答及一次可答的普通网页查找不强制建计划。新闻 `category=news` 在 Broker 内固定转为 `!mgn` 引擎选择并保留时间范围；精确标题/发布方查找使用受限 `lookup_purpose=publisher_verification` 并固定选择 SearXNG `!yh`，不叠加分类或时间范围。两个引擎标记均为内部实现细节，不向用户泄漏；来源查找本身不证明链接或日期。已有局部实现与单测不代表真实模型或 PC/DSH 闭环通过。
+- [ ] **B02-0 普通问答、新闻搜索、追问续接与任务计划优先闭环（进行中）。**先收口这四类主链路：普通问答使用直接回复，不创建 Task 或要求选择 Host；新闻与时效请求进入 DSH Task，通过授权的只读搜索 / 阅读工具发现候选、读取发布方原文并核验来源和日期，失败时如实说明，不编造来源；追问按同一会话内经授权的 Task 与当前修订续接，不能重复建任务或误续接；复杂请求按需创建和更新计划，服务端校验 Task、计划、授权和来源，简单问答及一次可答的普通网页查找不强制建计划。新闻 `category=news` 在 Broker 内固定选择 SearXNG `!mgn` 的 Morde 360 新闻引擎并保留时间范围；`lookup_purpose=publisher_verification` 也只用于同一 `!mgn` 引擎查找候选，不代表来源已核实。适配器优先读取新闻区，缺少新闻区时回退到标准结果列表，但只接受 `data-mdurl` 中的直接 HTTPS 发布方链接，绝不使用 360 跳转链接；丢弃相对时间标签。`morde_web_read` 以受限字符窗口读取原文，缺少标题 / 日期时应继续读后续窗口。内部 bang 不向用户泄漏；来源发现本身不证明标题、发布方或日期。已有局部实现与单测不代表真实模型或 PC/DSH 闭环通过。
   - 验收：App / Store / Worker 定向回归覆盖四类流程及无普通问答 Task、无误续接、计划依赖拒绝；真实模型路由、搜索结果与来源核验单独记录；在实际 `morde-pc` 操作代表性流程并记录服务端实际状态。新闻查询带 `category=news` 及所需时间范围；近期搜索不得在无结果时静默移除时间范围，也不得把栏目首页、RSS 聚合包装页或过期条目冒充已核验新闻。服务不可用、PC 无法启动或历史 / Task 关联证据不足时明确待验，不用预置文案代替实际结果。B02-1 / B02-6 只依赖各自所需的 B01/A 身份、Task、计划和结算合同稳定；网络出口或 PC/真实 DSH 验收阻塞不阻止相互独立的代码开发。当前按用户要求只执行步骤 2，不启动后续任务。
   - **本地验证（2026-11-26）：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run 'ConversationRoute|TaskPlan|BuiltinSearch' -count=1 -timeout=8m` 通过（0.881s）；`go test ./internal/worker -run 'CloudDSHWorkerPlanToolDispatchAndPersistencePath|ConversationRoute|InternalTool' -count=1 -timeout=8m` 通过（2.108s）。既有定向用例覆盖普通问答不预留 Task、只读搜索路由、授权候选续接、计划 Brief / 来源 / 依赖校验。Worker 计划回归使用 scripted ModelClient，只证明 Worker→Broker 分发及计划持久化，不证明生产模型会按语义选择工具。`go test ./internal/domain/task -count=1 -timeout=8m`、`go test ./internal/mcpconnector -run 'BuiltinSearch' -count=1 -timeout=8m`、`go test ./internal/config -run 'BuiltinSearch' -count=1 -timeout=8m` 及 `npm --prefix deploy/single/search run test:morde-patches` 通过（日期补丁 10/10）；本项 TODO 与计划测试 fixture 的 `git diff --check` 通过。
   - **此前实际 PC（2026-11-26 快照）：**用 `make pc` 启动并操作源码 `morde-pc`。普通问答 `2+2` 得到 `4`；本地路由测试证明 taskless 分支，但这次 PC 会话未从权威账本核实无 Task / Host。实际新闻请求因搜索工具未返回已确认结果而停止，未伪造来源。向尚未确认计划的任务询问状态，PC 回答任务等待用户处理、0 成功 / 0 失败 / 0 取消 / 1 未确认，原因为 `reconciliation_required`，且没有重试或新建任务；答复与当前界面状态相符，但 Task ID / revision 的权威关联尚未核实。复杂计划请求的 PC Task 因 `The previous cloud task checkpoint could not be reconciled safely.` 停在 reconciliation，计划正文没有交付，不能计为通过。本次步骤 2 复核没有启动 PC；上方最新复核说明当前待验项。
@@ -48,9 +48,9 @@
 - [ ] **B02-3 受控 Skill 候选。**先完成 B02-1/2；C-02 的 R09 记忆 / 来源 / 授权合同稳定后实施 R15。核对现有 Skill 读取与 DSH 上游 provider 的接入、版本及隔离能力，适用时优先复用；候选只在授权范围内形成、验证、启用和撤销。
   - 验收：A01 覆盖未批准不可用、明确启用后可用、撤权即时失效、不同账号 / Task 隔离；插件兼容及许可证核对记录在案。新 schema 交 A。
   - **2026-11-26 步骤 8 继续开发：**在 Morde 现有个人对象 API/Store 中接入 `skill_candidate` 严格类型、格式校验状态、明确启用、启用版本不可改和撤销；Personal Data 页面提供候选编辑/格式校验/确认/撤销。复用既有 `nanomuse_skill_read`，上下文只列 active Skill 元信息，Broker 按当前 owner 获取正文，Task 事件记录版本/摘要，PostgreSQL 同事务复核 owner 对象仍为同一 active revision。定向领域、App、PostgreSQL 回归见[步骤 8 记录](../../../验证记录/Morde_Harness_最终流程测试用例.md#step-8-controlled-skills-memory-evaluation-2026-11-26)。未直接安装 `dsh-tool-skill`/filesystem provider：上游 consumer 有自己的 Session catalog/loader，但未接 Morde Broker/Task 账本；filesystem provider 也不满足目录隔离。官方上游仍标注 developer preview 且快速变化，本轮不升级；新集成仍使用 DSH 唯一 Runtime。
-  - **仍待验：**R15 本地数据/API/Broker 切片已有代码，但 Portal 仅有组件/API mock；没有实际 `morde-pc`、真实 DSH/模型和跨重启端到端验收。B02-3 不勾选。
+  - **仍待验：**R15 本地数据/API/Broker 已实现；`web/portal/src/routes/PersonalData.tsx` 有候选编辑、服务端格式校验、单独明确启用和撤销入口，`PersonalData.test.tsx` 覆盖候选→validated→active→revoke。该页面回归通过 mock API，不等于真实服务验收；没有实际 `morde-pc`、真实 DSH/模型、跨账号/Task 隔离和撤权即时失效的端到端证据。B02-3 不勾选。**后续状态更正：**旧记录“个人候选 UI 仍缺”不准确；UI 已存在，未完成的是产品端及真实运行链路验收。
 - [ ] **B02-4 交接给 C 和 A。**交出 Skill 候选 / 启用 / 撤销的可运行合同给 C-02 的 R16，并将协作图、资源归属和测试结果交 A-02。
-  - **2026-11-26 步骤 8：**R15 的候选状态、owner/revision、Broker 读取与撤销栅栏已写入此 TODO 和[步骤 8 测试记录](../../../验证记录/Morde_Harness_最终流程测试用例.md#step-8-controlled-skills-memory-evaluation-2026-11-26)，C-02 可据此实施 R16；A-02 所需的工作图/资源与完整稳定快照证据尚未形成，故保留未勾选。
+  - **2026-11-26 步骤 8：**R15 的候选状态、owner/revision、Broker 读取与撤销栅栏已写入此 TODO 和[步骤 8 测试记录](../../../验证记录/Morde_Harness_最终流程测试用例.md#step-8-controlled-skills-memory-evaluation-2026-11-26)，C-02 已据此实现并记录 R16 的 Schedule 绑定/来源 revision 合同；可运行的 C 侧交接已交付。A-02 所需的协作图、资源归属和测试证据尚无明确接收记录，故 B02-4 仍未关闭。
   - 验收：C 可在不等本文件所有 PC 实测关闭的情况下使用已稳定合同；未运行真实模型或 PC 的部分明确待验。
 - [ ] **B02-5 资料来源与工具边界（R26）。**复核 `cloud_dsh_mcp_builtin.go` 及文件/检索工具是否能传递真实来源、可用位置和不完整信息，按工具自身现有合同补缺；将 Runtime 调整交 C、权限和跨层字段交 A。
   - 验收：T57/T59 的本地受控来源与伪造授权样本中，正常分析仍可执行，资料内命令不能增加权限；无法读取和定位如实反馈。真实模型和实际 PC 分开记录。
@@ -116,3 +116,23 @@
 - `dig` 直询 eth0 DNS `100.100.2.136/.138` 无 UDP 响应；直询系统级配置 `223.5.5.5/.6` 有响应但给出与公共 DoH 不同、彼此不一致的部分搜索域名地址。未切换 DNS，也未绕过服务商策略。
 - 直接查询 resolver 显示 eth0 的 `100.100.2.136/.138` 无 DNS 响应；系统级配置的 `223.5.5.5/.6` 对搜索域名返回与公共 DoH 不同、且彼此不一致的 A 记录。未切换 DNS 或绕过服务商策略。
 - 因此服务器并非完全断网，但当前存在 DNS 回答异常线索、搜索目标连接失败及内置搜索服务关闭；超时发生在 TLS 握手前，不能归因于证书验证。没有改远端 DNS/网络；生产新闻与 PC/DSH 语义验收保持待验，B02-0 不勾选。
+
+### 2026-11-26 B-02 当前 HEAD 定向收口复核
+
+- **基线：**`HEAD=7668629baa1905b122e805d4c882c0b771904f60`。工作树存在其他会话的未提交改动；本轮未修改 B-02 源码或共享文件，仅更新本 TODO。未连接远端、启动 Portal/DSH/PC 或创建对话 Task。
+- **App 定向回归：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run 'AgentChildSession|SelectedMCP|BuiltinSearch|DSHSkill|CloudDSH.*Skill|ConversationRoute|TaskPlan' -count=1 -timeout=8m` 通过（0.953s）。覆盖子会话、工具授权、搜索工具及路由/计划相关本地合同，不替代真实模型的工具选择、新闻总结、Task 续接或计划恢复。
+- **领域定向回归：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/domain/personal ./internal/domain/task -count=1 -timeout=8m` 通过（personal 1.207s，task 1.199s）。
+- **候选 UI 定向回归：**`cd web/portal && npm run test -- src/routes/PersonalData.test.tsx` 通过（33 项）。测试走 mock API；实际 PC 页面、真实后端授权/撤销、DSH 运行及跨账号/Task 隔离仍未验。
+- **当前判断：**B02-0 的本地搜索来源链路和上列 App 合同已有通过证据；实际 `morde-pc` + DSH/Provider 的普通问答无 Task 证明、新闻自然语言交付、追问绑定 Task/revision、复杂计划持久化/恢复仍待验。B02-3 的 UI 与本地工作流已存在，R15 完整验收未完成。B02-4 仅 C-02 交接有证据，A-02 协作/资源/测试交接尚未确认。B02-5 的本地来源/日期/授权门禁测试不替代 T57/T59 正常与伪造授权的现场结果、无来源反馈和 PC/真实模型证据。B02-6a 与 B02-7 的既有本地合同继续有效；PC/DSH 语义选择、故障恢复和用户可见交付继续待验。未发现本轮可在授权文件边界内安全独立修复的生产代码缺口；不因定向测试通过而勾选真实体验子项。
+
+### 2026-11-26 B02-0 新闻来源与原文分页续验
+
+- **实现更新：**此前以 Google News RSS + Yahoo 查找来源的本地方案由 `deploy/single/search/morde_360_news.py` 取代。固定 SearXNG 仅加载 Morde 360 新闻引擎；新闻发现和标题 / 发布方候选查找都经同一 `!mgn`，保留请求的 `time_range`。适配器优先解析新闻组件，缺失时读取标准结果列表的 `data-mdurl` 直接 HTTPS 发布方地址；限制结果数、去重并剔除聚合 URL、非 HTTPS 和非公网 IP；“1 天前”等相对标签不再作为发布日期。原文工具新增受限 `start_char` / `max_chars` 窗口，模型须继续读取后续窗口核对标题；没有可见日期时必须如实标记未核验。该变化替代本文件早先的 `!yh` / RSS 描述，不改变真实发布方页面核验门槛。
+- **验证：**`scripts/test-builtin-search-engine.sh` 7/7 离线通过；`bash scripts/setup-builtin-search.test.sh` 模拟安装 / 就绪场景通过；SearXNG 日期补丁 10/10 通过；App 与 MCP Connector 的 `BuiltinSearch` 定向 Go 测试通过。固定版本本地 SearXNG 经 Morde MCP→Broker 搜索并读回直接发布方文章；测试核对操作持久化、checkpoint replay、原文标题匹配及分页 / 参数边界。首次真实查询发现标准结果列表 fallback 缺口，修复后查询与原文读取成功。`web_url_read` 附加的 HTML 日期元数据标记为 unverified；最新严格复跑排除该元数据后没有找到页面可见日期，故本条只证明搜索、来源标题和页面可读，日期核验仍待完成。详见[本轮验证记录](../../../验证记录/Morde_Harness_最终流程测试用例.md#step-2-news-source-2026-11-26)和[元数据门禁修正](../../../验证记录/Morde_Harness_最终流程测试用例.md#step-2-date-metadata-gate-2026-11-26)。
+- **未完成：**这是本机真实搜索提供方 / 本地 MCP Broker 的来源读取验证，不是模型语义验收。真实模型 / DSH 仍未在 PC 新闻请求中证明会选出相关条目、分页读取页面、核日期并生成带来源摘要；当前生产搜索配置仍为关闭状态，普通问答、追问权威 Task/revision 关联和复杂计划恢复也未在本轮重新验收。B02-0、M02-15、M02-16 继续未勾选。
+
+### 2026-11-26 B02-0 360 标准结果列表兼容修复
+
+- **发现与修复：**最新复跑中，360 对测试环境没有返回独立 `#mohe-news` 新闻区，尽管搜索页面包含标准 `li.res-list` 新闻候选；旧解析器因此给出空结果。适配器现优先解析新闻区，缺少该区时只从标准结果列表的 `data-mdurl` 获取发布方链接。测试确认不会回退使用 360 中转 `href`，也会丢弃非 HTTPS URL 和相对时间。
+- **验证：**离线引擎回归扩大为 7/7；Setup 模拟、日期补丁、App `BuiltinSearch` 集成组和 Connector `BuiltinSearch` 组通过。live 集成搜到并读回光明网文章，候选标题在发布方页面正文匹配；本机搜索返回 3 条直接发布方候选。当前测试会剥离 `## Page date metadata (unverified)` 区域后再判断页面正文日期；最新复跑没有找到可见发布日期，所以只通过来源标题 / 原文读取，不把 `Published: 2026-11-26` 元数据当成核验通过。来源 operation 持久化和 checkpoint replay 均有检查。
+- **边界：**本次空结果失败及修复均记录；当前结果证明新的 fallback 在本机网络下工作，不代表所有地区或长时间范围内都稳定。生产搜索未启用，真实模型 / DSH / PC 新闻体验、新闻时效判断、普通问答、追问关联和复杂计划恢复仍待验；B02-0、M02-15、M02-16 不勾选。最新记录见[标准结果列表兼容复验](../../../验证记录/Morde_Harness_最终流程测试用例.md#step-2-360-standard-results-2026-11-26)和[元数据门禁修正](../../../验证记录/Morde_Harness_最终流程测试用例.md#step-2-date-metadata-gate-2026-11-26)。

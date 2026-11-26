@@ -425,7 +425,7 @@ func confirmedTaskAgentRootRuntimeUnavailable(err error) bool {
 func checkTaskAgentStallSafely(ctx context.Context, monitor TaskAgentStallMonitor, value task.Task, staleAfter time.Duration) (err error) {
 	defer func() {
 		if recovered := recover(); recovered != nil {
-			err = errors.New("Task agent activity monitor panicked")
+			err = errors.New("task agent activity monitor panicked")
 		}
 	}()
 	return monitor.CheckTaskAgentStall(ctx, value, staleAfter)

@@ -41,14 +41,14 @@ func NewTaskTerminalDeliveryWorker(options TaskTerminalDeliveryWorkerOptions) (*
 		strings.TrimSpace(options.WorkerID) != options.WorkerID || options.WorkerID == "" || len(options.WorkerID) > 128 ||
 		options.LeaseDuration < time.Second || options.LeaseDuration > 5*time.Minute || options.LeaseDuration%time.Second != 0 ||
 		options.PollInterval <= 0 || options.Logger == nil {
-		return nil, errors.New("Task terminal delivery worker dependencies and bounds are required")
+		return nil, errors.New("task terminal delivery worker dependencies and bounds are required")
 	}
 	return &TaskTerminalDeliveryWorker{options: options}, nil
 }
 
 func (w *TaskTerminalDeliveryWorker) Run(ctx context.Context) error {
 	if ctx == nil {
-		return errors.New("Task terminal delivery worker context is required")
+		return errors.New("task terminal delivery worker context is required")
 	}
 	for ctx.Err() == nil {
 		found, err := w.RunOnce(ctx)
@@ -72,7 +72,7 @@ func (w *TaskTerminalDeliveryWorker) Run(ctx context.Context) error {
 // claims another source when no reply-ready candidate needs recovery.
 func (w *TaskTerminalDeliveryWorker) RunOnce(ctx context.Context) (bool, error) {
 	if ctx == nil {
-		return false, errors.New("Task terminal delivery worker context is required")
+		return false, errors.New("task terminal delivery worker context is required")
 	}
 	ready, err := w.options.Store.ListTaskTerminalDeliveryReplyReady(ctx, 1)
 	if err != nil || len(ready) != 0 {
@@ -90,7 +90,7 @@ func (w *TaskTerminalDeliveryWorker) RunOnce(ctx context.Context) (bool, error) 
 
 func (w *TaskTerminalDeliveryWorker) deliverClaim(ctx context.Context, claim app.TaskTerminalDeliveryClaim) error {
 	if !app.ValidTaskTerminalDeliveryClaim(claim) || claim.State != app.TaskTerminalDeliveryStateClaimed {
-		return errors.New("Task terminal delivery claim is invalid")
+		return errors.New("task terminal delivery claim is invalid")
 	}
 	workCtx, cancel := context.WithDeadline(ctx, claim.LeaseExpiresAt.Add(-time.Second))
 	defer cancel()
@@ -154,7 +154,7 @@ func (w *TaskTerminalDeliveryWorker) deliverClaim(ctx context.Context, claim app
 			return callErr
 		}
 		if !validTerminalDeliveryModelResponse(response) {
-			return errors.New("Task terminal delivery model response is invalid")
+			return errors.New("task terminal delivery model response is invalid")
 		}
 		ready, found, err := w.options.Store.GetTaskTerminalDeliveryReplyReady(workCtx, claim.DeliveryID)
 		if err != nil || !found {

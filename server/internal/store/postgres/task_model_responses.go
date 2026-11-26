@@ -14,28 +14,28 @@ import (
 )
 
 type taskModelResponseRow struct {
-	taskOwnerID          string
-	initiatorID          string
-	projectID            string
-	personalModel        bool
-	agentInstanceID      string
-	agentGeneration      int64
-	agentSessionID       string
-	agentRootSessionID   string
-	leaseOwner           string
-	leaseVersion         int64
-	authorizationVersion int64
-	throughSequence      int64
-	engineVersion        string
-	profileVersion       string
-	modelID              string
-	providerEndpoint     string
-	providerModel        string
+	taskOwnerID           string
+	initiatorID           string
+	projectID             string
+	personalModel         bool
+	agentInstanceID       string
+	agentGeneration       int64
+	agentSessionID        string
+	agentRootSessionID    string
+	leaseOwner            string
+	leaseVersion          int64
+	authorizationVersion  int64
+	throughSequence       int64
+	engineVersion         string
+	profileVersion        string
+	modelID               string
+	providerEndpoint      string
+	providerModel         string
 	providerReportedModel string
-	connectionVersion    time.Time
-	requestDigest        []byte
-	ciphertext           []byte
-	digest               []byte
+	connectionVersion     time.Time
+	requestDigest         []byte
+	ciphertext            []byte
+	digest                []byte
 }
 
 func (s *Store) RecoverTaskModelResponse(ctx context.Context, request app.ModelCallReservation) (app.TaskModelResponseRecord, bool, error) {

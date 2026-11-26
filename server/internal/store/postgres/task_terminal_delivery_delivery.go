@@ -12,11 +12,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/store/postgres/sqlcgen"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func (s *Store) ClaimTaskTerminalDeliverySources(ctx context.Context, workerID string,
@@ -467,8 +468,7 @@ WHERE task_id=$1 AND owner_id=$2 AND task_revision=$3 AND result_event_sequence=
 	if err != nil {
 		return taskTerminalDeliveryValidationFacts{}, fmt.Errorf("read Task terminal delivery validation source: %w", err)
 	}
-	var validationState app.TaskValidationState
-	validationState = app.TaskValidationState(state)
+	validationState := app.TaskValidationState(state)
 	if !app.ValidTaskValidationState(validationState) || len(reportRaw) == 0 || len(reportRaw) > app.MaxTaskValidationReviewReportBytes ||
 		len(artifactProofsRaw) == 0 || len(artifactProofsRaw) > app.MaxTaskValidationReviewArtifactProofBytes {
 		return taskTerminalDeliveryValidationFacts{}, domain.NewError(domain.CodeInvalidState, "stored Task validation delivery facts are invalid")

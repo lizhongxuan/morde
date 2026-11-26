@@ -1520,13 +1520,14 @@ func TestPostgresTaskValidationUnresolvedApprovalCannotPass(t *testing.T) {
 			}
 			approval := insertConversationResultTestApproval(t, f, value.ID, 0, approvalStatus,
 				"call-unresolved-"+status, "morde_workspace_write")
-			if status == "pending" {
+			switch status {
+			case "pending":
 				if _, err := f.store.pool.Exec(ctx, `UPDATE task_pending_requests
 SET status='pending',decision='',responded_at=NULL,expires_at=clock_timestamp()+interval '5 minutes'
 WHERE id=$1`, approval.id); err != nil {
 					t.Fatalf("restore pending approval state: %v", err)
 				}
-			} else if status == "cancelled" {
+			case "cancelled":
 				if _, err := f.store.pool.Exec(ctx, `UPDATE task_pending_requests
 SET status='cancelled',decision='',responded_at=clock_timestamp(),expires_at=NULL
 WHERE id=$1`, approval.id); err != nil {

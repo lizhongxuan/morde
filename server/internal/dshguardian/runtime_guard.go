@@ -414,7 +414,7 @@ func (s *Service) SnapshotTaskProcess(ctx context.Context, runtimeFence app.Acco
 	taskFence app.AgentInstanceFence) (TaskProcessSnapshot, error) {
 	if ctx == nil || ctx.Err() != nil || runtimeFence.Validate() != nil || taskFence.Validate() != nil ||
 		runtimeFence.OwnerID != taskFence.OwnerID {
-		return TaskProcessSnapshot{}, errors.New("Task process snapshot identity or context is invalid")
+		return TaskProcessSnapshot{}, errors.New("task process snapshot identity or context is invalid")
 	}
 	release, err := s.lockRuntimeTask(ctx, runtimeFence, taskFence)
 	if err != nil {
@@ -423,15 +423,15 @@ func (s *Service) SnapshotTaskProcess(ctx context.Context, runtimeFence app.Acco
 	defer release()
 	value, ok, err := s.store.findTaskByFences(runtimeFence, taskFence)
 	if err != nil || !ok {
-		return TaskProcessSnapshot{}, errors.New("Guardian Task process lease for the exact Runtime and Agent fences is unavailable")
+		return TaskProcessSnapshot{}, errors.New("guardian task process lease for the exact runtime and agent fences is unavailable")
 	}
 	if value.Guard.RuntimeFence != runtimeFence || value.Guard.TaskFence != taskFence || value.Destroyed ||
 		value.UnprovenRunning || !value.Armed || !value.Started || !value.Guard.ExpiresAt.After(s.now()) {
-		return TaskProcessSnapshot{}, errors.New("Guardian Task process lease is expired, unstarted, or destroyed")
+		return TaskProcessSnapshot{}, errors.New("guardian task process lease is expired, unstarted, or destroyed")
 	}
 	runtimeLease, err := s.activeAccountRuntime(ctx, runtimeFence, value.Guard.RuntimeContainerID)
 	if err != nil {
-		return TaskProcessSnapshot{}, errors.New("Guardian account Runtime process identity is unavailable")
+		return TaskProcessSnapshot{}, errors.New("guardian account runtime process identity is unavailable")
 	}
 	inspector, ok := s.processes.(taskProcessSnapshotInspector)
 	if !ok {

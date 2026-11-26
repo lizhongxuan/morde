@@ -18,6 +18,7 @@ import (
 	"morde/server/internal/domain/execution"
 	"morde/server/internal/domain/host"
 	"morde/server/internal/domain/identity"
+	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
 	"morde/server/internal/domain/workspace"
@@ -288,7 +289,7 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 				if digestErr != nil {
 					return domain.NewError(domain.CodeInvalidState, "stored task requirement manifest is invalid")
 				}
-				authorized, authErr := requireCurrentTaskAuthorization(ctx, tx, row)
+				authorized, authErr := requireCurrentTaskAuthorizationSnapshot(ctx, tx, row)
 				if authErr != nil {
 					return authErr
 				}
@@ -1342,6 +1343,39 @@ func requireCurrentTaskAuthorization(ctx context.Context, tx pgx.Tx, value sqlcg
 		return false, nil
 	}
 	return requireCurrentTaskCredentialAuthorization(ctx, tx, value, true)
+}
+
+// Read-only Task snapshots cannot take row locks. Validate the authorization
+// against the same repeatable-read snapshot instead of issuing SELECT FOR SHARE;
+// write paths continue to use requireCurrentTaskAuthorization for revocation
+// serialization.
+func requireCurrentTaskAuthorizationSnapshot(ctx context.Context, tx pgx.Tx, value sqlcgen.Task) (bool, error) {
+	if value.AuthTokenID == "" || value.AuthVersion < 1 || !domain.ValidUserID(value.InitiatorID) {
+		return false, nil
+	}
+	if !projectWorkspaceAuthorizationPermit(ctx, value) {
+		if value.ProjectID.Valid {
+			if !project.ValidID(value.ProjectID.String) {
+				return false, nil
+			}
+			var member bool
+			err := tx.QueryRow(ctx, `SELECT EXISTS (
+ SELECT 1 FROM projects p
+ JOIN project_members m ON m.project_id=p.id AND m.user_id=$2 AND m.role IN ('owner','member')
+ JOIN users u ON u.id=m.user_id AND u.status='approved'
+ WHERE p.id=$1
+)`, value.ProjectID.String, value.InitiatorID).Scan(&member)
+			if err != nil {
+				return false, fmt.Errorf("check Task initiator project membership in read snapshot: %w", err)
+			}
+			if !member {
+				return false, nil
+			}
+		} else if value.InitiatorID != value.OwnerID {
+			return false, nil
+		}
+	}
+	return requireCurrentTaskCredentialAuthorization(ctx, tx, value, false)
 }
 
 // A verified project Workspace permit already holds these rows in the outer

@@ -1625,27 +1625,32 @@ type Schedule struct {
 	Title                    string             `json:"title"`
 	ExecutionPolicy          string             `json:"execution_policy"`
 	FileDeliveryIntent       string             `json:"file_delivery_intent"`
+	PersonalRuleBinding      []byte             `json:"personal_rule_binding"`
 }
 
 type ScheduleRun struct {
-	ID                     string             `json:"id"`
-	ScheduleID             string             `json:"schedule_id"`
-	OwnerID                string             `json:"owner_id"`
-	ScheduleVersion        int64              `json:"schedule_version"`
-	OccurrenceKey          string             `json:"occurrence_key"`
-	ScheduledAt            pgtype.Timestamptz `json:"scheduled_at"`
-	CoalescedCount         int64              `json:"coalesced_count"`
-	Status                 string             `json:"status"`
-	SkipReason             pgtype.Text        `json:"skip_reason"`
-	TaskID                 pgtype.Text        `json:"task_id"`
-	NotificationEvents     []string           `json:"notification_events"`
-	CreatedAt              pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
-	FinishedAt             pgtype.Timestamptz `json:"finished_at"`
-	ObservationSpec        []byte             `json:"observation_spec"`
-	ObservationConfigHash  string             `json:"observation_config_hash"`
-	ObservationOutcome     string             `json:"observation_outcome"`
-	ObservationFingerprint string             `json:"observation_fingerprint"`
+	ID                           string             `json:"id"`
+	ScheduleID                   string             `json:"schedule_id"`
+	OwnerID                      string             `json:"owner_id"`
+	ScheduleVersion              int64              `json:"schedule_version"`
+	OccurrenceKey                string             `json:"occurrence_key"`
+	ScheduledAt                  pgtype.Timestamptz `json:"scheduled_at"`
+	CoalescedCount               int64              `json:"coalesced_count"`
+	Status                       string             `json:"status"`
+	SkipReason                   pgtype.Text        `json:"skip_reason"`
+	TaskID                       pgtype.Text        `json:"task_id"`
+	NotificationEvents           []string           `json:"notification_events"`
+	CreatedAt                    pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                    pgtype.Timestamptz `json:"updated_at"`
+	FinishedAt                   pgtype.Timestamptz `json:"finished_at"`
+	ObservationSpec              []byte             `json:"observation_spec"`
+	ObservationConfigHash        string             `json:"observation_config_hash"`
+	ObservationOutcome           string             `json:"observation_outcome"`
+	ObservationFingerprint       string             `json:"observation_fingerprint"`
+	PersonalRuleBinding          []byte             `json:"personal_rule_binding"`
+	PersonalRuleValidationStatus string             `json:"personal_rule_validation_status"`
+	PersonalRuleValidatedAt      pgtype.Timestamptz `json:"personal_rule_validated_at"`
+	PersonalRuleRevokedAt        pgtype.Timestamptz `json:"personal_rule_revoked_at"`
 }
 
 type ServiceIdentity struct {
@@ -2230,6 +2235,16 @@ type TaskOperation struct {
 	ApprovalRequestHash         []byte             `json:"approval_request_hash"`
 }
 
+type TaskPcDeliveryObservation struct {
+	TaskID               string             `json:"task_id"`
+	OwnerID              string             `json:"owner_id"`
+	ConversationID       string             `json:"conversation_id"`
+	ClientInstallationID string             `json:"client_installation_id"`
+	MessageID            string             `json:"message_id"`
+	TaskRevision         int64              `json:"task_revision"`
+	ObservedAt           pgtype.Timestamptz `json:"observed_at"`
+}
+
 type TaskPendingRequest struct {
 	ID                      string             `json:"id"`
 	TaskID                  string             `json:"task_id"`
@@ -2279,6 +2294,34 @@ type TaskPlanStepExecutionBinding struct {
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	ResultDigest         []byte             `json:"result_digest"`
 	TaskStepID           string             `json:"task_step_id"`
+}
+
+type TaskRequirementManifestAttestation struct {
+	TaskID                   string             `json:"task_id"`
+	OwnerID                  string             `json:"owner_id"`
+	TaskRevision             int64              `json:"task_revision"`
+	PlanRevision             int64              `json:"plan_revision"`
+	PlanEventSequence        int64              `json:"plan_event_sequence"`
+	ManifestDigest           []byte             `json:"manifest_digest"`
+	AttestedByUserID         string             `json:"attested_by_user_id"`
+	AttestedByPrincipalKind  string             `json:"attested_by_principal_kind"`
+	TaskAuthorizationVersion int64              `json:"task_authorization_version"`
+	IdempotencyKey           string             `json:"idempotency_key"`
+	AttestedAt               pgtype.Timestamptz `json:"attested_at"`
+}
+
+type TaskRequirementManifestConfirmation struct {
+	TaskID                   string             `json:"task_id"`
+	OwnerID                  string             `json:"owner_id"`
+	TaskRevision             int64              `json:"task_revision"`
+	PlanRevision             int64              `json:"plan_revision"`
+	PlanEventSequence        int64              `json:"plan_event_sequence"`
+	ManifestDigest           []byte             `json:"manifest_digest"`
+	ConfirmedByUserID        string             `json:"confirmed_by_user_id"`
+	ConfirmedByPrincipalKind string             `json:"confirmed_by_principal_kind"`
+	TaskAuthorizationVersion int64              `json:"task_authorization_version"`
+	IdempotencyKey           string             `json:"idempotency_key"`
+	ConfirmedAt              pgtype.Timestamptz `json:"confirmed_at"`
 }
 
 type TaskRevisionIntent struct {

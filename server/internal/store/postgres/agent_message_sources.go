@@ -419,7 +419,7 @@ FOR UPDATE OF delivery,message`, messageID, fence.TaskID, fence.OwnerID).Scan(
 		!claimProof && (!enqueueProof || deliveryStatus != "pending" && deliveryStatus != "applied") {
 		return app.AgentMessageSourceReference{}, "", domain.NewError(domain.CodeInvalidState, "message source has no applied checkpoint proof")
 	}
-	proofEventSequence := int64(-1)
+	var proofEventSequence int64
 	if enqueueProof {
 		proofEventSequence = enqueuedThrough.Int64
 	} else {

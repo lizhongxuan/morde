@@ -14,9 +14,9 @@
 
 本地补丁回归：在本目录运行 `npm run test:morde-patches`，仅使用离线 HTML fixture；它不访问网页或发送文件。
 
-Google News RSS 引擎离线回归：运行仓库根目录的 `scripts/test-builtin-search-engine.sh`。该脚本在锁定的 SearXNG 镜像中以 `--network none` 执行 4 项 Python 用例，覆盖时间范围映射、RSS 标题/来源/日期解析、无效链接过滤和结果上限；镜像需已由 setup 脚本拉取，不在测试中自动联网拉取。
+内置新闻引擎离线回归：运行仓库根目录的 `scripts/test-builtin-search-engine.sh`。该脚本在锁定的 SearXNG 镜像中以 `--network none` 执行 Python 用例，覆盖上游 Cookie 与时间范围映射、新闻区和标准结果回退解析、直达 HTTPS 候选过滤、相对日期丢弃、去重、结果上限和空响应；镜像需已由 setup 脚本拉取，不在测试中自动联网拉取。
 
-新闻分类还启用 `morde_google_news_rss.py`，使用固定 HTTPS Google News RSS 搜索并保留来源名称与 RSS 发布时间。Morde Broker 将新闻查询限定到这个固定 RSS 引擎，避免慢速第三方引擎把可用结果拖成超时；不静默扩大或移除用户指定的时间范围。RSS 只负责发现新闻；其 `news.google.com/rss/articles/` 链接是聚合页，不是原始发布页。Agent 必须用标题和发布方再次搜索，读取直接发布方页面并核对日期；未找到或无法读到原文时，说明日期/来源未核实，不得把 RSS 时间当成已验证日期。标题/发布方二次查找使用 `lookup_purpose=publisher_verification`，Broker 将其固定路由到 SearXNG Yahoo `!yh` 引擎，且拒绝叠加新闻分类或时间范围；这只负责找到候选发布方链接，不能单独证明来源或日期。启动健康检查会确认 `!mgn` 与 `!yh` 均已加载。Yahoo 或发布方站点不可用时，应说明未核验，不能改用聚合页冒充原文。该适配器由现有 SearXNG 容器加载，不关闭 TLS 验证、不使用任意 URL 参数；RSS 失败时 SearXNG 继续按实际引擎结果返回空/失败状态。
+新闻请求由 `morde_360_news.py` 解析固定 SearXNG 360 新闻区；当 360 在当前地区未返回独立新闻区，或该模块没有产出可用候选时，适配器从标准搜索结果列表读取带有 `data-mdurl` 的发布方候选。Broker 将新闻查询和精确标题/发布方候选查询都限定到同一 `!mgn` 引擎，避免新闻分类扇出到其他不稳定引擎；用户指定的 `time_range` 保留并映射为上游范围，不会在无结果时静默移除。适配器只采用 `data-mdurl` 提供的直达 HTTPS URL，绝不回退到 360 的跳转 `href`；拒绝 `so.com` / `360.cn` 域名下的 360 地址、HTTP、非公网 IP 和重复结果。该域名过滤不判断所有第三方站点是否为新闻聚合器；候选仍须由 Agent 打开页面核对标题、发布方与日期，无法确认时应如实说明，不能以搜索排名、摘要、相对日期或未验证元数据声称新闻时效。`lookup_purpose=publisher_verification` 仅帮助在同一新闻引擎中寻找候选链接，本身不证明来源或日期。启动健康检查会确认固定 `!mgn` 新闻引擎已加载。适配器复用锁定版 SearXNG 上游 360 引擎的 Cookie 缓存、请求和时间范围映射；不关闭 TLS 校验，不接受任意 URL 参数。引擎无结果时如实返回空结果。
 
 macOS 搜索容器的 8189 端口只绑定 macOS 回环地址，虚拟机的回环地址是独立的。可保留一个独立的本机 SSH 反向转发，将虚拟机 `127.0.0.1:8189` 转到 macOS `127.0.0.1:8189`：
 

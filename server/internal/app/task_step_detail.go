@@ -66,7 +66,7 @@ func validTaskStepDetailDocument(value TaskStepDetailDocument) bool {
 	if value.ExecutionWorkspaceID != "" && !validRuntimeWorkspaceID(value.ExecutionWorkspaceID) {
 		return false
 	}
-	if taskStepExecutionRequiresWorkspace(value.Execution) && value.ExecutionWorkspaceID == "" {
+	if taskStepExecutionRequiresWorkspace(value.Object, value.Execution) && value.ExecutionWorkspaceID == "" {
 		return false
 	}
 	return true

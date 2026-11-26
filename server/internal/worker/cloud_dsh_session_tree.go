@@ -1505,22 +1505,6 @@ func cloudDSHStartDeliveryMode(mode app.AgentMessageDeliveryMode) (app.AgentMess
 	return mode, mode == app.AgentMessageDeliverySteer || mode == app.AgentMessageDeliveryFollowup
 }
 
-func cloudDSHMessageDeliveryFingerprint(message app.AgentConversationMessage) string {
-	mode := message.Mode
-	if mode == "" {
-		mode = app.AgentMessageDeliveryFollowup
-	}
-	content := message.Content
-	if message.Reference != nil {
-		if reference, err := app.FormatAgentMessageReferenceEnvelope(*message.Reference); err == nil {
-			content = reference
-		} else {
-			content = "[invalid-message-reference]"
-		}
-	}
-	return cloudDSHMessageDeliveryFingerprintForContent(message, content)
-}
-
 func cloudDSHMessageDeliveryFingerprintForContent(message app.AgentConversationMessage, content string) string {
 	mode := message.Mode
 	if mode == "" {

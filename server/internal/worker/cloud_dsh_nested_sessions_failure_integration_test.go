@@ -268,13 +268,22 @@ WHERE s.task_id=$1 AND s.owner_id=$2 AND s.session_id=$3`, call.Task.TaskID, cal
 			return app.ModelResponse{Text: "alpha-result; beta failed: " + details.Summary, StopReason: "stop", Usage: usage}, nil
 		case 4:
 			handoff, err := nestedModelHandoff(call.RawRequest)
+			if err != nil {
+				return app.ModelResponse{}, fmt.Errorf("read coordinator review handoff: %w", err)
+			}
 			_, body, found := strings.Cut(handoff, "\n")
 			var jobs []struct {
 				Status string `json:"status"`
 				Output string `json:"output"`
 			}
-			if err != nil || !found || json.Unmarshal([]byte(body), &jobs) != nil || len(jobs) != 2 {
-				return app.ModelResponse{}, fmt.Errorf("coordinator review contained invalid handoff: %q err=%v", handoff, err)
+			if !found {
+				return app.ModelResponse{}, fmt.Errorf("coordinator review contained invalid handoff: %q", handoff)
+			}
+			if err := json.Unmarshal([]byte(body), &jobs); err != nil {
+				return app.ModelResponse{}, fmt.Errorf("decode coordinator review handoff: %w", err)
+			}
+			if len(jobs) != 2 {
+				return app.ModelResponse{}, fmt.Errorf("coordinator review contained %d jobs, want 2", len(jobs))
 			}
 			seenSuccess, seenFailure := false, false
 			for _, job := range jobs {

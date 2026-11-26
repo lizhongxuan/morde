@@ -1666,16 +1666,16 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 	case err := <-taskValidationReviewWorkerDone:
 		taskValidationReviewWorkerExited = true
 		if err == nil {
-			runErr = errors.New("Task validation review worker stopped unexpectedly")
+			runErr = errors.New("task validation review worker stopped unexpectedly")
 		} else {
-			runErr = fmt.Errorf("Task validation review worker stopped unexpectedly: %w", err)
+			runErr = fmt.Errorf("task validation review worker stopped unexpectedly: %w", err)
 		}
 	case err := <-taskTerminalDeliveryWorkerDone:
 		taskTerminalDeliveryWorkerExited = true
 		if err == nil {
-			runErr = errors.New("Task terminal delivery worker stopped unexpectedly")
+			runErr = errors.New("task terminal delivery worker stopped unexpectedly")
 		} else {
-			runErr = fmt.Errorf("Task terminal delivery worker stopped unexpectedly: %w", err)
+			runErr = fmt.Errorf("task terminal delivery worker stopped unexpectedly: %w", err)
 		}
 	case err := <-resultWorkerDone:
 		resultWorkerExited = true
@@ -1736,7 +1736,7 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 				}
 			case <-shutdownCtx.Done():
 				if runErr == nil {
-					runErr = errors.New("Task validation review worker did not stop before shutdown timeout")
+					runErr = errors.New("task validation review worker did not stop before shutdown timeout")
 				}
 			}
 		}
@@ -1751,7 +1751,7 @@ func runServers(ctx context.Context, logger *zap.Logger, shutdownTimeout time.Du
 				}
 			case <-shutdownCtx.Done():
 				if runErr == nil {
-					runErr = errors.New("Task terminal delivery worker did not stop before shutdown timeout")
+					runErr = errors.New("task terminal delivery worker did not stop before shutdown timeout")
 				}
 			}
 		}

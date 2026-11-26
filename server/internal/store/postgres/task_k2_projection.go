@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -48,7 +49,7 @@ WHERE review.task_id=$1 AND review.owner_id=$2 AND review.task_revision=$3 AND r
   AND task.result<>'' AND sha256(convert_to(task.result,'UTF8'))=review.result_sha256
   AND task_validation_artifact_evidence_current(review.task_id,review.owner_id,review.artifact_content_evidence)`,
 		taskID, ownerID, revision, eventSequence, resultSHA256).Scan(&state)
-	if err == pgx.ErrNoRows {
+	if errors.Is(err, pgx.ErrNoRows) {
 		return app.TaskValidationPending, false, nil
 	}
 	if err != nil {
@@ -353,7 +354,7 @@ WHERE review.state='reviewed'
 		}
 		if !app.ValidTaskValidationState(state) {
 			rows.Close()
-			return nil, fmt.Errorf("Task validation verdict has unknown state %q", state)
+			return nil, fmt.Errorf("task validation verdict has unknown state %q", state)
 		}
 		if authKind == string(identity.KindScheduleTask) && !scheduleTaskScopeStringsValidForHost(authScopes, hostBound) {
 			continue

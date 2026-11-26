@@ -44,7 +44,10 @@ func TestMordeSoulExplainsLongMessageReferences(t *testing.T) {
 	base := strings.TrimSpace(mordeSoulFile)
 	if !strings.Contains(base, "MORDE_SOURCE_REFERENCE_V1") ||
 		!strings.Contains(base, "Use the supplied message ID and source hash with the current-message read or search tool") ||
-		!strings.Contains(base, "Delivery or checkpoint application does not prove the source was read") {
+		!strings.Contains(base, "Delivery or checkpoint application does not prove the source was read") ||
+		!strings.Contains(base, "Message IDs, source hashes, checkpoint markers, tool names, and internal status codes") ||
+		!strings.Contains(base, "Never expose them in user-facing progress, clarification, or final messages") ||
+		!strings.Contains(base, "what remains unconfirmed, and one safe next step in plain language") {
 		t.Fatalf("Morde SOUL does not explain bounded message references: %q", base)
 	}
 }

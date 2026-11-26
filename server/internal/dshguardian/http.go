@@ -650,10 +650,10 @@ func (c *Client) SnapshotTaskProcess(ctx context.Context, runtimeFence app.Accou
 		return TaskProcessSnapshot{}, err
 	}
 	if err := ValidateTaskProcessSnapshot(result); err != nil {
-		return TaskProcessSnapshot{}, fmt.Errorf("Guardian returned an invalid Task process snapshot: %w", err)
+		return TaskProcessSnapshot{}, fmt.Errorf("guardian returned an invalid task process snapshot: %w", err)
 	}
 	if result.RuntimeFence != runtimeFence || result.TaskFence != taskFence {
-		return TaskProcessSnapshot{}, errors.New("Guardian Task process snapshot fence does not match the request")
+		return TaskProcessSnapshot{}, errors.New("guardian task process snapshot fence does not match the request")
 	}
 	return result, nil
 }

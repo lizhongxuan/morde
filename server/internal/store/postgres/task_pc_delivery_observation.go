@@ -21,7 +21,7 @@ func (s *Store) RecordPCDeliveryObservation(ctx context.Context, observerID, tok
 	if err != nil {
 		return fmt.Errorf("begin PC delivery observation: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	var activeInstallationID string
 	err = tx.QueryRow(ctx, `SELECT installation.id
@@ -67,6 +67,7 @@ JOIN tasks task ON task.id=message.task_id AND task.owner_id=message.owner_id
   AND task.conversation_id=message.conversation_id AND task.initiator_id=message.actor_id
 JOIN task_events result ON result.task_id=message.task_id AND result.sequence=message.output_result_event_sequence
   AND result.task_revision=message.output_task_revision AND result.event_type='task.result'
+  AND result.result_content_sha256=sha256(convert_to(message.content,'UTF8'))
 WHERE message.id=$1 AND message.task_id=$2 AND message.owner_id=$3
   AND message.actor_id=$5 AND message.role='assistant' AND message.delivery_status='applied'
   AND message.output_status='completed' AND message.output_task_revision=$4

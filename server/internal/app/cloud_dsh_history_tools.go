@@ -684,7 +684,7 @@ func (b *CloudDSHToolBroker) executeCurrentConversationMessageSearch(ctx context
 		return AgentToolResult{}, err
 	}
 	source := resolvedSource.manifest
-	if !(recovering && checkpointOutput != nil) &&
+	if (!recovering || checkpointOutput == nil) &&
 		(current.Usage.ToolCalls == int64(^uint64(0)>>1) || current.Usage.ToolCalls >= current.Budget.ToolCalls) {
 		return AgentToolResult{}, domain.NewError(domain.CodeQuotaExceeded, "task tool call budget is exhausted")
 	}

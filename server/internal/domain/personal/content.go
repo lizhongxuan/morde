@@ -348,7 +348,7 @@ func isRuleCandidateID(value string) bool {
 		return false
 	}
 	for _, char := range value[2:] {
-		if !(char >= 'a' && char <= 'z') && !(char >= '0' && char <= '9') {
+		if (char < 'a' || char > 'z') && (char < '0' || char > '9') {
 			return false
 		}
 	}
@@ -360,7 +360,7 @@ func isSkillCandidateID(value string) bool {
 		return false
 	}
 	for _, char := range value[3:] {
-		if !((char >= 'a' && char <= 'f') || (char >= '0' && char <= '9')) {
+		if (char < 'a' || char > 'f') && (char < '0' || char > '9') {
 			return false
 		}
 	}

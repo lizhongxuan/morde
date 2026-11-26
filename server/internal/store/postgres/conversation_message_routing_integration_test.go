@@ -1,8 +1,10 @@
 package postgres
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"sync"
 	"testing"
 
@@ -11,6 +13,90 @@ import (
 	"morde/server/internal/domain/conversation"
 	"morde/server/internal/domain/task"
 )
+
+func TestProjectConversationReceiptCapturesWorkspaceSnapshotAndReplaysOriginal(t *testing.T) {
+	fixture := newProjectRouteWorkspaceFixture(t)
+	ctx := context.Background()
+	clientID := "project-workspace-capture-001"
+	requestHash := sha256.Sum256([]byte("project workspace route"))
+	spoofedVersion := int64(99)
+	receipt := func() app.ConversationMessageReceipt {
+		return app.ConversationMessageReceipt{
+			Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: fixture.attachment.owner.UserID,
+				ActorID: fixture.attachment.member.UserID, ConversationID: fixture.attachment.conversationID,
+				Role: conversation.RoleUser, Content: "请在项目工作区处理文件。"},
+			ServiceInstanceID: fixture.attachment.instanceID, ClientID: clientID, RequestHash: requestHash[:],
+			Input: app.ConversationRoutingInput{ProjectID: fixture.attachment.projectID, WorkspaceID: fixture.workspace.ID,
+				WorkspaceOwnerID: "u7654321", WorkspaceProjectResourceVersion: &spoofedVersion},
+			Authorization: task.Authorization{Kind: "session", Version: 1},
+		}
+	}
+
+	accepted, replayed, err := fixture.attachment.store.AcceptConversationMessage(ctx, receipt())
+	if err != nil || replayed {
+		t.Fatalf("accept project Workspace receipt: replayed=%t err=%v", replayed, err)
+	}
+	var metadata []byte
+	if err := fixture.attachment.store.pool.QueryRow(ctx, `SELECT request_metadata FROM conversation_message_routes WHERE message_id=$1`, accepted.ID).Scan(&metadata); err != nil {
+		t.Fatal(err)
+	}
+	var captured app.ConversationRoutingInput
+	if err := json.Unmarshal(metadata, &captured); err != nil {
+		t.Fatal(err)
+	}
+	if captured.WorkspaceOwnerID != fixture.attachment.owner.UserID || captured.WorkspaceProjectResourceVersion == nil ||
+		*captured.WorkspaceProjectResourceVersion != fixture.resource.Version || captured.WorkspaceInputRevision == nil ||
+		*captured.WorkspaceInputRevision != fixture.workspace.Revision || !bytes.Equal(captured.WorkspaceContextDigest, fixture.digest) {
+		t.Fatalf("project receipt did not capture authoritative Workspace snapshot: owner=%q resource=%v revision=%v digest=%x",
+			captured.WorkspaceOwnerID, captured.WorkspaceProjectResourceVersion, captured.WorkspaceInputRevision, captured.WorkspaceContextDigest)
+	}
+
+	if _, err := fixture.attachment.store.pool.Exec(ctx, `UPDATE project_resources SET version=version+1
+WHERE project_id=$1 AND kind='workspace' AND resource_id=$2`, fixture.attachment.projectID, fixture.workspace.ID); err != nil {
+		t.Fatal(err)
+	}
+	replayedMessage, replayed, err := fixture.attachment.store.AcceptConversationMessage(ctx, receipt())
+	if err != nil || !replayed || replayedMessage.ID != accepted.ID {
+		t.Fatalf("replay accepted receipt after resource changed: id=%q replayed=%t err=%v", replayedMessage.ID, replayed, err)
+	}
+	if err := fixture.attachment.store.pool.QueryRow(ctx, `SELECT request_metadata FROM conversation_message_routes WHERE message_id=$1`, accepted.ID).Scan(&metadata); err != nil {
+		t.Fatal(err)
+	}
+	var replayedInput app.ConversationRoutingInput
+	if err := json.Unmarshal(metadata, &replayedInput); err != nil {
+		t.Fatal(err)
+	}
+	if replayedInput.WorkspaceOwnerID != captured.WorkspaceOwnerID || replayedInput.WorkspaceProjectResourceVersion == nil ||
+		*replayedInput.WorkspaceProjectResourceVersion != *captured.WorkspaceProjectResourceVersion ||
+		replayedInput.WorkspaceInputRevision == nil || *replayedInput.WorkspaceInputRevision != *captured.WorkspaceInputRevision ||
+		!bytes.Equal(replayedInput.WorkspaceContextDigest, captured.WorkspaceContextDigest) {
+		t.Fatalf("replay recaptured mutable Workspace state: first=%+v replay=%+v", captured, replayedInput)
+	}
+}
+
+func TestProjectConversationReceiptRejectsNonMemberBeforeSnapshotCapture(t *testing.T) {
+	fixture := newProjectRouteWorkspaceFixture(t)
+	ctx := context.Background()
+	hash := sha256.Sum256([]byte("non-member project route"))
+	receipt := app.ConversationMessageReceipt{
+		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: fixture.attachment.owner.UserID,
+			ActorID: fixture.attachment.outsider.UserID, ConversationID: fixture.attachment.conversationID,
+			Role: conversation.RoleUser, Content: "请在项目工作区处理文件。"},
+		ServiceInstanceID: fixture.attachment.instanceID, ClientID: "nonmember-project-route-001", RequestHash: hash[:],
+		Input:         app.ConversationRoutingInput{ProjectID: fixture.attachment.projectID, WorkspaceID: fixture.workspace.ID},
+		Authorization: task.Authorization{Kind: "session", Version: 1},
+	}
+	if _, _, err := fixture.attachment.store.AcceptConversationMessage(ctx, receipt); err == nil {
+		t.Fatal("non-member created a project route receipt")
+	}
+	var count int
+	if err := fixture.attachment.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_message_routes WHERE client_message_id=$1`, receipt.ClientID).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("non-member left %d route receipts", count)
+	}
+}
 
 func TestConversationMessageReceiptIsAtomicAndScoped(t *testing.T) {
 	store, pool := newTemporaryStore(t)

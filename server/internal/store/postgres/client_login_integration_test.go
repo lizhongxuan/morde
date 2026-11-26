@@ -423,7 +423,7 @@ func TestClientLoginMobileAndCrossAccountRenewal(t *testing.T) {
 	}
 }
 
-func TestClientLoginRejectsInvalidAccountAndPasswordWithoutInstallation(t *testing.T) {
+func TestClientLoginRejectsInvalidAccountAndPasswordButAllowsRestrictedPasswordChange(t *testing.T) {
 	store, _, clients, owner := clientLoginFixture(t)
 	ctx := context.Background()
 	login := func(key, password string) error {
@@ -450,12 +450,23 @@ func TestClientLoginRejectsInvalidAccountAndPasswordWithoutInstallation(t *testi
 	if _, err := store.pool.Exec(ctx, `UPDATE users SET status='approved',must_change_password=true WHERE id=$1`, owner.ID); err != nil {
 		t.Fatal(err)
 	}
-	if err := login("login-forced-password", "client-password-123"); domain.CodeOf(err) != domain.CodeForbidden {
+	result, err := clientLoginForTest(ctx, clients, owner.Name, "client-password-123", "desktop", "laptop", "", "login-forced-password", "192.0.2.1")
+	if err != nil {
 		t.Fatalf("forced password change login = %v", err)
 	}
+	if result.InstallationID == "" || result.WebSessionCredential == "" || !result.User.MustChangePassword {
+		t.Fatalf("forced password change login did not return a restricted PC session: %#v", result)
+	}
 	items, err := store.ListClientInstallations(ctx, owner.ID)
-	if err != nil || len(items) != 0 {
-		t.Fatalf("rejected login created installations: %#v, %v", items, err)
+	if err != nil || len(items) != 1 || items[0].ID != result.InstallationID {
+		t.Fatalf("restricted login installations = %#v, %v", items, err)
+	}
+	var hostCount int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FROM hosts WHERE owner_id=$1`, owner.ID).Scan(&hostCount); err != nil {
+		t.Fatal(err)
+	}
+	if hostCount != 0 {
+		t.Fatalf("restricted password-change login provisioned %d Hosts before the password was changed", hostCount)
 	}
 }
 

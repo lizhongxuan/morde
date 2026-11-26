@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -23,6 +24,124 @@ type routeActionsTestFixture struct {
 	conversation  conversation.Conversation
 	instanceID    string
 	authorization task.Authorization
+}
+
+func TestProjectConversationRouteFailsClosedWhenAcceptedWorkspaceSnapshotChanges(t *testing.T) {
+	tests := []struct {
+		name     string
+		wantCode domain.ErrorCode
+		mutate   func(t *testing.T, fixture projectRouteWorkspaceFixture, claim *app.ConversationRouteClaim,
+			snapshot *app.ConversationRouteSnapshot)
+	}{
+		{
+			name:     "project resource version",
+			wantCode: domain.CodeWorkspaceConflict,
+			mutate: func(t *testing.T, fixture projectRouteWorkspaceFixture, _ *app.ConversationRouteClaim, _ *app.ConversationRouteSnapshot) {
+				_, err := fixture.attachment.store.pool.Exec(context.Background(), `UPDATE project_resources SET version=version+1
+WHERE project_id=$1 AND kind='workspace' AND resource_id=$2`, fixture.attachment.projectID, fixture.workspace.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:     "receipt Workspace owner changed",
+			wantCode: domain.CodeWorkspaceConflict,
+			mutate: func(t *testing.T, fixture projectRouteWorkspaceFixture, claim *app.ConversationRouteClaim,
+				snapshot *app.ConversationRouteSnapshot) {
+				claim.Input.WorkspaceOwnerID = fixture.attachment.member.UserID
+				metadata, err := json.Marshal(claim.Input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := fixture.attachment.store.pool.Exec(context.Background(), `UPDATE conversation_message_routes
+SET request_metadata=$2::jsonb WHERE message_id=$1`, claim.Message.ID, metadata); err != nil {
+					t.Fatal(err)
+				}
+				snapshot.Context.ExecutionScopeDigest, err = app.ConversationRouteExecutionScopeDigest(claim.Input)
+				if err != nil {
+					t.Fatal(err)
+				}
+				snapshot.Context.ControlScopeDigest, err = app.ConversationRouteControlScopeDigest(claim.Input)
+				if err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:     "Workspace revision",
+			wantCode: domain.CodeWorkspaceConflict,
+			mutate: func(t *testing.T, fixture projectRouteWorkspaceFixture, _ *app.ConversationRouteClaim, _ *app.ConversationRouteSnapshot) {
+				_, err := fixture.attachment.store.pool.Exec(context.Background(), `UPDATE workspaces SET revision=revision+1 WHERE id=$1`, fixture.workspace.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:     "manifest digest at unchanged revision",
+			wantCode: domain.CodeWorkspaceConflict,
+			mutate: func(t *testing.T, fixture projectRouteWorkspaceFixture, _ *app.ConversationRouteClaim, _ *app.ConversationRouteSnapshot) {
+				file := syncTestFile("receipt-snapshot.txt", []byte("changed manifest"))
+				chunks, err := json.Marshal(file.Chunks)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = fixture.attachment.store.pool.Exec(context.Background(), `INSERT INTO workspace_revision_files
+(workspace_id,valid_from_revision,file_path,folded_path,size_bytes,sha256,mode,chunks)
+VALUES ($1,$2,$3,lower($3),$4,$5,$6,$7)`, fixture.workspace.ID, fixture.workspace.Revision, file.Path,
+					file.SizeBytes, file.SHA256, int32(file.Mode), chunks)
+				if err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
+		{
+			name:     "Workspace grant revoked",
+			wantCode: domain.CodeForbidden,
+			mutate: func(t *testing.T, fixture projectRouteWorkspaceFixture, _ *app.ConversationRouteClaim, _ *app.ConversationRouteSnapshot) {
+				result, err := fixture.attachment.store.pool.Exec(context.Background(), `UPDATE host_members
+SET revoked_at=clock_timestamp() WHERE owner_id=$1 AND user_id=$2 AND revoked_at IS NULL
+AND host_id=(SELECT host_id FROM workspace_bindings WHERE workspace_id=$3 AND owner_id=$1 AND state='active')`,
+					fixture.attachment.owner.UserID, fixture.attachment.member.UserID, fixture.workspace.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if result.RowsAffected() != 1 {
+					t.Fatalf("revoked %d Workspace grants, want one", result.RowsAffected())
+				}
+			},
+		},
+	}
+
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newProjectRouteWorkspaceFixture(t)
+			clientID := fmt.Sprintf("project-snapshot-change-%02d", index)
+			claim := fixture.receive(t, clientID, fixture.digest)
+			snapshot, err := fixture.attachment.store.LoadConversationRouteSnapshot(context.Background(), claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			snapshot.Context.ModelID = claim.Input.ModelID
+			test.mutate(t, fixture, &claim, &snapshot)
+			err = fixture.attachment.store.ApplyConversationRoute(context.Background(), claim, snapshot, app.ConversationRouteDecision{
+				Action: app.ConversationRouteNew, FileDeliveryIntent: task.FileDeliveryRequired,
+				ModelOutput: `{"action":"new","task_id":"","file_delivery_intent":"required"}`,
+			})
+			if err == nil || domain.CodeOf(err) != test.wantCode {
+				t.Fatalf("route error after %s = %v, want %s", test.name, err, test.wantCode)
+			}
+			var taskCount int
+			if err := fixture.attachment.store.pool.QueryRow(context.Background(),
+				`SELECT count(*) FROM conversation_messages WHERE id=$1 AND task_id IS NOT NULL`, claim.Message.ID).Scan(&taskCount); err != nil {
+				t.Fatal(err)
+			}
+			if taskCount != 0 {
+				t.Fatalf("stale Workspace snapshot created %d Tasks; route error=%v", taskCount, err)
+			}
+		})
+	}
 }
 
 type conversationRouteTestBroker struct {

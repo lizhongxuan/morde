@@ -623,7 +623,8 @@ func (b *CloudDSHToolBroker) encodePersonalContext(ctx context.Context, claimed 
 		}
 		output.Write(line)
 		output.WriteByte('\n')
-		if object.ObjectType == personal.ObjectTypeMemory {
+		switch object.ObjectType {
+		case personal.ObjectTypeMemory:
 			proof.Items = append(proof.Items, CloudDSHMemoryVersion{ID: object.ObjectID, Revision: object.Revision})
 			includedMemories[object.ObjectID] = object.Revision
 			var memory struct {
@@ -633,7 +634,7 @@ func (b *CloudDSHToolBroker) encodePersonalContext(ctx context.Context, claimed 
 				return "", errors.New("personal memory context is invalid")
 			}
 			includedMemoryContent[object.ObjectID] = memory.Content
-		} else if object.ObjectType == personal.ObjectTypeRuleCandidate {
+		case personal.ObjectTypeRuleCandidate:
 			var candidate personal.RuleCandidateBody
 			if json.Unmarshal(object.Body, &candidate) != nil || candidate.Status != personal.RuleCandidateActive {
 				return "", errors.New("personal rule candidate is invalid")
@@ -642,13 +643,13 @@ func (b *CloudDSHToolBroker) encodePersonalContext(ctx context.Context, claimed 
 				ObjectType: object.ObjectType, ID: object.ObjectID, Revision: object.Revision,
 				SourceMemoryID: candidate.SourceMemoryID, SourceMemoryRevision: candidate.SourceMemoryRevision,
 			})
-		} else if object.ObjectType == personal.ObjectTypeSkillCandidate {
+		case personal.ObjectTypeSkillCandidate:
 			var candidate personal.SkillCandidateBody
 			if json.Unmarshal(object.Body, &candidate) != nil || candidate.Status != personal.SkillCandidateActive || candidate.Scope != "personal" {
 				return "", errors.New("personal skill context is invalid")
 			}
 			proof.Objects = append(proof.Objects, CloudDSHMemoryVersion{ObjectType: object.ObjectType, ID: object.ObjectID, Revision: object.Revision})
-		} else {
+		default:
 			proof.Objects = append(proof.Objects, CloudDSHMemoryVersion{ObjectType: object.ObjectType, ID: object.ObjectID, Revision: object.Revision})
 		}
 	}

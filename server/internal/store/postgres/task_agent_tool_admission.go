@@ -225,7 +225,8 @@ func agentToolAdmissionIdentifier(value string) bool {
 		return false
 	}
 	for _, char := range value {
-		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' || char >= '0' && char <= '9' || char == '_' || char == '-') {
+		if (char < 'a' || char > 'z') && (char < 'A' || char > 'Z') &&
+			(char < '0' || char > '9') && char != '_' && char != '-' {
 			return false
 		}
 	}
@@ -293,10 +294,6 @@ ORDER BY sequence`, taskID, ownerID, initiatorID, conversationID)
 		}
 	}
 	return messageValues, nil
-}
-
-func pendingTaskAgentToolSteers(ctx context.Context, tx pgx.Tx, value app.ModelTaskFence, projectID, conversationID string) ([]app.AgentConversationMessage, error) {
-	return pendingTaskAgentSteers(ctx, tx, value.TaskID, value.OwnerID, value.InitiatorID, projectID, conversationID)
 }
 
 func pendingTaskAgentSteersForLockedTask(ctx context.Context, tx pgx.Tx, taskID, ownerID string) ([]app.AgentConversationMessage, error) {

@@ -15,10 +15,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"go.uber.org/zap"
 	mordesync "morde-sync"
 	"morde-sync/client"
+
 	"morde/server/internal/api"
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -26,6 +25,9 @@ import (
 	"morde/server/internal/domain/workspace"
 	"morde/server/internal/storage/workspacecurrent"
 	"morde/server/internal/storage/workspacefs"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"go.uber.org/zap"
 )
 
 type localProjectUploadTestTransport struct {

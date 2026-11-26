@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -32,11 +33,11 @@ func TestPostgresTaskRequirementManifestConfirmationIsImmutableAndRevisionBound(
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer readTx.Rollback(context.Background())
+	defer func() { _ = readTx.Rollback(context.Background()) }()
 	projected, found, err := readTaskRequirementManifestConfirmationForPlan(context.Background(), readTx,
 		fixture.route.ownerID, current.ID, *current.CurrentRevision, 1, eventSequence,
 		current.Authorization.Version, digest)
-	if err != nil || !found || projected != confirmed {
+	if err != nil || !found || !reflect.DeepEqual(projected, confirmed) {
 		t.Fatalf("read exact confirmation projection: projection=%+v found=%v err=%v; want stored fact", projected, found, err)
 	}
 	projected, found, err = readTaskRequirementManifestConfirmationForPlan(context.Background(), readTx,
@@ -46,7 +47,7 @@ func TestPostgresTaskRequirementManifestConfirmationIsImmutableAndRevisionBound(
 		t.Fatalf("stale authorization version returned confirmation: projection=%+v found=%v err=%v", projected, found, err)
 	}
 	replayed, err := fixture.route.store.ConfirmTaskRequirementManifest(context.Background(), command)
-	if err != nil || replayed != confirmed {
+	if err != nil || !reflect.DeepEqual(replayed, confirmed) {
 		t.Fatalf("replay exact confirmation: first=%+v replay=%+v err=%v", confirmed, replayed, err)
 	}
 	newKey := command
@@ -114,7 +115,8 @@ func TestPostgresTaskRequirementManifestConfirmationAllowsCompletedAndFailsClose
 func taskRequirementConfirmationCommand(taskID, actorID string, taskRevision, planRevision, eventSequence int64, digest, idempotencyKey string) app.TaskRequirementManifestConfirmationCommand {
 	return app.TaskRequirementManifestConfirmationCommand{TaskID: taskID, ActorUserID: actorID,
 		ActorPrincipalKind: string(identity.KindSession), TaskRevision: taskRevision, PlanRevision: planRevision,
-		PlanEventSequence: eventSequence, ManifestDigest: digest, IdempotencyKey: idempotencyKey}
+		PlanEventSequence: eventSequence, ManifestDigest: digest, IdempotencyKey: idempotencyKey,
+		RequirementsCompleteAttested: true}
 }
 
 func commitRequirementManifestPlan(t *testing.T, fixture s03AgentTaskFixture, planRevision int64, callID string) (task.Task, int64, string) {

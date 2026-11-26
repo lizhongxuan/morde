@@ -23,6 +23,18 @@ import (
 func TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord(t *testing.T) {
 	fixture := newAgentLifecycleFixture(t)
 	ctx := context.Background()
+	workspaceValue, _, err := fixture.store.CreateAgentWorkspace(ctx, newAgentWorkspaceCandidate(t, fixture.request.Fence.OwnerID))
+	if err != nil {
+		t.Fatalf("create Task Workspace: %v", err)
+	}
+	if err := fixture.store.MarkAgentWorkspaceDirectoryInitialized(ctx, fixture.request.Fence.OwnerID, workspaceValue.ID); err != nil {
+		t.Fatalf("initialize Task Workspace: %v", err)
+	}
+	if _, err := fixture.store.pool.Exec(ctx, `UPDATE tasks
+SET workspace_id=$2, workspace_owner_id=$3, input_revision=$4, workspace_checkpoint_revision=$4
+WHERE id=$1 AND owner_id=$3`, fixture.request.Fence.TaskID, workspaceValue.ID, fixture.request.Fence.OwnerID, workspaceValue.Revision); err != nil {
+		t.Fatalf("attach Task to its owner Workspace: %v", err)
+	}
 	lease, _, err := fixture.service.Start(ctx, fixture.request)
 	if err != nil {
 		t.Fatal(err)
@@ -35,9 +47,15 @@ func TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord(t *testing.T) 
 	if err != nil {
 		t.Fatal(err)
 	}
+	capturedOutput := strings.Repeat("captured-output-", 4<<10)
+	stdoutTotalBytes, stdoutOmittedBytes := len(capturedOutput), 0
+	stdoutTruncated := false
 	step := task.Step{ID: stepID, TaskID: current.Task.ID, Sequence: 1, Kind: "tool", Status: task.StepSucceeded,
-		Title: "Search the web", Summary: "Search completed.", CreatedAt: time.Now().UTC()}
-	document := app.TaskStepDetailDocument{Object: "morde_web_search", Input: "Search query: AI news (time range: week).", Result: "2 public sources found."}
+		Title: "Run command", Summary: "Shell completed.", CreatedAt: time.Now().UTC()}
+	document := app.TaskStepDetailDocument{Object: "shell_exec", Input: "Run an authorized command.", Result: "Shell completed.",
+		ShellExecution: &app.TaskStepShellExecutionEvidence{StdoutBytes: len(capturedOutput)},
+		Execution: &app.TaskStepExecution{Stdout: &capturedOutput, StdoutTotalBytes: &stdoutTotalBytes,
+			StdoutOmittedBytes: &stdoutOmittedBytes, StdoutTruncated: &stdoutTruncated}, ExecutionWorkspaceID: workspaceValue.ID}
 	plain, err := json.Marshal(document)
 	if err != nil {
 		t.Fatal(err)
@@ -51,7 +69,7 @@ func TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord(t *testing.T) 
 		t.Fatal(err)
 	}
 	detailDigest := sha256.Sum256(plain)
-	requestDigest := sha256.Sum256([]byte("morde_web_search:{\"query\":\"AI news\",\"time_range\":\"week\"}"))
+	requestDigest := sha256.Sum256([]byte("shell.exec:{\"command\":\"printf captured\"}"))
 	usage := current.Task.Usage
 	usage.ToolCalls++
 	payload, err := json.Marshal(map[string]any{"step_id": step.ID, "sequence": step.Sequence, "kind": step.Kind,
@@ -65,7 +83,7 @@ func TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord(t *testing.T) 
 		Event: task.Event{TaskID: current.Task.ID, Type: "task.step", Payload: payload},
 		ToolCall: &app.TaskToolCallProgress{AgentSessionID: lease.Fence.AgentSessionID, AgentInstanceID: lease.Fence.AgentInstanceID,
 			AgentGeneration: lease.Fence.AgentGeneration, AuthorizationVersion: lease.Fence.AuthorizationVersion,
-			TaskRevision: *current.Task.CurrentRevision, CallKey: "http-search-call", ToolName: "morde_web_search",
+			TaskRevision: *current.Task.CurrentRevision, CallKey: "http-shell-large-output", ToolName: "shell_exec",
 			RequestDigest: requestDigest[:], Phase: string(task.StepSucceeded), DetailState: "available",
 			DetailCiphertext: ciphertext, DetailSHA256: detailDigest[:], DetailSizeBytes: int32(len(plain))},
 	}); err != nil {
@@ -99,13 +117,26 @@ func TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord(t *testing.T) 
 	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" ||
 		response.Header().Get("Pragma") != "no-cache" || response.Header().Get("Referrer-Policy") != "no-referrer" ||
 		!json.Valid(response.Body.Bytes()) {
-		t.Fatalf("task detail response=%d headers=%v body=%s", response.Code, response.Header(), response.Body.String())
+		bodySample := response.Body.String()
+		if len(bodySample) > 256 {
+			bodySample = bodySample[:256]
+		}
+		t.Fatalf("task detail response=%d headers=%v body_bytes=%d body_sample=%q", response.Code, response.Header(), response.Body.Len(), bodySample)
 	}
 	var got app.TaskStepDetail
 	if err := json.Unmarshal(response.Body.Bytes(), &got); err != nil || got.TaskID != current.Task.ID || got.StepID != stepID ||
 		got.DetailState != "available" || got.Object == nil || *got.Object != document.Object ||
-		got.Input == nil || *got.Input != document.Input || got.Result == nil || *got.Result != document.Result || got.EventSequence < 1 {
-		t.Fatalf("authorized HTTP task detail=%+v err=%v body=%s", got, err, response.Body.String())
+		got.Input == nil || *got.Input != document.Input || got.Result == nil || *got.Result != document.Result || got.EventSequence < 1 ||
+		got.Truncated || got.Execution == nil || got.Execution.Stdout == nil || *got.Execution.Stdout != capturedOutput ||
+		got.Execution.StdoutTotalBytes == nil || *got.Execution.StdoutTotalBytes != len(capturedOutput) ||
+		got.Execution.StdoutOmittedBytes == nil || *got.Execution.StdoutOmittedBytes != 0 ||
+		got.Execution.StdoutTruncated == nil || *got.Execution.StdoutTruncated {
+		gotStdoutBytes := 0
+		if got.Execution != nil && got.Execution.Stdout != nil {
+			gotStdoutBytes = len(*got.Execution.Stdout)
+		}
+		t.Fatalf("authorized HTTP task detail did not preserve large output: stdout_bytes=%d expected=%d truncated=%v event_sequence=%d err=%v",
+			gotStdoutBytes, len(capturedOutput), got.Truncated, got.EventSequence, err)
 	}
 
 	stranger := createPreRetirementTestUser(t, fixture.store, 8, 20_000, 40_000)
@@ -126,16 +157,16 @@ func TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord(t *testing.T) 
 	foreignRequest.AddCookie(&http.Cookie{Name: "ch_portal", Value: foreignCredential})
 	foreignResponse := httptest.NewRecorder()
 	foreignRouter.ServeHTTP(foreignResponse, foreignRequest)
-	if foreignResponse.Code != http.StatusNotFound || strings.Contains(foreignResponse.Body.String(), document.Input) ||
-		strings.Contains(foreignResponse.Body.String(), document.Result) {
+	if foreignResponse.Code != http.StatusNotFound || strings.Contains(foreignResponse.Body.String(), capturedOutput[:128]) ||
+		strings.Contains(foreignResponse.Body.String(), document.Input) || strings.Contains(foreignResponse.Body.String(), document.Result) {
 		t.Fatalf("foreign owner task detail response=%d body=%s; want not found without private detail", foreignResponse.Code, foreignResponse.Body.String())
 	}
 	foreignEventsRequest := httptest.NewRequest(http.MethodGet, "/api/tasks/"+current.Task.ID+"/events?after=0", nil)
 	foreignEventsRequest.AddCookie(&http.Cookie{Name: "ch_portal", Value: foreignCredential})
 	foreignEventsResponse := httptest.NewRecorder()
 	foreignRouter.ServeHTTP(foreignEventsResponse, foreignEventsRequest)
-	if foreignEventsResponse.Code != http.StatusNotFound || strings.Contains(foreignEventsResponse.Body.String(), document.Input) ||
-		strings.Contains(foreignEventsResponse.Body.String(), document.Result) {
+	if foreignEventsResponse.Code != http.StatusNotFound || strings.Contains(foreignEventsResponse.Body.String(), capturedOutput[:128]) ||
+		strings.Contains(foreignEventsResponse.Body.String(), document.Input) || strings.Contains(foreignEventsResponse.Body.String(), document.Result) {
 		t.Fatalf("foreign owner task event stream response=%d body=%s; want not found without private detail", foreignEventsResponse.Code, foreignEventsResponse.Body.String())
 	}
 }

@@ -32,7 +32,7 @@ func ValidateTaskProcessSnapshot(value TaskProcessSnapshot) error {
 		value.RuntimeFence.OwnerID != value.TaskFence.OwnerID || !containerIDRE.MatchString(value.RuntimeContainerID) || value.CapturedAt.IsZero() ||
 		value.RootPID < 2 || value.RootStartTimeTick == 0 || !value.Complete ||
 		len(value.Processes) == 0 || len(value.Processes) > maxTaskProcessSnapshotProcesses {
-		return errors.New("Task process snapshot identity or completeness is invalid")
+		return errors.New("task process snapshot identity or completeness is invalid")
 	}
 
 	seen := make(map[int]struct{}, len(value.Processes))
@@ -41,29 +41,29 @@ func ValidateTaskProcessSnapshot(value TaskProcessSnapshot) error {
 	for _, process := range value.Processes {
 		if process.PID < 1 || process.PID <= lastPID || process.StartTimeTick == 0 || len(process.State) != 1 ||
 			process.ParentPID < 0 || (process.ParentPID == 0) != process.ParentOutsideScope {
-			return errors.New("Task process snapshot contains an invalid process entry")
+			return errors.New("task process snapshot contains an invalid process entry")
 		}
 		lastPID = process.PID
 		seen[process.PID] = struct{}{}
 		if process.PID == value.RootPID {
 			if process.StartTimeTick != value.RootStartTimeTick {
-				return errors.New("Task process snapshot root identity changed")
+				return errors.New("task process snapshot root identity changed")
 			}
 			rootFound = true
 		}
 	}
 	if !rootFound {
-		return errors.New("Task process snapshot omits its fenced root process")
+		return errors.New("task process snapshot omits its fenced root process")
 	}
 	for _, process := range value.Processes {
 		if process.ParentPID > 0 {
 			if _, ok := seen[process.ParentPID]; !ok {
-				return errors.New("Task process snapshot parent is outside its scoped process list")
+				return errors.New("task process snapshot parent is outside its scoped process list")
 			}
 		}
 	}
 	if value.IntegritySHA256 != taskProcessSnapshotIntegritySHA256(value) {
-		return errors.New("Task process snapshot integrity digest does not match")
+		return errors.New("task process snapshot integrity digest does not match")
 	}
 	return nil
 }

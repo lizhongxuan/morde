@@ -110,7 +110,9 @@ VALUES ($1,$2,'workflow-trace-operation',$3,$4,$5,$6,$7,'prepared',$8,$9,$10,$11
 		if source.Locator == "db://conversation_messages/"+fixture.task.ID+"/"+messageID {
 			firstSource = source
 		}
-		if !strings.HasPrefix(source.Locator, "db://") {
+		stableLedgerLocator := strings.HasPrefix(source.Locator, "db://") ||
+			source.Kind == evaluation.WorkflowSourceRuntimeSnapshot && strings.HasPrefix(source.Locator, "guardian://task-processes/")
+		if !stableLedgerLocator {
 			t.Errorf("source locator is not a stable ledger locator: %q", source.Locator)
 		}
 		if len(source.SHA256) != sha256.Size*2 {
@@ -123,16 +125,16 @@ VALUES ($1,$2,'workflow-trace-operation',$3,$4,$5,$6,$7,'prepared',$8,$9,$10,$11
 		t.Fatalf("workflow trace has no source for assistant message %s", messageID)
 	}
 
-	pcGapFound := false
+	pcAdapterUnavailableGapFound := false
 	for _, gap := range trace.Gaps {
 		if gap.Stage == evaluation.WorkflowStageProvenance && gap.Scope == "pc_observation_adapter" &&
 			gap.State == evaluation.WorkflowGapUnavailable {
-			pcGapFound = true
+			pcAdapterUnavailableGapFound = true
 			break
 		}
 	}
-	if !pcGapFound {
-		t.Fatal("workflow trace omitted the unavailable PC observation gap")
+	if pcAdapterUnavailableGapFound {
+		t.Fatal("workflow trace still marks the PC observation adapter unavailable")
 	}
 
 	wrongOwnerID := mustID(t, domain.NewUserID)
@@ -167,5 +169,47 @@ VALUES ($1,$2,'workflow-trace-operation',$3,$4,$5,$6,$7,'prepared',$8,$9,$10,$11
 	}
 	if strings.Contains(string(secondJSON), objectiveCanary) || strings.Contains(string(secondJSON), secondContent) {
 		t.Fatal("workflow trace exposed raw task objective or mutated assistant content")
+	}
+
+	completedMessageID := mustID(t, domain.NewMessageID)
+	const completedContent = "workflow-trace-completed-result"
+	resultDigest := sha256.Sum256([]byte(completedContent))
+	var resultEventSequence, messageSequence int64
+	if err := fixture.route.store.pool.QueryRow(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM task_events WHERE task_id=$1`, fixture.task.ID).Scan(&resultEventSequence); err != nil {
+		t.Fatalf("allocate result event sequence: %v", err)
+	}
+	if err := fixture.route.store.pool.QueryRow(ctx, `SELECT COALESCE(MAX(sequence),0)+1 FROM conversation_messages WHERE conversation_id=$1`, fixture.task.ConversationID).Scan(&messageSequence); err != nil {
+		t.Fatalf("allocate assistant message sequence: %v", err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `INSERT INTO task_events
+(task_id,sequence,event_type,payload,task_revision,result_content_sha256)
+VALUES ($1,$2,'task.result','{"status":"completed"}'::jsonb,$3,$4)`, fixture.task.ID, resultEventSequence, fixture.task.CurrentRevision, resultDigest[:]); err != nil {
+		t.Fatalf("insert completed Task result event: %v", err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE tasks SET status='completed',current_revision=$2,desired_revision=$2,result=$3 WHERE id=$1`,
+		fixture.task.ID, fixture.task.CurrentRevision, completedContent); err != nil {
+		t.Fatalf("complete workflow trace Task: %v", err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `INSERT INTO conversation_messages
+(id,conversation_id,owner_id,actor_id,role,content,task_id,sequence,delivery_status,output_status,output_task_revision,output_result_event_sequence)
+VALUES ($1,$2,$3,$3,'assistant',$4,$5,$6,'applied','completed',$7,$8)`, completedMessageID,
+		fixture.task.ConversationID, fixture.task.OwnerID, completedContent, fixture.task.ID, messageSequence,
+		fixture.task.CurrentRevision, resultEventSequence); err != nil {
+		t.Fatalf("insert completed assistant result: %v", err)
+	}
+	completedTrace, err := fixture.route.store.GetTaskWorkflowTrace(ctx, fixture.task.ID, fixture.task.OwnerID)
+	if err != nil {
+		t.Fatalf("load workflow trace with unobserved completed reply: %v", err)
+	}
+	pcObservationGapFound := false
+	for _, gap := range completedTrace.Gaps {
+		if gap.Stage == evaluation.WorkflowStageDelivery && gap.State == evaluation.WorkflowGapUnknown &&
+			strings.Contains(gap.Scope, "PC visible-area observation is absent for published reply: "+completedMessageID) {
+			pcObservationGapFound = true
+			break
+		}
+	}
+	if !pcObservationGapFound {
+		t.Fatal("workflow trace omitted the PC visible-area gap for an unobserved completed reply")
 	}
 }

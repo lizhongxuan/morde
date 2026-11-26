@@ -2293,9 +2293,16 @@ func validateConversationRouteWorkspaceInputSnapshot(ctx context.Context, tx pgx
 	workspaceOwnerID := claim.Message.ActorID
 	var projectResourceVersion *int64
 	if input.ProjectID != "" {
-		ownerID, version, err := lockProjectTaskWorkspaceAccess(ctx, tx, input.ProjectID, claim.Message.ActorID, input.WorkspaceID, false)
+		if !domain.ValidUserID(input.WorkspaceOwnerID) || input.WorkspaceProjectResourceVersion == nil || *input.WorkspaceProjectResourceVersion < 1 {
+			return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "project Workspace receipt is missing its accepted authorization snapshot")
+		}
+		ownerID, version, err := lockProjectTaskWorkspaceAccess(contextWithoutProjectWorkspacePermit(ctx), tx,
+			input.ProjectID, claim.Message.ActorID, input.WorkspaceID, false)
 		if err != nil {
 			return "", nil, err
+		}
+		if ownerID != input.WorkspaceOwnerID || version != *input.WorkspaceProjectResourceVersion {
+			return "", nil, domain.NewError(domain.CodeWorkspaceConflict, "project Workspace owner or resource changed after the conversation receipt")
 		}
 		workspaceOwnerID = ownerID
 		projectResourceVersion = &version
@@ -2957,9 +2964,7 @@ FOR UPDATE OF r,m`, instanceID, messageID, principal.UserID, conversationID).Sca
 		}
 		auth := task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID,
 			ClientInstallationID: principal.ClientInstallationID, Version: 1, ExpiresAt: &expiresAt}
-		for _, scope := range tokenScopes {
-			auth.Scopes = append(auth.Scopes, scope)
-		}
+		auth.Scopes = append(auth.Scopes, tokenScopes...)
 		if sourceKind == "task_result_review" {
 			var authorizationVersion int64
 			err := tx.QueryRow(ctx, `UPDATE conversation_result_batches SET state='processing',retry_attempt=retry_attempt+1,updated_at=clock_timestamp()

@@ -354,9 +354,10 @@ FROM model_call_ledger WHERE owner_id=$1 AND source='terminal_delivery' AND call
 				disposition = app.TaskTerminalDeliveryModelUnknown
 			}
 		case "settled":
-			if stored.State == TaskTerminalDeliveryStateReplyReady {
+			switch stored.State {
+			case TaskTerminalDeliveryStateReplyReady:
 				disposition = app.TaskTerminalDeliveryModelReplyReady
-			} else if stored.State == TaskTerminalDeliveryStateClaimed || stored.State == TaskTerminalDeliveryStateUnknown {
+			case TaskTerminalDeliveryStateClaimed, TaskTerminalDeliveryStateUnknown:
 				disposition = app.TaskTerminalDeliveryModelFallbackSafe
 			}
 		default:

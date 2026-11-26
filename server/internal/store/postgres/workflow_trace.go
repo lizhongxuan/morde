@@ -1248,7 +1248,8 @@ func addWorkflowTraceDeliveries(ctx context.Context, tx pgx.Tx, builder *workflo
 	rows, err := tx.Query(ctx, `SELECT message.id,message.sequence,message.delivery_status,COALESCE(message.output_status,''),COALESCE(message.output_task_revision,-1),
 COALESCE(message.output_result_event_sequence,0),octet_length(message.content)::bigint,encode(sha256(convert_to(message.content,'UTF8')),'hex'),message.created_at,
 EXISTS (SELECT 1 FROM task_events result WHERE result.task_id=message.task_id AND result.sequence=message.output_result_event_sequence
-  AND result.task_revision=message.output_task_revision AND result.event_type='task.result')
+  AND result.task_revision=message.output_task_revision AND result.event_type='task.result'
+  AND result.result_content_sha256=sha256(convert_to(message.content,'UTF8')))
 FROM conversation_messages message WHERE message.task_id=$1 AND message.owner_id=$2 AND message.conversation_id=$3 AND message.role='assistant'
 ORDER BY message.sequence,message.id LIMIT $4`, taskRow.ID, taskRow.OwnerID, taskRow.ConversationID, workflowTraceFactLimit)
 	if err != nil {
@@ -1272,17 +1273,21 @@ ORDER BY message.sequence,message.id LIMIT $4`, taskRow.ID, taskRow.OwnerID, tas
 			ResultEventSequence int64     `json:"output_result_event_sequence,omitempty"`
 			ContentBytes        int       `json:"content_bytes"`
 			ContentSHA256       string    `json:"content_sha256"`
+			ResultEventMatched  bool      `json:"result_event_matches_content"`
 			CreatedAt           time.Time `json:"created_at"`
-		}{id, sequence, deliveryStatus, outputStatus, revision, resultEventSequence, int(contentBytes), contentDigest, createdAt})
+		}{id, sequence, deliveryStatus, outputStatus, revision, resultEventSequence, int(contentBytes), contentDigest, resultEventMatched, createdAt})
 		if err != nil {
 			rows.Close()
 			return err
 		}
-		state := workflowDeliveryNodeState(deliveryStatus, outputStatus)
+		state := workflowDeliveryNodeState(deliveryStatus, outputStatus, resultEventMatched)
 		nodeID := builder.addNode(evaluation.WorkflowNodeDelivery, state, taskRow.ID+":message:"+id, sourceID)
 		deliveryTargets[id] = workflowTraceDeliveryObservationTarget{sourceID: sourceID, taskRevision: revision,
 			pcEligible: deliveryStatus == "applied" && outputStatus == "completed" && revision >= 0 && resultEventSequence > 0 && resultEventMatched}
-		if deliveryStatus == "applied" && (outputStatus == "completed" || outputStatus == "") {
+		if deliveryStatus == "applied" && outputStatus == "completed" && !resultEventMatched {
+			builder.addGap(evaluation.WorkflowStageDelivery, "assistant Task result event is missing or its content digest does not match: "+id,
+				evaluation.WorkflowGapUnknown, nil, sourceID)
+		} else if deliveryStatus == "applied" && (outputStatus == "completed" || outputStatus == "") {
 			builder.addEdge(evaluation.WorkflowEdgeDelivered, taskNode, nodeID, sourceID)
 		} else {
 			builder.addGap(evaluation.WorkflowStageDelivery, "assistant output is not confirmed applied and complete: "+id, evaluation.WorkflowGapUnknown, nil, sourceID)
@@ -1383,6 +1388,7 @@ LEFT JOIN conversation_messages message ON message.id=observation.message_id
   AND message.task_id=observation.task_id AND message.owner_id=observation.owner_id AND message.conversation_id=observation.conversation_id
 LEFT JOIN task_events result ON result.task_id=message.task_id AND result.sequence=message.output_result_event_sequence
   AND result.task_revision=message.output_task_revision AND result.event_type='task.result'
+  AND result.result_content_sha256=sha256(convert_to(message.content,'UTF8'))
 WHERE observation.task_id=$1 AND observation.owner_id=$2 AND observation.conversation_id=$3
 ORDER BY observation.observed_at,observation.client_installation_id,observation.message_id LIMIT $4`,
 		taskRow.ID, taskRow.OwnerID, taskRow.ConversationID, workflowTraceFactLimit)
@@ -1439,9 +1445,13 @@ ORDER BY observation.observed_at,observation.client_installation_id,observation.
 	return nil
 }
 
-func workflowDeliveryNodeState(deliveryStatus, outputStatus string) evaluation.WorkflowNodeState {
+func workflowDeliveryNodeState(deliveryStatus, outputStatus string, resultEventMatched bool) evaluation.WorkflowNodeState {
 	switch {
-	case deliveryStatus == "applied" && (outputStatus == "completed" || outputStatus == ""):
+	case deliveryStatus == "applied" && outputStatus == "completed" && resultEventMatched:
+		return evaluation.WorkflowNodeCompleted
+	case deliveryStatus == "applied" && outputStatus == "completed":
+		return evaluation.WorkflowNodeUnknown
+	case deliveryStatus == "applied" && outputStatus == "":
 		return evaluation.WorkflowNodeCompleted
 	case deliveryStatus == "pending":
 		return evaluation.WorkflowNodePending

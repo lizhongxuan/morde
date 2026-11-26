@@ -2057,7 +2057,7 @@ func cloudDSHPlanStepReadResultDigest(result AgentToolResult) ([]byte, error) {
 		if image.MediaType == "" || len(image.Data) == 0 {
 			return nil, domain.NewError(domain.CodeInvalidState, "direct read image result is invalid")
 		}
-		images = append(images, resultImage{MediaType: image.MediaType, Data: image.Data})
+		images = append(images, resultImage(image))
 	}
 	canonical, err := json.Marshal(struct {
 		Status AgentToolResultStatus `json:"status"`

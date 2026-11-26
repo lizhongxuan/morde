@@ -201,8 +201,11 @@ func (s taskValidationReviewRuntimeStub) StartTaskValidationReview(_ context.Con
 			return nil, err
 		}
 		decoded, err := decodeCloudDSHTaskValidationReviewFrame(raw)
-		if err != nil || !cloudDSHTaskValidationReviewIdentityMatches(cloudDSHTaskValidationReviewIdentityFromFrame(decoded), fence) {
-			return nil, fmt.Errorf("test runtime generated an invalid review frame: %s (decode=%v)", raw, err)
+		if err != nil {
+			return nil, fmt.Errorf("test runtime generated an invalid review frame: %s: %w", raw, err)
+		}
+		if !cloudDSHTaskValidationReviewIdentityMatches(cloudDSHTaskValidationReviewIdentityFromFrame(decoded), fence) {
+			return nil, fmt.Errorf("test runtime generated a review frame with an invalid identity: %s", raw)
 		}
 		review.events <- cloudDSHRead{frame: raw}
 	}

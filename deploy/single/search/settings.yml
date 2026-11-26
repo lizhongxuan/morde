@@ -8,16 +8,14 @@ server:
 search:
   formats: [html, json]
 
-# Google News RSS is a bounded news-only source with usable publication times.
-# Keep it behind SearXNG so the existing Broker authorization and result limits
-# remain in force. The Task Agent must still open original publisher pages to
-# verify dates before presenting current-news claims.
+# 360's news widget provides direct publisher URLs. Its relative age labels are
+# intentionally discarded; only an original publisher page can verify dates.
 engines:
-  - name: morde google news rss
-    engine: morde_google_news_rss
+  - name: morde 360 news
+    engine: morde_360_news
     shortcut: mgn
     categories: news
-    language: en-US
+    language: zh
     time_range_support: true
     paging: false
     timeout: 12.0

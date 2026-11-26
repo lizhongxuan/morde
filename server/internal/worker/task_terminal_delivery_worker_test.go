@@ -211,9 +211,11 @@ func TestBuildTaskTerminalDeliveryModelRequestVerifiesDigestAndOmitsInternalIden
 	}
 	for _, fact := range []string{`\"step_counts\"`, `\"succeeded\":2`, `\"failed\":1`, `\"unconfirmed\":1`,
 		app.TaskTerminalDeliverySafeNextStep(app.TaskTerminalDeliverySourceFailure),
-		app.TaskTerminalDeliveryFailureExplanation("provider_unavailable"), `\"failure_explanation\"`} {
+		app.TaskTerminalDeliveryFailureExplanation("provider_unavailable"), `\"failure_explanation\"`,
+		"never expose message IDs, source hashes, checkpoint markers, internal tool names, or internal status/error codes",
+		"what remains unconfirmed, and one safe next step"} {
 		if !bytes.Contains(raw, []byte(fact)) {
-			t.Fatalf("model request omitted progress fact %q: %s", fact, raw)
+			t.Fatalf("model request omitted progress or safe-delivery rule %q: %s", fact, raw)
 		}
 	}
 	if bytes.Contains(raw, []byte("provider_unavailable")) || bytes.Contains(raw, []byte("failure_code")) {

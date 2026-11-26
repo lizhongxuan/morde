@@ -140,9 +140,9 @@ Muse 栏只概括逆向资料中的观察或文档要求；意图分类、合并
 | 逻辑模块 | Muse 对照 | Morde 当前与欠缺 | 对应任务 |
 | --- | --- | --- | --- |
 | 01 收件与会话 | 会话消息与任务、工作项可追溯。 | 已有发件箱、持久化和幂等基础；实际 PC 断线恢复、跨端接续及不重复执行仍须贯通。 | [R00A](<实施任务TODO/01-收件与会话.md>) |
-| 02 意图与依赖 | 能延续工作、处理多条消息；具体分类与合并算法未知。 | 路由、直接 Task、batch 与 schedule 使用结构化意图；新建缺省不按正文猜测。个人 route receipt Workspace input snapshot 与 route update `unclear` 版本化澄清已接入；Host/MCP/child 和内部 direct-read 已按真实成功证据门控依赖。D-01 的 H07 replay 已按用户确认的 candidate manifest，将 canonical obligation IDs、声明 scope 和实际 operation receipt 对应起来；共同 `morde-task-workspace-snapshot-v1` 摘要已统一并通过组件回归。Runtime 尚无 runner inventory/实际 scope receipt，真实 DSH Host→Portal check 与 final snapshot 活链路也未验，因此 R25 修复验证保持 pending；项目 Workspace snapshot、Hub command 等副作用工具计划绑定和真实 DSH 完整计划执行仍待完成。 | [R19-A / M02-14 / R25](<实施任务TODO/02-意图路由与任务拆分.md>) |
+| 02 意图与依赖 | 能延续工作、处理多条消息；具体分类与合并算法未知。 | 路由、直接 Task、batch 与 schedule 使用结构化意图；新建缺省不按正文猜测。个人与项目 route receipt 均捕获 Workspace revision/manifest digest；项目快照另绑定 owner 与 Project resource version，并在 Apply 事务重验，重放保持首次 receipt。route update `unclear` 版本化澄清已接入；Host/MCP/child 和内部 direct-read 已按真实成功证据门控依赖。PlanStep readiness 增加 Store 重建后复验，但未模拟 DSH 进程崩溃/重启。D-01 的 H07 replay 已按用户确认的 candidate manifest，将 canonical obligation IDs、声明 scope 和实际 operation receipt 对应起来；共同 `morde-task-workspace-snapshot-v1` 摘要已统一并通过组件回归。Runtime 尚无 runner inventory/实际 scope receipt，真实 DSH Host→Portal check 与 final snapshot 活链路也未验，因此 R25 修复验证保持 pending；Hub command 等副作用工具计划绑定和真实 DSH 完整计划执行仍待完成。 | [R19-A / M02-14 / R25](<实施任务TODO/02-意图路由与任务拆分.md>) |
 | 03 多 Agent 协作 | 资料观察到主 Agent 与多层子 Agent 协作，结果由上层汇总。 | DSH 委派及两层深度有实现和局部回归；Runtime 兼容带计划步骤/修订的委派并保留旧检查点，服务端仍负责校验；实际 PC + 真实模型的两个独立子任务、失败回传与最终汇总尚未验收。 | [R03](<实施任务TODO/03-并发派发与协调.md>) |
-| 04 工具与工作项 | 任务动态记录搜索、浏览、文件及命令等操作，可展开实际结果；失败项保留。 | 有工作项、账本与工作区搜索摘要；全类事件投影、命令 / 查询 / 输出详情与真实账本一致性仍需 PC + DSH 验证。外部资料信任边界及真实来源定位需补充分层验收；65 项 MCP 目录局部回归不等于所有工具选择问题已解决。 | [R04 / R12 / R24 / R26](<实施任务TODO/04-工具执行与工作项.md>) |
+| 04 工具与工作项 | 任务动态记录搜索、浏览、文件及命令等操作，可展开实际结果；失败项保留。 | 有工作项、账本与工作区搜索摘要；服务端现为五类浏览器动作提供仅含 origin/安全控件信息的详情，并对输入、URL 私密部分和内部 target ID 做省略。全类事件投影、命令 / 查询 / 输出详情的 PC 呈现与真实账本一致性仍需 PC + DSH 验证。外部资料信任边界及真实来源定位需补充分层验收；65 项 MCP 目录局部回归不等于所有工具选择问题已解决。 | [R04 / R12 / R24 / R26](<实施任务TODO/04-工具执行与工作项.md>) |
 | 05 审批 | 资料描述敏感操作的卡片和范围授权；不能据此推断 Muse 审批内部实现。 | 对话与审核区已有共享审批的内置 MCP Apps view；真实批准、拒绝、刷新、授权变化和副作用闭环未验，任务动态不承载审批操作。 | [R06 / R22](<实施任务TODO/05-审批.md>) |
 | 06 证据与验证 | 资料中有读回、证据绑定及特定文档任务的 checking worker；并非所有任务内部机制均已知。 | 已有独立复核 Worker 和版本栅栏；D-01 replay 将经当前授权校验的用户确认 manifest、稳定 obligation ID、唯一 typed check 映射、operation receipt 与 final Workspace proof 串在一起。固定 Go Test Runtime runner receipt producer/Linux parser、operation/Workspace 绑定和 Store verifier 已有受控实现与局部回归；要求来源 hash 只证明已声明来源身份，用户确认只确认候选清单。当前缺的是 PC→DSH→runner→Store 的真实执行与最终快照同 Task 对账，不能据受控 fixture 宣称完整 scope 已实际执行，因此 H07 继续 pending。大于 4 KiB 的当前验证预览受限，审批覆盖不足也须 pending；真实 PC/DSH 和资料结论定位待验。 | [R07 / R20 / R25 / R26](<实施任务TODO/06-验证.md>) |
 | 07 交付与提问 | 资料要求结果回到原对话，用户可继续交流。 | 成功结果整理已有基础；失败、取消和验证失败原因尚未形成完整、耐久的自然说明；文件交付的关键要点和来源定位待验。合并到其他任务属于接续运行，不能误报失败。 | [R08 / R20 / R23 / R26](<实施任务TODO/07-交付与提问.md>) |
@@ -302,17 +302,17 @@ flowchart TD
 
 #### 现状与要修改的地方
 
-路由模型返回结构化动作，服务端解析后按当前会话和 Task 快照执行。R19 已移除用请求中的关键词推断或改写 `new`、`update`、`stop`、`stop_all`、`tool` 等语义动作的兜底；分类输出非法时先尝试一次有界修复，仍失败或模型不可用则安全澄清，不猜测任务动作。应用与存储继续校验身份、目标、候选完整性、状态、revision、Project/执行范围、授权、操作账本和只读工具白名单。文件交付意图由结构化字段表达：Task、batch 和 schedule 的 API/OpenAPI、服务与持久化路径已接入；新建 Task/schedule 缺省为 `none`，update 省略时继承现值，幂等身份包含显式意图；batch item 意图保持不可变。schedule occurrence 创建 Task 时复制意图，个人 schedule snapshot 和 DSH schedule 工具保留字段。schedule 当前没有 Workspace 绑定，服务/API 仅接受 `none`，显式 `required` / `unclear` 提前拒绝。通用 `normalizeNewTask` 空值归一为 `none`，不再从 Objective 分类。个人 route `new/required` 已在 receipt 捕获并校验 Workspace input revision/context digest 后绑定 Task；个人 route update 的版本化 `unclear` 澄清已接入。Host/MCP/child 计划门和 Skill、附件、会话历史、Workspace/impact map、Hub 只读动作、Goal/Schedule 只读工具的 direct-read PlanStep admission、成功 TaskStep 身份与结果 digest/readiness 已接入本地实现和定向回归；项目 Workspace route snapshot、Hub command 等副作用工具的计划绑定及真实 PC + DSH/模型验收仍待完成。自然语言意图由 Agent/路由模型结构化判断；代码继续强制身份、授权、范围、预算、状态、幂等与未知副作用对账。当前自动化验证详见[统一验证记录](<../../验证记录/Morde_Harness_最终流程测试用例.md>)；本轮未对当前工作区 PC + 真实 DSH/模型做语义验收。跨 Task `dependency_task_ids` 已有 Project 范围过滤及事务复核；Host/MCP/child 与上述 direct-read 的 plan-step binding 已接入，跨场景/重启及真实 DSH 计划执行仍需验。Muse 的分类、合并算法未知；固定 Planner 文件、60 秒合并窗和“缺验收标准就必问”均不是已证实规则。
+路由模型返回结构化动作，服务端解析后按当前会话和 Task 快照执行。R19 已移除用请求中的关键词推断或改写 `new`、`update`、`stop`、`stop_all`、`tool` 等语义动作的兜底；分类输出非法时先尝试一次有界修复，仍失败或模型不可用则安全澄清，不猜测任务动作。应用与存储继续校验身份、目标、候选完整性、状态、revision、Project/执行范围、授权、操作账本和只读工具白名单。文件交付意图由结构化字段表达：Task、batch 和 schedule 的 API/OpenAPI、服务与持久化路径已接入；新建 Task/schedule 缺省为 `none`，update 省略时继承现值，幂等身份包含显式意图；batch item 意图保持不可变。schedule occurrence 创建 Task 时复制意图，个人 schedule snapshot 和 DSH schedule 工具保留字段。schedule 当前没有 Workspace 绑定，服务/API 仅接受 `none`，显式 `required` / `unclear` 提前拒绝。通用 `normalizeNewTask` 空值归一为 `none`，不再从 Objective 分类。个人及项目 route receipt 均已捕获 Workspace revision/context digest；项目 route 还在受权事务中绑定 owner 与 Project resource version，Apply 重新校验授权资源、resource version、revision 和 digest，幂等重放保留原 snapshot。个人 route update 的版本化 `unclear` 澄清已接入。Host/MCP/child 计划门和 Skill、附件、会话历史、Workspace/impact map、Hub 只读动作、Goal/Schedule 只读工具的 direct-read PlanStep admission、成功 TaskStep 身份与结果 digest/readiness 已接入本地实现和定向回归；Store 重建后 readiness 已验证仍由持久账本决定，但 DSH 进程级崩溃/恢复未模拟。Hub command 等副作用工具计划绑定及真实 PC + DSH/模型验收仍待完成。自然语言意图由 Agent/路由模型结构化判断；代码继续强制身份、授权、范围、预算、状态、幂等与未知副作用对账。当前自动化验证详见[统一验证记录](<../../验证记录/Morde_Harness_最终流程测试用例.md>)；本轮未对当前工作区 PC + 真实 DSH/模型做语义验收。跨 Task `dependency_task_ids` 已有 Project 范围过滤及事务复核；Host/MCP/child 与上述 direct-read 的 plan-step binding 已接入，真实 DSH 计划执行仍需验。Muse 的分类、合并算法未知；固定 Planner 文件、60 秒合并窗和“缺验收标准就必问”均不是已证实规则。
 
-> **2026-11-25 最新覆盖：**下方步骤 02 的部分现状文字包含历史记录；Broker 对缺失或非法的持久文件意图直接拒绝。Task、batch、schedule 结构化字段及 schedule persistence 已接入；route Workspace snapshot/update-unclear、Host/MCP/child 和 direct-read PlanStep admission/result digest 已接入。项目 Workspace route snapshot、Hub command 计划绑定、真实 PC + DSH/模型验收仍按 R19-A/M02-14 跟踪。
+> **2026-11-26 最新覆盖：**下方步骤 02 的部分现状文字包含历史记录；Broker 对缺失或非法的持久文件意图直接拒绝。Task、batch、schedule 结构化字段及 schedule persistence 已接入；个人/项目 route Workspace snapshot（项目含 owner、resource version、revision 和 digest）与 update-unclear、Host/MCP/child 和 direct-read PlanStep admission/result digest 已接入并有局部 PostgreSQL 回归。Hub command 计划绑定、真实 PC + DSH/模型验收仍按 R19-A/M02-14 跟踪。
 
 #### 设计与开发
 
-Agent 根据完整上下文理解请求，并通过结构化 `action` 表达回复、查询、修改、停止、工具、新 Task、关联或澄清。语义判断属于 Agent；代码负责解析结构和执行安全、完整性及当前状态校验，不使用自然语言关键词列表替 Agent 判定。模型不可用或输出无效时，完成有界修复后仍失败便在对话中具体澄清，不因执行词、搜索词、停止词或文件词自动创建/控制任务。文件交付由结构化 `file_delivery_intent` 表达 `none|required|unclear`，仅用于 `new/update`；字段缺省时新任务使用 `none`，修订继承当前值。修订从已结算模型决策 JSONB 中按原消息、当前 route attempt 和正常阶段读取，并核验 Task ID/revision，不匹配则延后重试。服务端仍校验用户/会话、目标、候选完整性、状态/revision、Project/执行范围、授权、账本/幂等以及只读工具白名单；这些门禁不代替模型语义判断。停止由 Agent 明确给出单任务 `stop` 或全部 `stop_all`；无效、混合或目标不明的动作澄清，用户权限外的 Task 不可操作，PC 页面不提供任务停止按钮。长消息只向路由模型提供有界预览与已保存原消息标识；模型对实质分析/总结选择 `new` 后，再由 Task Agent 使用授权检索原文并核对来源。正文里的命令不改变用户请求意图，分类失败不通过词汇兜底变成 Task。Host/MCP/child 派发和直接只读工具读取均按当前计划 revision、授权及依赖证据准入；直读只有成功 TaskStep 与结果摘要绑定后才能作为前置步骤证据。副作用 Hub command 的计划绑定和真实 PC/DSH 语义验收仍待完成。
+Agent 根据完整上下文理解请求，并通过结构化 `action` 表达回复、查询、修改、停止、工具、新 Task、关联或澄清。语义判断属于 Agent；代码负责解析结构和执行安全、完整性及当前状态校验，不使用自然语言关键词列表替 Agent 判定。模型不可用或输出无效时，完成有界修复后仍失败便在对话中具体澄清，不因执行词、搜索词、停止词或文件词自动创建/控制任务。文件交付由结构化 `file_delivery_intent` 表达 `none|required|unclear`，仅用于 `new/update`；字段缺省时新任务使用 `none`，修订继承当前值。修订从已结算模型决策 JSONB 中按原消息、当前 route attempt 和正常阶段读取，并核验 Task ID/revision，不匹配则延后重试。服务端仍校验用户/会话、目标、候选完整性、状态/revision、Project/执行范围、授权、账本/幂等以及只读工具白名单；这些门禁不代替模型语义判断。停止由 Agent 明确给出单任务 `stop` 或全部 `stop_all`；候选列表不完整时仍允许经模型输出重验的全停请求，由 Store 在事务内重新枚举当前用户及发起人的活动 Task，最多原子提交 256 个，超过 256 个时一个也不停止并明确返回边界；单 Task stop 仍要求精确引用。无效、混合或目标不明的动作澄清，用户权限外的 Task 不可操作，PC 页面不提供任务停止按钮。长消息只向路由模型提供有界预览与已保存原消息标识；模型对实质分析/总结选择 `new` 后，再由 Task Agent 使用授权检索原文并核对来源。正文里的命令不改变用户请求意图，分类失败不通过词汇兜底变成 Task。Host/MCP/child 派发和直接只读工具读取均按当前计划 revision、授权及依赖证据准入；直读只有成功 TaskStep 与结果摘要绑定后才能作为前置步骤证据。副作用 Hub command 的计划绑定和真实 PC/DSH 语义验收仍待完成。
 
 #### PlanStep 门控与当前阻塞
 
-`Plan.Validate` 校验结构，`executeTaskPlan` 保存模型提交的计划，模型填写 `completed` 不能作为依赖放行证据。公共合同 v1 §3 定义 `(task_id, task_revision, plan_revision, plan_step_id)`、执行绑定和结算证据；Host operation、MCP operation、child spawn 与 direct-read 工具已有准入/绑定和定向 App/PostgreSQL 回归。direct-read 必须同时有当前成功 `task_steps` 调用身份和 32-byte 结果摘要才可解锁依赖；失败、取消、unknown、缺证据、旧授权或过期修订不放行，独立步骤可并行。Hub command 等副作用工具绑定、跨场景/重启及真实 DSH 计划执行仍未完整验收；详细进度以 M02-14 最新验证记录为准。
+`Plan.Validate` 校验结构，`executeTaskPlan` 保存模型提交的计划，模型填写 `completed` 不能作为依赖放行证据。公共合同 v1 §3 定义 `(task_id, task_revision, plan_revision, plan_step_id)`、执行绑定和结算证据；Host operation、MCP operation、child spawn 与 direct-read 工具已有准入/绑定和定向 App/PostgreSQL 回归。direct-read 必须同时有当前成功 `task_steps` 调用身份和 32-byte 结果摘要才可解锁依赖；失败、取消、unknown、缺证据、旧授权或过期修订不放行，独立步骤可并行。PostgreSQL 回归还通过重建 Store、重载 Task 后再次读取 readiness，并验证前置步骤失败会关闭、恢复成功重新开放；这只证明数据库持久状态，不模拟 DSH Runtime 进程重启。Hub command 等副作用工具绑定、真实 DSH 计划执行仍未完整验收；详细进度以 M02-14 最新验证记录为准。
 
 #### Morde 落点
 
@@ -360,7 +360,7 @@ Runtime 已接入上游锁定版本的 advisory reminder；连续三次完全相
 
 #### 现状与要修改的地方
 
-Broker 已有调用接纳、执行和对账。本轮补齐加密工作项执行详情、取消终态和网页工具状态；未知结果不重放。项目同步亦接入固定默认电脑、云端 applied 回执和本机待处理指纹。本轮 R05 同步复核中，5 项 App 冲突/基线用例、6 项隔离 PostgreSQL 上传/冲突用例以及 1 项 Agent Workspace 直接提交用例通过；这些数据库用例均在一次性 PostgreSQL 上执行，先前未设 DSN 的运行实际会跳过。完整手动上传 E2E、当前 PC 操作和真实云端仍待验收。新增 PostgreSQL race 回归确认 Morde 自身同项目上传 session 创建单赢家；剩余竞态限定为 Host 外部非协作写入可能造成多文件部分应用，冲突不推进 baseline。2026-11-24 R24 增加工具类型对应的中文摘要及文件动作标题映射；授权 TaskStepDetail API 现在返回有界网页结果预览、全文哈希和截断标记，Portal 仅以不可信纯文本显示，明确不是来源链接清单或独立核验；当前 API 定义的七类工作项失败原因均映射为中文并有回归；Assistant 组件 240/240、类型检查及 app/API 定向测试通过。R12 本地合成回归确认 65 项 MCP 目录经两个固定 MCP 定义仍能审批后调用第 65 项，工具定义达到上限时当前消息历史搜索、读取与搜索仍保留；通用工具注册表选择/恢复及真实 PC + DSH 事实仍待验。仍缺文件/浏览器/电脑详情、Host 之外耗时；实际 PC + DSH 工作项事实与账本一致性仍待 T54 验收。
+Broker 已有调用接纳、执行和对账。本轮补齐加密工作项执行详情、取消终态和网页工具状态；未知结果不重放。项目同步亦接入固定默认电脑、云端 applied 回执和本机待处理指纹。本轮 R05 同步复核中，5 项 App 冲突/基线用例、6 项隔离 PostgreSQL 上传/冲突用例以及 1 项 Agent Workspace 直接提交用例通过；这些数据库用例均在一次性 PostgreSQL 上执行，先前未设 DSN 的运行实际会跳过。完整手动上传 E2E、当前 PC 操作和真实云端仍待验收。新增 PostgreSQL race 回归确认 Morde 自身同项目上传 session 创建单赢家；剩余竞态限定为 Host 外部非协作写入可能造成多文件部分应用，冲突不推进 baseline。2026-11-24 R24 增加工具类型对应的中文摘要及文件动作标题映射；授权 TaskStepDetail API 现在返回有界网页结果预览、全文哈希和截断标记，Portal 仅以不可信纯文本显示，明确不是来源链接清单或独立核验；当前 API 定义的七类工作项失败原因均映射为中文并有回归；Assistant 组件 240/240、类型检查及 app/API 定向测试通过。R12 本地合成回归确认 65 项 MCP 目录经两个固定 MCP 定义仍能审批后调用第 65 项，工具定义达到上限时当前消息历史搜索、读取与搜索仍保留；通用工具注册表选择/恢复及真实 PC + DSH 事实仍待验。服务端浏览器动作摘要已局部实现：访问/导航只记 origin，点击/按键使用白名单字段，输入内容仅标记省略；参数不带出 URL 路径、查询、片段、凭据或内部 target ID，且输出证据仍受 Workspace 授权门禁。App 定向与完整回归通过。仍缺文件/电脑详情、Host 之外耗时；实际 PC + DSH 工作项事实与账本一致性仍待 T54 验收。
 
 #### 设计与开发
 
@@ -448,7 +448,7 @@ Host、外部 MCP 和 Workspace/media 的逐次审批绑定及 Broker 回归通�
 
 #### 设计与开发
 
-Task 完成前在锁内重检 pending/applied steer 与完成候选 fence；该 Task 有未被候选覆盖的新 steer 时恢复原 Session，独立新请求按步骤 02 路由。确认后先持久化一份回执，再发回原会话；用自然语言说明结果要点、产物、证据和未完成项，不以内部状态码及修订号机械拼接回复。验证状态必须在原对话说明，证据详情可在授权工作项中显示，且仅在结果摘要和修订匹配时显示；来源跳转限于当前会话已载入消息，工作项通过现有 Task 详情授权接口读取，成果仍需完整 Workspace proof。澄清和具备账本确认的安全重试已在对话可用；停止只由 AI 对话中的自然语言请求触发：明确匹配单个 Task 时按现有身份/状态/修订和账本栅栏请求停止，明确要求停止全部时仅请求取消当前用户发起的活动 Task；PC 页面不显示任务停止按钮，请求受理不等于已停止。思考中的三个点只在对话最底部显示一次；所有消息气泡默认不显示状态、确认或停止脚注，AI 回复仅在悬停/键盘聚焦时显示时间与复制。完成结果链原本只接已完成 Task：失败或等待另从有身份的持久事件送到原会话，不放松成功验证栅栏。主 Agent 基于已知事实说明已完成内容、原因或未知及下一步；模型不可用或预算不足时给真实提示。合并本身不报失败，目标后来失败时说明真实原因。批准/拒绝反馈与 Task 后续状态分开表达；PC/iOS 展示执行中、待批、失败、结果未知、待验证和已通过等真实状态，拒绝后恢复运行也不冒充完成。
+Task 完成前在锁内重检 pending/applied steer 与完成候选 fence；该 Task 有未被候选覆盖的新 steer 时恢复原 Session，独立新请求按步骤 02 路由。确认后先持久化一份回执，再发回原会话；用自然语言说明结果要点、产物、证据和未完成项，不以内部状态码及修订号机械拼接回复。验证状态必须在原对话说明，证据详情可在授权工作项中显示，且仅在结果摘要和修订匹配时显示；来源跳转限于当前会话已载入消息，工作项通过现有 Task 详情授权接口读取，成果仍需完整 Workspace proof。澄清和具备账本确认的安全重试已在对话可用；停止只由 AI 对话中的自然语言请求触发：明确匹配单个 Task 时按现有身份/状态/修订和账本栅栏请求停止，明确要求停止全部时仅请求取消当前用户发起的活动 Task；PC 页面不显示任务停止按钮，请求受理不等于已停止。思考中的三个点只在对话最底部显示一次；所有消息气泡默认不显示状态、确认或停止脚注，AI 回复仅在悬停/键盘聚焦时显示时间与复制。完成结果链原本只接已完成 Task：失败或等待另从有身份的持久事件送到原会话，不放松成功验证栅栏。主 Agent 基于已知事实说明已完成内容、原因或未知及下一步；模型不可用或预算不足时给真实提示。进度、澄清及最终回复不得暴露消息 ID、来源哈希、checkpoint 标记、内部工具名或内部状态/错误码；等待或结果未知时用自然语言区分已确认事实、未确认部分和安全下一步。合并本身不报失败，目标后来失败时说明真实原因。批准/拒绝反馈与 Task 后续状态分开表达；PC/iOS 展示执行中、待批、失败、结果未知、待验证和已通过等真实状态，拒绝后恢复运行也不冒充完成。
 
 用户要求根据 GitHub 代码画业务流程图时，按授权读取相关源码，交付可核对的仓库版本和代码位置，并在原对话或 Morde PC 客户端内提供可读图形；不能把仅有图表代码视为图形交付。`ChatMarkdownContent.tsx` 已接入 `ChatMermaid`；E-01 在实际 PC + 本地合成消息中验证了四节点流程图和可展开源码，这只证明呈现能力。授权 GitHub 仓库的版本/位置核对、真实 DSH 源码分析与 T57 交付仍待验，按 R23-A / T57 分层记录。
 
@@ -474,11 +474,13 @@ Task 完成前在锁内重检 pending/applied steer 与完成候选 fence；该 
 
 ### 08 记忆与纠正沉淀
 
-**状态：**PC 历史视觉与 iOS 本地流程通过；PC 其他验收待完成
+**状态：**PC 历史视觉与 iOS 本地流程通过；R17 生产账本图、PC 可见回执及 Runtime/授权快照适配已实现并有本地回归；实际 PC/DSH、R13 成功链路和持续评测待完成
 
 #### 现状与要修改的地方
 
 当前工作区已补齐历史访问复核、个人记忆修订后继关系、用户确认的规则候选及遗忘清理约束。修订来源不可用时关系隐藏；规则候选只引用来源记忆修订，不另存正文。本轮一次性 PostgreSQL 16 数据库组 11/11 覆盖来源、撤权、删除清理与显式候选启用，应用/领域/API 筛选回归通过。全局侧栏精简后，动态、灵感和偏好曾无页面内入口；本轮已补分类链接，并恢复安全的个人数据页级重试，Portal 定向组件 38/38 通过。以上是源码/数据库证据，实际 PC、Markdown 视图与索引、真实 DSH 语义仍待验。Muse 的后台整理触发、索引策略和去重阈值仍未知，不据此推测产品行为。
+
+R17 的 `WorkflowTrace` v1 已能从 owner-scoped PostgreSQL 快照关联 route、Task、Agent、model-call、operation、approval、verification、delivery、Host、Runtime/DSH heartbeat、当前授权来源与 Guardian OS 进程快照；PC assistant 结果可见后有同修订回执。回执和 completed/delivered 关系还要求 `task.result.result_content_sha256` 与助手正文 SHA-256 一致；不匹配时拒绝回执或保留 unknown/gap，不生成 delivered 边。2026-11-26 定向 PostgreSQL 2/2（包含摘要不匹配负例）、API 回执 1/1、Portal Assistant 278/278 与 typecheck 通过。当前授权及进程快照只是采集时点观察；实际源码 `make pc` 本轮无法连接云端，真实 PC/DSH/R13 成功样本与持续评测仍待验，故不将 R17 记为完成。
 
 #### 设计与开发
 
@@ -508,7 +510,7 @@ Task 完成前在锁内重检 pending/applied steer 与完成候选 fence；该 
 
 #### 设计与开发
 
-失败按任务、调用身份、阶段和稳定原因码留痕。执行中可确认且安全恢复的错误先以脱敏结构化结果交回同一 DSH Session/主 Agent，由 Agent 在原 Task、checkpoint、授权和剩余预算内判断能否修复；失败工作项保留，修复动作作为新步骤记录。无法安全恢复后才由主 Agent 基于事实在原对话说明中断原因、已完成内容和下一步；模型不可用或预算不足时给真实的服务/额度提示，不绕过预算，也不伪装成 Agent 输出。子 Agent 失败回到主 Agent；已委派不等于完成。用户新增的 Agent-first 错误体验是 Morde 产品要求，不代表 Muse 内部机制已公开。合并本身不报失败，目标后来失败时如实说明。取消、等待、失败和未知分别处理；日志不记录工具参数、模型原文或凭据。Provider 429 沿用路由层有限重试与持久等待；精确 `terminal_for_attempt` 限流立即结束当次尝试，不能在该次尝试中重试、委派或绕过；Task/MCP 重试须由用户发起，并重验账本、等待期、Agent 停止证明、授权、审批与预算。已派发操作或用量未知时按原身份对账，无法确认则等待，不重放或释放预留。Workspace 的具名等待与具备可信解除信号的 durable 阻塞可恢复同一 Task/checkpoint；审批、撤权和用户操作仍须等待。保留部分回复并标中断，待审批不是失败。审批响应 401 清除失效凭据和陈旧操作；403/404 安全刷新或隐藏不可读状态，409 按冲突刷新。客户端重开、DSH Node 与服务进程重启分别验收。
+失败按任务、调用身份、阶段和稳定原因码留痕。执行中可确认且安全恢复的错误先以脱敏结构化结果交回同一 DSH Session/主 Agent，由 Agent 在原 Task、checkpoint、授权和剩余预算内判断能否修复；失败工作项保留，修复动作作为新步骤记录。无法安全恢复后才由主 Agent 基于事实在原对话说明中断原因、已完成内容和下一步；模型不可用或预算不足时给真实的服务/额度提示，不绕过预算，也不伪装成 Agent 输出。子 Agent 失败回到主 Agent；已委派不等于完成。用户新增的 Agent-first 错误体验是 Morde 产品要求，不代表 Muse 内部机制已公开。用户可见的恢复与终态消息不得暴露消息 ID、来源哈希、checkpoint 标记、内部工具名或内部状态/错误码；等待或未知时以普通语言说明已确认、未确认和下一步。合并本身不报失败，目标后来失败时如实说明。取消、等待、失败和未知分别处理；日志不记录工具参数、模型原文或凭据。Provider 429 沿用路由层有限重试与持久等待；精确 `terminal_for_attempt` 限流立即结束当次尝试，不能在该次尝试中重试、委派或绕过；Task/MCP 重试须由用户发起，并重验账本、等待期、Agent 停止证明、授权、审批与预算。已派发操作或用量未知时按原身份对账，无法确认则等待，不重放或释放预留。Workspace 的具名等待与具备可信解除信号的 durable 阻塞可恢复同一 Task/checkpoint；审批、撤权和用户操作仍须等待。保留部分回复并标中断，待审批不是失败。审批响应 401 清除失效凭据和陈旧操作；403/404 安全刷新或隐藏不可读状态，409 按冲突刷新。客户端重开、DSH Node 与服务进程重启分别验收。
 
 #### Morde 落点
 

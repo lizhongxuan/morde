@@ -10,7 +10,7 @@ func ValidConversationRouteStopDecision(value ConversationRouteContext, decision
 		value.ContentTruncated || value.CurrentMessageHasAttachments || len(value.ContentSources) != 0 ||
 		value.ResultReview != nil || value.PreviousMissing || value.ReferenceUnavailable ||
 		(value.CandidateSetIncomplete || value.TaskCandidateSetIncomplete || value.RequestCandidateSetIncomplete) &&
-			(value.ReferenceTaskID == "" || decision.Action == ConversationRouteStopAll) ||
+			decision.Action != ConversationRouteStopAll && value.ReferenceTaskID == "" ||
 		decision.Acknowledge || decision.ExplicitNew || decision.Question != "" || decision.Reply != "" ||
 		decision.ToolName != "" || decision.ToolArguments != "" || len(decision.DependencyTaskIDs) != 0 || len(decision.AggregateMessageIDs) != 0 {
 		return false

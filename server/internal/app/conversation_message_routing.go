@@ -36,26 +36,28 @@ type AcceptConversationMessageCommand struct {
 
 // ConversationRoutingInput contains only the immutable options needed after receipt.
 type ConversationRoutingInput struct {
-	ProjectID               string      `json:"project_id,omitempty"`
-	VariantGroupID          string      `json:"variant_group_id,omitempty"`
-	VariantVersion          int64       `json:"variant_version,omitempty"`
-	VariantAction           string      `json:"variant_action,omitempty"`
-	VariantOperationID      string      `json:"variant_operation_id,omitempty"`
-	VariantSourceMessageID  string      `json:"variant_source_message_id,omitempty"`
-	ResultReviewID          string      `json:"result_review_id,omitempty"`
-	PreviousClientMessageID string      `json:"previous_client_message_id,omitempty"`
-	ReferenceTaskID         string      `json:"reference_task_id,omitempty"`
-	ModelID                 string      `json:"model_id,omitempty"`
-	HostID                  string      `json:"host_id,omitempty"`
-	WorkspaceID             string      `json:"workspace_id,omitempty"`
-	WorkspaceInputRevision  *int64      `json:"workspace_input_revision,omitempty"`
-	WorkspaceContextDigest  []byte      `json:"workspace_context_digest,omitempty"`
-	ChangeTaskTarget        bool        `json:"change_task_target,omitempty"`
-	ApplicationID           string      `json:"application_id,omitempty"`
-	TimeZone                string      `json:"time_zone,omitempty"`
-	MCPConnectorIDs         []string    `json:"mcp_connector_ids,omitempty"`
-	ClientAttachmentIDs     []string    `json:"client_attachment_ids,omitempty"`
-	Budget                  task.Budget `json:"budget"`
+	ProjectID                       string      `json:"project_id,omitempty"`
+	VariantGroupID                  string      `json:"variant_group_id,omitempty"`
+	VariantVersion                  int64       `json:"variant_version,omitempty"`
+	VariantAction                   string      `json:"variant_action,omitempty"`
+	VariantOperationID              string      `json:"variant_operation_id,omitempty"`
+	VariantSourceMessageID          string      `json:"variant_source_message_id,omitempty"`
+	ResultReviewID                  string      `json:"result_review_id,omitempty"`
+	PreviousClientMessageID         string      `json:"previous_client_message_id,omitempty"`
+	ReferenceTaskID                 string      `json:"reference_task_id,omitempty"`
+	ModelID                         string      `json:"model_id,omitempty"`
+	HostID                          string      `json:"host_id,omitempty"`
+	WorkspaceID                     string      `json:"workspace_id,omitempty"`
+	WorkspaceOwnerID                string      `json:"workspace_owner_id,omitempty"`
+	WorkspaceProjectResourceVersion *int64      `json:"workspace_project_resource_version,omitempty"`
+	WorkspaceInputRevision          *int64      `json:"workspace_input_revision,omitempty"`
+	WorkspaceContextDigest          []byte      `json:"workspace_context_digest,omitempty"`
+	ChangeTaskTarget                bool        `json:"change_task_target,omitempty"`
+	ApplicationID                   string      `json:"application_id,omitempty"`
+	TimeZone                        string      `json:"time_zone,omitempty"`
+	MCPConnectorIDs                 []string    `json:"mcp_connector_ids,omitempty"`
+	ClientAttachmentIDs             []string    `json:"client_attachment_ids,omitempty"`
+	Budget                          task.Budget `json:"budget"`
 }
 
 type ConversationMessageReceipt struct {
@@ -191,6 +193,8 @@ func ConversationReceiptHash(conversationID, content string, input ConversationR
 	// These fields are captured from mutable server state at first acceptance.
 	// Exclude them from request identity so retrying the same client message
 	// after a Workspace revision advances still replays its original receipt.
+	input.WorkspaceOwnerID = ""
+	input.WorkspaceProjectResourceVersion = nil
 	input.WorkspaceInputRevision = nil
 	input.WorkspaceContextDigest = nil
 	return hashIdempotencyRequest(struct {

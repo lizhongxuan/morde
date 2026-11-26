@@ -99,9 +99,15 @@ func TestConversationRouteModelRequestKeepsMinimumWindowOutputBudget(t *testing.
 	if review.MaxOutputTokens != 512 {
 		t.Fatalf("result review route output budget differs from the minimum-window default: MaxOutputTokens=%d", review.MaxOutputTokens)
 	}
-	for _, required := range []string{"source positions explicitly present", "Never invent a source position", "not read or could not be located"} {
+	for _, required := range []string{
+		"source positions explicitly present",
+		"Never invent a source position",
+		"not read or could not be located",
+		"never expose message IDs, source hashes, checkpoint markers, internal tool names, or internal status/error codes",
+		"what remains unconfirmed, and one safe next step",
+	} {
 		if !strings.Contains(review.Instructions, required) {
-			t.Errorf("result review instructions omit source-bound delivery rule %q", required)
+			t.Errorf("result review instructions omit safe delivery rule %q", required)
 		}
 	}
 }
@@ -866,6 +872,13 @@ func TestConversationRouteStopAllUsesModelSemanticsAndStructuralGuards(t *testin
 	decision := ParseConversationRouteDecisionForContext(output, value)
 	if decision.Action != ConversationRouteStopAll || decision.InvalidOutput || decision.ModelOutput != output {
 		t.Fatalf("semantic stop-all decision was rejected because its wording did not match keywords: %+v", decision)
+	}
+	incomplete := value
+	incomplete.CandidateSetIncomplete = true
+	incomplete.TaskCandidateSetIncomplete = true
+	incomplete.RequestCandidateSetIncomplete = true
+	if !ValidConversationRouteStopDecision(incomplete, decision) {
+		t.Fatal("explicit model stop-all was rejected because its bounded candidate list was incomplete")
 	}
 
 	for _, test := range []struct {

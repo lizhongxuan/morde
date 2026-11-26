@@ -4951,15 +4951,16 @@ func (a *browserAcceptanceActivity) verifyApprovalDecisionOutcome(ctx context.Co
 	if details.Task.Status != task.StatusQueued && details.Task.Status != task.StatusRunning && details.Task.Status != task.StatusFailed {
 		return fmt.Errorf("approval outcome Task status=%s, want queued, running, or failed after the wait was resolved", details.Task.Status)
 	}
-	if expected == task.PendingRequestRejected {
+	switch expected {
+	case task.PendingRequestRejected:
 		if details.PendingRequest.ExpiresAt != nil && !details.PendingRequest.RespondedAt.Before(*details.PendingRequest.ExpiresAt) {
 			return errors.New("rejected approval was recorded after its expiry")
 		}
-	} else if expected == task.PendingRequestExpired {
+	case task.PendingRequestExpired:
 		if details.PendingRequest.ExpiresAt == nil || details.PendingRequest.RespondedAt.Before(*details.PendingRequest.ExpiresAt) {
 			return errors.New("expired approval is missing a response at or after its expiry")
 		}
-	} else {
+	default:
 		return fmt.Errorf("unsupported approval outcome %q", expected)
 	}
 	if err := a.verifyApprovalResponseEvent(ctx, current, approvalID, approvalVersion, expected); err != nil {

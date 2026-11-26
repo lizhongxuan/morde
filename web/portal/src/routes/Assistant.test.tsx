@@ -1448,6 +1448,41 @@ describe('Assistant durable tasks', () => {
     expect(local.pathname).toBe('/__ch/task-auth');
   });
 
+  it('records PC delivery only after a completed reply stays visible for the full observation window', async () => {
+    const observers: TestIntersectionObserver[] = [];
+    class TestIntersectionObserver {
+      private target: Element | null = null;
+      constructor(private readonly callback: IntersectionObserverCallback) { observers.push(this); }
+      observe(target: Element) { this.target = target; }
+      disconnect() { this.target = null; }
+      notify(ratio: number) {
+        if (!this.target) throw new Error('no observed message target');
+        this.callback([{ target: this.target, isIntersecting: ratio >= 0.25, intersectionRatio: ratio } as IntersectionObserverEntry],
+          this as unknown as IntersectionObserver);
+      }
+    }
+    vi.stubGlobal('IntersectionObserver', TestIntersectionObserver);
+    const observeReply = vi.spyOn(portalApi, 'observeTaskReplyInPC').mockResolvedValue();
+    const completedReply = { ...reply, task_id: task.id, output_status: 'completed' as const,
+      output_task_revision: 4, output_result_event_sequence: 8 };
+    mockCommon({ conversations: [conversation], messages: [message, completedReply] });
+    renderPage();
+
+    await screen.findByText('你好！');
+    await waitFor(() => expect(observers.length).toBeGreaterThan(0));
+    const observer = observers.at(-1);
+    if (!observer) throw new Error('no intersection observer was created');
+    act(() => observer.notify(0.5));
+    await new Promise((resolve) => window.setTimeout(resolve, 350));
+    act(() => observer.notify(0.1));
+    await new Promise((resolve) => window.setTimeout(resolve, 400));
+    expect(observeReply).not.toHaveBeenCalled();
+
+    act(() => observer.notify(0.5));
+    await waitFor(() => expect(observeReply).toHaveBeenCalledOnce(), { timeout: 1_500 });
+    expect(observeReply).toHaveBeenCalledWith(task.id, completedReply.id, 4);
+  });
+
   it('does not offer a legacy Workbench observation action from Task Dynamics', async () => {
     const hostTask = { ...task, status: 'running' as const, result: null, host_id: targetHost.id, finished_at: null };
     mockCommon({ conversations: [conversation], messages: [message], hosts: [targetHost] });

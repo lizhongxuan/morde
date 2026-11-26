@@ -194,9 +194,6 @@ func TestReplayTaskEventChainStructuralRules(t *testing.T) {
 			if !found {
 				t.Fatalf("chain reasons = %v, want %q", chain.InvalidReasons, tc.reason)
 			}
-			if len(chain.Entries) > 0 && chain.Entries[0].Kind == task.EventKindCreated {
-				// created first is fine; other rules still apply
-			}
 		})
 	}
 }

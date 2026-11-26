@@ -43,13 +43,27 @@ flowchart LR
 
 ## 3. 结构化追问
 
-现有 `ask_user` 和 Task 澄清只接收自由文本。优先接入 DSH 上游的 [`dsh-user-questions`](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/interaction/user-questions/README.md) 与 [`dsh-tool-ask-user`](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/interaction/tool-ask-user/README.md)，通过 Morde provider/适配层进入现有 Broker 与持久化流程。两包上游 `0.2.2-rc.1` 为 MIT，版本与当前 Runtime 依赖同版本（[user-questions 清单](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/interaction/user-questions/package.json)、[tool-ask-user 清单](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/interaction/tool-ask-user/package.json)）；实际接入前仍须核验依赖、会话恢复、取消和隔离，不能仅凭版本相同认定兼容。上游限制运行中的子 Agent 直接向用户提问，子 Agent 的问题由主 Agent 汇总，保持现有协作边界。
+### 兼容性验证结论
 
-新澄清记录携带问题 ID、文本、选项 ID、标签和单选/多选规则；新增版本化答复接口，提交每个问题的选项、自由文本或明确的 `skip`。服务端校验当前账号、会话、Task、问题版本和选项，以同一幂等键原子记录答复并恢复对应任务；结果未知时复用原请求身份核对。回传 DSH 时将选项 ID 映射为原标签、自由文本映射为 `custom`；明确跳过映射为空 `selected` 且无 `custom`，服务端保留独立跳过事实，不能用假答案冒充。
+2026-11-26 使用 [`dsh-user-questions`](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/interaction/user-questions/README.md) 和 [`dsh-tool-ask-user`](https://github.com/deepseek-ai/deepseek-harness/blob/dsh-v0.2.2-rc.1/packages/interaction/tool-ask-user/README.md) 的官方 `0.2.2-rc.1` 包及 Morde 当前 DSH 依赖在本机验证。两包为 MIT，发布包的 DSH peer 依赖与 Morde 版本一致；**插件可加载，但目前不能直接接入，适配后的端到端兼容性尚未验证**。当前项目未安装这两个插件。
 
-用户可主动跳过现有必答问题；Agent 收到跳过事实后继续可安全执行的部分。此规则覆盖 Agent 追问、文件交付和路由澄清；涉及未确定目标、文件交付意图或权限的操作仍经过原门禁，无法安全推进时说明未完成内容。旧客户端继续使用原文本问题和答复接口；多问题依次投影为单题并逐题保存旧答复，全部处理后再恢复任务，答复作为对应问题的自由文本处理。旧会话保留原 `ask_user` 合同，新能力按版本接入，恢复时不改变已冻结的工具集。
+| 检查 | 结果与影响 |
+| --- | --- |
+| 任务隔离 | 插件实包测试中，并发根 Agent 的回答各自归属；取消一个请求不影响另一个，子 Agent 和失效 Agent 被拒绝。Morde 现有并发 Task、定向取消和跨 Session checkpoint 拒绝测试通过。插件本身不校验 Morde 的账号与 Task 授权，不能据此认定两者已打通。 |
+| 会话恢复 | 插件的 `timed` 模式可从模拟事件日志重建待答状态，重建后的答复属于对应 Session；其超时或进程中断后的答复作为新用户消息送入 Agent。默认阻塞模式不由该投影追踪。Morde 现有流程则持久化待答并恢复**原工具调用**；两种恢复语义不能直接替换。上述插件验证是新 Context 的日志重放，未执行真实进程重启后的插件与 Morde 联合恢复。 |
+| 澄清合同 | 上游工具为 `ask_user_question`，接收问题数组；Morde 现有 `ask_user` 仅接受 `{question}`。实包工具 schema 的根对象缺少 `additionalProperties: false`，嵌套对象允许额外属性，Morde 当前启动校验拒绝该 schema。即使收紧 schema，Morde 对子 Agent 和同轮混合工具调用的澄清限制目前只识别 `ask_user`。 |
 
-Morde 持久记录是待答和恢复的依据，不能仅依赖插件进程内的等待。如果验证表明插件无法满足现有 checkpoint、授权或恢复约束，则记录原因，保留 Morde 的 `ask_user` 并按上游问题与答复格式做最小扩展，仍由 DSH 执行。
+实包验证覆盖多选、自由文本、明确跳过、隔离、取消、schema 校验及事件重放，共 6 项，在 Node 24.22.2 和 26.13.0 通过；Morde 现有 Runtime、Broker/API 定向测试及临时 PostgreSQL 的澄清版本、幂等和持久化测试通过。这些是分别验证，**不代表插件已接入、真实端到端已通过，或其他生产 Node 版本已验证**。
+
+### 适配设计
+
+- 优先复用同版本插件的提问服务和工具能力，以 Morde provider、受限工具 schema 和调用适配层连接现有 Broker；固定依赖版本。只收紧新工具的 schema，不放宽全局校验；同步将新工具纳入现有子 Agent 禁用和同轮单独调用规则。插件默认阻塞工具的 provider 请求不直接携带 `call_id`，适配层须从所属执行上下文绑定它，不能依赖跨任务共享状态；无可核验 Agent 身份的请求不得进入 Morde 用户数据流程。上游对**运行中由其他 Agent 持有**的子 Agent 提问有拒绝保护，子 Agent 的问题仍由主 Agent 汇总。
+- Morde 数据库仍是待答和恢复的依据：请求绑定账号、会话、Task、Agent、执行代次、授权版本、原 `call_id` 和问题版本；Broker 校验现有授权与租约，原子保存待答，按原流程暂停。答复后只对账并恢复该原调用，将结构化答案作为它的结果；不能把 `timed` 的 `pending` 或新用户消息当成原调用结果。断线、取消、重启和重复答复须保留现有隔离与幂等语义。
+- 新记录包含问题 ID、文本、选项 ID、标签和单选/多选规则；同一问题内选项 ID 和标签均须唯一，避免答案映射歧义。版本化答复接口校验账号、Task、问题版本与选项，并记录选项、自由文本或明确 `skip`。回传时选项 ID 映射为上游标签，自由文本映射为 `custom`；单选的自由文本覆盖选项，多选的自由文本可补充选项。跳过映射为空 `selected` 且无 `custom`，另行持久化跳过事实。
+- 用户可主动跳过现有必答问题，包括 Agent 追问、文件交付和路由澄清；Agent 只继续可安全执行的部分。跳过不构成授权，也不替代文件交付意图；未确定目标或权限时保留原门禁并说明未完成内容。
+- 旧 `ask_user`、旧接口和已冻结工具集保持原样。新多问题请求向旧客户端逐题投影并保存答复；仅对新协议的批次在全部处理后恢复任务，旧单题请求仍按原规则恢复。若实测无法在不改变原调用恢复、授权和隔离语义的前提下接入插件，则记录具体原因，保留 `ask_user` 并按上游数据格式做最小扩展。
+
+接入后须在真实 Morde 服务链路验证跨账号/Task 拒绝、并发隔离、取消单任务、等待期间进程重启与客户端断线、原调用恢复和重复提交；同时回归旧客户端、文件交付澄清和审批。通过前不得宣称插件与 Morde 完整兼容。
 
 **落点：**[Broker 澄清](../../../server/internal/app/cloud_dsh_tool_broker.go)、[澄清持久化](../../../server/internal/store/postgres/task_pending.go)、[PC 澄清卡片](../../../web/portal/src/routes/Assistant.tsx)及 Runtime 插件配置。
 

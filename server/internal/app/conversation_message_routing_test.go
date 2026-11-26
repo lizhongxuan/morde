@@ -87,6 +87,30 @@ func TestConversationReceiptCapturesWorkspaceInputSnapshotAndKeepsRetryHashStabl
 	}
 }
 
+func TestConversationReceiptHashIgnoresProjectWorkspaceAuthorizationSnapshot(t *testing.T) {
+	firstVersion, nextVersion := int64(4), int64(5)
+	firstRevision, nextRevision := int64(12), int64(13)
+	first, err := ConversationReceiptHash("c1234567", "在项目工作区里处理文件。", ConversationRoutingInput{
+		ProjectID: "pr123456", WorkspaceID: "w1234567", WorkspaceOwnerID: "u1234567",
+		WorkspaceProjectResourceVersion: &firstVersion, WorkspaceInputRevision: &firstRevision,
+		WorkspaceContextDigest: bytes.Repeat([]byte{1}, 32),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := ConversationReceiptHash("c1234567", "在项目工作区里处理文件。", ConversationRoutingInput{
+		ProjectID: "pr123456", WorkspaceID: "w1234567", WorkspaceOwnerID: "u7654321",
+		WorkspaceProjectResourceVersion: &nextVersion, WorkspaceInputRevision: &nextRevision,
+		WorkspaceContextDigest: bytes.Repeat([]byte{2}, 32),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(first, second) {
+		t.Fatal("server-captured project Workspace authorization changed the client request hash")
+	}
+}
+
 func TestConversationReceiptDoesNotAuthorizeForeignWorkspaceSnapshot(t *testing.T) {
 	principal := taskTestPrincipal()
 	base := &conversationReceiptStoreStub{taskStoreStub: &taskStoreStub{conversations: map[string]conversation.Conversation{

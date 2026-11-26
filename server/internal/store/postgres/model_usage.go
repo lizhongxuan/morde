@@ -82,7 +82,8 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 	}
 	var taskProjectID string
 	var err error
-	if request.Source == app.ModelCallTask {
+	switch request.Source {
+	case app.ModelCallTask:
 		if request.Task == nil {
 			return domain.NewError(domain.CodeUnauthenticated, "task model authorization is unavailable")
 		}
@@ -90,12 +91,12 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 			request.Task.TaskID, request.Task.OwnerID, request.Task.InitiatorID).Scan(&taskProjectID); err != nil {
 			return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
 		}
-	} else if request.Source == app.ModelCallReview {
+	case app.ModelCallReview:
 		taskProjectID, err = checkTaskValidationReviewModelFence(ctx, tx, *request.Review)
 		if err != nil {
 			return err
 		}
-	} else if request.Source == app.ModelCallTerminalDelivery {
+	case app.ModelCallTerminalDelivery:
 		var current bool
 		taskProjectID, current, err = checkTaskTerminalDeliveryModelFenceInTx(ctx, tx, *request.TerminalDelivery)
 		if err != nil {
@@ -408,7 +409,8 @@ func (s *Store) beginModelCallDispatch(ctx context.Context, request app.ModelCal
 			return err
 		}
 		projectID := request.ProjectID
-		if request.Source == app.ModelCallTask {
+		switch request.Source {
+		case app.ModelCallTask:
 			if request.Task == nil {
 				return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
 			}
@@ -416,13 +418,13 @@ func (s *Store) beginModelCallDispatch(ctx context.Context, request app.ModelCal
 				request.Task.TaskID, request.Task.OwnerID, request.Task.InitiatorID).Scan(&projectID); err != nil || projectID != request.ProjectID {
 				return domain.NewError(domain.CodeUnauthenticated, "task model project scope is unavailable")
 			}
-		} else if request.Source == app.ModelCallReview {
+		case app.ModelCallReview:
 			var err error
 			projectID, err = checkTaskValidationReviewModelFence(ctx, tx, *request.Review)
 			if err != nil || projectID != request.ProjectID {
 				return domain.NewError(domain.CodeUnauthenticated, "Task validation review project scope is unavailable")
 			}
-		} else if request.Source == app.ModelCallTerminalDelivery {
+		case app.ModelCallTerminalDelivery:
 			var current bool
 			var err error
 			projectID, current, err = checkTaskTerminalDeliveryModelFenceInTx(ctx, tx, *request.TerminalDelivery)

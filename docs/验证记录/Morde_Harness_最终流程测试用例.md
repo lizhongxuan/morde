@@ -2266,6 +2266,14 @@ Tokenizer 与 token 统计来源：
 - **隔离 PostgreSQL：**首次未注入 `CH_TEST_DATABASE_URL` 的 Store 命令明确 skip。随后从本机专用 `morde-m09-verify-postgres` 容器构造仅指向 `127.0.0.1:55432` 的临时测试 DSN，只注入 Go 测试子进程；每个测试按 `newTemporaryStore` 建立并清理隔离数据库。命令 `GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run 'TestPostgresTask(ValidationPlanCheckReplayVerifiesReceiptAndSources|RequirementManifestConfirmation)' -count=1 -v -timeout=8m` 通过（3 个用例，11.731s），覆盖确认记录不可变/修订绑定/撤权 fail closed，以及通过完整用户确认和 exact operation/check mapping 后仍因 Runtime actual coverage 缺失而保持 pending。A 的 API/App/Store 相关定向编译与 API 回归通过，`npm run generate:api`、`gofmt` 和 `git diff --check` 通过。
 - **未验收：**此前用户说明本地 Portal/DSH 暂时不能恢复，PC 确认 UI 尚未接入；本轮没有启动 PC、操作浏览器、连接远端或运行 DeepSeek。没有真实 DSH/PC 失败回复、用户 manifest 确认交互或 Runtime runner inventory 实测。D01-1/2/3/5 继续未勾选；本地协议回归不作为端到端验收。
 
+### 2026-11-27 H07 replay 与源码 PC 续验
+
+- **H07 合同：**当前要求用户显式确认可审阅 candidate manifest 的完整性（`RequirementsCompleteAttested`）。该事实可使 `RequirementSetVerified=true`，但不证明实际 runner 覆盖；没有有效 coverage receipt 时回放仍为 pending。仅当 coverage receipt 与当前 operation、Task/plan、Workspace 快照及 final proof 全部匹配时才可 PASS。
+- **PostgreSQL 定向组：**本机 PostgreSQL 16.15 隔离库 `127.0.0.1:56202`，命令 `CH_TEST_DATABASE_URL=<loopback temporary database> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^(TestPostgresTaskRequirementManifestConfirmationIsImmutableAndRevisionBound|TestPostgresTaskRequirementManifestConfirmationAllowsCompletedAndFailsClosedAfterRevocation|TestPostgresTaskValidationPlanCheckReplayVerifiesReceiptAndSources)$' -count=1 -timeout=8m` 通过（5.505s）。此前修复 read-only repeatable-read snapshot 在读取确认投影时误发 `SELECT FOR SHARE`；读路径现在在同一数据库快照内以普通查询核对成员和凭据，写路径仍保留撤权串行化锁。回归确认用户完整性声明单独不足以 PASS，完整且匹配的 runner coverage + final Workspace proof 才能 PASS，篡改回执保持拒绝。
+- **相邻验证：**Portal Assistant 定向回归 278/278 通过；`GOPROXY=off GOSUMDB=off go vet ./...`、`GOPROXY=off GOSUMDB=off make race`、Go 格式检查与 `git diff --check` 通过。`make race` 未设置 `CH_TEST_DATABASE_URL`，不覆盖条件 PostgreSQL 集成测试。完整 PostgreSQL `make it` 输出 `go test -timeout=45m ./...` 的所有有测试包均为 `ok`：PostgreSQL 1318.860s、Worker 358.586s，OpenSandbox 因 `CH_OSB_URL`/`CH_OSB_API_KEY` 未配置而跳过。外层 zsh 日志包装器在测试后尝试赋值保留变量 `status`，故包装命令返回 1 且未打印尾部；测试日志本身没有失败包并列出所有成功结果。固定版本 `make lint` 首次因 `GOPROXY=off` 禁止查询未缓存的 golangci-lint v2.15.0，正在使用项目规定的固定版本重试。
+- **源码 PC：**使用独立 profile `/tmp/morde-goal-pc-20261127` 执行 `MORDE_TEST_USER_DATA=/tmp/morde-goal-pc-20261127 make pc`，Portal/Workbench/Electron 源码构建并启动。可见客户端提示暂时无法连接 Morde 云端；独立只读探测 `/healthz` 与 `/readyz` 均为 HTTP 200、TLS 校验通过。未在身份无法按 profile 唯一确认的窗口上点击重试/退出，未输入凭据、发送消息、创建 Task、改密码或改远端数据。只能记为构建/启动通过、PC 云端交互阻塞，不能记 PC 登录或 Harness E2E 通过。
+- **当前边界：**没有调用真实模型/DeepSeek，也未完成 PC→DSH→runner→Store 活链路；H07、D01-5 与相关 PC/DSH 验收保持待验。隔离 PostgreSQL 只用于自动化；完整集成包实际结果已记录，包装器未捕获 `make it` 的原始退出码，依据所有测试包 `ok` 和无 `FAIL` 记录结果。
+
 <a id="step-1-local-baseline-2026-11-26"></a>
 ## 步骤 1：本地开发基线（2026-11-26）
 
@@ -2550,8 +2558,41 @@ Tokenizer 与 token 统计来源：
 
 - **环境：**运行 `scripts/setup-builtin-search.sh` 启动锁定版本 SearXNG `2026.11.5+3e95f6cd2`；`/config` 中 `!mgn`/`!yh` 就绪且 JSON `/search` 返回有效结构。使用固定 `mcp-searxng 2.10.0` 脚本、Morde Built-in connector 和 CloudDSHToolBroker；不是 Provider/真实 DSH 调用。
 - **验证：**从 `server/` 运行 `CH_TEST_BUILTIN_SEARCH_SCRIPT="$(cd ../deploy/single/search/node_modules/mcp-searxng/dist && pwd)/cli.js" GOPROXY=off GOSUMDB=off go test ./internal/app -run '^TestBuiltinSearchIntegrationWithLocalSearxng$' -count=1 -timeout=3m -v` 通过（10.94s）。完整调用顺序为 `!mgn` 发现新闻 → `!yh` 按精确标题/发布方查找 → 直接 HTTPS MIT News 页面 → `morde_web_read` 正文核对。候选标题与正文对应；RSS 日期候选 `2026-11-20T20:00:00Z` 的 UTC 日期与正文可见 `November 20, 2026` 相符；各 operation 的持久化结果均核对，首条搜索结果另通过 checkpoint replay 比对。
-- **来源及边界：**使用系统默认证书验证访问 HTTPS 原文，没有关闭 TLS。该用例通过证明一次本机受控新闻发现、来源定位、页面读取和工具结果重放，不证明真实模型/DSH 能正确选择多条新闻、评价相关性、独立判断日期并总结给用户，也不证明 Portal/生产端的搜索开关或网络出口可用。此前同一用例失败的记录保留为外网波动证据；本条是当前工作树最新一次通过。临时本机 SearXNG 容器与 compose 网络已清理，未改远端。
+- **来源及边界：**使用系统默认证书验证访问 HTTPS 原文，没有关闭 TLS。该用例通过证明一次本机受控新闻发现、来源定位、页面读取和工具结果重放，不证明真实模型/DSH 能正确选择多条新闻、评价相关性、独立判断日期并总结给用户，也不证明 Portal/生产端的搜索开关或网络出口可用。此前同一用例失败的记录保留为外网波动证据；后续复验见下方。临时本机 SearXNG 容器与 compose 网络已清理，未改远端。
 - **同一工作树定向回归：**App 路由/计划/搜索摘要组通过（1.294s），Worker 路由/内部工具/计划组通过（0.901s），MCP Connector 搜索组通过（1.169s），`scripts/test-builtin-search-engine.sh` 4/4 通过；`git diff --check` 无输出。测试结束后未发现 `morde-search` 容器运行。
+- **后续实时复验（2026-11-26 15:30 UTC）：**以独立 Compose 项目启动锁定版 SearXNG，仅绑定 `127.0.0.1:8189`；版本 `/config` 与 JSON `/search` 就绪。运行 `CH_TEST_BUILTIN_SEARCH_SCRIPT=/Users/zhongxuan_li/Desktop/morde/deploy/single/search/node_modules/mcp-searxng/dist/cli.js GOPROXY=off GOSUMDB=off go test ./internal/app -run '^TestBuiltinSearchIntegrationWithLocalSearxng$' -count=1 -timeout=8m -v`，完整 Morde MCP → Tool Broker → 新闻查询 → HTTPS 发布方页面读取集成通过（25.64s）。读取到光明网直接发布页 `https://difang.gmw.cn/he/2026-11/26/content_39122867.htm`，候选标题与原文标题匹配；页面正文未找到可见发布日期，HTML 日期元数据不作为证据，故本次不计日期/时效通过。未关闭 TLS 校验；本轮创建的 SearXNG 容器与网络已清理，8189 端口已释放。该受控集成仍不证明真实模型/DSH/PC 能筛选相关性、核日期并给用户交付摘要。
+
+<a id="step-2-route-plan-current-rerun-2026-11-26"></a>
+
+### Step 2 路由与计划当前工作树复验（2026-11-26 15:35 UTC）
+
+- **App / Worker / Connector：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run 'ConversationRoute|TaskPlan|BuiltinSearch|TaskToolInputSummary' -count=1 -timeout=8m` 通过（1.303s）；相同环境下 Worker `-run 'ConversationRouteWorker|ConversationRouteInternalToolExecutor|TaskPlan'` 通过（0.890s），MCP Connector `-run 'BuiltinSearch'` 通过（1.845s）。
+- **PostgreSQL：**一次性无持久卷 `postgres:16.15` 容器，仅映射到随机 `127.0.0.1` 端口。11 项状态查询、join、并发 join、会话/执行范围拒绝、精确 Task 依赖结果及 PlanStep revision/replay 用例通过（15.553s）；容器已由本轮创建并停止移除，未复用其他容器或业务数据库。命令包含 `CH_TEST_DATABASE_URL=<本轮 loopback DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '<11 个指定用例>' -count=1 -timeout=12m -v`。
+- **范围：**本组证明当前共享工作树的应用、Worker、Connector 与 Store/事务合同回归通过；不证明真实模型语义、PC 追问目标 Task/revision、DSH 计划生成或跨重启 checkpoint。M02-15、M02-16 继续待真实 PC + Portal/DSH/模型验收。
+
+<a id="step-2-news-contract-worker-rerun-2026-11-26"></a>
+
+### Step 2 新闻工具证据合同与 DSH 搜索链复验（2026-11-26 15:38 UTC）
+
+- `cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestConversationRouteModelRequestCarriesStableLocalizedTime|TestConversationRouteDirectToolIsExplicitAndReadOnly|TestConversationRouteDirectReplyRequiresValidTargetlessText|TestSearchReplyAndClarificationFollowStructuredDecision|TestBuiltinSearchDateEvidenceExcludesUnverifiedMetadata|TestBuiltinSearchDefinitionsRevalidateLeastPrivilegedPrincipal|TestBuiltinPublisherVerificationUsesFixedNewsSearch|TestCloudDSHTaskPlanDefinitionAndEventFence)$' -count=1 -timeout=8m` 通过（1.842s）。覆盖路由直答/工具合同、新闻发布日期证据隔离、工具授权/提示及 Task Plan 合同。
+- `cd server && GOPROXY=off GOSUMDB=off go test ./internal/worker -run '^(TestDSHSearchReadThroughBrokerPersistsSourceDateAndWorkChain|TestDSHSearchToolCompletesThroughWorkerAndPersistsOperation|TestDSHSearchReadPromptInjectionCannotEscalateTaskTools)$' -count=1 -timeout=8m` 通过（1.199s）。这是确定性合成 Model/Adapter 的 Worker→Broker→搜索/原文读取→来源与工作链持久化回归，不是真实 DSH 或真实新闻结果。
+- 工具合同已经规定必须读取原发布方并以正文可见内容核验日期；未验证 metadata、摘要或相对时间不作发布日期证据，找不到时需明确说明。当前没有发现需要重复添加的提示规则。真实生产搜索仍关闭且 PC 无法连接，真实模型筛选与用户可见来源摘要、日期/时效验收保持待验；M02-15、M02-16、B02-0 不关闭。
+
+<a id="step-2-search-local-regression-2026-11-26"></a>
+
+### Step 2 搜索配置与解析器本地回归（2026-11-26 15:42 UTC）
+
+- `./scripts/test-builtin-search-engine.sh` 通过（8/8），覆盖固定 360 新闻引擎的时间范围保留、专用新闻区/标准列表回退、直接 HTTPS 发布方链接、去重、数量上限与相对日期丢弃。
+- `bash scripts/setup-builtin-search.test.sh` 通过（10/10），覆盖安装/就绪模拟、固定版本与新闻引擎检查、超时及不可用 JSON 错误分类。`npm --prefix deploy/single/search run test:morde-patches` 通过（10/10），覆盖日期候选解析、Article JSON-LD 验证、patch 版本校验、私有 URL/DNS 拒绝及原文日期 metadata 输出。
+- 这是离线解析器与安装模拟结果，不验证真实搜索服务可用、正文发布日期可见或真实模型是否正确使用来源。生产搜索仍关闭；此前服务器 DNS/出站异常及源码 PC 连接失败未解除，M02-15、M02-16、B02-0 保持待验。
+
+<a id="step-2-isolated-source-pc-2026-11-26"></a>
+
+### Step 2 隔离源码 PC 连接复验（2026-11-26 15:46 UTC）
+
+- 用 `MORDE_TEST_USER_DATA=/tmp/morde-step2-pc-live-20261126 make pc` 启动唯一隔离 profile。`build:pc` 的 Portal、Workbench 和 Electron 源码构建完成，窗口加载仓库 `clients/desktop/harness/desktop/resources/morde.html`。
+- 页面显示“暂时无法连接 Morde / Morde 云端页面暂时无法连接；本机同步状态未改变”。CUA 能截图读取，但点击“重试连接”返回 `noWindowsAvailable`，因此没有后续交互。没有输入凭据、发送消息、创建 Task 或修改远端配置。用 Ctrl-C 停止了本轮 `make pc`，并核对隔离 profile 的进程已停止。
+- 这确认新隔离源码客户端也无法进入对话，但不能说明服务端故障根因；真实普通问答、新闻来源展示、追问 Task/revision 和复杂计划仍未通过 PC/DSH/模型验收。M02-15、M02-16、B02-0 继续待验。
 
 <a id="step-2-search-egress-readonly-2026-11-26"></a>
 
@@ -2587,3 +2628,133 @@ Tokenizer 与 token 统计来源：
 - **用例：**`TestPostgresTaskValidationUnresolvedApprovalCannotPass` 将 pending、rejected、expired、cancelled 四种审批请求分别绑定成功 Workspace 发布回执和成功 Task step。即便模型对所有硬检查都给出支持，服务端仍要求 `ApprovalHistoryVerified=false`、H05 为 pending，且总状态不得为 PASS。
 - **验证：**一次性 PostgreSQL 16.15 loopback 容器中运行 `CH_TEST_DATABASE_URL=<loopback test DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^TestPostgresTaskValidationUnresolvedApprovalCannotPass$' -count=3 -timeout=8m`，三次通过（5.344s）；容器和临时数据库已清理。
 - **限制：**仅验证当前逐次审批绑定路径的四类未批准/终态请求，不证明其他副作用类型已被完整分类。实际 PC 同 Task 确认与真实 DSH final Workspace 仍待验，M06-03/R07 不关闭。
+
+### 2026-11-26 用户可见回复隐藏内部协议字段
+
+- **实现：**普通 DSH Session SOUL、路由结果审阅 prompt、独立 Task 终态投递 prompt 均明确禁止在进度、澄清或最终文本中输出消息 ID、来源哈希、checkpoint 标记、内部工具名、内部状态/错误码；未知或等待状态需要用自然语言说明已确认事实、未确认部分和安全下一步。对应代码见 `server/internal/app/SOUL.md`、`conversation_route_decision.go`、`task_terminal_delivery.go`。
+- **定向验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestMordeSoulExplainsLongMessageReferences|TestConversationRouteModelRequestKeepsMinimumWindowOutputBudget)$' -count=1` 通过；`GOPROXY=off GOSUMDB=off go test ./internal/worker -run '^TestBuildTaskTerminalDeliveryModelRequestVerifiesDigestAndOmitsInternalIdentity$' -count=1` 通过；`git diff --check` 通过。
+- **实际 PC 观察：**本轮 `make pc` 完成源码客户端构建并打开已有会话；未发送消息、重试或创建 Task。历史长文章回复在可见对话中含内部消息标识及搜索工具名，但服务端版本未核实，不能证明由当前工作树产生。该代码切片仍须在实际 PC + 当前 DSH/模型验证文案不会泄露内部字段；M09-07、M10-03、M10-06 保持未关闭。
+
+<a id="2026-11-26-stop-all-数量边界与原子拒绝"></a>
+
+### 2026-11-26 stop_all 数量边界与原子拒绝
+
+- **缺陷：**候选列表容量已满时，Store 的 `stop_all` 查询仍会按 owner/initiator 重新枚举当前活动 Task 并最多锁 257 条，但应用层 `ValidConversationRouteStopDecision` 先因候选列表不完整把显式模型 `stop_all` 改成澄清，导致用户明确说“停止全部”也无法触发安全的 Store 上限路径。
+- **修复：**仅经当前原始模型输出重验的 `stop_all` 可越过候选列表完整性门禁；单 Task `stop` 仍需精确引用。Store 仍原子限制最多 256 项，检测到第 257 项时不更改任何 Task，并返回可读说明。
+- **验证：**App `GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestConversationRouteStopAllUsesModelSemanticsAndStructuralGuards|TestConversationRouteStopDecisionUsesModelSemanticsAndActiveCandidate)$' -count=1` 通过。一次性 loopback PostgreSQL 16.15 容器中，`CH_TEST_DATABASE_URL=<loopback DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^TestPostgresConversationRouteStopAllTaskCountBoundaries$' -count=1 -timeout=8m` 通过 0、256、257 三种场景；257 时 257 个 Task 全部保持 queued。容器由本轮创建并清理，未复用已有 PostgreSQL 容器。
+- **边界：**用例验证路由应用及 Store 原子上限，不证明真实模型是否会把用户语义分类为 `stop_all`，也未验证取消请求最终由 Agent 停止。M02-12 不关闭。
+
+### 2026-11-26 当前共享工作树增量复验
+
+- **代码快照：**`release` HEAD 与 `origin/release` 均为 `bbe7554290f6596f7b8cf13959ba485b3c5c850f`；测试使用含未提交会话改动的当前工作树，没有重置或覆盖文件。
+- **服务端：**`GOPROXY=off GOSUMDB=off go test ./internal/app -count=1 -timeout=8m` 通过（35.382s）；`go test ./internal/worker -count=1 -timeout=8m` 通过（79.806s）；`go test ./internal/evaluation -count=1 -coverprofile=/tmp/morde-evaluation-current.cover` 通过（82.0%）；`go vet ./internal/evaluation` 通过。
+- **PostgreSQL：**一次性 PostgreSQL 16.15 容器 `morde-workflow-trace-verify-20261126` 仅绑定 loopback。`TestGetTaskWorkflowTraceIsOwnerScopedAndBindsLedgerDigests` 通过（1.63s）；stop-all 0、256、257 Task 数量边界通过，`-count=3` 连续通过。首次同组运行曾见一次状态/回复断言异常，单测及其后组合运行通过且未复现；该异常也记录于 A-01 基线条目。完成后停止并移除容器。
+- **Portal 与改密：**`npm run test -- src/routes/Assistant.test.tsx src/routes/admin/AdminUsers.test.tsx` 通过，285/285；`npm run typecheck`、`npm run build:pc`、`npm run build:admin` 通过。`go test ./internal/api -run '^(TestInitialSuperAdminSessionIsRestrictedToPasswordChange|TestAdminPasswordResetRouteRequiresSuperAdminAndValidatesPayload)$' -count=1` 通过。代码已有 super-admin 修改任意账号密码入口、目标会话/客户端凭据撤销和首次改密受限流程；服务端也允许带 `must_change_password` 的远程登录进入受限改密页。未更改任何账户密码。
+- **验收限制：**以上是本地单元/组件/隔离数据库和构建证据。没有由此宣称实际源码 PC 登录、生产新闻源、真实 DSH、默认云端 Host、iOS/跨端或 H07 全量 coverage 通过；相关 TODO 保持待验。
+
+### 2026-11-26 M04-03 大输出授权 HTTP 回读
+
+- **用例调整：**扩展 `TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord`，使任务绑定到已初始化的 owner Workspace，并在真实 PostgreSQL Store、加密详情、TaskService 与 API router 间走完整读取路径。合成 stdout 为 Runtime 允许上限 64 KiB；用例核对输出完整一致、总字节数准确、omitted=0、未截断、详情为 available 且响应带 `no-store`/`no-cache`。
+- **授权边界：**原任务所有者读取成功；另一个用户通过同一 API 访问得到 404，详情与事件响应均不包含输出片段。
+- **验证：**一次性 `postgres:16.15` loopback 容器运行 `CH_TEST_DATABASE_URL=<loopback test DSN> GOPROXY=off GOSUMDB=off GIN_MODE=release go test ./internal/store/postgres -run '^TestTaskStepDetailHTTPReadsAuthorizedEncryptedPostgresRecord$' -count=1 -timeout=8m` 通过（3.042s）。容器由本轮新建并在结束后清理，未复用共享数据库容器。`gofmt` 与 `git diff --check` 通过。
+- **边界：**这补齐大输出经 PostgreSQL→授权 HTTP 的组合自动化证据；没有操作实际 `morde-pc`/iOS 详情展开 UI，也未完成 PC 七要素逐项对照，因此 M04-03 仍待客户端验收。
+
+### 2026-11-26 管理员 PC 登录失败与密码入口核对
+
+- **代码与入口：**当前源码的 `AdminUsers` 已提供超级管理员重置任意账号密码的入口；重置后账号必须改密。API 和 App 分别限制超级管理员、校验账号状态并撤销旧凭据。初始 / 重置密码可从正常远程 PC 或 Portal 网络入口登录，受限改密期间仍禁止普通 API、同步和默认 Host 初始化；代码、README、OpenAPI 均未保留 loopback 来源限制。
+- **本地回归：**API 定向测试 4 项通过，覆盖初始超管受限会话、Client 改密页引导、访问路由范围及超管重置权限；App 的远程初始登录和受限改密测试 2 项通过，超管密码重置服务用例通过；Portal `AdminUsers` / `AccountSettings` 测试 10/10 通过。没有修改任何账户密码。
+- **远端只读证据：**Portal 部署 head 为 `b7876cc6`；admin 账号状态为 `super_admin / approved`，`must_change_password=false`。远端审计显示该账号在 19:37、19:57 CST 有 `auth.login_failed`，之后 20:00、20:09、20:26、21:27 CST 有 `client.login` 成功记录。公网 `/admin/` 当前静态 bundle 含“重置密码”表单，服务端已注册对应 API。未读取或导出密码哈希，也未执行重置。
+- **诊断与边界：**登录失败请求到达 `/api/auth/client-login` 并收到 401；账号状态不是待审核、禁用或强制改密。失败时的密码内容不会记录，故不能判断输入了哪一组字符；同一账号后续成功记录证明远程 PC 登录不受 loopback 限制。若仍遇到 401，应通过已有超级管理员会话重置临时密码，再用 PC 登录并完成改密；不要把密码发到对话里。
+- **PC 操作范围：**尝试用独立源码 profile 启动 `make pc`；本机同时存在多个 Electron PC 窗口，CUA 无法唯一绑定到本次 profile，因此没有在不确定窗口输入凭据。只停止了本轮启动的进程并清理本轮 profile；未发送消息、创建 Task 或更改远端状态。此项不新增真实 PC UI 登录验收；此前源码 PC 普通登录成功记录仍按原证据保留。
+
+
+### 2026-11-26 M10-07 转义分片 checkpoint 重放
+
+- **用例调整：**扩展 `TestPostgresAgentMessageDeliveryReceiptsAndBoundedSourcePages`。1 MiB+1 receipt-backed 合成消息前部含 64 KiB `<`，使实际 Broker JSON 输出发生转义并缩小 rune 分片；测试读取首片后重建 Broker，以原 call 与 checkpoint output 调 `Reconcile`，随后继续读取直至全文重建。
+- **结果：**一次性 PostgreSQL 16.15 loopback 容器内定向测试通过（6.315s）。输出与 checkpoint 逐字节相同；重放前后持久化 Task 步骤数及 `ToolCalls` 不变；连续分片重建原文 SHA-256 和首/中/尾锚点通过。`gofmt`、`git diff --check` 通过，容器已清理。
+- **边界：**这验证 Store/Broker 的 checkpoint 输出重放及幂等持久账本，不模拟 DSH Runtime 进程级重启，也不证明真实模型的长消息语义。M10-03/M10-06 与真实 PC+DSH 仍未验收。
+
+### 2026-11-26 M02-13/14 项目路由快照与 PlanStep 恢复回归
+
+- **M02-13 项目 Workspace route receipt：**接收事务在项目授权锁内捕获 Workspace owner、Project resource version、Workspace revision 和 manifest digest；Apply 阶段重验当前授权与快照。`ConversationReceiptHash` 排除服务端首次捕获的可变快照字段，所以重试仍命中原消息 receipt；重放不重新捕获后续 Workspace 版本。没有可绑定 Workspace 时，required 路由仍 fail closed。
+- **App：**`GOPROXY=off GOSUMDB=off go test ./internal/app -run 'TestConversationReceipt|TestConversationRouteExecutionScope|TestConversationRouteControlScope' -count=1 -timeout=8m` 通过；当前工作树复跑 1.433s。
+- **PostgreSQL 项目路由：**一次性 PostgreSQL 16.15 loopback 实例运行 `CH_TEST_DATABASE_URL=<loopback DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^(TestProjectConversationReceiptCapturesWorkspaceSnapshotAndReplaysOriginal|TestProjectConversationReceiptRejectsNonMemberBeforeSnapshotCapture|TestProjectConversationRouteFailsClosedWhenAcceptedWorkspaceSnapshotChanges|TestConversationRouteProjectRequiredBindsAuthorizedWorkspaceInputSnapshot|TestConversationRouteProjectUnclearRetainsAuthorizedWorkspaceInputSnapshot)$' -count=1 -timeout=8m` 通过（8.024s）。覆盖非成员拒绝、原 receipt 重放、Project resource version 变化、receipt owner mismatch、Workspace revision/manifest digest 变化、授权撤销以及 required/unclear 路径。owner 负向用例通过构造不匹配的 receipt owner snapshot 验证拒绝，不代表真实所有权迁移。
+- **M02-14 readiness 重建：**扩展 `TestPostgresCloudDSHTaskPlanStepReadBindingRequiresExactSettlement`；同一 PostgreSQL pool 上构造新 Store 并重载 Task，readiness 保持正确；将前置步骤变为 failed 后依赖关闭，恢复 succeeded 后依赖重新开放。一次性 loopback PostgreSQL 16.15 定向测试通过（2.055s），命令为 `CH_TEST_DATABASE_URL=<loopback DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^TestPostgresCloudDSHTaskPlanStepReadBindingRequiresExactSettlement$' -count=1 -timeout=8m`。
+- **合并复跑：**另建全新 PostgreSQL 16.15 loopback 容器，将上述 5 个项目路由用例与 readiness 重建用例合并运行：`CH_TEST_DATABASE_URL=<loopback DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^(TestProjectConversationReceiptCapturesWorkspaceSnapshotAndReplaysOriginal|TestProjectConversationReceiptRejectsNonMemberBeforeSnapshotCapture|TestProjectConversationRouteFailsClosedWhenAcceptedWorkspaceSnapshotChanges|TestConversationRouteProjectRequiredBindsAuthorizedWorkspaceInputSnapshot|TestConversationRouteProjectUnclearRetainsAuthorizedWorkspaceInputSnapshot|TestPostgresCloudDSHTaskPlanStepReadBindingRequiresExactSettlement)$' -count=1 -timeout=8m` 通过（6 项，13.937s）。临时容器在测试后已移除。
+- **边界：**测试在隔离临时数据库中运行，结束后已清理。它们证明本地事务、快照和数据库重建合同，不模拟 Worker/DSH 进程崩溃、checkpoint 恢复，不验证实际 PC 项目选择、真实 DSH 路由/计划执行或模型语义。M02-13/14/15/16 继续未勾选。
+
+### 2026-11-26 M04 浏览器工作项安全摘要
+
+- **实现：**浏览器 open/navigation 详情只保留 HTTP(S) origin；click/type 只保留允许的角色和脱敏元素名；press-key 只保留 allowlist key；输入内容只记录 `text_omitted`。URL path/query/fragment/userinfo 和内部 target ID 不保存。浏览器白名单参数不要求 Workspace；意外出现的命令、输出、退出码和截断证据仍受 Workspace 权限校验。截图参数未纳入免 Workspace 白名单。
+- **定向验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestTaskToolExecutionDetailsSummarizeBrowserActionsWithoutSensitiveData|TestBrowserExecutionParametersDoNotBypassWorkspaceEvidenceGate|TestTaskStepExecutionIsSealedAndAvailableOnlyToTaskOwner|TestTaskStepExecutionRedactsSecretsAndReportsOnlyKnownTruncation|TestTaskServiceReturnsBoundWebContentEvidenceToAuthorizedTaskReader)$' -count=1 -timeout=8m` 通过（0.560s）。
+- **完整 App 包：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -count=1 -timeout=8m` 通过（31.944s）。`git diff --check` 对本轮代码和文档通过。
+- **边界：**仅验证服务端参数摘要、隐私过滤与 Workspace 门禁；没有在实际 `morde-pc` + 真实 DSH 浏览器调用中核对 UI 呈现、账本一致性或真实页面效果。M04-06/R24/T54 保持未关闭。
+
+<a id="step-2-news-source-2026-11-26"></a>
+
+### Step 2 新闻来源与原文分页续验（2026-11-26）
+
+- **实现：**本地新闻搜索由 Google News RSS / Yahoo 切换到固定 SearXNG 的 Morde 360 新闻引擎（`deploy/single/search/morde_360_news.py`）。新闻发现和受限的标题 / 发布方候选查找均使用 `!mgn`，请求的 `time_range` 保留并映射到上游范围。引擎仅从新闻区或标准结果列表的 `data-mdurl` 返回直接 HTTPS 发布方链接，限制最多 8 条、去重并剔除聚合域名和非公网 IP；相对“几小时前”等标签不作为日期。`morde_web_read` 允许 `start_char` 0..100000、`max_chars` 1..2400 的有界窗口读取；缺少标题 / 正文 / 日期时可继续下一窗口。
+- **验证命令与结果：**
+  - `./scripts/test-builtin-search-engine.sh`：7/7 通过，使用锁定的 SearXNG 镜像和 `--network none`；覆盖上游 Cookie / day-week-month-year 时间范围、新闻区与标准列表解析、直接 HTTPS 链接过滤、相对日期丢弃、去重、最多 8 条和空响应。
+  - `bash scripts/setup-builtin-search.test.sh`：setup 脚本模拟场景全部通过。`npm --prefix deploy/single/search run test:morde-patches`：10/10 通过。
+  - `cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run 'BuiltinSearch' -count=1 -timeout=8m`：通过；`go test ./internal/mcpconnector -run 'BuiltinSearch' -count=1 -timeout=8m`：通过，覆盖 Broker / connector 搜索及原文分页参数的合法和拒绝路径。
+  - `scripts/setup-builtin-search.sh` 启动本机锁定版 SearXNG 后，以 `CH_TEST_BUILTIN_SEARCH_SCRIPT=<本机固定 MCP 脚本路径> GOPROXY=off GOSUMDB=off go test ./internal/app -run '^TestBuiltinSearchIntegrationWithLocalSearxng$' -count=1 -timeout=8m -v` 运行完整 Morde MCP→Broker 集成，实际搜索带周范围新闻、读取直接 HTTPS 发布方页面；用例在分页窗口中找到与候选匹配的标题并核对操作持久化与 checkpoint replay。最新严格门禁排除 `Page date metadata (unverified)` 后没有找到页面可见日期；日期仍未核验。样例来源为一篇人工智能文章。测试完成后停止并清理本轮启动的本地搜索容器与网络。
+- **限制：**这证明本机搜索工具和原文读取链路在本次网络条件下成功，不代表真实模型 / DSH 会选对新闻、读全所需页面、判断相关性并撰写来源充分的回答；不证明生产端已启用搜索或提供方长期稳定。本轮未操作远端、未启动 Portal / DSH / 实际 PC 对话，也未运行真实模型。步骤 2 的普通问答、追问 Task/revision 权威关联和复杂计划恢复仍需各自验收，M02-15、M02-16、B02-0 不勾选。
+
+<a id="step-2-360-standard-results-2026-11-26"></a>
+
+### Step 2 360 标准结果列表兼容复验（2026-11-26）
+
+- **新发现：**带周范围的 `!mgn` 查询首次返回空结果。直接用严格 HTTPS 查看同一 360 页面发现，当前地区页面未返回专门的 `#mohe-news` 区块，却包含标准 `li.res-list` 新闻候选。SearXNG 没报告引擎超时；问题是定制解析器只读取专用新闻区。
+- **修复：**`morde_360_news.py` 继续优先解析新闻区；缺少该区时，从标准 `li.res-list` 中只提取 `data-mdurl` 的直接 HTTPS 发布方链接。不会回退使用 `href` 中的 360 跳转 URL；仍过滤聚合域、非 HTTPS、非公网 IP、重复 URL，并丢弃相对日期。请求仍保留 `time_range=week`，未静默放宽日期范围。
+- **回归与实际结果：**新增 fixture 覆盖标准结果 fallback、拒绝仅有跳转链接的候选及丢弃相对日期；`./scripts/test-builtin-search-engine.sh` 7/7 通过。实际本机 `!mgn 人工智能 新闻` 返回 3 条直接来源候选。`CH_TEST_BUILTIN_SEARCH_SCRIPT=<固定 mcp-searxng cli.js> GOPROXY=off GOSUMDB=off go test ./internal/app -run 'BuiltinSearch' -count=1 -timeout=8m` 与 `GOPROXY=off GOSUMDB=off go test ./internal/mcpconnector -run 'BuiltinSearch' -count=1 -timeout=8m` 均通过。完整 Morde MCP→Broker→SearXNG 集成读回光明网文章 `https://difang.gmw.cn/he/2026-11/26/content_39122867.htm` 并匹配页面正文标题；最初报告的 `Published: 2026-11-26` 实际来自明确标记为 unverified 的 HTML 元数据，并非页面可见日期。最新修正测试将元数据从正文证据剥离后，确认标题可匹配、页面可读，但本次样本没有可见发布日期，因此日期核验未通过。搜索 Task operation 持久化及 checkpoint replay 检查通过。
+- **环境收尾与边界：**联网探测无关闭证书校验；本轮本机 SearXNG 后续会停止。setup 模拟、日期补丁 10/10、App 与 Connector 定向组均通过。另一次最初误传含 `..` 的脚本路径在构造 Connector 前被拒；随后改用规范绝对路径，纳入的最新测试已通过。该结果是本机提供方的一次成功复验，不保证其他查询/地区始终有结果，更不等于真实模型/DSH 在 PC 端完成新闻筛选、核日期和摘要。生产搜索仍沿用此前只读记录的关闭状态；普通问答、追问 Task/revision 和复杂计划验收仍待完成，B02-0、M02-15/16 不勾选。
+
+<a id="step-2-date-metadata-gate-2026-11-26"></a>
+
+### Step 2 修正新闻日期证据门禁（2026-11-26）
+
+- **错误发现：**`morde_web_read` 会在正文前附加 `## Page date metadata (unverified)` 和 `Published:` 候选。此前集成测试只检查是否出现“Published + 日期”，曾将该元数据候选误认为页面可见日期；相应旧日志不能作为已核验日期证据。
+- **测试修正：**`cloud_dsh_mcp_builtin_test.go` 现先从候选正文中剥离明确标记为 unverified 的元数据，再独立寻找标题和可见日期。集成允许“标题匹配但可见日期缺失”作为搜索 / 原文读取的部分成功，并明确记录日期未核验；只有正文窗口中实际出现日期行时才记为可见日期证据。真实答复不得把未验证元数据说成已确认新闻日期。
+- **最新结果：**复跑 `CH_TEST_BUILTIN_SEARCH_SCRIPT=<规范绝对路径> GOPROXY=off GOSUMDB=off go test ./internal/app -run '^TestBuiltinSearchIntegrationWithLocalSearxng$' -count=1 -timeout=8m -v` 通过（测试 25.31s），找到直接 HTTPS 光明网页面并匹配新闻标题；剥离 metadata 后未找到可见发布日期，测试日志明确标记日期未确认。搜索及原文 operation 持久化和 checkpoint replay 检查通过。这只证明工具发现与文章页读取链路，不是新闻时效验收。日期补丁 10/10、离线引擎 7/7、App / Connector `BuiltinSearch` 定向组通过。
+- **状态：**日期 / 时效核验子项继续待验。缺少明确可见日期时，Agent 应说明无法确认时间范围，不以 URL 日期、搜索结果相对时间、摘要或 HTML 元数据候选代替；实际模型 / DSH / PC 新闻答复和生产搜索启用仍未验收，B02-0、M02-15、M02-16 继续未勾选。
+
+<a id="step-2-current-pc-screen-2026-11-26"></a>
+
+### Step 2 当前源码 PC 界面复核（2026-11-26）
+
+- **基线与窗口归属：**当前分支为 `release`，共享工作树包含多处其他未提交改动；没有重置、暂存或覆盖。首次按显示名选中的已打包实例白屏，不能归因于源码 PC；随后 `getApp("Electron")` 返回加载仓库 `clients/desktop/harness/desktop/resources/morde.html` 的源码窗口。进程核对发现同时存在多个 `make pc` Electron 实例及不同隔离 profile；CUA 的应用/窗口信息不足以唯一识别截图对应 profile。
+- **结果：**源码客户端显示“暂时无法连接 Morde；本机同步状态未改变”，并提供“重试连接/退出登录”。CUA 坐标点击报 `noWindowsAvailable`；按 Tab 后再按 Return，屏幕仍显示同一离线页，无法确认重试动作是否触发。本轮没有发送消息、创建 Task 或触发搜索。页面能渲染，但窗口关联的具体隔离 profile、云端连接失败原因均未确认。
+- **本轮定向复跑：**当前工作树 App 路由/计划/内置搜索组通过（1.562s），Worker 路由/内部工具/计划组通过（0.923s），MCP Connector 搜索组通过（0.976s），360 搜索引擎离线用例 7/7、搜索安装/就绪模拟 10/10 通过。没有设置 PostgreSQL 集成环境；未重跑本机 SearXNG 外网集成。`git diff --check` 通过。新闻正文可见日期缺失的最新样本仍未通过日期/时效门禁；生产搜索开关与真实 PC/DSH 交付也未验。
+- **Portal 当前健康检查（2026-11-26 15:22 UTC）：**只读请求 `/healthz`、`/readyz` 均返回 HTTP 200，TLS 校验结果为 0。健康检查成功只证明服务端探针可用，不证明账号认证、客户端安装凭据、PC 会话、搜索服务或 DSH 执行可用。
+- **PC 窗口复查（2026-11-26 15:31 UTC）：**`getApp("Electron")` 再次返回加载仓库 `clients/desktop/harness/desktop/resources/morde.html` 的窗口，截图显示“暂时无法连接 Morde；本机同步状态未改变”。对“重试连接”坐标点击再次得到 CUA `noWindowsAvailable`，没有确认按钮动作；窗口仍无法绑定到多个并行 `make pc` profile 中的唯一一个。本轮没有输入登录凭据、没有发送消息或创建 Task，因此不能据此判定账号登录失败原因。
+- **后续解除条件：**恢复源码客户端到已连接对话状态后，再从 PC 端分别验证普通问答、新闻来源与摘要、追问关联和复杂计划；新闻必须有可核查发布方来源，日期不可见时需如实说明未能确认时效。当前不据此关闭 M02-15、M02-16 或 B02-0。
+
+<a id="step-2-360-news-empty-module-fallback-2026-11-26"></a>
+
+### Step 2 360 新闻模块无有效候选时回退（2026-11-26）
+
+- **发现与修复：**解析器原先只在新闻模块完全缺失时读取标准结果列表；模块存在但为空或候选均被安全过滤时会错误返回空结果。现在只要新闻模块未产出有效候选，就回退检查标准结果列表，并继续要求直接 `data-mdurl`、HTTPS、允许的公网主机/IP 和去重。README 的来源域描述同步为代码实际执行的明确过滤范围 `so.com`/`360.cn`，未宣称覆盖所有第三方聚合站。
+- **自动化：**`./scripts/test-builtin-search-engine.sh` 8/8 通过，新增 fixture 覆盖模块存在但仅含无效/被拒候选；`bash scripts/setup-builtin-search.test.sh` 安装与就绪模拟全部通过。当前完整 `go test ./...`（未设置 `CH_TEST_DATABASE_URL`）通过；Portal 全量 71 个文件、958/958 通过。离线 fixture 不证明实时新闻服务或生产网络可用。
+- **边界：**本轮没有真实模型/DSH/PC 新闻请求；页面可见发布日期缺失的既有样本仍未通过日期门禁，真实新闻答复与生产搜索状态仍待验。
+
+<a id="r17-pc-delivery-observation-2026-11-26"></a>
+## R17 PC 可见交付观察续验（2026-11-26）
+
+- **PostgreSQL 集成：通过 2/2。**在一次性 loopback PostgreSQL 环境运行：
+  `CH_TEST_DATABASE_URL=<loopback DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^(TestRecordPCDeliveryObservationRequiresPublishedReplyAndBindsWorkflowTrace|TestGetTaskWorkflowTraceIsOwnerScopedAndBindsLedgerDigests)$' -count=1 -timeout=8m -v`。新增测试覆盖普通 session/解绑 installation 拒绝、错误 revision 无写入、撤权后拒绝、精确已应用 Task 结果回执、幂等，以及 workflow trace 的来源绑定和 PC delivery gap 消除；owner 隔离、脱敏和 digest 绑定回归也通过。
+- **API：通过。**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/api -run '^TestPCDeliveryObservationRequiresDesktopSessionAndPublishedReplyIdentity$' -count=1 -timeout=8m`，1/1 通过；覆盖 desktop installation 会话、严格 JSON/query/revision 校验、成功 no-store 回执及服务错误不伪装为成功。
+- **Portal 组件：通过。**`cd web/portal && npm test -- --run src/routes/Assistant.test.tsx`，278/278 通过；`npm run typecheck` 通过。组件用 IntersectionObserver 验证结果连续可见 700ms 才提交，离开视口会取消计时。此测试使用组件环境，不证明真实 PC 网络请求或服务端回执写入。
+- **实际源码 PC：阻塞，未执行用户 Task。**隔离 profile `/tmp/morde-goal-pc-20261126` 下 `make pc` 构建成功并打开源码 `resources/morde.html`。实际截图显示“暂时无法连接 Morde”、错误说明、重试连接和退出登录；可访问树只暴露 HTML 容器，坐标重试因 CUA 返回 `noWindowsAvailable` 未能执行。`/healthz` 与 `/readyz` 同期返回 200；未认证的 `/api/auth/client-web-session` 返回 401、空请求 `/api/auth/client-login` 返回 400，说明健康/API 路由可响应但不证明账号认证或 PC 会话成功。未输入凭据、未发送消息、未写入真实观察回执。
+- **验收边界：**实现与本地组件/数据库合同有自动化证据；真实 PC 回执、DSH heartbeat/Guardian 进程观察、执行时授权来源、R13 同 Task 完整成功链路及持续评估仍未验。R17/D02-3 保持未完成；不能将当前授权/Runtime 快照解释为历史执行时事实。
+- **摘要一致性负例续验：**只接受 `task.result.result_content_sha256` 与助手消息正文 SHA-256 匹配的回执。一次性 PostgreSQL 定向回归 2/2 通过，另覆盖事件摘要不匹配时拒绝回执且不落账、WorkflowTrace 将该结果标为 unknown 并记录 gap、不连接 `delivered` 边，以及已记回执在事件摘要后来变化时失效。该本地修复没有解除实际 PC/DSH/R13 阻塞。
+
+### 2026-11-27 全仓静态检查与验证收口
+
+- **生成：**`cd server && make generate` 通过；sqlc 将现有 schedule 个人规则绑定、PC delivery observation 与 requirement manifest 表结构同步到 `internal/store/postgres/sqlcgen/models.go`。没有手改生成文件。
+- **服务端：**固定版本 `cd server && make lint`（golangci-lint v2.15.0）0 issues；随后 `GOPROXY=off GOSUMDB=off make test` 退出码 0，`GOPROXY=off GOSUMDB=off make race` 退出码 0。两命令未设置 `CH_TEST_DATABASE_URL`，因此它们不覆盖条件 PostgreSQL 集成测试。
+- **定向 PostgreSQL：**H07 的 manifest confirmation / replay 三个测试，加 R17 的 delivery observation / WorkflowTrace 两个测试，在 `127.0.0.1:56202` loopback 测试库上合并运行通过（`ok morde/server/internal/store/postgres 8.506s`）。测试未访问远程数据库。
+- **生成后状态：**`git diff --check` 通过；`sqlcgen/models.go` 的变更由 `make generate` 产生并已纳入待集成改动。
+- **P0 smoke：**用 loopback PostgreSQL 运行 `deploy/single/smoke.sh --src . --record /tmp/morde-smoke-record-20261127.json --timeout 600`，pass=8、fail=0、exception=2。T10 和 T43 因需要真实 PC/模型/DSH 按门禁记录为环境例外，不计通过。
+- **端到端边界：**源码 PC 已构建并启动，但客户端仍显示云端暂时无法连接；`/healthz` 与 `/readyz` 返回 200。未登录、未提交消息或 Task。H07、R17、真实 DSH/Host 与 PC 交付仍未验收，相关 TODO 不关闭。

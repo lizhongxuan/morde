@@ -96,8 +96,8 @@ func (r *RuntimeTaskValidationFinalWorkspaceSnapshotReader) ReadTaskValidationFi
 		cleanupErr := releaseTaskValidationWorkspaceSnapshotFence(ctx, release)
 		return nil, nil, errors.Join(fmt.Errorf("read current Task Workspace manifest for validation: %w", readErr), cleanupErr)
 	}
-	if page.HostFence.HostID != session.Fence.HostID || page.HostFence.RuntimeGeneration != session.Fence.RuntimeGeneration ||
-		page.HostFence.RuntimeInstanceID != session.Fence.RuntimeInstanceID || page.HostFence.ControlVersion != session.Fence.ControlVersion ||
+	if page.HostID != session.Fence.HostID || page.RuntimeGeneration != session.Fence.RuntimeGeneration ||
+		page.RuntimeInstanceID != session.Fence.RuntimeInstanceID || page.ControlVersion != session.Fence.ControlVersion ||
 		page.TaskID != current.ID || page.WorkspaceID != current.WorkspaceID ||
 		page.BindingVersion != check.WorkspaceBindingVersion || page.InputRevision != *current.InputRevision ||
 		page.WorkspaceCheckpointRevision != *current.WorkspaceCheckpointRevision ||
