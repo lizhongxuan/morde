@@ -1,6 +1,12 @@
 const api = window.morde;
 const $ = (id) => document.getElementById(id);
-const offlineText = 'Morde 云端页面暂时无法连接。网络恢复后，可从 PC 端「本机项目」入口继续同步。';
+const offlineMessages = Object.freeze({
+  session: '已登录，但云端会话暂时无法续期。请检查网络后重试。',
+  proxy: '已登录，但本机对话页面服务暂时不可用。重试连接可重新加载。',
+  assistant: '已登录，但对话页面暂时无法加载。重试连接不会重新发送消息。',
+  unavailable: 'Morde 云端页面暂时无法连接。请检查网络后重试；本机项目同步状态未改变。',
+});
+function offlineText(reason) { return offlineMessages[reason] || offlineMessages.unavailable; }
 let state = null;
 
 function showMessage(target, value, error = false) {
@@ -14,12 +20,12 @@ function renderState(value) {
   $('offline-page').hidden = !value.authenticated || value.view !== 'offline';
   if (value.origin && !$('origin').value) $('origin').value = value.origin;
   if (!value.authenticated && !value.storageReady) showMessage($('message'), '系统安全存储不可用，请解锁 Keychain、GNOME Keyring 或 KDE Wallet。', true);
-  if (value.authenticated && value.view === 'offline' && !$('offline-message').textContent) showMessage($('offline-message'), offlineText, true);
+  if (value.authenticated && value.view === 'offline') showMessage($('offline-message'), offlineText(value.offlineReason), true);
 }
-function showOffline(error = offlineText) {
+function showOffline(reason = 'unavailable') {
   $('login').hidden = true;
   $('offline-page').hidden = false;
-  showMessage($('offline-message'), error, true);
+  showMessage($('offline-message'), offlineText(reason), true);
 }
 function errorMessage(error) { return (error?.message || String(error)).replace(/^Error invoking remote method '[^']+': Error: /, ''); }
 
@@ -39,7 +45,7 @@ $('retry-assistant').onclick = () => {
   showMessage($('offline-message'), '正在重新连接 Morde…');
   void api.openAssistant().then(() => api.state()).then(renderState).catch(() => showOffline());
 };
-$('sign-out').onclick = () => void api.logout().then(renderState).catch((error) => showOffline(errorMessage(error)));
+$('sign-out').onclick = () => void api.logout().then(renderState).catch(() => showOffline());
 api.onState(renderState);
-api.onSync((value) => { if (value?.state === 'offline') showOffline(value.message || offlineText); });
+api.onSync((value) => { if (value?.state === 'offline') showOffline(value.offlineReason); });
 void api.state().then(renderState).catch(() => showMessage($('message'), '无法读取 Morde 客户端状态。', true));

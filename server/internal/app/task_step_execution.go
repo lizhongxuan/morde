@@ -96,6 +96,7 @@ type TaskValidationRunnerCoverageReceipt struct {
 var taskStepSecretAssignment = regexp.MustCompile("(?i)((?:--)?(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|authorization|credential|client[_-]?secret|private[_-]?key|access[_-]?key|refresh[_-]?token)[\"']?\\s*(?:=|:|\\s)\\s*)(?:\"[^\"]*\"|'[^']*'|[^\\s,;}&]+)")
 var taskStepSecretURL = regexp.MustCompile(`(?i)(https?://)[^\s/@]+:[^\s/@]+@`)
 var taskStepPrivateKey = regexp.MustCompile("(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----")
+var taskStepWorkspaceQuerySecretAssignment = regexp.MustCompile(`(?i)(?:^|[\s,;?&])(?:--(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|authorization|credential|client[_-]?secret|private[_-]?key|access[_-]?key|refresh[_-]?token)\s+|(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|authorization|credential|client[_-]?secret|private[_-]?key|access[_-]?key|refresh[_-]?token)["']?\s*(?:=|:)\s*)(?:"[^"]*"|'[^']*'|[^\s,;}&]+)`)
 var taskStepSensitiveCommand = regexp.MustCompile(`(?i)(?:\b(?:printenv|env)\b|\b(?:aws\s+(?:configure|sts|iam|secretsmanager|sso)|gcloud\s+auth|az\s+account\s+get-access-token|security\s+find-generic-password|ssh-add\s+-L)\b|(?:^|[\s/])(?:\.env|\.ssh|\.gnupg|\.aws|\.azure|\.kube|\.docker|\.netrc|\.git-credentials|\.config/(?:gh|gcloud))(?:[./\s]|$)|(?:^|[\s/])[^\s]+\.(?:pem|p12|pfx|keystore|key)(?:[\s]|$)|\$\{?[a-z_][a-z0-9_]*(?:password|passwd|secret|token|key|credential))`)
 
 // Timing covers only a call actually dispatched to the Host, never recovery.
@@ -312,6 +313,11 @@ func taskToolExecutionParameters(name, raw string) string {
 			cleaned, _, _ := taskStepDisclosureText(path)
 			selected["path"] = cleaned
 		}
+		if name == cloudDSHWorkspaceSearchToolName {
+			if query, ok := taskStepWorkspaceSearchQuery(fields["query"]); ok {
+				selected["query"] = query
+			}
+		}
 		for _, key := range []string{"start_line", "end_line"} {
 			var number int64
 			if len(fields[key]) > 0 && json.Unmarshal(fields[key], &number) == nil && number > 0 {
@@ -352,6 +358,23 @@ func taskToolExecutionParameters(name, raw string) string {
 		return ""
 	}
 	return string(encoded)
+}
+
+func taskStepWorkspaceSearchQuery(raw json.RawMessage) (string, bool) {
+	query := decodeSafeString(raw, 640)
+	if query == "" || utf8.RuneCountInString(query) > 160 || cloudDSHHistoryCredentialPattern.MatchString(query) ||
+		taskStepSecretURL.MatchString(query) || taskStepPrivateKey.MatchString(query) ||
+		taskStepWorkspaceQuerySecretAssignment.MatchString(query) {
+		return "", false
+	}
+	query = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, query)
+	query = strings.TrimSpace(query)
+	return query, query != ""
 }
 
 // taskToolBrowserOrigin records only the scheme and host. Browser URLs may

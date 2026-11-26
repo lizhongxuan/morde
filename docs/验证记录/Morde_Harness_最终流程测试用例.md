@@ -2785,3 +2785,18 @@ Tokenizer 与 token 统计来源：
 - **验证：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^TestCloudDSHCurrentMessage(Reader|ReadDefinition|Search)' -count=1 -timeout=8m` 通过（1.692s）。这覆盖长消息分页读取/定义/检索的应用层回归；不覆盖真实模型语义，也不是 Workspace receipt 集成测试。
 - **TODO：**M11-02、M11-03 的本地合成复现和根因修复已有代码及既有回归证据，现标完成；M11-01（真实 PC/DSH 现象的可靠身份/顺序记录）与 M11-04（真实客户端/DSH 验收）保持未完成。
 - **PC profile 归属：**隔离 profile `/tmp/morde-pc-r17-final-20261127` 的 Electron helper 仍运行，但根目录未发现 `credentials.bin` 或 `portal-local-origin.json`。CUA AX 显示登录表单、截图显示云端离线卡，无法把输入/点击归属到该 profile；没有据此判断凭据错误，也没有提交对话消息、创建 Task 或触发 Host 操作。真实 PC/R17 验收继续 pending。
+
+<a id="pc-offline-reason-recovery-2026-11-27"></a>
+### PC 离线原因提示回归与实机阻塞（2026-11-27）
+
+- **实现：**登录后的桌面连接失败改为安全的阶段分类：Web 会话、桌面本地 Portal 服务、Assistant 页面加载；未知错误使用通用提示。错误详情、URL、凭据和堆栈不进入 renderer。重试只重开当前 Assistant 页面，不重放用户消息。
+- **自动化：**在 `clients/desktop/harness/desktop` 执行 `npm run build:test && node --test tests/morde-main-recovery.test.mjs tests/morde-renderer.test.mjs`，67/67 通过；`npm run typecheck` 通过。测试覆盖三类失败、敏感错误内容不泄漏、同一安装身份和视图的恢复。
+- **源码 PC：**用隔离 profile `/tmp/morde-pc-offline-recovery-20261127` 启动 `make pc`；进程仍运行。CUA 可按 Electron.app 路径读取窗口，但无法唯一绑定其窗口与该 profile。该 profile 未发现凭据文件，故无法证明画面对应新构建或认证状态；未发送消息、创建 Task 或触发 Host 操作。未完成阶段文案的实机验收。
+- **限制：**本次实现与自动化回归不代表远端连接根因已修复，也不关闭 M11-01/M11-04。生产环境没有重启或重新部署；此次只改桌面端。
+
+<a id="m04-06-workspace-search-query-summary-2026-11-27"></a>
+### M04-06 Workspace 搜索工作项查询摘要（2026-11-27）
+
+- **实现：**`task_step_execution.go` 将 `morde_workspace_search` 的安全查询词写入 TaskStepDetail 参数摘要，限 160 Unicode 字符；明确凭据赋值、已知 Token/Bearer、URL 用户信息或查询参数凭据及私钥内容整体不展示。普通短语 `authorization check` 不会误判为凭据。Workspace 参数仍受原授权/证据门禁保护。
+- **测试：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestWorkspaceSearchExecutionParametersPreserveQueryAndOmitCredentials|TestTaskToolExecutionDetailsSummarizeBrowserActionsWithoutSensitiveData|TestBrowserExecutionParametersDoNotBypassWorkspaceEvidenceGate)$' -count=1 -timeout=8m` 通过；`GOPROXY=off GOSUMDB=off go test ./internal/app -count=1 -timeout=8m` 通过（32.847s）。该包命令未设置 `CH_TEST_DATABASE_URL`，不含条件 PostgreSQL 集成测试。
+- **边界：**未操作实际 PC 工作项详情，也没有真实 DSH 搜索事件可对账。M04-06/T54 继续待 PC + DSH 验收；本次只补齐本地安全参数摘要。

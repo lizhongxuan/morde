@@ -196,6 +196,17 @@ let localPortalServerClose: Promise<void> | null = null;
 let webAttached = false;
 let webOpenTask: { window: BrowserWindow; promise: Promise<void> } | null = null;
 let view: "connecting" | "web" | "offline" = "connecting";
+type PortalOfflineReason = "session" | "proxy" | "assistant" | "unavailable";
+class PortalConnectionFailure extends Error {
+  constructor(readonly offlineReason: PortalOfflineReason) {
+    super("Morde connection step failed");
+    this.name = "PortalConnectionFailure";
+  }
+}
+function portalOfflineReason(error: unknown): PortalOfflineReason {
+  return error instanceof PortalConnectionFailure ? error.offlineReason : "unavailable";
+}
+let offlineReason: PortalOfflineReason | null = null;
 let webRefreshTimer: NodeJS.Timeout | null = null;
 let credentialExpiryTimer: NodeJS.Timeout | null = null;
 let authorizationCheckTimer: NodeJS.Timeout | null = null;
@@ -1547,6 +1558,7 @@ function publicState(): unknown {
     authenticated: Boolean(credentials), accountName: credentials?.accountName ?? null, origin: credentials?.origin ?? lastOrigin,
     installationId: credentials?.installationId ?? null, expiresAt: credentials?.clientExpiresAt ?? null,
     expiresSoon: credentials ? credentialExpiresSoon(credentials.clientExpiresAt) : false,
+    offlineReason: view === "offline" ? offlineReason : null,
     mappings: credentials ? mappings.map(publicMapping) : [], projectMappings: credentials ? projectMappings.map(publicProjectMapping) : [], syncState: sync.snapshot(),
     syncCheckpoint: credentials && syncCheckpoint ? { workspaceId: syncCheckpoint.workspaceId, mode: syncCheckpoint.mode, installationId: syncCheckpoint.installationId, scope: syncCheckpoint.scope,
       ...(syncCheckpoint.projectSelectionID ? { projectSelectionID: syncCheckpoint.projectSelectionID, projectName: syncCheckpoint.projectName } : {}),
@@ -2232,7 +2244,8 @@ function trustedPortalBridgeEvent(event: { sender: WebContents; senderFrame: { u
 
 const documentLoadOptions = { extraHeaders: "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8" };
 async function loadAssistantPage(contents: WebContents, url: string): Promise<void> {
-  await withTimeout(contents.loadURL(url, documentLoadOptions), 20_000, () => contents.stop());
+  try { await withTimeout(contents.loadURL(url, documentLoadOptions), 20_000, () => contents.stop()); }
+  catch { throw new PortalConnectionFailure("assistant"); }
 }
 function installDocumentErrorRecovery(partition: Session, origin?: string): (contents: WebContents, fallbackURL: string, fallbackLabel: string) => (value: string) => boolean {
   type RecoveryPage = { contents: WebContents; fallbackURL: string; fallbackLabel: string; recoveryPageURL: string | null; blockedDocumentURL: string | null };
@@ -2667,6 +2680,7 @@ function positionWeb(): void {
 function showView(next: "web" | "offline"): void {
   if (next === "offline") void closeNativeWorkbenchEmbed().catch(() => undefined);
   view = next;
+  if (next === "web") offlineReason = null;
   if (mainWindow && webView) {
     if (next === "web") {
       if (!webAttached) { mainWindow.contentView.addChildView(webView); webAttached = true; webView.webContents.focus(); }
@@ -2678,36 +2692,60 @@ function showView(next: "web" | "offline"): void {
 }
 function showConnecting(): void {
   view = "connecting";
+  offlineReason = null;
   if (mainWindow && webAttached && webView) {
     mainWindow.contentView.removeChildView(webView);
     webAttached = false;
   }
   notifyState();
 }
-function showOffline(): void {
+function showOffline(reason: PortalOfflineReason = "unavailable"): void {
+  offlineReason = reason;
   showView("offline");
-  mainWindow?.webContents.send("morde:sync-state", { state: "offline", message: "Morde 云端页面暂时无法连接；本机同步状态未改变。" });
+  mainWindow?.webContents.send("morde:sync-state", {
+    state: "offline", offlineReason: reason,
+    message: "Morde 云端页面暂时无法连接；本机同步状态未改变。",
+  });
+}
+
+function scheduleWebSessionRetry(auth: Credentials): void {
+  webRefreshTimer = clearTimer(webRefreshTimer);
+  webRefreshTimer = setTimeout(() => {
+    void refreshWebSession(auth).catch((error: unknown) => {
+      if (credentials === auth) showOffline(portalOfflineReason(error));
+    });
+  }, 30_000);
+  webRefreshTimer.unref();
 }
 
 async function refreshWebSession(auth: Credentials, initial?: WebSession): Promise<void> {
   if (credentials !== auth || !webPartition) return;
+  let next: WebSession;
   try {
-    const next = initial ?? await api.webSession();
+    next = initial ?? await api.webSession();
+  } catch (error) {
+    if (credentials !== auth) return;
+    if (String(error).includes("Authorization expired or revoked")) { clearAuthorization(); return; }
+    scheduleWebSessionRetry(auth);
+    throw new PortalConnectionFailure("session");
+  }
+  try {
     if (credentials !== auth || !webPartition) return;
     const localPortal = await ensureLocalPortalServer(auth.origin, next.hostFrameSource);
     if (credentials !== auth || !webPartition) return;
     await webPartition.cookies.set({ url: localPortal.origin, name: "ch_portal", value: next.credential, path: "/", httpOnly: true, secure: false, sameSite: "strict", expirationDate: Date.parse(next.expiresAt) / 1000 });
-    webRefreshTimer = clearTimer(webRefreshTimer);
-    webRefreshTimer = setTimeout(() => { void refreshWebSession(auth).catch(() => undefined); }, Math.max(1000, Math.min(Date.parse(next.expiresAt) - Date.now() - 60_000, 2_147_483_647)));
-    webRefreshTimer.unref();
-  } catch (error) {
+  } catch {
     if (credentials !== auth) return;
-    if (String(error).includes("Authorization expired or revoked")) { clearAuthorization(); return; }
-    webRefreshTimer = clearTimer(webRefreshTimer);
-    webRefreshTimer = setTimeout(() => { void refreshWebSession(auth).catch(() => undefined); }, 30_000);
-    webRefreshTimer.unref();
-    throw error;
+    scheduleWebSessionRetry(auth);
+    throw new PortalConnectionFailure("proxy");
   }
+  webRefreshTimer = clearTimer(webRefreshTimer);
+  webRefreshTimer = setTimeout(() => {
+    void refreshWebSession(auth).catch((error: unknown) => {
+      if (credentials === auth) showOffline(portalOfflineReason(error));
+    });
+  }, Math.max(1000, Math.min(Date.parse(next.expiresAt) - Date.now() - 60_000, 2_147_483_647)));
+  webRefreshTimer.unref();
 }
 
 async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): Promise<void> {
@@ -2722,7 +2760,7 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
   await refreshWebSession(auth, initial);
   if (credentials !== auth || mainWindow !== owner || owner.isDestroyed() || webPartition !== partition) return;
   const appOrigin = portalOriginFor(auth);
-  if (!appOrigin) throw new Error("Local Portal is unavailable");
+  if (!appOrigin) throw new PortalConnectionFailure("proxy");
   const assistantURL = `${appOrigin}/assistant`;
   installDownloadAndClipboard(partition, appOrigin);
   if (!webLogoutWatchers.has(partition)) {
@@ -2753,7 +2791,7 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
         if (refreshedOrigin && credentials === auth && mainWindow === owner && webPartition === partition && !content.webContents.isDestroyed()) {
           return loadAssistantPage(content.webContents, `${refreshedOrigin}${route}`);
         }
-      }).catch(() => { if (credentials === auth && mainWindow === owner) showOffline(); });
+      }).catch((error: unknown) => { if (credentials === auth && mainWindow === owner) showOffline(portalOfflineReason(error)); });
     };
     content.webContents.setWindowOpenHandler((details) => {
       const entry = hostEntryURL(details.url, appOrigin);
@@ -2803,7 +2841,7 @@ async function openWeb(initial: WebSession | undefined, owner: BrowserWindow): P
       if (target?.pathname === "/login") restoreFromLogin(target);
       if (target?.pathname.startsWith("/admin")) {
         void shell.openExternal(new URL(`${target.pathname}${target.search}${target.hash}`, auth.origin).href);
-        void loadAssistantPage(content.webContents, assistantURL).catch(() => { if (credentials === auth && mainWindow === owner) showOffline(); });
+        void loadAssistantPage(content.webContents, assistantURL).catch((error: unknown) => { if (credentials === auth && mainWindow === owner) showOffline(portalOfflineReason(error)); });
       }
     });
     await loadAssistantPage(content.webContents, assistantURL);
@@ -2875,7 +2913,7 @@ async function login(origin: unknown, name: unknown, password: unknown): Promise
     void refreshLiveSyncCapability(result.credentials);
     showConnecting();
     try { await openAssistant(result.webSession); }
-    catch { showOffline(); }
+    catch (error) { showOffline(portalOfflineReason(error)); }
     void restoreWorkspaceNode(result.credentials);
     return publicState();
   } catch (error) {
@@ -3083,7 +3121,10 @@ function register(): void {
   ipcMain.handle("morde:host-workbench-ready", (event, nonce) => notifyNativeWorkbenchReady(event, nonce));
   ipcMain.handle("morde:host-workbench-state", (event, state) => notifyNativeWorkbenchState(event, state));
   handler("morde:state", () => publicState());
-  handler("morde:open-assistant", async () => { await openAssistant(); return { opened: true }; });
+  handler("morde:open-assistant", async () => {
+    try { await openAssistant(); return { opened: true }; }
+    catch (error) { showOffline(portalOfflineReason(error)); return { opened: false }; }
+  });
   codexBridgeHandler("morde:codex-state", () => ({ authenticated: Boolean(credentials), codex: credentials ? codex.publicState() : null }));
   codexBridgeHandler("morde:codex-add-profile", async () => {
     if (!credentials || !safeStorageReady()) throw new Error("Codex 需要有效的 morde-pc 授权和系统安全存储");
@@ -3676,9 +3717,9 @@ function showWindow(): void {
     else {
       showConnecting();
       const owner = mainWindow;
-      void openAssistant().catch(() => {
+      void openAssistant().catch((error: unknown) => {
         if (!owner || mainWindow !== owner || owner.isDestroyed()) return;
-        showOffline();
+        showOffline(portalOfflineReason(error));
       });
     }
   }

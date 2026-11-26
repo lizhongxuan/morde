@@ -50,7 +50,7 @@ function harness(initialAuth = null, existingRoot = null) {
   const userData = join(root, 'Morde Client');
   const fs = require('node:fs');
   fs.mkdirSync(userData, { recursive: true });
-  let nextWebContentsID = 1;
+  let nextWebContentsID = 1, nextAssistantLoadError = null;
   if (initialAuth) writeFileSync(join(userData, 'credentials.bin'), JSON.stringify({ version: 2, credentials: initialAuth }));
   const handlers = new Map(), windows = [], views = [], partitions = [], appEvents = new Map(), shellURLs = [];
   class FakeContents {
@@ -61,7 +61,14 @@ function harness(initialAuth = null, existingRoot = null) {
     closed = false;
     on(name, fn) { this.events.set(name, fn); }
     setWindowOpenHandler(fn) { this.open = fn; }
-    async loadURL(url) { this.url = url; }
+    async loadURL(url) {
+      if (nextAssistantLoadError && String(url).endsWith('/assistant')) {
+        const error = nextAssistantLoadError;
+        nextAssistantLoadError = null;
+        throw error;
+      }
+      this.url = url;
+    }
     getURL() { return this.url; }
     isDestroyed() { return this.closed; }
     focus() { this.focused = true; }
@@ -128,6 +135,7 @@ function harness(initialAuth = null, existingRoot = null) {
     root, userData, handlers, windows, views, partitions, appEvents, shellURLs, dialog,
     async ready() { await new Promise((resolve) => setImmediate(resolve)); await new Promise((resolve) => setImmediate(resolve)); },
     invoke(channel, ...args) { return handlers.get(channel)({ sender: windows.at(-1).webContents }, ...args); },
+    failNextAssistantLoad(error) { nextAssistantLoadError = error; },
     cleanup(removeRoot = true) {
       globalThis.setInterval = originalSetInterval;
       for (const interval of intervals) clearInterval(interval);
@@ -891,11 +899,12 @@ test('a revoked installation automatically signs out while preserving its pendin
 
 test('retry after the initial Web session outage installs the Portal session guards', async () => {
   const originalFetch = globalThis.fetch;
+  const failureDetail = 'Bearer hidden-session-token /api/auth/client-web-session?ticket=private body=private';
   let online = false, webSessionCalls = 0;
   globalThis.fetch = async (url) => {
     if (!String(url).endsWith('/api/auth/client-web-session')) return loginFetch(url);
     webSessionCalls++;
-    if (!online) throw new TypeError('network offline');
+    if (!online) throw new TypeError(failureDetail);
     return json({ web_session_credential: 'recovered-web', web_session_expires_at: future });
   };
   const h = harness(auth);
@@ -903,16 +912,85 @@ test('retry after the initial Web session outage installs the Portal session gua
     await h.ready();
     await waitFor(() => h.windows[0].webContents.messages.some(([channel, state]) => channel === 'morde:state' && state.view === 'offline'),
       'timed out waiting for the offline view');
+    const failedState = await h.invoke('morde:state');
+    assert.equal(failedState.offlineReason, 'session');
+    assert.equal(failedState.authenticated, true);
+    assert.equal(JSON.stringify(h.windows[0].webContents.messages).includes(failureDetail), false);
     assert.equal(h.partitions.length, 1);
     assert.equal(h.views.length, 0);
 
     online = true;
     assert.deepEqual(await h.invoke('morde:open-assistant'), { opened: true });
     assert.equal(webSessionCalls, 2);
-    assert.equal((await h.invoke('morde:state')).view, 'web');
+    const recoveredState = await h.invoke('morde:state');
+    assert.equal(recoveredState.view, 'web');
+    assert.equal(recoveredState.offlineReason, null);
+    assert.equal(recoveredState.installationId, auth.installationId);
     assert.equal(h.windows[0].contentView.attached[0], h.views[0]);
     assert.equal(typeof h.partitions[0].permissionRequest, 'function');
     assert.equal(typeof h.partitions[0].webRequest.completed, 'function');
+  } finally { globalThis.fetch = originalFetch; h.cleanup(); }
+});
+
+test('local Portal startup failure is reported as proxy stage and retry opens the same Assistant session', async () => {
+  const originalFetch = globalThis.fetch;
+  const originalAssets = process.env.MORDE_TEST_PORTAL_ASSETS;
+  const privateAssetPath = join(tmpdir(), 'morde-private-portal-assets-missing');
+  process.env.MORDE_TEST_PORTAL_ASSETS = privateAssetPath;
+  globalThis.fetch = async (url) => loginFetch(url);
+  const h = harness(auth);
+  try {
+    await h.ready();
+    await waitFor(() => h.windows[0].webContents.messages.some(([channel, state]) => channel === 'morde:state' && state.view === 'offline'), 'timed out waiting for proxy failure');
+    const failedState = await h.invoke('morde:state');
+    assert.equal(failedState.offlineReason, 'proxy');
+    assert.equal(failedState.authenticated, true);
+    assert.equal(JSON.stringify(failedState).includes(privateAssetPath), false);
+    assert.equal(JSON.stringify(h.windows[0].webContents.messages).includes(privateAssetPath), false);
+    assert.equal(h.views.length, 0);
+
+    if (originalAssets === undefined) delete process.env.MORDE_TEST_PORTAL_ASSETS;
+    else process.env.MORDE_TEST_PORTAL_ASSETS = originalAssets;
+    assert.deepEqual(await h.invoke('morde:open-assistant'), { opened: true });
+    const recoveredState = await h.invoke('morde:state');
+    assert.equal(recoveredState.view, 'web');
+    assert.equal(recoveredState.offlineReason, null);
+    assert.equal(recoveredState.installationId, auth.installationId);
+    assert.equal(h.views.length, 1);
+    assert.equal(h.windows[0].contentView.attached[0], h.views[0]);
+  } finally {
+    if (originalAssets === undefined) delete process.env.MORDE_TEST_PORTAL_ASSETS;
+    else process.env.MORDE_TEST_PORTAL_ASSETS = originalAssets;
+    globalThis.fetch = originalFetch;
+    h.cleanup();
+  }
+});
+
+test('Assistant load failure is reported without URL or token and retry reuses the same view', async () => {
+  const originalFetch = globalThis.fetch;
+  const failureDetail = 'https://portal.example/assistant?ticket=private Bearer hidden-assistant-token stack=private';
+  globalThis.fetch = async (url) => loginFetch(url);
+  const h = harness(auth);
+  h.failNextAssistantLoad(new Error(failureDetail));
+  try {
+    await h.ready();
+    await waitFor(() => h.windows[0].webContents.messages.some(([channel, state]) => channel === 'morde:state' && state.view === 'offline'), 'timed out waiting for Assistant load failure');
+    const failedState = await h.invoke('morde:state');
+    assert.equal(failedState.offlineReason, 'assistant');
+    assert.equal(failedState.authenticated, true);
+    assert.equal(JSON.stringify(failedState).includes(failureDetail), false);
+    assert.equal(JSON.stringify(h.windows[0].webContents.messages).includes(failureDetail), false);
+    const originalView = h.views[0];
+    assert.ok(originalView);
+
+    assert.deepEqual(await h.invoke('morde:open-assistant'), { opened: true });
+    const recoveredState = await h.invoke('morde:state');
+    assert.equal(recoveredState.view, 'web');
+    assert.equal(recoveredState.offlineReason, null);
+    assert.equal(recoveredState.installationId, auth.installationId);
+    assert.equal(h.views.length, 1);
+    assert.equal(h.views[0], originalView);
+    assert.equal(h.windows[0].contentView.attached[0], originalView);
   } finally { globalThis.fetch = originalFetch; h.cleanup(); }
 });
 

@@ -169,6 +169,62 @@ func TestTaskToolExecutionDetailsSummarizeBrowserActionsWithoutSensitiveData(t *
 	}
 }
 
+func TestWorkspaceSearchExecutionParametersPreserveQueryAndOmitCredentials(t *testing.T) {
+	const workspaceID = "w1234567"
+	const query = "authorization check"
+	activity := cloudDSHToolActivity{
+		call: ModelToolCall{Name: cloudDSHWorkspaceSearchToolName,
+			Arguments: `{"expected_revision":4,"query":"` + query + `"}`},
+		current: task.Task{WorkspaceID: workspaceID},
+	}
+	detail, _ := taskToolExecutionDetails(activity)
+	if detail == nil || detail.Parameters == nil {
+		t.Fatalf("Workspace search query missing from execution detail: %+v", detail)
+	}
+	var parameters map[string]any
+	if err := json.Unmarshal([]byte(*detail.Parameters), &parameters); err != nil {
+		t.Fatalf("decode execution parameters %q: %v", *detail.Parameters, err)
+	}
+	if parameters["query"] != query {
+		t.Fatalf("search query projection = %#v, want %q", parameters["query"], query)
+	}
+	if !taskStepExecutionRequiresWorkspace(cloudDSHWorkspaceSearchToolName, detail) {
+		t.Fatal("Workspace search parameters bypassed the Workspace evidence gate")
+	}
+	if !validTaskStepDetailDocument(TaskStepDetailDocument{Object: cloudDSHWorkspaceSearchToolName,
+		Execution: detail, ExecutionWorkspaceID: workspaceID}) {
+		t.Fatal("authorized Workspace search detail did not satisfy the evidence boundary")
+	}
+
+	for _, secretQuery := range []string{
+		"api_key=synthetic-secret-value",
+		"Bearer " + strings.Repeat("A", 24),
+		"https://user:password@example.test/private",
+		"https://example.test/search?api_key=synthetic-secret-value",
+	} {
+		encoded, err := json.Marshal(map[string]string{"query": secretQuery})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := taskToolExecutionParameters(cloudDSHWorkspaceSearchToolName, string(encoded)); got != "" {
+			t.Fatalf("credential-bearing Workspace query was recorded: %q", got)
+		}
+	}
+	for _, raw := range []string{
+		`{"query":"line1\nline2"}`,
+		`{"query":"` + strings.Repeat("q", 161) + `"}`,
+	} {
+		if got := taskToolExecutionParameters(cloudDSHWorkspaceSearchToolName, raw); got != "" {
+			t.Fatalf("unsafe or overlong Workspace query was recorded: %q", got)
+		}
+	}
+	boundary := strings.Repeat("q", 160)
+	boundaryJSON := `{"query":"` + boundary + `"}`
+	if got := taskToolExecutionParameters(cloudDSHWorkspaceSearchToolName, boundaryJSON); !strings.Contains(got, boundary) {
+		t.Fatalf("160-rune Workspace query should be retained: %q", got)
+	}
+}
+
 func TestBrowserExecutionParametersDoNotBypassWorkspaceEvidenceGate(t *testing.T) {
 	safeBrowserDetail := TaskStepDetailDocument{Object: runtimeToolBrowserOpenTab,
 		Execution: &TaskStepExecution{Parameters: stringPointer(`{"site":"https://example.test"}`)}}
