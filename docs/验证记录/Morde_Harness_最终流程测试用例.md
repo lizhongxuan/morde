@@ -2757,4 +2757,12 @@ Tokenizer 与 token 统计来源：
 - **定向 PostgreSQL：**H07 的 manifest confirmation / replay 三个测试，加 R17 的 delivery observation / WorkflowTrace 两个测试，在 `127.0.0.1:56202` loopback 测试库上合并运行通过（`ok morde/server/internal/store/postgres 8.506s`）。测试未访问远程数据库。
 - **生成后状态：**`git diff --check` 通过；`sqlcgen/models.go` 的变更由 `make generate` 产生并已纳入待集成改动。
 - **P0 smoke：**用 loopback PostgreSQL 运行 `deploy/single/smoke.sh --src . --record /tmp/morde-smoke-record-20261127.json --timeout 600`，pass=8、fail=0、exception=2。T10 和 T43 因需要真实 PC/模型/DSH 按门禁记录为环境例外，不计通过。
-- **端到端边界：**源码 PC 已构建并启动，但客户端仍显示云端暂时无法连接；`/healthz` 与 `/readyz` 返回 200。未登录、未提交消息或 Task。H07、R17、真实 DSH/Host 与 PC 交付仍未验收，相关 TODO 不关闭。
+- **部署前端到端快照：**源码 PC 已构建并启动，但客户端显示云端暂时无法连接；`/healthz` 与 `/readyz` 返回 200。该快照未登录、未提交消息或 Task。部署后的独立观察见下方 release/PC 续验；H07、R17、真实 DSH/Host 与 PC 交付仍未验收，相关 TODO 不关闭。
+
+<a id="release-deploy-and-pc-check-2026-11-27"></a>
+### 2026-11-27 release 部署与实际源码 PC 续验
+
+- **发布版本：**`release` commit `f976369e`（修复 Linux `process_task_linux.go` 未使用局部变量导致的 portal 编译失败）已推送并部署；服务器源码 checkout 与本地 commit 一致，工作分支为 `release`，GitHub `origin` 地址已恢复。
+- **部署门禁：**正式更新脚本通过 P0 smoke，记录为 pass=5、fail=0、exception=5；T01/T26/T36 需要独立测试 PostgreSQL DSN，T10/T43 需要真实 PC/DSH。服务构建与原子切换成功，数据库迁移从 254 升到 257，更新后 `current=257/latest=257`；`morde-portal.service=active`、`/healthz=ok`、`/readyz=200`。服务器 HTTPS 拉取超时后，按授权经临时 Git bundle 传入目标提交完成发布；远端 Git remote 已恢复，临时 bundle/裸仓库已删除。
+- **PC 登录观察：**在 `make pc` 隔离源码 profile 中进入账号登录流程。该时间段服务器日志出现一次 `/api/auth/client-login` 200 和后续若干 session API 200；CUA 可视画面却仍显示“暂时无法连接 Morde”，可访问树则保留登录表单，且无法唯一绑定窗口/profile。没有发送消息、创建 Task 或操作 Host。该混合证据只说明服务端有成功认证和会话请求，不能证明当前窗口已登录或客户端完整连通；不关闭 A02-3、T43、E01/E02 的实机验收。
+- **安全与清理：**没有修改管理员密码、数据库账号或业务数据；临时部署 bundle 已清理。此次没有访问用户对话正文。
