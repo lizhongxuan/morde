@@ -1680,16 +1680,18 @@ func TestRuntimeToolExecutorPollsAndMapsShellExitCode(t *testing.T) {
 func TestRuntimeToolExecutorRenewsRuntimeLeaseDuringLongOperation(t *testing.T) {
 	handler := &runtimeToolTestHandler{
 		capability: "shell.exec", action: "run",
-		result: `{"exit_code":0,"stdout":"done","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
-		delay:  700 * time.Millisecond,
+		result:  `{"exit_code":0,"stdout":"done","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
+		delay:   1500 * time.Millisecond,
+		started: make(chan struct{}),
 	}
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{handler: handler}})
 	fixture.executor.operations.pollEvery = 5 * time.Millisecond
 	fixture.executor.leaseEvery = 10 * time.Millisecond
-	initialExpiry := time.Now().Add(500 * time.Millisecond).UTC()
-	fixture.store.setLeaseExpiry(initialExpiry)
-	request, preparation := fixture.prepared(runtimeToolShellExec, `{"command":"sleep 1"}`, identity.ScopeComputerOperate)
+	request, preparation := fixture.prepared(runtimeToolShellExec, `{"command":"sleep 2"}`, identity.ScopeComputerOperate)
 	fixture.persistOperation(request)
+	// Start the short lease only after setup is complete so prepare/persistence
+	// time cannot consume the renewal window before Execute starts.
+	fixture.store.setLeaseExpiry(time.Now().Add(time.Second).UTC())
 
 	resultCh := make(chan struct {
 		result AgentToolResult
@@ -1702,15 +1704,22 @@ func TestRuntimeToolExecutorRenewsRuntimeLeaseDuringLongOperation(t *testing.T) 
 			err    error
 		}{result: result, err: err}
 	}()
-	time.Sleep(120 * time.Millisecond)
-	fixture.store.setLeaseExpiry(time.Now().Add(time.Second).UTC())
+	select {
+	case <-handler.started:
+		// The handler is now running and will outlast the original lease. Extend
+		// the durable lease while the operation is active so the executor must
+		// propagate the change to Runtime.
+		fixture.store.setLeaseExpiry(time.Now().Add(5 * time.Second).UTC())
+	case <-time.After(3 * time.Second):
+		t.Fatal("runtime handler did not start")
+	}
 
 	select {
 	case got := <-resultCh:
 		if got.err != nil || got.result.Status != AgentToolSucceeded {
 			t.Fatalf("Execute() = %#v, %v; want success after lease renewal", got.result, got.err)
 		}
-	case <-time.After(2 * time.Second):
+	case <-time.After(4 * time.Second):
 		t.Fatal("long operation did not complete after runtime lease renewal")
 	}
 	if handler.calls.Load() != 1 {
@@ -2371,6 +2380,8 @@ type runtimeToolTestHandler struct {
 	result     string
 	delay      time.Duration
 	err        error
+	started    chan struct{}
+	startOnce  sync.Once
 	calls      atomic.Int32
 }
 
@@ -2378,6 +2389,9 @@ func (h *runtimeToolTestHandler) Capability() string { return h.capability }
 func (h *runtimeToolTestHandler) Action() string     { return h.action }
 func (h *runtimeToolTestHandler) Execute(ctx context.Context, _ contract.ExecuteRequest) (json.RawMessage, error) {
 	h.calls.Add(1)
+	if h.started != nil {
+		h.startOnce.Do(func() { close(h.started) })
+	}
 	if h.delay > 0 {
 		timer := time.NewTimer(h.delay)
 		defer timer.Stop()

@@ -40,6 +40,9 @@ func TestTaskValidationRunnerCoverageReceiptRequiresExactPlanScope(t *testing.T)
 		"targeted command cannot claim full suite": func(_ *task.PlanVerificationCheck, proof *app.TaskValidationRunnerCoverageReceipt) {
 			proof.ScopeMode = string(task.PlanVerificationScopeFullSuite)
 		},
+		"receipt operation identity mismatch": func(_ *task.PlanVerificationCheck, proof *app.TaskValidationRunnerCoverageReceipt) {
+			proof.OperationID = "o7654321"
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			changedCheck := targeted
@@ -52,6 +55,18 @@ func TestTaskValidationRunnerCoverageReceiptRequiresExactPlanScope(t *testing.T)
 				t.Fatal("mismatched plan/runner coverage scopes were accepted")
 			}
 		})
+	}
+
+	targetRoot := task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest, ScopeMode: task.PlanVerificationScopeTargeted,
+		Command: "go test -run=^TestTaskReplay$ .", CoveragePaths: []string{"."}, Selectors: []string{"TestTaskReplay"}}
+	claim, current, row, shell, receipt = taskValidationRunnerCoverageFixture(targetRoot)
+	receipt.ScopeMode = string(task.PlanVerificationScopeTargeted)
+	receipt.PackageSelector = "."
+	receipt.TestSelector = "^TestTaskReplay$"
+	commandDigest = sha256.Sum256([]byte(targetRoot.Command))
+	receipt.ExactCommandSHA256 = hex.EncodeToString(commandDigest[:])
+	if !validTaskValidationRunnerCoverageReceipt(&receipt, targetRoot, claim, current, row, shell) {
+		t.Fatal("exact current-directory package selector was rejected")
 	}
 }
 
@@ -103,7 +118,7 @@ func taskValidationRunnerCoverageFixture(check task.PlanVerificationCheck) (app.
 	app.TaskValidationRunnerCoverageReceipt) {
 	claim := app.TaskValidationReviewClaim{TaskID: "t1234567"}
 	current := taskValidationReplayTask{workspaceID: "w1234567"}
-	row := taskValidationReplayBinding{operationBindingVersion: 2, operationCheckpoint: 7}
+	row := taskValidationReplayBinding{executionID: "o1234567", operationBindingVersion: 2, operationCheckpoint: 7}
 	viewID := "v" + hashTextDigest("workspace view")
 	snapshot := hashTextDigest("workspace snapshot")
 	shell := taskValidationReplayShellResult{ExitCode: 0, WorkspaceViewID: viewID,
@@ -113,7 +128,7 @@ func taskValidationRunnerCoverageFixture(check task.PlanVerificationCheck) (app.
 	packageInventory := hashTextDigest("test-bearing packages")
 	testInventory := hashTextDigest("test and example roots")
 	receipt := app.TaskValidationRunnerCoverageReceipt{
-		Version: 1, Runner: "go", RunnerVersion: "go version go1.25.3 linux/amd64",
+		Version: 1, OperationID: row.executionID, Runner: "go", RunnerVersion: "go version go1.25.3 linux/amd64",
 		ScopeMode: string(check.ScopeMode), ScopeContract: taskValidationRunnerCoverageScopeContract,
 		PackageSelector: "./...", ExactCommandSHA256: hex.EncodeToString(commandDigest[:]),
 		TaskID: claim.TaskID, WorkspaceID: current.workspaceID,

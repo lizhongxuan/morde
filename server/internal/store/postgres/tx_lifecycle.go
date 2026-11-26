@@ -561,15 +561,24 @@ SELECT 1 FROM workspace_copy_reservations WHERE source_host_id=$1 AND host_copy_
 		if current.State == host.StateRunning && current.RuntimeGeneration > 1 {
 			return nil
 		}
-		if current.DeletedAt != nil || current.ControlState != host.ControlAI {
+		if current.DeletedAt != nil {
+			return hostStateConflict(current)
+		}
+		if current.ControlState != host.ControlAI {
+			if params.RecoveryFromFailed {
+				return failedHostRestoreCASConflict(current)
+			}
 			return hostStateConflict(current)
 		}
 		expectedState := host.StateStopped
 		if params.RecoveryFromFailed {
-			if params.ExpectedGeneration <= 1 || current.State != host.StateFailed || current.RuntimeGeneration != params.ExpectedGeneration ||
-				current.StateReason != params.ExpectedReason || current.SandboxID != params.ExpectedSandboxID ||
-				(current.StateReason != "orchestrator_error" && current.StateReason != "ready_timeout" && current.StateReason != "lost") {
-				return hostStateConflict(current)
+			if params.ExpectedGeneration <= 1 ||
+				(params.ExpectedReason != "orchestrator_error" && params.ExpectedReason != "ready_timeout" && params.ExpectedReason != "lost") {
+				return domain.InvalidArgument("host.restore_recovery", "failed Host restore identity is invalid")
+			}
+			if current.State != host.StateFailed || current.RuntimeGeneration != params.ExpectedGeneration ||
+				current.StateReason != params.ExpectedReason || current.SandboxID != params.ExpectedSandboxID {
+				return failedHostRestoreCASConflict(current)
 			}
 			var hasOutstandingLease bool
 			if err := tx.QueryRow(ctx, `SELECT EXISTS (
@@ -627,6 +636,9 @@ WHERE id=$1 AND state=$5 AND runtime_generation=$4 AND state_reason=$6
 			return fmt.Errorf("begin host restore: %w", err)
 		}
 		if tag.RowsAffected() != 1 {
+			if params.RecoveryFromFailed {
+				return failedHostRestoreCASConflict(current)
+			}
 			return hostStateConflict(current)
 		}
 		row, err = queries.GetHost(ctx, params.HostID)
@@ -746,6 +758,9 @@ func (s *Store) AdoptFailedHostRestore(ctx context.Context, hostID string, gener
 	if !domain.ValidHostID(hostID) || generation <= 1 || len(reason) > 64 || len(sandboxID) == 0 || len(sandboxID) > 128 {
 		return domain.InvalidArgument("host.recovery", "host recovery request is invalid")
 	}
+	if reason != "orchestrator_error" && reason != "ready_timeout" && reason != "lost" {
+		return domain.InvalidArgument("host.recovery", "failed Host restore reason is invalid")
+	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
 		// AcquireHostActivityLease takes FOR SHARE on the Host row. Holding
 		// FOR UPDATE here serializes adoption with lease creation and renewal.
@@ -761,10 +776,14 @@ func (s *Store) AdoptFailedHostRestore(ctx context.Context, hostID string, gener
 		if err != nil {
 			return err
 		}
-		if current.State != host.StateFailed || current.RuntimeGeneration != generation || current.StateReason != reason ||
-			current.SandboxID != sandboxID || current.DeletedAt != nil || current.ControlState != host.ControlAI ||
-			(reason != "orchestrator_error" && reason != "ready_timeout" && reason != "lost") {
+		if current.DeletedAt != nil {
 			return hostStateConflict(current)
+		}
+		if current.ControlState != host.ControlAI {
+			return failedHostRestoreCASConflict(current)
+		}
+		if current.State != host.StateFailed || current.RuntimeGeneration != generation || current.StateReason != reason || current.SandboxID != sandboxID {
+			return failedHostRestoreCASConflict(current)
 		}
 		var hasOutstandingLease bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (
@@ -788,7 +807,7 @@ WHERE id=$1 AND state='failed' AND runtime_generation=$2 AND state_reason=$3
 			return fmt.Errorf("adopt failed Host restore sandbox: %w", err)
 		}
 		if tag.RowsAffected() != 1 {
-			return hostStateConflict(current)
+			return failedHostRestoreCASConflict(current)
 		}
 		return nil
 	})
@@ -808,6 +827,12 @@ func lockHost(ctx context.Context, tx pgx.Tx, hostID string) error {
 
 func hostStateConflict(current host.Host) error {
 	err := domain.NewError(domain.CodeInvalidState, "host state changed")
+	err.Details["state"] = string(current.State)
+	return err
+}
+
+func failedHostRestoreCASConflict(current host.Host) error {
+	err := domain.NewError(domain.CodeConflict, "failed Host restore identity changed")
 	err.Details["state"] = string(current.State)
 	return err
 }

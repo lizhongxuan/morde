@@ -736,6 +736,7 @@ func TestConversationRouteModelActionIsPreservedAcrossSemanticRewrites(t *testin
 		{name: "stop paraphrase", content: "把这项工作结束掉。", output: `{"action":"stop","task_id":"q1234567"}`, want: ConversationRouteStop},
 		{name: "stop all paraphrase", content: "把还没有结束的工作全部撤掉。", output: `{"action":"stop_all"}`, want: ConversationRouteStopAll},
 		{name: "tool paraphrase", content: "有没有关于日本央行利率政策的最新公开信息？", output: `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`, want: ConversationRouteTool},
+		{name: "news tool requests news category", content: "帮我搜索今天的 AI 新闻", output: `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"AI news","category":"news","time_range":"day"}}`, want: ConversationRouteTool},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			value := ConversationRouteContext{ActorID: "u1234567", Content: test.content, Candidates: []ConversationRouteCandidate{candidate}}
@@ -748,6 +749,10 @@ func TestConversationRouteModelActionIsPreservedAcrossSemanticRewrites(t *testin
 			}
 			if test.name == "new without restart phrase" && decision.ExplicitNew {
 				t.Fatalf("message wording changed the model explicit_new bit: %+v", decision)
+			}
+			if test.name == "news tool requests news category" &&
+				decision.ToolArguments != `{"query":"AI news","category":"news","time_range":"day"}` {
+				t.Fatalf("direct route changed the Morde tool argument contract before persistence: %s", decision.ToolArguments)
 			}
 		})
 	}
@@ -1040,7 +1045,8 @@ func TestConversationRouteDirectToolIsExplicitAndReadOnly(t *testing.T) {
 	}
 	request, err := ConversationRouteModelRequest(value)
 	if err != nil || !strings.Contains(request.Instructions, `"tool_name"`) ||
-		!strings.Contains(request.Instructions, `"morde_web_search"`) || !strings.Contains(request.Instructions, `action "tool"`) {
+		!strings.Contains(request.Instructions, `"morde_web_search"`) || !strings.Contains(request.Instructions, `action "tool"`) ||
+		!strings.Contains(request.Instructions, `category="news"`) {
 		t.Fatalf("direct tool contract missing from model request: err=%v instructions=%s", err, request.Instructions)
 	}
 	mixedControl := value

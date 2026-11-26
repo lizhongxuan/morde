@@ -93,6 +93,7 @@ type shellRunnerCoverageReceipt struct {
 	PackageSelector                  string `json:"package_selector"`
 	TestSelector                     string `json:"test_selector,omitempty"`
 	ExactCommandSHA256               string `json:"exact_command_sha256"`
+	OperationID                      string `json:"operation_id"`
 	TaskID                           string `json:"task_id"`
 	WorkspaceID                      string `json:"workspace_id"`
 	WorkspaceDirectory               string `json:"workspace_directory"`

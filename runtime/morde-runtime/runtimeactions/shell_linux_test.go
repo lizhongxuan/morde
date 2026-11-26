@@ -249,7 +249,6 @@ func TestGoTestASTInventoryFailsClosedForUnsupportedDefinitions(t *testing.T) {
 }
 
 func TestGoTestRunParserFailsClosedOnIncompleteOrSkippedEvents(t *testing.T) {
-	workspace := "/workspace"
 	packagePath := "example.test/pkg"
 	source := goSourceInventory{
 		all: map[string]goPackageInventory{packagePath: {
@@ -272,6 +271,17 @@ func TestGoTestRunParserFailsClosedOnIncompleteOrSkippedEvents(t *testing.T) {
 			{Action: "start", Package: packagePath}, {Action: "run", Package: packagePath, Test: "TestAlpha"},
 			{Action: "pass", Package: packagePath, Test: "TestAlpha"}, {Action: "pass", Package: packagePath},
 		}) + `{"Action":`},
+		{name: "test before package start", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "run", Package: packagePath, Test: "TestAlpha"},
+		})},
+		{name: "event after package terminal", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "start", Package: packagePath}, {Action: "run", Package: packagePath, Test: "TestAlpha"},
+			{Action: "pass", Package: packagePath, Test: "TestAlpha"}, {Action: "pass", Package: packagePath},
+			{Action: "output", Package: packagePath, Output: "PASS\n"},
+		})},
+		{name: "duplicate package start", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "start", Package: packagePath}, {Action: "start", Package: packagePath},
+		})},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			if _, _, _, valid := parseGoTestRun(test.output, discovered, source); valid {
@@ -289,6 +299,46 @@ func TestGoTestRunParserFailsClosedOnIncompleteOrSkippedEvents(t *testing.T) {
 	_, _, stats, valid := parseGoTestRun(encodeGoTestEvents(t, skipEvents), discovered, source)
 	if !valid || stats.skipped != 1 {
 		t.Fatalf("skip event parse=(%+v,%v), want one recorded skip", stats, valid)
+	}
+}
+
+func TestTrustedGoVersionRequiresAndReturnsCompleteOutput(t *testing.T) {
+	version, ok := parseTrustedGoVersion("go version go1.25.3 linux/amd64\n", "", 0, false, false, true)
+	if !ok || version != "go version go1.25.3 linux/amd64" {
+		t.Fatalf("version=(%q,%v), want complete go version output", version, ok)
+	}
+	for _, stdout := range []string{
+		"go1.25.3 linux/amd64\n",
+		"go version go1.25.3 linux/amd64",
+		"go version go1.25.3 linux/amd64\nextra\n",
+	} {
+		if version, ok := parseTrustedGoVersion(stdout, "", 0, false, false, true); ok {
+			t.Fatalf("incomplete version output %q accepted as %q", stdout, version)
+		}
+	}
+}
+
+func TestTrustedGoStageKeepsVisibleAndParserCaptureLimitsSeparate(t *testing.T) {
+	stage := newShellGoStageResult(4, 8)
+	if _, err := stage.stdoutWriter().Write([]byte("123456")); err != nil {
+		t.Fatal(err)
+	}
+	if got := stage.stdout.String(); got != "123456" || stage.stdout.truncated {
+		t.Fatalf("parser capture=(%q,truncated=%v), want complete 6-byte capture", got, stage.stdout.truncated)
+	}
+	if got := stage.visibleStdout.String(); got != "1234" || !stage.visibleStdout.truncated {
+		t.Fatalf("visible output=(%q,truncated=%v), want bounded 4-byte prefix", got, stage.visibleStdout.truncated)
+	}
+	stage.clean = true
+	if !successfulTrustedGoStage(stage) {
+		t.Fatal("user-visible truncation incorrectly invalidated complete internal parser capture")
+	}
+
+	truncatedCapture := newShellGoStageResult(4, 5)
+	_, _ = truncatedCapture.stdoutWriter().Write([]byte("123456"))
+	truncatedCapture.clean = true
+	if successfulTrustedGoStage(truncatedCapture) {
+		t.Fatal("internal parser capture truncation was treated as complete")
 	}
 }
 

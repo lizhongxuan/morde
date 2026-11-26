@@ -2265,3 +2265,54 @@ Tokenizer 与 token 统计来源：
 - **App / Worker：**在 `server/`，`GOPROXY=off GOSUMDB=off go test ./internal/app -run 'TaskTerminalDelivery|TaskValidationPlanReplay|TaskRequirementManifest|TaskPlanRequirementManifest|RuntimeControlStopTaskOperation' -count=1 -timeout=8m` 通过（1.741s）；`go test ./internal/worker -run 'TaskTerminalDelivery|TaskValidation|DefinitiveToolFailure|TaskStopWorker' -count=1 -timeout=8m` 通过（1.449s）；`go test ./internal/worker -run '^TestTaskValidationReviewPromptIncludesReplaySection$' -count=1 -timeout=8m` 通过（0.901s）。A 的 `go test ./internal/api -run '^TestConfirmTaskRequirementManifest' -count=1 -timeout=8m` 通过。
 - **隔离 PostgreSQL：**首次未注入 `CH_TEST_DATABASE_URL` 的 Store 命令明确 skip。随后从本机专用 `morde-m09-verify-postgres` 容器构造仅指向 `127.0.0.1:55432` 的临时测试 DSN，只注入 Go 测试子进程；每个测试按 `newTemporaryStore` 建立并清理隔离数据库。命令 `GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run 'TestPostgresTask(ValidationPlanCheckReplayVerifiesReceiptAndSources|RequirementManifestConfirmation)' -count=1 -v -timeout=8m` 通过（3 个用例，11.731s），覆盖确认记录不可变/修订绑定/撤权 fail closed，以及通过完整用户确认和 exact operation/check mapping 后仍因 Runtime actual coverage 缺失而保持 pending。A 的 API/App/Store 相关定向编译与 API 回归通过，`npm run generate:api`、`gofmt` 和 `git diff --check` 通过。
 - **未验收：**此前用户说明本地 Portal/DSH 暂时不能恢复，PC 确认 UI 尚未接入；本轮没有启动 PC、操作浏览器、连接远端或运行 DeepSeek。没有真实 DSH/PC 失败回复、用户 manifest 确认交互或 Runtime runner inventory 实测。D01-1/2/3/5 继续未勾选；本地协议回归不作为端到端验收。
+
+<a id="step-1-local-baseline-2026-11-26"></a>
+## 步骤 1：本地开发基线（2026-11-26）
+
+### 快照与合同
+
+- 分支 release，HEAD `6ed46c1dba6c9349c239907b1253dc7d49e88ca1`。验证开始前工作区含 26 个 tracked 修改、3 个 untracked 路径；均保留。源代码工作区指纹按 SHA-256 计算：HEAD + NUL + `git diff --binary HEAD -- clients runtime server web` 字节；随后按路径排序，对每个 untracked 文件追加 NUL + 路径 + NUL + 文件内容。摘要为 `1d674730b57d860c0e50af6689da4e6bb864071ce648170d7423fcd5ef313c78`。
+- 最新数据库迁移顺序 00249 → 00250 → 00251 → 00252 → 00253；隔离 PostgreSQL 16.15 的所选集成测试走完迁移初始化。机器本地 5432 有监听，本轮没有连接该实例；临时数据库只走 127.0.0.1:55467。
+- H07 对外合同为 `POST /api/tasks/{id}/requirement-manifest/confirm`，须认证、强 `If-Match` 和 `Idempotency-Key`。此确认不证明义务集合完整或实际测试覆盖。代码回归拒绝把 targeted run 当要求的 full-suite；Store 在缺 runner inventory/实际 coverage 时保持 pending。
+
+### 本轮自动化证据
+
+- App：`GOPROXY=off GOSUMDB=off go test ./internal/app -run 'Test(EvaluateTaskValidationPlanReplay|TaskValidation|AgentCheckpoint|AgentMessageEmptySource|AgentMessageSourcePage)' -count=1 -timeout=8m` 通过（1.390s）。
+- H07 门禁：`GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestTaskPlanRequirementManifestRejectsTargetedCheckForFullSuite|TestEvaluateTaskValidationPlanReplayKeepsOmittedRequiredCheckPending)$' -count=1 -timeout=8m` 通过（1.453s）；这是定向保护用例，不是全量验证证据。
+- API：`GOPROXY=off GOSUMDB=off go test ./internal/api -run '^TestConfirmTaskRequirementManifest' -count=1 -timeout=8m` 通过（0.823s）。
+- PostgreSQL：在独立 PostgreSQL 16.15 容器执行 `CH_TEST_DATABASE_URL=<loopback 临时库> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^(TestPostgresTaskRequirementManifestConfirmationIsImmutableAndRevisionBound|TestPostgresTaskRequirementManifestConfirmationAllowsCompletedAndFailsClosedAfterRevocation|TestPostgresTaskValidationPlanCheckReplayVerifiesReceiptAndSources|TestPostgresTaskEventChainRejectsUnboundValidationReviewAndReceipt|TestPostgresAgentCheckpointFencingAndIdempotency|TestPostgresAgentMessageDeliveryReceiptAtomicApplyReplayAndPageRead|TestConversationRouteInitialAttachmentIsDeliveredOnceAfterStartupRetry|TestBeginHostRestoreFailedLostRequiresExactCASAndNoOutstandingLease|TestAdoptFailedHostRestoreAcceptsLostWithExactSandboxIdentity|TestIsTaskWorkspaceVerificationOperation)$' -count=1 -timeout=12m`，选定组通过（15.532s）。附件-only 场景验证 startup retry 后同一消息只应用一次；容器不挂载持久业务卷，测试后停止。
+- Worker：`GOPROXY=off GOSUMDB=off go test ./internal/worker -run 'TaskValidation|CloudTaskArtifactCommitFailureRecoversWithoutRedispatch|CloudTaskSurvivesClientDisconnectAndPublishesItsPrivateWorkspaceView' -count=1 -timeout=12m` 通过（13.493s）。
+- DSH Runtime：`npm test` 全量 255/255 通过（约 90s）。
+- Portal：`npm test -- --maxWorkers=1`，71 个测试文件、947 项通过；`npm run typecheck` 通过。
+- PC 源码：`npm test` 293 项通过；`npm run typecheck` 通过；`make -n pc` 指向源码 Electron 启动命令。本轮没有启动/操作实际 GUI，因此不计 PC 端到端通过。
+- Linux Runtime：`GOOS=linux GOARCH=arm64 CGO_ENABLED=0 GOPROXY=off GOSUMDB=off go test -c ./runtimeactions` 交叉编译通过；容器内 9 项 Linux 定向测试通过。容器没有 delegated cgroup，完整 Linux 包测试中依赖该环境的测试不能得出 PASS。另修复 trusted Go stage 对内部解析输出截断未判失败的问题，新增回归覆盖内部缓冲截断与用户可见输出截断边界。
+
+### 环境、范围与状态
+
+- 机器本地 PostgreSQL 5432 监听；本轮隔离 PostgreSQL 使用独立 55467 端口，未连接或复用其他服务/会话的数据库。Portal 常用本地端口 7080/7180/8080/9090 未监听；本轮未启动 Portal、DSH、Guardian 或 Host 服务。UI 规范文件 `docs/design/ice-cream-blue/morde-icecream-blue-ui-spec.html` 缺失。
+- 本轮没有运行全量服务端 `make test`、`make it`、`make race` 或全量 lint；没有运行真实模型、真实 DSH/Host 或实际 PC GUI。定向测试通过不构成全仓 PASS；H07 继续 pending。
+- 没有改远端环境、连接远端或发送/上传文件。R00 基线已建立但整体未收尾，缺少的服务及全量验证边界仍需按后续步骤处理。
+
+<a id="step-2-local-route-news-plan-2026-11-26"></a>
+## 步骤 2：普通对话、新闻搜索、追问与计划（2026-11-26）
+
+### 本地代码与定向验证
+
+- 新闻搜索工具合同新增唯一分类 news。App 验证 Morde 参数并在调用 Broker 时映射为 SearXNG categories=news；route model decision 保存前仍保留原始 Morde arguments，避免内部参数改名后无法通过持久化合同。任务工作项输入摘要显示新闻分类。App、Worker、MCP connector 对应定向回归通过。
+- App 命令：GOPROXY=off GOSUMDB=off go test ./internal/app -run 'ConversationRoute|TaskPlan|BuiltinSearch|TaskToolInputSummary' -count=1 -timeout=8m（通过，1.301s）。
+- Worker 命令：GOPROXY=off GOSUMDB=off go test ./internal/worker -run 'CloudDSHWorkerPlanToolDispatchAndPersistencePath|ConversationRoute|InternalTool' -count=1 -timeout=8m（通过，2.188s）。
+- Connector 命令：GOPROXY=off GOSUMDB=off go test ./internal/mcpconnector -run 'BuiltinSearch' -count=1 -timeout=8m（通过，1.972s）。
+- 本机 PostgreSQL 16.15 隔离环境的 11 项路由、追问、跨 Task 依赖、计划 replay 与 Hub command 依赖集成组通过（13.046s）。命令使用 CH_TEST_DATABASE_URL=<独立 loopback DSN> GOPROXY=off GOSUMDB=off go test ./internal/store/postgres -run '^(TestConversationRouteStatusReadsTaskWithoutCreatingOrStopping|TestConversationRouteStatusWithoutExplicitReferencePersistsAuthorizedTarget|TestConversationRouteJoinWaitsOnOriginalRequestWithoutCreatingTask|TestConversationRouteJoinAppendsRequirementsToActiveTaskRevision|TestConversationRouteJoinRevalidatesAuthorizationSnapshotUnderLock|TestConcurrentConversationRouteJoinsReclassifyAndPreserveBothRevisions|TestConversationRouteJoinRejectsDifferentExecutionScope|TestConversationRouteJoinRejectsTargetFromDifferentConversation|TestConversationRouteTaskDependencyWaitsForAndReceivesExactResult|TestPostgresCloudDSHTaskPlanPersistsReplaysAndFencesRevisions|TestPostgresTaskPlanStepHubCommandDispatchBindsAtomicallyAndChecksDependencies)$' -count=1 -timeout=12m。首轮发现迁移 00251 重建 task_plan_step_execution_bindings_check 时遗漏 hub_operation；新迁移 00254_task_plan_hub_binding_constraint_repair.sql 恢复约束分支后，单项和完整 11 项重跑通过。该迁移未部署。只使用独立临时库，未连接已有本地业务数据库。
+
+### 搜索工具链实证
+
+- 固定版本 mcp-searxng 2.10.0 → CloudDSHToolBroker → 本地 SearXNG 2026.11.5+3e95f6cd2：实际执行近一周新闻查询并得到来源，再经 morde_web_read 读取该来源。命令：CH_TEST_BUILTIN_SEARCH_SCRIPT=/Users/zhongxuan_li/Desktop/morde/deploy/single/search/node_modules/mcp-searxng/dist/cli.js GOPROXY=off GOSUMDB=off go test ./internal/app -run '^TestBuiltinSearchIntegrationWithLocalSearxng$' -count=1 -v -timeout=3m。TestBuiltinSearchIntegrationWithLocalSearxng 通过（4.48s），同时检查工具操作持久化与安全回放。
+- 返回文章来自 The Motley Fool，文章 URL 与页面 metadata 显示 2026-11-25 候选日期。页面将该日期标为 unverified；没有真实模型/DSH 做页面日期核对、新闻相关性判断及自然语言摘要，不能作为新闻体验已通过。
+- 直接搜索引擎不稳定：Google News 有 access denied、Bing News 超时、Reuters 有 HTTP error；DuckDuckGo News 加 week 范围返回零结果，不加范围曾返回 2024 年旧条目。不得为了出结果静默去掉时间范围或编造新闻。
+- 严格 TLS 检查未使用跳过验证选项：Google Search HTTP 200、Google News RSS 可读、Reuters 返回 401，均通过 TLS 验证；DuckDuckGo/Brave 在 TLS 握手前超时。当前证据不支持“CA 证书错误”结论，问题更符合网络出口或搜索引擎访问限制。保留证书校验。
+
+### 体验验收结论与范围
+
+- 普通回复、不创建 Task，及追问按授权候选、任务修订选择目标，有本地 App/Worker/PostgreSQL 证据；真实 PC + DSH 语义和消息账本结果未验证。
+- Task plan 的 Brief、revision、执行依赖及 Hub dispatch 在本地集成组验证；真实 DSH checkpoint 恢复和 PC 复杂计划仍待验。追问现场 settled decision 的 Task ID/revision 也仍缺权威 PC 证据。
+- 本机 Portal/DSH/Guardian 未运行；本步骤没有启动实际 PC、连接远端、修改远端或部署迁移。真实搜索源可读取但新闻日期与摘要质量未验证。步骤 2 保持部分完成；M02-15、M02-16、B02-0 均不勾选。

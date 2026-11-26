@@ -1069,6 +1069,12 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .chat-message-row-assistant .chat-message-body { flex: 1; max-width: 620px; }
 .assistant-page .chat-message { max-width: none; padding: 11px 16px; border: 0; color: #344052; font-size: 14px; line-height: 1.7; }
 .assistant-page .chat-message-user { position: relative; border-radius: 17px 17px 5px 17px; background: #dcecff; color: #263b55; }
+.assistant-page .chat-message-user-collapsed { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 14; overflow: hidden; }
+.assistant-page .chat-message-expand { margin-top: 1.9em; padding: 0; display: inline-flex; align-items: center; gap: 7px; border: 0; color: #1d4ed8; background: transparent; font: inherit; font-size: .9em; font-weight: 600; cursor: pointer; }
+.assistant-page .chat-message-expand:hover { text-decoration: underline; }
+.assistant-page .chat-message-expand:focus-visible { outline: 2px solid #9cafff; outline-offset: 2px; }
+.chat-message-expand-chevron { width: 7px; height: 7px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: translateY(-2px) rotate(45deg); transition: transform .15s ease; }
+.chat-message-expand-chevron.is-expanded { transform: translateY(2px) rotate(225deg); }
 .assistant-page .chat-message-assistant { border-radius: 17px 17px 17px 5px; background: #f1f2f4; }
 .chat-thinking-row { align-items: center; }
 .thinking-bubble { padding: 10px 16px; display: inline-flex; align-items: center; border: 1px solid var(--line, #dbeafe); border-radius: 22px; background: #fff; }
@@ -1088,6 +1094,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-page .message-retry:disabled { cursor: wait; opacity: .55; }
 .assistant-page .chat-message:focus-visible { outline: 2px solid #9cafff; outline-offset: 2px; }
 .chat-message-meta { min-height: 24px; margin: 3px 2px 0; display: flex; align-items: center; justify-content: flex-end; gap: 8px; opacity: 0; visibility: hidden; transition: opacity .15s, visibility .15s; }
+.chat-message-row-assistant .chat-message-meta { justify-content: flex-start; }
 .chat-message-row:hover .chat-message-meta, .chat-message-row:focus-within .chat-message-meta { opacity: 1; visibility: visible; }
 .chat-message-time { color: #9aa6b5; font-size: 10px; }
 .chat-message-copy { width: 24px; height: 24px; padding: 4px; display: grid; place-items: center; border: 0; border-radius: 6px; color: #74839a; background: transparent; cursor: pointer; }

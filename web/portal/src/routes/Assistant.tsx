@@ -192,8 +192,19 @@ function canAnswerClarification(task: Task): boolean {
 }
 
 function UserMessageContent({ content, attachmentIDs = [] }: { content: string; attachmentIDs?: string[] }) {
+  const [expanded, setExpanded] = useState(false);
+  const isLong = content.length > 600 || content.split(/\r?\n/u).length > 8;
   return <>
-    <p>{content}</p>
+    <p className={isLong && !expanded ? 'chat-message-user-collapsed' : undefined}>{content}</p>
+    {isLong && <button type="button" className="chat-message-expand" aria-expanded={expanded} onClick={(event) => {
+      if (expanded) {
+        const message = event.currentTarget.closest('.chat-message');
+        window.requestAnimationFrame(() => message?.scrollIntoView({ behavior: 'smooth', block: 'start' }));
+      }
+      setExpanded((value) => !value);
+    }}>
+      {expanded ? '收起' : '显示更多'}<span className={`chat-message-expand-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true" />
+    </button>}
     {attachmentIDs.length > 0 && <small className="chat-message-attachments">附件 · {attachmentIDs.length}
       {attachmentIDs.map((attachmentID, attachmentIndex) => <span key={attachmentID}> · <a
         href={`/api/personal-data/attachments/${encodeURIComponent(attachmentID)}`} download>下载附件 {attachmentIndex + 1}</a></span>)}

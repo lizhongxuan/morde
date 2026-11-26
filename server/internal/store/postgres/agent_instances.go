@@ -1366,12 +1366,22 @@ WHERE task_id=$1 AND owner_id=$2 AND agent_instance_id=$3 AND agent_generation=$
 
 func isTaskWorkspaceVerificationOperation(operation task.Operation) bool {
 	parts := strings.Split(operation.Key, ":")
-	if len(parts) != 5 || parts[0] != "agent" || parts[1] != "verify" ||
-		!domain.ValidStepID(parts[2]) || !domain.ValidWorkspaceID(parts[3]) ||
-		operation.WorkspaceID != parts[3] {
+	var stepID, workspaceID, bindingVersionValue string
+	switch {
+	case len(parts) == 6 && parts[0] == "agent" && parts[1] == "verify" && parts[2] == "v2":
+		stepID, workspaceID, bindingVersionValue = parts[3], parts[4], parts[5]
+	case len(parts) == 5 && parts[0] == "agent" && parts[1] == "verify":
+		// Keep recognizing the original key while persisted operations from an
+		// older runtime may still need completion-time output verification.
+		stepID, workspaceID, bindingVersionValue = parts[2], parts[3], parts[4]
+	default:
 		return false
 	}
-	bindingVersion, err := strconv.ParseInt(parts[4], 10, 64)
+	if !domain.ValidStepID(stepID) || !domain.ValidWorkspaceID(workspaceID) ||
+		operation.WorkspaceID != workspaceID {
+		return false
+	}
+	bindingVersion, err := strconv.ParseInt(bindingVersionValue, 10, 64)
 	return err == nil && bindingVersion > 0 && operation.BindingVersion == bindingVersion
 }
 

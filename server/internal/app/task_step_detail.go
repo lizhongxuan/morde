@@ -700,13 +700,22 @@ func taskToolInputSummary(name, rawArguments string) string {
 		arguments, _, err := builtinSearchArguments(name, rawArguments)
 		if err == nil {
 			var input struct {
-				Query     json.RawMessage `json:"query"`
-				TimeRange json.RawMessage `json:"time_range"`
+				Query      json.RawMessage `json:"query"`
+				TimeRange  json.RawMessage `json:"time_range"`
+				Categories json.RawMessage `json:"categories"`
 			}
 			if json.Unmarshal(arguments, &input) == nil {
 				if query := decodeSafeString(input.Query, 512); query != "" {
+					newsCategory := decodeSafeString(input.Categories, 16) == "news"
 					if timeRange := decodeSafeString(input.TimeRange, 16); timeRange != "" {
-						return "Search query: " + query + " (time range: " + timeRange + ")."
+						details := []string{"time range: " + timeRange}
+						if newsCategory {
+							details = append([]string{"category: news"}, details...)
+						}
+						return "Search query: " + query + " (" + strings.Join(details, "; ") + ")."
+					}
+					if newsCategory {
+						return "Search query: " + query + " (category: news)."
 					}
 					return "Search query: " + query
 				}

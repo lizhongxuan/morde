@@ -152,17 +152,23 @@ func validBuiltinSearchArguments(name string, arguments json.RawMessage) bool {
 			return false
 		}
 	} else {
-		if len(input) < 1 || len(input) > 2 {
+		if len(input) < 1 || len(input) > 3 {
 			return false
 		}
 		for argument := range input {
-			if argument != "query" && argument != "time_range" {
+			if argument != "query" && argument != "time_range" && argument != "categories" {
 				return false
 			}
 		}
 		if rawTimeRange, ok := input["time_range"]; ok {
 			var timeRange string
 			if json.Unmarshal(rawTimeRange, &timeRange) != nil || (timeRange != "day" && timeRange != "week" && timeRange != "month" && timeRange != "year") {
+				return false
+			}
+		}
+		if rawCategories, ok := input["categories"]; ok {
+			var categories string
+			if json.Unmarshal(rawCategories, &categories) != nil || categories != "news" {
 				return false
 			}
 		}

@@ -6,12 +6,21 @@
 
 **设计与交接：**按[多 Agent 与共享资源](<01-复杂链路设计与交接.md#agents-tools>)绑定父子身份、工具摘要与资源互斥；按[受控 Skill 设计](<01-复杂链路设计与交接.md#memory-skill>)核对来源版本和动态提供方式，不把模型选择或 Skill 当作授权。
 
-- [ ] **B02-0 普通问答、新闻搜索、追问续接与任务计划优先闭环（进行中）。**先于两个子 Agent 协作实现和验收这四类主链路：普通问答使用直接回复，不创建 Task 或要求选择 Host；新闻请求使用当前授权的只读搜索 / 阅读工具，核验来源与日期并区分搜索失败；追问按同一会话内经授权的 Task 与当前修订续接，不能重复建任务或误续接；复杂请求按需创建和更新计划，服务端校验 Task、计划、授权和来源，简单问答及单次搜索不强制建计划。已有局部实现与单测不代表真实模型、搜索配置或 PC/DSH 闭环通过。
-  - 验收：App / Store / Worker 定向回归覆盖四类流程及无 Task、无误续接、计划依赖拒绝；真实 DeepSeek 路由与搜索结果 / 来源验证单独记录；在实际 `morde-pc` 操作代表性流程，记录服务端实际状态。搜索未启用、PC 无法启动或历史 / Task 关联证据不足时明确待验，不用预置文案代替实际结果。四项闭环完成后再开始 B02-1 / B02-6 的两个子 Agent 协作。
+- [ ] **B02-0 普通问答、新闻搜索、追问续接与任务计划优先闭环（进行中）。**先收口这四类主链路：普通问答使用直接回复，不创建 Task 或要求选择 Host；新闻请求使用当前授权的只读搜索 / 阅读工具，明确传入新闻分类，核验来源与日期并区分搜索失败；追问按同一会话内经授权的 Task 与当前修订续接，不能重复建任务或误续接；复杂请求按需创建和更新计划，服务端校验 Task、计划、授权和来源，简单问答及单次搜索不强制建计划。已有局部实现与单测不代表真实模型、远端配置或 PC/DSH 闭环通过。
+  - 验收：App / Store / Worker 定向回归覆盖四类流程及无 Task、无误续接、计划依赖拒绝；真实 DeepSeek 路由与搜索结果 / 来源验证单独记录；在实际 `morde-pc` 操作代表性流程，记录服务端实际状态。新闻查询使用 `category=news` 及所需时间范围；近期搜索不得在无结果时静默移除时间范围，也不得把栏目首页或过期条目冒充近期新闻。服务不可用、PC 无法启动或历史 / Task 关联证据不足时明确待验，不用预置文案代替实际结果。B02-1 / B02-6 只依赖各自所需的 B01/A 身份、Task、计划和结算合同稳定；网络出口或 PC/真实 DSH 验收阻塞不阻止相互独立的代码开发。当前按用户要求只执行步骤 2，不启动后续任务。
   - **本地验证（2026-11-26）：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run 'ConversationRoute|TaskPlan|BuiltinSearch' -count=1 -timeout=8m` 通过（0.881s）；`go test ./internal/worker -run 'CloudDSHWorkerPlanToolDispatchAndPersistencePath|ConversationRoute|InternalTool' -count=1 -timeout=8m` 通过（2.108s）。既有定向用例覆盖普通问答不预留 Task、只读搜索路由、授权候选续接、计划 Brief / 来源 / 依赖校验。Worker 计划回归使用 scripted ModelClient，只证明 Worker→Broker 分发及计划持久化，不证明生产模型会按语义选择工具。`go test ./internal/domain/task -count=1 -timeout=8m`、`go test ./internal/mcpconnector -run 'BuiltinSearch' -count=1 -timeout=8m`、`go test ./internal/config -run 'BuiltinSearch' -count=1 -timeout=8m` 及 `npm --prefix deploy/single/search run test:morde-patches` 通过（日期补丁 10/10）；本项 TODO 与计划测试 fixture 的 `git diff --check` 通过。
-  - **实际 PC（2026-11-26）：**用 `make pc` 启动并操作源码 `morde-pc`。普通问答 `2+2` 得到 `4`；本地路由测试证明 taskless 分支，但这次 PC 会话未从权威账本核实无 Task / Host。实际新闻请求因搜索工具未返回已确认结果而停止，未伪造来源。向尚未确认计划的任务询问状态，PC 回答任务等待用户处理、0 成功 / 0 失败 / 0 取消 / 1 未确认，原因为 `reconciliation_required`，且没有重试或新建任务；答复与当前界面状态相符，但 Task ID / revision 的权威关联尚未核实。复杂计划请求的 PC Task 因 `The previous cloud task checkpoint could not be reconciled safely.` 停在 reconciliation，计划正文没有交付，不能计为通过。
-  - **搜索服务验证及待验：**`scripts/setup-builtin-search.sh` 在本机启动固定版 SearXNG `2026.11.5+3e95f6cd2`，JSON health check 通过；但 `TestBuiltinSearchWithLocalSearxng` 对 `latest AI news` 返回 `isError=true`、无来源链接。直接查询 SearXNG 得 0 条结果，`brave` 超时、DuckDuckGo / Google CSE TLS 验证失败；本机及测试主机对 DuckDuckGo 的 HTTPS 连接均超时。已停止本机临时容器。测试主机只读配置明确 `cloud_dsh.builtin_search.enabled: false`，容器未安装、8189 不可达；本轮不部署或重启远端服务，避免干扰同一测试机上的 C-01 隔离候选联测。新闻搜索须等外网搜索出口 / TLS 配置可用、再配置远端服务后做 PC 来源验收。
-  - **计划与后续顺序：**计划恢复需 C-01 核查 checkpoint / Task 关联并重验；追问仍需权威 Task ID / revision 关联证据。故 B02-0 保持进行中，B02-1 / B02-6 的产品子 Agent 协作仍未开始。
+  - **此前实际 PC（2026-11-26 快照）：**用 `make pc` 启动并操作源码 `morde-pc`。普通问答 `2+2` 得到 `4`；本地路由测试证明 taskless 分支，但这次 PC 会话未从权威账本核实无 Task / Host。实际新闻请求因搜索工具未返回已确认结果而停止，未伪造来源。向尚未确认计划的任务询问状态，PC 回答任务等待用户处理、0 成功 / 0 失败 / 0 取消 / 1 未确认，原因为 `reconciliation_required`，且没有重试或新建任务；答复与当前界面状态相符，但 Task ID / revision 的权威关联尚未核实。复杂计划请求的 PC Task 因 `The previous cloud task checkpoint could not be reconciled safely.` 停在 reconciliation，计划正文没有交付，不能计为通过。本次步骤 2 复核没有启动 PC；上方最新复核说明当前待验项。
+  - **早期搜索服务验证及待验：**`scripts/setup-builtin-search.sh` 在本机启动固定版 SearXNG `2026.11.5+3e95f6cd2`，JSON health check 通过；但 `TestBuiltinSearchWithLocalSearxng` 对 `latest AI news` 返回 `isError=true`、无来源链接。直接查询 SearXNG 得 0 条结果，`brave` 超时、DuckDuckGo / Google CSE 的一次性 TLS 探测失败（根因未证实；下方最新严格 HTTPS 检查未证实 CA 校验错误）；本机及测试主机对 DuckDuckGo 的 HTTPS 连接均超时。此次启动的本地临时容器已停止。此前对测试主机只读检查称 `cloud_dsh.builtin_search.enabled: false`、容器未安装且 8189 不可达；这些是历史环境记录，本轮没有连接或检查远端。最新本地搜索证据与出口限制见下方。
+  - **计划与后续顺序：**计划恢复仍需 C-01 核查 checkpoint / Task 关联并重验；追问仍需 PC/真实模型的权威 Task ID / revision 关联证据。B02-0 保持进行中。搜索环境和 PC/DSH 只阻塞相应的真实端到端验收；B02-1 / B02-6 的独立实现可在各自接口合同稳定后继续，本步骤不会启动它们。
+
+### 2026-11-26 步骤 2 最新复核
+
+- **新闻工具本地修复：**之前 `morde_web_search` 没有新闻分类参数，真实查询会返回出版社栏目首页。现在模型合同增加唯一允许值 `category="news"`，只在 Broker 边界映射为 SearXNG `categories="news"`；路由持久化保留 Morde 原始参数，避免映射后再次校验失败。普通网页搜索不传分类时仍保持原行为；不接受其他分类。任务工作项摘要现在会显示“category: news”。对应实现：`cloud_dsh_mcp_builtin.go:cloudDSHBuiltinSearchDefinitions/builtinSearchArguments`、`conversation_route_decision.go:conversationRouteDirectToolInstructions/parseConversationRouteDecision`、`mcpconnector/builtin_search.go:validBuiltinSearchArguments`、`task_step_detail.go:taskToolInputSummary`。
+- **定向自动化：**App `ConversationRoute|TaskPlan|BuiltinSearch|TaskToolInputSummary` 组通过（1.301s）；Worker `CloudDSHWorkerPlanToolDispatchAndPersistencePath|ConversationRoute|InternalTool` 组通过（2.188s）；`mcpconnector` `BuiltinSearch` 本地合同组通过（1.972s）。覆盖新闻参数验证/映射、分类路由原文持久化、普通问答与 route、Task Plan 及 Worker 分发。上述均不证明真实模型自己选对工具或给出正确总结。
+- **真实搜索/来源读取（本机受控 SearXNG，非远端配置）：**固定版 `mcp-searxng 2.10.0` → `CloudDSHToolBroker` → 本地 SearXNG `2026.11.5+3e95f6cd2`，实际用 `category=news,time_range=week` 搜索 `artificial intelligence news`；随后 `morde_web_read` 读取搜索结果页面。App 集成测试通过（4.48s），任务操作已持久化并能按 checkpoint 安全回放；来源为 The Motley Fool 的 AI 股票文章，URL 日期段和页面日期元数据候选均为 `2026-11-25`。元数据明确标记“unverified”，因此只证明页面可读和候选可取，不证明模型已核验页面展示日期、相关性或完成用户级新闻摘要。
+- **搜索环境与 TLS：**同一新闻引擎曾返回 `Search Degraded`：Google News access denied、Bing News timeout、Reuters HTTP error；DuckDuckGo News 的周范围请求返回 0 条，无时间范围时曾混入 2024 年 Wikinews 结果，所以不得无过滤回退。主机直接 HTTPS 严格验证结果：Google Search 200、Google News RSS 最终可读、Reuters 401 均为 `tls_verify=0`；DuckDuckGo 与 Brave 在 TLS 握手前连接超时。未关闭证书校验；问题是出口/引擎可用性与授权响应，不是已证实的 CA 失败。新闻服务有波动，单次通过不能保证长期可用。
+- **追问与计划 PostgreSQL：**独立本机 PostgreSQL 16.15，步骤 2 定向 11 项通过（13.046s）：覆盖状态查询绑定授权 Task、无新 Task/无停止，join 关联与并发、跨 Task 依赖、计划 revision replay，以及 Hub command 依赖绑定。初跑发现迁移 `00251` 重建约束时漏回 `hub_operation` 分支，使计划内 Hub dispatch 被拒；新增 `00254_task_plan_hub_binding_constraint_repair.sql`，单项和完整 11 项复验通过。该修复未部署，真实 DSH Task 恢复与实际 PC 计划仍未验。
+- **仍待验：**实际 `morde-pc` 与本地 Portal/DSH 未启动；本机 `7080/7180` 无 Portal listener，本步骤未连接远端或操作远端数据。源码 PC 旧观察中的计划 checkpoint reconciliation、PC 追问的权威 Task/revision 绑定未被本地测试解决。单步搜索当前由工具结果直接形成对话文本，真实 DSH 的日期核验与自然语言摘要未验；因此 B02-0 不勾选，B02-1/6 代码工作不受搜索网络阻塞。
 
 - [ ] **B02-1 真实协作与结果汇总。**复用 DSH 委派及 root → coordinator → worker 的既有能力；独立子任务可并行，有依赖的步骤依真实结果衔接，权限不超过父级。
   - 验收：T09–T12 覆盖两层深度、两 worker 实际时间重叠、同一 GUI / 冲突写入不无序并发、成功 / 失败 / unknown 逐级汇总、取消目标不影响独立任务和 checkpoint 恢复；真实 PC + 模型由 E/A 共同核验 T10/T43。
@@ -45,10 +54,10 @@
 
 记录父子身份 / 授权与工具集合合同、Skill 输入输出、C/A 的实现请求、测试命令和真实模型 / PC 未验项。
 
-### 2026-11-26 B-02 TODO 联合审计
+### 2026-11-26 B-02 TODO 联合审计（本轮步骤 2 验证前快照；最新状态见下方）
 
-- **B02-0 进行中。**普通问答在源码 PC 曾收到 `2+2 → 4`，但未从权威账本确认这次会话没有创建 Task/选择 Host；新闻搜索未得到可核验来源；追问没有现场 settled decision 的目标 Task/revision 证据；复杂计划在 checkpoint reconciliation 停止。四项未闭环前，按用户要求不开始 B02-1/B02-6 的子 Agent 协作验收。
-- **B02-1 未完成。**本地父级工具子集、会话隔离与 App/Worker 路径回归通过；仍缺真实两个 worker 的时间重叠、冲突资源协调、子结果逐级汇总及 PC/真实 DSH 证据。
+- **B02-0 当时进行中。**普通问答在源码 PC 曾收到 `2+2 → 4`，但未从权威账本确认这次会话没有创建 Task/选择 Host；当时新闻搜索未得到可核验来源；追问没有现场 settled decision 的目标 Task/revision 证据；复杂计划在 checkpoint reconciliation 停止。新闻工具链后来已补本地受控搜索和来源读取证据，但真实模型/PC 体验仍待验；详见下方“步骤 2 最新复核”。这里保留的是此前快照，不代表本轮最终状态。
+- **B02-1 未完成。**本地父级工具子集、会话隔离与 App/Worker 路径回归通过；仍缺真实两个 worker 的时间重叠、冲突资源协调、子结果逐级汇总及 PC/真实 DSH 证据。是否启动后续并行任务按用户的步骤安排执行；本轮未开始。
 - **B02-2 未完成。**64 项工具定义上限与重复调用提醒已做定向回归；预算及必需工具仲裁、重启后的工具集一致性、底层取消确认和 unknown 副作用不重放仍待验。
 - **B02-3 未完成。**受控 Skill 读取不等于候选审批、启用、撤销及跨账号/Task 隔离；且依赖 B02-1/2 和 C-02 R09。
 - **B02-4 未完成。**缺少可运行 R16 Skill 合同交接与 A-02 协作/资源验收交接记录；等待 B02-3 合同稳定。

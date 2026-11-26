@@ -51,7 +51,8 @@ func buildAgentMessageReference(fence app.AgentCheckpointFence, conversationID, 
 	}
 	if !domain.ValidMessageID(messageID) || !domain.ValidConversationID(conversationID) || messageSequence < 1 || taskRevision < 0 ||
 		(mode != app.AgentMessageDeliverySteer && mode != app.AgentMessageDeliveryFollowup) ||
-		len(content) < 1 || len(content) > app.MaxConversationMessageBytes || !utf8.ValidString(content) || strings.ContainsRune(content, '\x00') {
+		len(content) > app.MaxConversationMessageBytes || len(content) == 0 && len(attachmentIDs) == 0 ||
+		!utf8.ValidString(content) || strings.ContainsRune(content, '\x00') {
 		return app.AgentMessageReferenceEnvelope{}, nil, domain.NewError(domain.CodeInvalidState, "message source is invalid")
 	}
 	if attachmentIDs == nil {
@@ -93,6 +94,9 @@ type agentMessageSourcePage struct {
 }
 
 func agentMessageSourcePages(content string) []agentMessageSourcePage {
+	if content == "" {
+		return []agentMessageSourcePage{}
+	}
 	pages := make([]agentMessageSourcePage, 0, len(content)/app.MaxConversationMessageChunkBytes+1)
 	pageStartByte, pageBytes := 0, 0
 	pageStartRune, pageRunes := int64(0), 0
@@ -492,7 +496,10 @@ WHERE message_id=$1 AND task_id=$2 AND owner_id=$3 AND agent_generation=$6 AND r
 
 func validAgentMessageSourceDigestFields(contentBytes int64, sourceDigest []byte, manifestVersion int, manifestDigest []byte,
 	representationVersion int, representationDigest, attachmentDigest []byte, representationKind string) bool {
-	return contentBytes > 0 && contentBytes <= app.MaxConversationMessageBytes && len(sourceDigest) == sha256.Size &&
+	emptyAttachmentListDigest := sha256.Sum256([]byte("[]"))
+	validContentSize := contentBytes > 0 && contentBytes <= app.MaxConversationMessageBytes ||
+		contentBytes == 0 && len(attachmentDigest) == sha256.Size && !bytes.Equal(attachmentDigest, emptyAttachmentListDigest[:])
+	return validContentSize && len(sourceDigest) == sha256.Size &&
 		manifestVersion == app.AgentMessageManifestVersion && len(manifestDigest) == sha256.Size &&
 		representationVersion == app.AgentMessageReferenceEnvelopeVersion && len(representationDigest) == sha256.Size &&
 		len(attachmentDigest) == sha256.Size && (representationKind == "inline" || representationKind == "reference")

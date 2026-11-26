@@ -808,6 +808,8 @@ func (h *ShellHandler) command(args shellArguments, workspaceDir *os.File, jailW
 type shellGoStageResult struct {
 	stdout          *boundedBuffer
 	stderr          *boundedBuffer
+	visibleStdout   *boundedBuffer
+	visibleStderr   *boundedBuffer
 	exitCode        int
 	timedOut        bool
 	clean           bool
@@ -817,6 +819,26 @@ type shellGoStageResult struct {
 
 const maxTrustedGoPackages = 256
 const maxTrustedGoTestSources = 4096
+const maxTrustedGoCaptureBytes = 8 << 20
+
+func newShellGoStageResult(visibleLimit, captureLimit int) shellGoStageResult {
+	captureBudget := &outputBudget{limit: captureLimit}
+	visibleBudget := &outputBudget{limit: visibleLimit}
+	return shellGoStageResult{
+		stdout:        &boundedBuffer{limit: captureLimit, budget: captureBudget},
+		stderr:        &boundedBuffer{limit: captureLimit, budget: captureBudget},
+		visibleStdout: &boundedBuffer{limit: visibleLimit, budget: visibleBudget},
+		visibleStderr: &boundedBuffer{limit: visibleLimit, budget: visibleBudget},
+	}
+}
+
+func (stage shellGoStageResult) stdoutWriter() io.Writer {
+	return io.MultiWriter(stage.stdout, stage.visibleStdout)
+}
+
+func (stage shellGoStageResult) stderrWriter() io.Writer {
+	return io.MultiWriter(stage.stderr, stage.visibleStderr)
+}
 
 type goListError struct {
 	Err string
@@ -860,11 +882,14 @@ type goTestEventStats struct {
 
 func successfulTrustedGoStage(stage shellGoStageResult) bool {
 	return stage.exitCode == 0 && !stage.timedOut && stage.clean &&
-		!stage.stdoutTruncated && !stage.stderrTruncated
+		!stage.stdoutTruncated && !stage.stderrTruncated && !stage.stdout.truncated && !stage.stderr.truncated
 }
 
 func parseTrustedGoVersion(stdout, stderr string, exitCode int, stdoutTruncated, stderrTruncated, clean bool) (string, bool) {
 	if exitCode != 0 || stdoutTruncated || stderrTruncated || !clean || strings.TrimSpace(stderr) != "" {
+		return "", false
+	}
+	if !strings.HasSuffix(stdout, "\n") {
 		return "", false
 	}
 	line := strings.TrimSuffix(stdout, "\n")
@@ -881,7 +906,7 @@ func parseTrustedGoVersion(stdout, stderr string, exitCode int, stdoutTruncated,
 			return "", false
 		}
 	}
-	return fields[2] + " " + fields[3], true
+	return line, true
 }
 
 func parseGoSourceInventory(output, jailWorkspace, jailCWD string) (goSourceInventory, string, int, bool) {
@@ -1124,13 +1149,21 @@ func parseGoTestRun(output string, discovered map[string]map[string]bool, source
 		if _, exists := source.all[event.Package]; !exists {
 			return nil, nil, stats, false
 		}
+		if packageTerminal[event.Package] != "" {
+			return nil, nil, stats, false
+		}
+		if event.Action == "start" {
+			if event.Test != "" || packageStarted[event.Package] {
+				return nil, nil, stats, false
+			}
+			packageStarted[event.Package] = true
+			continue
+		}
+		if !packageStarted[event.Package] {
+			return nil, nil, stats, false
+		}
 		if event.Test == "" {
 			switch event.Action {
-			case "start":
-				if packageStarted[event.Package] {
-					return nil, nil, stats, false
-				}
-				packageStarted[event.Package] = true
 			case "output":
 				line := strings.TrimSuffix(event.Output, "\n")
 				if !strings.HasSuffix(event.Output, "\n") || strings.Count(event.Output, "\n") != 1 || strings.Contains(event.Output, "\r") ||
@@ -1228,7 +1261,15 @@ func parseGoTestRun(output string, discovered map[string]map[string]bool, source
 			return nil, nil, stats, false
 		}
 	}
-	if !sameStringSet(mapKeysBool(packageTerminal), mapKeysBool(source.all)) {
+	packageTerminalIDs := make([]string, 0, len(packageTerminal))
+	for packagePath := range packageTerminal {
+		packageTerminalIDs = append(packageTerminalIDs, packagePath)
+	}
+	sourcePackageIDs := make([]string, 0, len(source.all))
+	for packagePath := range source.all {
+		sourcePackageIDs = append(sourcePackageIDs, packagePath)
+	}
+	if !sameStringSet(packageTerminalIDs, sourcePackageIDs) {
 		return nil, nil, stats, false
 	}
 	observedTestPackages := make(map[string]bool)
@@ -1368,8 +1409,8 @@ func (h *ShellHandler) goCommand(argv []string, workspaceDir *os.File, jailWorks
 func (h *ShellHandler) executeTrustedGoTest(ctx context.Context, request contract.ExecuteRequest, exactCommand string,
 	spec shellGoTestSpec, workspaceRoot *os.Root, workspaceDir *os.File, jailWorkspace, jailCWD, snapshotBefore string) (shellResult, *shellRunnerCoverageReceipt, error) {
 	noReceipt := func(stage shellGoStageResult) (shellResult, *shellRunnerCoverageReceipt, error) {
-		return shellResult{ExitCode: stage.exitCode, Stdout: stage.stdout.String(), Stderr: stage.stderr.String(),
-			StdoutTruncated: stage.stdoutTruncated, StderrTruncated: stage.stderrTruncated, TimedOut: stage.timedOut}, nil, nil
+		return shellResult{ExitCode: stage.exitCode, Stdout: stage.visibleStdout.String(), Stderr: stage.visibleStderr.String(),
+			StdoutTruncated: stage.visibleStdout.truncated, StderrTruncated: stage.visibleStderr.truncated, TimedOut: stage.timedOut}, nil, nil
 	}
 	run := func(name string, argv []string) (shellGoStageResult, error) {
 		return h.runTrustedGoStage(ctx, request.OperationID, name, argv, workspaceDir, jailWorkspace, jailCWD)
@@ -1439,8 +1480,8 @@ func (h *ShellHandler) executeTrustedGoTest(ctx context.Context, request contrac
 	if err != nil {
 		return shellResult{}, nil, err
 	}
-	result := shellResult{ExitCode: testStage.exitCode, Stdout: testStage.stdout.String(), Stderr: testStage.stderr.String(),
-		StdoutTruncated: testStage.stdoutTruncated, StderrTruncated: testStage.stderrTruncated, TimedOut: testStage.timedOut}
+	result := shellResult{ExitCode: testStage.exitCode, Stdout: testStage.visibleStdout.String(), Stderr: testStage.visibleStderr.String(),
+		StdoutTruncated: testStage.visibleStdout.truncated, StderrTruncated: testStage.visibleStderr.truncated, TimedOut: testStage.timedOut}
 	if !successfulTrustedGoStage(testStage) {
 		return result, nil, nil
 	}
@@ -1464,7 +1505,8 @@ func (h *ShellHandler) executeTrustedGoTest(ctx context.Context, request contrac
 		Version: 1, Runner: "go", RunnerVersion: version, ScopeMode: spec.ScopeMode,
 		ScopeContract:   "go_test_test_functions_only; examples/benchmarks/fuzz-target unsupported",
 		PackageSelector: spec.PackageSelector, TestSelector: spec.TestSelector,
-		ExactCommandSHA256: hex.EncodeToString(commandDigest[:]), TaskID: request.TaskID, WorkspaceID: request.WorkspaceID,
+		ExactCommandSHA256: hex.EncodeToString(commandDigest[:]), OperationID: request.OperationID,
+		TaskID: request.TaskID, WorkspaceID: request.WorkspaceID,
 		WorkspaceDirectory: request.WorkspaceDirectory, BindingVersion: request.BindingVersion,
 		WorkspaceViewID: request.WorkspaceViewID, WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision,
 		WorkspaceCWD: ".", WorkspaceSnapshotSHA256Before: snapshotBefore,
@@ -1481,7 +1523,7 @@ func (h *ShellHandler) executeTrustedGoTest(ctx context.Context, request contrac
 
 func (h *ShellHandler) runTrustedGoStage(ctx context.Context, operationID, stageName string, argv []string,
 	workspaceDir *os.File, jailWorkspace, jailCWD string) (shellGoStageResult, error) {
-	stage := shellGoStageResult{stdout: &boundedBuffer{limit: h.outputLimit}, stderr: &boundedBuffer{limit: h.outputLimit}}
+	stage := newShellGoStageResult(h.outputLimit, maxTrustedGoCaptureBytes)
 	if ctx.Err() != nil {
 		return stage, ErrShellOperationCancelled
 	}
@@ -1503,8 +1545,8 @@ func (h *ShellHandler) runTrustedGoStage(ctx context.Context, operationID, stage
 	command := h.goCommand(argv, workspaceDir, jailWorkspace, jailCWD)
 	command.Dir = string(filepath.Separator)
 	command.Env = []string{"PATH=/usr/bin:/bin"}
-	command.Stdout = stage.stdout
-	command.Stderr = stage.stderr
+	command.Stdout = stage.stdoutWriter()
+	command.Stderr = stage.stderrWriter()
 	group, err := os.Open(groupPath)
 	if err != nil {
 		h.mu.Unlock()
@@ -1537,27 +1579,26 @@ func (h *ShellHandler) runTrustedGoStage(ctx context.Context, operationID, stage
 	if ctx.Err() != nil {
 		stage.timedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
 	}
+	waitFailure := false
 	if waitErr != nil {
 		var exitErr *exec.ExitError
 		if errors.As(waitErr, &exitErr) {
 			stage.exitCode = exitErr.ExitCode()
 		} else {
-			return stage, ErrProcessDomainUnavailable
+			waitFailure = true
 		}
 	}
-	if ctx.Err() != nil {
-		stage.clean = false
+	populated, populatedErr := cgroupPopulated(filepath.Join(groupPath, "cgroup.events"))
+	stage.clean = populatedErr == nil && !populated && ctx.Err() == nil && !waitFailure
+	if populatedErr != nil || populated || ctx.Err() != nil || waitFailure {
+		h.killUntilEmpty(groupPath)
 	} else {
-		populated, populatedErr := cgroupPopulated(filepath.Join(groupPath, "cgroup.events"))
-		stage.clean = populatedErr == nil && !populated
-		if !stage.clean {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), maxStopCleanup)
+		cleanupErr := h.killAndWait(cleanupCtx, groupPath)
+		cancel()
+		if cleanupErr != nil {
+			stage.clean = false
 			h.killUntilEmpty(groupPath)
-		} else {
-			cleanupCtx, cancel := context.WithTimeout(context.Background(), maxStopCleanup)
-			if h.killAndWait(cleanupCtx, groupPath) != nil {
-				stage.clean = false
-			}
-			cancel()
 		}
 	}
 	stage.stdoutTruncated = stage.stdout.truncated
@@ -1569,6 +1610,9 @@ func (h *ShellHandler) runTrustedGoStage(ctx context.Context, operationID, stage
 		h.operations[operationID] = state
 	}
 	h.mu.Unlock()
+	if waitFailure {
+		return stage, ErrProcessDomainUnavailable
+	}
 	if ctx.Err() != nil && !stage.timedOut {
 		return stage, ErrShellOperationCancelled
 	}

@@ -999,14 +999,23 @@ describe('Assistant durable tasks', () => {
     expect(within(articles[1]!).getByRole('list').querySelectorAll('li')).toHaveLength(2);
   });
 
-  it('keeps long user messages complete without adding controls inside the bubble', async () => {
+  it('collapses long user messages and lets the user expand and collapse them', async () => {
     const content = '长消息内容'.repeat(150);
     mockCommon({ conversations: [conversation], messages: [{ ...message, content }] });
     renderPage();
 
     const article = await screen.findByRole('article', { name: '你的消息' });
     expect(within(article).getByText(content)).toBeInTheDocument();
-    expect(within(article).queryByRole('button')).not.toBeInTheDocument();
+    expect(within(article).getByText(content)).toHaveClass('chat-message-user-collapsed');
+    const user = userEvent.setup();
+    const expand = within(article).getByRole('button', { name: '显示更多' });
+    expect(expand).toHaveAttribute('aria-expanded', 'false');
+    await user.click(expand);
+    expect(within(article).getByText(content)).not.toHaveClass('chat-message-user-collapsed');
+    const collapse = within(article).getByRole('button', { name: '收起' });
+    expect(collapse).toHaveAttribute('aria-expanded', 'true');
+    await user.click(collapse);
+    expect(within(article).getByText(content)).toHaveClass('chat-message-user-collapsed');
     expect(within(article).queryByRole('status')).not.toBeInTheDocument();
   });
 

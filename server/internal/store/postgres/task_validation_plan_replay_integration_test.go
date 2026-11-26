@@ -233,17 +233,17 @@ WHERE task_id=$1 AND event_type='task.plan' ORDER BY sequence DESC LIMIT 1`, cur
 		t.Fatalf("persist explicit requirement manifest confirmation: %v", err)
 	}
 	confirmed := loadReplay(finalProof)
-	if confirmed.State != app.TaskValidationReplayPending || !confirmed.RequirementSetVerified ||
+	if confirmed.State != app.TaskValidationReplayPending || confirmed.RequirementSetVerified ||
 		!confirmed.FinalWorkspaceSnapshotVerified || confirmed.FinalWorkspaceSnapshotProof == nil || len(confirmed.Checks) != 1 ||
 		confirmed.Checks[0].ScopeMode != task.PlanVerificationScopeFullSuite || len(confirmed.Checks[0].RequirementIDs) != 1 ||
 		confirmed.Checks[0].RequirementIDs[0] != obligation.ID || confirmed.Checks[0].ActualCoverageVerified {
-		t.Fatalf("confirmed full-suite obligation mapped to its exact passing check = %+v; mapping and final snapshot should verify while actual runner coverage remains unknown and H07 pending", confirmed)
+		t.Fatalf("exact candidate confirmation must not establish requirement-set completeness = %+v; mapping/final snapshot should verify while runner coverage and independent completeness remain unavailable", confirmed)
 	}
 	coverageInventoryDigest := func(label string) string {
 		return hex.EncodeToString(hashBytes(label))
 	}
 	coverageReceipt := app.TaskValidationRunnerCoverageReceipt{
-		Version: 1, Runner: "go", RunnerVersion: "go version go1.25.3 linux/amd64",
+		Version: 1, OperationID: created.ID, Runner: "go", RunnerVersion: "go version go1.25.3 linux/amd64",
 		ScopeMode: string(task.PlanVerificationScopeFullSuite), ScopeContract: taskValidationRunnerCoverageScopeContract,
 		PackageSelector: "./...", ExactCommandSHA256: hex.EncodeToString(commandSHA[:]),
 		TaskID: current.Task.ID, WorkspaceID: workspaceValue.ID,
@@ -278,10 +278,10 @@ WHERE task_id=$1 AND event_type='task.plan' ORDER BY sequence DESC LIMIT 1`, cur
 		t.Fatalf("store independently verifiable Go runner coverage receipt: %v", err)
 	}
 	verifiedCoverage := loadReplay(finalProof)
-	if verifiedCoverage.State != app.TaskValidationReplayPass || !verifiedCoverage.RequirementSetVerified ||
+	if verifiedCoverage.State != app.TaskValidationReplayPending || verifiedCoverage.RequirementSetVerified ||
 		!verifiedCoverage.FinalWorkspaceSnapshotVerified || len(verifiedCoverage.Checks) != 1 ||
 		!verifiedCoverage.Checks[0].ActualCoverageVerified {
-		t.Fatalf("complete manifest, exact check mapping, runner package/test inventories and final snapshot = %+v; want H07 PASS", verifiedCoverage)
+		t.Fatalf("valid runner receipt and final snapshot still lack independent requirement completeness attestation: %+v; want actual coverage verified but H07 pending", verifiedCoverage)
 	}
 	for name, mutate := range map[string]func(*app.TaskValidationRunnerCoverageReceipt){
 		"package inventory differs": func(receipt *app.TaskValidationRunnerCoverageReceipt) {

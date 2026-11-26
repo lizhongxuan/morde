@@ -14,12 +14,9 @@ import (
 	"morde/server/internal/domain/task"
 )
 
-// TestPostgresTaskEventChainFactsAndReplay drives one complete fix task
-// through its event chain: raw events project to the nine semantic kinds,
-// the reviewed validation state and the published receipt supply the
-// verification and delivery entries, and the replayed chain runs from
-// head to tail.
-func TestPostgresTaskEventChainFactsAndReplay(t *testing.T) {
+// TestPostgresTaskEventChainRejectsUnboundValidationReviewAndReceipt ensures
+// a review row alone cannot provide verification facts or justify delivery.
+func TestPostgresTaskEventChainRejectsUnboundValidationReviewAndReceipt(t *testing.T) {
 	store, _ := newTemporaryStore(t)
 	ctx := context.Background()
 	owner := createPreRetirementTestUser(t, store, 4, 20_000, 40_000)
@@ -73,8 +70,8 @@ VALUES ($1,$2,0,5,$3,'reviewed',$4,
 	if err != nil {
 		t.Fatalf("chain facts after review: %v", err)
 	}
-	if facts != (app.TaskEventChainFacts{ValidationState: app.TaskValidationPass}) {
-		t.Fatalf("chain facts after review = %+v, want {PASS false}", facts)
+	if facts != (app.TaskEventChainFacts{}) {
+		t.Fatalf("unbound PASS review produced chain facts = %+v; want no validation or delivery facts", facts)
 	}
 	var serviceInstanceID string
 	if err := store.pool.QueryRow(ctx, `SELECT instance_id::text FROM service_identity WHERE singleton=true`).Scan(&serviceInstanceID); err != nil {
@@ -104,8 +101,8 @@ VALUES ($1,$2,$2,$3,$4,$5,0,5,$6,$7,1,'published',$8,1)`, batchID, owner.ID, con
 	if err != nil {
 		t.Fatalf("chain facts after publish: %v", err)
 	}
-	if facts != (app.TaskEventChainFacts{ValidationState: app.TaskValidationPass, Delivered: true}) {
-		t.Fatalf("chain facts after publish = %+v, want {PASS true}", facts)
+	if facts != (app.TaskEventChainFacts{Delivered: true}) {
+		t.Fatalf("unverified receipt chain facts = %+v, want delivery fact without a validation verdict", facts)
 	}
 	service, err := app.NewTaskEventChainService(store)
 	if err != nil {
@@ -115,11 +112,10 @@ VALUES ($1,$2,$2,$3,$4,$5,0,5,$6,$7,1,'published',$8,1)`, batchID, owner.ID, con
 	if err != nil {
 		t.Fatalf("replay chain: %v", err)
 	}
-	if !chain.Valid {
-		t.Fatalf("complete fix chain must be valid, reasons: %v", chain.InvalidReasons)
+	if chain.Valid {
+		t.Fatal("published result without bound validation evidence produced a valid event chain")
 	}
-	wantKinds := []task.EventKind{task.EventKindCreated, task.EventKindSplit, task.EventKindDispatched,
-		task.EventKindExecution, task.EventKindVerification, task.EventKindDelivery}
+	wantKinds := []task.EventKind{task.EventKindCreated, task.EventKindSplit, task.EventKindDispatched, task.EventKindExecution}
 	if len(chain.Entries) != len(wantKinds) {
 		t.Fatalf("chain entries = %d, want %d: %+v", len(chain.Entries), len(wantKinds), chain.Entries)
 	}
@@ -127,6 +123,21 @@ VALUES ($1,$2,$2,$3,$4,$5,0,5,$6,$7,1,'published',$8,1)`, batchID, owner.ID, con
 		if chain.Entries[index].Kind != want {
 			t.Fatalf("chain entry %d kind = %q, want %q", index, chain.Entries[index].Kind, want)
 		}
+	}
+	for _, entry := range chain.Entries {
+		if entry.Kind == task.EventKindVerification || entry.Kind == task.EventKindDelivery {
+			t.Fatalf("unbound PASS review supplied synthetic chain entry: %+v", entry)
+		}
+	}
+	foundUnverifiedDelivery := false
+	for _, reason := range chain.InvalidReasons {
+		if reason == "delivered without passing verification" {
+			foundUnverifiedDelivery = true
+			break
+		}
+	}
+	if !foundUnverifiedDelivery {
+		t.Fatalf("unverified delivery invalid reason missing: %v", chain.InvalidReasons)
 	}
 	if len(chain.UnmappedSequences) != 1 || chain.UnmappedSequences[0] != 5 {
 		t.Fatalf("unmapped sequences = %v, want [5]", chain.UnmappedSequences)

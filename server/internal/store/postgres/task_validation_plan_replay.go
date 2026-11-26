@@ -19,7 +19,6 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
-	"morde/server/internal/store/postgres/sqlcgen"
 )
 
 type taskValidationReplayTask struct {
@@ -135,11 +134,10 @@ func loadTaskValidationPlanCheckReplay(ctx context.Context, tx pgx.Tx, claim app
 	if evidence == nil {
 		return nil, nil
 	}
-	requirementsVerified, err := taskValidationPlanRequirementManifestVerified(ctx, tx, claim, plan, current)
-	if err != nil {
-		return nil, err
-	}
-	evidence.RequirementSetVerified = requirementsVerified
+	// No trusted source-completeness and semantic-attestation writer exists
+	// yet. The exact-digest candidate confirmation is not sufficient to assert
+	// that the plan covers every explicit requirement, so H07 must stay pending.
+	evidence.RequirementSetVerified = false
 	checkIDs := make([]string, 0, len(plan.Steps))
 	for _, step := range plan.Steps {
 		if step.VerificationCheck != nil {
@@ -349,7 +347,8 @@ const taskValidationRunnerCoverageScopeContract = "go_test_test_functions_only; 
 func validTaskValidationRunnerCoverageReceipt(receipt *app.TaskValidationRunnerCoverageReceipt,
 	check task.PlanVerificationCheck, claim app.TaskValidationReviewClaim, current taskValidationReplayTask,
 	row taskValidationReplayBinding, shell taskValidationReplayShellResult) bool {
-	if receipt == nil || check.Kind != task.PlanVerificationCheckTest || receipt.Version != 1 || receipt.Runner != "go" ||
+	if receipt == nil || check.Kind != task.PlanVerificationCheckTest || receipt.Version != 1 ||
+		receipt.OperationID == "" || receipt.OperationID != row.executionID || receipt.Runner != "go" ||
 		!validGoRunnerVersion(receipt.RunnerVersion) || receipt.ScopeContract != taskValidationRunnerCoverageScopeContract ||
 		receipt.ScopeMode != string(check.ScopeMode) || !receipt.ParserComplete ||
 		receipt.TaskID != claim.TaskID || receipt.WorkspaceID != current.workspaceID ||
@@ -386,7 +385,7 @@ func validTaskValidationRunnerCoverageReceipt(receipt *app.TaskValidationRunnerC
 		const selectorPrefix = "go test -run=^"
 		targetPackage := strings.TrimPrefix(receipt.PackageSelector, "./")
 		if !strings.HasPrefix(check.Command, selectorPrefix) || len(check.CoveragePaths) != 1 || len(check.Selectors) != 1 ||
-			!strings.HasPrefix(receipt.PackageSelector, "./") || targetPackage == "." || path.Clean(targetPackage) != targetPackage ||
+			!strings.HasPrefix(receipt.PackageSelector, "./") || path.Clean(targetPackage) != targetPackage ||
 			strings.HasPrefix(targetPackage, "../") || strings.Contains(targetPackage, "...") || targetPackage != check.CoveragePaths[0] {
 			return false
 		}
@@ -586,68 +585,6 @@ WHERE file.workspace_id=$1 AND file.file_path=$2 AND file.valid_from_revision<=$
 	default:
 		return false, nil
 	}
-}
-
-func taskValidationPlanRequirementManifestVerified(ctx context.Context, tx pgx.Tx,
-	claim app.TaskValidationReviewClaim, plan task.Plan, current taskValidationReplayTask) (bool, error) {
-	manifest := plan.RequirementManifest
-	if manifest == nil {
-		return false, nil
-	}
-	digest, err := plan.RequirementManifestDigest()
-	if err != nil || digest != manifest.Digest {
-		return false, nil
-	}
-	for _, obligation := range manifest.Obligations {
-		verified, err := taskValidationRequirementSourceVerified(ctx, tx, claim, current, obligation.Source)
-		if err != nil || !verified {
-			return false, err
-		}
-	}
-	planEventSequence, err := latestTaskValidationPlanEventSequence(ctx, tx, claim.TaskID, claim.TaskRevision, plan.Revision)
-	if err != nil || planEventSequence < 1 {
-		return false, err
-	}
-	confirmation, found, err := readTaskRequirementManifestConfirmationForPlan(ctx, tx, claim.OwnerID,
-		claim.TaskID, claim.TaskRevision, plan.Revision, planEventSequence, current.authVersion, digest)
-	if err != nil || !found {
-		return false, err
-	}
-	if !domain.ValidUserID(confirmation.ConfirmedByUserID) ||
-		!validTaskRequirementConfirmationPrincipalKind(confirmation.ConfirmedByPrincipalKind) || confirmation.ConfirmedAt.IsZero() {
-		return false, nil
-	}
-	row, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: claim.TaskID, OwnerID: claim.OwnerID})
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("read current Task authorization for H07 requirement confirmation: %w", err)
-	}
-	if row.AuthVersion != confirmation.TaskAuthorizationVersion || row.CurrentRevision != claim.TaskRevision ||
-		row.DesiredRevision != claim.TaskRevision {
-		return false, nil
-	}
-	authorized, err := requireCurrentTaskAuthorization(ctx, tx, row)
-	if err != nil || !authorized {
-		return false, err
-	}
-	return true, nil
-}
-
-func latestTaskValidationPlanEventSequence(ctx context.Context, tx pgx.Tx, taskID string,
-	taskRevision, planRevision int64) (int64, error) {
-	var sequence int64
-	err := tx.QueryRow(ctx, `SELECT sequence FROM task_events WHERE task_id=$1 AND event_type='task.plan'
-AND payload #>> '{plan,task_revision}'=$2 AND payload #>> '{plan,revision}'=$3
-ORDER BY sequence DESC LIMIT 1`, taskID, fmt.Sprint(taskRevision), fmt.Sprint(planRevision)).Scan(&sequence)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, fmt.Errorf("read current plan event sequence for H07 requirement confirmation: %w", err)
-	}
-	return sequence, nil
 }
 
 func replayPlanCheckDigests(check task.PlanVerificationCheck) (command, wholeCheck, coverage string, ok bool) {

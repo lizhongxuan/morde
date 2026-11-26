@@ -48,9 +48,11 @@ func PendingTaskValidationReplayEvidence(plan *task.Plan) *TaskValidationReplayE
 // latest durable operation fact for each typed check. It returns FAIL for a
 // verified applicable failing check, PASS only when every declared check
 // passed on one unchanged Task Workspace snapshot, each runner coverage
-// receipt matches its declared scope, the exact candidate manifest has a
-// current user confirmation, and final-snapshot identity is independently
-// verified. Missing facts remain PENDING.
+// receipt matches its declared scope, an independent completeness and
+// semantic-attestation fact covers the full requirement set, and
+// final-snapshot identity is independently verified. Confirming a candidate
+// manifest digest alone is not a completeness or semantic attestation.
+// Missing facts remain PENDING.
 func EvaluateTaskValidationPlanReplay(plan task.Plan, evidence *TaskValidationReplayEvidence) TaskValidationReplayState {
 	if plan.Validate() != nil || plan.FixPlan == nil || evidence == nil || evidence.PlanRevision != plan.Revision {
 		return TaskValidationReplayPending

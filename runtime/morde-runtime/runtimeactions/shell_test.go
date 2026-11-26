@@ -111,6 +111,20 @@ func TestShellTaskWorkspaceResultV2OmitsLegacyDigestAndStillDecodesV1(t *testing
 	}
 }
 
+func TestShellRunnerCoverageReceiptSerializesOperationIdentity(t *testing.T) {
+	encoded, err := json.Marshal(shellRunnerCoverageReceipt{OperationID: "op-12345678", RunnerVersion: "go version go1.25.3 linux/amd64"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["operation_id"] != "op-12345678" || got["runner_version"] != "go version go1.25.3 linux/amd64" {
+		t.Fatalf("receipt identity fields = %#v", got)
+	}
+}
+
 func TestParseShellArguments(t *testing.T) {
 	tests := []struct {
 		name        string

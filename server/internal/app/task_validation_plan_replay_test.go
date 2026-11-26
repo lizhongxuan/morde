@@ -152,6 +152,8 @@ func TestEvaluateTaskValidationPlanReplayPassesVerifiedRequiredCheckAndSources(t
 			VerificationApplicability: task.PlanVerificationApplicabilityCheck, VerificationCheck: &check}}}
 	fact := taskValidationReplayCheckFixture(plan, "verify", check, 1)
 	fact.RequirementSourceVerified = true
+	// This synthetic fact represents a future independent Store-validated
+	// completeness and semantic attestation, not an exact-digest confirmation.
 	evidence := &TaskValidationReplayEvidence{RequirementSetVerified: true, FinalWorkspaceSnapshotVerified: true,
 		PlanRevision: plan.Revision, Checks: []TaskValidationReplayCheckEvidence{fact}}
 	evidence.FinalWorkspaceSnapshotProof = taskValidationFinalWorkspaceProofFixture(fact)

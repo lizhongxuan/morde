@@ -350,8 +350,10 @@ func (s *AgentCheckpointService) ReadMessageSourcePage(ctx context.Context, fenc
 // total_runes, pages; each page orders rune_offset, next_rune_offset, sha256.
 func ComputeAgentMessageManifestSHA256(messageID string, sequence, contentBytes int64, sourceSHA256 []byte,
 	totalRunes int64, pages []AgentMessageSourcePage) ([]byte, error) {
-	if !domain.ValidMessageID(messageID) || sequence < 1 || contentBytes < 1 || contentBytes > MaxConversationMessageBytes ||
-		totalRunes < 1 || totalRunes > contentBytes || len(sourceSHA256) != sha256.Size || !validAgentMessageSourcePages(contentBytes, totalRunes, pages) {
+	if !domain.ValidMessageID(messageID) || sequence < 1 || contentBytes < 0 || contentBytes > MaxConversationMessageBytes ||
+		totalRunes < 0 || totalRunes > contentBytes || len(sourceSHA256) != sha256.Size ||
+		!validAgentMessageSourcePages(contentBytes, totalRunes, pages) ||
+		contentBytes == 0 && !validCanonicalEmptyAgentMessageSource(contentBytes, totalRunes, sourceSHA256, pages) {
 		return nil, domain.InvalidArgument("message_source_manifest", "message source manifest fields are invalid")
 	}
 	canonical := struct {
@@ -574,18 +576,21 @@ func ParseAgentMessageReferenceEnvelope(content string) (AgentMessageReferenceEn
 }
 
 func validateAgentMessageReferenceEnvelopeFields(envelope AgentMessageReferenceEnvelope) error {
+	emptySource := validCanonicalEmptyAgentMessageSource(envelope.ContentBytes, envelope.TotalRunes,
+		mustDecodeHexDigest(envelope.SourceSHA256), envelope.Pages)
 	if envelope.Version != AgentMessageReferenceEnvelopeVersion || !domain.ValidTaskID(envelope.TaskID) || envelope.TaskRevision < 0 ||
 		!domain.ValidUserID(envelope.OwnerID) || !domain.ValidConversationID(envelope.ConversationID) ||
 		!domain.ValidMessageID(envelope.MessageID) || envelope.MessageSequence < 1 ||
 		envelope.AuthorizationVersion < 1 || envelope.AgentGeneration < 1 ||
 		!agentCheckpointIDPattern.MatchString(envelope.RootSessionID) ||
 		(envelope.Mode != AgentMessageDeliverySteer && envelope.Mode != AgentMessageDeliveryFollowup) ||
-		envelope.ContentBytes < 1 || envelope.ContentBytes > MaxConversationMessageBytes ||
+		envelope.ContentBytes < 1 && !emptySource || envelope.ContentBytes > MaxConversationMessageBytes ||
 		envelope.ManifestVersion != AgentMessageManifestVersion || !validLowerHexDigest(envelope.SourceSHA256) ||
 		!validLowerHexDigest(envelope.ManifestSHA256) ||
-		envelope.TotalRunes < 1 || envelope.TotalRunes > envelope.ContentBytes ||
+		envelope.TotalRunes < 1 && !emptySource || envelope.TotalRunes > envelope.ContentBytes ||
 		len(envelope.AttachmentIDs) > conversation.MaxHistoryImportAttachments || envelope.AttachmentIDs == nil ||
-		!validAgentMessageSourcePages(envelope.ContentBytes, envelope.TotalRunes, envelope.Pages) {
+		!validAgentMessageSourcePages(envelope.ContentBytes, envelope.TotalRunes, envelope.Pages) ||
+		emptySource && len(envelope.AttachmentIDs) == 0 {
 		return domain.InvalidArgument("message_reference", "message reference envelope fields are invalid")
 	}
 	for index, id := range envelope.AttachmentIDs {
@@ -602,6 +607,9 @@ func validateAgentMessageReferenceEnvelopeFields(envelope AgentMessageReferenceE
 }
 
 func validAgentMessageSourcePages(contentBytes, totalRunes int64, pages []AgentMessageSourcePage) bool {
+	if contentBytes == 0 || totalRunes == 0 || len(pages) == 0 {
+		return contentBytes == 0 && totalRunes == 0 && pages != nil && len(pages) == 0
+	}
 	if contentBytes < 1 || totalRunes < 1 || len(pages) == 0 ||
 		int64(len(pages)) > (contentBytes+MaxConversationMessageChunkBytes-1)/MaxConversationMessageChunkBytes+1 {
 		return false
@@ -616,6 +624,13 @@ func validAgentMessageSourcePages(contentBytes, totalRunes int64, pages []AgentM
 		next = page.NextRuneOffset
 	}
 	return next == totalRunes
+}
+
+func validCanonicalEmptyAgentMessageSource(contentBytes, totalRunes int64, sourceSHA256 []byte,
+	pages []AgentMessageSourcePage) bool {
+	emptyDigest := sha256.Sum256(nil)
+	return contentBytes == 0 && totalRunes == 0 && len(sourceSHA256) == sha256.Size &&
+		subtleCompareCheckpointDigest(sourceSHA256, emptyDigest[:]) && pages != nil && len(pages) == 0
 }
 
 func validLowerHexDigest(value string) bool {

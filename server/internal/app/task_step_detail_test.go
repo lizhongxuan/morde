@@ -53,6 +53,9 @@ func TestTaskToolInputSummaryShowsOnlyValidatedSearchQuery(t *testing.T) {
 	if got := taskToolInputSummary(cloudDSHWebSearchToolName, `{"query":"AI news","time_range":"week"}`); got != "Search query: AI news (time range: week)." {
 		t.Fatalf("safe search input summary = %q", got)
 	}
+	if got := taskToolInputSummary(cloudDSHWebSearchToolName, `{"query":"AI news","category":"news","time_range":"week"}`); got != "Search query: AI news (category: news; time range: week)." {
+		t.Fatalf("safe news search input summary = %q", got)
+	}
 	credential := "sk-proj-" + strings.Repeat("A", 40)
 	got := taskToolInputSummary(cloudDSHWebSearchToolName, `{"query":"`+credential+`"}`)
 	if strings.Contains(got, credential) || strings.Contains(got, "Search query:") {

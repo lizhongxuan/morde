@@ -59,6 +59,7 @@ type TaskValidationCheckExecutionReceipt struct {
 // the Runtime's parser_complete flag alone is never sufficient.
 type TaskValidationRunnerCoverageReceipt struct {
 	Version                          int    `json:"version"`
+	OperationID                      string `json:"operation_id"`
 	Runner                           string `json:"runner"`
 	RunnerVersion                    string `json:"runner_version"`
 	ScopeMode                        string `json:"scope_mode"`
