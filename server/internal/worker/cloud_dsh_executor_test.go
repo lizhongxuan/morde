@@ -101,13 +101,206 @@ type cloudDSHTestLaunch struct {
 }
 
 type cloudDSHTestSupervisor struct {
-	mu         sync.Mutex
-	cmd        *exec.Cmd
-	launch     cloudDSHTestLaunch
-	node       string
-	account    string
-	instances  *cloudDSHTestInstanceStore
-	badReceipt bool
+	mu                  sync.Mutex
+	diagnosticMu        sync.Mutex
+	cmd                 *exec.Cmd
+	launch              cloudDSHTestLaunch
+	node                string
+	account             string
+	instances           *cloudDSHTestInstanceStore
+	badReceipt          bool
+	firstFrameCategory  string
+	firstFrameBytes     int
+	firstFrameTruncated bool
+	stderrBytes         int
+	stderrTruncated     bool
+}
+
+const (
+	cloudDSHTestStderrByteLimit     = 64 << 10
+	cloudDSHTestFirstFrameByteLimit = 64 << 10
+)
+
+// The test supervisor intentionally keeps only counts and coarse categories.
+// Runtime stderr and the first protocol frame may contain sensitive data.
+type cloudDSHTestStderrCounter struct{ supervisor *cloudDSHTestSupervisor }
+
+func (w cloudDSHTestStderrCounter) Write(value []byte) (int, error) {
+	if w.supervisor == nil {
+		return len(value), nil
+	}
+	w.supervisor.diagnosticMu.Lock()
+	defer w.supervisor.diagnosticMu.Unlock()
+	remaining := cloudDSHTestStderrByteLimit - w.supervisor.stderrBytes
+	if remaining > 0 {
+		added := min(len(value), remaining)
+		w.supervisor.stderrBytes += added
+		if added < len(value) {
+			w.supervisor.stderrTruncated = true
+		}
+	} else if len(value) > 0 {
+		w.supervisor.stderrTruncated = true
+	}
+	return len(value), nil
+}
+
+type cloudDSHTestObservedOutput struct {
+	source     io.ReadCloser
+	supervisor *cloudDSHTestSupervisor
+	frame      []byte
+	frameBytes int
+	truncated  bool
+	finished   bool
+}
+
+func (r *cloudDSHTestObservedOutput) Read(target []byte) (int, error) {
+	n, err := r.source.Read(target)
+	if n > 0 {
+		r.observe(target[:n])
+	}
+	if err != nil && !r.finished {
+		category := "truncated_frame"
+		if r.frameBytes == 0 {
+			category = "no_frame"
+		}
+		if !errors.Is(err, io.EOF) {
+			category = "read_error"
+		}
+		r.finish(category)
+	}
+	return n, err
+}
+
+func (r *cloudDSHTestObservedOutput) Close() error { return r.source.Close() }
+
+func (r *cloudDSHTestObservedOutput) observe(value []byte) {
+	if r.finished {
+		return
+	}
+	newline := bytes.IndexByte(value, '\n')
+	complete := newline >= 0
+	if complete {
+		value = value[:newline]
+	}
+	remaining := cloudDSHTestFirstFrameByteLimit - r.frameBytes
+	if remaining > 0 {
+		added := min(len(value), remaining)
+		r.frame = append(r.frame, value[:added]...)
+		r.frameBytes += added
+		if added < len(value) {
+			r.truncated = true
+		}
+	} else if len(value) > 0 {
+		r.truncated = true
+	}
+	if complete {
+		category := "invalid_json"
+		if r.truncated {
+			category = "oversized_frame"
+		} else if json.Valid(r.frame) {
+			category = "valid_json"
+		}
+		r.finish(category)
+	}
+}
+
+func (r *cloudDSHTestObservedOutput) finish(category string) {
+	if r.finished {
+		return
+	}
+	r.finished = true
+	if r.supervisor != nil {
+		r.supervisor.diagnosticMu.Lock()
+		r.supervisor.firstFrameCategory = category
+		r.supervisor.firstFrameBytes = r.frameBytes
+		r.supervisor.firstFrameTruncated = r.truncated || category == "truncated_frame"
+		r.supervisor.diagnosticMu.Unlock()
+	}
+	// Do not retain even a bounded copy of a protocol frame after classifying it.
+	clear(r.frame)
+	r.frame = nil
+}
+
+func (s *cloudDSHTestSupervisor) startupDiagnostic(err error) string {
+	stage := "unavailable"
+	category := "startup_state_unavailable"
+	var staged interface{ RuntimeStartupStage() string }
+	if errors.As(err, &staged) {
+		switch staged.RuntimeStartupStage() {
+		case "runtime_supervisor_start":
+			stage, category = "runtime_supervisor_start", "runtime_startup_failure"
+		case "runtime_process_pipes":
+			stage, category = "runtime_process_pipes", "runtime_startup_failure"
+		case "runtime_handshake_write":
+			stage, category = "runtime_handshake_write", "handshake_write_failure"
+		case "runtime_handshake_timeout":
+			stage, category = "runtime_handshake_timeout", "first_frame_timeout"
+		case "runtime_handshake_response":
+			stage = "runtime_handshake_response"
+			cause := errors.Unwrap(err)
+			switch {
+			case errors.Is(cause, io.EOF):
+				category = "first_frame_eof"
+			case cause != nil:
+				category = "first_frame_read_error"
+			default:
+				category = "first_frame_rejected"
+			}
+		case "runtime_control_ready":
+			stage, category = "runtime_control_ready", "runtime_ready_persist_failure"
+		default:
+			stage, category = "other_runtime_startup_stage", "runtime_startup_failure"
+		}
+	}
+	firstFrameCategory := "unobserved"
+	firstFrameBytes := 0
+	firstFrameTruncated := false
+	stderrCategory := "empty"
+	stderrBytes := 0
+	stderrTruncated := false
+	if s != nil {
+		s.diagnosticMu.Lock()
+		firstFrameCategory = s.firstFrameCategory
+		firstFrameBytes = s.firstFrameBytes
+		firstFrameTruncated = s.firstFrameTruncated
+		stderrBytes = s.stderrBytes
+		stderrTruncated = s.stderrTruncated
+		s.diagnosticMu.Unlock()
+	}
+	if firstFrameCategory == "" {
+		firstFrameCategory = "unobserved"
+	}
+	if stderrBytes > 0 {
+		stderrCategory = "nonempty"
+	}
+	if category == "startup_state_unavailable" {
+		switch firstFrameCategory {
+		case "invalid_json":
+			category = "first_frame_parse_failure"
+		case "no_frame":
+			if stderrCategory == "nonempty" {
+				category = "runtime_startup_before_first_frame"
+			} else {
+				category = "no_first_frame_output"
+			}
+		case "truncated_frame", "oversized_frame", "read_error":
+			category = "first_frame_read_failure"
+		case "valid_json":
+			category = "first_frame_received"
+		}
+	}
+	if category == "first_frame_rejected" {
+		switch firstFrameCategory {
+		case "invalid_json":
+			category = "first_frame_parse_failure"
+		case "oversized_frame", "truncated_frame":
+			category = "first_frame_incomplete_or_oversized"
+		case "valid_json":
+			category = "first_frame_validation_failure"
+		}
+	}
+	return fmt.Sprintf("category=%s stage=%s first_frame=%s first_frame_bytes=%d first_frame_truncated=%t stderr=%s stderr_bytes_capped=%d stderr_truncated=%t",
+		category, stage, firstFrameCategory, firstFrameBytes, firstFrameTruncated, stderrCategory, stderrBytes, stderrTruncated)
 }
 
 type cloudDSHExecutorTestGuardian struct{ f01NodeTaskGuardian }
@@ -204,10 +397,17 @@ func (s *cloudDSHTestSupervisor) StartAccountRuntime(_ context.Context, _ app.Ac
 	expiresAt time.Time) (CloudDSHAccountRuntimeProcess, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.diagnosticMu.Lock()
+	s.firstFrameCategory = ""
+	s.firstFrameBytes = 0
+	s.firstFrameTruncated = false
+	s.stderrBytes = 0
+	s.stderrTruncated = false
+	s.diagnosticMu.Unlock()
 	command := exec.Command(s.node, s.account)
 	command.Dir = filepath.Dir(s.account)
 	command.Env = []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "NODE_ENV=production"}
-	command.Stderr = io.Discard
+	command.Stderr = cloudDSHTestStderrCounter{supervisor: s}
 	input, err := command.StdinPipe()
 	if err != nil {
 		return CloudDSHAccountRuntimeProcess{}, err
@@ -226,7 +426,7 @@ func (s *cloudDSHTestSupervisor) StartAccountRuntime(_ context.Context, _ app.Ac
 	s.launch.Environment = append([]string(nil), command.Env...)
 	s.launch.ExpiresAt = expiresAt
 	return CloudDSHAccountRuntimeProcess{ContainerID: strings.Repeat("a", 64), ContainerName: "test-conversation-runtime",
-		Input: input, Output: output}, nil
+		Input: input, Output: &cloudDSHTestObservedOutput{source: output, supervisor: s}}, nil
 }
 
 func (s *cloudDSHTestSupervisor) RenewAccountRuntime(context.Context, app.AccountAgentRuntimeFence, string, time.Time) error {
@@ -1030,6 +1230,9 @@ func cloudDSHFixture(t *testing.T) (*CloudDSHExecutor, *cloudDSHTestSupervisor, 
 			_ = supervisor.cmd.Wait()
 		}
 		supervisor.mu.Unlock()
+		if t.Failed() {
+			t.Logf("DSH test Runtime diagnostic (safe summary): %s", supervisor.startupDiagnostic(nil))
+		}
 	})
 	checkpoints := &cloudDSHTestCheckpoints{}
 	models := &cloudDSHTestModels{response: app.ModelResponse{Text: "local result", StopReason: "stop", Usage: app.ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1}}}
@@ -1043,6 +1246,38 @@ func cloudDSHFixture(t *testing.T) (*CloudDSHExecutor, *cloudDSHTestSupervisor, 
 		ExecutionLocation: "server", Lease: task.Lease{Owner: "worker-test", Version: 1, ExpiresAt: &expires},
 		Authorization: task.Authorization{Version: 1}, Budget: task.Budget{ActiveSeconds: 20, ToolCalls: 1, ModelTokens: 1000}, CheckpointThroughSequence: -1}
 	return executor, supervisor, store, checkpoints, models, value
+}
+
+func TestCloudDSHTestRuntimeDiagnosticIsBoundedAndRedacted(t *testing.T) {
+	supervisor := &cloudDSHTestSupervisor{}
+	stderr := cloudDSHTestStderrCounter{supervisor: supervisor}
+	privateMarker := "synthetic-private-stderr-marker"
+	if _, err := stderr.Write([]byte(strings.Repeat(privateMarker, cloudDSHTestStderrByteLimit/len(privateMarker)+2))); err != nil {
+		t.Fatalf("count synthetic stderr bytes: %v", err)
+	}
+
+	firstFrame := `{"type":"runtime_ready","credential":"synthetic-private-frame-marker"` + "\n"
+	observed := &cloudDSHTestObservedOutput{source: io.NopCloser(strings.NewReader(firstFrame)), supervisor: supervisor}
+	if _, err := io.Copy(io.Discard, observed); err != nil {
+		t.Fatalf("observe synthetic first frame: %v", err)
+	}
+
+	startup := cloudDSHStartupFailure("runtime_supervisor_start", "test startup failed", errors.New(privateMarker))
+	startupDiagnostic := supervisor.startupDiagnostic(startup)
+	if !strings.Contains(startupDiagnostic, "category=runtime_startup_failure") ||
+		strings.Contains(startupDiagnostic, privateMarker) || strings.Contains(startupDiagnostic, "synthetic-private-frame-marker") {
+		t.Fatalf("startup diagnostic is not categorized and redacted: %s", startupDiagnostic)
+	}
+
+	parse := cloudDSHStartupFailure("runtime_handshake_response", "test handshake failed", nil)
+	parseDiagnostic := supervisor.startupDiagnostic(parse)
+	if !strings.Contains(parseDiagnostic, "category=first_frame_parse_failure") ||
+		!strings.Contains(parseDiagnostic, "first_frame=invalid_json") ||
+		!strings.Contains(parseDiagnostic, "stderr_bytes_capped=65536") ||
+		!strings.Contains(parseDiagnostic, "stderr_truncated=true") ||
+		strings.Contains(parseDiagnostic, privateMarker) || strings.Contains(parseDiagnostic, "synthetic-private-frame-marker") {
+		t.Fatalf("first-frame diagnostic must be bounded and contain no raw data: %s", parseDiagnostic)
+	}
 }
 
 type cloudDSHTaskPlanWorkerTestStore struct {
@@ -1284,7 +1519,7 @@ func TestCloudDSHExecutorRunsHostlessServerTaskWithoutCompletingIt(t *testing.T)
 	}
 	err := executor.ExecuteTask(context.Background(), value)
 	if !errors.Is(err, ErrCloudDSHCompletionPending) {
-		t.Fatalf("candidate result = %v", err)
+		t.Fatalf("candidate result failed: %s", supervisor.startupDiagnostic(err))
 	}
 	if len(models.calls) != 1 || len(checkpoints.commands) == 0 || store.stopped != 1 {
 		t.Fatalf("models=%d checkpoints=%d stopped=%d", len(models.calls), len(checkpoints.commands), store.stopped)
