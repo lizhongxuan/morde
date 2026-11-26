@@ -1535,3 +1535,27 @@
   `go test ./internal/app/` 全量仅 4 个失败，全部是基线既有失败
   （与 P3-1/P3-2/P3-5 同一组，工作区路径/环境问题，与本次改动无
   关）。
+
+## 修复迁移 00251：补 00248 漏掉的 task_step_id（2026-11-26）
+
+- 背景：2026-11-26 用户让从 release（a00cd2d）重部署。门禁在 a00cd2d
+  上通过（8 过 / 0 挂 / 2 例外），但 update.sh 在迁移 250 处 abort：
+  `column "task_step_id" does not exist`，换版前中止，线上仍跑
+  2bce2195（DB 249），未受影响。
+- 根因：迁移 00248 在 7af64095 部署（2026-11-25 16:46，DB 238→248）
+  时只加了 `result_digest`；随后 e7e4678（2026-11-25 16:55）改了这
+  个已跑过的文件，补了 `task_step_id`。goose 不重跑已标记 applied
+  的迁移，live 库因此一直缺这列；a00cd2d 的迁移 250 默认它存在，
+  一跑就失败。门禁在全新测试库上跑迁移，所以查不出这种漂移——
+  门禁通过不等于 live 库能升上去。
+- 修复：新迁移 `00251_task_plan_step_task_step_id_repair.sql`（不改
+  00248 本身），Up 用 `ADD COLUMN IF NOT EXISTS task_step_id`（与
+  00248 现行定义一致）+ 把 `task_plan_step_execution_bindings_check`
+  换成 00248 现行定义；Down 沿用 00249 的做法，只留 `SELECT 1`，
+  不回滚（250 依赖这列）。核过：live 库
+  `task_plan_step_execution_bindings` 0 行，无违反新约束的数据；
+  250 未进 goose 表，250 的第一条语句也未部分执行
+  （task_hub_operations 无新增列），事务已整体回滚。
+- 教训：已跑过的迁移文件绝不能再改；补漏一律新写修复迁移。另记：
+  goose 表里 242 缺失（240、241、243–249 已跑），暂与本次无关。
+- 验证：待部署时核对——251、250 依次跑完，DB 到 250，服务健康。
