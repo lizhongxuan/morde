@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/evaluation"
 )
@@ -41,7 +42,6 @@ type workflowTraceOperationRecord struct {
 }
 
 type workflowTraceDeliveryObservationTarget struct {
-	nodeID       string
 	sourceID     string
 	taskRevision int64
 	pcEligible   bool
@@ -184,6 +184,8 @@ type workflowTraceTask struct {
 	CurrentRevision      int64
 	DesiredRevision      int64
 	EventSequence        int64
+	AgentGeneration      int64
+	AgentSessionID       string
 	AuthorizationKind    string
 	AuthorizationTokenID string
 	AuthorizationScopes  []string
@@ -205,9 +207,11 @@ func (s *Store) GetTaskWorkflowTrace(ctx context.Context, taskID, ownerID string
 	err := s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
 		var taskRow workflowTraceTask
 		err := tx.QueryRow(ctx, `SELECT id,owner_id,conversation_id,COALESCE(host_id,''),status,current_revision,desired_revision,event_seq,
-auth_kind,auth_token_id,auth_scopes,auth_version,model_id,objective,created_at,updated_at FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).Scan(
+agent_generation,COALESCE(agent_session_id,''),auth_kind,auth_token_id,auth_scopes,auth_version,model_id,objective,created_at,updated_at
+FROM tasks WHERE id=$1 AND owner_id=$2`, taskID, ownerID).Scan(
 			&taskRow.ID, &taskRow.OwnerID, &taskRow.ConversationID, &taskRow.HostID, &taskRow.Status, &taskRow.CurrentRevision,
-			&taskRow.DesiredRevision, &taskRow.EventSequence, &taskRow.AuthorizationKind, &taskRow.AuthorizationTokenID, &taskRow.AuthorizationScopes,
+			&taskRow.DesiredRevision, &taskRow.EventSequence, &taskRow.AgentGeneration, &taskRow.AgentSessionID,
+			&taskRow.AuthorizationKind, &taskRow.AuthorizationTokenID, &taskRow.AuthorizationScopes,
 			&taskRow.AuthorizationVersion, &taskRow.ModelID, &taskRow.Objective, &taskRow.CreatedAt, &taskRow.UpdatedAt)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return missingTaskError()
@@ -279,6 +283,9 @@ auth_kind,auth_token_id,auth_scopes,auth_version,model_id,objective,created_at,u
 			return err
 		}
 		if err := addWorkflowTraceRuntime(ctx, tx, builder, taskRow, taskNode, taskSource); err != nil {
+			return err
+		}
+		if err := addWorkflowTraceDSHSessionRuntimeSnapshot(ctx, tx, builder, taskRow, taskNode, taskSource); err != nil {
 			return err
 		}
 		if err := addWorkflowTraceCurrentAuthorization(ctx, tx, builder, taskRow); err != nil {
@@ -1219,18 +1226,21 @@ func addWorkflowTraceDeliveries(ctx context.Context, tx pgx.Tx, builder *workflo
 		builder.addGap(evaluation.WorkflowStageDelivery, "assistant conversation output records", evaluation.WorkflowGapAbsent, &zero, countSource)
 	}
 	workflowTruncatedGap(builder, evaluation.WorkflowStageDelivery, "assistant conversation output records", count, countSource)
-	rows, err := tx.Query(ctx, `SELECT id,sequence,delivery_status,COALESCE(output_status,''),COALESCE(output_task_revision,-1),
-COALESCE(output_result_event_sequence,0),octet_length(content)::bigint,encode(sha256(convert_to(content,'UTF8')),'hex'),created_at
-FROM conversation_messages WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3 AND role='assistant'
-ORDER BY sequence,id LIMIT $4`, taskRow.ID, taskRow.OwnerID, taskRow.ConversationID, workflowTraceFactLimit)
+	rows, err := tx.Query(ctx, `SELECT message.id,message.sequence,message.delivery_status,COALESCE(message.output_status,''),COALESCE(message.output_task_revision,-1),
+COALESCE(message.output_result_event_sequence,0),octet_length(message.content)::bigint,encode(sha256(convert_to(message.content,'UTF8')),'hex'),message.created_at,
+EXISTS (SELECT 1 FROM task_events result WHERE result.task_id=message.task_id AND result.sequence=message.output_result_event_sequence
+  AND result.task_revision=message.output_task_revision AND result.event_type='task.result')
+FROM conversation_messages message WHERE message.task_id=$1 AND message.owner_id=$2 AND message.conversation_id=$3 AND message.role='assistant'
+ORDER BY message.sequence,message.id LIMIT $4`, taskRow.ID, taskRow.OwnerID, taskRow.ConversationID, workflowTraceFactLimit)
 	if err != nil {
 		return fmt.Errorf("read workflow assistant deliveries: %w", err)
 	}
 	for rows.Next() {
 		var id, deliveryStatus, outputStatus, contentDigest string
 		var sequence, revision, resultEventSequence, contentBytes int64
+		var resultEventMatched bool
 		var createdAt time.Time
-		if err := rows.Scan(&id, &sequence, &deliveryStatus, &outputStatus, &revision, &resultEventSequence, &contentBytes, &contentDigest, &createdAt); err != nil {
+		if err := rows.Scan(&id, &sequence, &deliveryStatus, &outputStatus, &revision, &resultEventSequence, &contentBytes, &contentDigest, &createdAt, &resultEventMatched); err != nil {
 			rows.Close()
 			return err
 		}
@@ -1251,7 +1261,8 @@ ORDER BY sequence,id LIMIT $4`, taskRow.ID, taskRow.OwnerID, taskRow.Conversatio
 		}
 		state := workflowDeliveryNodeState(deliveryStatus, outputStatus)
 		nodeID := builder.addNode(evaluation.WorkflowNodeDelivery, state, taskRow.ID+":message:"+id, sourceID)
-		deliveryTargets[id] = workflowTraceDeliveryObservationTarget{nodeID: nodeID, sourceID: sourceID, taskRevision: revision}
+		deliveryTargets[id] = workflowTraceDeliveryObservationTarget{sourceID: sourceID, taskRevision: revision,
+			pcEligible: deliveryStatus == "applied" && outputStatus == "completed" && revision >= 0 && resultEventSequence > 0 && resultEventMatched}
 		if deliveryStatus == "applied" && (outputStatus == "completed" || outputStatus == "") {
 			builder.addEdge(evaluation.WorkflowEdgeDelivered, taskNode, nodeID, sourceID)
 		} else {
@@ -1317,10 +1328,6 @@ WHERE o.task_id=$1 AND o.owner_id=$2 ORDER BY o.id LIMIT $3`, taskRow.ID, taskRo
 		nodeID := builder.addNode(evaluation.WorkflowNodeDelivery, workflowOutboxDeliveryState(state, messageStatus), taskRow.ID+":outbox:"+id, sourceID)
 		if state == "published" && messageID != "" && messageStatus == "applied" {
 			builder.addEdge(evaluation.WorkflowEdgeDelivered, taskNode, nodeID, sourceID)
-			if target, ok := deliveryTargets[messageID]; ok && target.taskRevision == revision {
-				target.pcEligible = true
-				deliveryTargets[messageID] = target
-			}
 		} else {
 			builder.addGap(evaluation.WorkflowStageDelivery, "terminal delivery lacks a confirmed published conversation message: "+id, evaluation.WorkflowGapUnknown, nil, sourceID)
 		}
@@ -1351,12 +1358,12 @@ WHERE task_id=$1 AND owner_id=$2 AND conversation_id=$3`, taskRow.ID, taskRow.Ow
 	workflowTruncatedGap(builder, evaluation.WorkflowStageDelivery, "PC delivery observations", count, countSource)
 	rows, err := tx.Query(ctx, `SELECT observation.client_installation_id,observation.message_id,observation.task_revision,observation.observed_at,
 message.role,COALESCE(message.delivery_status,''),COALESCE(message.output_status,''),COALESCE(message.output_task_revision,-1),
-COALESCE(message.output_result_event_sequence,0),COALESCE(delivery.state,''),COALESCE(delivery.task_revision,-1)
+COALESCE(message.output_result_event_sequence,0),COALESCE(result.sequence,0)
 FROM task_pc_delivery_observations observation
 LEFT JOIN conversation_messages message ON message.id=observation.message_id
   AND message.task_id=observation.task_id AND message.owner_id=observation.owner_id AND message.conversation_id=observation.conversation_id
-LEFT JOIN task_terminal_delivery_outbox delivery ON delivery.task_id=message.task_id AND delivery.owner_id=message.owner_id
-  AND delivery.conversation_id=message.conversation_id AND delivery.published_message_id=message.id
+LEFT JOIN task_events result ON result.task_id=message.task_id AND result.sequence=message.output_result_event_sequence
+  AND result.task_revision=message.output_task_revision AND result.event_type='task.result'
 WHERE observation.task_id=$1 AND observation.owner_id=$2 AND observation.conversation_id=$3
 ORDER BY observation.observed_at,observation.client_installation_id,observation.message_id LIMIT $4`,
 		taskRow.ID, taskRow.OwnerID, taskRow.ConversationID, workflowTraceFactLimit)
@@ -1365,11 +1372,11 @@ ORDER BY observation.observed_at,observation.client_installation_id,observation.
 	}
 	observed := make(map[string]struct{})
 	for rows.Next() {
-		var installationID, messageID, role, deliveryStatus, outputStatus, outboxState string
-		var revision, messageRevision, resultEventSequence, outboxRevision int64
+		var installationID, messageID, role, deliveryStatus, outputStatus string
+		var revision, messageRevision, resultEventSequence, matchedResultEventSequence int64
 		var observedAt time.Time
 		if err := rows.Scan(&installationID, &messageID, &revision, &observedAt, &role, &deliveryStatus, &outputStatus,
-			&messageRevision, &resultEventSequence, &outboxState, &outboxRevision); err != nil {
+			&messageRevision, &resultEventSequence, &matchedResultEventSequence); err != nil {
 			rows.Close()
 			return err
 		}
@@ -1386,8 +1393,9 @@ ORDER BY observation.observed_at,observation.client_installation_id,observation.
 			return err
 		}
 		target, exists := deliveryTargets[messageID]
-		if !exists || !target.pcEligible || revision != messageRevision || revision != outboxRevision ||
-			role != "assistant" || deliveryStatus != "applied" || outputStatus != "completed" || resultEventSequence < 1 || outboxState != "published" {
+		if !exists || !target.pcEligible || revision != target.taskRevision || revision != messageRevision ||
+			role != "assistant" || deliveryStatus != "applied" || outputStatus != "completed" ||
+			resultEventSequence < 1 || resultEventSequence != matchedResultEventSequence {
 			builder.addGap(evaluation.WorkflowStageDelivery, "PC observation does not match a published assistant Task result: "+messageID,
 				evaluation.WorkflowGapUnknown, nil, sourceID)
 			continue
@@ -1573,10 +1581,117 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND conversation_id=$3`,
 	runtimeNode := builder.addNode(evaluation.WorkflowNodeRuntime, workflowRuntimeNodeState(state, leaseActive),
 		taskRow.ConversationID+":"+runtimeID+":"+fmt.Sprint(generation), sourceID)
 	builder.addEdge(evaluation.WorkflowEdgeTargets, taskNode, runtimeNode, taskSource, sourceID)
-	// This row describes the current account Runtime lease. It does not capture
-	// the DSH process tree or prove the historical process state for this Task.
-	builder.addGap(evaluation.WorkflowStageRuntime, "DSH process/session snapshot is not captured by the account Runtime registry",
+	return nil
+}
+
+func addWorkflowTraceDSHSessionRuntimeSnapshot(ctx context.Context, tx pgx.Tx, builder *workflowTraceBuilder,
+	taskRow workflowTraceTask, taskNode, taskSource string) error {
+	locator := "db://task_agent_sessions/" + taskRow.ID + "/" + taskRow.AgentSessionID + "/current"
+	if taskRow.AgentSessionID == "" || taskRow.AgentGeneration < 1 {
+		return addWorkflowTraceDSHSessionRuntimeUnavailable(builder, taskRow, taskNode, taskSource, locator)
+	}
+	var activityStatus, activityPhase, activityState, agentState string
+	var activityGeneration, activitySequence, activityRevision int64
+	var activityObservedAt, heartbeatAt pgtype.Timestamptz
+	var leaseActive bool
+	err := tx.QueryRow(ctx, `SELECT COALESCE(session.activity_status,''),COALESCE(session.activity_generation,0),
+COALESCE(session.activity_sequence,0),COALESCE(session.activity_revision,-1),COALESCE(session.activity_phase,''),
+COALESCE(session.activity_state,''),session.activity_observed_at,session.activity_heartbeat_at,
+COALESCE(instance.state,''),COALESCE(instance.lease_expires_at>transaction_timestamp(),false)
+FROM task_agent_sessions session
+LEFT JOIN task_agent_instances instance ON instance.task_id=session.task_id AND instance.owner_id=session.owner_id
+  AND instance.agent_generation=session.activity_generation
+WHERE session.task_id=$1 AND session.owner_id=$2 AND session.session_id=$3 AND session.parent_session_id IS NULL`,
+		taskRow.ID, taskRow.OwnerID, taskRow.AgentSessionID).Scan(&activityStatus, &activityGeneration, &activitySequence,
+		&activityRevision, &activityPhase, &activityState, &activityObservedAt, &heartbeatAt, &agentState, &leaseActive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return addWorkflowTraceDSHSessionRuntimeUnavailable(builder, taskRow, taskNode, taskSource, locator)
+	}
+	if err != nil {
+		return fmt.Errorf("read workflow DSH session heartbeat snapshot: %w", err)
+	}
+	heartbeatFresh := heartbeatAt.Valid && !heartbeatAt.Time.After(builder.trace.CapturedAt) &&
+		!heartbeatAt.Time.Before(builder.trace.CapturedAt.Add(-2*app.MaxAgentLease))
+	identityMatches := activityGeneration == taskRow.AgentGeneration && activityRevision == taskRow.CurrentRevision &&
+		activitySequence > 0 && (activityStatus == "idle" || activityStatus == "running") && heartbeatAt.Valid
+	var activityObservedAtValue, heartbeatAtValue *time.Time
+	if activityObservedAt.Valid {
+		value := activityObservedAt.Time
+		activityObservedAtValue = &value
+	}
+	if heartbeatAt.Valid {
+		value := heartbeatAt.Time
+		heartbeatAtValue = &value
+	}
+	snapshot := struct {
+		TaskID                string     `json:"task_id"`
+		SessionID             string     `json:"session_id"`
+		TaskRevision          int64      `json:"task_revision"`
+		AgentGeneration       int64      `json:"agent_generation"`
+		ActivityGeneration    int64      `json:"activity_generation"`
+		ActivityRevision      int64      `json:"activity_revision"`
+		ActivitySequence      int64      `json:"activity_sequence"`
+		ActivityStatus        string     `json:"activity_status,omitempty"`
+		ActivityPhase         string     `json:"activity_phase,omitempty"`
+		ActivityState         string     `json:"activity_state,omitempty"`
+		ActivityObservedAt    *time.Time `json:"activity_observed_at,omitempty"`
+		HeartbeatAt           *time.Time `json:"heartbeat_at,omitempty"`
+		HeartbeatFresh        bool       `json:"heartbeat_fresh"`
+		HeartbeatFreshnessSec int        `json:"heartbeat_freshness_seconds"`
+		AgentInstanceState    string     `json:"agent_instance_state,omitempty"`
+		AgentLeaseActive      bool       `json:"agent_lease_active"`
+		IdentityMatches       bool       `json:"identity_matches_task"`
+	}{
+		TaskID: taskRow.ID, SessionID: taskRow.AgentSessionID, TaskRevision: taskRow.CurrentRevision,
+		AgentGeneration: taskRow.AgentGeneration, ActivityGeneration: activityGeneration, ActivityRevision: activityRevision,
+		ActivitySequence: activitySequence, ActivityStatus: activityStatus, ActivityPhase: activityPhase, ActivityState: activityState,
+		HeartbeatFresh: heartbeatFresh, HeartbeatFreshnessSec: int((2 * app.MaxAgentLease).Seconds()),
+		AgentInstanceState: agentState, AgentLeaseActive: leaseActive, IdentityMatches: identityMatches,
+	}
+	snapshot.ActivityObservedAt = activityObservedAtValue
+	snapshot.HeartbeatAt = heartbeatAtValue
+	sourceID, err := builder.addSource(evaluation.WorkflowSourceRuntimeSnapshot, locator, snapshot)
+	if err != nil {
+		return err
+	}
+	runtimeNode := builder.addNode(evaluation.WorkflowNodeRuntime, evaluation.WorkflowNodeUnknown,
+		taskRow.ID+":dsh-session:"+taskRow.AgentSessionID+":"+fmt.Sprint(taskRow.AgentGeneration), sourceID)
+	builder.addEdge(evaluation.WorkflowEdgeTargets, taskNode, runtimeNode, taskSource, sourceID)
+	if !identityMatches {
+		builder.addGap(evaluation.WorkflowStageRuntime, "root DSH session heartbeat does not exactly match the current Task revision and Agent generation",
+			evaluation.WorkflowGapUnknown, nil, sourceID)
+	} else if !heartbeatFresh {
+		builder.addGap(evaluation.WorkflowStageRuntime, "root DSH session heartbeat is missing, stale or newer than the captured snapshot",
+			evaluation.WorkflowGapUnknown, nil, sourceID)
+	} else if agentState != "active" || !leaseActive {
+		builder.addGap(evaluation.WorkflowStageRuntime, "recent root DSH session heartbeat conflicts with the Agent instance state or lease",
+			evaluation.WorkflowGapUnknown, nil, sourceID)
+	}
+	builder.addGap(evaluation.WorkflowStageRuntime, "root DSH session heartbeat records recent runtime activity, not direct process-tree state or PID",
 		evaluation.WorkflowGapUnknown, nil, sourceID)
+	return nil
+}
+
+func addWorkflowTraceDSHSessionRuntimeUnavailable(builder *workflowTraceBuilder, taskRow workflowTraceTask,
+	taskNode, taskSource, locator string) error {
+	sourceID, err := builder.addSource(evaluation.WorkflowSourceRuntimeSnapshot, locator, struct {
+		Available       bool   `json:"available"`
+		TaskID          string `json:"task_id"`
+		SessionID       string `json:"session_id,omitempty"`
+		TaskRevision    int64  `json:"task_revision"`
+		AgentGeneration int64  `json:"agent_generation"`
+	}{false, taskRow.ID, taskRow.AgentSessionID, taskRow.CurrentRevision, taskRow.AgentGeneration})
+	if err != nil {
+		return err
+	}
+	nodeKey := taskRow.ID + ":dsh-session:root"
+	if taskRow.AgentSessionID != "" {
+		nodeKey = taskRow.ID + ":dsh-session:" + taskRow.AgentSessionID + ":" + fmt.Sprint(taskRow.AgentGeneration)
+	}
+	runtimeNode := builder.addNode(evaluation.WorkflowNodeRuntime, evaluation.WorkflowNodeUnavailable, nodeKey, sourceID)
+	builder.addEdge(evaluation.WorkflowEdgeTargets, taskNode, runtimeNode, taskSource, sourceID)
+	builder.addGap(evaluation.WorkflowStageRuntime, "root DSH session heartbeat snapshot is unavailable",
+		evaluation.WorkflowGapUnavailable, nil, sourceID)
 	return nil
 }
 

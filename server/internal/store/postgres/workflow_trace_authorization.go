@@ -51,8 +51,8 @@ type workflowTraceAuthorizationTask struct {
 }
 
 type workflowTraceAuthorizationAccount struct {
-	ID       string `json:"id"`
-	Disabled bool   `json:"disabled"`
+	ID     string `json:"id"`
+	Status string `json:"status"`
 }
 
 type workflowTraceAuthorizationCredential struct {
@@ -166,8 +166,8 @@ func addWorkflowTraceCurrentAuthorization(ctx context.Context, tx pgx.Tx, builde
    'authorization_client_installation_id',COALESCE(t.auth_client_installation_id,''),'authorization_version',t.auth_version,
    'execution_epoch',t.execution_epoch,'agent_generation',t.agent_generation,'workspace_id',COALESCE(t.workspace_id,''),
    'workspace_owner_id',COALESCE(t.workspace_owner_id,''),'workspace_project_resource_version',t.workspace_project_resource_version),
- 'owner', (SELECT jsonb_build_object('id',u.id,'disabled',u.disabled) FROM users u WHERE u.id=t.owner_id),
- 'initiator', (SELECT jsonb_build_object('id',u.id,'disabled',u.disabled) FROM users u WHERE u.id=t.initiator_id),
+	 'owner', (SELECT jsonb_build_object('id',u.id,'status',u.status) FROM users u WHERE u.id=t.owner_id),
+	 'initiator', (SELECT jsonb_build_object('id',u.id,'status',u.status) FROM users u WHERE u.id=t.initiator_id),
  'credential', (SELECT jsonb_build_object('id',token.id,'owner_id',token.owner_id,'kind',token.kind,'scopes',token.scopes,
    'client_installation_id',COALESCE(token.client_installation_id,''),'expires_at',token.expires_at,'revoked',token.revoked_at IS NOT NULL)
    FROM tokens token WHERE token.id=t.auth_token_id),
@@ -265,8 +265,8 @@ func addWorkflowTraceAuthorizationSnapshot(builder *workflowTraceBuilder, taskRo
 		builder.addGap(evaluation.WorkflowStageAuthorization, "current credential or installation is not an exact active match to the Task snapshot",
 			evaluation.WorkflowGapUnknown, nil, sourceID)
 	}
-	if snapshot.Owner == nil || snapshot.Owner.Disabled {
-		builder.addGap(evaluation.WorkflowStageAuthorization, "current Task owner identity is unavailable or disabled",
+	if snapshot.Owner == nil || snapshot.Owner.Status != "approved" {
+		builder.addGap(evaluation.WorkflowStageAuthorization, "current Task owner identity is unavailable or not approved",
 			evaluation.WorkflowGapUnknown, nil, sourceID)
 	}
 	if snapshot.ExecutionControl == nil || snapshot.ExecutionControl.State != "enabled" || !snapshot.ExecutionControl.EpochMatchesTask {
@@ -310,7 +310,7 @@ func addWorkflowTraceAuthorizationSnapshot(builder *workflowTraceBuilder, taskRo
 
 func workflowTraceCredentialSnapshotMatches(snapshot workflowTraceCurrentAuthorizationSnapshot) bool {
 	task, credential := snapshot.Task, snapshot.Credential
-	if credential == nil || snapshot.Initiator == nil || snapshot.Initiator.Disabled || credential.ID != task.AuthorizationTokenID ||
+	if credential == nil || snapshot.Initiator == nil || snapshot.Initiator.Status != "approved" || credential.ID != task.AuthorizationTokenID ||
 		credential.OwnerID != task.InitiatorID || credential.Kind != task.AuthorizationKind || credential.Revoked ||
 		!credential.ExpiresAt.After(snapshot.CapturedAt) || credential.ClientInstallationID != task.AuthorizationClientInstallationID ||
 		!sameWorkflowAuthorizationScopes(credential.Scopes, task.AuthorizationScopes) {
@@ -382,8 +382,23 @@ func containsWorkflowAuthorizationScope(values []string, wanted string) bool {
 }
 
 func workflowTraceProjectResourceMatches(snapshot workflowTraceCurrentAuthorizationSnapshot, kind string) bool {
+	resourceID := ""
+	resourceOwnerID := ""
+	switch kind {
+	case "host":
+		resourceID = snapshot.Task.HostID
+		if snapshot.Host != nil {
+			resourceOwnerID = snapshot.Host.OwnerID
+		}
+	case "workspace":
+		resourceID = snapshot.Task.WorkspaceID
+		resourceOwnerID = snapshot.Task.WorkspaceOwnerID
+	default:
+		return false
+	}
 	for _, resource := range snapshot.ProjectResources {
-		if resource.Kind == kind && resource.Active && resource.ResourceID == map[string]string{"host": snapshot.Task.HostID, "workspace": snapshot.Task.WorkspaceID}[kind] {
+		if resource.Kind == kind && resource.Active && resource.ResourceID == resourceID &&
+			resource.ResourceOwnerID == resourceOwnerID && resourceOwnerID != "" {
 			return true
 		}
 	}
@@ -402,10 +417,14 @@ func workflowTraceProjectWorkspaceVersionMatches(snapshot workflowTraceCurrentAu
 
 func workflowTraceWorkspaceGrantMatches(snapshot workflowTraceCurrentAuthorizationSnapshot) bool {
 	fence, grant := snapshot.WorkspaceGrantFence, snapshot.WorkspaceFenceGrant
-	if fence == nil || grant == nil || grant.Revoked || grant.HostID != fence.HostID || grant.OwnerID != fence.WorkspaceOwnerID ||
+	task := snapshot.Task
+	if fence == nil || grant == nil || task.ProjectID == "" || task.WorkspaceID == "" || task.WorkspaceOwnerID == "" ||
+		fence.ProjectID != task.ProjectID || fence.WorkspaceID != task.WorkspaceID ||
+		fence.WorkspaceOwnerID != task.WorkspaceOwnerID || fence.ActorID != task.InitiatorID ||
+		grant.Revoked || grant.HostID != fence.HostID || grant.OwnerID != fence.WorkspaceOwnerID ||
 		grant.UserID != fence.ActorID || grant.GrantVersion != fence.GrantVersion ||
 		fingerprintHostMemberGrant(grant.CreatedAt, grant.GrantVersion, grant.Permissions) != fence.GrantFingerprint ||
-		!containsWorkflowAuthorizationScope(grant.Permissions, "desktop:control") {
+		!containsWorkflowAuthorizationScope(grant.Permissions, "workspace:file:read") {
 		return false
 	}
 	for _, binding := range snapshot.WorkspaceBindings {

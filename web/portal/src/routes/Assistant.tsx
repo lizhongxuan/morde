@@ -1229,6 +1229,7 @@ function PCDeliveryVisibilityObservation(props: { taskID: string; messageID: str
     let observed = false;
     let inFlight = false;
     let attempts = 0;
+    let retryDelay = 0;
     let timer: number | undefined;
     const schedule = () => {
       if (!visible || document.visibilityState !== 'visible' || observed || inFlight || attempts >= 3 || timer !== undefined) return;
@@ -1241,10 +1242,17 @@ function PCDeliveryVisibilityObservation(props: { taskID: string; messageID: str
           .catch((error: unknown) => {
             const retryable = !(error instanceof ApiError) || error.status === 429 || error.status >= 500;
             if (retryable && attempts < 3 && visible && document.visibilityState === 'visible') {
-              timer = window.setTimeout(() => { timer = undefined; schedule(); }, attempts * 1000);
+              retryDelay = attempts * 1000;
             }
           })
-          .finally(() => { inFlight = false; });
+          .finally(() => {
+            inFlight = false;
+            if (retryDelay > 0) {
+              const delay = retryDelay;
+              retryDelay = 0;
+              timer = window.setTimeout(() => { timer = undefined; schedule(); }, delay);
+            }
+          });
       }, 700);
     };
     const observer = new IntersectionObserver((entries) => {

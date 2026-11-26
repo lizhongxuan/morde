@@ -6054,7 +6054,7 @@ paths:
       tags: [Tasks]
       operationId: observeTaskReplyInPC
       summary: Record a desktop client-visible Task reply
-      description: Accepts only a client web session bound to an active desktop installation and a completed, published assistant message for this Task and revision. The server records its own observation time and installation identity; request bodies contain no message content.
+      description: Accepts only the Task initiator's client web session bound to an active desktop installation, with current access to the conversation, and a completed assistant message bound to the exact persisted task.result event for this Task and revision. The server records its own observation time and installation identity; request bodies contain no message content.
       security: [{ portalSession: [] }]
       requestBody:
         required: true
