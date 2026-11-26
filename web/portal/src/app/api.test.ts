@@ -12,6 +12,57 @@ describe('typed Portal API client', () => {
       .toBe('/api/tasks/q1234567/artifacts/a7654321/content');
   });
 
+  it.each(['image/png', 'audio/ogg', 'video/mp4'])('loads only the authorized Task media preview bytes (%s)', async (mediaType) => {
+    const calls: { input: RequestInfo | URL; init?: RequestInit }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input, init });
+      return new Response('safe preview bytes', { headers: { 'Content-Type': mediaType, 'Cache-Control': 'private, no-store' } });
+    }));
+
+    const preview = await portalApi.taskMediaPreview('q1234567', 'o1234567');
+
+    expect(preview).toBeInstanceOf(Blob);
+    expect(preview.type).toBe(mediaType);
+    expect(await preview.text()).toBe('safe preview bytes');
+    expect(calls).toHaveLength(1);
+    const call = calls.at(0)!;
+    expect(call.input).toBe('/api/tasks/q1234567/media/o1234567/preview');
+    expect(call.init?.credentials).toBe('include');
+    expect(call.init?.redirect).toBe('manual');
+  });
+
+  it.each(['image/svg+xml', 'image/png; charset=utf-8', 'text/html'])('rejects unsafe media preview MIME without following a provider URL (%s)', async (mediaType) => {
+    const calls: { input: RequestInfo | URL; init?: RequestInit }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input, init });
+      return new Response('https://provider.invalid/private-media', {
+        headers: { 'Content-Type': mediaType, Location: 'https://provider.invalid/private-media' },
+      });
+    }));
+
+    await expect(portalApi.taskMediaPreview('q1234567', 'o1234567')).rejects.toThrow('无法安全显示');
+    expect(calls).toHaveLength(1);
+    const call = calls.at(0)!;
+    expect(String(call.input)).toBe('/api/tasks/q1234567/media/o1234567/preview');
+    expect(String(call.input)).not.toContain('provider.invalid');
+    expect(call.init?.redirect).toBe('manual');
+  });
+
+  it('fails closed on a media preview redirect without requesting its destination', async () => {
+    const calls: { input: RequestInfo | URL; init?: RequestInit }[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      calls.push({ input, init });
+      return new Response('provider bytes must not be read', {
+        status: 302, headers: { Location: 'https://provider.invalid/private-media' },
+      });
+    }));
+
+    await expect(portalApi.taskMediaPreview('q1234567', 'o1234567')).rejects.toThrow('已拒绝显示');
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.input).toBe('/api/tasks/q1234567/media/o1234567/preview');
+    expect(calls[0]!.init?.redirect).toBe('manual');
+  });
+
   it('normalizes empty non-ready main-conversation IDs from the API contract', async () => {
     vi.stubGlobal('fetch', vi.fn(async () => Response.json({ status: 'selection_required', conversation_id: '', version: 0 })));
 

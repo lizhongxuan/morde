@@ -198,6 +198,8 @@ func TestWorkspaceSearchExecutionParametersPreserveQueryAndOmitCredentials(t *te
 
 	for _, secretQuery := range []string{
 		"api_key=synthetic-secret-value",
+		"DB_PASSWORD=synthetic-secret-value",
+		"x-api-key=synthetic-secret-value",
 		"Bearer " + strings.Repeat("A", 24),
 		"https://user:password@example.test/private",
 		"https://example.test/search?api_key=synthetic-secret-value",

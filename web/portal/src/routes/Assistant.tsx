@@ -3965,7 +3965,7 @@ export function Assistant() {
                       <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的审批请求">
                         <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
                         <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
-                          <TaskApprovalCard approval={messageTask.pending_request} submitting={respondToApproval.isPending}
+                          <TaskApprovalCard taskID={messageTask.id} approval={messageTask.pending_request} submitting={respondToApproval.isPending}
                             onDecision={(decision) => submitApprovalDecision(messageTask, decision)} />
                         </div>
                       </div>}

@@ -99,6 +99,7 @@ export function Reviews() {
     return key;
   };
   const renderItem = (item: TaskApprovalItem) => <TaskApprovalCard key={`${item.task_id}:${item.approval.id}`}
+    taskID={item.task_id}
     compact reviewInbox approval={item.approval}
     submitting={respond.isPending && respond.variables?.item.approval.id === item.approval.id}
     onDecision={(decision) => respond.mutateAsync({ item, decision, key: approvalKey(item, decision) })} />;

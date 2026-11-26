@@ -4,6 +4,13 @@ import type { components, operations } from '../api/schema';
 
 type AuditQuery = NonNullable<operations['listAuditLogs']['parameters']['query']>;
 
+const taskMediaPreviewTypes = new Set([
+  'image/png', 'image/jpeg', 'image/webp',
+  'video/mp4',
+  'audio/mpeg', 'audio/ogg', 'audio/opus', 'audio/wav', 'audio/aac',
+]);
+const maxTaskMediaPreviewBytes = 300 * 1024 * 1024;
+
 function personalIdentityHeaders(serviceInstanceID?: string, actorID?: string) {
   if (Boolean(serviceInstanceID) !== Boolean(actorID)) throw new Error('个人数据操作必须同时提供服务实例和账号身份。');
   return serviceInstanceID && actorID ? {
@@ -271,6 +278,27 @@ export const portalApi = {
       ...(options.cursor ? { cursor: options.cursor } : {}),
     } } })),
   taskArtifactContentURL: (id: string, artifactID: string) => `/api/tasks/${encodeURIComponent(id)}/artifacts/${encodeURIComponent(artifactID)}/content`,
+  taskMediaPreview: async (id: string, operationID: string): Promise<Blob> => {
+    const response = await requestFetch(`/api/tasks/${encodeURIComponent(id)}/media/${encodeURIComponent(operationID)}/preview`, {
+      redirect: 'manual',
+    });
+    const responseURL = response.url ? new URL(response.url, window.location.origin) : null;
+    if (response.type === 'opaqueredirect' || (response.status >= 300 && response.status < 400) || response.redirected ||
+      (responseURL && responseURL.origin !== window.location.origin)) {
+      throw new Error('媒体预览请求发生重定向，已拒绝显示。');
+    }
+    if (!response.ok) await throwResponseError(response);
+    const mediaType = response.headers.get('Content-Type') ?? '';
+    const contentLength = response.headers.get('Content-Length');
+    const declaredSize = contentLength === null ? null : Number(contentLength);
+    if (!taskMediaPreviewTypes.has(mediaType) ||
+      (declaredSize !== null && (!Number.isSafeInteger(declaredSize) || declaredSize < 1 || declaredSize > maxTaskMediaPreviewBytes))) {
+      throw new Error('媒体预览类型或大小无效，无法安全显示。');
+    }
+    const body = await response.blob();
+    if (body.size < 1 || body.size > maxTaskMediaPreviewBytes) throw new Error('媒体预览大小无效，无法安全显示。');
+    return new Blob([body], { type: mediaType });
+  },
   agentWorkspaceFileURL: (id: string, path: string) => `/api/workspaces/${encodeURIComponent(id)}/files/${path.split('/').map(encodeURIComponent).join('/')}`,
   taskStepDetail: async (id: string, stepID: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/steps/{step_id}', {
     params: { path: { id, step_id: stepID } },
