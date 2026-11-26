@@ -63,7 +63,7 @@ export function AdminUsers() {
         window.location.assign('/admin/login');
         return;
       }
-      notify('密码已重置。用户下次登录后需要先修改密码。', 'success');
+      notify('密码已重置。用户下次可在 PC 或 Portal 登录，并按提示完成密码修改后继续使用。', 'success');
       void client.invalidateQueries({ queryKey: ['admin', 'users'] });
     },
     onError: (error) => notify(errorDetails(error).message, 'error'),
@@ -143,7 +143,7 @@ export function AdminUsers() {
     {passwordTarget && <Modal title={`修改 ${passwordTarget.name} 的密码`} onClose={closePasswordReset}>
       <form className="form-stack" onSubmit={submitPasswordReset}>
         <div className="notice notice-warning" role="note">
-          <p>新密码会立即生效，并使该账号现有登录和客户端凭据失效。用户下次需先登录 Portal 修改密码，之后才能使用 PC 或 iOS 客户端。</p>
+          <p>新密码会立即生效，并使该账号现有登录和客户端凭据失效。用户下次可在 PC 或 Portal 登录，按提示完成密码修改后继续使用。</p>
           {passwordTarget.id === current?.id && <p>这是当前超级管理员账号；保存后会退出登录，需要使用新密码重新登录并完成修改。</p>}
         </div>
         <label htmlFor="admin-reset-password">新密码</label>

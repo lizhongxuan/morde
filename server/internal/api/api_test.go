@@ -157,13 +157,13 @@ func (s verifierStub) VerifyAPIKey(context.Context, string) (identity.Principal,
 }
 func (s verifierStub) VerifyDevice(context.Context, string) (identity.Principal, error) {
 	return identity.Principal{
-		UserID: testUserID, Role: identity.RoleUser, Kind: identity.KindDevice, TokenID: testTokenID,
+		UserID: testUserID, Role: identity.RoleUser, MustChangePassword: s.mustChange, Kind: identity.KindDevice, TokenID: testTokenID,
 		WorkspaceIDs: []string{testWorkspaceID}, Scopes: []identity.Scope{identity.ScopeWorkspaceSync},
 	}, s.err
 }
 func (s verifierStub) VerifyClient(context.Context, string) (identity.Principal, error) {
 	return identity.Principal{UserID: testUserID, Role: s.roleOrUser(), Kind: identity.KindClient,
-		TokenID: testTokenID, ClientInstallationID: "i1234567"}, s.err
+		MustChangePassword: s.mustChange, TokenID: testTokenID, ClientInstallationID: "i1234567"}, s.err
 }
 func (s verifierStub) ConsumeTicket(context.Context, string) (app.Ticket, error) {
 	return app.Ticket{}, errors.New("unexpected ticket consumption")
@@ -1186,6 +1186,67 @@ func TestInitialSuperAdminSessionIsRestrictedToPasswordChange(t *testing.T) {
 	cleared := changed.Result().Cookies()[0]
 	if cleared.Name != portalCookieName || cleared.MaxAge >= 0 || !cleared.HttpOnly || !cleared.Secure {
 		t.Fatalf("password change did not clear the old session cookie: %#v", cleared)
+	}
+}
+
+func TestPasswordChangeRequiredClientCanOnlyBootstrapPasswordPage(t *testing.T) {
+	services := newServices()
+	login := &clientLoginHTTPStub{}
+	deps := services.deps()
+	deps.ClientLogin = login
+	deps.Verifier = verifierStub{mustChange: true}
+	router, err := New(deps, validOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCredential, _, err := identity.NewCredential(identity.KindClient, testTokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorization := "Bearer " + clientCredential
+	profile := request(router, http.MethodGet, "/api/me", "", authorization, "")
+	if profile.Code != http.StatusOK {
+		t.Fatalf("restricted client profile read = %d %s", profile.Code, profile.Body)
+	}
+	webSession := request(router, http.MethodPost, "/api/auth/client-web-session", "", authorization, "")
+	if webSession.Code != http.StatusOK || !strings.Contains(webSession.Body.String(), `"web_session_credential":"web-secret"`) {
+		t.Fatalf("restricted client could not bootstrap the password page: %d %s", webSession.Code, webSession.Body)
+	}
+	if blocked := request(router, http.MethodGet, "/api/me/preferences", "", authorization, ""); blocked.Code != http.StatusForbidden {
+		t.Fatalf("password-change-required client operation = %d %s, want 403", blocked.Code, blocked.Body)
+	}
+	if logout := request(router, http.MethodPost, "/api/auth/client-logout", "", authorization, ""); logout.Code != http.StatusNoContent {
+		t.Fatalf("restricted client logout = %d %s", logout.Code, logout.Body)
+	}
+	deviceCredential, _, err := identity.NewCredential(identity.KindDevice, testTokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if blocked := request(router, http.MethodPost, "/api/workspaces/w1234567/sync-sessions", `{}`, "Bearer "+deviceCredential, ""); blocked.Code != http.StatusForbidden {
+		t.Fatalf("password-change-required device sync = %d %s, want 403", blocked.Code, blocked.Body)
+	}
+}
+
+func TestPasswordChangeAccessRouteIsNarrowlyScoped(t *testing.T) {
+	for _, tc := range []struct {
+		kind   identity.Kind
+		method string
+		path   string
+		allow  bool
+	}{
+		{kind: identity.KindSession, method: http.MethodGet, path: "/api/me", allow: true},
+		{kind: identity.KindSession, method: http.MethodPost, path: "/api/me/password", allow: true},
+		{kind: identity.KindClient, method: http.MethodGet, path: "/api/me", allow: true},
+		{kind: identity.KindClient, method: http.MethodPost, path: "/api/auth/client-web-session", allow: true},
+		{kind: identity.KindClient, method: http.MethodPost, path: "/api/auth/client-logout", allow: true},
+		{kind: identity.KindClient, method: http.MethodGet, path: "/api/me", allow: false},
+		{kind: identity.KindClient, method: http.MethodGet, path: "/api/me/preferences", allow: false},
+		{kind: identity.KindDevice, method: http.MethodPost, path: "/api/workspaces/:id/sync-sessions", allow: false},
+		{kind: identity.KindAPIKey, method: http.MethodPost, path: "/api/auth/client-web-session", allow: false},
+	} {
+		if got := passwordChangeAccessRoute(tc.kind, tc.method, tc.path); got != tc.allow {
+			t.Errorf("passwordChangeAccessRoute(%q, %q, %q) = %t, want %t", tc.kind, tc.method, tc.path, got, tc.allow)
+		}
 	}
 }
 

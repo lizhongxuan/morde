@@ -179,3 +179,28 @@ func TestClientLoginClosesInstallationAfterCredentialCommit(t *testing.T) {
 		t.Fatalf("LoginClient() identity snapshot = %#v, want %#v", store.authenticated, expectedUser)
 	}
 }
+
+func TestClientLoginAllowsRemoteBootstrapForRequiredPasswordChange(t *testing.T) {
+	credentials, users, hosts, _, _, _ := newCredentialFixture(t)
+	user := users.values["u1234567"]
+	user.MustChangePassword = true
+	users.values[user.ID] = user
+
+	events := []string{}
+	store := &clientRevocationStore{events: &events}
+	service, err := NewClientLoginService(store, credentials, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := service.Login(context.Background(), "alice", "correct horse", "desktop", "morde-pc", "", "initial-password-01", "203.0.113.42",
+		ClientLoginAttempt{InstanceID: "123e4567-e89b-12d3-a456-426614174000", Generation: 1})
+	if err != nil {
+		t.Fatalf("remote PC login for required password change = %v", err)
+	}
+	if !result.User.MustChangePassword || !store.authenticated.MustChangePassword {
+		t.Fatalf("password-change requirement was not carried into restricted login: result=%#v authenticated=%#v", result.User, store.authenticated)
+	}
+	if len(hosts.values) != 0 {
+		t.Fatalf("restricted first login provisioned a default Host before password change: %#v", hosts.values)
+	}
+}

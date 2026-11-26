@@ -424,7 +424,7 @@ func (h *api) authenticate(c *gin.Context) {
 	if principal.Kind == identity.KindSession && principal.ClientInstallationID != "" {
 		principal.Role = identity.RoleUser
 	}
-	if principal.Kind == identity.KindSession && principal.MustChangePassword && !passwordChangeRoute(c.Request.Method, c.FullPath()) {
+	if principal.MustChangePassword && !passwordChangeAccessRoute(principal.Kind, c.Request.Method, c.FullPath()) {
 		writeError(c, domain.NewError(domain.CodeForbidden, "password change is required before continuing"))
 		c.Abort()
 		return
@@ -465,6 +465,19 @@ func (h *api) authenticate(c *gin.Context) {
 func passwordChangeRoute(method, path string) bool {
 	return (method == http.MethodGet && path == "/api/me") ||
 		(method == http.MethodPost && (path == "/api/me/password" || path == "/api/auth/logout"))
+}
+
+func passwordChangeAccessRoute(kind identity.Kind, method, path string) bool {
+	if kind == identity.KindSession {
+		return passwordChangeRoute(method, path)
+	}
+	// A client credential issued with an initial or reset password may only
+	// mint the restricted web session needed to show the password-change page,
+	// read its own profile for the client's periodic authorization check, or log
+	// out. All other client, sync-device, and service actions stay blocked.
+	return kind == identity.KindClient &&
+		(method == http.MethodGet && path == "/api/me" || method == http.MethodPost &&
+			(path == "/api/auth/client-web-session" || path == "/api/auth/client-logout"))
 }
 
 func (h *api) checkOrigin(c *gin.Context) {

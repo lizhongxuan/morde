@@ -657,7 +657,8 @@ func (s *CredentialService) verify(ctx context.Context, raw string, want identit
 		role = identity.RoleUser
 	}
 	principal := identity.Principal{
-		UserID: user.ID, Role: role, MustChangePassword: user.MustChangePassword && want == identity.KindSession,
+		UserID: user.ID, Role: role, MustChangePassword: user.MustChangePassword &&
+			(want == identity.KindSession || want == identity.KindClient || want == identity.KindDevice),
 		Kind: want, TokenID: token.ID, ClientInstallationID: token.ClientInstallationID,
 		HostIDs: append([]string(nil), token.HostIDs...), WorkspaceIDs: append([]string(nil), token.WorkspaceIDs...),
 		Scopes: append([]identity.Scope(nil), token.Scopes...),

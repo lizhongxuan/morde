@@ -110,11 +110,10 @@ func (s *ClientLoginService) Login(ctx context.Context, name, password, platform
 	if err != nil {
 		return ClientLoginResult{}, err
 	}
-	if user.MustChangePassword {
-		return ClientLoginResult{}, domain.NewError(domain.CodeForbidden, "password change is required before client login")
-	}
-	if err := s.credentials.ensureDefaultHost(ctx, user); err != nil {
-		return ClientLoginResult{}, err
+	if !user.MustChangePassword {
+		if err := s.credentials.ensureDefaultHost(ctx, user); err != nil {
+			return ClientLoginResult{}, err
+		}
 	}
 	id, err := domain.NewClientInstallationID()
 	if err != nil {

@@ -330,7 +330,7 @@ export class MordeAPI {
         account_rejected: "账号审核未通过，请联系管理员。",
         account_disabled: "账号已被禁用，请联系管理员。",
         rate_limited: "登录尝试过于频繁，请稍后重试。",
-        forbidden: "请先在管理后台修改密码，再登录客户端。",
+        forbidden: "请先修改密码，再继续使用客户端。",
       };
       const error = new Error(messages[body?.error?.code ?? ""] ?? (response.status === 401 ? messages.unauthenticated : `Morde 登录失败（HTTP ${response.status}）。`));
       Object.assign(error, { code: body?.error?.code, reason: body?.error?.details?.reason });
