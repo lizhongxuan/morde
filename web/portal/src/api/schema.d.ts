@@ -3912,6 +3912,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/{id}/requirement-manifest/confirm": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Confirm the exact current Task verification requirement manifest
+         * @description Requires an authenticated Task reader and an Idempotency-Key. This records only an explicit positive confirmation of the exact current server-resolved plan manifest; it does not verify that the manifest is complete or mark H07 verified. Task revision, plan revision, plan event sequence, digest, and current authorization are rechecked transactionally. Stale, cancelled, unauthorized, or changed plans are rejected.
+         */
+        post: operations["confirmTaskRequirementManifest"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tasks/{id}/artifacts/{artifact_id}/content": {
         parameters: {
             query?: never;
@@ -9626,7 +9648,11 @@ export interface components {
                  */
                 basis: "required" | "risk_selected";
                 command: string;
+                /** @enum {string} */
+                scope_mode?: "full_suite" | "targeted";
                 coverage_paths: string[];
+                selectors?: string[];
+                requirement_ids?: string[];
                 requirement_source?: {
                     /** @enum {string} */
                     kind: "user_message" | "project_file";
@@ -9638,6 +9664,40 @@ export interface components {
                     content_sha256: string;
                 };
             };
+        };
+        /** @description Canonical persisted source identity. Submission-only locator/token fields are never stored in a Plan event. */
+        TaskPlanRequirementSource: components["schemas"]["TaskPlanUserMessageRequirementSource"] | components["schemas"]["TaskPlanProjectFileRequirementSource"];
+        TaskPlanUserMessageRequirementSource: {
+            /** @constant */
+            kind: "user_message";
+            message_id: string;
+            content_sha256: string;
+        };
+        TaskPlanProjectFileRequirementSource: {
+            /** @constant */
+            kind: "project_file";
+            workspace_path: string;
+            /** Format: int64 */
+            workspace_revision: number;
+            content_sha256: string;
+        };
+        TaskPlanRequirementObligation: {
+            id: string;
+            statement: string;
+            /** @enum {string} */
+            kind: "test" | "build" | "lint" | "typecheck" | "other";
+            /** @enum {string} */
+            scope_mode: "full_suite" | "targeted";
+            coverage_paths: string[];
+            selectors?: string[];
+            source: components["schemas"]["TaskPlanRequirementSource"];
+        };
+        TaskPlanRequirementManifest: {
+            /** @constant */
+            version: 1;
+            obligations: components["schemas"]["TaskPlanRequirementObligation"][];
+            /** @description Server-computed digest of the canonical candidate manifest. It does not prove completeness. */
+            digest: string;
         };
         TaskPlan: {
             /** Format: int64 */
@@ -9651,8 +9711,29 @@ export interface components {
              */
             cost_estimate_state: "unknown";
             steps: components["schemas"]["TaskPlanStep"][];
+            requirement_manifest?: components["schemas"]["TaskPlanRequirementManifest"];
             /** Format: date-time */
             created_at?: string;
+        };
+        TaskRequirementManifestConfirmationRequest: {
+            /** Format: int64 */
+            expected_task_revision: number;
+            /** Format: int64 */
+            expected_plan_revision: number;
+            /** Format: int64 */
+            expected_plan_event_sequence: number;
+        };
+        TaskRequirementManifestConfirmation: {
+            task_id: components["schemas"]["TaskId"];
+            /** Format: int64 */
+            task_revision: number;
+            /** Format: int64 */
+            plan_revision: number;
+            /** Format: int64 */
+            plan_event_sequence: number;
+            manifest_digest: string;
+            /** Format: date-time */
+            confirmed_at: string;
         };
         TaskStepRetryRequest: {
             /** Format: int64 */
@@ -17811,6 +17892,43 @@ export interface operations {
                 };
             };
             404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    confirmTaskRequirementManifest: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+                /** @description Strong quoted lowercase SHA-256 ETag of the candidate manifest, for example "<64 lowercase hex characters>". The server recomputes this digest from the current Plan event. */
+                "If-Match": string;
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskRequirementManifestConfirmationRequest"];
+            };
+        };
+        responses: {
+            /** @description Persisted confirmation fact for the exact current manifest. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    ETag?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskRequirementManifestConfirmation"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
             default: components["responses"]["Error"];
         };
     };

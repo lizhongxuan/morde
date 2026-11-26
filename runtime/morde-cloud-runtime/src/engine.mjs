@@ -2414,9 +2414,24 @@ export async function runAgent(ipc, frame) {
         message.content?.length === 1 && message.content[0]?.type === 'text' && message.content[0].text === frame.prompt)
     const stageRevisionMessages = deliveries => {
       const byID = new Map(deliveries.map(message => [message.message_id, message]))
+      const appliedIDs = new Set()
       for (const event of agent.session.snapshotEvents()) {
         if (event.type === 'user/message' && byID.has(event.data?.id)) {
-          throw new Error('pending revision is already present in the checkpoint')
+          const message = byID.get(event.data.id)
+          const mode = Object.hasOwn(message, 'mode') ? message.mode : 'followup'
+          if (!sameDeliveredMessage(event.data, message.message_id, message.content, message.attachment_ids, mode)) {
+            throw new Error('pending revision conflicts with the checkpointed message')
+          }
+          if (appliedIDs.has(message.message_id)) throw new Error('checkpoint contains a duplicate revision message')
+          appliedIDs.add(message.message_id)
+        }
+      }
+      let unappliedRevisionSeen = false
+      for (const message of deliveries) {
+        if (appliedIDs.has(message.message_id)) {
+          if (unappliedRevisionSeen) throw new Error('checkpoint applied revision messages out of order')
+        } else {
+          unappliedRevisionSeen = true
         }
       }
       let contextCount = 0
@@ -2429,14 +2444,16 @@ export async function runAgent(ipc, frame) {
         }
         if (!agent.inbox.remove(existing.id)) throw new Error('pending revision could not be restaged')
       }
-      for (let index = 0; index < deliveries.length; index++) {
-        const message = deliveries[index]
+      const pendingDeliveries = deliveries.filter(message => !appliedIDs.has(message.message_id))
+      for (let index = 0; index < pendingDeliveries.length; index++) {
+        const message = pendingDeliveries[index]
         const mode = Object.hasOwn(message, 'mode') ? message.mode : 'followup'
         const value = freezeMessage({ id: MessageId(message.message_id), role: 'user',
           content: deliveredMessageBlocks(message.content, message.attachment_ids), source: { kind: 'user', morde_delivery_mode: mode } })
-        if (index + 1 === deliveries.length) agent.followup(value)
+        if (index + 1 === pendingDeliveries.length) agent.followup(value)
         else agent.inject(value)
       }
+      return pendingDeliveries
     }
     if (coordinator && frame.resume === true && frame.initial_message) {
       const alreadyPersisted = agent.session.snapshotEvents().some(event =>
@@ -2463,15 +2480,14 @@ export async function runAgent(ipc, frame) {
       if (frame.prompt !== undefined && (!recovery.completed || recovery.openTurn !== null)) {
         throw new Error('server continuation requires a completed checkpoint')
       }
-      const hasRevisionMessages = revisionMessages.length !== 0
-      if (frame.step_retry === undefined && hasRevisionMessages) {
-        stageRevisionMessages(revisionMessages)
+      if (frame.step_retry === undefined && revisionMessages.length !== 0) {
+        revisionMessages = stageRevisionMessages(revisionMessages)
         installMessageDeliveryHandler()
       }
       await agent.whenIdle()
       if (!await ctx.sessions.flush(agent.session)) throw new Error('checkpoint listener unavailable')
       if (state.failed || state.toolFailure || ipc.cancelled) {
-        throw new Error(hasRevisionMessages ? 'revised task did not remain idle' : 'session recovery did not remain idle')
+        throw new Error(revisionMessages.length !== 0 ? 'revised task did not remain idle' : 'session recovery did not remain idle')
       }
       if (frame.step_retry !== undefined) {
         if (!recovery.completed || recovery.openTurn !== null || revisionMessages.length !== 0) {

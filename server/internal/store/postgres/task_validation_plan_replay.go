@@ -8,6 +8,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"path"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -16,6 +19,7 @@ import (
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/store/postgres/sqlcgen"
 )
 
 type taskValidationReplayTask struct {
@@ -59,6 +63,7 @@ type taskValidationReplayShellResult struct {
 	WorkspaceSnapshotSHA256Before string                                   `json:"workspace_snapshot_sha256_before"`
 	WorkspaceSnapshotSHA256After  string                                   `json:"workspace_snapshot_sha256_after"`
 	VerificationCheck             *app.TaskValidationCheckExecutionReceipt `json:"verification_check,omitempty"`
+	CoverageReceipt               *app.TaskValidationRunnerCoverageReceipt `json:"coverage_receipt,omitempty"`
 }
 
 // ReadTaskValidationReplayEvidence returns the typed-check facts for the
@@ -130,6 +135,11 @@ func loadTaskValidationPlanCheckReplay(ctx context.Context, tx pgx.Tx, claim app
 	if evidence == nil {
 		return nil, nil
 	}
+	requirementsVerified, err := taskValidationPlanRequirementManifestVerified(ctx, tx, claim, plan, current)
+	if err != nil {
+		return nil, err
+	}
+	evidence.RequirementSetVerified = requirementsVerified
 	checkIDs := make([]string, 0, len(plan.Steps))
 	for _, step := range plan.Steps {
 		if step.VerificationCheck != nil {
@@ -204,7 +214,7 @@ ORDER BY b.created_at,COALESCE(step.sequence,0)`, claim.OwnerID, claim.TaskID, c
 		verified := check != nil && check.Basis == task.PlanVerificationCheckRiskSelected
 		if check != nil {
 			var err error
-			verified, err = taskValidationPlanCheckRequirementSourceVerified(ctx, tx, claim, current, *check)
+			verified, err = taskValidationPlanCheckRequirementSourcesVerified(ctx, tx, claim, current, plan, *check)
 			if err != nil {
 				return nil, err
 			}
@@ -265,7 +275,8 @@ func replayCheckFactFromBinding(claim app.TaskValidationReviewClaim, plan task.P
 	fact := app.TaskValidationReplayCheckEvidence{CheckID: row.planStepID, Status: app.TaskValidationReplayPending,
 		TaskID: claim.TaskID, TaskRevision: claim.TaskRevision, PlanRevision: plan.Revision,
 		OperationID: row.executionID, CallID: row.callID, RunSequence: row.stepSequence,
-		Kind: checkKind(check), Basis: checkBasis(check), CoveragePaths: checkCoverage(check),
+		Kind: checkKind(check), Basis: checkBasis(check), ScopeMode: checkScopeMode(check),
+		CoveragePaths: checkCoverage(check), Selectors: checkSelectors(check), RequirementIDs: checkRequirementIDs(check),
 		RequirementSource: checkRequirementSource(check)}
 	if row.planStepID == "" || step.ID != row.planStepID || check == nil {
 		return fact
@@ -290,7 +301,7 @@ func replayCheckFactFromBinding(claim app.TaskValidationReviewClaim, plan task.P
 	var shell taskValidationReplayShellResult
 	decoder := json.NewDecoder(bytes.NewReader([]byte(row.operationResult)))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&shell) != nil || shell.ExitCode < 0 || shell.ExitCode > 255 || shell.VerificationCheck == nil ||
+	if decoder.Decode(&shell) != nil || decoder.Decode(new(any)) != io.EOF || shell.ExitCode < 0 || shell.ExitCode > 255 || shell.VerificationCheck == nil ||
 		shell.TaskID != claim.TaskID || shell.WorkspaceID != current.workspaceID || shell.BindingVersion != row.operationBindingVersion ||
 		shell.WorkspaceCheckpointRevision == nil || *shell.WorkspaceCheckpointRevision != row.operationCheckpoint ||
 		!validReplayWorkspaceViewID(shell.WorkspaceViewID) ||
@@ -327,8 +338,113 @@ func replayCheckFactFromBinding(claim app.TaskValidationReviewClaim, plan task.P
 		fact.Status = app.TaskValidationReplayFail
 	} else if row.operationStatus == "succeeded" && shell.ExitCode == 0 && !shell.TimedOut {
 		fact.Status = app.TaskValidationReplayPass
+		fact.ActualCoverageVerified = validTaskValidationRunnerCoverageReceipt(
+			shell.CoverageReceipt, *check, claim, current, row, shell)
 	}
 	return fact
+}
+
+const taskValidationRunnerCoverageScopeContract = "go_test_test_functions_only; examples/benchmarks/fuzz-target unsupported"
+
+func validTaskValidationRunnerCoverageReceipt(receipt *app.TaskValidationRunnerCoverageReceipt,
+	check task.PlanVerificationCheck, claim app.TaskValidationReviewClaim, current taskValidationReplayTask,
+	row taskValidationReplayBinding, shell taskValidationReplayShellResult) bool {
+	if receipt == nil || check.Kind != task.PlanVerificationCheckTest || receipt.Version != 1 || receipt.Runner != "go" ||
+		!validGoRunnerVersion(receipt.RunnerVersion) || receipt.ScopeContract != taskValidationRunnerCoverageScopeContract ||
+		receipt.ScopeMode != string(check.ScopeMode) || !receipt.ParserComplete ||
+		receipt.TaskID != claim.TaskID || receipt.WorkspaceID != current.workspaceID ||
+		receipt.WorkspaceDirectory != claim.TaskID+"/"+receipt.WorkspaceViewID ||
+		receipt.BindingVersion != row.operationBindingVersion || receipt.WorkspaceViewID != shell.WorkspaceViewID ||
+		receipt.WorkspaceCheckpointRevision == nil || *receipt.WorkspaceCheckpointRevision != row.operationCheckpoint ||
+		receipt.WorkspaceCWD != "." || receipt.WorkspaceSnapshotSHA256Before != shell.WorkspaceSnapshotSHA256Before ||
+		receipt.WorkspaceSnapshotSHA256After != shell.WorkspaceSnapshotSHA256After ||
+		!validReplayDigest(receipt.WorkspaceSnapshotSHA256Before) ||
+		receipt.WorkspaceSnapshotSHA256Before != receipt.WorkspaceSnapshotSHA256After ||
+		!validReplayDigest(receipt.ExactCommandSHA256) ||
+		!validReplayDigest(receipt.DiscoveredSourceInventorySHA256) || receipt.DiscoveredSourceInventoryCount < 1 ||
+		!validReplayDigest(receipt.DiscoveredPackageInventorySHA256) || receipt.DiscoveredPackageInventoryCount < 1 ||
+		!validReplayDigest(receipt.ExecutedPackageInventorySHA256) || receipt.ExecutedPackageInventoryCount < 1 ||
+		receipt.DiscoveredPackageInventorySHA256 != receipt.ExecutedPackageInventorySHA256 ||
+		receipt.DiscoveredPackageInventoryCount != receipt.ExecutedPackageInventoryCount ||
+		!validReplayDigest(receipt.DiscoveredTestInventorySHA256) || receipt.DiscoveredTestInventoryCount < 1 ||
+		!validReplayDigest(receipt.ExecutedTestInventorySHA256) || receipt.ExecutedTestInventoryCount < 1 ||
+		receipt.DiscoveredTestInventorySHA256 != receipt.ExecutedTestInventorySHA256 ||
+		receipt.DiscoveredTestInventoryCount != receipt.ExecutedTestInventoryCount ||
+		receipt.PassedTestCount < receipt.ExecutedTestInventoryCount || receipt.FailedTestCount != 0 ||
+		receipt.SkippedTestCount != 0 || shell.ExitCode != 0 || shell.TimedOut || shell.StdoutTruncated || shell.StderrTruncated {
+		return false
+	}
+	commandDigest := sha256.Sum256([]byte(check.Command))
+	if receipt.ExactCommandSHA256 != hex.EncodeToString(commandDigest[:]) {
+		return false
+	}
+	switch check.ScopeMode {
+	case task.PlanVerificationScopeFullSuite:
+		return check.Command == "go test ./..." && len(check.Selectors) == 0 &&
+			receipt.PackageSelector == "./..." && receipt.TestSelector == ""
+	case task.PlanVerificationScopeTargeted:
+		const selectorPrefix = "go test -run=^"
+		targetPackage := strings.TrimPrefix(receipt.PackageSelector, "./")
+		if !strings.HasPrefix(check.Command, selectorPrefix) || len(check.CoveragePaths) != 1 || len(check.Selectors) != 1 ||
+			!strings.HasPrefix(receipt.PackageSelector, "./") || targetPackage == "." || path.Clean(targetPackage) != targetPackage ||
+			strings.HasPrefix(targetPackage, "../") || strings.Contains(targetPackage, "...") || targetPackage != check.CoveragePaths[0] {
+			return false
+		}
+		suffix := "$ " + receipt.PackageSelector
+		if !strings.HasSuffix(check.Command, suffix) {
+			return false
+		}
+		selector := strings.TrimSuffix(strings.TrimPrefix(check.Command, selectorPrefix), suffix)
+		if !validExactGoTestName(selector) || check.Selectors[0] != selector {
+			return false
+		}
+		return receipt.TestSelector == "^"+selector+"$"
+	default:
+		return false
+	}
+}
+
+func validGoRunnerVersion(value string) bool {
+	fields := strings.Fields(value)
+	if len(fields) != 4 || fields[0] != "go" || fields[1] != "version" || !strings.HasPrefix(fields[2], "go1.") {
+		return false
+	}
+	version := strings.TrimPrefix(fields[2], "go")
+	if strings.HasPrefix(version, ".") || strings.HasSuffix(version, ".") || !strings.Contains(version, ".") {
+		return false
+	}
+	for _, character := range version {
+		if (character < '0' || character > '9') && character != '.' {
+			return false
+		}
+	}
+	architecture := strings.Split(fields[3], "/")
+	if len(architecture) != 2 || architecture[0] == "" || architecture[1] == "" {
+		return false
+	}
+	for _, component := range architecture {
+		for _, character := range component {
+			if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') &&
+				(character < '0' || character > '9') && character != '_' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func validExactGoTestName(value string) bool {
+	if len(value) < len("TestX") || len(value) > 256 || !strings.HasPrefix(value, "Test") {
+		return false
+	}
+	for index := 0; index < len(value); index++ {
+		character := value[index]
+		if (character < 'a' || character > 'z') && (character < 'A' || character > 'Z') &&
+			(character < '0' || character > '9') && character != '_' {
+			return false
+		}
+	}
+	return true
 }
 
 func replayPlanStep(plan task.Plan, id string) (task.PlanStep, *task.PlanVerificationCheck) {
@@ -354,11 +470,32 @@ func checkBasis(check *task.PlanVerificationCheck) task.PlanVerificationCheckBas
 	return check.Basis
 }
 
+func checkScopeMode(check *task.PlanVerificationCheck) task.PlanVerificationScopeMode {
+	if check == nil {
+		return ""
+	}
+	return check.ScopeMode
+}
+
 func checkCoverage(check *task.PlanVerificationCheck) []string {
 	if check == nil {
 		return nil
 	}
 	return append([]string(nil), check.CoveragePaths...)
+}
+
+func checkSelectors(check *task.PlanVerificationCheck) []string {
+	if check == nil {
+		return nil
+	}
+	return append([]string(nil), check.Selectors...)
+}
+
+func checkRequirementIDs(check *task.PlanVerificationCheck) []task.PlanVerificationRequirementID {
+	if check == nil {
+		return nil
+	}
+	return append([]task.PlanVerificationRequirementID(nil), check.RequirementIDs...)
 }
 
 func checkRequirementSource(check *task.PlanVerificationCheck) *task.PlanVerificationRequirementSource {
@@ -373,15 +510,44 @@ func checkRequirementSource(check *task.PlanVerificationCheck) *task.PlanVerific
 	return &source
 }
 
-func taskValidationPlanCheckRequirementSourceVerified(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim,
-	current taskValidationReplayTask, check task.PlanVerificationCheck) (bool, error) {
+func taskValidationPlanCheckRequirementSourcesVerified(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim,
+	current taskValidationReplayTask, plan task.Plan, check task.PlanVerificationCheck) (bool, error) {
 	if check.Basis == task.PlanVerificationCheckRiskSelected {
-		return check.RequirementSource == nil, nil
+		return check.RequirementSource == nil && len(check.RequirementIDs) == 0, nil
 	}
-	if check.Basis != task.PlanVerificationCheckRequired || check.RequirementSource == nil {
+	if check.Basis != task.PlanVerificationCheckRequired {
 		return false, nil
 	}
-	source := check.RequirementSource
+	if plan.RequirementManifest == nil {
+		if check.RequirementSource == nil {
+			return false, nil
+		}
+		return taskValidationRequirementSourceVerified(ctx, tx, claim, current, *check.RequirementSource)
+	}
+	if check.RequirementSource != nil || len(check.RequirementIDs) == 0 {
+		return false, nil
+	}
+	obligations := make(map[task.PlanVerificationRequirementID]task.PlanVerificationObligation,
+		len(plan.RequirementManifest.Obligations))
+	for _, obligation := range plan.RequirementManifest.Obligations {
+		obligations[obligation.ID] = obligation
+	}
+	for _, id := range check.RequirementIDs {
+		obligation, found := obligations[id]
+		if !found {
+			return false, nil
+		}
+		verified, err := taskValidationRequirementSourceVerified(ctx, tx, claim, current, obligation.Source)
+		if err != nil || !verified {
+			return verified, err
+		}
+	}
+	return true, nil
+}
+
+func taskValidationRequirementSourceVerified(ctx context.Context, tx pgx.Tx, claim app.TaskValidationReviewClaim,
+	current taskValidationReplayTask, value task.PlanVerificationRequirementSource) (bool, error) {
+	source := &value
 	switch source.Kind {
 	case task.PlanVerificationRequirementUserMessage:
 		if !domain.ValidMessageID(source.MessageID) || source.WorkspacePath != "" || source.WorkspaceRevision != nil {
@@ -420,6 +586,68 @@ WHERE file.workspace_id=$1 AND file.file_path=$2 AND file.valid_from_revision<=$
 	default:
 		return false, nil
 	}
+}
+
+func taskValidationPlanRequirementManifestVerified(ctx context.Context, tx pgx.Tx,
+	claim app.TaskValidationReviewClaim, plan task.Plan, current taskValidationReplayTask) (bool, error) {
+	manifest := plan.RequirementManifest
+	if manifest == nil {
+		return false, nil
+	}
+	digest, err := plan.RequirementManifestDigest()
+	if err != nil || digest != manifest.Digest {
+		return false, nil
+	}
+	for _, obligation := range manifest.Obligations {
+		verified, err := taskValidationRequirementSourceVerified(ctx, tx, claim, current, obligation.Source)
+		if err != nil || !verified {
+			return false, err
+		}
+	}
+	planEventSequence, err := latestTaskValidationPlanEventSequence(ctx, tx, claim.TaskID, claim.TaskRevision, plan.Revision)
+	if err != nil || planEventSequence < 1 {
+		return false, err
+	}
+	confirmation, found, err := readTaskRequirementManifestConfirmationForPlan(ctx, tx, claim.OwnerID,
+		claim.TaskID, claim.TaskRevision, plan.Revision, planEventSequence, current.authVersion, digest)
+	if err != nil || !found {
+		return false, err
+	}
+	if !domain.ValidUserID(confirmation.ConfirmedByUserID) ||
+		!validTaskRequirementConfirmationPrincipalKind(confirmation.ConfirmedByPrincipalKind) || confirmation.ConfirmedAt.IsZero() {
+		return false, nil
+	}
+	row, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: claim.TaskID, OwnerID: claim.OwnerID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read current Task authorization for H07 requirement confirmation: %w", err)
+	}
+	if row.AuthVersion != confirmation.TaskAuthorizationVersion || row.CurrentRevision != claim.TaskRevision ||
+		row.DesiredRevision != claim.TaskRevision {
+		return false, nil
+	}
+	authorized, err := requireCurrentTaskAuthorization(ctx, tx, row)
+	if err != nil || !authorized {
+		return false, err
+	}
+	return true, nil
+}
+
+func latestTaskValidationPlanEventSequence(ctx context.Context, tx pgx.Tx, taskID string,
+	taskRevision, planRevision int64) (int64, error) {
+	var sequence int64
+	err := tx.QueryRow(ctx, `SELECT sequence FROM task_events WHERE task_id=$1 AND event_type='task.plan'
+AND payload #>> '{plan,task_revision}'=$2 AND payload #>> '{plan,revision}'=$3
+ORDER BY sequence DESC LIMIT 1`, taskID, fmt.Sprint(taskRevision), fmt.Sprint(planRevision)).Scan(&sequence)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	if err != nil {
+		return 0, fmt.Errorf("read current plan event sequence for H07 requirement confirmation: %w", err)
+	}
+	return sequence, nil
 }
 
 func replayPlanCheckDigests(check task.PlanVerificationCheck) (command, wholeCheck, coverage string, ok bool) {

@@ -67,6 +67,7 @@ func TestPostgresTaskTerminalDeliveryMessageAndPublishedMarkerAreAtomicAndIdempo
 	f := newAgentLifecycleFixture(t)
 	ctx := context.Background()
 	commitTaskTerminalDeliveryFailure(t, f)
+	reply := "系统状态说明：任务执行状态为失败。原因：" + app.TaskTerminalDeliveryFailureExplanation("provider_unavailable")
 	claims, err := f.store.ClaimTaskTerminalDeliverySources(ctx, "terminal-publisher", 30*time.Second, 1)
 	if err != nil || len(claims) != 1 {
 		t.Fatalf("claim terminal delivery source: claims=%+v err=%v", claims, err)
@@ -77,7 +78,7 @@ func TestPostgresTaskTerminalDeliveryMessageAndPublishedMarkerAreAtomicAndIdempo
 	}
 	ciphertext, err := app.SealTaskTerminalDeliveryReply(sealer, claims[0], app.TaskTerminalDeliveryReply{
 		Kind: app.TaskTerminalDeliveryReplySystemState,
-		Text: "系统状态说明：任务执行失败，当前无法生成 Agent 整理说明。",
+		Text: reply,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -99,7 +100,7 @@ END $$`); err != nil {
 BEFORE UPDATE ON task_terminal_delivery_outbox FOR EACH ROW EXECUTE FUNCTION test_reject_terminal_delivery_publish()`); err != nil {
 		t.Fatalf("create terminal delivery publish trigger: %v", err)
 	}
-	if _, _, err := f.store.PublishTaskTerminalDeliveryReply(ctx, ready, "系统状态说明：任务执行失败，当前无法生成 Agent 整理说明。"); err == nil {
+	if _, _, err := f.store.PublishTaskTerminalDeliveryReply(ctx, ready, reply); err == nil {
 		t.Fatal("message publication committed without the source marker")
 	}
 	if _, err := f.store.pool.Exec(ctx, `DROP TRIGGER test_reject_terminal_delivery_publish ON task_terminal_delivery_outbox`); err != nil {
@@ -121,19 +122,17 @@ BEFORE UPDATE ON task_terminal_delivery_outbox FOR EACH ROW EXECUTE FUNCTION tes
 		t.Fatalf("failed transaction was partially committed: assistant_messages=%d state=%q", assistantMessages, state)
 	}
 
-	published, messageID, err := f.store.PublishTaskTerminalDeliveryReply(ctx, ready,
-		"系统状态说明：任务执行失败，当前无法生成 Agent 整理说明。")
+	published, messageID, err := f.store.PublishTaskTerminalDeliveryReply(ctx, ready, reply)
 	if err != nil || !published || !domain.ValidMessageID(messageID) {
 		t.Fatalf("publish terminal delivery: published=%t message=%q err=%v", published, messageID, err)
 	}
-	replayed, replayMessageID, err := f.store.PublishTaskTerminalDeliveryReply(ctx, ready,
-		"系统状态说明：任务执行失败，当前无法生成 Agent 整理说明。")
+	replayed, replayMessageID, err := f.store.PublishTaskTerminalDeliveryReply(ctx, ready, reply)
 	if err != nil || replayed || replayMessageID != messageID {
 		t.Fatalf("replayed terminal delivery: published=%t message=%q err=%v", replayed, replayMessageID, err)
 	}
 	if err := f.store.pool.QueryRow(ctx, `SELECT count(*) FROM conversation_messages
 WHERE id=$1 AND task_id=$2 AND role='assistant' AND content=$3`, messageID, ready.TaskID,
-		"系统状态说明：任务执行失败，当前无法生成 Agent 整理说明。").Scan(&assistantMessages); err != nil {
+		reply).Scan(&assistantMessages); err != nil {
 		t.Fatal(err)
 	}
 	if assistantMessages != 1 {

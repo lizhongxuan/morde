@@ -261,11 +261,11 @@ func terminalDeliverySystemStateReply(facts app.TaskTerminalDeliverySourceFacts)
 		facts.StepCounts.Unconfirmed, app.TaskTerminalDeliverySafeNextStep(facts.Identity.SourceKind))
 	switch facts.Identity.SourceKind {
 	case app.TaskTerminalDeliverySourceFailure:
-		return fmt.Sprintf("系统状态说明：任务执行状态为失败（记录原因代码：%s）。%s", facts.FailureCode, progress)
+		return fmt.Sprintf("系统状态说明：任务执行状态为失败。原因：%s %s", app.TaskTerminalDeliveryFailureExplanation(facts.FailureCode), progress)
 	case app.TaskTerminalDeliverySourceCancellation:
 		return "系统状态说明：任务已确认取消。" + progress
 	case app.TaskTerminalDeliverySourceWaiting:
-		return fmt.Sprintf("系统状态说明：任务当前处于等待处理状态（记录原因代码：%s）。%s", facts.WaitingReason, progress)
+		return fmt.Sprintf("系统状态说明：任务当前处于等待处理状态。原因：%s %s", app.TaskTerminalDeliveryWaitingExplanation(facts.WaitingReason), progress)
 	case app.TaskTerminalDeliverySourceValidation:
 		var checks []string
 		for _, finding := range facts.ValidationFindings {

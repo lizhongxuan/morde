@@ -562,8 +562,14 @@ func TestTaskValidationReviewPromptIncludesReplaySection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(prompt, `"replay":{"state":"pending","requirement_set_verified":false,"final_workspace_snapshot_verified":false,"plan_revision":1,"checks":[{"check_id":"verify","kind":"test","basis":"risk_selected","coverage_paths":["server"],"requirement_source_verified":false,"status":"pending"}]}`) {
+	if !strings.Contains(prompt, `"replay":{"state":"pending","requirement_set_verified":false,"final_workspace_snapshot_verified":false,"plan_revision":1,"checks":[{"check_id":"verify","kind":"test","basis":"risk_selected","coverage_paths":["server"],"requirement_source_verified":false,"actual_coverage_verified":false,"status":"pending"}]}`) {
 		t.Fatalf("review prompt missing typed replay facts = %s", prompt)
+	}
+	for _, expected := range []string{"actual_coverage_verified=true", "发现与执行的测试包/测试根清单",
+		"普通 shell 退出码或 parser 布尔字段本身不够", "若用户/项目明确要求全量测试而计划只声明定向检查"} {
+		if !strings.Contains(taskValidationReviewSystemPrompt+taskValidationReviewCoverageSupplement, expected) {
+			t.Fatalf("review system prompt omitted runner coverage guidance %q", expected)
+		}
 	}
 	prompt, err = taskValidationReviewPrompt(app.TaskValidationReviewInput{Objective: "Fix the bug", Result: "Fixed"})
 	if err != nil {

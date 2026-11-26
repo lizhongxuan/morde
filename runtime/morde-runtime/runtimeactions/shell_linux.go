@@ -12,6 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"hash"
 	"io"
 	"os"
@@ -24,6 +27,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"morde-runtime/contract"
 	"morde-runtime/runtimecore"
@@ -65,6 +70,7 @@ type ShellHandler struct {
 	bwrapPath     string
 	bwrapBase     []string
 	setprivPath   string
+	goPath        string
 	setsidPath    string
 	credential    *syscall.Credential
 	workDir       string
@@ -152,6 +158,9 @@ func NewShellHandler(options ShellOptions) (*ShellHandler, error) {
 	if err != nil {
 		return nil, shellStartupUnavailable(ShellFailureRequiredTool)
 	}
+	// Go is optional for the generic shell capability. Its absence only disables
+	// the trusted test adapter; it must not disable ordinary shell execution.
+	goTool, _ := findTrustedExecutable([]string{"/usr/local/go/bin/go", "/usr/bin/go", "/bin/go", "/usr/local/bin/go"})
 	credential, _, err := gemCredential()
 	if err != nil {
 		return nil, shellStartupUnavailable(ShellFailureOther)
@@ -170,7 +179,7 @@ func NewShellHandler(options ShellOptions) (*ShellHandler, error) {
 		return nil, shellStartupUnavailable(ShellFailureWorkspaceProbe)
 	}
 	handler := &ShellHandler{
-		basePath: base, bwrapPath: bwrap, bwrapBase: bwrapBase, setprivPath: setpriv,
+		basePath: base, bwrapPath: bwrap, bwrapBase: bwrapBase, setprivPath: setpriv, goPath: goTool,
 		setsidPath: setsid, credential: credential, workDir: workDir, workspaceRoot: workspaceRoot, maxTimeout: options.MaxTimeout,
 		pollInterval: options.PollInterval, outputLimit: options.MaxOutputBytes,
 		parallel: make(chan struct{}, maxParallelShells), operations: make(map[string]operationRecord),
@@ -275,6 +284,35 @@ func (h *ShellHandler) Execute(ctx context.Context, request contract.ExecuteRequ
 		if err != nil {
 			return nil, fmt.Errorf("scan Task Workspace snapshot before shell execution: %w", err)
 		}
+	}
+	if spec, recognized := parseShellGoTestSpec(args.Command); recognized && h.goPath != "" &&
+		request.WorkspaceViewID != "" && relativeCWD == "." {
+		result, receipt, runErr := h.executeTrustedGoTest(operationContext, request, args.Command, spec,
+			workspaceRoot, workspaceDir, jailWorkspace, jailCWD, workspaceSnapshotBefore)
+		if runErr != nil {
+			return nil, runErr
+		}
+		workspaceSnapshotAfter, snapshotErr := taskWorkspaceSnapshotSHA256(ctx, workspaceRoot)
+		if snapshotErr != nil {
+			return nil, fmt.Errorf("scan Task Workspace snapshot after shell execution: %w", snapshotErr)
+		}
+		if receipt != nil {
+			receipt.WorkspaceSnapshotSHA256After = workspaceSnapshotAfter
+		}
+		revision := request.WorkspaceCheckpointRevision
+		encoded, marshalErr := json.Marshal(shellTaskWorkspaceResult{
+			ExitCode: result.ExitCode, Stdout: result.Stdout, Stderr: result.Stderr,
+			StdoutTruncated: result.StdoutTruncated, StderrTruncated: result.StderrTruncated,
+			TimedOut: result.TimedOut, TaskID: request.TaskID, WorkspaceID: request.WorkspaceID,
+			BindingVersion: request.BindingVersion, WorkspaceViewID: request.WorkspaceViewID,
+			WorkspaceCheckpointRevision:   &revision,
+			WorkspaceSnapshotSHA256Before: workspaceSnapshotBefore, WorkspaceSnapshotSHA256After: workspaceSnapshotAfter,
+			CoverageReceipt: receipt,
+		})
+		if marshalErr != nil {
+			return nil, ErrProcessDomainUnavailable
+		}
+		return encoded, nil
 	}
 
 	operationID := request.OperationID
@@ -765,6 +803,776 @@ func (h *ShellHandler) command(args shellArguments, workspaceDir *os.File, jailW
 	command := exec.Command(h.bwrapPath, commandArgs...)
 	command.ExtraFiles = []*os.File{workspaceDir}
 	return command
+}
+
+type shellGoStageResult struct {
+	stdout          *boundedBuffer
+	stderr          *boundedBuffer
+	exitCode        int
+	timedOut        bool
+	clean           bool
+	stdoutTruncated bool
+	stderrTruncated bool
+}
+
+const maxTrustedGoPackages = 256
+const maxTrustedGoTestSources = 4096
+
+type goListError struct {
+	Err string
+}
+
+type goListPackage struct {
+	ImportPath   string
+	Dir          string
+	Name         string
+	TestGoFiles  []string
+	XTestGoFiles []string
+	Incomplete   bool
+	Error        *goListError
+	DepsErrors   []goListError
+}
+
+type goPackageInventory struct {
+	importPath   string
+	relativeDir  string
+	testGoFiles  []string
+	xTestGoFiles []string
+}
+
+type goSourceInventory struct {
+	all         map[string]goPackageInventory
+	testBearing map[string]bool
+}
+
+type goTestEvent struct {
+	Action  string
+	Package string
+	Test    string
+	Output  string
+}
+
+type goTestEventStats struct {
+	passed  int
+	failed  int
+	skipped int
+}
+
+func successfulTrustedGoStage(stage shellGoStageResult) bool {
+	return stage.exitCode == 0 && !stage.timedOut && stage.clean &&
+		!stage.stdoutTruncated && !stage.stderrTruncated
+}
+
+func parseTrustedGoVersion(stdout, stderr string, exitCode int, stdoutTruncated, stderrTruncated, clean bool) (string, bool) {
+	if exitCode != 0 || stdoutTruncated || stderrTruncated || !clean || strings.TrimSpace(stderr) != "" {
+		return "", false
+	}
+	line := strings.TrimSuffix(stdout, "\n")
+	if strings.Contains(line, "\n") || strings.Contains(line, "\r") {
+		return "", false
+	}
+	fields := strings.Fields(line)
+	if len(fields) != 4 || fields[0] != "go" || fields[1] != "version" || !strings.HasPrefix(fields[2], "go1.") ||
+		!(fields[3] == "linux/amd64" || fields[3] == "linux/arm64") {
+		return "", false
+	}
+	for _, character := range fields[2][2:] {
+		if !(character >= '0' && character <= '9') && character != '.' && character != 'a' && character != 'b' && character != 'c' {
+			return "", false
+		}
+	}
+	return fields[2] + " " + fields[3], true
+}
+
+func parseGoSourceInventory(output, jailWorkspace, jailCWD string) (goSourceInventory, string, int, bool) {
+	inventory := goSourceInventory{all: make(map[string]goPackageInventory), testBearing: make(map[string]bool)}
+	decoder := json.NewDecoder(strings.NewReader(output))
+	for {
+		var listed goListPackage
+		err := decoder.Decode(&listed)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil || listed.ImportPath == "" || listed.Dir == "" || listed.Name == "" || listed.Incomplete ||
+			listed.Error != nil || len(listed.DepsErrors) != 0 || len(inventory.all) >= maxTrustedGoPackages {
+			return goSourceInventory{}, "", 0, false
+		}
+		if _, duplicate := inventory.all[listed.ImportPath]; duplicate {
+			return goSourceInventory{}, "", 0, false
+		}
+		cleanDir := filepath.Clean(listed.Dir)
+		relativeDir, err := filepath.Rel(jailCWD, cleanDir)
+		if err != nil || !filepath.IsAbs(cleanDir) || relativeDir == ".." || strings.HasPrefix(relativeDir, ".."+string(filepath.Separator)) ||
+			!pathWithinRoot(jailWorkspace, cleanDir) {
+			return goSourceInventory{}, "", 0, false
+		}
+		if err := validGoListFiles(listed.TestGoFiles); err != nil {
+			return goSourceInventory{}, "", 0, false
+		}
+		if err := validGoListFiles(listed.XTestGoFiles); err != nil {
+			return goSourceInventory{}, "", 0, false
+		}
+		listed.TestGoFiles = append([]string(nil), listed.TestGoFiles...)
+		listed.XTestGoFiles = append([]string(nil), listed.XTestGoFiles...)
+		sort.Strings(listed.TestGoFiles)
+		sort.Strings(listed.XTestGoFiles)
+		packageInventory := goPackageInventory{importPath: listed.ImportPath, relativeDir: filepath.ToSlash(relativeDir),
+			testGoFiles: listed.TestGoFiles, xTestGoFiles: listed.XTestGoFiles}
+		inventory.all[listed.ImportPath] = packageInventory
+		if len(listed.TestGoFiles)+len(listed.XTestGoFiles) > 0 {
+			inventory.testBearing[listed.ImportPath] = true
+		}
+	}
+	if len(inventory.all) == 0 {
+		return goSourceInventory{}, "", 0, false
+	}
+	sourceItems := make([]string, 0, len(inventory.testBearing))
+	sourceCount := 0
+	for importPath := range inventory.testBearing {
+		packageInventory := inventory.all[importPath]
+		for _, file := range packageInventory.testGoFiles {
+			sourceItems = append(sourceItems, importPath+"\x00"+packageInventory.relativeDir+"\x00test\x00"+file)
+			sourceCount++
+		}
+		for _, file := range packageInventory.xTestGoFiles {
+			sourceItems = append(sourceItems, importPath+"\x00"+packageInventory.relativeDir+"\x00xtest\x00"+file)
+			sourceCount++
+		}
+	}
+	if sourceCount == 0 || sourceCount > maxTrustedGoTestSources {
+		return goSourceInventory{}, "", 0, false
+	}
+	return inventory, hashStringInventory(sourceItems), sourceCount, true
+}
+
+func scanGoTestSourceFiles(root *os.Root, source goSourceInventory) (map[string]map[string]bool, string, int, bool) {
+	if root == nil || len(source.testBearing) == 0 {
+		return nil, "", 0, false
+	}
+	const maxSourceFileBytes = 8 << 20
+	const maxSourceTotalBytes = 64 << 20
+	tests := make(map[string]map[string]bool)
+	sourceItems := make([]string, 0)
+	sourceCount, totalBytes := 0, 0
+	for packagePath, packageInventory := range source.all {
+		if !source.testBearing[packagePath] {
+			continue
+		}
+		for _, entry := range []struct {
+			kind  string
+			files []string
+		}{{kind: "test", files: packageInventory.testGoFiles}, {kind: "xtest", files: packageInventory.xTestGoFiles}} {
+			for _, sourceFile := range entry.files {
+				relativePath := filepath.Join(packageInventory.relativeDir, sourceFile)
+				file, err := root.Open(relativePath)
+				if err != nil {
+					return nil, "", 0, false
+				}
+				info, err := file.Stat()
+				if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maxSourceFileBytes {
+					_ = file.Close()
+					return nil, "", 0, false
+				}
+				contents, readErr := io.ReadAll(io.LimitReader(file, maxSourceFileBytes+1))
+				closeErr := file.Close()
+				if readErr != nil || closeErr != nil || len(contents) > maxSourceFileBytes {
+					return nil, "", 0, false
+				}
+				totalBytes += len(contents)
+				if totalBytes > maxSourceTotalBytes {
+					return nil, "", 0, false
+				}
+				parsed, parseErr := parser.ParseFile(token.NewFileSet(), relativePath, contents, parser.AllErrors)
+				if parseErr != nil || parsed == nil {
+					return nil, "", 0, false
+				}
+				aliases, dotTesting, aliasesOK := goTestingImportAliases(parsed)
+				if !aliasesOK {
+					return nil, "", 0, false
+				}
+				for _, declaration := range parsed.Decls {
+					function, ok := declaration.(*ast.FuncDecl)
+					if !ok || function.Recv != nil || function.Name == nil {
+						continue
+					}
+					name := function.Name.Name
+					if name == "TestMain" {
+						if !validGoTestFunctionSignature(function, "T", aliases, dotTesting) {
+							return nil, "", 0, false
+						}
+					} else if isGoTestNameCandidate(name, "Example") || isGoTestNameCandidate(name, "Benchmark") || isGoTestNameCandidate(name, "Fuzz") {
+						// These runner kinds are intentionally outside this receipt contract.
+						return nil, "", 0, false
+					} else if !isGoTestNameCandidate(name, "Test") {
+						continue
+					}
+					if !validGoTestName(name) || !validGoTestFunctionSignature(function, "T", aliases, dotTesting) {
+						return nil, "", 0, false
+					}
+					if tests[packagePath] == nil {
+						tests[packagePath] = make(map[string]bool)
+					}
+					if tests[packagePath][name] {
+						return nil, "", 0, false
+					}
+					tests[packagePath][name] = true
+				}
+				digest := sha256.Sum256(contents)
+				sourceItems = append(sourceItems, packagePath+"\x00"+packageInventory.relativeDir+"\x00"+entry.kind+"\x00"+sourceFile+"\x00"+hex.EncodeToString(digest[:]))
+				sourceCount++
+			}
+		}
+	}
+	if sourceCount == 0 || sourceCount > maxTrustedGoTestSources || len(flattenGoTestInventory(tests)) == 0 {
+		return nil, "", 0, false
+	}
+	return tests, hashStringInventory(sourceItems), sourceCount, true
+}
+
+func goTestingImportAliases(file *ast.File) (map[string]bool, bool, bool) {
+	aliases := make(map[string]bool)
+	dotTesting := false
+	for _, imported := range file.Imports {
+		pathValue, err := strconv.Unquote(imported.Path.Value)
+		if err != nil {
+			return nil, false, false
+		}
+		if pathValue != "testing" {
+			continue
+		}
+		if imported.Name == nil {
+			aliases["testing"] = true
+			continue
+		}
+		switch imported.Name.Name {
+		case ".":
+			dotTesting = true
+		case "_":
+			return nil, false, false
+		default:
+			aliases[imported.Name.Name] = true
+		}
+	}
+	return aliases, dotTesting, true
+}
+
+func validGoTestFunctionSignature(function *ast.FuncDecl, testType string, aliases map[string]bool, dotTesting bool) bool {
+	if function == nil || function.Type == nil || function.Type.TypeParams != nil && len(function.Type.TypeParams.List) != 0 ||
+		function.Type.Results != nil && len(function.Type.Results.List) != 0 || function.Type.Params == nil ||
+		len(function.Type.Params.List) != 1 || len(function.Type.Params.List[0].Names) > 1 {
+		return false
+	}
+	pointer, ok := function.Type.Params.List[0].Type.(*ast.StarExpr)
+	if !ok {
+		return false
+	}
+	switch target := pointer.X.(type) {
+	case *ast.Ident:
+		return target.Name == testType && dotTesting
+	case *ast.SelectorExpr:
+		packageName, ok := target.X.(*ast.Ident)
+		return ok && target.Sel.Name == testType && aliases[packageName.Name]
+	default:
+		return false
+	}
+}
+
+func isGoTestNameCandidate(name, prefix string) bool {
+	if !strings.HasPrefix(name, prefix) {
+		return false
+	}
+	suffix := strings.TrimPrefix(name, prefix)
+	if suffix == "" {
+		return true
+	}
+	runeValue, _ := utf8.DecodeRuneInString(suffix)
+	return !unicode.IsLower(runeValue)
+}
+
+func validGoListFiles(files []string) error {
+	seen := make(map[string]bool, len(files))
+	for _, file := range files {
+		if file == "" || filepath.Base(file) != file || !strings.HasSuffix(file, ".go") || file == ".go" || seen[file] {
+			return ErrInvalidShellRequest
+		}
+		seen[file] = true
+	}
+	return nil
+}
+
+func pathWithinRoot(root, path string) bool {
+	relative, err := filepath.Rel(root, path)
+	return err == nil && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator))
+}
+
+func parseGoTestRun(output string, discovered map[string]map[string]bool, source goSourceInventory) (map[string]map[string]bool, map[string]bool, goTestEventStats, bool) {
+	executed := make(map[string]map[string]bool)
+	packageTerminal := make(map[string]string)
+	packageStarted := make(map[string]bool)
+	testState := make(map[string]string)
+	stats := goTestEventStats{}
+	decoder := json.NewDecoder(strings.NewReader(output))
+	for {
+		var event goTestEvent
+		err := decoder.Decode(&event)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil || event.Action == "" || event.Package == "" {
+			return nil, nil, stats, false
+		}
+		if _, exists := source.all[event.Package]; !exists {
+			return nil, nil, stats, false
+		}
+		if event.Test == "" {
+			switch event.Action {
+			case "start":
+				if packageStarted[event.Package] {
+					return nil, nil, stats, false
+				}
+				packageStarted[event.Package] = true
+			case "output":
+				line := strings.TrimSuffix(event.Output, "\n")
+				if !strings.HasSuffix(event.Output, "\n") || strings.Count(event.Output, "\n") != 1 || strings.Contains(event.Output, "\r") ||
+					!(line == "PASS" || isGoTestSummaryLine(line, event.Package, true)) {
+					return nil, nil, stats, false
+				}
+			case "pass":
+				if packageTerminal[event.Package] != "" {
+					return nil, nil, stats, false
+				}
+				packageTerminal[event.Package] = "pass"
+			case "skip":
+				if packageTerminal[event.Package] != "" {
+					return nil, nil, stats, false
+				}
+				packageTerminal[event.Package] = "skip"
+			case "fail":
+				return nil, nil, stats, false
+			default:
+				return nil, nil, stats, false
+			}
+			continue
+		}
+		if !source.testBearing[event.Package] {
+			return nil, nil, stats, false
+		}
+		rootName := strings.SplitN(event.Test, "/", 2)[0]
+		if !discovered[event.Package][rootName] {
+			return nil, nil, stats, false
+		}
+		key := event.Package + "\x00" + event.Test
+		switch event.Action {
+		case "run":
+			if testState[key] != "" {
+				return nil, nil, stats, false
+			}
+			testState[key] = "running"
+			if event.Test == rootName {
+				if executed[event.Package] == nil {
+					executed[event.Package] = make(map[string]bool)
+				}
+				if executed[event.Package][rootName] {
+					return nil, nil, stats, false
+				}
+				executed[event.Package][rootName] = true
+			}
+		case "pause":
+			if testState[key] != "running" {
+				return nil, nil, stats, false
+			}
+			testState[key] = "paused"
+		case "cont":
+			if testState[key] != "paused" {
+				return nil, nil, stats, false
+			}
+			testState[key] = "running"
+		case "output":
+			if testState[key] != "running" && testState[key] != "paused" {
+				return nil, nil, stats, false
+			}
+		case "pass":
+			if testState[key] != "running" && testState[key] != "paused" {
+				return nil, nil, stats, false
+			}
+			testState[key] = "pass"
+			stats.passed++
+		case "fail":
+			if testState[key] != "running" && testState[key] != "paused" {
+				return nil, nil, stats, false
+			}
+			testState[key] = "fail"
+			stats.failed++
+		case "skip":
+			if testState[key] != "running" && testState[key] != "paused" {
+				return nil, nil, stats, false
+			}
+			testState[key] = "skip"
+			stats.skipped++
+		default:
+			return nil, nil, stats, false
+		}
+	}
+	for _, state := range testState {
+		if state == "running" || state == "paused" {
+			return nil, nil, stats, false
+		}
+	}
+	for packagePath := range source.all {
+		terminal := packageTerminal[packagePath]
+		if source.testBearing[packagePath] {
+			if terminal != "pass" || !sameStringSet(mapKeysBool(discovered[packagePath]), mapKeysBool(executed[packagePath])) {
+				return nil, nil, stats, false
+			}
+		} else if terminal != "pass" && terminal != "skip" {
+			return nil, nil, stats, false
+		}
+	}
+	if !sameStringSet(mapKeysBool(packageTerminal), mapKeysBool(source.all)) {
+		return nil, nil, stats, false
+	}
+	observedTestPackages := make(map[string]bool)
+	for packagePath := range packageTerminal {
+		if source.testBearing[packagePath] {
+			observedTestPackages[packagePath] = true
+		}
+	}
+	return executed, observedTestPackages, stats, true
+}
+
+func selectGoTestRoot(discovered map[string]map[string]bool, testName string) map[string]map[string]bool {
+	selected := make(map[string]map[string]bool)
+	for packagePath, tests := range discovered {
+		if tests[testName] {
+			selected[packagePath] = map[string]bool{testName: true}
+		}
+	}
+	return selected
+}
+
+func isGoTestSummaryLine(line, packagePath string, includePass bool) bool {
+	if includePass && line == "PASS" {
+		return true
+	}
+	fields := strings.Fields(line)
+	if len(fields) == 3 && fields[0] == "ok" && fields[1] == packagePath {
+		_, err := time.ParseDuration(fields[2])
+		return err == nil
+	}
+	if len(fields) >= 5 && fields[0] == "?" && fields[1] == packagePath && strings.Join(fields[2:], " ") == "[no test files]" {
+		return true
+	}
+	return false
+}
+
+func flattenGoTestInventory(inventory map[string]map[string]bool) []string {
+	items := make([]string, 0)
+	for packagePath, tests := range inventory {
+		for testName := range tests {
+			items = append(items, packagePath+"\x00"+testName)
+		}
+	}
+	sort.Strings(items)
+	return items
+}
+
+func sortedGoInventoryKeys(inventory map[string]bool) []string {
+	items := make([]string, 0, len(inventory))
+	for item := range inventory {
+		items = append(items, item)
+	}
+	sort.Strings(items)
+	return items
+}
+
+func mapKeysBool(values map[string]bool) []string {
+	return sortedGoInventoryKeys(values)
+}
+
+func cloneBoolSet(values map[string]bool) map[string]bool {
+	clone := make(map[string]bool, len(values))
+	for key, value := range values {
+		clone[key] = value
+	}
+	return clone
+}
+
+func sameStringSet(left, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	leftCopy := append([]string(nil), left...)
+	rightCopy := append([]string(nil), right...)
+	sort.Strings(leftCopy)
+	sort.Strings(rightCopy)
+	for index := range leftCopy {
+		if leftCopy[index] != rightCopy[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func hashStringInventory(items []string) string {
+	values := append([]string(nil), items...)
+	sort.Strings(values)
+	digest := sha256.New()
+	for _, item := range values {
+		writeTaskWorkspaceManifestField(digest, 'i', []byte(item))
+	}
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+func (h *ShellHandler) goCommand(argv []string, workspaceDir *os.File, jailWorkspace, jailCWD string) *exec.Cmd {
+	commandArgs := append([]string(nil), h.bwrapBase...)
+	commandArgs = append(commandArgs,
+		"--dir", "/dev", "--dev", "/dev",
+		"--dir", "/proc", "--proc", "/proc",
+		"--size", strconv.Itoa(maxTempBytes), "--tmpfs", "/tmp",
+		"--dir", "/run", "--tmpfs", "/run",
+		"--dir", "/var", "--dir", "/var/tmp", "--tmpfs", "/var/tmp",
+		"--dir", "/home", "--dir", "/home/gem", "--dir", "/home/gem/workspace",
+		"--clearenv",
+		"--setenv", "HOME", "/home/gem",
+		"--setenv", "USER", "gem",
+		"--setenv", "LOGNAME", "gem",
+		"--setenv", "SHELL", "/bin/bash",
+		"--setenv", "PATH", "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+		"--setenv", "LANG", "C.UTF-8",
+		"--setenv", "TERM", "xterm-256color",
+		"--setenv", "TZ", "Asia/Shanghai",
+		"--setenv", "TMPDIR", "/tmp",
+		"--setenv", "PWD", jailCWD,
+		"--setenv", "GOENV", "off",
+		"--setenv", "GOTOOLCHAIN", "local",
+		"--setenv", "GOPROXY", "off",
+		"--setenv", "GOSUMDB", "off",
+		"--setenv", "GOCACHE", "/tmp/morde-go-build-cache",
+		"--setenv", "GOPATH", "/tmp/morde-go-path",
+		"--setenv", "GOMODCACHE", "/tmp/morde-go-path/pkg/mod",
+	)
+	relativeJail, _ := filepath.Rel("/home/gem/workspace", jailWorkspace)
+	parent := "/home/gem/workspace"
+	for _, component := range strings.Split(relativeJail, string(filepath.Separator)) {
+		parent = filepath.Join(parent, component)
+		commandArgs = append(commandArgs, "--dir", parent)
+	}
+	commandArgs = append(commandArgs, "--bind", "/proc/self/fd/3", jailWorkspace,
+		"--chdir", jailCWD, "--", h.setprivPath, "--no-new-privs", "--", h.goPath)
+	commandArgs = append(commandArgs, argv...)
+	command := exec.Command(h.bwrapPath, commandArgs...)
+	command.ExtraFiles = []*os.File{workspaceDir}
+	return command
+}
+
+func (h *ShellHandler) executeTrustedGoTest(ctx context.Context, request contract.ExecuteRequest, exactCommand string,
+	spec shellGoTestSpec, workspaceRoot *os.Root, workspaceDir *os.File, jailWorkspace, jailCWD, snapshotBefore string) (shellResult, *shellRunnerCoverageReceipt, error) {
+	noReceipt := func(stage shellGoStageResult) (shellResult, *shellRunnerCoverageReceipt, error) {
+		return shellResult{ExitCode: stage.exitCode, Stdout: stage.stdout.String(), Stderr: stage.stderr.String(),
+			StdoutTruncated: stage.stdoutTruncated, StderrTruncated: stage.stderrTruncated, TimedOut: stage.timedOut}, nil, nil
+	}
+	run := func(name string, argv []string) (shellGoStageResult, error) {
+		return h.runTrustedGoStage(ctx, request.OperationID, name, argv, workspaceDir, jailWorkspace, jailCWD)
+	}
+	runWithoutReceipt := func() (shellResult, *shellRunnerCoverageReceipt, error) {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			return shellResult{ExitCode: -1, TimedOut: true}, nil, nil
+		}
+		if ctx.Err() != nil {
+			return shellResult{}, nil, ErrShellOperationCancelled
+		}
+		argv := []string{"test", "-json"}
+		if spec.TestSelector != "" {
+			argv = append(argv, "-run="+spec.TestSelector)
+		}
+		argv = append(argv, spec.PackageSelector)
+		stage, err := run("execute-tests", argv)
+		if err != nil {
+			return shellResult{}, nil, err
+		}
+		return noReceipt(stage)
+	}
+	versionStage, err := run("version", []string{"version"})
+	if err != nil {
+		return shellResult{}, nil, err
+	}
+	version, versionOK := parseTrustedGoVersion(versionStage.stdout.String(), versionStage.stderr.String(), versionStage.exitCode,
+		versionStage.stdoutTruncated, versionStage.stderrTruncated, versionStage.clean)
+	if !versionOK {
+		return runWithoutReceipt()
+	}
+	listStage, err := run("packages", []string{"list", "-json", spec.PackageSelector})
+	if err != nil {
+		return shellResult{}, nil, err
+	}
+	if !successfulTrustedGoStage(listStage) {
+		return runWithoutReceipt()
+	}
+	sourceInventory, _, _, inventoryOK := parseGoSourceInventory(listStage.stdout.String(), jailWorkspace, jailCWD)
+	if !inventoryOK || len(sourceInventory.testBearing) == 0 || spec.ScopeMode == "targeted" && len(sourceInventory.all) != 1 {
+		return runWithoutReceipt()
+	}
+	discoveredTests, sourceSHA, sourceCount, sourceFilesOK := scanGoTestSourceFiles(workspaceRoot, sourceInventory)
+	if !sourceFilesOK || len(sourceInventory.testBearing) == 0 {
+		return runWithoutReceipt()
+	}
+	discoveredTestIDs := flattenGoTestInventory(discoveredTests)
+	discoveredPackages := cloneBoolSet(sourceInventory.testBearing)
+	if spec.TestSelector != "" {
+		name := strings.TrimSuffix(strings.TrimPrefix(spec.TestSelector, "^"), "$")
+		expectedTests := selectGoTestRoot(discoveredTests, name)
+		if len(flattenGoTestInventory(expectedTests)) == 0 {
+			return runWithoutReceipt()
+		}
+		discoveredTests = expectedTests
+		discoveredTestIDs = flattenGoTestInventory(discoveredTests)
+	}
+	if len(discoveredTestIDs) == 0 {
+		return runWithoutReceipt()
+	}
+	runArgs := []string{"test", "-json"}
+	if spec.TestSelector != "" {
+		runArgs = append(runArgs, "-run="+spec.TestSelector)
+	}
+	runArgs = append(runArgs, spec.PackageSelector)
+	testStage, err := run("execute-tests", runArgs)
+	if err != nil {
+		return shellResult{}, nil, err
+	}
+	result := shellResult{ExitCode: testStage.exitCode, Stdout: testStage.stdout.String(), Stderr: testStage.stderr.String(),
+		StdoutTruncated: testStage.stdoutTruncated, StderrTruncated: testStage.stderrTruncated, TimedOut: testStage.timedOut}
+	if !successfulTrustedGoStage(testStage) {
+		return result, nil, nil
+	}
+	executedTests, executedPackages, testStats, runOK := parseGoTestRun(testStage.stdout.String(), discoveredTests, sourceInventory)
+	if !runOK || len(executedTests) == 0 || len(executedPackages) == 0 || testStats.failed != 0 || testStats.skipped != 0 {
+		return result, nil, nil
+	}
+	executedTestIDs := flattenGoTestInventory(executedTests)
+	discoveredPackageIDs := sortedGoInventoryKeys(discoveredPackages)
+	executedPackageIDs := sortedGoInventoryKeys(executedPackages)
+	if !sameStringSet(discoveredTestIDs, executedTestIDs) || !sameStringSet(discoveredPackageIDs, executedPackageIDs) {
+		return result, nil, nil
+	}
+	postTests, postSourceSHA, postSourceCount, postSourcesOK := scanGoTestSourceFiles(workspaceRoot, sourceInventory)
+	if !postSourcesOK || postSourceSHA != sourceSHA || postSourceCount != sourceCount ||
+		!sameStringSet(discoveredTestIDs, flattenGoTestInventory(postTests)) {
+		return result, nil, nil
+	}
+	commandDigest := sha256.Sum256([]byte(exactCommand))
+	receipt := &shellRunnerCoverageReceipt{
+		Version: 1, Runner: "go", RunnerVersion: version, ScopeMode: spec.ScopeMode,
+		ScopeContract:   "go_test_test_functions_only; examples/benchmarks/fuzz-target unsupported",
+		PackageSelector: spec.PackageSelector, TestSelector: spec.TestSelector,
+		ExactCommandSHA256: hex.EncodeToString(commandDigest[:]), TaskID: request.TaskID, WorkspaceID: request.WorkspaceID,
+		WorkspaceDirectory: request.WorkspaceDirectory, BindingVersion: request.BindingVersion,
+		WorkspaceViewID: request.WorkspaceViewID, WorkspaceCheckpointRevision: request.WorkspaceCheckpointRevision,
+		WorkspaceCWD: ".", WorkspaceSnapshotSHA256Before: snapshotBefore,
+		DiscoveredSourceInventorySHA256: sourceSHA, DiscoveredSourceInventoryCount: sourceCount,
+		DiscoveredPackageInventorySHA256: hashStringInventory(discoveredPackageIDs), DiscoveredPackageInventoryCount: len(discoveredPackageIDs),
+		ExecutedPackageInventorySHA256: hashStringInventory(executedPackageIDs), ExecutedPackageInventoryCount: len(executedPackageIDs),
+		DiscoveredTestInventorySHA256: hashStringInventory(discoveredTestIDs), DiscoveredTestInventoryCount: len(discoveredTestIDs),
+		ExecutedTestInventorySHA256: hashStringInventory(executedTestIDs), ExecutedTestInventoryCount: len(executedTestIDs),
+		PassedTestCount: testStats.passed, FailedTestCount: testStats.failed, SkippedTestCount: testStats.skipped,
+		ParserComplete: true,
+	}
+	return result, receipt, nil
+}
+
+func (h *ShellHandler) runTrustedGoStage(ctx context.Context, operationID, stageName string, argv []string,
+	workspaceDir *os.File, jailWorkspace, jailCWD string) (shellGoStageResult, error) {
+	stage := shellGoStageResult{stdout: &boundedBuffer{limit: h.outputLimit}, stderr: &boundedBuffer{limit: h.outputLimit}}
+	if ctx.Err() != nil {
+		return stage, ErrShellOperationCancelled
+	}
+	groupPath := h.groupPath(operationID + "-go-" + stageName)
+	h.mu.Lock()
+	state, exists := h.operations[operationID]
+	if !exists || state.phase == operationStopRequested || state.phase == operationStoppedBeforeExecute || state.phase == operationComplete {
+		h.mu.Unlock()
+		return stage, ErrShellOperationCancelled
+	}
+	if state.groupPath != "" {
+		h.mu.Unlock()
+		return stage, ErrProcessDomainUnavailable
+	}
+	if err := createOperationGroup(groupPath); err != nil {
+		h.mu.Unlock()
+		return stage, ErrProcessDomainUnavailable
+	}
+	command := h.goCommand(argv, workspaceDir, jailWorkspace, jailCWD)
+	command.Dir = string(filepath.Separator)
+	command.Env = []string{"PATH=/usr/bin:/bin"}
+	command.Stdout = stage.stdout
+	command.Stderr = stage.stderr
+	group, err := os.Open(groupPath)
+	if err != nil {
+		h.mu.Unlock()
+		_ = os.Remove(groupPath)
+		return stage, ErrProcessDomainUnavailable
+	}
+	command.SysProcAttr = &syscall.SysProcAttr{Credential: h.credential, UseCgroupFD: true, CgroupFD: int(group.Fd())}
+	if err := command.Start(); err != nil {
+		_ = group.Close()
+		h.mu.Unlock()
+		_ = os.Remove(groupPath)
+		return stage, ErrProcessDomainUnavailable
+	}
+	_ = group.Close()
+	state.phase = operationRunning
+	state.groupPath = groupPath
+	h.operations[operationID] = state
+	h.mu.Unlock()
+
+	wait := make(chan error, 1)
+	go func() { wait <- command.Wait() }()
+	var waitErr error
+	select {
+	case waitErr = <-wait:
+	case <-ctx.Done():
+		stage.timedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+		h.killUntilEmpty(groupPath)
+		waitErr = <-wait
+	}
+	if ctx.Err() != nil {
+		stage.timedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+	}
+	if waitErr != nil {
+		var exitErr *exec.ExitError
+		if errors.As(waitErr, &exitErr) {
+			stage.exitCode = exitErr.ExitCode()
+		} else {
+			return stage, ErrProcessDomainUnavailable
+		}
+	}
+	if ctx.Err() != nil {
+		stage.clean = false
+	} else {
+		populated, populatedErr := cgroupPopulated(filepath.Join(groupPath, "cgroup.events"))
+		stage.clean = populatedErr == nil && !populated
+		if !stage.clean {
+			h.killUntilEmpty(groupPath)
+		} else {
+			cleanupCtx, cancel := context.WithTimeout(context.Background(), maxStopCleanup)
+			if h.killAndWait(cleanupCtx, groupPath) != nil {
+				stage.clean = false
+			}
+			cancel()
+		}
+	}
+	stage.stdoutTruncated = stage.stdout.truncated
+	stage.stderrTruncated = stage.stderr.truncated
+	h.mu.Lock()
+	state = h.operations[operationID]
+	if state.groupPath == groupPath {
+		state.groupPath = ""
+		h.operations[operationID] = state
+	}
+	h.mu.Unlock()
+	if ctx.Err() != nil && !stage.timedOut {
+		return stage, ErrShellOperationCancelled
+	}
+	return stage, nil
 }
 
 func (h *ShellHandler) groupPath(operationID string) string {

@@ -55,16 +55,29 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.Task.ID).Sc
 		t.Fatalf("read exact user requirement source: %v", err)
 	}
 	sourceDigest := sha256.Sum256([]byte(sourceContent))
-	check := task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest, Basis: task.PlanVerificationCheckRequired,
-		Command: "go test ./...", CoveragePaths: []string{"server"},
-		RequirementSource: &task.PlanVerificationRequirementSource{Kind: task.PlanVerificationRequirementUserMessage,
+	obligation := task.PlanVerificationObligation{Statement: "Run the full test suite",
+		Kind: task.PlanVerificationCheckTest, ScopeMode: task.PlanVerificationScopeFullSuite,
+		CoveragePaths: []string{"server"}, Source: task.PlanVerificationRequirementSource{Kind: task.PlanVerificationRequirementUserMessage,
 			MessageID: sourceMessageID, ContentSHA256: hex.EncodeToString(sourceDigest[:])}}
+	obligationID, err := obligation.CanonicalID()
+	if err != nil {
+		t.Fatalf("canonicalize required user test obligation: %v", err)
+	}
+	obligation.ID = task.PlanVerificationRequirementID(obligationID)
+	check := task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest, Basis: task.PlanVerificationCheckRequired,
+		Command: "go test ./...", ScopeMode: task.PlanVerificationScopeFullSuite, CoveragePaths: []string{"server"},
+		RequirementIDs: []task.PlanVerificationRequirementID{obligation.ID}}
 	plan := task.Plan{TaskRevision: *current.Task.CurrentRevision, Revision: 1, Goal: "Fix the requested issue",
 		Scope: "server implementation", VerificationMethod: "run the declared test check", CostEstimateState: "unknown",
-		FixPlan: &task.FixPlan{ChangedFiles: []string{"server/internal/app/task.go"}, Risks: []string{"regression"}, Alternatives: []string{"revert"}},
+		FixPlan:             &task.FixPlan{ChangedFiles: []string{"server/internal/app/task.go"}, Risks: []string{"regression"}, Alternatives: []string{"revert"}},
+		RequirementManifest: &task.PlanVerificationRequirementManifest{Version: 1, Obligations: []task.PlanVerificationObligation{obligation}},
 		Steps: []task.PlanStep{{ID: "verify", Title: "Run the required tests", Status: task.PlanStepPending,
 			CompletionCriteria:        []string{"the required test check passes"},
 			VerificationApplicability: task.PlanVerificationApplicabilityCheck, VerificationCheck: &check}}}
+	plan.RequirementManifest.Digest, err = plan.RequirementManifestDigest()
+	if err != nil {
+		t.Fatalf("digest required test manifest: %v", err)
+	}
 	current.Task = commitTaskPlanForStepBinding(t, fixture, plan, "call_h07_plan")
 
 	callID := "call_h07_shell_check"
@@ -207,9 +220,112 @@ WHERE task_id=$1 AND role='user' ORDER BY sequence LIMIT 1`, current.Task.ID).Sc
 		InputRevision: checkFact.InputRevision, WorkspaceCheckpointRevision: checkFact.WorkspaceCheckpointRevision,
 		InputManifestSHA256: checkFact.InputManifestSHA256, ViewID: checkFact.WorkspaceViewID,
 		SnapshotSHA256: checkFact.WorkspaceSnapshotSHA256After}
-	if got := loadReplay(finalProof); got.State != app.TaskValidationReplayPending || !got.FinalWorkspaceSnapshotVerified ||
-		got.FinalWorkspaceSnapshotProof == nil {
-		t.Fatalf("matching database-fenced final snapshot proof = %+v; final snapshot should verify while source-set completeness remains pending", got)
+	var planEventSequence int64
+	if err := fixture.route.store.pool.QueryRow(ctx, `SELECT sequence FROM task_events
+WHERE task_id=$1 AND event_type='task.plan' ORDER BY sequence DESC LIMIT 1`, current.Task.ID).Scan(&planEventSequence); err != nil {
+		t.Fatalf("read plan event sequence for explicit requirement confirmation: %v", err)
+	}
+	if _, err := fixture.route.store.ConfirmTaskRequirementManifest(ctx, app.TaskRequirementManifestConfirmationCommand{
+		TaskID: current.Task.ID, ActorUserID: current.Task.OwnerID, ActorPrincipalKind: "session",
+		TaskRevision: plan.TaskRevision, PlanRevision: plan.Revision, PlanEventSequence: planEventSequence,
+		ManifestDigest: plan.RequirementManifest.Digest, IdempotencyKey: "confirm-h07-plan-requirements",
+	}); err != nil {
+		t.Fatalf("persist explicit requirement manifest confirmation: %v", err)
+	}
+	confirmed := loadReplay(finalProof)
+	if confirmed.State != app.TaskValidationReplayPending || !confirmed.RequirementSetVerified ||
+		!confirmed.FinalWorkspaceSnapshotVerified || confirmed.FinalWorkspaceSnapshotProof == nil || len(confirmed.Checks) != 1 ||
+		confirmed.Checks[0].ScopeMode != task.PlanVerificationScopeFullSuite || len(confirmed.Checks[0].RequirementIDs) != 1 ||
+		confirmed.Checks[0].RequirementIDs[0] != obligation.ID || confirmed.Checks[0].ActualCoverageVerified {
+		t.Fatalf("confirmed full-suite obligation mapped to its exact passing check = %+v; mapping and final snapshot should verify while actual runner coverage remains unknown and H07 pending", confirmed)
+	}
+	coverageInventoryDigest := func(label string) string {
+		return hex.EncodeToString(hashBytes(label))
+	}
+	coverageReceipt := app.TaskValidationRunnerCoverageReceipt{
+		Version: 1, Runner: "go", RunnerVersion: "go version go1.25.3 linux/amd64",
+		ScopeMode: string(task.PlanVerificationScopeFullSuite), ScopeContract: taskValidationRunnerCoverageScopeContract,
+		PackageSelector: "./...", ExactCommandSHA256: hex.EncodeToString(commandSHA[:]),
+		TaskID: current.Task.ID, WorkspaceID: workspaceValue.ID,
+		WorkspaceDirectory: current.Task.ID + "/" + viewID, BindingVersion: bindingVersion,
+		WorkspaceViewID: viewID, WorkspaceCheckpointRevision: &checkpointRevision, WorkspaceCWD: ".",
+		WorkspaceSnapshotSHA256Before: manifestDigest, WorkspaceSnapshotSHA256After: manifestDigest,
+		DiscoveredSourceInventorySHA256:  coverageInventoryDigest("go source inventory"),
+		DiscoveredSourceInventoryCount:   1,
+		DiscoveredPackageInventorySHA256: coverageInventoryDigest("discovered Go test packages"),
+		DiscoveredPackageInventoryCount:  2,
+		ExecutedPackageInventorySHA256:   coverageInventoryDigest("discovered Go test packages"),
+		ExecutedPackageInventoryCount:    2,
+		DiscoveredTestInventorySHA256:    coverageInventoryDigest("discovered Go test roots"),
+		DiscoveredTestInventoryCount:     2,
+		ExecutedTestInventorySHA256:      coverageInventoryDigest("discovered Go test roots"),
+		ExecutedTestInventoryCount:       2, PassedTestCount: 3, ParserComplete: true,
+	}
+	var coverageResultFields map[string]json.RawMessage
+	if err := json.Unmarshal(runtimeResult, &coverageResultFields); err != nil {
+		t.Fatalf("decode passing operation result for coverage receipt: %v", err)
+	}
+	coverageReceiptJSON, err := json.Marshal(coverageReceipt)
+	if err != nil {
+		t.Fatalf("marshal runner coverage receipt: %v", err)
+	}
+	coverageResultFields["coverage_receipt"] = coverageReceiptJSON
+	coverageResult, err := json.Marshal(coverageResultFields)
+	if err != nil {
+		t.Fatalf("marshal operation result with runner coverage: %v", err)
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_operations SET result=$2 WHERE id=$1`, created.ID, string(coverageResult)); err != nil {
+		t.Fatalf("store independently verifiable Go runner coverage receipt: %v", err)
+	}
+	verifiedCoverage := loadReplay(finalProof)
+	if verifiedCoverage.State != app.TaskValidationReplayPass || !verifiedCoverage.RequirementSetVerified ||
+		!verifiedCoverage.FinalWorkspaceSnapshotVerified || len(verifiedCoverage.Checks) != 1 ||
+		!verifiedCoverage.Checks[0].ActualCoverageVerified {
+		t.Fatalf("complete manifest, exact check mapping, runner package/test inventories and final snapshot = %+v; want H07 PASS", verifiedCoverage)
+	}
+	for name, mutate := range map[string]func(*app.TaskValidationRunnerCoverageReceipt){
+		"package inventory differs": func(receipt *app.TaskValidationRunnerCoverageReceipt) {
+			receipt.ExecutedPackageInventorySHA256 = coverageInventoryDigest("different executed packages")
+		},
+		"test inventory differs": func(receipt *app.TaskValidationRunnerCoverageReceipt) {
+			receipt.ExecutedTestInventoryCount++
+		},
+		"snapshot changed": func(receipt *app.TaskValidationRunnerCoverageReceipt) {
+			receipt.WorkspaceSnapshotSHA256After = coverageInventoryDigest("changed workspace")
+		},
+		"parser incomplete": func(receipt *app.TaskValidationRunnerCoverageReceipt) {
+			receipt.ParserComplete = false
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			changedReceipt := coverageReceipt
+			changedCheckpoint := checkpointRevision
+			changedReceipt.WorkspaceCheckpointRevision = &changedCheckpoint
+			mutate(&changedReceipt)
+			changedJSON, err := json.Marshal(changedReceipt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changedFields := make(map[string]json.RawMessage, len(coverageResultFields))
+			for key, value := range coverageResultFields {
+				changedFields[key] = append(json.RawMessage(nil), value...)
+			}
+			changedFields["coverage_receipt"] = changedJSON
+			changedResult, err := json.Marshal(changedFields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_operations SET result=$2 WHERE id=$1`, created.ID, string(changedResult)); err != nil {
+				t.Fatalf("store changed coverage receipt: %v", err)
+			}
+			got := loadReplay(finalProof)
+			if got.State != app.TaskValidationReplayPending || len(got.Checks) != 1 || got.Checks[0].ActualCoverageVerified {
+				t.Fatalf("tampered %s receipt = %+v; want actual coverage unverified and H07 pending", name, got)
+			}
+		})
+	}
+	if _, err := fixture.route.store.pool.Exec(ctx, `UPDATE task_operations SET result=$2 WHERE id=$1`, created.ID, string(coverageResult)); err != nil {
+		t.Fatalf("restore trusted-shape runner coverage receipt after mismatch cases: %v", err)
 	}
 	changedManifest := *finalProof
 	changedManifest.SnapshotSHA256 = hex.EncodeToString(hashBytes("changed final Workspace"))

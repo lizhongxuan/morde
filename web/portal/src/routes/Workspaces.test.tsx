@@ -389,6 +389,37 @@ describe('Workspaces', () => {
     expect(uploadProject).toHaveBeenCalledOnce();
   });
 
+  it('requires an explicit choice when multiple saved project directories are restored', async () => {
+    const first = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'alpha', directoryName: 'alpha-folder' };
+    const second = { selectionID: '22222222-2222-4222-8222-222222222223', hostId: host.id, workspaceId: workspace.id,
+      projectName: 'beta', directoryName: 'beta-folder' };
+    const localState = { projectMappings: [first, second], syncState: 'idle' as const, syncCheckpoint: null, syncRecovery: null };
+    const uploadProject = vi.fn().mockResolvedValue({ session: { state: 'completed' }, cloudStatus: 'confirmed', hostStatus: 'applied', localSnapshotConfirmed: true,
+      hostApplication: { status: 'applied', targetRevision: 3, appliedRevision: 3, impacts: [] } });
+    setProjectBridge({ projectUploadTargets: vi.fn().mockResolvedValue([projectTarget]), selectProjectDirectory: vi.fn(), uploadProject,
+      state: vi.fn().mockResolvedValue(localState) });
+    vi.spyOn(portalApi, 'capabilities').mockResolvedValue(projectCapabilities);
+    useDefaultProjectHost();
+    const user = userEvent.setup();
+    renderWorkspaces();
+
+    const savedProjectSelector = await screen.findByRole('combobox', { name: '已保存的本机项目' });
+    expect(savedProjectSelector).toHaveValue('');
+    expect(within(savedProjectSelector).getAllByRole('option')).toHaveLength(3);
+    expect(screen.queryByRole('textbox', { name: '项目名' })).not.toBeInTheDocument();
+
+    await user.selectOptions(savedProjectSelector, second.selectionID);
+    expect(await screen.findByText('已选：beta-folder')).toBeInTheDocument();
+    const nameInput = screen.getByRole('textbox', { name: '项目名' });
+    expect(nameInput).toHaveValue('beta');
+    await user.click(screen.getByRole('button', { name: '确认项目名' }));
+    await user.click(screen.getByRole('button', { name: '开始同步' }));
+
+    expect(uploadProject).toHaveBeenCalledWith(second.selectionID, 'beta');
+    expect(uploadProject).not.toHaveBeenCalledWith(first.selectionID, 'alpha');
+  });
+
   it('shows local changes as pending without starting another upload', async () => {
     const selection = { selectionID: '11111111-1111-4111-8111-111111111112', hostId: host.id, workspaceId: workspace.id,
       projectName: 'demo', directoryName: 'demo' };

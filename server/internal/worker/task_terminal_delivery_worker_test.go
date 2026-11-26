@@ -155,7 +155,9 @@ func TestTaskTerminalDeliveryWorkerNotDispatchedUsesSystemStateReply(t *testing.
 	worker := newTaskTerminalDeliveryTestWorker(t, store, gateway)
 	found, err := worker.RunOnce(context.Background())
 	if !found || err != nil || store.persisted != 1 || store.published != 1 ||
-		!strings.HasPrefix(store.publishedText, "系统状态说明：") || !strings.Contains(store.publishedText, "provider_unavailable") ||
+		!strings.HasPrefix(store.publishedText, "系统状态说明：") ||
+		!strings.Contains(store.publishedText, app.TaskTerminalDeliveryFailureExplanation("provider_unavailable")) ||
+		strings.Contains(store.publishedText, "provider_unavailable") ||
 		!strings.Contains(store.publishedText, "已完成 2 步、失败 1 步") ||
 		!strings.Contains(store.publishedText, "详细步骤和执行记录请查看任务记录") ||
 		!strings.Contains(store.publishedText, app.TaskTerminalDeliverySafeNextStep(app.TaskTerminalDeliverySourceFailure)) {
@@ -170,7 +172,7 @@ func TestTaskTerminalDeliveryWorkerNotDispatchedUsesSystemStateReply(t *testing.
 		t.Fatal(err)
 	}
 	encoded, _ := json.Marshal(request)
-	for _, internal := range []string{"u1234567", "c1234567", "q1234567", "source_sha256", "facts_sha256", "objective_sha256"} {
+	for _, internal := range []string{"u1234567", "c1234567", "q1234567", "source_sha256", "facts_sha256", "objective_sha256", "failure_code", "provider_unavailable"} {
 		if bytes.Contains(encoded, []byte(internal)) {
 			t.Fatalf("internal delivery identity leaked into model request: %s", encoded)
 		}
@@ -208,10 +210,14 @@ func TestBuildTaskTerminalDeliveryModelRequestVerifiesDigestAndOmitsInternalIden
 		}
 	}
 	for _, fact := range []string{`\"step_counts\"`, `\"succeeded\":2`, `\"failed\":1`, `\"unconfirmed\":1`,
-		app.TaskTerminalDeliverySafeNextStep(app.TaskTerminalDeliverySourceFailure)} {
+		app.TaskTerminalDeliverySafeNextStep(app.TaskTerminalDeliverySourceFailure),
+		app.TaskTerminalDeliveryFailureExplanation("provider_unavailable"), `\"failure_explanation\"`} {
 		if !bytes.Contains(raw, []byte(fact)) {
 			t.Fatalf("model request omitted progress fact %q: %s", fact, raw)
 		}
+	}
+	if bytes.Contains(raw, []byte("provider_unavailable")) || bytes.Contains(raw, []byte("failure_code")) {
+		t.Fatalf("model request exposed an internal failure code instead of a user-facing fact: %s", raw)
 	}
 	tampered := store.facts
 	tampered.FailureCode = "untrusted_code"
@@ -222,16 +228,17 @@ func TestBuildTaskTerminalDeliveryModelRequestVerifiesDigestAndOmitsInternalIden
 
 func TestTaskTerminalDeliveryWaitingReasonUsesSafeCategories(t *testing.T) {
 	for _, test := range []struct {
-		reason string
-		want   string
+		reason      string
+		want        string
+		explanation string
 	}{
-		{reason: "tool_result_unknown", want: "unknown_outcome"},
-		{reason: "mcp_result_unknown", want: "unknown_outcome"},
-		{reason: "dsh_recovery_unresolved", want: "reconciliation_required"},
-		{reason: "model_retry_ladder_exhausted", want: "external_dependency"},
-		{reason: "model_context_limit", want: "external_dependency"},
-		{reason: "tool_call_budget", want: "external_dependency"},
-		{reason: "unexpected_private_reason", want: "reconciliation_required"},
+		{reason: "tool_result_unknown", want: "unknown_outcome", explanation: "结果尚未确认"},
+		{reason: "mcp_result_unknown", want: "unknown_outcome", explanation: "结果尚未确认"},
+		{reason: "dsh_recovery_unresolved", want: "reconciliation_required", explanation: "需要先对账确认"},
+		{reason: "model_retry_ladder_exhausted", want: "external_dependency", explanation: "等待所需信息"},
+		{reason: "model_context_limit", want: "external_dependency", explanation: "等待所需信息"},
+		{reason: "tool_call_budget", want: "external_dependency", explanation: "等待所需信息"},
+		{reason: "unexpected_private_reason", want: "reconciliation_required", explanation: "需要先对账确认"},
 	} {
 		safeReason := app.SafeTaskTerminalDeliveryWaitingReason(test.reason)
 		if safeReason != test.want {
@@ -241,8 +248,33 @@ func TestTaskTerminalDeliveryWaitingReasonUsesSafeCategories(t *testing.T) {
 			Identity:      app.TaskTerminalDeliveryIdentity{SourceKind: app.TaskTerminalDeliverySourceWaiting},
 			WaitingReason: safeReason,
 		})
-		if !strings.Contains(fallback, test.want) || strings.Contains(fallback, test.reason) {
-			t.Fatalf("waiting fallback leaked internal reason %q or omitted category: %q", test.reason, fallback)
+		if !strings.Contains(fallback, test.explanation) || strings.Contains(fallback, test.reason) || strings.Contains(fallback, test.want) {
+			t.Fatalf("waiting fallback exposed a code or omitted the user-facing explanation: %q", fallback)
+		}
+	}
+}
+
+func TestTaskTerminalDeliveryFailureReasonReturnsToConversationInPlainLanguage(t *testing.T) {
+	for _, test := range []struct {
+		code        string
+		explanation string
+	}{
+		{code: "provider_unavailable", explanation: "模型服务当前不可用"},
+		{code: "provider_timeout", explanation: "模型服务未能在时限内回复"},
+		{code: "provider_rate_limited", explanation: "模型服务暂时限制了本次请求"},
+		{code: "model_unavailable", explanation: "当前配置的模型不可用"},
+		{code: "model_output_invalid", explanation: "模型返回内容未通过格式校验"},
+		{code: "model_budget_exhausted", explanation: "模型调用预算已用尽"},
+		{code: "tool_failed", explanation: "某项工具执行失败"},
+		{code: "task_execution_failed", explanation: "任务执行未能完成"},
+		{code: "unexpected_private_failure", explanation: "无法确认具体原因"},
+	} {
+		fallback := terminalDeliverySystemStateReply(app.TaskTerminalDeliverySourceFacts{
+			Identity:    app.TaskTerminalDeliveryIdentity{SourceKind: app.TaskTerminalDeliverySourceFailure},
+			FailureCode: test.code,
+		})
+		if !strings.Contains(fallback, test.explanation) || strings.Contains(fallback, test.code) || strings.Contains(fallback, "原因代码") {
+			t.Fatalf("failure reason %q was not safely explained to the user: %q", test.code, fallback)
 		}
 	}
 }

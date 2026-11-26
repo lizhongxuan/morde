@@ -260,3 +260,141 @@ func TestPlanSubmissionInputAllowsUnhashedRequirementLocators(t *testing.T) {
 		}
 	})
 }
+
+func TestPlanRequirementManifestInputAndCanonicalDigest(t *testing.T) {
+	source := PlanVerificationRequirementSource{Kind: PlanVerificationRequirementUserMessage,
+		MessageID: "m1234567", ContentSHA256: strings.Repeat("a", 64)}
+	obligation := PlanVerificationObligation{Statement: "Run the complete test suite", Kind: PlanVerificationCheckTest,
+		ScopeMode: PlanVerificationScopeFullSuite, CoveragePaths: []string{"."}, Source: source}
+	id, err := obligation.CanonicalID()
+	if err != nil {
+		t.Fatalf("canonical obligation ID: %v", err)
+	}
+	obligation.ID = PlanVerificationRequirementID(id)
+	check := &PlanVerificationCheck{Kind: PlanVerificationCheckTest, Basis: PlanVerificationCheckRequired,
+		Command: "go test ./...", ScopeMode: PlanVerificationScopeFullSuite, CoveragePaths: []string{"."},
+		RequirementIDs: []PlanVerificationRequirementID{obligation.ID}}
+	plan := Plan{TaskRevision: 4, Revision: 2, Goal: "Fix behavior", CostEstimateState: "unknown", FixPlan: &FixPlan{},
+		RequirementManifest: &PlanVerificationRequirementManifest{Version: 1, Obligations: []PlanVerificationObligation{obligation}},
+		Steps: []PlanStep{{ID: "verify-suite", Title: "Run complete suite", Status: PlanStepPending,
+			VerificationApplicability: PlanVerificationApplicabilityCheck, VerificationCheck: check}}}
+	digest, err := plan.RequirementManifestDigest()
+	if err != nil {
+		t.Fatalf("compute requirement manifest digest: %v", err)
+	}
+	plan.RequirementManifest.Digest = digest
+	if err := plan.ValidateSubmission(); err != nil {
+		t.Fatalf("canonical requirement plan rejected: %v", err)
+	}
+
+	reordered := plan
+	reordered.RequirementManifest = &PlanVerificationRequirementManifest{Version: 1, Digest: strings.Repeat("0", 64),
+		Obligations: append([]PlanVerificationObligation(nil), plan.RequirementManifest.Obligations...)}
+	reorderedDigest, err := reordered.RequirementManifestDigest()
+	if err != nil || reorderedDigest != digest {
+		t.Fatalf("manifest digest depends on stored digest/order: %q %v, want %q", reorderedDigest, err, digest)
+	}
+	revised := plan
+	revised.Revision++
+	revisedDigest, err := revised.RequirementManifestDigest()
+	if err != nil || revisedDigest == digest {
+		t.Fatalf("manifest digest did not bind PlanRevision: %q %v", revisedDigest, err)
+	}
+	if _, err := (Plan{TaskRevision: 4, Revision: 2}).RequirementManifestDigest(); err == nil {
+		t.Fatal("missing requirement manifest produced a digest")
+	}
+}
+
+func TestPlanRequirementManifestRejectsMissingOrOrphanMappingAndScopeMismatch(t *testing.T) {
+	source := PlanVerificationRequirementSource{Kind: PlanVerificationRequirementUserMessage,
+		MessageID: "m1234567", ContentSHA256: strings.Repeat("a", 64)}
+	obligation := PlanVerificationObligation{Statement: "Run the complete test suite", Kind: PlanVerificationCheckTest,
+		ScopeMode: PlanVerificationScopeFullSuite, CoveragePaths: []string{"."}, Source: source}
+	id, err := obligation.CanonicalID()
+	if err != nil {
+		t.Fatal(err)
+	}
+	obligation.ID = PlanVerificationRequirementID(id)
+	base := Plan{TaskRevision: 1, Revision: 1, Goal: "Fix behavior", CostEstimateState: "unknown", FixPlan: &FixPlan{},
+		RequirementManifest: &PlanVerificationRequirementManifest{Version: 1, Obligations: []PlanVerificationObligation{obligation}},
+		Steps: []PlanStep{{ID: "verify-suite", Title: "Run suite", Status: PlanStepPending,
+			VerificationApplicability: PlanVerificationApplicabilityCheck, VerificationCheck: &PlanVerificationCheck{
+				Kind: PlanVerificationCheckTest, Basis: PlanVerificationCheckRequired, Command: "go test ./...",
+				ScopeMode: PlanVerificationScopeFullSuite, CoveragePaths: []string{"."},
+				RequirementIDs: []PlanVerificationRequirementID{obligation.ID},
+			}}}}
+	digest, err := base.RequirementManifestDigest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.RequirementManifest.Digest = digest
+	if err := base.ValidateSubmission(); err != nil {
+		t.Fatalf("valid full-suite mapping rejected: %v", err)
+	}
+
+	for name, mutate := range map[string]func(*Plan){
+		"missing mapping": func(plan *Plan) { plan.Steps[0].VerificationCheck.RequirementIDs = nil },
+		"orphan mapping": func(plan *Plan) {
+			plan.Steps[0].VerificationCheck.RequirementIDs = []PlanVerificationRequirementID{PlanVerificationRequirementID("rq_" + strings.Repeat("b", 64))}
+		},
+		"targeted cannot satisfy full suite": func(plan *Plan) {
+			plan.Steps[0].VerificationCheck.ScopeMode = PlanVerificationScopeTargeted
+			plan.Steps[0].VerificationCheck.CoveragePaths = []string{"server"}
+			plan.Steps[0].VerificationCheck.Selectors = []string{"TestFix"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := base
+			value.RequirementManifest = &PlanVerificationRequirementManifest{Version: base.RequirementManifest.Version,
+				Digest: base.RequirementManifest.Digest, Obligations: append([]PlanVerificationObligation(nil), base.RequirementManifest.Obligations...)}
+			value.Steps = append([]PlanStep(nil), base.Steps...)
+			check := *base.Steps[0].VerificationCheck
+			check.RequirementIDs = append([]PlanVerificationRequirementID(nil), check.RequirementIDs...)
+			value.Steps[0].VerificationCheck = &check
+			mutate(&value)
+			if err := value.ValidateSubmission(); err == nil {
+				t.Fatal("invalid obligation mapping was accepted")
+			}
+		})
+	}
+}
+
+func TestPlanRequirementManifestInputUsesLocalRefsAndRejectsModelIdentity(t *testing.T) {
+	workspaceRevision := int64(7)
+	inputSource := PlanVerificationRequirementSource{Kind: PlanVerificationRequirementProjectFile,
+		WorkspacePath: "AGENTS.md", WorkspaceRevision: &workspaceRevision}
+	obligation := PlanVerificationObligation{Ref: "req1", Statement: "Run lint on the project instructions",
+		Kind: PlanVerificationCheckLint, ScopeMode: PlanVerificationScopeTargeted, CoveragePaths: []string{"AGENTS.md"}, Source: inputSource}
+	plan := Plan{TaskRevision: 1, Revision: 1, Goal: "Fix behavior", CostEstimateState: "unknown", FixPlan: &FixPlan{},
+		RequirementManifest: &PlanVerificationRequirementManifest{Version: 1, Obligations: []PlanVerificationObligation{obligation}},
+		Steps: []PlanStep{{ID: "verify-lint", Title: "Run lint", Status: PlanStepPending,
+			VerificationApplicability: PlanVerificationApplicabilityCheck, VerificationCheck: &PlanVerificationCheck{
+				Kind: PlanVerificationCheckLint, Basis: PlanVerificationCheckRequired, Command: "lint AGENTS.md",
+				ScopeMode: PlanVerificationScopeTargeted, CoveragePaths: []string{"AGENTS.md"},
+				RequirementIDs: []PlanVerificationRequirementID{"req1"},
+			}}}}
+	if err := plan.ValidateSubmissionInput(); err != nil {
+		t.Fatalf("valid local-ref manifest input rejected: %v", err)
+	}
+	if err := plan.ValidateSubmission(); err == nil {
+		t.Fatal("unresolved manifest input was accepted as persisted plan")
+	}
+
+	for name, mutate := range map[string]func(*Plan){
+		"forged manifest digest": func(value *Plan) { value.RequirementManifest.Digest = strings.Repeat("a", 64) },
+		"forged obligation ID": func(value *Plan) {
+			value.RequirementManifest.Obligations[0].ID = PlanVerificationRequirementID("rq_" + strings.Repeat("b", 64))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			value := plan
+			manifest := *plan.RequirementManifest
+			manifest.Obligations = append([]PlanVerificationObligation(nil), plan.RequirementManifest.Obligations...)
+			value.RequirementManifest = &manifest
+			mutate(&value)
+			if err := value.ValidateSubmissionInput(); err == nil {
+				t.Fatal("model-supplied manifest identity was accepted without App canonicalization")
+			}
+		})
+	}
+}

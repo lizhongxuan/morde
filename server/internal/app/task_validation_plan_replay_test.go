@@ -119,6 +119,8 @@ func TestEvaluateTaskValidationPlanReplayRequiresRequirementSetAndFinalSnapshotF
 	fact := taskValidationReplayCheckFixture(plan, "verify", check, 1)
 	legacyFact := fact
 	legacyFact.WorkspaceSnapshotSHA256Before, legacyFact.WorkspaceSnapshotSHA256After = "", ""
+	coverageUnknown := fact
+	coverageUnknown.ActualCoverageVerified = false
 	for name, evidence := range map[string]*TaskValidationReplayEvidence{
 		"incomplete requirement set": {PlanRevision: plan.Revision, FinalWorkspaceSnapshotVerified: true,
 			Checks: []TaskValidationReplayCheckEvidence{fact}},
@@ -126,6 +128,8 @@ func TestEvaluateTaskValidationPlanReplayRequiresRequirementSetAndFinalSnapshotF
 			Checks: []TaskValidationReplayCheckEvidence{fact}},
 		"final snapshot boolean without proof": {PlanRevision: plan.Revision, RequirementSetVerified: true,
 			FinalWorkspaceSnapshotVerified: true, Checks: []TaskValidationReplayCheckEvidence{fact}},
+		"runner coverage unknown": {PlanRevision: plan.Revision, RequirementSetVerified: true,
+			FinalWorkspaceSnapshotVerified: true, Checks: []TaskValidationReplayCheckEvidence{coverageUnknown}},
 		"legacy check receipt without shared snapshot digest": {PlanRevision: plan.Revision,
 			RequirementSetVerified: true, FinalWorkspaceSnapshotVerified: true,
 			Checks: []TaskValidationReplayCheckEvidence{legacyFact}},
@@ -153,6 +157,58 @@ func TestEvaluateTaskValidationPlanReplayPassesVerifiedRequiredCheckAndSources(t
 	evidence.FinalWorkspaceSnapshotProof = taskValidationFinalWorkspaceProofFixture(fact)
 	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPass {
 		t.Fatalf("fully verified required check replay = %q, want pass", got)
+	}
+}
+
+func TestEvaluateTaskValidationPlanReplayCarriesManifestToExactCheckAndKeepsUnknownRunnerScopePending(t *testing.T) {
+	source := task.PlanVerificationRequirementSource{Kind: task.PlanVerificationRequirementUserMessage,
+		MessageID: "m1234567", ContentSHA256: strings.Repeat("a", 64)}
+	obligation := task.PlanVerificationObligation{Statement: "Run the full test suite",
+		Kind: task.PlanVerificationCheckTest, ScopeMode: task.PlanVerificationScopeFullSuite,
+		CoveragePaths: []string{"server"}, Source: source}
+	obligationID, err := obligation.CanonicalID()
+	if err != nil {
+		t.Fatalf("canonicalize required test obligation: %v", err)
+	}
+	obligation.ID = task.PlanVerificationRequirementID(obligationID)
+	check := task.PlanVerificationCheck{Kind: task.PlanVerificationCheckTest, Basis: task.PlanVerificationCheckRequired,
+		Command: "go test ./...", ScopeMode: task.PlanVerificationScopeFullSuite, CoveragePaths: []string{"server"},
+		RequirementIDs: []task.PlanVerificationRequirementID{obligation.ID}}
+	plan := task.Plan{TaskRevision: 4, Revision: 2, Goal: "Fix the bug", CostEstimateState: "unknown",
+		FixPlan: &task.FixPlan{}, RequirementManifest: &task.PlanVerificationRequirementManifest{Version: 1,
+			Obligations: []task.PlanVerificationObligation{obligation}}, Steps: []task.PlanStep{{ID: "verify-suite",
+			Title: "Run the full suite", Status: task.PlanStepCompleted,
+			VerificationApplicability: task.PlanVerificationApplicabilityCheck, VerificationCheck: &check}}}
+	plan.RequirementManifest.Digest, err = plan.RequirementManifestDigest()
+	if err != nil || plan.Validate() != nil {
+		t.Fatalf("manifest-backed plan invalid: digest=%q err=%v validate=%v", plan.RequirementManifest.Digest, err, plan.Validate())
+	}
+	pending := PendingTaskValidationReplayEvidence(&plan)
+	if len(pending.Checks) != 1 || pending.Checks[0].ScopeMode != task.PlanVerificationScopeFullSuite ||
+		len(pending.Checks[0].RequirementIDs) != 1 || pending.Checks[0].RequirementIDs[0] != obligation.ID ||
+		pending.Checks[0].ActualCoverageVerified {
+		t.Fatalf("pending evidence lost requirement/check mapping or implied runner scope: %+v", pending)
+	}
+
+	fact := taskValidationReplayCheckFixture(plan, "verify-suite", check, 1)
+	fact.RequirementSourceVerified = true
+	evidence := &TaskValidationReplayEvidence{PlanRevision: plan.Revision, RequirementSetVerified: true,
+		FinalWorkspaceSnapshotVerified: true, Checks: []TaskValidationReplayCheckEvidence{fact},
+		FinalWorkspaceSnapshotProof: taskValidationFinalWorkspaceProofFixture(fact)}
+	fact.ActualCoverageVerified = false
+	evidence.Checks[0] = fact
+	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPending {
+		t.Fatalf("confirmed full-suite obligation with only a declared check = %q, want pending", got)
+	}
+	fact.ActualCoverageVerified = true
+	evidence.Checks[0] = fact
+	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPass {
+		t.Fatalf("manifest, exact check mapping, and trusted runner scope = %q, want pass", got)
+	}
+	fact.RequirementIDs = nil
+	evidence.Checks[0] = fact
+	if got := EvaluateTaskValidationPlanReplay(plan, evidence); got != TaskValidationReplayPending {
+		t.Fatalf("execution receipt detached from required obligation = %q, want pending", got)
 	}
 }
 
@@ -326,9 +382,11 @@ func taskValidationReplayCheckFixture(plan task.Plan, checkID string, check task
 	runSequence int64) TaskValidationReplayCheckEvidence {
 	commandSHA, checkSHA, coverageSHA, _ := taskValidationPlanCheckDigests(check)
 	return TaskValidationReplayCheckEvidence{
-		CheckID: checkID, TaskID: "q1234567", Kind: check.Kind, Basis: check.Basis,
-		CoveragePaths: append([]string(nil), check.CoveragePaths...), RequirementSource: check.RequirementSource,
+		CheckID: checkID, TaskID: "q1234567", Kind: check.Kind, Basis: check.Basis, ScopeMode: check.ScopeMode,
+		CoveragePaths: append([]string(nil), check.CoveragePaths...), Selectors: append([]string(nil), check.Selectors...),
+		RequirementIDs: append([]task.PlanVerificationRequirementID(nil), check.RequirementIDs...), RequirementSource: check.RequirementSource,
 		RequirementSourceVerified: check.Basis == task.PlanVerificationCheckRiskSelected,
+		ActualCoverageVerified:    true,
 		Status:                    TaskValidationReplayPass, TaskRevision: plan.TaskRevision, PlanRevision: plan.Revision,
 		OperationID: "o1234567", CallID: "call-" + checkID, RequestSHA256: strings.Repeat("1", 64),
 		CommandSHA256: commandSHA, CheckSHA256: checkSHA, CoverageSHA256: coverageSHA, RunSequence: runSequence,

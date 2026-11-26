@@ -159,6 +159,152 @@ func TestShellTaskWorkspaceResultPreservesOutputAndSnapshotIdentity(t *testing.T
 	}
 }
 
+func TestGoTestASTInventoryMatchesOneStructuredExecutionWithoutListingSideEffects(t *testing.T) {
+	workspacePath := t.TempDir()
+	packagePath := "example.test/pkg/one"
+	noTestPackagePath := "example.test/pkg/empty"
+	if err := os.MkdirAll(filepath.Join(workspacePath, "pkg", "one"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(workspacePath, "pkg", "empty"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for name, contents := range map[string]string{
+		"pkg/one/one_test.go":      "package one\nimport \"testing\"\nfunc TestAlpha(t *testing.T) {}\n",
+		"pkg/one/external_test.go": "package one_test\nimport check \"testing\"\nfunc TestExternal(t *check.T) {}\n",
+	} {
+		if err := os.WriteFile(filepath.Join(workspacePath, name), []byte(contents), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	root, err := os.OpenRoot(workspacePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	listed := strings.Join([]string{
+		`{"ImportPath":"` + packagePath + `","Dir":"` + filepath.Join("/workspace", "pkg/one") + `","Name":"one","TestGoFiles":["one_test.go"],"XTestGoFiles":["external_test.go"]}`,
+		`{"ImportPath":"` + noTestPackagePath + `","Dir":"` + filepath.Join("/workspace", "pkg/empty") + `","Name":"empty"}`,
+	}, "\n")
+	source, _, _, ok := parseGoSourceInventory(listed, "/workspace", "/workspace")
+	if !ok || len(source.all) != 2 || len(source.testBearing) != 1 {
+		t.Fatalf("source inventory=(%+v,%v)", source, ok)
+	}
+	discovered, sourceDigest, sourceCount, ok := scanGoTestSourceFiles(root, source)
+	if !ok || sourceDigest == "" || sourceCount != 2 || len(flattenGoTestInventory(discovered)) != 2 {
+		t.Fatalf("AST inventory=(%v,%q,%d,%v)", discovered, sourceDigest, sourceCount, ok)
+	}
+
+	runEvents := []goTestEvent{
+		{Action: "start", Package: packagePath},
+		{Action: "run", Package: packagePath, Test: "TestAlpha"},
+		{Action: "run", Package: packagePath, Test: "TestAlpha/sub"},
+		{Action: "pass", Package: packagePath, Test: "TestAlpha/sub"},
+		{Action: "pass", Package: packagePath, Test: "TestAlpha"},
+		{Action: "run", Package: packagePath, Test: "TestExternal"},
+		{Action: "pass", Package: packagePath, Test: "TestExternal"},
+		{Action: "output", Package: packagePath, Output: "PASS\n"},
+		{Action: "output", Package: packagePath, Output: "ok  \t" + packagePath + "\t0.001s\n"},
+		{Action: "pass", Package: packagePath},
+		{Action: "start", Package: noTestPackagePath},
+		{Action: "output", Package: noTestPackagePath, Output: "? " + noTestPackagePath + " [no test files]\n"},
+		{Action: "skip", Package: noTestPackagePath},
+	}
+	executed, executedPackages, stats, ok := parseGoTestRun(encodeGoTestEvents(t, runEvents), discovered, source)
+	if !ok || stats.passed != 3 || stats.failed != 0 || stats.skipped != 0 || len(executedPackages) != 1 || !executedPackages[packagePath] {
+		t.Fatalf("execution inventory=(%v,%v,%+v,%v)", executed, executedPackages, stats, ok)
+	}
+	if !sameStringSet(flattenGoTestInventory(discovered), flattenGoTestInventory(executed)) {
+		t.Fatalf("discovered roots %v do not match executed roots %v", discovered, executed)
+	}
+}
+
+func TestGoTestASTInventoryFailsClosedForUnsupportedDefinitions(t *testing.T) {
+	for _, sourceText := range []string{
+		"package pkg\nimport \"testing\"\nfunc TestAlpha() {}\n",
+		"package pkg\nfunc ExampleAlpha() {}\n",
+		"package pkg\nimport \"testing\"\nfunc TestMain(m *testing.M) {}\n",
+	} {
+		t.Run(strings.ReplaceAll(sourceText, "\n", "_"), func(t *testing.T) {
+			workspace := t.TempDir()
+			if err := os.WriteFile(filepath.Join(workspace, "pkg_test.go"), []byte(sourceText), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			root, err := os.OpenRoot(workspace)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer root.Close()
+			inventory := goSourceInventory{
+				all: map[string]goPackageInventory{"example.test/pkg": {
+					importPath: "example.test/pkg", relativeDir: ".", testGoFiles: []string{"pkg_test.go"},
+				}},
+				testBearing: map[string]bool{"example.test/pkg": true},
+			}
+			if tests, _, _, ok := scanGoTestSourceFiles(root, inventory); ok {
+				t.Fatalf("unsupported source unexpectedly produced inventory: %v", tests)
+			}
+		})
+	}
+}
+
+func TestGoTestRunParserFailsClosedOnIncompleteOrSkippedEvents(t *testing.T) {
+	workspace := "/workspace"
+	packagePath := "example.test/pkg"
+	source := goSourceInventory{
+		all: map[string]goPackageInventory{packagePath: {
+			importPath: packagePath, relativeDir: ".", testGoFiles: []string{"pkg_test.go"},
+		}},
+		testBearing: map[string]bool{packagePath: true},
+	}
+	discovered := map[string]map[string]bool{packagePath: {"TestAlpha": true}}
+	for _, test := range []struct {
+		name   string
+		output string
+	}{
+		{name: "missing terminal", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "start", Package: packagePath}, {Action: "run", Package: packagePath, Test: "TestAlpha"}, {Action: "pass", Package: packagePath},
+		})},
+		{name: "unknown event", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "start", Package: packagePath}, {Action: "bogus", Package: packagePath},
+		})},
+		{name: "malformed trailing json", output: encodeGoTestEvents(t, []goTestEvent{
+			{Action: "start", Package: packagePath}, {Action: "run", Package: packagePath, Test: "TestAlpha"},
+			{Action: "pass", Package: packagePath, Test: "TestAlpha"}, {Action: "pass", Package: packagePath},
+		}) + `{"Action":`},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, _, valid := parseGoTestRun(test.output, discovered, source); valid {
+				t.Fatal("incomplete runner events produced a valid inventory")
+			}
+		})
+	}
+
+	skipEvents := []goTestEvent{
+		{Action: "start", Package: packagePath},
+		{Action: "run", Package: packagePath, Test: "TestAlpha"},
+		{Action: "skip", Package: packagePath, Test: "TestAlpha"},
+		{Action: "pass", Package: packagePath},
+	}
+	_, _, stats, valid := parseGoTestRun(encodeGoTestEvents(t, skipEvents), discovered, source)
+	if !valid || stats.skipped != 1 {
+		t.Fatalf("skip event parse=(%+v,%v), want one recorded skip", stats, valid)
+	}
+}
+
+func encodeGoTestEvents(t *testing.T, events []goTestEvent) string {
+	t.Helper()
+	lines := make([]string, 0, len(events))
+	for _, event := range events {
+		encoded, err := json.Marshal(event)
+		if err != nil {
+			t.Fatal(err)
+		}
+		lines = append(lines, string(encoded))
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
 func TestCreateOperationGroupFailsClosedOnOrdinaryFilesystem(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "operation")
 	if err := createOperationGroup(path); err == nil {

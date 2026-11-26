@@ -2241,6 +2241,49 @@ test('restores a 1 MiB+1 source reference revision batch in order without duplic
   }
 })
 
+test('reconciles revision messages already applied in the checkpoint without redelivery', { timeout: 15_000 }, async () => {
+  const identity = { ...start, conversation_id: 'conversation_123' }
+  const revisionMessages = [
+    { message_id: 'mrev0001', content: 'Apply the first revision once.', attachment_ids: [], mode: 'steer' },
+    { message_id: 'mrevnxt1', content: 'Keep the checkpointed order.', attachment_ids: [], mode: 'followup' },
+  ]
+  const captured = await captureSession({ startFrame: { ...identity, revision_messages: revisionMessages }, interrupt: true })
+  const initialEvents = captured.flatMap(page => JSON.parse(page.payload).events)
+  for (const message of revisionMessages) {
+    assert.equal(initialEvents.filter(event => event.type === 'user/message' && event.data.id === message.message_id).length, 1)
+  }
+
+  // Simulate a Worker recovery frame whose pending-message checkpoint still
+  // lists messages that DSH had already applied before persisting its checkpoint.
+  const resumed = await resumeSession(captured, {
+    baseStart: identity,
+    alterStart: value => ({ ...value, revision_messages: revisionMessages }),
+  })
+  assert.equal(resumed.code, 0, `frames: ${JSON.stringify(resumed.frames)}`)
+  assert.equal(resumed.modelCalls, 1)
+  const requestMessages = resumed.modelRequests[0].messages.filter(message =>
+    revisionMessages.some(item => item.message_id === message.id))
+  assert.deepEqual(requestMessages.map(message => message.id), revisionMessages.map(message => message.message_id))
+  assert.equal(requestMessages[0].content.map(block => block.text ?? '').join(''), revisionMessages[0].content)
+  assert.equal(requestMessages[1].content.map(block => block.text ?? '').join(''), revisionMessages[1].content)
+  const allEvents = [...initialEvents, ...resumed.emitted.flatMap(frame => JSON.parse(frame.payload).events)]
+  for (const message of revisionMessages) {
+    assert.equal(allEvents.filter(event => event.type === 'user/message' && event.data.id === message.message_id).length, 1,
+      `recovery must not duplicate ${message.message_id}`)
+  }
+
+  const conflicting = await resumeSession(captured, {
+    baseStart: identity,
+    alterStart: value => ({
+      ...value,
+      revision_messages: [revisionMessages[0], { ...revisionMessages[1], content: 'Conflicting retry content.' }],
+    }),
+  })
+  assert.notEqual(conflicting.code, 0)
+  assert.equal(conflicting.modelCalls, 0, 'a reused message ID with different content must fail closed')
+  assert.equal(conflicting.frames.some(frame => frame.type === 'settled'), false)
+})
+
 test('restores a compacted long Task with its brief, latest message, and completed tool pair',
   { timeout: 30_000 }, async t => {
     const earlyConstraint = 'EARLY-ONLY-ALPHA: preserve ledger ordering in the final answer.'

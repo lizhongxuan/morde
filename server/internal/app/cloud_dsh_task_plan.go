@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"reflect"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -18,10 +19,11 @@ import (
 const cloudDSHTaskPlanToolName = "morde_task_plan_update"
 
 type cloudDSHTaskPlanInput struct {
-	Goal               string          `json:"goal"`
-	Scope              string          `json:"scope,omitempty"`
-	VerificationMethod string          `json:"verification_method,omitempty"`
-	Steps              []task.PlanStep `json:"steps"`
+	Goal                string                                    `json:"goal"`
+	Scope               string                                    `json:"scope,omitempty"`
+	VerificationMethod  string                                    `json:"verification_method,omitempty"`
+	Steps               []task.PlanStep                           `json:"steps"`
+	RequirementManifest *task.PlanVerificationRequirementManifest `json:"requirement_manifest,omitempty"`
 	// FixPlan is optional: when present it marks the task as a bug fix.
 	FixPlan *task.FixPlan `json:"fix_plan,omitempty"`
 }
@@ -55,16 +57,16 @@ type CloudDSHTaskPlanRequirementSourceResolver interface {
 
 func cloudDSHTaskPlanDefinition() AgentToolDefinition {
 	return AgentToolDefinition{ModelTool: ModelTool{Name: cloudDSHTaskPlanToolName,
-		Description: strings.TrimSpace(`Use only for complex, multi-step tasks; do not call for simple questions. Save a complete brief with scope, verification_method and acceptance criteria in step completion_criteria; fill known context instead of asking the user. Plans never request confirmation or expand permissions; cost remains unknown unless app-verified. Revise when the approach changes.
+		Description: strings.TrimSpace(`Use for complex multi-step tasks, not simple questions. Provide goal, scope, verification method and acceptance criteria. Do not request confirmation or expand permissions; cost stays unknown unless app-verified. Revise when the approach changes.
 
-For every fix-plan step set verification_applicability to check or not_applicable. A check needs an exact bounded command and explicit Workspace-relative coverage_paths. Set basis=required only for checks explicitly requested by the user or project, and include all of them; never claim full verification after omitting one. Other checks are risk_selected by task risk. H07 may stay pending until coverage completeness is independently verified; the plan alone does not prove it.
+For fix-plan steps set verification_applicability to check or not_applicable. Checks need a bounded command and Workspace-relative coverage_paths. Use basis=required only for explicit user/project verification requests, mapping every one to a source-backed obligation in requirement_manifest. Give obligations unique local refs; checks map them with requirement_ids. Use full_suite only for a complete suite with no selectors; use targeted for narrower paths/selectors. The server resolves sources and replaces refs with IDs/digest. The plan is a candidate, never proof. Never claim completeness or verification.
 
-For user_message, use locator=current_task_input (initial accepted Task input), locator=current_task_turn_input (direct user input attached to this call), or locator=history_search_result with the exact history_result_token from authorized morde_current_conversation_history_search results. Search uses the Task's fixed through_sequence and can omit messages accepted after Task start. Never infer or invent an ID or ask the user for an internal ID/hash. The server resolves identity and computes SHA from trusted input or the re-read message.
+For user_message use locator=current_task_input, locator=current_task_turn_input, or locator=history_search_result with the exact history_result_token from authorized morde_current_conversation_history_search results. Search uses the Task's fixed through_sequence and can omit messages accepted after Task start. Never infer or invent an ID/hash. The server resolves trusted input and computes its SHA.
 
-For project_file, use path and revision from an authorized immutable Workspace read. The server verifies the snapshot and computes the digest; if resolution fails, keep the source unverified and do not relabel it risk_selected. This metadata never authorizes tool execution. Old plans without typed checks retain unknown applicability.
+For project_file use path/revision from an authorized immutable Workspace read. The server verifies the snapshot and computes the digest; on failure, leave the source unresolved, not risk_selected. This metadata never authorizes execution. Old plans without typed checks retain unknown applicability.
 
-Optional fix_plan lists up to 8 changed files, risks and alternatives; root_cause needs a summary, reproduction output and up to 8 workspace-relative code locations. Fixes may edit within authorized scope before verification. H07 evaluates checks; a failing baseline is not a universal prerequisite.`),
-		Parameters: json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string","minLength":1,"maxLength":2048},"scope":{"type":"string","maxLength":2048},"verification_method":{"type":"string","maxLength":1024},"fix_plan":{"type":"object","properties":{"changed_files":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"risks":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"alternatives":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"root_cause":{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":1024},"repro_output":{"type":"string","minLength":1,"maxLength":4096},"code_lines":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":512}}},"required":["summary","repro_output","code_lines"],"additionalProperties":false}},"additionalProperties":false},"steps":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":40},"title":{"type":"string","minLength":1,"maxLength":160},"description":{"type":"string","maxLength":1024},"depends_on":{"type":"array","maxItems":8,"items":{"type":"string"}},"outputs":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"completion_criteria":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"verification_applicability":{"type":"string","enum":["check","not_applicable"]},"verification_check":{"type":"object","properties":{"kind":{"type":"string","enum":["test","build","lint","typecheck","other"]},"basis":{"type":"string","enum":["required","risk_selected"]},"command":{"type":"string","minLength":1,"maxLength":1024},"coverage_paths":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":512}},"requirement_source":{"type":"object","properties":{"kind":{"type":"string","enum":["user_message","project_file"]},"locator":{"type":"string","enum":["current_task_input","current_task_turn_input","history_search_result"]},"history_result_token":{"type":"string","minLength":1,"maxLength":2048},"workspace_path":{"type":"string","maxLength":512},"workspace_revision":{"type":"integer","minimum":0}},"required":["kind"],"additionalProperties":false}},"required":["kind","basis","command","coverage_paths"],"additionalProperties":false}},"required":["id","title","status"],"additionalProperties":false}}},"required":["goal","steps"],"additionalProperties":false}`)}, RequiredScope: identity.ScopeTaskRead}
+Optional fix_plan lists up to 8 changed files, risks and alternatives; root_cause needs a summary, reproduction output and up to 8 workspace-relative code locations. Fix within authorized scope before verification. H07 evaluates checks; a failing baseline is not a universal prerequisite.`),
+		Parameters: json.RawMessage(`{"type":"object","properties":{"goal":{"type":"string","minLength":1,"maxLength":2048},"scope":{"type":"string","maxLength":2048},"verification_method":{"type":"string","maxLength":1024},"fix_plan":{"type":"object","properties":{"changed_files":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"risks":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"alternatives":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"root_cause":{"type":"object","properties":{"summary":{"type":"string","minLength":1,"maxLength":1024},"repro_output":{"type":"string","minLength":1,"maxLength":4096},"code_lines":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":512}}},"required":["summary","repro_output","code_lines"],"additionalProperties":false}},"additionalProperties":false},"steps":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":40},"title":{"type":"string","minLength":1,"maxLength":160},"description":{"type":"string","maxLength":1024},"depends_on":{"type":"array","maxItems":8,"items":{"type":"string"}},"outputs":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"completion_criteria":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":512}},"status":{"type":"string","enum":["pending","in_progress","completed","blocked"]},"verification_applicability":{"type":"string","enum":["check","not_applicable"]},"verification_check":{"type":"object","properties":{"kind":{"type":"string","enum":["test","build","lint","typecheck","other"]},"basis":{"type":"string","enum":["required","risk_selected"]},"command":{"type":"string","minLength":1,"maxLength":1024},"coverage_paths":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":512}},"scope_mode":{"type":"string","enum":["full_suite","targeted"]},"selectors":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"requirement_ids":{"type":"array","maxItems":32,"items":{"type":"string","pattern":"^[a-z][a-z0-9_-]{0,39}$"}}},"required":["kind","basis","command","scope_mode","coverage_paths","requirement_ids"],"additionalProperties":false}},"required":["id","title","status"],"additionalProperties":false}},"requirement_manifest":{"type":"object","properties":{"version":{"type":"integer","enum":[1]},"obligations":{"type":"array","maxItems":32,"items":{"type":"object","properties":{"ref":{"type":"string","pattern":"^[a-z][a-z0-9_-]{0,39}$"},"statement":{"type":"string","minLength":1,"maxLength":512},"kind":{"type":"string","enum":["test","build","lint","typecheck","other"]},"scope_mode":{"type":"string","enum":["full_suite","targeted"]},"coverage_paths":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":512}},"selectors":{"type":"array","maxItems":8,"items":{"type":"string","maxLength":256}},"source":{"type":"object","properties":{"kind":{"type":"string","enum":["user_message","project_file"]},"locator":{"type":"string","enum":["current_task_input","current_task_turn_input","history_search_result"]},"history_result_token":{"type":"string","minLength":1,"maxLength":2048},"workspace_path":{"type":"string","maxLength":512},"workspace_revision":{"type":"integer","minimum":0}},"required":["kind"],"additionalProperties":false}},"required":["ref","statement","kind","scope_mode","coverage_paths","source"],"additionalProperties":false}}},"required":["version","obligations"],"additionalProperties":false}},"required":["goal","steps","requirement_manifest"],"additionalProperties":false}`)}, RequiredScope: identity.ScopeTaskRead}
 }
 
 // requireCompleteTaskPlanBrief is the write gate (E01): a task that already
@@ -124,7 +126,11 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 		return result, err
 	}
 	plan := task.Plan{TaskRevision: *current.CurrentRevision, Goal: input.Goal, Scope: input.Scope,
-		VerificationMethod: input.VerificationMethod, CostEstimateState: "unknown", Steps: input.Steps, FixPlan: input.FixPlan}
+		VerificationMethod: input.VerificationMethod, CostEstimateState: "unknown", Steps: input.Steps,
+		RequirementManifest: input.RequirementManifest, FixPlan: input.FixPlan}
+	if plan.RequirementManifest == nil && !cloudDSHTaskPlanHasLegacyRequirementSource(plan) {
+		plan.RequirementManifest = &task.PlanVerificationRequirementManifest{Version: 1, Obligations: []task.PlanVerificationObligation{}}
+	}
 	clearTaskTurnInputModelClaims(&plan)
 	var checkpointPlan *task.Plan
 	if recovering && checkpointOutput != nil {
@@ -172,7 +178,9 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 	if checkpointPlan != nil {
 		replay := *checkpointPlan
 		if replay.TaskRevision != plan.TaskRevision || replay.Validate() != nil ||
-			replay.Goal != input.Goal || replay.Scope != input.Scope || replay.VerificationMethod != input.VerificationMethod || !reflect.DeepEqual(replay.Steps, plan.Steps) || !reflect.DeepEqual(replay.FixPlan, input.FixPlan) {
+			replay.Goal != input.Goal || replay.Scope != input.Scope || replay.VerificationMethod != input.VerificationMethod ||
+			!reflect.DeepEqual(replay.Steps, plan.Steps) || !reflect.DeepEqual(replay.RequirementManifest, plan.RequirementManifest) ||
+			!reflect.DeepEqual(replay.FixPlan, input.FixPlan) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "checkpointed task plan does not match its original call")
 		}
 		plan = replay
@@ -218,7 +226,8 @@ func (b *CloudDSHToolBroker) executeTaskPlan(ctx context.Context, claimed task.T
 			return AgentToolResult{}, err
 		}
 		if err == nil && (stored.Validate() != nil || stored.TaskRevision != plan.TaskRevision || stored.Goal != input.Goal ||
-			stored.Scope != input.Scope || stored.VerificationMethod != input.VerificationMethod || !reflect.DeepEqual(stored.Steps, plan.Steps) || !reflect.DeepEqual(stored.FixPlan, input.FixPlan)) {
+			stored.Scope != input.Scope || stored.VerificationMethod != input.VerificationMethod || !reflect.DeepEqual(stored.Steps, plan.Steps) ||
+			!reflect.DeepEqual(stored.RequirementManifest, plan.RequirementManifest) || !reflect.DeepEqual(stored.FixPlan, input.FixPlan)) {
 			return AgentToolResult{}, domain.NewError(domain.CodeInvalidState, "stored task plan replay receipt is invalid")
 		}
 		if err == nil {
@@ -294,9 +303,26 @@ func preserveCheckpointProjectFileSources(input *task.Plan, checkpoint task.Plan
 	return nil
 }
 
+func cloudDSHTaskPlanHasLegacyRequirementSource(plan task.Plan) bool {
+	for _, step := range plan.Steps {
+		if step.VerificationCheck != nil && step.VerificationCheck.RequirementSource != nil {
+			return true
+		}
+	}
+	return false
+}
+
 func clearTaskTurnInputModelClaims(plan *task.Plan) {
 	if plan == nil {
 		return
+	}
+	if manifest := plan.RequirementManifest; manifest != nil {
+		manifest.Digest = ""
+		for index := range manifest.Obligations {
+			manifest.Obligations[index].ID = ""
+			manifest.Obligations[index].Source.MessageID = ""
+			manifest.Obligations[index].Source.ContentSHA256 = ""
+		}
 	}
 	for stepIndex := range plan.Steps {
 		check := plan.Steps[stepIndex].VerificationCheck
@@ -317,6 +343,11 @@ func (b *CloudDSHToolBroker) resolveTaskPlanRequirementSources(ctx context.Conte
 	currentTaskTurnMessageID string) error {
 	if plan == nil {
 		return domain.InvalidArgument("task_plan.requirement_source", "task plan is missing")
+	}
+	if plan.RequirementManifest != nil {
+		if err := b.resolveTaskPlanRequirementManifest(ctx, current, plan, currentTaskTurnMessageID); err != nil {
+			return err
+		}
 	}
 	var resolver CloudDSHTaskPlanRequirementSourceResolver
 	for stepIndex := range plan.Steps {
@@ -392,6 +423,106 @@ func (b *CloudDSHToolBroker) resolveTaskPlanRequirementSources(ctx context.Conte
 		checkCopy.RequirementSource = &resolved
 		plan.Steps[stepIndex].VerificationCheck = &checkCopy
 	}
+	return nil
+}
+
+func (b *CloudDSHToolBroker) resolveTaskPlanRequirementManifest(ctx context.Context, current task.Task, plan *task.Plan,
+	currentTaskTurnMessageID string) error {
+	if plan == nil || plan.RequirementManifest == nil {
+		return domain.InvalidArgument("task_plan.requirement_manifest", "requirement manifest is missing")
+	}
+	refs := make(map[string]task.PlanVerificationRequirementID, len(plan.RequirementManifest.Obligations))
+	var resolver CloudDSHTaskPlanRequirementSourceResolver
+	for index := range plan.RequirementManifest.Obligations {
+		obligation := &plan.RequirementManifest.Obligations[index]
+		ref := obligation.Ref
+		source := obligation.Source
+		expectedMessageID, expectedContentSHA256 := "", ""
+		if source.Kind == task.PlanVerificationRequirementUserMessage &&
+			source.Locator == task.PlanVerificationRequirementCurrentTaskTurnInputLocator {
+			if !domain.ValidMessageID(currentTaskTurnMessageID) {
+				return domain.NewError(domain.CodeInvalidState, "current task-turn message identity is unavailable")
+			}
+			source.MessageID = currentTaskTurnMessageID
+			source.ContentSHA256 = ""
+			source.Locator = ""
+		}
+		if source.Kind == task.PlanVerificationRequirementUserMessage &&
+			source.Locator == task.PlanVerificationRequirementHistorySearchResultLocator {
+			verifiedSource, err := b.resolveCloudDSHTaskPlanHistorySource(ctx, current, source.HistoryResultToken)
+			if err != nil {
+				return err
+			}
+			if verifiedSource.Kind != task.PlanVerificationRequirementUserMessage || !domain.ValidMessageID(verifiedSource.MessageID) ||
+				verifiedSource.Locator != "" || verifiedSource.HistoryResultToken != "" {
+				return domain.NewError(domain.CodeInvalidState, "history source proof resolver returned a non-canonical source")
+			}
+			expectedMessageID, expectedContentSHA256 = verifiedSource.MessageID, verifiedSource.ContentSHA256
+			source = verifiedSource
+		}
+		var resolved task.PlanVerificationRequirementSource
+		if source.Kind == task.PlanVerificationRequirementProjectFile {
+			value, err := b.resolveTaskPlanProjectFileSource(ctx, current, source)
+			if err != nil {
+				return err
+			}
+			resolved = value
+		} else {
+			if resolver == nil {
+				value, ok := b.store.(CloudDSHTaskPlanRequirementSourceResolver)
+				if !ok {
+					return domain.NewError(domain.CodeUnsupported, "task plan requirement source resolution is unavailable")
+				}
+				resolver = value
+			}
+			value, err := resolver.ResolveCloudDSHTaskPlanRequirementSource(ctx, current, source)
+			if err != nil {
+				return err
+			}
+			resolved = value
+		}
+		if resolved.Kind != source.Kind || resolved.Locator != "" || resolved.HistoryResultToken != "" ||
+			(expectedMessageID != "" && resolved.MessageID != expectedMessageID) ||
+			(expectedContentSHA256 != "" && resolved.ContentSHA256 != expectedContentSHA256) {
+			return domain.NewError(domain.CodeInvalidState, "task plan requirement source resolver returned a non-canonical source")
+		}
+		obligation.Source = resolved
+		obligation.Ref = ""
+		id, err := obligation.CanonicalID()
+		if err != nil {
+			return domain.InvalidArgument("task_plan.requirement_manifest", "requirement obligation could not be canonicalized")
+		}
+		obligation.ID = task.PlanVerificationRequirementID(id)
+		if _, exists := refs[ref]; exists {
+			return domain.InvalidArgument("task_plan.requirement_manifest", "requirement refs are duplicated")
+		}
+		refs[ref] = obligation.ID
+	}
+	for stepIndex := range plan.Steps {
+		check := plan.Steps[stepIndex].VerificationCheck
+		if check == nil {
+			continue
+		}
+		checkCopy := *check
+		checkCopy.RequirementIDs = make([]task.PlanVerificationRequirementID, 0, len(check.RequirementIDs))
+		for _, ref := range check.RequirementIDs {
+			id, exists := refs[string(ref)]
+			if !exists {
+				return domain.InvalidArgument("task_plan.requirement_manifest", "check references an unknown requirement ref")
+			}
+			checkCopy.RequirementIDs = append(checkCopy.RequirementIDs, id)
+		}
+		sort.Slice(checkCopy.RequirementIDs, func(i, j int) bool { return checkCopy.RequirementIDs[i] < checkCopy.RequirementIDs[j] })
+		plan.Steps[stepIndex].VerificationCheck = &checkCopy
+	}
+	sort.Slice(plan.RequirementManifest.Obligations, func(i, j int) bool {
+		return plan.RequirementManifest.Obligations[i].ID < plan.RequirementManifest.Obligations[j].ID
+	})
+	digest, err := plan.RequirementManifestDigest()
+	if err != nil {
+		return domain.InvalidArgument("task_plan.requirement_manifest", "requirement manifest could not be canonicalized")
+	}
+	plan.RequirementManifest.Digest = digest
 	return nil
 }
 

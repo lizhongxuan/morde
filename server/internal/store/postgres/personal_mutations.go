@@ -218,11 +218,15 @@ WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object
 			return personal.MutationReceipt{}, err
 		}
 	}
-	if mutation.ObjectType == personal.ObjectTypeSkillSetting && mutation.ObjectID == "builtin_memory" && !mutation.Delete {
-		var setting struct {
-			Enabled bool `json:"enabled"`
+	if mutation.ObjectType == personal.ObjectTypeSkillSetting && mutation.ObjectID == "builtin_memory" {
+		memoryDisabled := mutation.Delete
+		if !mutation.Delete {
+			var setting struct {
+				Enabled bool `json:"enabled"`
+			}
+			memoryDisabled = json.Unmarshal(mutation.Body, &setting) == nil && !setting.Enabled
 		}
-		if json.Unmarshal(mutation.Body, &setting) == nil && !setting.Enabled {
+		if memoryDisabled {
 			if err := invalidateAllPersonalConversationSummariesInTx(ctx, tx, mutation.OwnerID); err != nil {
 				return personal.MutationReceipt{}, err
 			}

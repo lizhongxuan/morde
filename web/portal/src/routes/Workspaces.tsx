@@ -447,20 +447,30 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
     || projectPreferences.isFetching || projectTargets.isFetching || projectTargets.isError || Boolean(selectedProjectTarget.blockedMessage);
   const scopedProjectState = localProjectState;
   const scopedProjectSelection = projectDirectorySelection;
-  const savedProjectSelection = scopedProjectState?.projectMappings.find((item) => item.hostId === selectedProjectTarget?.hostId
-    && item.workspaceId === selectedProjectTarget.workspaceId);
+  const savedProjectSelections = scopedProjectState?.projectMappings.filter((item) => item.hostId === selectedProjectTarget?.hostId
+    && item.workspaceId === selectedProjectTarget.workspaceId) ?? [];
+  const checkpointProjectSelection = scopedProjectState?.syncCheckpoint?.projectSelectionID
+    ? savedProjectSelections.find((item) => item.selectionID === scopedProjectState.syncCheckpoint?.projectSelectionID
+      && item.projectName === scopedProjectState.syncCheckpoint?.projectName)
+    : undefined;
+  const savedProjectSelection = checkpointProjectSelection
+    ?? (savedProjectSelections.length === 1 ? savedProjectSelections[0] : undefined);
   const projectSelectionMatchesTarget = Boolean(selectedProjectTarget && scopedProjectSelection
     && scopedProjectSelection.hostId === selectedProjectTarget.hostId
     && scopedProjectSelection.workspaceId === selectedProjectTarget.workspaceId);
+  const projectSelectionOptions = projectSelectionMatchesTarget && scopedProjectSelection
+    && !savedProjectSelections.some((item) => item.selectionID === scopedProjectSelection.selectionID)
+    ? [scopedProjectSelection, ...savedProjectSelections] : savedProjectSelections;
   useEffect(() => {
     if (!savedProjectSelection || scopedProjectSelection || !user?.id) return;
-    // Restore a saved native directory selection into the editable form once it arrives.
+    // Restore a single saved directory or the directory tied to a pending recovery point.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setProjectDirectorySelection(savedProjectSelection);
     setProjectNameDraft(savedProjectSelection.projectName);
     setConfirmedProjectName('');
   }, [savedProjectSelection, scopedProjectSelection, user?.id]);
   const projectCheckpoint = scopedProjectState?.syncCheckpoint;
+  const projectSelectionChangeBlocked = !scopedProjectState || scopedProjectState.syncState !== 'idle' || Boolean(projectCheckpoint);
   const checkpointMatchesSelection = Boolean(projectCheckpoint && scopedProjectSelection
     && projectCheckpoint.workspaceId === scopedProjectSelection.workspaceId
     && projectCheckpoint.projectSelectionID === scopedProjectSelection.selectionID
@@ -738,6 +748,19 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
     setProjectNameError(validation.error ?? '');
     if (!validation.error && scopedProjectSelection) setConfirmedProjectName(validation.name);
   };
+  const restoreSavedProjectSelection = (selectionID: string) => {
+    if (!selectionID || projectSelectionChangeBlocked) return;
+    const selection = projectSelectionOptions.find((item) => item.selectionID === selectionID);
+    if (!selection || !selectedProjectTarget || selectedProjectTargetUnavailable
+      || selection.hostId !== selectedProjectTarget.hostId || selection.workspaceId !== selectedProjectTarget.workspaceId) return;
+    projectSelectionRevision.current += 1;
+    setProjectDirectorySelection(selection);
+    setProjectNameDraft(selection.projectName);
+    setConfirmedProjectName('');
+    setProjectNameError('');
+    setProjectDirectoryNotice(`已恢复本机目录“${selection.directoryName}”。`);
+    setProjectUploadMessage('待处理：确认项目名后，点击同步才会更新云端。');
+  };
   const refreshLocalProjectState = async () => {
     if (!projectBridge?.state || !user?.id) return;
     const ownerID = user.id;
@@ -886,8 +909,18 @@ function WorkspacesContent({ user, projectSyncOnly }: { user: ReturnType<typeof 
             && <small className="table-sub">{configuredDefaultProjectTarget.blockedMessage}</small>}
         </article>}
         {selectedProjectTarget && !selectedProjectTargetUnavailable && <div className="form-stack" style={{ marginTop: 10 }}>
+            {projectSelectionOptions.length > 0 && <>
+              <label htmlFor="saved-project-selection">已保存的本机项目</label>
+              <select id="saved-project-selection" value={scopedProjectSelection?.selectionID ?? ''}
+                disabled={projectSelectionChangeBlocked} onChange={(event) => restoreSavedProjectSelection(event.target.value)}>
+                {!scopedProjectSelection && <option value="">请选择一个已保存的项目目录</option>}
+                {projectSelectionOptions.map((item) => <option key={item.selectionID} value={item.selectionID}>
+                  {item.projectName} · {item.directoryName}
+                </option>)}
+              </select>
+            </>}
             <div className="inline-actions">
-              <button type="button" className="button button-secondary" disabled={projectDirectoryBusy || projectUploadBusy || scopedProjectState?.syncState === 'running'} onClick={() => void chooseProjectDirectory()}>
+              <button type="button" className="button button-secondary" disabled={projectDirectoryBusy || projectSelectionChangeBlocked} onClick={() => void chooseProjectDirectory()}>
                 {projectDirectoryBusy ? '正在打开目录选择器…' : projectSelectionMatchesTarget ? '重新选择本机目录' : '选择本机目录'}
               </button>
               {projectSelectionMatchesTarget && scopedProjectSelection && <span role="status">已选：{scopedProjectSelection.directoryName}</span>}

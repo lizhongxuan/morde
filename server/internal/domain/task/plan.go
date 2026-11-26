@@ -1,9 +1,12 @@
 package task
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"path"
+	"sort"
 	"strings"
 	"unicode/utf8"
 
@@ -11,8 +14,12 @@ import (
 )
 
 const (
-	MaxPlanSteps     = 32
-	MaxPlanListItems = 8
+	MaxPlanSteps                     = 32
+	MaxPlanListItems                 = 8
+	MaxPlanVerificationObligations   = 32
+	MaxPlanRequirementRefBytes       = 40
+	MaxPlanRequirementStatementBytes = 512
+	MaxPlanRequirementIDsPerCheck    = 32
 )
 
 type PlanStepStatus string
@@ -33,6 +40,9 @@ type Plan struct {
 	VerificationMethod string     `json:"verification_method,omitempty"`
 	CostEstimateState  string     `json:"cost_estimate_state"`
 	Steps              []PlanStep `json:"steps"`
+	// RequirementManifest is the candidate set of explicit verification
+	// obligations. Its digest is server-computed; it does not assert completeness.
+	RequirementManifest *PlanVerificationRequirementManifest `json:"requirement_manifest,omitempty"`
 	// FixPlan is optional: when present it marks the task as a bug fix and
 	// carries the structured fix proposal. Plans stored before E03 omit it.
 	FixPlan *FixPlan `json:"fix_plan,omitempty"`
@@ -72,6 +82,36 @@ const (
 	PlanVerificationCheckTypecheck PlanVerificationCheckKind = "typecheck"
 	PlanVerificationCheckOther     PlanVerificationCheckKind = "other"
 )
+
+type PlanVerificationScopeMode string
+
+const (
+	PlanVerificationScopeFullSuite PlanVerificationScopeMode = "full_suite"
+	PlanVerificationScopeTargeted  PlanVerificationScopeMode = "targeted"
+)
+
+type PlanVerificationRequirementID string
+
+type PlanVerificationRequirementManifest struct {
+	Version     int                          `json:"version"`
+	Digest      string                       `json:"digest,omitempty"`
+	Obligations []PlanVerificationObligation `json:"obligations"`
+}
+
+// PlanVerificationObligation is one candidate explicit verification request.
+// Ref only links items within a tool call; the App replaces it with a
+// deterministic ID after resolving Source. Neither Ref nor ID proves that the
+// candidate manifest contains every user requirement.
+type PlanVerificationObligation struct {
+	ID            PlanVerificationRequirementID     `json:"id,omitempty"`
+	Ref           string                            `json:"ref,omitempty"`
+	Statement     string                            `json:"statement"`
+	Kind          PlanVerificationCheckKind         `json:"kind"`
+	ScopeMode     PlanVerificationScopeMode         `json:"scope_mode"`
+	CoveragePaths []string                          `json:"coverage_paths"`
+	Selectors     []string                          `json:"selectors,omitempty"`
+	Source        PlanVerificationRequirementSource `json:"source"`
+}
 
 type PlanVerificationCheckBasis string
 
@@ -122,10 +162,15 @@ type PlanVerificationRequirementSource struct {
 // evidence to H07. Its identity is the containing PlanStep.ID, which is
 // already carried through the durable plan-step execution binding.
 type PlanVerificationCheck struct {
-	Kind              PlanVerificationCheckKind          `json:"kind"`
-	Basis             PlanVerificationCheckBasis         `json:"basis"`
-	Command           string                             `json:"command"`
-	CoveragePaths     []string                           `json:"coverage_paths"`
+	Kind           PlanVerificationCheckKind       `json:"kind"`
+	Basis          PlanVerificationCheckBasis      `json:"basis"`
+	Command        string                          `json:"command"`
+	ScopeMode      PlanVerificationScopeMode       `json:"scope_mode,omitempty"`
+	CoveragePaths  []string                        `json:"coverage_paths"`
+	Selectors      []string                        `json:"selectors,omitempty"`
+	RequirementIDs []PlanVerificationRequirementID `json:"requirement_ids,omitempty"`
+	// RequirementSource is retained for old persisted plans. New candidate
+	// manifests keep source refs on obligations and map checks by RequirementIDs.
 	RequirementSource *PlanVerificationRequirementSource `json:"requirement_source,omitempty"`
 }
 
@@ -173,7 +218,7 @@ func (p Plan) Validate() error {
 		default:
 			return errors.New("task plan verification applicability is invalid")
 		}
-		if step.VerificationCheck != nil && !step.VerificationCheck.valid() {
+		if step.VerificationCheck != nil && !step.VerificationCheck.valid(p.RequirementManifest != nil) {
 			return errors.New("task plan verification check is invalid")
 		}
 		steps[step.ID] = step
@@ -213,6 +258,14 @@ func (p Plan) Validate() error {
 			return errors.New("task plan dependencies contain a cycle")
 		}
 	}
+	if p.RequirementManifest != nil {
+		if err := p.validateCanonicalRequirementManifest(); err != nil {
+			return err
+		}
+		if err := p.validateRequirementMappings(); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -243,6 +296,9 @@ func (p Plan) ValidateSubmission() error {
 func (p Plan) ValidateSubmissionInput() error {
 	input := p
 	input.Steps = append([]PlanStep(nil), p.Steps...)
+	if p.RequirementManifest != nil {
+		return p.validateRequirementManifestInput(input)
+	}
 	for index := range input.Steps {
 		check := input.Steps[index].VerificationCheck
 		if check == nil || check.RequirementSource == nil {
@@ -269,11 +325,24 @@ func (p Plan) ValidateSubmissionInput() error {
 	return input.Validate()
 }
 
-func (check PlanVerificationCheck) valid() bool {
+func (check PlanVerificationCheck) valid(withManifest bool) bool {
 	if !validPlanVerificationCheckKind(check.Kind) ||
 		(check.Basis != PlanVerificationCheckRequired && check.Basis != PlanVerificationCheckRiskSelected) ||
 		!planText(check.Command, 1, 1024) || len(check.CoveragePaths) == 0 || len(check.CoveragePaths) > MaxPlanListItems ||
 		!validPlanCoveragePaths(check.CoveragePaths) {
+		return false
+	}
+	if withManifest {
+		if check.RequirementSource != nil || !validPlanVerificationScope(check.ScopeMode, check.CoveragePaths, check.Selectors) ||
+			len(check.RequirementIDs) > MaxPlanRequirementIDsPerCheck {
+			return false
+		}
+		if check.Basis == PlanVerificationCheckRequired {
+			return len(check.RequirementIDs) > 0
+		}
+		return len(check.RequirementIDs) == 0
+	}
+	if check.ScopeMode != "" || len(check.Selectors) != 0 || len(check.RequirementIDs) != 0 {
 		return false
 	}
 	if check.Basis == PlanVerificationCheckRequired {
@@ -335,6 +404,270 @@ func (source PlanVerificationRequirementSource) validSubmissionInput() bool {
 	default:
 		return false
 	}
+}
+
+func (p Plan) validateRequirementManifestInput(input Plan) error {
+	manifest := p.RequirementManifest
+	if manifest == nil || manifest.Version != 1 || len(manifest.Obligations) > MaxPlanVerificationObligations || manifest.Digest != "" {
+		return errors.New("task plan requirement manifest input is invalid")
+	}
+	validationManifest := &PlanVerificationRequirementManifest{Version: manifest.Version,
+		Obligations: make([]PlanVerificationObligation, 0, len(manifest.Obligations))}
+	refs := make(map[string]PlanVerificationRequirementID, len(manifest.Obligations))
+	for _, obligation := range manifest.Obligations {
+		if obligation.ID != "" || !obligation.validSubmissionInput() {
+			return errors.New("task plan requirement obligation input is invalid")
+		}
+		if _, exists := refs[obligation.Ref]; exists {
+			return errors.New("task plan requirement ref is duplicated")
+		}
+		canonical := obligation
+		canonical.Source.Locator = ""
+		canonical.Source.HistoryResultToken = ""
+		canonical.Source.ContentSHA256 = strings.Repeat("0", 64)
+		if canonical.Source.Kind == PlanVerificationRequirementUserMessage && canonical.Source.MessageID == "" {
+			canonical.Source.MessageID = "m0000000"
+		}
+		canonical.Ref = ""
+		id, err := canonical.CanonicalID()
+		if err != nil {
+			return errors.New("task plan requirement obligation cannot be canonicalized")
+		}
+		canonical.ID = PlanVerificationRequirementID(id)
+		refs[obligation.Ref] = canonical.ID
+		validationManifest.Obligations = append(validationManifest.Obligations, canonical)
+	}
+	input.RequirementManifest = validationManifest
+	for index := range input.Steps {
+		check := input.Steps[index].VerificationCheck
+		if check == nil {
+			continue
+		}
+		if check.RequirementSource != nil || len(check.RequirementIDs) > MaxPlanRequirementIDsPerCheck {
+			return errors.New("task plan check must reference the requirement manifest")
+		}
+		checkCopy := *check
+		checkCopy.RequirementIDs = make([]PlanVerificationRequirementID, 0, len(check.RequirementIDs))
+		seen := make(map[PlanVerificationRequirementID]struct{}, len(check.RequirementIDs))
+		for _, ref := range check.RequirementIDs {
+			id, exists := refs[string(ref)]
+			if !validPlanRequirementRef(string(ref)) || !exists {
+				return errors.New("task plan check references an unknown requirement ref")
+			}
+			if _, exists := seen[id]; exists {
+				return errors.New("task plan check requirement ref is duplicated")
+			}
+			seen[id] = struct{}{}
+			checkCopy.RequirementIDs = append(checkCopy.RequirementIDs, id)
+		}
+		sort.Slice(checkCopy.RequirementIDs, func(i, j int) bool { return checkCopy.RequirementIDs[i] < checkCopy.RequirementIDs[j] })
+		input.Steps[index].VerificationCheck = &checkCopy
+	}
+	digest, err := input.RequirementManifestDigest()
+	if err != nil {
+		return err
+	}
+	input.RequirementManifest.Digest = digest
+	return input.Validate()
+}
+
+func (obligation PlanVerificationObligation) validSubmissionInput() bool {
+	return validPlanRequirementRef(obligation.Ref) && planText(obligation.Statement, 1, MaxPlanRequirementStatementBytes) &&
+		validPlanVerificationCheckKind(obligation.Kind) &&
+		validPlanVerificationScope(obligation.ScopeMode, obligation.CoveragePaths, obligation.Selectors) &&
+		obligation.Source.ContentSHA256 == "" && obligation.Source.validSubmissionInput()
+}
+
+func (obligation PlanVerificationObligation) CanonicalID() (string, error) {
+	if !planText(obligation.Statement, 1, MaxPlanRequirementStatementBytes) || !validPlanVerificationCheckKind(obligation.Kind) ||
+		!validPlanVerificationScope(obligation.ScopeMode, obligation.CoveragePaths, obligation.Selectors) || !obligation.Source.valid() {
+		return "", errors.New("task plan requirement obligation is not canonical")
+	}
+	payload := struct {
+		Version       int                               `json:"version"`
+		Statement     string                            `json:"statement"`
+		Kind          PlanVerificationCheckKind         `json:"kind"`
+		ScopeMode     PlanVerificationScopeMode         `json:"scope_mode"`
+		CoveragePaths []string                          `json:"coverage_paths"`
+		Selectors     []string                          `json:"selectors"`
+		Source        PlanVerificationRequirementSource `json:"source"`
+	}{Version: 1, Statement: obligation.Statement, Kind: obligation.Kind, ScopeMode: obligation.ScopeMode,
+		CoveragePaths: canonicalPlanStrings(obligation.CoveragePaths), Selectors: canonicalPlanStrings(obligation.Selectors), Source: obligation.Source}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return "rq_" + hex.EncodeToString(digest[:]), nil
+}
+
+// RequirementManifestDigest returns the lowercase SHA-256 digest of the
+// canonical candidate manifest. It binds manifest version, TaskRevision,
+// Plan.Revision, each canonical obligation ID, its statement/type/scope, and
+// canonical source identity. It excludes the stored Digest field, local Ref,
+// check mapping, TaskID, owner, and authorization context. Callers bind those
+// outer identities in their event/confirmation records.
+func (p Plan) RequirementManifestDigest() (string, error) {
+	manifest := p.RequirementManifest
+	if manifest == nil || manifest.Version != 1 || p.TaskRevision < 0 || p.Revision < 1 ||
+		len(manifest.Obligations) > MaxPlanVerificationObligations {
+		return "", errors.New("task plan requirement manifest is unavailable or invalid")
+	}
+	obligations := make([]planRequirementManifestDigestObligation, 0, len(manifest.Obligations))
+	seen := make(map[PlanVerificationRequirementID]struct{}, len(manifest.Obligations))
+	for _, obligation := range manifest.Obligations {
+		if obligation.Ref != "" {
+			return "", errors.New("task plan requirement ref is not canonical")
+		}
+		id, err := obligation.CanonicalID()
+		if err != nil || string(obligation.ID) != id {
+			return "", errors.New("task plan requirement ID is not canonical")
+		}
+		if _, exists := seen[obligation.ID]; exists {
+			return "", errors.New("task plan requirement ID is duplicated")
+		}
+		seen[obligation.ID] = struct{}{}
+		obligations = append(obligations, planRequirementManifestDigestObligation{ID: obligation.ID,
+			Statement: obligation.Statement, Kind: obligation.Kind, ScopeMode: obligation.ScopeMode,
+			CoveragePaths: canonicalPlanStrings(obligation.CoveragePaths), Selectors: canonicalPlanStrings(obligation.Selectors),
+			Source: obligation.Source})
+	}
+	sort.Slice(obligations, func(i, j int) bool { return obligations[i].ID < obligations[j].ID })
+	payload := planRequirementManifestDigestPayload{Version: manifest.Version, TaskRevision: p.TaskRevision,
+		PlanRevision: p.Revision, Obligations: obligations}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:]), nil
+}
+
+type planRequirementManifestDigestPayload struct {
+	Version      int                                       `json:"version"`
+	TaskRevision int64                                     `json:"task_revision"`
+	PlanRevision int64                                     `json:"plan_revision"`
+	Obligations  []planRequirementManifestDigestObligation `json:"obligations"`
+}
+
+type planRequirementManifestDigestObligation struct {
+	ID            PlanVerificationRequirementID     `json:"id"`
+	Statement     string                            `json:"statement"`
+	Kind          PlanVerificationCheckKind         `json:"kind"`
+	ScopeMode     PlanVerificationScopeMode         `json:"scope_mode"`
+	CoveragePaths []string                          `json:"coverage_paths"`
+	Selectors     []string                          `json:"selectors"`
+	Source        PlanVerificationRequirementSource `json:"source"`
+}
+
+func (p Plan) validateCanonicalRequirementManifest() error {
+	manifest := p.RequirementManifest
+	if manifest == nil || manifest.Version != 1 || len(manifest.Obligations) > MaxPlanVerificationObligations ||
+		!validPlanSHA256(manifest.Digest) {
+		return errors.New("task plan requirement manifest is invalid")
+	}
+	digest, err := p.RequirementManifestDigest()
+	if err != nil || digest != manifest.Digest {
+		return errors.New("task plan requirement manifest digest does not match")
+	}
+	return nil
+}
+
+func (p Plan) validateRequirementMappings() error {
+	manifest := p.RequirementManifest
+	if manifest == nil {
+		return nil
+	}
+	obligations := make(map[PlanVerificationRequirementID]PlanVerificationObligation, len(manifest.Obligations))
+	for _, obligation := range manifest.Obligations {
+		obligations[obligation.ID] = obligation
+	}
+	mapped := make(map[PlanVerificationRequirementID]string, len(obligations))
+	for _, step := range p.Steps {
+		check := step.VerificationCheck
+		if check == nil {
+			continue
+		}
+		for _, id := range check.RequirementIDs {
+			obligation, exists := obligations[id]
+			if !exists {
+				return errors.New("task plan check references an unknown requirement ID")
+			}
+			if prior, exists := mapped[id]; exists {
+				return errors.New("task plan requirement is mapped by multiple checks: " + prior)
+			}
+			if check.Kind != obligation.Kind || check.ScopeMode != obligation.ScopeMode ||
+				!samePlanStringSet(check.CoveragePaths, obligation.CoveragePaths) || !samePlanStringSet(check.Selectors, obligation.Selectors) {
+				return errors.New("task plan check does not match its requirement type or scope")
+			}
+			mapped[id] = step.ID
+		}
+	}
+	if len(mapped) != len(obligations) {
+		return errors.New("task plan has an unmapped requirement obligation")
+	}
+	return nil
+}
+
+func validPlanVerificationScope(mode PlanVerificationScopeMode, paths, selectors []string) bool {
+	if len(paths) == 0 || len(paths) > MaxPlanListItems || !validPlanCoveragePaths(paths) ||
+		len(selectors) > MaxPlanListItems || !validPlanTextList(selectors, 256) {
+		return false
+	}
+	seen := make(map[string]struct{}, len(selectors))
+	for _, selector := range selectors {
+		if _, exists := seen[selector]; exists {
+			return false
+		}
+		seen[selector] = struct{}{}
+	}
+	switch mode {
+	case PlanVerificationScopeFullSuite:
+		return len(selectors) == 0
+	case PlanVerificationScopeTargeted:
+		if len(paths) == 1 && paths[0] == "." && len(selectors) == 0 {
+			return false
+		}
+		return true
+	default:
+		return false
+	}
+}
+
+func validPlanRequirementRef(value string) bool {
+	if len(value) == 0 || len(value) > MaxPlanRequirementRefBytes || value[0] < 'a' || value[0] > 'z' {
+		return false
+	}
+	for index := 1; index < len(value); index++ {
+		character := value[index]
+		if (character < 'a' || character > 'z') && (character < '0' || character > '9') && character != '_' && character != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func canonicalPlanStrings(values []string) []string {
+	result := append([]string(nil), values...)
+	sort.Strings(result)
+	if result == nil {
+		return []string{}
+	}
+	return result
+}
+
+func samePlanStringSet(left, right []string) bool {
+	left = canonicalPlanStrings(left)
+	right = canonicalPlanStrings(right)
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func validPlanCoveragePaths(paths []string) bool {

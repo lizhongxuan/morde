@@ -702,6 +702,57 @@ last_applied_manifest_sha256 IS NULL FROM workspace_sync_project_sources WHERE s
 		t.Fatalf("source baseline after stale receipt = session %q revision NULL=%t manifest NULL=%t; want competing transaction's empty baseline",
 			baselineSession, baselineRevisionIsNull, baselineManifestIsNull)
 	}
+
+	// Restore the last confirmed baseline after the deliberate stale-receipt race,
+	// then persist an actual unknown Host receipt for the still-pending second upload.
+	firstDigest, err := workspace.ProjectManifestSHA256(registeredFolder.RelativePath, first.Files, first.EmptyDirectories, first.Directories)
+	if err != nil {
+		t.Fatalf("hash first confirmed project baseline: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE workspace_sync_project_sources
+SET last_applied_session_id=$2,last_applied_target_revision=$3,last_applied_manifest_sha256=decode($4,'hex'),updated_at=now()
+WHERE source_binding_id=$1`, second.SourceBindingID, first.ID, first.TargetRevision, firstDigest); err != nil {
+		t.Fatalf("restore confirmed source baseline before unknown receipt: %v", err)
+	}
+	var unknownHostID string
+	var unknownBindingVersion, unknownTargetRevision, unknownGeneration int64
+	var unknownManifestDigest []byte
+	if err := pool.QueryRow(ctx, `SELECT host_id,workspace_binding_version,target_revision,manifest_sha256
+FROM workspace_sync_project_upload_applications WHERE workspace_id=$1 AND session_id=$2`, second.WorkspaceID, second.ID).
+		Scan(&unknownHostID, &unknownBindingVersion, &unknownTargetRevision, &unknownManifestDigest); err != nil {
+		t.Fatalf("read pending project application for unknown receipt: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT runtime_generation FROM hosts WHERE id=$1`, unknownHostID).Scan(&unknownGeneration); err != nil {
+		t.Fatalf("read Host generation for unknown receipt: %v", err)
+	}
+	unknownSyncState := workspace.BindingSyncConflict
+	unknownReport := workspace.HostProjectUploadApplicationReport{
+		SourceBindingID: second.SourceBindingID, TargetRevision: unknownTargetRevision,
+		ManifestSHA256: hex.EncodeToString(unknownManifestDigest), Status: "unknown", SyncState: &unknownSyncState,
+		Impacts: []workspace.SyncHostApplicationImpact{{Path: ".", State: "unknown", Reason: "outcome_unknown"}},
+	}
+	unknownPrincipal := identity.Principal{UserID: second.OwnerID, Kind: identity.KindHostReplica, HostScope: unknownHostID,
+		HostGeneration: unknownGeneration, ReplicaWorkspaceID: second.WorkspaceID, BindingVersion: unknownBindingVersion}
+	unknownApplication, err := store.RecordWorkspaceSyncProjectUploadApplication(ctx, unknownPrincipal, second.WorkspaceID,
+		unknownBindingVersion, second.ID, unknownReport)
+	if err != nil || unknownApplication.Status != "unknown" {
+		t.Fatalf("record unknown Host project application receipt = %#v, err=%v; want durable unknown", unknownApplication, err)
+	}
+	var unknownBaselineSession string
+	var unknownBaselineRevision int64
+	var unknownBaselineDigest []byte
+	if err := pool.QueryRow(ctx, `SELECT last_applied_session_id,last_applied_target_revision,last_applied_manifest_sha256
+FROM workspace_sync_project_sources WHERE source_binding_id=$1`, second.SourceBindingID).
+		Scan(&unknownBaselineSession, &unknownBaselineRevision, &unknownBaselineDigest); err != nil {
+		t.Fatalf("read source baseline after unknown Host receipt: %v", err)
+	}
+	if unknownBaselineSession != first.ID || unknownBaselineRevision != first.TargetRevision || hex.EncodeToString(unknownBaselineDigest) != firstDigest {
+		t.Fatalf("unknown receipt advanced source baseline = session %q revision %d digest %s; want previous applied session %q revision %d digest %s",
+			unknownBaselineSession, unknownBaselineRevision, hex.EncodeToString(unknownBaselineDigest), first.ID, first.TargetRevision, firstDigest)
+	}
+	if _, err := syncService.CreateSyncSession(ctx, device, workspaceValue.ID, request, "project-upload-unknown-receipt-recovery-create"); domain.CodeOf(err) != domain.CodeWorkspaceBusy {
+		t.Fatalf("create project sync while Host outcome is unknown = %v; want workspace busy", err)
+	}
 }
 
 func applySyntheticProjectMutationForTest(t *testing.T, store *Store, workspaceID, path string, file *workspace.File,

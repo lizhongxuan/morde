@@ -33,6 +33,7 @@ type taskStepShellOutput struct {
 	WorkspaceSnapshotSHA256Before string                               `json:"workspace_snapshot_sha256_before,omitempty"`
 	WorkspaceSnapshotSHA256After  string                               `json:"workspace_snapshot_sha256_after,omitempty"`
 	VerificationCheck             *TaskValidationCheckExecutionReceipt `json:"verification_check,omitempty"`
+	CoverageReceipt               *TaskValidationRunnerCoverageReceipt `json:"coverage_receipt,omitempty"`
 }
 
 // TaskValidationCheckExecutionReceipt is written by the server-side tool
@@ -50,6 +51,44 @@ type TaskValidationCheckExecutionReceipt struct {
 	CheckSHA256    string `json:"check_sha256"`
 	CoverageSHA256 string `json:"coverage_sha256"`
 	RequestSHA256  string `json:"request_sha256"`
+}
+
+// TaskValidationRunnerCoverageReceipt carries the structured inventory and
+// test events produced by the fixed Go test runner. Store replay must validate
+// this receipt against the typed plan check and the enclosing operation facts;
+// the Runtime's parser_complete flag alone is never sufficient.
+type TaskValidationRunnerCoverageReceipt struct {
+	Version                          int    `json:"version"`
+	Runner                           string `json:"runner"`
+	RunnerVersion                    string `json:"runner_version"`
+	ScopeMode                        string `json:"scope_mode"`
+	ScopeContract                    string `json:"scope_contract"`
+	PackageSelector                  string `json:"package_selector"`
+	TestSelector                     string `json:"test_selector"`
+	ExactCommandSHA256               string `json:"exact_command_sha256"`
+	TaskID                           string `json:"task_id"`
+	WorkspaceID                      string `json:"workspace_id"`
+	WorkspaceDirectory               string `json:"workspace_directory"`
+	BindingVersion                   int64  `json:"binding_version"`
+	WorkspaceViewID                  string `json:"workspace_view_id"`
+	WorkspaceCheckpointRevision      *int64 `json:"workspace_checkpoint_revision"`
+	WorkspaceCWD                     string `json:"workspace_cwd"`
+	WorkspaceSnapshotSHA256Before    string `json:"workspace_snapshot_sha256_before"`
+	WorkspaceSnapshotSHA256After     string `json:"workspace_snapshot_sha256_after"`
+	DiscoveredSourceInventorySHA256  string `json:"discovered_source_inventory_sha256"`
+	DiscoveredSourceInventoryCount   int    `json:"discovered_source_inventory_count"`
+	DiscoveredPackageInventorySHA256 string `json:"discovered_package_inventory_sha256"`
+	DiscoveredPackageInventoryCount  int    `json:"discovered_package_inventory_count"`
+	ExecutedPackageInventorySHA256   string `json:"executed_package_inventory_sha256"`
+	ExecutedPackageInventoryCount    int    `json:"executed_package_inventory_count"`
+	DiscoveredTestInventorySHA256    string `json:"discovered_test_inventory_sha256"`
+	DiscoveredTestInventoryCount     int    `json:"discovered_test_inventory_count"`
+	ExecutedTestInventorySHA256      string `json:"executed_test_inventory_sha256"`
+	ExecutedTestInventoryCount       int    `json:"executed_test_inventory_count"`
+	PassedTestCount                  int    `json:"passed_test_count"`
+	FailedTestCount                  int    `json:"failed_test_count"`
+	SkippedTestCount                 int    `json:"skipped_test_count"`
+	ParserComplete                   bool   `json:"parser_complete"`
 }
 
 var taskStepSecretAssignment = regexp.MustCompile("(?i)((?:--)?(?:password|passwd|passphrase|pwd|secret|token|api[_-]?key|authorization|credential|client[_-]?secret|private[_-]?key|access[_-]?key|refresh[_-]?token)[\"']?\\s*(?:=|:|\\s)\\s*)(?:\"[^\"]*\"|'[^']*'|[^\\s,;}&]+)")

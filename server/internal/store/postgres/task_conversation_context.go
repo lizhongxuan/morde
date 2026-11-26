@@ -394,17 +394,18 @@ func readTaskConversationSummary(ctx context.Context, tx pgx.Tx, value task.Task
  AND v.object_type=p.object_type AND v.object_id=p.object_id
 WHERE p.service_instance_id=$1::uuid AND p.owner_id=$2 AND p.object_type=$3 AND p.object_id='builtin_memory'
   AND NOT v.is_deleted`, currentInstanceID, value.OwnerID, personal.ObjectTypeSkillSetting).Scan(&body)
-		if settingErr != nil && !errors.Is(settingErr, pgx.ErrNoRows) {
+		if errors.Is(settingErr, pgx.ErrNoRows) {
+			return nil, taskContextSnapshotError("Task conversation summary personal memory is unavailable")
+		}
+		if settingErr != nil {
 			return nil, fmt.Errorf("read personal memory setting for Task summary: %w", settingErr)
 		}
-		if settingErr == nil {
-			var setting struct {
-				Enabled bool `json:"enabled"`
-			}
-			if personal.ValidateObjectBody(personal.ObjectTypeSkillSetting, "builtin_memory", body) != nil ||
-				json.Unmarshal(body, &setting) != nil || !setting.Enabled {
-				return nil, taskContextSnapshotError("Task conversation summary personal memory is unavailable")
-			}
+		var setting struct {
+			Enabled bool `json:"enabled"`
+		}
+		if personal.ValidateObjectBody(personal.ObjectTypeSkillSetting, "builtin_memory", body) != nil ||
+			json.Unmarshal(body, &setting) != nil || !setting.Enabled {
+			return nil, taskContextSnapshotError("Task conversation summary personal memory is unavailable")
 		}
 	}
 	sequence := manifest.ThroughSequence

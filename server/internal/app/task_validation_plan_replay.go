@@ -26,7 +26,10 @@ func PendingTaskValidationReplayEvidence(plan *task.Plan) *TaskValidationReplayE
 		}
 		check := TaskValidationReplayCheckEvidence{CheckID: step.ID, Status: TaskValidationReplayPending,
 			Kind: step.VerificationCheck.Kind, Basis: step.VerificationCheck.Basis,
+			ScopeMode:                 step.VerificationCheck.ScopeMode,
 			CoveragePaths:             append([]string(nil), step.VerificationCheck.CoveragePaths...),
+			Selectors:                 append([]string(nil), step.VerificationCheck.Selectors...),
+			RequirementIDs:            append([]task.PlanVerificationRequirementID(nil), step.VerificationCheck.RequirementIDs...),
 			RequirementSourceVerified: step.VerificationCheck.Basis == task.PlanVerificationCheckRiskSelected}
 		if step.VerificationCheck.RequirementSource != nil {
 			source := *step.VerificationCheck.RequirementSource
@@ -44,9 +47,10 @@ func PendingTaskValidationReplayEvidence(plan *task.Plan) *TaskValidationReplayE
 // EvaluateTaskValidationPlanReplay derives H07 from a current plan and the
 // latest durable operation fact for each typed check. It returns FAIL for a
 // verified applicable failing check, PASS only when every declared check
-// passed on one unchanged Task Workspace snapshot and both requirement-set
-// completeness and final-snapshot identity are independently verified, and
-// PENDING otherwise.
+// passed on one unchanged Task Workspace snapshot, each runner coverage
+// receipt matches its declared scope, the exact candidate manifest has a
+// current user confirmation, and final-snapshot identity is independently
+// verified. Missing facts remain PENDING.
 func EvaluateTaskValidationPlanReplay(plan task.Plan, evidence *TaskValidationReplayEvidence) TaskValidationReplayState {
 	if plan.Validate() != nil || plan.FixPlan == nil || evidence == nil || evidence.PlanRevision != plan.Revision {
 		return TaskValidationReplayPending
@@ -114,7 +118,7 @@ func EvaluateTaskValidationPlanReplay(plan task.Plan, evidence *TaskValidationRe
 				hasUnknown = true
 			}
 		case TaskValidationReplayPass:
-			if fact.ExitCode != 0 || fact.TimedOut || !validSyncDigest(fact.WorkspaceSnapshotSHA256Before) ||
+			if !fact.ActualCoverageVerified || fact.ExitCode != 0 || fact.TimedOut || !validSyncDigest(fact.WorkspaceSnapshotSHA256Before) ||
 				fact.WorkspaceSnapshotSHA256Before != fact.WorkspaceSnapshotSHA256After {
 				hasUnknown = true
 				continue
@@ -172,7 +176,8 @@ func validTaskValidationReplayCheckIdentity(plan task.Plan, checkID string, chec
 	}
 	expectedCheckBytes, expectedErr := json.Marshal(check)
 	providedCheck := task.PlanVerificationCheck{Kind: fact.Kind, Basis: fact.Basis, Command: check.Command,
-		CoveragePaths: fact.CoveragePaths, RequirementSource: fact.RequirementSource}
+		ScopeMode: fact.ScopeMode, CoveragePaths: fact.CoveragePaths, Selectors: fact.Selectors,
+		RequirementIDs: fact.RequirementIDs, RequirementSource: fact.RequirementSource}
 	providedCheckBytes, providedErr := json.Marshal(providedCheck)
 	return expectedErr == nil && providedErr == nil && bytes.Equal(expectedCheckBytes, providedCheckBytes) &&
 		fact.CheckID == checkID && fact.TaskRevision == plan.TaskRevision && fact.PlanRevision == plan.Revision &&

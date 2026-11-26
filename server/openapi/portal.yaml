@@ -5659,6 +5659,43 @@ paths:
               schema: { $ref: '#/components/schemas/Task' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/requirement-manifest/confirm:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    post:
+      tags: [Tasks]
+      operationId: confirmTaskRequirementManifest
+      summary: Confirm the exact current Task verification requirement manifest
+      description: Requires an authenticated Task reader and an Idempotency-Key. This records only an explicit positive confirmation of the exact current server-resolved plan manifest; it does not verify that the manifest is complete or mark H07 verified. Task revision, plan revision, plan event sequence, digest, and current authorization are rechecked transactionally. Stale, cancelled, unauthorized, or changed plans are rejected.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+        - name: If-Match
+          in: header
+          required: true
+          description: Strong quoted lowercase SHA-256 ETag of the candidate manifest, for example "<64 lowercase hex characters>". The server recomputes this digest from the current Plan event.
+          schema: { type: string, pattern: '^"[0-9a-f]{64}"$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskRequirementManifestConfirmationRequest' }
+      responses:
+        '200':
+          description: Persisted confirmation fact for the exact current manifest.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+            ETag: { schema: { type: string, pattern: '^"[0-9a-f]{64}"$' } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskRequirementManifestConfirmation' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/artifacts/{artifact_id}/content:
     parameters:
       - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
@@ -12837,7 +12874,10 @@ components:
             kind: { type: string, enum: [test, build, lint, typecheck, other] }
             basis: { type: string, enum: [required, risk_selected], description: Required checks cite an explicit user message or project file; risk_selected checks are chosen for this task. }
             command: { type: string, minLength: 1, maxLength: 1024 }
+            scope_mode: { type: string, enum: [full_suite, targeted] }
             coverage_paths: { type: array, minItems: 1, maxItems: 8, items: { type: string, minLength: 1, maxLength: 512 } }
+            selectors: { type: array, maxItems: 8, items: { type: string, maxLength: 256 } }
+            requirement_ids: { type: array, maxItems: 32, items: { type: string, pattern: '^rq_[0-9a-f]{64}$' } }
             requirement_source:
               type: object
               additionalProperties: false
@@ -12848,6 +12888,48 @@ components:
                 workspace_path: { type: string, maxLength: 512 }
                 workspace_revision: { type: integer, format: int64, minimum: 0 }
                 content_sha256: { type: string, pattern: '^[0-9a-f]{64}$', description: Canonical digest stored in the plan; new plan-tool submissions have the server resolve the source and compute this value. }
+    TaskPlanRequirementSource:
+      description: Canonical persisted source identity. Submission-only locator/token fields are never stored in a Plan event.
+      oneOf:
+        - $ref: '#/components/schemas/TaskPlanUserMessageRequirementSource'
+        - $ref: '#/components/schemas/TaskPlanProjectFileRequirementSource'
+    TaskPlanUserMessageRequirementSource:
+      type: object
+      additionalProperties: false
+      required: [kind, message_id, content_sha256]
+      properties:
+        kind: { type: string, const: user_message }
+        message_id: { type: string, pattern: '^m[a-z0-9]{7}$' }
+        content_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+    TaskPlanProjectFileRequirementSource:
+      type: object
+      additionalProperties: false
+      required: [kind, workspace_path, workspace_revision, content_sha256]
+      properties:
+        kind: { type: string, const: project_file }
+        workspace_path: { type: string, minLength: 1, maxLength: 512 }
+        workspace_revision: { type: integer, format: int64, minimum: 0 }
+        content_sha256: { type: string, pattern: '^[0-9a-f]{64}$' }
+    TaskPlanRequirementObligation:
+      type: object
+      additionalProperties: false
+      required: [id, statement, kind, scope_mode, coverage_paths, source]
+      properties:
+        id: { type: string, pattern: '^rq_[0-9a-f]{64}$' }
+        statement: { type: string, minLength: 1, maxLength: 512 }
+        kind: { type: string, enum: [test, build, lint, typecheck, other] }
+        scope_mode: { type: string, enum: [full_suite, targeted] }
+        coverage_paths: { type: array, minItems: 1, maxItems: 8, items: { type: string, maxLength: 512 } }
+        selectors: { type: array, maxItems: 8, items: { type: string, maxLength: 256 } }
+        source: { $ref: '#/components/schemas/TaskPlanRequirementSource' }
+    TaskPlanRequirementManifest:
+      type: object
+      additionalProperties: false
+      required: [version, obligations, digest]
+      properties:
+        version: { type: integer, const: 1 }
+        obligations: { type: array, maxItems: 32, items: { $ref: '#/components/schemas/TaskPlanRequirementObligation' } }
+        digest: { type: string, pattern: '^[0-9a-f]{64}$', description: Server-computed digest of the canonical candidate manifest. It does not prove completeness. }
     TaskPlan:
       type: object
       additionalProperties: false
@@ -12858,7 +12940,26 @@ components:
         goal: { type: string, minLength: 1, maxLength: 2048 }
         cost_estimate_state: { type: string, const: unknown, description: Cost is unknown unless an independently verified estimate is later provided. }
         steps: { type: array, minItems: 1, maxItems: 32, items: { $ref: '#/components/schemas/TaskPlanStep' } }
+        requirement_manifest: { $ref: '#/components/schemas/TaskPlanRequirementManifest' }
         created_at: { type: string, format: date-time }
+    TaskRequirementManifestConfirmationRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_task_revision, expected_plan_revision, expected_plan_event_sequence]
+      properties:
+        expected_task_revision: { type: integer, format: int64, minimum: 0 }
+        expected_plan_revision: { type: integer, format: int64, minimum: 1 }
+        expected_plan_event_sequence: { type: integer, format: int64, minimum: 1 }
+    TaskRequirementManifestConfirmation:
+      type: object
+      required: [task_id, task_revision, plan_revision, plan_event_sequence, manifest_digest, confirmed_at]
+      properties:
+        task_id: { $ref: '#/components/schemas/TaskId' }
+        task_revision: { type: integer, format: int64, minimum: 0 }
+        plan_revision: { type: integer, format: int64, minimum: 1 }
+        plan_event_sequence: { type: integer, format: int64, minimum: 1 }
+        manifest_digest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        confirmed_at: { type: string, format: date-time }
     TaskStepRetryRequest:
       type: object
       additionalProperties: false

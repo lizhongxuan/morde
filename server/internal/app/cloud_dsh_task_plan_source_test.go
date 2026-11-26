@@ -98,6 +98,31 @@ func taskPlanHistorySourceArguments(token string) string {
 	return strings.Replace(arguments, needle, needle+`,"history_result_token":`+string(encodedToken), 1)
 }
 
+func taskPlanManifestArguments(obligation task.PlanVerificationObligation, checkScope task.PlanVerificationScopeMode,
+	checkCoverage []string, checkSelectors []string, requirementRefs []task.PlanVerificationRequirementID) string {
+	command := "go test ./..."
+	if obligation.Kind == task.PlanVerificationCheckLint {
+		command = "golangci-lint run ./..."
+	}
+	input := cloudDSHTaskPlanInput{Goal: "Fix the requested behavior", Scope: "server implementation",
+		VerificationMethod: "run the requested checks", FixPlan: &task.FixPlan{},
+		RequirementManifest: &task.PlanVerificationRequirementManifest{Version: 1,
+			Obligations: []task.PlanVerificationObligation{obligation}},
+		Steps: []task.PlanStep{{ID: "verify", Title: "Run the required checks", Status: task.PlanStepPending,
+			CompletionCriteria: []string{"required checks pass"}, VerificationApplicability: task.PlanVerificationApplicabilityCheck,
+			VerificationCheck: &task.PlanVerificationCheck{Kind: obligation.Kind, Basis: task.PlanVerificationCheckRequired,
+				Command: command, ScopeMode: checkScope, CoveragePaths: checkCoverage, Selectors: checkSelectors,
+				RequirementIDs: requirementRefs}}}}
+	encoded, _ := json.Marshal(input)
+	return string(encoded)
+}
+
+func taskPlanManifestSourceObligation(source task.PlanVerificationRequirementSource, mode task.PlanVerificationScopeMode,
+	coverage []string, selectors []string) task.PlanVerificationObligation {
+	return task.PlanVerificationObligation{Ref: "req1", Statement: "Run the requested verification", Kind: task.PlanVerificationCheckTest,
+		ScopeMode: mode, CoveragePaths: coverage, Selectors: selectors, Source: source}
+}
+
 func resolvedUserTaskPlanSource(source task.PlanVerificationRequirementSource) (task.PlanVerificationRequirementSource, error) {
 	if source.Kind != task.PlanVerificationRequirementUserMessage {
 		return task.PlanVerificationRequirementSource{}, domain.NewError(domain.CodeUnsupported, "project source unavailable")
@@ -153,6 +178,105 @@ func TestTaskPlanSubmissionResolvesUserSourceBeforeValidationAndPersistence(t *t
 			}
 			t.Fatal("canonical plan was not persisted")
 		})
+	}
+}
+
+func TestTaskPlanRequirementManifestServerCanonicalizesModelClaims(t *testing.T) {
+	store, broker, current := newTaskPlanSourceTestBroker(t, resolvedUserTaskPlanSource)
+	source := task.PlanVerificationRequirementSource{Kind: task.PlanVerificationRequirementUserMessage,
+		Locator: task.PlanVerificationRequirementCurrentTaskInputLocator, MessageID: "m7654321", ContentSHA256: strings.Repeat("f", 64)}
+	obligation := taskPlanManifestSourceObligation(source, task.PlanVerificationScopeFullSuite, []string{"."}, nil)
+	obligation.ID = task.PlanVerificationRequirementID("rq_" + strings.Repeat("b", 64))
+	arguments := taskPlanManifestArguments(obligation, task.PlanVerificationScopeFullSuite, []string{"."}, nil,
+		[]task.PlanVerificationRequirementID{task.PlanVerificationRequirementID(obligation.Ref)})
+	var input cloudDSHTaskPlanInput
+	if err := json.Unmarshal([]byte(arguments), &input); err != nil {
+		t.Fatal(err)
+	}
+	modelDigest := strings.Repeat("d", 64)
+	input.RequirementManifest.Digest = modelDigest
+	input.RequirementManifest.Obligations[0].Source.MessageID = "m7654321"
+	input.RequirementManifest.Obligations[0].Source.ContentSHA256 = strings.Repeat("e", 64)
+	input.RequirementManifest.Obligations[0].ID = obligation.ID
+	argumentsBytes, err := json.Marshal(input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-requirement-manifest-canonical", string(argumentsBytes)))
+	if err != nil || result.Status != AgentToolSucceeded {
+		t.Fatalf("manifest plan submission = %#v, %v", result, err)
+	}
+	if len(store.inputs) != 1 || store.inputs[0].MessageID != "" || store.inputs[0].ContentSHA256 != "" ||
+		store.inputs[0].Locator != task.PlanVerificationRequirementCurrentTaskInputLocator {
+		t.Fatalf("Store resolver received model-controlled source identity: %+v", store.inputs)
+	}
+	var output task.Plan
+	if err := json.Unmarshal([]byte(result.Output), &output); err != nil {
+		t.Fatalf("decode canonical plan: %v", err)
+	}
+	manifest := output.RequirementManifest
+	if manifest == nil || manifest.Digest == "" || manifest.Digest == modelDigest || len(manifest.Obligations) != 1 {
+		t.Fatalf("manifest digest was not server-generated: %+v", manifest)
+	}
+	canonicalID := manifest.Obligations[0].ID
+	if canonicalID == "" || canonicalID == obligation.ID || manifest.Obligations[0].Ref != "" ||
+		manifest.Obligations[0].Source.MessageID != "m1234567" || manifest.Obligations[0].Source.ContentSHA256 == strings.Repeat("e", 64) {
+		t.Fatalf("manifest obligation was not canonicalized: %+v", manifest.Obligations[0])
+	}
+	check := output.Steps[0].VerificationCheck
+	if check == nil || len(check.RequirementIDs) != 1 || check.RequirementIDs[0] != canonicalID || check.ScopeMode != task.PlanVerificationScopeFullSuite {
+		t.Fatalf("check mapping was not rewritten to the canonical obligation ID: %+v", check)
+	}
+	digest, err := output.RequirementManifestDigest()
+	if err != nil || digest != manifest.Digest || output.ValidateSubmission() != nil {
+		t.Fatalf("canonical manifest digest/plan validation = %q, %v; manifest=%+v", digest, err, manifest)
+	}
+}
+
+func TestTaskPlanRequirementManifestRejectsMissingOrOrphanMapping(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		refs []task.PlanVerificationRequirementID
+	}{
+		{name: "missing mapping"},
+		{name: "orphan mapping", refs: []task.PlanVerificationRequirementID{"missing"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store, broker, current := newTaskPlanSourceTestBroker(t, resolvedUserTaskPlanSource)
+			source := task.PlanVerificationRequirementSource{Kind: task.PlanVerificationRequirementUserMessage,
+				Locator: task.PlanVerificationRequirementCurrentTaskInputLocator}
+			obligation := taskPlanManifestSourceObligation(source, task.PlanVerificationScopeFullSuite, []string{"."}, nil)
+			arguments := taskPlanManifestArguments(obligation, task.PlanVerificationScopeFullSuite, []string{"."}, nil, test.refs)
+			result, err := broker.Execute(context.Background(), current, briefPlanCall(current,
+				"plan-requirement-manifest-invalid-"+strings.ReplaceAll(test.name, " ", "-"), arguments))
+			if err != nil || result.Status != AgentToolFailed || len(store.inputs) != 0 {
+				t.Fatalf("invalid requirement mapping result=%#v err=%v resolverInputs=%+v", result, err, store.inputs)
+			}
+			for _, progress := range store.committedTaskProgress {
+				if progress.CloudDSHTaskPlan != nil {
+					t.Fatal("invalid requirement mapping was persisted")
+				}
+			}
+		})
+	}
+}
+
+func TestTaskPlanRequirementManifestRejectsTargetedCheckForFullSuite(t *testing.T) {
+	store, broker, current := newTaskPlanSourceTestBroker(t, resolvedUserTaskPlanSource)
+	source := task.PlanVerificationRequirementSource{Kind: task.PlanVerificationRequirementUserMessage,
+		Locator: task.PlanVerificationRequirementCurrentTaskInputLocator}
+	obligation := taskPlanManifestSourceObligation(source, task.PlanVerificationScopeFullSuite, []string{"."}, nil)
+	arguments := taskPlanManifestArguments(obligation, task.PlanVerificationScopeTargeted,
+		[]string{"server/internal/app"}, []string{"TestFix"}, []task.PlanVerificationRequirementID{"req1"})
+	result, err := broker.Execute(context.Background(), current, briefPlanCall(current,
+		"plan-requirement-manifest-scope-mismatch", arguments))
+	if err != nil || result.Status != AgentToolFailed || len(store.inputs) != 0 {
+		t.Fatalf("targeted check satisfied full-suite obligation: result=%#v err=%v resolverInputs=%+v", result, err, store.inputs)
+	}
+	for _, progress := range store.committedTaskProgress {
+		if progress.CloudDSHTaskPlan != nil {
+			t.Fatal("scope-mismatched plan was persisted")
+		}
 	}
 }
 
@@ -566,9 +690,12 @@ func TestTaskPlanRequirementSourceToolSchemaUsesServerResolvedDigest(t *testing.
 		!strings.Contains(definition.Description, "locator=current_task_input") ||
 		!strings.Contains(definition.Description, "locator=history_search_result") ||
 		!strings.Contains(definition.Description, "history_result_token") ||
+		!strings.Contains(definition.Description, "requirement_manifest") ||
+		!strings.Contains(definition.Description, "full_suite") || !strings.Contains(definition.Description, "targeted") ||
 		!strings.Contains(definition.Description, "fixed through_sequence") ||
 		!strings.Contains(definition.Description, "can omit messages accepted after Task start") ||
-		!strings.Contains(definition.Description, "Never infer or invent an ID") {
+		!strings.Contains(definition.Description, "Never infer or invent an ID") ||
+		!strings.Contains(definition.Description, "Never claim completeness or verification") {
 		t.Fatalf("plan source instructions do not describe trusted source resolution: %s", definition.Description)
 	}
 	var schema map[string]any
@@ -579,7 +706,27 @@ func TestTaskPlanRequirementSourceToolSchemaUsesServerResolvedDigest(t *testing.
 	steps := properties["steps"].(map[string]any)
 	stepItem := steps["items"].(map[string]any)
 	check := stepItem["properties"].(map[string]any)["verification_check"].(map[string]any)
-	source := check["properties"].(map[string]any)["requirement_source"].(map[string]any)
+	checkProperties := check["properties"].(map[string]any)
+	if _, ok := checkProperties["requirement_source"]; ok {
+		t.Fatal("check schema duplicates a source already stored in the requirement manifest")
+	}
+	if _, ok := checkProperties["scope_mode"]; !ok {
+		t.Fatal("check schema does not expose typed coverage scope")
+	}
+	if _, ok := checkProperties["requirement_ids"]; !ok {
+		t.Fatal("check schema does not map checks to manifest obligations")
+	}
+	manifest := properties["requirement_manifest"].(map[string]any)
+	manifestProperties := manifest["properties"].(map[string]any)
+	if _, ok := manifestProperties["digest"]; ok {
+		t.Fatal("tool schema exposes model-controlled manifest digest")
+	}
+	obligation := manifestProperties["obligations"].(map[string]any)["items"].(map[string]any)
+	obligationProperties := obligation["properties"].(map[string]any)
+	if _, ok := obligationProperties["id"]; ok {
+		t.Fatal("tool schema exposes model-controlled canonical requirement ID")
+	}
+	source := obligationProperties["source"].(map[string]any)
 	sourceProperties := source["properties"].(map[string]any)
 	historyToken, ok := sourceProperties["history_result_token"].(map[string]any)
 	if !ok {
@@ -588,9 +735,14 @@ func TestTaskPlanRequirementSourceToolSchemaUsesServerResolvedDigest(t *testing.
 	if historyToken["minLength"] != float64(1) || historyToken["maxLength"] != float64(task.PlanVerificationRequirementHistoryResultTokenMaxBytes) {
 		t.Fatalf("history result token bounds = %+v", historyToken)
 	}
-	for _, untrusted := range []string{"message_id", "content_sha256"} {
+	for _, untrusted := range []string{"message_id", "content_sha256", "complete", "verified"} {
 		if _, ok := sourceProperties[untrusted]; ok {
 			t.Fatalf("plan tool exposes model-controlled canonical field %q", untrusted)
+		}
+	}
+	for _, untrusted := range []string{"complete", "verified", "digest"} {
+		if _, ok := manifestProperties[untrusted]; ok {
+			t.Fatalf("plan tool exposes model-controlled manifest state %q", untrusted)
 		}
 	}
 	locator := sourceProperties["locator"].(map[string]any)

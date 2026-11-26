@@ -73,7 +73,7 @@ func (s *WorkspaceSyncService) applyLiveProjectUpload(ctx context.Context, plan 
 		if plan.ProjectLiveBaseline == nil {
 			return []workspace.Conflict{{Path: session.Scope[0], Reason: "cloud_baseline_unavailable"}}, nil
 		}
-		if conflicts := projectLiveBaselineConflicts(*plan.ProjectLiveBaseline, live.files, live.directories); len(conflicts) > 0 {
+		if conflicts := projectLiveBaselineConflictsForPendingUpload(*plan.ProjectLiveBaseline, live.files, live.directories, session); len(conflicts) > 0 {
 			return conflicts, nil
 		}
 	}
@@ -475,6 +475,146 @@ func projectLiveBaselineConflicts(baseline WorkspaceSyncProjectLiveBaseline, fil
 		}
 	}
 	return conflicts
+}
+
+// A retry after a direct apply error can observe filesystem changes made by its
+// own prior attempt. Ignore only pending paths whose observed state matches the
+// requested result; preserve every unrelated baseline conflict.
+func projectLiveBaselineConflictsForPendingUpload(baseline WorkspaceSyncProjectLiveBaseline, files []workspace.File,
+	directories []workspace.Directory, session workspace.SyncSession) []workspace.Conflict {
+	conflicts := projectLiveBaselineConflicts(baseline, files, directories)
+	if len(conflicts) == 0 {
+		return nil
+	}
+	liveFiles := make(map[string]workspace.File, len(files))
+	for _, file := range files {
+		liveFiles[strings.ToLower(file.Path)] = file
+	}
+	liveDirectories := make(map[string]workspace.Directory, len(directories))
+	for _, directory := range directories {
+		liveDirectories[strings.ToLower(directory.Path)] = directory
+	}
+	baselineFiles := make(map[string]workspace.File, len(baseline.Files))
+	for _, file := range baseline.Files {
+		baselineFiles[strings.ToLower(file.Path)] = file
+	}
+	baselineDirectories := make(map[string]workspace.Directory, len(baseline.Directories))
+	for _, directory := range baseline.Directories {
+		baselineDirectories[strings.ToLower(directory.Path)] = directory
+	}
+	plannedFiles := make(map[string]workspace.File, len(session.UploadFiles))
+	for _, file := range session.UploadFiles {
+		plannedFiles[strings.ToLower(file.Path)] = file
+	}
+	plannedDeletes := make(map[string]struct{}, len(session.UploadDeletedPaths))
+	for _, filePath := range session.UploadDeletedPaths {
+		plannedDeletes[strings.ToLower(filePath)] = struct{}{}
+	}
+	plannedDirectoryDeletes := make(map[string]struct{}, len(session.UploadDeletedDirectories))
+	for _, directoryPath := range session.UploadDeletedDirectories {
+		plannedDirectoryDeletes[strings.ToLower(directoryPath)] = struct{}{}
+	}
+	result := make([]workspace.Conflict, 0, len(conflicts))
+	for _, conflict := range conflicts {
+		key := strings.ToLower(conflict.Path)
+		if previous, isFile := baselineFiles[key]; isFile {
+			if actual, exists := liveFiles[key]; exists {
+				if desired, planned := plannedFiles[key]; planned && pendingProjectUploadFileMatches(actual, previous, desired) {
+					continue
+				}
+			} else if _, planned := plannedDeletes[key]; planned {
+				continue
+			}
+			result = append(result, conflict)
+			continue
+		}
+		previous, isDirectory := baselineDirectories[key]
+		if isDirectory {
+			if _, exists := liveDirectories[key]; !exists {
+				if _, planned := plannedDirectoryDeletes[key]; planned {
+					continue
+				}
+			} else if current := liveDirectories[key]; sameDirectoryMetadataExceptModTime(previous, current) &&
+				pendingProjectUploadChangedWithin(session, conflict.Path, liveFiles, liveDirectories, baselineFiles, baselineDirectories) {
+				continue
+			}
+		}
+		result = append(result, conflict)
+	}
+	return result
+}
+
+func sameDirectoryMetadataExceptModTime(a, b workspace.Directory) bool {
+	// Adding, replacing, or removing a child can advance directory mtime without
+	// changing its permissions or native metadata.
+	return a.Path == b.Path && sameOptionalWorkspaceMode(a.Mode, b.Mode) && a.MetadataKnown == b.MetadataKnown &&
+		workspace.SameNativeMetadata(a.Xattrs, b.Xattrs, a.ACL, b.ACL)
+}
+
+func sameOptionalWorkspaceMode(a, b *uint32) bool {
+	return a == nil && b == nil || a != nil && b != nil && *a == *b
+}
+
+func pendingProjectUploadFileMatches(actual, previous, desired workspace.File) bool {
+	// A prior attempt can replace the file and change its mtime. Accept only the
+	// pending content and supported mode while preserving metadata the upload does not own.
+	return actual.Path == desired.Path && directProjectFilesMatch(actual, desired, true) &&
+		actual.MetadataKnown == previous.MetadataKnown && workspace.SameNativeMetadata(actual.Xattrs, previous.Xattrs, actual.ACL, previous.ACL)
+}
+
+func pendingProjectUploadChangedWithin(session workspace.SyncSession, directory string, files map[string]workspace.File,
+	directories map[string]workspace.Directory, baselineFiles map[string]workspace.File,
+	baselineDirectories map[string]workspace.Directory) bool {
+	within := func(candidate string) bool {
+		return !strings.EqualFold(candidate, directory) && projectPathWithinRoot(candidate, directory)
+	}
+	for _, desired := range session.UploadFiles {
+		if !within(desired.Path) {
+			continue
+		}
+		actual, exists := files[strings.ToLower(desired.Path)]
+		if exists && actual.Path == desired.Path {
+			if previous, hadBaseline := baselineFiles[strings.ToLower(desired.Path)]; hadBaseline {
+				if pendingProjectUploadFileMatches(actual, previous, desired) {
+					return true
+				}
+			} else if desiredCurrentFileMatches(actual, true, desired) {
+				return true
+			}
+		}
+	}
+	for _, filePath := range session.UploadDeletedPaths {
+		if within(filePath) {
+			if _, exists := files[strings.ToLower(filePath)]; !exists {
+				return true
+			}
+		}
+	}
+	for _, directoryPath := range session.UploadDeletedDirectories {
+		if within(directoryPath) {
+			if _, exists := directories[strings.ToLower(directoryPath)]; !exists {
+				return true
+			}
+		}
+	}
+	for _, directoryPath := range append(append([]string(nil), session.UploadEmptyDirectories...), directoryPaths(session.UploadDirectories)...) {
+		if within(directoryPath) {
+			key := strings.ToLower(directoryPath)
+			_, existedInBaseline := baselineDirectories[key]
+			if _, exists := directories[key]; exists && !existedInBaseline {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func directoryPaths(values []workspace.Directory) []string {
+	paths := make([]string, 0, len(values))
+	for _, value := range values {
+		paths = append(paths, value.Path)
+	}
+	return paths
 }
 
 func directProjectEmptyDirectoryRecords(paths []string) []workspace.Directory {

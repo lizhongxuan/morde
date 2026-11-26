@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -42,6 +43,10 @@ type TaskService interface {
 
 type TaskApprovalQueryService interface {
 	ListTaskApprovals(context.Context, identity.Principal, string, app.PageRequest) (app.TaskApprovalPage, error)
+}
+
+type TaskRequirementConfirmationService interface {
+	ConfirmTaskRequirementManifest(context.Context, identity.Principal, string, app.TaskRequirementManifestConfirmationInput) (app.TaskRequirementManifestConfirmation, error)
 }
 
 type TaskFileFetchQueryService interface {
@@ -623,6 +628,21 @@ type taskStepRetryRequest struct {
 	ExpectedAttempt      int64 `json:"expected_attempt"`
 }
 
+type taskRequirementManifestConfirmationRequest struct {
+	TaskRevision      int64 `json:"expected_task_revision"`
+	PlanRevision      int64 `json:"expected_plan_revision"`
+	PlanEventSequence int64 `json:"expected_plan_event_sequence"`
+}
+
+type taskRequirementManifestConfirmationResponse struct {
+	TaskID            string    `json:"task_id"`
+	TaskRevision      int64     `json:"task_revision"`
+	PlanRevision      int64     `json:"plan_revision"`
+	PlanEventSequence int64     `json:"plan_event_sequence"`
+	ManifestDigest    string    `json:"manifest_digest"`
+	ConfirmedAt       time.Time `json:"confirmed_at"`
+}
+
 func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	if service == nil {
 		return
@@ -634,6 +654,9 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks", h.submitTask(service))
 	group.DELETE("/tasks/:id/mcp-connectors/:connector_id", h.revokeTaskMCPConnectorGrant(service))
 	group.GET("/tasks/:id", h.getTask(service))
+	if confirmationService, ok := service.(TaskRequirementConfirmationService); ok {
+		group.POST("/tasks/:id/requirement-manifest/confirm", h.confirmTaskRequirementManifest(confirmationService))
+	}
 	if detailService, ok := service.(TaskStepDetailService); ok {
 		group.GET("/tasks/:id/steps/:step_id", h.getTaskStepDetail(detailService))
 	}
@@ -649,6 +672,70 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks/:id/inputs", h.addTaskInput(service))
 	group.POST("/tasks/:id/approvals/:approval_id/responses", h.respondToTaskApproval(service))
 	group.GET("/tasks/:id/events", h.streamTaskEvents(service))
+}
+
+func (h *api) confirmTaskRequirementManifest(service TaskRequirementConfirmationService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.URL.RawQuery != "" {
+			writeError(c, domain.InvalidArgument("request", "task requirement confirmation does not accept a query string"))
+			return
+		}
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		var request taskRequirementManifestConfirmationRequest
+		if !decodeStrictJSON(c, &request) {
+			return
+		}
+		ifMatchValues := c.Request.Header.Values("If-Match")
+		manifestDigest, validIfMatch := "", false
+		if len(ifMatchValues) == 1 {
+			manifestDigest, validIfMatch = taskRequirementManifestDigestIfMatch(ifMatchValues[0])
+		}
+		if !validIfMatch {
+			writeError(c, domain.InvalidArgument("If-Match", "a strong quoted manifest SHA-256 precondition is required"))
+			return
+		}
+		idempotencyKey := c.GetHeader("Idempotency-Key")
+		if idempotencyKey == "" {
+			writeError(c, domain.InvalidArgument("Idempotency-Key", "an idempotency key is required"))
+			return
+		}
+		confirmation, err := service.ConfirmTaskRequirementManifest(c.Request.Context(), principal, taskID,
+			app.TaskRequirementManifestConfirmationInput{TaskRevision: request.TaskRevision, PlanRevision: request.PlanRevision,
+				PlanEventSequence: request.PlanEventSequence, ManifestDigest: manifestDigest, IdempotencyKey: idempotencyKey})
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
+		c.Header("Referrer-Policy", "no-referrer")
+		c.Header("ETag", `"`+confirmation.ManifestDigest+`"`)
+		c.JSON(http.StatusOK, taskRequirementManifestConfirmationResponse{
+			TaskID: confirmation.TaskID, TaskRevision: confirmation.TaskRevision, PlanRevision: confirmation.PlanRevision,
+			PlanEventSequence: confirmation.PlanEventSequence, ManifestDigest: confirmation.ManifestDigest,
+			ConfirmedAt: confirmation.ConfirmedAt,
+		})
+	}
+}
+
+func taskRequirementManifestDigestIfMatch(value string) (string, bool) {
+	if len(value) != 66 || value[0] != '"' || value[len(value)-1] != '"' {
+		return "", false
+	}
+	digest := value[1 : len(value)-1]
+	decoded, err := hex.DecodeString(digest)
+	if err != nil || len(decoded) != 32 || hex.EncodeToString(decoded) != digest {
+		return "", false
+	}
+	return digest, true
 }
 
 func (h *api) getTaskStepDetail(service TaskStepDetailService) gin.HandlerFunc {

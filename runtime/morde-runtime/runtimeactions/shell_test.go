@@ -149,6 +149,34 @@ func TestParseShellArguments(t *testing.T) {
 	}
 }
 
+func TestParseShellGoTestSpecFailsClosedOnCommandVariants(t *testing.T) {
+	tests := []struct {
+		command string
+		want    shellGoTestSpec
+		valid   bool
+	}{
+		{command: "go test ./...", want: shellGoTestSpec{ScopeMode: "full_suite", PackageSelector: "./..."}, valid: true},
+		{command: "go test -run=^TestExample$ ./internal/app", want: shellGoTestSpec{
+			ScopeMode: "targeted", PackageSelector: "./internal/app", TestSelector: "^TestExample$",
+		}, valid: true},
+		{command: "go test ./... -count=1"},
+		{command: "go test -run TestExample ./internal/app"},
+		{command: "go test -run=^TestExample$ ./internal/app && echo done"},
+		{command: "go test -run=^TestExample$ ./internal/../app"},
+		{command: "go test -run=^TestExample$ ./internal/app ./other"},
+		{command: "go test ./... "},
+		{command: "bash -c 'go test ./...'"},
+	}
+	for _, test := range tests {
+		t.Run(test.command, func(t *testing.T) {
+			got, valid := parseShellGoTestSpec(test.command)
+			if valid != test.valid || valid && got != test.want {
+				t.Fatalf("parseShellGoTestSpec(%q) = (%+v, %v), want (%+v, %v)", test.command, got, valid, test.want, test.valid)
+			}
+		})
+	}
+}
+
 func TestParseShellArgumentsBounds(t *testing.T) {
 	command := strings.Repeat("x", maxCommandBytes+1)
 	arguments, err := json.Marshal(shellArguments{Command: command})

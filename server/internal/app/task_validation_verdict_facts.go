@@ -220,10 +220,11 @@ func EvaluateTaskValidationReplay(hasFixPlan bool, gate TestGateResult, evidence
 // older unit helpers and are never serialized into the review prompt.
 type TaskValidationReplayEvidence struct {
 	State TaskValidationReplayState `json:"state"`
-	// RequirementSetVerified is set only when trusted source analysis proves
-	// the typed plan check list covers every explicit user/project check.
-	// The current Store reader cannot establish that completeness, so it must
-	// remain false and H07 cannot pass on declared checks alone.
+	// RequirementSetVerified means the current plan's canonical candidate
+	// manifest was explicitly confirmed by an authenticated user, every
+	// obligation source is still verified, and the stored plan/event/auth fences
+	// match. It binds the confirmation to that exact candidate; it does not
+	// independently prove that the candidate is complete or semantically correct.
 	RequirementSetVerified bool `json:"requirement_set_verified"`
 	// FinalWorkspaceSnapshotVerified is set only when the delivered Task
 	// Workspace still matches the snapshot on which all checks ran.
@@ -254,33 +255,42 @@ const (
 // latest real operation bound to one typed plan check. It omits shell output
 // and file contents while preserving the identities needed to assess H07.
 type TaskValidationReplayCheckEvidence struct {
-	CheckID                       string                                  `json:"check_id"`
-	TaskID                        string                                  `json:"task_id,omitempty"`
-	Kind                          task.PlanVerificationCheckKind          `json:"kind,omitempty"`
-	Basis                         task.PlanVerificationCheckBasis         `json:"basis,omitempty"`
-	CoveragePaths                 []string                                `json:"coverage_paths,omitempty"`
-	RequirementSource             *task.PlanVerificationRequirementSource `json:"requirement_source,omitempty"`
-	RequirementSourceVerified     bool                                    `json:"requirement_source_verified"`
-	Status                        TaskValidationReplayState               `json:"status"`
-	TaskRevision                  int64                                   `json:"task_revision,omitempty"`
-	PlanRevision                  int64                                   `json:"plan_revision,omitempty"`
-	OperationID                   string                                  `json:"operation_id,omitempty"`
-	CallID                        string                                  `json:"call_id,omitempty"`
-	RequestSHA256                 string                                  `json:"request_sha256,omitempty"`
-	CommandSHA256                 string                                  `json:"command_sha256,omitempty"`
-	CheckSHA256                   string                                  `json:"check_sha256,omitempty"`
-	CoverageSHA256                string                                  `json:"coverage_sha256,omitempty"`
-	RunSequence                   int64                                   `json:"run_sequence,omitempty"`
-	ExitCode                      int                                     `json:"exit_code,omitempty"`
-	TimedOut                      bool                                    `json:"timed_out,omitempty"`
-	WorkspaceID                   string                                  `json:"workspace_id,omitempty"`
-	WorkspaceBindingVersion       int64                                   `json:"workspace_binding_version,omitempty"`
-	WorkspaceCheckpointRevision   int64                                   `json:"workspace_checkpoint_revision,omitempty"`
-	WorkspaceViewID               string                                  `json:"workspace_view_id,omitempty"`
-	WorkspaceManifestSHA256Before string                                  `json:"workspace_manifest_sha256_before,omitempty"`
-	WorkspaceManifestSHA256After  string                                  `json:"workspace_manifest_sha256_after,omitempty"`
-	WorkspaceSnapshotSHA256Before string                                  `json:"-"`
-	WorkspaceSnapshotSHA256After  string                                  `json:"-"`
+	CheckID                   string                                  `json:"check_id"`
+	TaskID                    string                                  `json:"task_id,omitempty"`
+	Kind                      task.PlanVerificationCheckKind          `json:"kind,omitempty"`
+	Basis                     task.PlanVerificationCheckBasis         `json:"basis,omitempty"`
+	ScopeMode                 task.PlanVerificationScopeMode          `json:"scope_mode,omitempty"`
+	CoveragePaths             []string                                `json:"coverage_paths,omitempty"`
+	Selectors                 []string                                `json:"selectors,omitempty"`
+	RequirementIDs            []task.PlanVerificationRequirementID    `json:"requirement_ids,omitempty"`
+	RequirementSource         *task.PlanVerificationRequirementSource `json:"requirement_source,omitempty"`
+	RequirementSourceVerified bool                                    `json:"requirement_source_verified"`
+	// ActualCoverageVerified is set only after Store validates a trusted,
+	// structured Runtime runner receipt against the exact plan command, scope,
+	// discovered/executed inventories, operation fence and stable snapshot.
+	// Missing, unsupported or inconsistent receipts leave this false even when
+	// the shell command exits successfully.
+	ActualCoverageVerified        bool                      `json:"actual_coverage_verified"`
+	Status                        TaskValidationReplayState `json:"status"`
+	TaskRevision                  int64                     `json:"task_revision,omitempty"`
+	PlanRevision                  int64                     `json:"plan_revision,omitempty"`
+	OperationID                   string                    `json:"operation_id,omitempty"`
+	CallID                        string                    `json:"call_id,omitempty"`
+	RequestSHA256                 string                    `json:"request_sha256,omitempty"`
+	CommandSHA256                 string                    `json:"command_sha256,omitempty"`
+	CheckSHA256                   string                    `json:"check_sha256,omitempty"`
+	CoverageSHA256                string                    `json:"coverage_sha256,omitempty"`
+	RunSequence                   int64                     `json:"run_sequence,omitempty"`
+	ExitCode                      int                       `json:"exit_code,omitempty"`
+	TimedOut                      bool                      `json:"timed_out,omitempty"`
+	WorkspaceID                   string                    `json:"workspace_id,omitempty"`
+	WorkspaceBindingVersion       int64                     `json:"workspace_binding_version,omitempty"`
+	WorkspaceCheckpointRevision   int64                     `json:"workspace_checkpoint_revision,omitempty"`
+	WorkspaceViewID               string                    `json:"workspace_view_id,omitempty"`
+	WorkspaceManifestSHA256Before string                    `json:"workspace_manifest_sha256_before,omitempty"`
+	WorkspaceManifestSHA256After  string                    `json:"workspace_manifest_sha256_after,omitempty"`
+	WorkspaceSnapshotSHA256Before string                    `json:"-"`
+	WorkspaceSnapshotSHA256After  string                    `json:"-"`
 	// Runtime and input identity fields are server-only ledger baselines. The
 	// reviewer model does not need these values to assess the declared checks.
 	HostID                string `json:"-"`

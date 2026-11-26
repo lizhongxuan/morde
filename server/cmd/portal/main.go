@@ -51,6 +51,8 @@ import (
 const defaultConfigPath = "/etc/cloudhost/portal.yaml"
 const legacyPCPortalEnabledEnv = "CH_PORTAL_LEGACY_PC_ENABLED"
 
+var _ api.TaskRequirementConfirmationService = (*app.TaskService)(nil)
+
 func parseLegacyPCPortalEnabled(value string, set bool) (bool, error) {
 	if !set {
 		return true, nil

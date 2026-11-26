@@ -276,8 +276,9 @@ func TestFixPlanHostFileWriteDoesNotRequireRedTest(t *testing.T) {
 
 func TestTaskPlanFixPlanSubmission(t *testing.T) {
 	store, broker, current := newBriefPlanBroker(t)
-	steps := `[{"id":"repro","title":"Reproduce","status":"pending","completion_criteria":["crash reproduces"],"verification_applicability":"check","verification_check":{"kind":"test","basis":"risk_selected","command":"go test ./...","coverage_paths":["auth"]}}]`
-	base := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps
+	steps := `[{"id":"repro","title":"Reproduce","status":"pending","completion_criteria":["crash reproduces"],"verification_applicability":"check","verification_check":{"kind":"test","basis":"risk_selected","command":"go test ./...","scope_mode":"targeted","coverage_paths":["auth"],"requirement_ids":[]}}]`
+	manifest := `,"requirement_manifest":{"version":1,"obligations":[]}`
+	base := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps + manifest
 	fixPlan := `,"fix_plan":{"changed_files":["auth/session.go"],"risks":["session expiry shifts"],"alternatives":["restart daily"]}}`
 
 	result, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-fix-1", base+fixPlan))
@@ -311,19 +312,19 @@ func TestTaskPlanFixPlanSubmission(t *testing.T) {
 		t.Fatalf("plan without a fix plan output = %s, err=%v", result.Output, err)
 	}
 
-	tooMany := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps +
+	tooMany := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps + manifest +
 		`,"fix_plan":{"changed_files":["a","b","c","d","e","f","g","h","i"]}}`
 	if result, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-fix-4", tooMany)); err != nil ||
 		result.Status != AgentToolFailed {
 		t.Fatalf("plan with too many fix plan files was not returned to the Agent: result=%#v, err=%v", result, err)
 	}
-	tooLong := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps +
+	tooLong := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps + manifest +
 		`,"fix_plan":{"risks":["` + strings.Repeat("x", 513) + `"]}}`
 	if result, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-fix-5", tooLong)); err != nil ||
 		result.Status != AgentToolFailed {
 		t.Fatalf("plan with an overlong fix plan risk was not returned to the Agent: result=%#v, err=%v", result, err)
 	}
-	unknownField := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps +
+	unknownField := `{"goal":"Fix the login crash","scope":"auth package only","verification_method":"run the failing test","steps":` + steps + manifest +
 		`,"fix_plan":{"changed_files":[],"unknown":1}}`
 	if _, err := broker.Execute(context.Background(), current, briefPlanCall(current, "plan-fix-6", unknownField)); err == nil ||
 		domain.CodeOf(err) != domain.CodeInvalidArgument {

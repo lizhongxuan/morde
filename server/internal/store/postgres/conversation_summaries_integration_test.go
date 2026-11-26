@@ -483,6 +483,39 @@ WHERE owner_id=$1 AND conversation_id=$2 AND summary_version=1`, f.ownerID, clai
 		assertTaskSummaryRecoveryFailsBeforeClaim(t, f, taskID)
 	})
 
+	t.Run("missing memory setting", func(t *testing.T) {
+		f := newRouteActionsTestFixture(t)
+		ctx := context.Background()
+		principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID}
+		if _, err := f.store.ApplyPersonalMutation(ctx, principal, personalObjectMutationForTest(t, f.ownerID,
+			"summary-memory-setting-enable", personal.ObjectTypeSkillSetting, "builtin_memory", 0,
+			`{"enabled":true}`, false)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.store.ApplyPersonalMutation(ctx, principal, personalObjectMutationForTest(t, f.ownerID,
+			"summary-memory-setting-source", personal.ObjectTypeMemory, "global", 0,
+			`{"content":"The user prefers morning meetings.","category":"fact"}`, false)); err != nil {
+			t.Fatal(err)
+		}
+		_, _, taskID := createRouteTaskWithSummary(t, f, "Summary from a personal memory.", func(_, claim app.ConversationRouteClaim) []app.ConversationSummarySource {
+			identityValue, err := app.ConversationSummaryScopeForClaim(claim)
+			if err != nil {
+				t.Fatal(err)
+			}
+			source := app.ConversationSummarySource{Kind: app.ConversationSummarySourceMemory, ID: "global",
+				ObjectType: personal.ObjectTypeMemory, Version: 1}
+			source.SHA256 = app.ConversationSummaryMemorySourceDigest(identityValue, source)
+			return []app.ConversationSummarySource{source}
+		})
+		deleted, err := f.store.pool.Exec(ctx, `DELETE FROM personal_objects
+WHERE service_instance_id=$1::uuid AND owner_id=$2 AND object_type=$3 AND object_id='builtin_memory'`,
+			f.instanceID, f.ownerID, personal.ObjectTypeSkillSetting)
+		if err != nil || deleted.RowsAffected() != 1 {
+			t.Fatalf("remove memory setting fixture row: affected=%d err=%v", deleted.RowsAffected(), err)
+		}
+		assertTaskSummaryRecoveryFailsBeforeClaim(t, f, taskID)
+	})
+
 	t.Run("memory version changed", func(t *testing.T) {
 		f := newRouteActionsTestFixture(t)
 		principal := identity.Principal{UserID: f.ownerID, Role: identity.RoleUser, Kind: identity.KindSession, TokenID: f.authorization.TokenID}

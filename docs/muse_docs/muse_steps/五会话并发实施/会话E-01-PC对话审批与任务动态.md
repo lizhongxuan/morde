@@ -21,6 +21,14 @@
 
 **依赖 / 状态：**现有界面与 fixture 可立即核对；通用 MCP 资源、R20 终态和新增详情字段分别依赖 A/D 的合同。视觉权威规范缺失时沿用现有样式并单列待验。
 
+### 2026-11-26 本轮收口进度
+
+- 使用源码 `make pc` 和独立 profile `/tmp/morde-e01-closeout-20261126`，连接只监听回环地址的合成服务 `127.0.0.1:61017` 与独立 PostgreSQL `127.0.0.1:55470`。实际 PC 发送“跨端活动验收：等待用户授权”后显示 `Morde 的审批请求` / `MCP App 操作审批`；审核页显示同一条待处理卡及本地合成资源的影响说明。没有重放旧 Task，也没有连接真实 DSH、云端 Host 或真实模型。截图中的长源码分析提示本轮未送入真实模型；合成服务不能验证该分析结果或 Mermaid 输出。
+- PC 与 A 联合只读核账确认 Task `qxmrx760`（conversation `cuiol6d4`、user message `mw7s0vnb`）为 `waiting_user / approval_required`，approval `ru0d71lk` v1 为 `pending`；用户消息 delivery=`applied`。账本有 2 条 status、2 条 step、1 条 waiting_user 事件，`task_operations` 和 `model_call_ledger` 均为 0。没有批准/拒绝决定或工具副作用。
+- 未能从本轮可用 PC 无障碍树访问嵌入 MCP App 的允许 / 拒绝控件；CUA 也不能按 profile 精确区分多个 Electron 实例。为避免误操作其他会话，没有通过直接 API 代替 UI 决定。`approval-resume` 仍在 `awaiting_message`，没有结果；Go fixture 测试在 642 秒后由我主动 Ctrl-C（退出码 1），所以本轮审批完成与完整链路未通过。
+- 本地回归：`npx vitest run --maxWorkers=1 src/routes/Assistant.test.tsx src/routes/Reviews.test.tsx src/components/TaskApprovalMcpApp.integration.test.ts src/components/TaskApprovalCard.test.tsx src/components/ChatMermaid.test.tsx src/components/ChatMermaid.integration.test.tsx`（6 个文件、294 项通过）；`npm run typecheck` 通过。独立 PC、Go fixture 和 PG 容器已停止；确认本轮 PC PID、61017 listener 和容器均已释放。
+- E01-1/2/3/5 保持未勾选。E01-4 的 `[x]` 仍只代表此前已完成的本地 fixture PC 交互；本轮新增证据仅到真实 PC 可见的待审批状态和 A 的只读账本核对，不代表允许 / 拒绝、真实 DSH、撤权 / 过期 / 重连或跨端恢复通过。
+
 **定向回归：**在 `web/portal/` 运行 Assistant、Reviews、TaskApprovalMcpApp、TaskApprovalCard 和 ChatMermaid 定向测试及 `npm run typecheck`；另在仓库根目录启动 `make pc` 实测，组件回归不能替代实际 PC。
 
 ## 交接记录
