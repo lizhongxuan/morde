@@ -2459,9 +2459,9 @@ Tokenizer 与 token 统计来源：
 
 ### release 部署与 PC 登录补验（2026-11-26）
 
-- **发布：**按用户授权推送并部署 release 20ba7f302f3a1717b3bb1e416c57d1e30c9f650e。迁移 254/254；Portal service active，healthz=ok、readyz=200。没有部署 PC 安装包；此次登录修复属于服务端鉴权桥接。
-- **实际 PC：**使用源码 make pc 和隔离 profile 打开 morde-pc 登录页。一次授权的登录请求到达 Portal，服务端访问日志记录 /api/auth/client-login 返回 401；界面仍在登录页。没有进入改密或主对话，没有发送消息、创建 Task、执行工具、审批或上传文件。测试进程已停止；保留本次隔离 profile 供后续诊断。
-- **结论：**本次证明该组生产凭据未通过认证，不能证明登录修复已被真实账号验收；也不能仅凭 401 区分密码错误与账号凭据状态问题。没有再尝试其他密码、没有改数据库或密码。下一步需用户提供有效凭据，或由用户在 PC/管理员界面完成密码设置，然后从实际 PC 入口继续验证。
+- **发布：**按用户授权推送并部署 release b7876cc6b17204d29576c8c85c78903d11115e45。迁移 254/254；Portal service active，healthz=ok、readyz=200。服务器部署 smoke 为 pass=5/fail=0/exception=5；测试 DSN 未设置，T10/T43 依赖 PC/DSH。没有部署 PC 安装包；此次登录修复属于服务端鉴权桥接。
+- **实际 PC：**使用源码 make pc 和隔离 profile 打开 morde-pc 登录页。服务器尚为前一部署版本时，一次授权的登录请求到达 Portal，访问日志记录 /api/auth/client-login 返回 401；界面仍在登录页。没有进入改密或主对话，没有发送消息、创建 Task、执行工具、审批或上传文件。测试进程已停止；保留本次隔离 profile 供后续诊断。
+- **结论：**该组凭据在前一部署版本上未通过认证；不能仅凭 401 区分密码错误与账号凭据状态问题。随后服务已更新到 release b7876cc6，但没有再尝试该组凭据或其他密码，也没有改数据库或密码。下一步需用户提供有效凭据，或由用户在 PC/管理员界面完成密码设置，然后从实际 PC 入口继续验证。
 - **边界：**部署与健康检查通过，但 M01/T01、强制改密、PC+DSH 真实任务和完整 Muse 体验未通过验收。P0 smoke 的 5/0/5 结果保留为有限证据，数据库与 PC/DSH 例外不计 PASS。未使用模型 API key。
 
 
@@ -2469,3 +2469,12 @@ Tokenizer 与 token 统计来源：
 
 - **M04-06/R26：**仅修改 Assistant 测试，新增不可信 source locator 的路径穿越、负行号/修订号与 manifest digest 不得展示断言。Assistant 275/275、Portal typecheck 通过。真实 PC/DSH 未验。
 - **M06-03：**仅修改 PostgreSQL 集成测试，在复核提交窗口撤权后断言不产生 PASS/FAIL，review 保持 processing/pending；隔离 loopback PostgreSQL 定向用例 2.769 秒通过，gofmt 与 git diff --check 通过。Workspace 并发与未知审批仍缺覆盖。
+
+
+### 初始/重置密码登录部署后 PC 续验（2026-11-26）
+
+- **部署后端：**`release` `b7876cc6b17204d29576c8c85c78903d11115e45` 已部署；迁移 254/254，Portal active，`healthz=ok`、`readyz=200`。P0 smoke `pass=5/fail=0/exception=5`，例外没有记作通过。
+- **部署后台页面：**本地 Admin 页面构建成功，并只同步 `/admin` 静态资源；线上 bundle 包含超管修改密码入口和“PC 或 Portal 登录并完成改密”的当前说明。只读核对，没有重置密码。
+- **PC 构建：**`make pc` 被共享工作区 Portal `tsc` 阶段阻断，原因是计划功能相关 mock/test 的 4 处对象缺 `personal_rule`（TS2741）。未改这些非本任务文件。直接运行 Portal Vite 构建（跳过类型检查）、Workbench 构建、同步程序构建和 Electron TypeScript 构建均通过，并用隔离 `MORDE_TEST_USER_DATA` 启动实际源码 `morde-pc` 登录页。
+- **登录结果：**第一次输入时我误把另一组服务器凭据当成 Morde admin 密码，服务日志出现两条 `POST /api/auth/client-login` HTTP 401；它们不能证明 Morde admin 密码错误。更正为用户提供的 Morde admin 凭据后，实际源码 PC 进入 `/assistant` 并显示已有会话，登录通过。普通登录自动登记了这个隔离测试安装；没有发送消息、创建 Task、执行工具、审批或修改密码。
+- **结论：**服务器端移除 loopback 门槛已由服务代码、非 loopback 服务测试和实际部署确认；真实 PC 普通登录通过。此账号未触发强制改密，因此 PC 受限改密页面仍未验收。管理员改密入口和当前说明已部署到 `/admin`，但没有执行密码重置。`M01-02/03` 不关闭。
