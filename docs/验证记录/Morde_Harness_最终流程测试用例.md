@@ -2792,7 +2792,7 @@ Tokenizer 与 token 统计来源：
 - **实现：**登录后的桌面连接失败改为安全的阶段分类：Web 会话、桌面本地 Portal 服务、Assistant 页面加载；未知错误使用通用提示。错误详情、URL、凭据和堆栈不进入 renderer。重试只重开当前 Assistant 页面，不重放用户消息。
 - **自动化：**在 `clients/desktop/harness/desktop` 执行 `npm run build:test && node --test tests/morde-main-recovery.test.mjs tests/morde-renderer.test.mjs`，67/67 通过；`npm run typecheck` 通过。测试覆盖三类失败、敏感错误内容不泄漏、同一安装身份和视图的恢复。
 - **源码 PC：**用隔离 profile `/tmp/morde-pc-offline-recovery-20261127` 启动 `make pc`；进程仍运行。CUA 可按 Electron.app 路径读取窗口，但无法唯一绑定其窗口与该 profile。该 profile 未发现凭据文件，故无法证明画面对应新构建或认证状态；未发送消息、创建 Task 或触发 Host 操作。未完成阶段文案的实机验收。
-- **限制：**本次实现与自动化回归不代表远端连接根因已修复，也不关闭 M11-01/M11-04。生产环境没有重启或重新部署；此次只改桌面端。
+- **限制：**本次实现与自动化回归不代表远端连接根因已修复，也不关闭 M11-01/M11-04。Portal 后端随 `18c07367` 已部署；桌面端阶段提示没有打包分发，未把 Portal health/ready 视作 PC 连接或 DSH 验收。
 
 <a id="m04-06-workspace-search-query-summary-2026-11-27"></a>
 ### M04-06 Workspace 搜索工作项查询摘要（2026-11-27）
@@ -2800,3 +2800,11 @@ Tokenizer 与 token 统计来源：
 - **实现：**`task_step_execution.go` 将 `morde_workspace_search` 的安全查询词写入 TaskStepDetail 参数摘要，限 160 Unicode 字符；明确凭据赋值、已知 Token/Bearer、URL 用户信息或查询参数凭据及私钥内容整体不展示。普通短语 `authorization check` 不会误判为凭据。Workspace 参数仍受原授权/证据门禁保护。
 - **测试：**`cd server && GOPROXY=off GOSUMDB=off go test ./internal/app -run '^(TestWorkspaceSearchExecutionParametersPreserveQueryAndOmitCredentials|TestTaskToolExecutionDetailsSummarizeBrowserActionsWithoutSensitiveData|TestBrowserExecutionParametersDoNotBypassWorkspaceEvidenceGate)$' -count=1 -timeout=8m` 通过；`GOPROXY=off GOSUMDB=off go test ./internal/app -count=1 -timeout=8m` 通过（32.847s）。该包命令未设置 `CH_TEST_DATABASE_URL`，不含条件 PostgreSQL 集成测试。
 - **边界：**未操作实际 PC 工作项详情，也没有真实 DSH 搜索事件可对账。M04-06/T54 继续待 PC + DSH 验收；本次只补齐本地安全参数摘要。
+
+<a id="release-deploy-18c07367-2026-11-27"></a>
+### `release` 18c07367 生产部署与复核（2026-11-27）
+
+- **发布：**本地 `release` 提交 `18c07367` 已推送；按授权在服务器运行 `bash /opt/morde-src/deploy/single/update.sh --branch release`。服务器源码快进到 `18c07367`，Portal 二进制切换成功，备份保留于 `/opt/morde/backups/pre-update-20261126T184712Z/portal`。未更改管理员凭据或应用数据。
+- **门禁：**发布前 P0 smoke `pass=5, fail=0, exception=5`。T01/T26/T36 因未设置专用 PostgreSQL 测试库为例外；T10/T43 需真实 PC、模型/DSH，未计通过。迁移执行后为 `current=257/latest=257`，无新迁移待处理。
+- **发布后只读复核：**`.deployed-head` 为 `18c073678cddef117427ede5293b05b862c85ee5`；Portal 服务 `active`，`/healthz=ok`、`/readyz=200`，7080/7081/7082 均监听。
+- **范围：**本次发布服务端 App 改动，使 TaskStepDetail 可安全提供 Workspace 搜索查询摘要。PC 离线分阶段文案改动没有打包发布；没有真实 PC/DSH 对话或工作项检查，因此相应验收仍 pending。桌面源码 `make pc` 使用隔离 profile 运行，但 CUA 不能将窗口绑定到该 profile，未发送用户消息或创建 Task。
