@@ -4103,6 +4103,99 @@ describe('Assistant durable tasks', () => {
     expect(within(activity).getByText(/只显示有界预览/u)).toBeInTheDocument();
   });
 
+  it('shows an HTTPS web request address without claiming that it is a verified source', async () => {
+    const stepID = 's1234567';
+    const completedTask: Task = { ...task, status: 'completed', finished_at: timestamp, event_sequence: 3,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: morde_web_read', summary: '网页读取完成', created_at: timestamp }] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: stepID, event_sequence: 3,
+      tool_name: 'morde_web_read', detail_state: 'available', object: '网页', input: null, result: '读取完成', truncated: false,
+      source_locations: [
+        { id: 'source-https', kind: 'public_web_page', uri: 'https://example.test/article',
+          state: 'requested_uri_only', content_sha256: 'a'.repeat(64) },
+        { id: 'source-script', kind: 'public_web_page', uri: 'javascript:alert(1)',
+          state: 'requested_uri_only', content_sha256: 'b'.repeat(64) },
+      ] });
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：读取网页' }));
+    await user.click(await within(activity).findByText('查看记录的位置'));
+
+    const requestLink = within(activity).getByRole('link', { name: 'https://example.test/article' });
+    expect(requestLink).toHaveAttribute('href', 'https://example.test/article');
+    expect(requestLink).toHaveAttribute('rel', 'noopener noreferrer');
+    expect(within(activity).getAllByText('网页请求地址（未核实最终来源）')).toHaveLength(2);
+    expect(within(activity).getAllByText('这是工具提交的 HTTPS 请求地址，不代表页面最终跳转地址或内容已独立核实。')).toHaveLength(2);
+    expect(within(activity).getByText('请求地址暂不可显示。')).toBeInTheDocument();
+    expect(within(activity).queryByRole('link', { name: 'javascript:alert(1)' })).not.toBeInTheDocument();
+  });
+
+  it('does not show an empty source list', async () => {
+    const stepID = 's1234567';
+    const completedTask: Task = { ...task, status: 'completed', finished_at: timestamp, event_sequence: 3,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: morde_web_read', summary: '网页读取完成', created_at: timestamp }] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: stepID, event_sequence: 3,
+      tool_name: 'morde_web_read', detail_state: 'available', object: '网页', input: null, result: '读取完成', truncated: false,
+      source_locations: [] });
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：读取网页' }));
+    expect(within(activity).queryByText('查看记录的位置')).not.toBeInTheDocument();
+  });
+
+  it('fails closed for an unknown source type', async () => {
+    const stepID = 's1234567';
+    const completedTask: Task = { ...task, status: 'completed', finished_at: timestamp, event_sequence: 3,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: morde_web_read', summary: '网页读取完成', created_at: timestamp }] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: stepID, event_sequence: 3,
+      tool_name: 'morde_web_read', detail_state: 'available', object: '网页', input: null, result: '读取完成', truncated: false,
+      source_locations: [{ id: 'source-unknown', kind: 'future_source_type', uri: 'javascript:should-not-render',
+        state: 'requested_uri_only', content_sha256: 'c'.repeat(64) } as unknown as components['schemas']['TaskStepSourceLocation']] });
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：读取网页' }));
+    await user.click(await within(activity).findByText('查看记录的位置'));
+    expect(within(activity).getByText('该来源位置类型暂不支持展示。')).toBeInTheDocument();
+    expect(within(activity).queryByText('javascript:should-not-render')).not.toBeInTheDocument();
+    expect(within(activity).queryByRole('link')).not.toBeInTheDocument();
+  });
+
+  it('shows an authorized workspace path, match line, and recorded revision without claiming citation verification', async () => {
+    const stepID = 's1234567';
+    const completedTask: Task = { ...task, status: 'completed', finished_at: timestamp, event_sequence: 3,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: morde_workspace_search', summary: '文件搜索完成', created_at: timestamp }] };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue({ task_id: task.id, step_id: stepID, event_sequence: 3,
+      tool_name: 'morde_workspace_search', detail_state: 'available', object: '项目文件', input: '核心业务', result: '匹配完成', truncated: false,
+      source_locations: [{ id: 'workspace-match', kind: 'workspace_search_match', workspace_id: 'w1234567',
+        path: 'docs/业务流程.md', line: 42, revision: 13, manifest_sha256: 'd'.repeat(64),
+        state: 'immutable_workspace_revision', content_sha256: 'e'.repeat(64) }] });
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：搜索工作区文件' }));
+    await user.click(await within(activity).findByText('查看记录的位置'));
+
+    expect(within(activity).getByText('工作区匹配位置')).toBeInTheDocument();
+    expect(within(activity).getByText('docs/业务流程.md:42')).toBeInTheDocument();
+    expect(within(activity).getByText('工作区修订 13')).toBeInTheDocument();
+    expect(within(activity).getByText('这是已授权读取记录中的位置，不代表回答内容已由该文件独立核实。')).toBeInTheDocument();
+    expect(within(activity).queryByText('d'.repeat(64))).not.toBeInTheDocument();
+  });
+
   it('does not show web result evidence for an unconfirmed step', async () => {
     const stepID = 's1234567';
     const runningTask: Task = { ...task, status: 'running', result: null, finished_at: null, event_sequence: 3,

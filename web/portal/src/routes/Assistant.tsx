@@ -47,6 +47,7 @@ type Task = Awaited<ReturnType<typeof portalApi.task>>;
 type TaskStep = Task['steps'][number];
 type TaskStepDetail = Awaited<ReturnType<typeof portalApi.taskStepDetail>>;
 type TaskStepDetailWithExecution = Omit<TaskStepDetail, 'execution'> & { execution?: TaskStepDetail['execution'] | null };
+type TaskStepSourceLocation = NonNullable<TaskStepDetail['source_locations']>[number];
 type TaskArtifact = Task['artifacts'][number];
 type ClarificationInteraction = {
   clarificationID: string;
@@ -705,6 +706,8 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
     data.content_evidence.preview.length <= 4_096 && /^[0-9a-f]{64}$/u.test(data.content_evidence.sha256) &&
     typeof data.content_evidence.truncated === 'boolean' ? data.content_evidence : null;
   const safeContentEvidence = contentEvidence ? safeTaskActivityText(contentEvidence.preview, 4_096) : null;
+  const sourceLocations = data.detail_state === 'available' && step.status === 'succeeded' &&
+    Array.isArray(data.source_locations) ? data.source_locations : [];
   const execution = data.detail_state === 'available' && data.execution && !Array.isArray(data.execution) &&
     typeof data.execution === 'object' ? data.execution : null;
   const isShell = data.tool_name === 'shell_exec';
@@ -739,6 +742,13 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
         {contentEvidence.truncated && <p>只显示有界预览；完整内容的 SHA-256 为 <code>{contentEvidence.sha256}</code>。</p>}
         {!contentEvidence.truncated && <p>完整记录的 SHA-256 为 <code>{contentEvidence.sha256}</code>。</p>}
       </details>}
+      {sourceLocations.length > 0 && <details className="task-step-web-evidence task-step-source-locations">
+        <summary>查看记录的位置</summary>
+        <p>位置来自已完成工具步骤的记录；它们不代表回答内容已通过独立核验。</p>
+        <ul>
+          {sourceLocations.map((source, index) => renderTaskStepSourceLocation(source, index))}
+        </ul>
+      </details>}
       {execution ? <>
         {(location || isShell) && <p><strong>执行位置</strong> {location?.value || '未记录'}</p>}
         {(command || isShell) && <p><strong>命令</strong> {command?.value || '未记录'}</p>}
@@ -763,6 +773,64 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
     {step.failure_reason === 'connector_rate_limited' && step.retry_after_at && Number.isFinite(Date.parse(step.retry_after_at)) && !step.retryable &&
       <p role="status">连接器限流，最早可在 {formatDate(step.retry_after_at)} 后手动重试。</p>}
   </div>;
+}
+
+function safeTaskStepWebRequestURI(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 4_096 || /[?#]/u.test(value)) return null;
+  try {
+    const url = new URL(value);
+    if (url.protocol !== 'https:' || !url.hostname || url.username || url.password || url.search || url.hash) return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
+function safeTaskStepWorkspacePath(value: unknown): string | null {
+  if (typeof value !== 'string' || value.length === 0 || value.length > 2_048 || value.startsWith('/') ||
+    value.includes('\\') || Array.from(value).some((character) => {
+      const code = character.charCodeAt(0);
+      return code < 0x20 || code === 0x7f;
+    })) return null;
+  const segments = value.split('/');
+  if (segments.some((segment) => segment.length === 0 || segment === '.' || segment === '..')) return null;
+  return value;
+}
+
+function renderTaskStepSourceLocation(source: TaskStepSourceLocation, index: number) {
+  const key = `${typeof source?.id === 'string' ? source.id : 'source'}:${index}`;
+  if (!source || typeof source !== 'object') {
+    return <li key={key}>来源位置暂不可用。</li>;
+  }
+
+  if (source.kind === 'public_web_page') {
+    const requestURI = source.state === 'requested_uri_only' ? safeTaskStepWebRequestURI(source.uri) : null;
+    return <li key={key}>
+      <strong>网页请求地址（未核实最终来源）</strong>
+      {requestURI ? <p><a href={requestURI} target="_blank" rel="noopener noreferrer">{requestURI}</a></p>
+        : <p>请求地址暂不可显示。</p>}
+      <p>这是工具提交的 HTTPS 请求地址，不代表页面最终跳转地址或内容已独立核实。</p>
+    </li>;
+  }
+
+  if (source.kind === 'workspace_file' || source.kind === 'workspace_search_match') {
+    const path = safeTaskStepWorkspacePath(source.path);
+    if (!path) return <li key={key}>工作区位置暂不可用。</li>;
+    const safePath = safeTaskActivityText(path, 2_048);
+    const line = Number.isSafeInteger(source.line) && (source.line ?? 0) > 0 ? source.line : null;
+    const revision = Number.isSafeInteger(source.revision) && (source.revision ?? -1) >= 0 ? source.revision : null;
+    const locationState = source.state === 'immutable_workspace_revision' && revision !== null
+      ? `工作区修订 ${revision}`
+      : source.state === 'live_workspace_directory' ? '任务工作区检查点' : null;
+    return <li key={key}>
+      <strong>{source.kind === 'workspace_search_match' ? '工作区匹配位置' : '工作区文件位置'}</strong>
+      <p><code>{safePath.value}{line === null ? '' : `:${line}`}</code></p>
+      {locationState && <p>{locationState}</p>}
+      <p>这是已授权读取记录中的位置，不代表回答内容已由该文件独立核实。</p>
+    </li>;
+  }
+
+  return <li key={key}>该来源位置类型暂不支持展示。</li>;
 }
 
 function taskActivityIsExecuting(status: string): boolean {
