@@ -1,4 +1,15 @@
 -- +goose Up
+-- Repair note: migration 00248 was edited (e7e4678, 2026-11-25) to add
+-- task_step_id AFTER it had already applied to the live database, so the
+-- live task_plan_step_execution_bindings table lacks the column while the
+-- constraint rewrite below assumes it. A repair migration numbered after
+-- 250 cannot help: goose applies pending migrations in ascending version
+-- order, so 250 runs first. This migration heals the drift itself.
+-- IF NOT EXISTS keeps it a no-op on fresh databases, where 00248 already
+-- added the column; 00251 (same delta) stays as a harmless no-op after it.
+ALTER TABLE task_plan_step_execution_bindings
+  ADD COLUMN IF NOT EXISTS task_step_id text NOT NULL DEFAULT '' CHECK (task_step_id = '' OR task_step_id ~ '^[A-Za-z0-9][A-Za-z0-9_-]{0,39}$');
+
 ALTER TABLE task_hub_operations
   ADD COLUMN agent_session_id text NOT NULL DEFAULT '',
   ADD COLUMN call_id text NOT NULL DEFAULT '',
