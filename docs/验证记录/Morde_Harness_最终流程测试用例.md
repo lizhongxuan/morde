@@ -2812,6 +2812,7 @@ Tokenizer 与 token 统计来源：
 - **代码：**PC 对话与审核区使用同一个受授权 Task 媒体预览 API；前端明确拒绝 redirect/外链、非白名单 MIME 和超上限响应。图像加载或音视频可播放后才显示可审批 MCP App；加载/播放失败保留拒绝操作，切换 Task/operation 与卸载时回收旧对象 URL。
 - **验证：**`cd web/portal && npm test -- --run src/app/api.test.ts src/components/TaskApprovalCard.test.tsx` 通过（68/68）；`npm test -- --run src/routes/Assistant.test.tsx src/routes/Reviews.test.tsx` 通过（288/288）；全量 `npm test -- --run` 通过，71 个文件、969/969；`npm run typecheck -- --pretty false`、相关 6 文件 ESLint、`npm run build:pc` 均通过。build:pc 报告现有部分 JS chunk 超过 500 kB 的提示，但成功结束。
 - **实际 PC：**以 `MORDE_TEST_USER_DATA=/tmp/morde-pc-m05-media-20261127 make pc` 启动源码客户端；构建成功。CUA 定位到 `clients/desktop/harness/desktop/resources/morde.html` 的源码窗口，画面为“暂时无法连接 Morde”。没有可用媒体审批请求。点击重试时输入控制返回 `Computer Use server error -10005: noWindowsAvailable`，重试未能送达；未提交消息或审批、未触发任务/Host 副作用。实际客户端预览显示、拒绝路径未验，M05-03 不勾选。
+- **后续只读复核：**按 Electron.app 路径读取源码窗口，截图仍为“暂时无法连接 Morde”；本机访问生产 `/healthz` 返回 HTTP 200。窗口未能唯一绑定到本次隔离 profile，没有执行点击、登录、消息提交或审批操作。健康检查不代表 PC 登录/Assistant 会话可用，也不改变 M05-03 的待验状态。
 - **部署边界：**当前改动是 PC 安装包内嵌 Portal 资源的前端代码；服务端 `update.sh` 不打包或分发 PC 客户端。不能把 Portal 服务更新视作该 PC UI 的线上发布。
 
 <a id="release-deploy-18c07367-2026-11-27"></a>
