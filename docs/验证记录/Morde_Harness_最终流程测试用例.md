@@ -2821,3 +2821,11 @@ Tokenizer 与 token 统计来源：
 - **门禁：**发布前 P0 smoke `pass=5, fail=0, exception=5`。T01/T26/T36 因未设置专用 PostgreSQL 测试库为例外；T10/T43 需真实 PC、模型/DSH，未计通过。迁移执行后为 `current=257/latest=257`，无新迁移待处理。
 - **发布后只读复核：**`.deployed-head` 为 `18c073678cddef117427ede5293b05b862c85ee5`；Portal 服务 `active`，`/healthz=ok`、`/readyz=200`，7080/7081/7082 均监听。
 - **范围：**本次发布服务端 App 改动，使 TaskStepDetail 可安全提供 Workspace 搜索查询摘要。PC 离线分阶段文案改动没有打包发布；没有真实 PC/DSH 对话或工作项检查，因此相应验收仍 pending。桌面源码 `make pc` 使用隔离 profile 运行，但 CUA 不能将窗口绑定到该 profile，未发送用户消息或创建 Task。
+
+<a id="release-deploy-2e0c0b8e-2026-11-27"></a>
+### `release` 2e0c0b8e 服务端部署与复核（2026-11-27）
+
+- **发布：**`bash /opt/morde-src/deploy/single/update.sh --branch release` 将服务器源码从 `18c07367` 快进到 `2e0c0b8ea9e60f9fee38a631f21329f7700935bc`，构建并原子替换 Portal 二进制，原二进制备份于 `/opt/morde/backups/pre-update-20261126T191226Z/portal`。新二进制 SHA-256：`a821ff831e99261fcd6482978744af48a960a933a10f00b7bfa826278159b939`。
+- **门禁：**P0 smoke=5 PASS/0 FAIL/5 EXCEPTION。T01/T26/T36 因未配置专用 PostgreSQL 测试库例外；T10 需要真实 PC/模型，T43 需要真实 PC/DSH/隔离环境。迁移 current/latest=257/257，无待应用迁移。
+- **只读复核：**`.deployed-head` 第一行为完整提交 `2e0c0b8ea9e60f9fee38a631f21329f7700935bc`；`morde-portal.service=active`、`/healthz=ok`、`/readyz=200`，7080/7081/7082 监听正常。
+- **范围边界：**部署生效的是 Workspace 查询摘要凭据键前缀脱敏后端。脚本提示 `web/portal` 与 `web/workbench` 静态资源不在脚本重建范围内；媒体审批 UI 需打包进 PC 客户端后才能交付，当前没有发布 PC 安装包，也没有声称实际媒体审批功能已在线生效。真实 PC/DSH 验收未完成。
