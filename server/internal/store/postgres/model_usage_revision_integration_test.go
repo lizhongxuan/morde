@@ -34,10 +34,12 @@ func (revisionModelResolverTest) SaveProbeCapabilities(_ context.Context, _ iden
 }
 
 type revisionProviderTest struct {
-	started chan struct{}
-	release chan struct{}
-	aborted chan struct{}
-	calls   atomic.Int32
+	started  chan struct{}
+	release  chan struct{}
+	aborted  chan struct{}
+	response *app.ModelResponse
+	err      error
+	calls    atomic.Int32
 }
 
 func setTaskModelResponseSealer(t *testing.T, gateway *app.ModelGatewayService) {
@@ -53,7 +55,15 @@ func setTaskModelResponseSealer(t *testing.T, gateway *app.ModelGatewayService) 
 
 func (p *revisionProviderTest) Complete(ctx context.Context, _ app.ModelRequest) (app.ModelResponse, error) {
 	p.calls.Add(1)
-	close(p.started)
+	if p.started != nil {
+		close(p.started)
+	}
+	if p.err != nil {
+		return app.ModelResponse{}, p.err
+	}
+	if p.response != nil {
+		return *p.response, nil
+	}
 	select {
 	case <-ctx.Done():
 		if p.aborted != nil {
@@ -128,7 +138,8 @@ VALUES ($1,$2,'agent-1',1,'session-1','engine','profile','revision-supervisor',$
 	}
 	setTaskModelResponseSealer(t, gateway)
 	fence := app.ModelTaskFence{TaskID: taskID, OwnerID: f.ownerID, InitiatorID: f.ownerID,
-		LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version, AgentInstanceID: "agent-1", AgentGeneration: 1,
+		TaskRevision: *claimed.CurrentRevision, LeaseOwner: claimed.Lease.Owner, LeaseVersion: claimed.Lease.Version,
+		AgentInstanceID: "agent-1", AgentGeneration: 1,
 		AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 0, EngineVersion: "engine", ProfileVersion: "profile"}
 	callID, err := app.DSHModelCallID(fence.TaskID, fence.AgentSessionID, 0)
 	if err != nil {

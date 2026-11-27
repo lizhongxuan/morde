@@ -671,6 +671,7 @@ func (s *TaskService) Get(ctx context.Context, principal identity.Principal, id 
 		return TaskDetails{}, err
 	}
 	details.ValidationEvidence = restrictTaskValidationEvidence(validationEvidence, details.Steps, !workspaceVisible, artifactsHidden)
+	details.Attention = s.taskAttention(ctx, principal, details)
 	return details, nil
 }
 

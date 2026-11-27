@@ -41,6 +41,7 @@ type CloudDSHToolBroker struct {
 	schedules                *ScheduleService
 	projectContext           *ProjectService
 	stepDetailSealer         *Sealer
+	taskModelRecoveryAuto    bool
 }
 
 // AgentMessageSourceReader exposes only fenced metadata and bounded page

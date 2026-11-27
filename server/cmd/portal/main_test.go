@@ -600,3 +600,15 @@ func TestParseLegacyPCPortalEnabled(t *testing.T) {
 		})
 	}
 }
+
+func TestParseTaskModelRecoveryAutoDefaultsOff(t *testing.T) {
+	if enabled, err := parseTaskModelRecoveryAuto("", false); err != nil || enabled {
+		t.Fatalf("unset task model recovery auto = (%t, %v), want false", enabled, err)
+	}
+	if enabled, err := parseTaskModelRecoveryAuto("true", true); err != nil || !enabled {
+		t.Fatalf("explicit task model recovery auto = (%t, %v), want true", enabled, err)
+	}
+	if _, err := parseTaskModelRecoveryAuto("later", true); err == nil || !strings.Contains(err.Error(), taskModelRecoveryAutoEnv) {
+		t.Fatalf("invalid task model recovery auto value error = %v", err)
+	}
+}

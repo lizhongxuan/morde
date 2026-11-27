@@ -52,6 +52,13 @@ func (s *Store) RecoverTaskModelResponse(ctx context.Context, request app.ModelC
 		if err := checkModelCaller(ctx, tx, request); err != nil {
 			return err
 		}
+		if request.Task.RecoveryCallID != "" {
+			if err := verifyTaskModelRecoveryAttemptForReservation(ctx, tx, request); err != nil {
+				return err
+			}
+		} else if request.DSHCallID != "" && request.CallID != request.DSHCallID {
+			return domain.NewError(domain.CodeInvalidState, "Task model response frame identity changed")
+		}
 		var state, modelID, providerModel string
 		var taskID *string
 		var requestDigest []byte

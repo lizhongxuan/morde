@@ -251,6 +251,9 @@ FROM task_clarification_requests WHERE task_id=$1 ORDER BY version`, id)
 		if err := populateTaskRevisionProjection(ctx, tx, projected); err != nil {
 			return err
 		}
+		if err := loadTaskModelRecoveryIntents(ctx, tx, projected); err != nil {
+			return err
+		}
 		var resultMessagePending, resultMessagePublished, currentRevisionStarted bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (
  SELECT 1 FROM conversation_result_sources source
@@ -1052,6 +1055,26 @@ AND (lease_expires_at > clock_timestamp() OR EXISTS (
 		if err != nil {
 			return fmt.Errorf("read task authorization before claim: %w", err)
 		}
+		var recoveryIntent task.ModelRecoveryIntent
+		var hasRecoveryIntent bool
+		if taskRow.CurrentRevision >= 0 {
+			recoveryIntent, hasRecoveryIntent, err = loadTaskModelRecoveryIntent(ctx, tx, taskRow.ID, taskRow.OwnerID, taskRow.CurrentRevision, false)
+			if err != nil {
+				return err
+			}
+		}
+		recoveryQueue := taskRow.Status == string(task.StatusQueued) && taskRow.WaitingReason == taskModelRecoveryScheduledReason
+		activeRecoveryIntent := hasRecoveryIntent && (recoveryIntent.State == task.ModelRecoveryScheduled || recoveryIntent.State == task.ModelRecoveryAttempting)
+		if recoveryQueue || activeRecoveryIntent {
+			matches := hasRecoveryIntent && intentMatchesCurrentTaskForClaim(recoveryIntent, rowTaskDomain(taskRow))
+			if !matches || recoveryQueue && (recoveryIntent.State != task.ModelRecoveryScheduled || recoveryIntent.EventSequence != taskRow.EventSeq) ||
+				taskRow.Status == string(task.StatusQueued) && (!recoveryQueue || recoveryIntent.State != task.ModelRecoveryScheduled) {
+				if err := quarantineInvalidTaskModelRecoveryClaim(ctx, tx, taskRow, recoveryIntent, hasRecoveryIntent); err != nil {
+					return err
+				}
+				return nil
+			}
+		}
 		var queueEnteredAt time.Time
 		if taskRow.Status == string(task.StatusQueued) {
 			if err := tx.QueryRow(ctx, `SELECT COALESCE((
@@ -1213,6 +1236,10 @@ WHERE id=$1 AND current_revision=desired_revision RETURNING event_seq`, id, work
 			return fmt.Errorf("read claimed task: %w", err)
 		}
 		claimed = rowTaskDomain(row)
+		if hasRecoveryIntent {
+			intentCopy := recoveryIntent
+			claimed.ModelRecovery = &intentCopy
+		}
 		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls WHERE task_id=$1 AND owner_id=$2)`,
 			claimed.ID, claimed.OwnerID).Scan(&claimed.InternalTool); err != nil {
 			return fmt.Errorf("read internal route tool claim type: %w", err)

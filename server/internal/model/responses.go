@@ -652,7 +652,8 @@ func providerStatusError(status int, body []byte, apiKey string, zai bool, retry
 	default:
 		kind = app.ModelErrorInvalidResponse
 	}
-	err := &app.ModelClientError{Kind: kind, Stage: "provider_status", ProviderCode: code}
+	err := &app.ModelClientError{Kind: kind, Stage: "provider_status", ProviderCode: code,
+		ConfirmedNoUsage: status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable}
 	if kind == app.ModelErrorRateLimited {
 		err.RetryAfter, _, err.RetryAfterExceedsDurableHorizon = parseProviderRetryAfterHeaders(status, retryAfterHeaders, receivedAt)
 	}

@@ -108,6 +108,7 @@ type TaskK2Projection struct {
 
 type TaskDetails struct {
 	Task                            task.Task
+	Attention                       *TaskAttention
 	Dependencies                    []Dependency
 	ChildJobs                       []ChildJob
 	ResultReview                    *ResultReview

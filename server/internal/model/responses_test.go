@@ -673,13 +673,14 @@ func TestProviderErrorsAreClassifiedAndDoNotExposeCredentialsOrBody(t *testing.T
 		want             app.ModelClientErrorKind
 		wantStage        string
 		wantProviderCode string
+		wantNoUsage      bool
 	}{
 		{name: "unauthorized", status: 401, body: `{"error":{"message":"test-secret-key user prompt"}}`, want: app.ModelErrorAuthentication},
 		{name: "forbidden", status: 403, body: `{}`, want: app.ModelErrorAccess},
-		{name: "rate limited", status: 429, body: `{"error":{"type":"rate_limit_exceeded"}}`, want: app.ModelErrorRateLimited},
+		{name: "rate limited", status: 429, body: `{"error":{"type":"rate_limit_exceeded"}}`, want: app.ModelErrorRateLimited, wantNoUsage: true},
 		{name: "quota", status: 400, body: `{"error":{"code":"insufficient_quota","message":"test-secret-key"}}`, want: app.ModelErrorQuota},
 		{name: "other client error", status: 400, body: `{"error":{"code":"invalid_request_error","message":"test-secret-key"}}`, want: app.ModelErrorInvalidRequest, wantStage: "provider_status", wantProviderCode: "invalid_request_error"},
-		{name: "server", status: 503, body: `{"error":{"message":"test-secret-key"}}`, want: app.ModelErrorUnavailable},
+		{name: "server", status: 503, body: `{"error":{"message":"test-secret-key"}}`, want: app.ModelErrorUnavailable, wantNoUsage: true},
 		{name: "untrusted response header", status: 401, body: `{}`, want: app.ModelErrorAuthentication},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -693,6 +694,10 @@ func TestProviderErrorsAreClassifiedAndDoNotExposeCredentialsOrBody(t *testing.T
 			})
 			if got := modelErrorKind(t, err); got != test.want {
 				t.Fatalf("error kind = %q, want %q", got, test.want)
+			}
+			var classified *app.ModelClientError
+			if !errors.As(err, &classified) || classified.ConfirmedNoUsage != test.wantNoUsage {
+				t.Fatalf("confirmed no-usage evidence = %+v, want %t", classified, test.wantNoUsage)
 			}
 			if test.wantStage != "" {
 				var clientErr *app.ModelClientError

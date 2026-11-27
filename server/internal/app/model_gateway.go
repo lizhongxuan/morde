@@ -40,6 +40,7 @@ type ModelTaskFence struct {
 	TaskID               string
 	OwnerID              string
 	InitiatorID          string
+	TaskRevision         int64
 	LeaseOwner           string
 	LeaseVersion         int64
 	AgentInstanceID      string
@@ -50,6 +51,10 @@ type ModelTaskFence struct {
 	ThroughSequence      int64
 	EngineVersion        string
 	ProfileVersion       string
+	// RecoveryCallID is a separate, durable ledger identity for the one
+	// scheduled recovery of this DSH frame. CallID on ModelCall remains the
+	// deterministic DSH frame identity.
+	RecoveryCallID string
 }
 
 // ModelTaskProjectResolver reads the project scope from the persisted Task so
@@ -59,17 +64,18 @@ type ModelTaskProjectResolver interface {
 }
 
 type ModelCall struct {
-	Source           ModelCallSource
-	Principal        identity.Principal
-	Task             *ModelTaskFence
-	Review           *TaskValidationReviewModelFence
-	TerminalDelivery *TaskTerminalDeliveryModelFence
-	Summary          *ConversationSummaryModelFence
-	ModelID          string
-	CallID           string
-	RawRequest       json.RawMessage
-	ImageResolver    TaskModelImageResolver
-	Request          ModelRequest
+	Source                      ModelCallSource
+	Principal                   identity.Principal
+	Task                        *ModelTaskFence
+	Review                      *TaskValidationReviewModelFence
+	TerminalDelivery            *TaskTerminalDeliveryModelFence
+	Summary                     *ConversationSummaryModelFence
+	ModelID                     string
+	CallID                      string
+	RawRequest                  json.RawMessage
+	ImageResolver               TaskModelImageResolver
+	Request                     ModelRequest
+	ReplayTaskModelResponseOnly bool
 }
 
 type ModelCallReservation struct {
@@ -90,6 +96,7 @@ type ModelCallReservation struct {
 	NeedsTools        bool
 	NeedsVision       bool
 	CallID            string
+	DSHCallID         string
 	RequestDigest     []byte
 	LegacyCallID      string
 	LegacyDigest      []byte
@@ -111,6 +118,121 @@ type ModelCallSettlement struct {
 	ResponseDigest        []byte
 	ResponseTextDigest    []byte
 	ResponseInvalid       bool
+}
+
+// TaskModelNoDispatchEvidence is proof that a specific Task model call did not
+// reach the provider. The Model Gateway creates it only after a failed
+// BeginModelCallDispatch is followed by a successful reservation abandonment.
+// A provider error, settlement error, or failed abandonment must never create
+// this evidence.
+type TaskModelNoDispatchEvidence struct {
+	TaskFence     ModelTaskFence
+	CallID        string
+	ModelID       string
+	RequestDigest []byte
+	UsageKnown    bool
+	InputTokens   int64
+	OutputTokens  int64
+}
+
+type TaskModelRecoveryFailureKind string
+
+const (
+	TaskModelRecoveryFailureNoDispatch     TaskModelRecoveryFailureKind = "no_dispatch"
+	TaskModelRecoveryFailureProviderReject TaskModelRecoveryFailureKind = "provider_reject"
+)
+
+// TaskModelRecoveryFailureEvidence is bounded proof that a model call failed
+// in a way that can be considered once by the read-only recovery path.
+type TaskModelRecoveryFailureEvidence struct {
+	Kind              TaskModelRecoveryFailureKind
+	TaskFence         ModelTaskFence
+	CallID            string
+	ModelID           string
+	RequestDigest     []byte
+	UsageKnown        bool
+	InputTokens       int64
+	OutputTokens      int64
+	ProviderErrorKind ModelClientErrorKind
+}
+
+type TaskModelRecoveryFailure interface {
+	TaskModelRecoveryFailureEvidence() TaskModelRecoveryFailureEvidence
+}
+
+// TaskModelNoDispatchError carries bounded identity evidence while keeping the
+// underlying persistence error out of Error().
+type TaskModelNoDispatchError struct {
+	evidence TaskModelNoDispatchEvidence
+	cause    error
+}
+
+func (e *TaskModelNoDispatchError) Error() string {
+	return "task model request was confirmed not dispatched"
+}
+
+func (e *TaskModelNoDispatchError) Unwrap() error { return e.cause }
+
+func (e *TaskModelNoDispatchError) TaskModelNoDispatchEvidence() TaskModelNoDispatchEvidence {
+	if e == nil {
+		return TaskModelNoDispatchEvidence{}
+	}
+	return e.evidence
+}
+
+func (e *TaskModelNoDispatchError) TaskModelRecoveryFailureEvidence() TaskModelRecoveryFailureEvidence {
+	if e == nil {
+		return TaskModelRecoveryFailureEvidence{}
+	}
+	return TaskModelRecoveryFailureEvidence{Kind: TaskModelRecoveryFailureNoDispatch, TaskFence: e.evidence.TaskFence,
+		CallID: e.evidence.CallID, ModelID: e.evidence.ModelID, RequestDigest: append([]byte(nil), e.evidence.RequestDigest...),
+		UsageKnown: e.evidence.UsageKnown, InputTokens: e.evidence.InputTokens,
+		OutputTokens: e.evidence.OutputTokens}
+}
+
+// TaskModelRetryableFailureError is returned only after a bounded provider
+// rejection and its known usage have been durably settled.
+type TaskModelRetryableFailureError struct {
+	evidence TaskModelRecoveryFailureEvidence
+	cause    error
+}
+
+func (e *TaskModelRetryableFailureError) Error() string {
+	return "task model request was rejected with confirmed zero usage"
+}
+
+func (e *TaskModelRetryableFailureError) Unwrap() error { return e.cause }
+
+func (e *TaskModelRetryableFailureError) TaskModelRecoveryFailureEvidence() TaskModelRecoveryFailureEvidence {
+	if e == nil {
+		return TaskModelRecoveryFailureEvidence{}
+	}
+	result := e.evidence
+	result.RequestDigest = append([]byte(nil), e.evidence.RequestDigest...)
+	return result
+}
+
+func (e *TaskModelRetryableFailureError) ModelFailureCategory() string {
+	if e == nil {
+		return "unknown"
+	}
+	return string(e.evidence.ProviderErrorKind)
+}
+
+func (e *TaskModelRetryableFailureError) ModelFailureDiagnostic() AgentModelFailureDiagnostic {
+	return AgentModelFailureDiagnostic{Stage: "model_gateway", Category: e.ModelFailureCategory(),
+		ReasonCode: "provider_rejected_request"}
+}
+
+func confirmedTaskModelProviderRejection(err error, usage ModelUsage) bool {
+	if err == nil || usage.Known && (usage.InputTokens != 0 || usage.OutputTokens != 0) {
+		return false
+	}
+	var providerErr *ModelClientError
+	if !errors.As(err, &providerErr) || providerErr.Stage != "provider_status" || !providerErr.ConfirmedNoUsage {
+		return false
+	}
+	return providerErr.Kind == ModelErrorRateLimited || providerErr.Kind == ModelErrorUnavailable
 }
 
 type ModelUsageObservation struct {
@@ -390,6 +512,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if ctx == nil {
 		return ModelResponse{}, domain.InvalidArgument("model_call", "model call context is required")
 	}
+	if call.ReplayTaskModelResponseOnly && call.Source != ModelCallTask {
+		return ModelResponse{}, domain.InvalidArgument("model_call", "replay-only model recovery requires a Task call")
+	}
 	call.Task = normalizedModelTaskFence(call.Task)
 	if (call.Source == ModelCallCompaction || call.Source == ModelCallTask || call.Source == ModelCallReview || call.Source == ModelCallTerminalDelivery) && s.responseSealer == nil {
 		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "model response encryption is unavailable")
@@ -523,12 +648,19 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if projectID != "" && !endpoint.Personal && s.projectBudget == nil {
 		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "project model budget is unavailable")
 	}
+	ledgerCallID := call.CallID
+	if call.Source == ModelCallTask && call.Task.RecoveryCallID != "" {
+		if !idempotencyKeyPattern.MatchString(call.Task.RecoveryCallID) || call.Task.RecoveryCallID == call.CallID {
+			return ModelResponse{}, domain.InvalidArgument("model_call", "invalid task recovery call identity")
+		}
+		ledgerCallID = call.Task.RecoveryCallID
+	}
 	reservation := ModelCallReservation{
 		Source: call.Source, Principal: call.Principal, Task: call.Task, Review: call.Review,
 		TerminalDelivery: call.TerminalDelivery, Summary: call.Summary, OwnerID: ownerID,
 		ProjectID: projectID, PersonalModel: endpoint.Personal,
 		ModelID: call.ModelID, ProviderEndpoint: endpoint.Endpoint.BaseURL, ProviderModel: endpoint.Endpoint.ModelID, ConnectionVersion: endpoint.Version,
-		NeedsTools: needsTools, NeedsVision: needsVision, CallID: call.CallID, RequestDigest: digest[:], ReservedTokens: reserve,
+		NeedsTools: needsTools, NeedsVision: needsVision, CallID: ledgerCallID, DSHCallID: call.CallID, RequestDigest: digest[:], ReservedTokens: reserve,
 	}
 	if call.Source == ModelCallCompaction {
 		if recovery, ok := s.store.(ConversationSummaryModelOutputStore); ok {
@@ -567,6 +699,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			}
 			return response, nil
 		}
+	}
+	if call.ReplayTaskModelResponseOnly {
+		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "task model recovery response is not available")
 	}
 	if call.Source == ModelCallReview {
 		recovery, ok := s.store.(TaskValidationReviewModelResponseStore)
@@ -622,6 +757,12 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		if abandonErr := s.store.AbandonModelCallReservation(abandonCtx, reservation); abandonErr != nil {
 			return ModelResponse{}, errors.Join(dispatchErr, fmt.Errorf("release undispatched model reservation: %w", abandonErr))
 		}
+		if call.Source == ModelCallTask && reservation.Task != nil {
+			return ModelResponse{}, &TaskModelNoDispatchError{evidence: TaskModelNoDispatchEvidence{
+				TaskFence: *reservation.Task, CallID: reservation.DSHCallID, ModelID: reservation.ModelID,
+				RequestDigest: append([]byte(nil), reservation.RequestDigest...), UsageKnown: true,
+			}, cause: dispatchErr}
+		}
 		return ModelResponse{}, dispatchErr
 	}
 	dispatchErr = dispatchCtx.Err()
@@ -675,9 +816,19 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if call.Source == ModelCallTask {
 		attachCurrentTaskTurnMessageID(&response, currentTaskTurnMessageID)
 	}
-	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: call.CallID, Usage: response.Usage,
+	retryableFailure := false
+	var retryableFailureKind ModelClientErrorKind
+	if call.Source == ModelCallTask && confirmedTaskModelProviderRejection(callErr, response.Usage) {
+		var providerErr *ModelClientError
+		if errors.As(callErr, &providerErr) {
+			retryableFailure = true
+			retryableFailureKind = providerErr.Kind
+			response.Usage = ModelUsage{Known: true}
+		}
+	}
+	settlement := ModelCallSettlement{Source: call.Source, OwnerID: ownerID, CallID: reservation.CallID, Usage: response.Usage,
 		ProviderReportedModel: response.ProviderReportedModel,
-		Unknown:               callErr != nil || !response.Usage.Known, Summary: call.Summary}
+		Unknown:               callErr != nil && !retryableFailure || !response.Usage.Known, Summary: call.Summary}
 	if call.Source == ModelCallTerminalDelivery {
 		settlement.TerminalDeliveryCall = &reservation
 	}
@@ -739,7 +890,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		}
 	}
 	var taskOutputErr error
-	if call.Source == ModelCallTask && !settlement.Unknown {
+	if call.Source == ModelCallTask && !settlement.Unknown && !retryableFailure {
 		taskOutputErr = validateTaskModelResponse(call.Request, response)
 		if taskOutputErr == nil {
 			taskOutputErr = taskDelivery.ValidateTaskModelDelivery(ctx, reservation)
@@ -762,7 +913,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	var settleErr error
 	if projectCall {
 		settleErr = s.projectBudget.SettleModelCall(settleCtx, SettleProjectModelCallCommand{
-			ProjectID: projectID, Source: call.Source, CallID: call.CallID,
+			ProjectID: projectID, Source: call.Source, CallID: reservation.CallID,
 			Usage: project.Usage{InputTokens: response.Usage.InputTokens, OutputTokens: response.Usage.OutputTokens}, Unknown: settlement.Unknown,
 			ProviderReportedModel: settlement.ProviderReportedModel,
 			Summary:               call.Summary, TaskCall: settlement.TaskCall, ResponseCiphertext: settlement.ResponseCiphertext,
@@ -792,7 +943,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			unknownCtx, cancelUnknown := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer cancelUnknown()
 			unknownErr := s.store.SettleModelCall(unknownCtx, ModelCallSettlement{Source: call.Source, OwnerID: ownerID,
-				CallID: call.CallID, Unknown: true, Summary: call.Summary,
+				CallID: reservation.CallID, Unknown: true, Summary: call.Summary,
 				TerminalDeliveryCall: settlement.TerminalDeliveryCall})
 			if unknownErr != nil {
 				return ModelResponse{}, errors.Join(fmt.Errorf("settle model call: %w", settleErr),
@@ -815,6 +966,12 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		}
 	}
 	if callErr != nil {
+		if retryableFailure && reservation.Task != nil {
+			return ModelResponse{}, &TaskModelRetryableFailureError{evidence: TaskModelRecoveryFailureEvidence{
+				Kind: TaskModelRecoveryFailureProviderReject, TaskFence: *reservation.Task, CallID: reservation.DSHCallID,
+				ModelID: reservation.ModelID, RequestDigest: append([]byte(nil), reservation.RequestDigest...), UsageKnown: true,
+				ProviderErrorKind: retryableFailureKind}, cause: callErr}
+		}
 		return ModelResponse{}, modelConnectionCheckError(callErr)
 	}
 	if summaryOutputErr != nil {
@@ -918,6 +1075,9 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 		id, err := DSHModelCallID(call.Task.TaskID, call.Task.AgentSessionID, call.Task.ThroughSequence)
 		if err != nil || id != call.CallID || len(call.RawRequest) == 0 || !json.Valid(call.RawRequest) {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task model call identity or request")
+		}
+		if call.Task.RecoveryCallID != "" && (!idempotencyKeyPattern.MatchString(call.Task.RecoveryCallID) || call.Task.RecoveryCallID == id) {
+			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task recovery call identity")
 		}
 		ownerID = call.Task.InitiatorID
 	case ModelCallReview:

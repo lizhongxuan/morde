@@ -80,6 +80,11 @@ func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallR
 	if err := checkModelCaller(ctx, tx, request); err != nil {
 		return err
 	}
+	if request.Source == app.ModelCallTask && request.Task != nil && request.Task.RecoveryCallID != "" {
+		if err := verifyTaskModelRecoveryAttemptForReservation(ctx, tx, request); err != nil {
+			return err
+		}
+	}
 	var taskProjectID string
 	var err error
 	switch request.Source {

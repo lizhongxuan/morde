@@ -323,6 +323,16 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3`, fence.TaskID, fence.OwnerID
 WHERE id=$1`, fence.TaskID, value.Through, value.Digest); err != nil {
 				return fmt.Errorf("advance task checkpoint: %w", err)
 			}
+			if _, err := tx.Exec(ctx, `UPDATE task_model_recovery_schedules
+SET state='completed',updated_at=clock_timestamp()
+WHERE task_id=$1 AND owner_id=$2 AND task_revision=(SELECT current_revision FROM tasks WHERE id=$1 AND owner_id=$2)
+  AND task_revision=(SELECT desired_revision FROM tasks WHERE id=$1 AND owner_id=$2)
+  AND authorization_version=$3 AND agent_instance_id=$4 AND agent_generation=$5 AND agent_session_id=$6
+  AND engine_version=$7 AND profile_version=$8 AND state='attempting'
+  AND checkpoint_through_seq < $9`, fence.TaskID, fence.OwnerID, fence.AuthorizationVersion, fence.AgentInstanceID,
+				fence.AgentGeneration, fence.AgentSessionID, fence.EngineVersion, fence.ProfileVersion, value.Through); err != nil {
+				return fmt.Errorf("complete Task model recovery after checkpoint: %w", err)
+			}
 			if _, err := tx.Exec(ctx, `UPDATE task_agent_sessions SET root_checkpoint_through_seq=$3,root_checkpoint_baseline_known=true
 WHERE task_id=$1 AND owner_id=$2 AND session_id=$4 AND parent_session_id IS NULL`,
 				fence.TaskID, fence.OwnerID, value.Through, rootSessionID); err != nil {

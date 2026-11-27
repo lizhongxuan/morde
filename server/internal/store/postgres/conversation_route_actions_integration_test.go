@@ -500,6 +500,82 @@ lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, taskID); er
 	}
 }
 
+func TestConversationAcknowledgementStaysOnOriginalTaskMessageAcrossRevision(t *testing.T) {
+	f := newRouteActionsTestFixture(t)
+	ctx := context.Background()
+	const originalClientID = "route-ack-anchor-original"
+	original := f.receive(t, originalClientID, "Please do a longer task", app.ConversationRoutingInput{})
+	snapshot, err := f.store.LoadConversationRouteSnapshot(ctx, original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot.Context.ModelID = "p1234567"
+	if err := f.store.ApplyConversationRoute(ctx, original, snapshot, app.ConversationRouteDecision{
+		Action: app.ConversationRouteNew, Acknowledge: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var taskID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT task_id FROM conversation_messages WHERE id=$1`, original.Message.ID).Scan(&taskID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET status='running',lease_owner='ack-anchor-test',lease_version=1,
+lease_expires_at=clock_timestamp()+interval '1 minute' WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	startTaskRevision := func() {
+		t.Helper()
+		tx, err := f.store.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if err := recordTaskRevisionStartedInTx(ctx, tx, taskID); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	startTaskRevision()
+	var currentRevision int64
+	if err := f.store.pool.QueryRow(ctx, `SELECT current_revision FROM tasks WHERE id=$1`, taskID).Scan(&currentRevision); err != nil {
+		t.Fatal(err)
+	}
+	const followupClientID = "route-ack-anchor-followup"
+	followup := f.receive(t, followupClientID, "Add one more requirement", app.ConversationRoutingInput{})
+	if _, err := f.store.pool.Exec(ctx, `UPDATE conversation_message_routes SET acknowledgement_requested=true WHERE message_id=$1`, followup.Message.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `INSERT INTO task_revision_intents
+(message_id,task_id,owner_id,initiator_id,conversation_id,message_sequence,expected_revision)
+VALUES ($1,$2,$3,$3,$4,$5,$6)`, followup.Message.ID, taskID, f.ownerID, f.conversation.ID, followup.Message.Sequence, currentRevision); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET current_revision=current_revision+1,desired_revision=desired_revision+1 WHERE id=$1`, taskID); err != nil {
+		t.Fatal(err)
+	}
+	startTaskRevision()
+
+	page, err := f.store.ListMessages(ctx, f.ownerID, f.conversation.ID, app.PageRequest{Limit: 10})
+	if err != nil || len(page.Items) != 2 {
+		t.Fatalf("conversation messages = %+v err=%v", page.Items, err)
+	}
+	acknowledged := make(map[string]bool, len(page.Items))
+	for _, message := range page.Items {
+		acknowledged[message.ClientMessageID] = message.AgentAcknowledged
+	}
+	if !acknowledged[originalClientID] || acknowledged[followupClientID] {
+		t.Fatalf("Task acknowledgement moved from its original request: original=%t followup=%t messages=%+v",
+			acknowledged[originalClientID], acknowledged[followupClientID], page.Items)
+	}
+	var anchorID string
+	if err := f.store.pool.QueryRow(ctx, `SELECT acknowledgement_message_id FROM task_revision_starts
+WHERE task_id=$1 AND revision=$2`, taskID, currentRevision+1).Scan(&anchorID); err != nil || anchorID != original.Message.ID {
+		t.Fatalf("persisted acknowledgement anchor = %q, want %q, err=%v", anchorID, original.Message.ID, err)
+	}
+}
+
 func TestConversationRouteJoinWaitsOnOriginalRequestWithoutCreatingTask(t *testing.T) {
 	f := newRouteActionsTestFixture(t)
 	ctx := context.Background()

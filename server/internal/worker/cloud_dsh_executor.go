@@ -102,11 +102,15 @@ func cloudDSHToolExecutionFailureFor(frame cloudDSHFrame, reasonCode string, cau
 }
 
 type cloudDSHModelResultError struct {
-	stage      string
-	category   string
-	reasonCode string
-	toolName   string
-	toolCallID string
+	stage              string
+	category           string
+	reasonCode         string
+	toolName           string
+	toolCallID         string
+	noDispatch         *app.TaskModelNoDispatchEvidence
+	recoveryFailure    *app.TaskModelRecoveryFailureEvidence
+	recoveryFailureErr app.TaskModelRecoveryFailure
+	recoveryCheckpoint *cloudDSHReadOnlyRecoveryCheckpoint
 }
 
 func (e cloudDSHModelResultError) Error() string { return errCloudDSHModelResultUnavailable.Error() }
@@ -120,6 +124,17 @@ func (e cloudDSHModelResultError) ModelFailureCategory() string { return e.categ
 func (e cloudDSHModelResultError) ModelFailureDiagnostic() app.AgentModelFailureDiagnostic {
 	return app.AgentModelFailureDiagnostic{Stage: e.stage, Category: e.category, ReasonCode: e.reasonCode,
 		ToolName: e.toolName, ToolCallID: e.toolCallID}
+}
+
+func (e cloudDSHModelResultError) TaskModelNoDispatchEvidence() (app.TaskModelNoDispatchEvidence, bool) {
+	if e.noDispatch == nil {
+		return app.TaskModelNoDispatchEvidence{}, false
+	}
+	return *e.noDispatch, true
+}
+
+func (e cloudDSHModelResultError) taskModelRecoveryProof() (app.TaskModelRecoveryFailure, *cloudDSHReadOnlyRecoveryCheckpoint) {
+	return e.recoveryFailureErr, e.recoveryCheckpoint
 }
 
 func cloudDSHModelErrorCategory(err error) string {
@@ -209,6 +224,50 @@ func cloudDSHModelErrorCategory(err error) string {
 
 func cloudDSHModelResultErrorFor(err error) error {
 	return cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err)}
+}
+
+type cloudDSHModelRecoveryFailureSource interface {
+	TaskModelRecoveryFailureEvidence() app.TaskModelRecoveryFailureEvidence
+}
+
+func cloudDSHModelResultErrorForCall(err error, call app.ModelCall, checkpoints ...cloudDSHReadOnlyRecoveryCheckpoint) error {
+	failure := cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err)}
+	var source cloudDSHModelRecoveryFailureSource
+	if !errors.As(err, &source) || call.Source != app.ModelCallTask || call.Task == nil {
+		return failure
+	}
+	evidence := source.TaskModelRecoveryFailureEvidence()
+	wantCallID, callIDErr := app.DSHModelCallID(call.Task.TaskID, call.Task.AgentSessionID, call.Task.ThroughSequence)
+	if callIDErr != nil || evidence.TaskFence != *call.Task || evidence.CallID != call.CallID || evidence.CallID != wantCallID ||
+		!evidence.UsageKnown || evidence.InputTokens != 0 || evidence.OutputTokens != 0 || evidence.ModelID != call.ModelID ||
+		len(evidence.RequestDigest) != 32 {
+		return failure
+	}
+	switch evidence.Kind {
+	case app.TaskModelRecoveryFailureNoDispatch:
+		if evidence.ProviderErrorKind != "" {
+			return failure
+		}
+		noDispatch := app.TaskModelNoDispatchEvidence{TaskFence: evidence.TaskFence, CallID: evidence.CallID,
+			ModelID: evidence.ModelID, RequestDigest: append([]byte(nil), evidence.RequestDigest...), UsageKnown: evidence.UsageKnown,
+			InputTokens: evidence.InputTokens, OutputTokens: evidence.OutputTokens}
+		failure.noDispatch = &noDispatch
+	case app.TaskModelRecoveryFailureProviderReject:
+		if evidence.ProviderErrorKind != app.ModelErrorRateLimited && evidence.ProviderErrorKind != app.ModelErrorUnavailable {
+			return failure
+		}
+	default:
+		return failure
+	}
+	recoveryEvidence := evidence
+	recoveryEvidence.RequestDigest = append([]byte(nil), evidence.RequestDigest...)
+	failure.recoveryFailure = &recoveryEvidence
+	failure.recoveryFailureErr = source
+	if len(checkpoints) == 1 {
+		checkpoint := checkpoints[0]
+		failure.recoveryCheckpoint = &checkpoint
+	}
+	return failure
 }
 
 func cloudDSHChildModelFailureCode(err error) (string, bool) {
@@ -350,11 +409,37 @@ type cloudDSHDetailedModelRecoveryTools interface {
 	PauseModelRecoveryDiagnostic(context.Context, task.Task, app.AgentModelFailureDiagnostic) error
 }
 
+type cloudDSHTaskModelRecoveryScheduler interface {
+	ScheduleTaskModelRecovery(context.Context, task.Task, app.TaskModelRecoveryFailure, int64, []byte, []byte) (bool, error)
+}
+
+type cloudDSHTaskModelRecoveryAttemptStarter interface {
+	BeginTaskModelRecoveryAttempt(context.Context, task.ModelRecoveryIntent, app.AgentInstanceFence) error
+}
+
 type cloudDSHModelFailureDiagnosticSource interface {
 	ModelFailureDiagnostic() app.AgentModelFailureDiagnostic
 }
 
 func pauseCloudDSHModelRecovery(ctx context.Context, tools CloudDSHRecoveryTools, value task.Task, cause error) error {
+	var proofSource interface {
+		taskModelRecoveryProof() (app.TaskModelRecoveryFailure, *cloudDSHReadOnlyRecoveryCheckpoint)
+	}
+	if errors.As(cause, &proofSource) {
+		failure, checkpoint := proofSource.taskModelRecoveryProof()
+		if failure != nil && checkpoint != nil {
+			if scheduler, ok := tools.(cloudDSHTaskModelRecoveryScheduler); ok {
+				checkpointTask := value
+				checkpointTask.CheckpointThroughSequence = checkpoint.ThroughSequence
+				checkpointTask.CheckpointDigest = append([]byte(nil), checkpoint.Digest...)
+				scheduled, err := scheduler.ScheduleTaskModelRecovery(ctx, checkpointTask, failure, checkpoint.ThroughSequence,
+					checkpoint.Digest, checkpoint.ToolsetDigest)
+				if scheduled || err != nil {
+					return err
+				}
+			}
+		}
+	}
 	var source cloudDSHModelFailureDiagnosticSource
 	if errors.As(cause, &source) {
 		if detailed, ok := tools.(cloudDSHDetailedModelRecoveryTools); ok {

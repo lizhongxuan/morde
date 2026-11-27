@@ -82,3 +82,33 @@ func TestTaskModelResponseSealOpenAndRejectsChangedFence(t *testing.T) {
 		t.Fatalf("valid successor generation could not open prior response: %v", err)
 	}
 }
+
+func TestTaskModelResponseBindsRecoveryLedgerAndDSHFrameSeparately(t *testing.T) {
+	sealer, reservation := taskModelResponseFixture(t)
+	dshCallID := reservation.CallID
+	reservation.Task = normalizedModelTaskFence(reservation.Task)
+	reservation.Task.TaskRevision = 9
+	reservation.Task.RecoveryCallID = "mrc_recovery_123"
+	reservation.CallID = reservation.Task.RecoveryCallID
+	reservation.DSHCallID = dshCallID
+	response := ModelResponse{Text: "recovered", Usage: ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1},
+		StopReason: "stop", ProviderReportedModel: "provider-snapshot-3"}
+	record, err := SealTaskModelResponse(sealer, reservation, response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := OpenTaskModelResponse(sealer, record, reservation); err != nil || got.Text != response.Text {
+		t.Fatalf("recovery response did not round trip with separate frame and ledger IDs: response=%+v err=%v", got, err)
+	}
+	changedFrame := reservation
+	changedFrame.DSHCallID = "mdl_another_123"
+	if _, err := OpenTaskModelResponse(sealer, record, changedFrame); err == nil {
+		t.Fatal("recovery response opened for a different DSH frame")
+	}
+	changedRevision := reservation
+	changedRevision.Task = normalizedModelTaskFence(reservation.Task)
+	changedRevision.Task.TaskRevision++
+	if _, err := OpenTaskModelResponse(sealer, record, changedRevision); err == nil {
+		t.Fatal("recovery response opened for a different Task revision")
+	}
+}

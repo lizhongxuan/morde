@@ -4000,6 +4000,28 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/tasks/{id}/model-recovery-retries": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Queue one persisted safe model recovery for the current Task revision
+         * @description Available only when the server has persisted a retry_available intent from gateway-confirmed zero-dispatch evidence. The server rechecks the initiator, current authorization version, Task revision, event sequence, checkpoint and one-attempt schedule atomically. External writes and unknown outcomes are never retried by this action.
+         */
+        post: operations["retryTaskModelRecovery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/tasks/{id}/file-fetches/{fetch_id}": {
         parameters: {
             query?: never;
@@ -9831,6 +9853,12 @@ export interface components {
             /** Format: int64 */
             expected_attempt: number;
         };
+        TaskModelRecoveryRetryRequest: {
+            /** Format: int64 */
+            expected_revision: number;
+            /** Format: int64 */
+            expected_event_sequence: number;
+        };
         TaskStepRetryResult: {
             task_id: components["schemas"]["TaskId"];
             source_step_id: components["schemas"]["StepId"];
@@ -10233,6 +10261,8 @@ export interface components {
              * @description Event cursor from the same database snapshot as this Task; resume task events after this sequence.
              */
             event_sequence: number;
+            /** @description Server-derived presentation state for this authenticated caller. Action is non-null only for a current operation the caller can perform; event_sequence must match this Task snapshot. */
+            attention?: components["schemas"]["TaskAttention"] | null;
             result: string | null;
             /** @description Optional read-only claim-to-evidence mapping for the current Task revision. Event streams do not expose this detail. */
             validation_detail?: components["schemas"]["TaskValidationEvidenceDetail"];
@@ -10261,6 +10291,25 @@ export interface components {
             assistant_message: components["schemas"]["TaskAssistantMessage"] | null;
             /** Format: date-time */
             finished_at: string | null;
+        };
+        TaskAttention: {
+            /** @enum {string} */
+            kind: "needs_user_action" | "recovering" | "paused_retryable" | "interrupted" | "result_unverified";
+            /**
+             * @description Safe category only; never a provider error
+             * @enum {string}
+             */
+            reason: "approval_required" | "clarification_required" | "recovery_scheduled" | "retry_available" | "execution_failed" | "outcome_unknown" | "unknown";
+            /**
+             * @description Null when no current authorized action exists.
+             * @enum {string|null}
+             */
+            action: "approve" | "clarify" | "retry" | "view_details" | null;
+            /**
+             * Format: int64
+             * @description Must match the event_sequence of the Task snapshot.
+             */
+            event_sequence: number;
         };
         TaskPage: {
             items: components["schemas"]["TaskSummary"][];
@@ -18182,6 +18231,42 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["TaskStepRetryResult"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    retryTaskModelRecovery: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Reuse only for an exact retry of the same operation and normalized request. */
+                "Idempotency-Key": components["parameters"]["IdempotencyKey"];
+            };
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskModelRecoveryRetryRequest"];
+            };
+        };
+        responses: {
+            /** @description The exact Task recovery was queued or returned for an idempotent replay. */
+            202: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Task"];
                 };
             };
             400: components["responses"]["BadRequest"];

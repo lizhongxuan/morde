@@ -153,9 +153,12 @@ const (
 )
 
 type ModelClientError struct {
-	Kind                            ModelClientErrorKind
-	Stage                           string
-	ProviderCode                    string
+	Kind         ModelClientErrorKind
+	Stage        string
+	ProviderCode string
+	// ConfirmedNoUsage is set only when an explicit provider status rejects
+	// the request before model execution (currently HTTP 429 or 503).
+	ConfirmedNoUsage                bool
 	RetryAfter                      time.Duration
 	RetryAfterExceedsDurableHorizon bool
 }

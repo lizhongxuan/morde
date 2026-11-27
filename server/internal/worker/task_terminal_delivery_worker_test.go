@@ -155,12 +155,12 @@ func TestTaskTerminalDeliveryWorkerNotDispatchedUsesSystemStateReply(t *testing.
 	worker := newTaskTerminalDeliveryTestWorker(t, store, gateway)
 	found, err := worker.RunOnce(context.Background())
 	if !found || err != nil || store.persisted != 1 || store.published != 1 ||
-		!strings.HasPrefix(store.publishedText, "系统状态说明：") ||
+		!strings.HasPrefix(store.publishedText, "这次没有拿到已核实的结果，任务已中断。") ||
 		!strings.Contains(store.publishedText, app.TaskTerminalDeliveryFailureExplanation("provider_unavailable")) ||
 		strings.Contains(store.publishedText, "provider_unavailable") ||
-		!strings.Contains(store.publishedText, "已完成 2 步、失败 1 步") ||
-		!strings.Contains(store.publishedText, "详细步骤和执行记录请查看任务记录") ||
-		!strings.Contains(store.publishedText, app.TaskTerminalDeliverySafeNextStep(app.TaskTerminalDeliverySourceFailure)) {
+		!strings.Contains(store.publishedText, "任务详情") ||
+		strings.Contains(store.publishedText, "已完成 2 步") || strings.Contains(store.publishedText, "对账") ||
+		strings.Contains(store.publishedText, "再试一次") || strings.Contains(store.publishedText, "正在查") {
 		t.Fatalf("definite pre-dispatch fallback: found=%t err=%v persisted=%d published=%d text=%q",
 			found, err, store.persisted, store.published, store.publishedText)
 	}
@@ -209,16 +209,18 @@ func TestBuildTaskTerminalDeliveryModelRequestVerifiesDigestAndOmitsInternalIden
 			t.Fatalf("internal identity in model request: %s", raw)
 		}
 	}
-	for _, fact := range []string{`\"step_counts\"`, `\"succeeded\":2`, `\"failed\":1`, `\"unconfirmed\":1`,
+	for _, fact := range []string{
 		app.TaskTerminalDeliverySafeNextStep(app.TaskTerminalDeliverySourceFailure),
 		app.TaskTerminalDeliveryFailureExplanation("provider_unavailable"), `\"failure_explanation\"`,
 		"never expose message IDs, source hashes, checkpoint markers, internal tool names, or internal status/error codes",
-		"what remains unconfirmed, and one safe next step"} {
+		"Do not list step counts or treat operational progress steps as evidence of task results",
+		"the result is unconfirmed and that no safe retry is available"} {
 		if !bytes.Contains(raw, []byte(fact)) {
 			t.Fatalf("model request omitted progress or safe-delivery rule %q: %s", fact, raw)
 		}
 	}
-	if bytes.Contains(raw, []byte("provider_unavailable")) || bytes.Contains(raw, []byte("failure_code")) {
+	if bytes.Contains(raw, []byte("provider_unavailable")) || bytes.Contains(raw, []byte("failure_code")) ||
+		bytes.Contains(raw, []byte("step_counts")) || bytes.Contains(raw, []byte("succeeded")) {
 		t.Fatalf("model request exposed an internal failure code instead of a user-facing fact: %s", raw)
 	}
 	tampered := store.facts
@@ -236,11 +238,11 @@ func TestTaskTerminalDeliveryWaitingReasonUsesSafeCategories(t *testing.T) {
 	}{
 		{reason: "tool_result_unknown", want: "unknown_outcome", explanation: "结果尚未确认"},
 		{reason: "mcp_result_unknown", want: "unknown_outcome", explanation: "结果尚未确认"},
-		{reason: "dsh_recovery_unresolved", want: "reconciliation_required", explanation: "需要先对账确认"},
-		{reason: "model_retry_ladder_exhausted", want: "external_dependency", explanation: "等待所需信息"},
-		{reason: "model_context_limit", want: "external_dependency", explanation: "等待所需信息"},
-		{reason: "tool_call_budget", want: "external_dependency", explanation: "等待所需信息"},
-		{reason: "unexpected_private_reason", want: "reconciliation_required", explanation: "需要先对账确认"},
+		{reason: "dsh_recovery_unresolved", want: "reconciliation_required", explanation: "暂时无法安全继续"},
+		{reason: "model_retry_ladder_exhausted", want: "external_dependency", explanation: "当前没有可确认的后续操作"},
+		{reason: "model_context_limit", want: "external_dependency", explanation: "当前没有可确认的后续操作"},
+		{reason: "tool_call_budget", want: "external_dependency", explanation: "当前没有可确认的后续操作"},
+		{reason: "unexpected_private_reason", want: "reconciliation_required", explanation: "暂时无法安全继续"},
 	} {
 		safeReason := app.SafeTaskTerminalDeliveryWaitingReason(test.reason)
 		if safeReason != test.want {
@@ -256,6 +258,29 @@ func TestTaskTerminalDeliveryWaitingReasonUsesSafeCategories(t *testing.T) {
 	}
 }
 
+func TestTerminalDeliverySystemStateReplyDoesNotInventNewsResultsOrRetryActions(t *testing.T) {
+	failure := terminalDeliverySystemStateReply(app.TaskTerminalDeliverySourceFacts{
+		Identity:   app.TaskTerminalDeliveryIdentity{SourceKind: app.TaskTerminalDeliverySourceFailure},
+		TaskStatus: "failed", FailureCode: "unknown",
+		StepCounts:       app.TaskTerminalDeliveryStepCounts{Total: 1, Succeeded: 1},
+		ObjectiveSummary: "你看看今天有什么新闻",
+	})
+	if !strings.Contains(failure, "这次没有拿到已核实的结果，任务已中断") ||
+		!strings.Contains(failure, "原因暂未查明") || strings.Contains(failure, "新闻") ||
+		strings.Contains(failure, "已完成 1 步") || strings.Contains(failure, "再试一次") || strings.Contains(failure, "对账") {
+		t.Fatalf("unknown failure claimed progress, result, or retry: %q", failure)
+	}
+	waiting := terminalDeliverySystemStateReply(app.TaskTerminalDeliverySourceFacts{
+		Identity:   app.TaskTerminalDeliveryIdentity{SourceKind: app.TaskTerminalDeliverySourceWaiting},
+		TaskStatus: "waiting_user", WaitingReason: "reconciliation_required",
+		StepCounts: app.TaskTerminalDeliveryStepCounts{Total: 1, Succeeded: 1},
+	})
+	if !strings.Contains(waiting, "任务已暂停") || !strings.Contains(waiting, "暂时无法安全继续") ||
+		strings.Contains(waiting, "对账") || strings.Contains(waiting, "再试一次") || strings.Contains(waiting, "正在查") {
+		t.Fatalf("unknown waiting result offered an unsupported action: %q", waiting)
+	}
+}
+
 func TestTaskTerminalDeliveryFailureReasonReturnsToConversationInPlainLanguage(t *testing.T) {
 	for _, test := range []struct {
 		code        string
@@ -267,7 +292,7 @@ func TestTaskTerminalDeliveryFailureReasonReturnsToConversationInPlainLanguage(t
 		{code: "model_unavailable", explanation: "当前配置的模型不可用"},
 		{code: "model_output_invalid", explanation: "模型返回内容未通过格式校验"},
 		{code: "model_budget_exhausted", explanation: "模型调用预算已用尽"},
-		{code: "tool_failed", explanation: "某项工具执行失败"},
+		{code: "tool_failed", explanation: "某项操作失败"},
 		{code: "task_execution_failed", explanation: "任务执行未能完成"},
 		{code: "unexpected_private_failure", explanation: "无法确认具体原因"},
 	} {

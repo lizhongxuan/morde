@@ -303,6 +303,21 @@ export const portalApi = {
   taskStepDetail: async (id: string, stepID: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/steps/{step_id}', {
     params: { path: { id, step_id: stepID } },
   })),
+  retryTaskModelRecovery: async (id: string, body: { expected_revision: number; expected_event_sequence: number }, idempotencyKey: string) => {
+    const response = await requestFetch(`/api/tasks/${encodeURIComponent(id)}/model-recovery-retries`, {
+      method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(body),
+    });
+    if (!response.ok) await throwResponseError(response);
+    if (response.status !== 202) throw new Error('服务端未确认任务模型恢复请求，请核对任务状态。');
+    const value: unknown = await response.json();
+    if (!value || typeof value !== 'object' || !('id' in value) || value.id !== id ||
+      !('current_revision' in value) || value.current_revision !== body.expected_revision ||
+      !('event_sequence' in value) || typeof value.event_sequence !== 'number' ||
+      !Number.isSafeInteger(value.event_sequence) || value.event_sequence <= body.expected_event_sequence) {
+      throw new Error('服务端返回的任务模型恢复状态无效，请刷新任务核对。');
+    }
+    return value as components['schemas']['Task'];
+  },
   retryTaskStep: async (id: string, stepID: string, body: components['schemas']['TaskStepRetryRequest'], idempotencyKey: string) => {
     const result = await api.POST('/api/tasks/{id}/steps/{step_id}/retries', {
       params: { path: { id, step_id: stepID }, header: { 'Idempotency-Key': idempotencyKey } }, body,

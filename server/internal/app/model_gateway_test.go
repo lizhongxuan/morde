@@ -187,6 +187,19 @@ func TestTaskModelGatewayWaitsForTypedConcurrencyReservation(t *testing.T) {
 	}
 }
 
+func TestTaskModelGatewayReplayOnlyDoesNotDispatchWhenResponseIsMissing(t *testing.T) {
+	rawRequest := []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[]}`)
+	service, store, client, call := taskGatewayFixture(t, rawRequest, ModelResponse{Text: "unexpected dispatch", StopReason: "stop",
+		Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}, ProviderReportedModel: "provider-snapshot-3"})
+	call.ReplayTaskModelResponseOnly = true
+
+	_, err := service.Complete(context.Background(), call)
+	if domain.CodeOf(err) != domain.CodeInvalidState || store.recoverN != 1 || store.reserveN != 0 || store.dispatchN != 0 ||
+		store.abandonN != 0 || store.settleN != 0 || client.calls != 0 {
+		t.Fatalf("replay-only call dispatched without a settled response: err=%v store=%+v provider_calls=%d", err, store, client.calls)
+	}
+}
+
 func TestTaskModelGatewayStopsWaitingWhenCancelled(t *testing.T) {
 	store := &concurrencyLimitedModelGatewayStore{modelGatewayStoreTest: &modelGatewayStoreTest{}, always: true}
 	service, client, call := concurrencyTaskGatewayFixture(t, store)

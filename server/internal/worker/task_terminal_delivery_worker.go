@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -256,30 +255,24 @@ func (w *TaskTerminalDeliveryWorker) persistAndPublishSystemState(ctx context.Co
 }
 
 func terminalDeliverySystemStateReply(facts app.TaskTerminalDeliverySourceFacts) string {
-	progress := fmt.Sprintf("持久步骤记录共 %d 步：已完成 %d 步、失败 %d 步、取消 %d 步、未确认或未完成 %d 步；详细步骤和执行记录请查看任务记录。下一步：%s",
-		facts.StepCounts.Total, facts.StepCounts.Succeeded, facts.StepCounts.Failed, facts.StepCounts.Cancelled,
-		facts.StepCounts.Unconfirmed, app.TaskTerminalDeliverySafeNextStep(facts.Identity.SourceKind))
 	switch facts.Identity.SourceKind {
 	case app.TaskTerminalDeliverySourceFailure:
-		return fmt.Sprintf("系统状态说明：任务执行状态为失败。原因：%s %s", app.TaskTerminalDeliveryFailureExplanation(facts.FailureCode), progress)
+		cause := app.TaskTerminalDeliveryFailureExplanation(facts.FailureCode)
+		if cause == "" || facts.FailureCode == "unknown" {
+			return "这次没有拿到已核实的结果，任务已中断。原因暂未查明；可以查看任务详情。"
+		}
+		return "这次没有拿到已核实的结果，任务已中断。" + cause + "可以查看任务详情。"
 	case app.TaskTerminalDeliverySourceCancellation:
-		return "系统状态说明：任务已确认取消。" + progress
+		return "任务已停止；未完成的部分没有交付。可以查看任务详情。"
 	case app.TaskTerminalDeliverySourceWaiting:
-		return fmt.Sprintf("系统状态说明：任务当前处于等待处理状态。原因：%s %s", app.TaskTerminalDeliveryWaitingExplanation(facts.WaitingReason), progress)
+		return "任务已暂停。" + app.TaskTerminalDeliveryWaitingExplanation(facts.WaitingReason) + "可以查看任务详情。"
 	case app.TaskTerminalDeliverySourceValidation:
-		var checks []string
-		for _, finding := range facts.ValidationFindings {
-			if finding.Outcome == app.TaskValidationCheckFail || finding.Outcome == app.TaskValidationCheckPending {
-				checks = append(checks, string(finding.ID))
-			}
+		if facts.ValidationState == app.TaskValidationPass || facts.ValidationState == app.TaskValidationPassNotes {
+			return "任务结果已通过验证。验证依据可在任务详情查看。"
 		}
-		if len(checks) == 0 {
-			return fmt.Sprintf("系统状态说明：任务验证结论为 %s。%s", facts.ValidationState, progress)
-		}
-		return fmt.Sprintf("系统状态说明：任务验证结论为 %s；未通过或尚未确认的检查：%s。%s",
-			facts.ValidationState, strings.Join(checks, "、"), progress)
+		return "任务结果仍有检查未通过或待确认。验证依据可在任务详情查看。"
 	default:
-		return "系统状态说明：任务状态已记录。" + progress
+		return "任务状态已保存；当前没有可确认的结果。可以查看任务详情。"
 	}
 }
 

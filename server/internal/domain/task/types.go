@@ -174,6 +174,7 @@ type Task struct {
 	AgentEngineVersion          string
 	AgentProfileVersion         string
 	StepRetry                   *StepRetryIntent
+	ModelRecovery               *ModelRecoveryIntent `json:"-"`
 	CheckpointDigest            []byte
 	CheckpointThroughSequence   int64
 	EventSequence               int64

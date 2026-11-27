@@ -5785,6 +5785,39 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/model-recovery-retries:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+    post:
+      tags: [Tasks]
+      operationId: retryTaskModelRecovery
+      summary: Queue one persisted safe model recovery for the current Task revision
+      description: Available only when the server has persisted a retry_available intent from gateway-confirmed zero-dispatch evidence. The server rechecks the initiator, current authorization version, Task revision, event sequence, checkpoint and one-attempt schedule atomically. External writes and unknown outcomes are never retried by this action.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/IdempotencyKey' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TaskModelRecoveryRetryRequest' }
+      responses:
+        '202':
+          description: The exact Task recovery was queued or returned for an idempotent replay.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Task' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/file-fetches/{fetch_id}:
     parameters:
       - { name: id, in: path, required: true, schema: { $ref: '#/components/schemas/TaskId' } }
@@ -13165,6 +13198,13 @@ components:
       properties:
         expected_task_revision: { type: integer, format: int64, minimum: 0 }
         expected_attempt: { type: integer, format: int64, minimum: 1 }
+    TaskModelRecoveryRetryRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_revision, expected_event_sequence]
+      properties:
+        expected_revision: { type: integer, format: int64, minimum: 0 }
+        expected_event_sequence: { type: integer, format: int64, minimum: 0 }
     TaskStepRetryResult:
       type: object
       required: [task_id, source_step_id, attempt_step_id, attempt, status, replayed]
@@ -13515,6 +13555,7 @@ components:
           required: [event_sequence, result, waiting_reason, steps, batch_items, artifacts, pending_request, clarification_request, stop_request, assistant_message, finished_at]
           properties:
             event_sequence: { type: integer, format: int64, minimum: 0, description: Event cursor from the same database snapshot as this Task; resume task events after this sequence. }
+            attention: { oneOf: [{ $ref: '#/components/schemas/TaskAttention' }, { type: 'null' }], description: Server-derived presentation state for this authenticated caller. Action is non-null only for a current operation the caller can perform; event_sequence must match this Task snapshot. }
             result: { type: [string, 'null'] }
             validation_detail: { $ref: '#/components/schemas/TaskValidationEvidenceDetail', description: Optional read-only claim-to-evidence mapping for the current Task revision. Event streams do not expose this detail. }
             current_revision_started: { type: boolean, description: True only after the current Task revision's root Agent has durably begun a turn; also compare current_revision and desired_revision before showing it for a pending change. }
@@ -13534,6 +13575,15 @@ components:
             stop_request: { oneOf: [{ $ref: '#/components/schemas/TaskStopRequest' }, { type: 'null' }] }
             assistant_message: { oneOf: [{ $ref: '#/components/schemas/TaskAssistantMessage' }, { type: 'null' }] }
             finished_at: { type: [string, 'null'], format: date-time }
+    TaskAttention:
+      type: object
+      additionalProperties: false
+      required: [kind, reason, action, event_sequence]
+      properties:
+        kind: { type: string, enum: [needs_user_action, recovering, paused_retryable, interrupted, result_unverified] }
+        reason: { type: string, enum: [approval_required, clarification_required, recovery_scheduled, retry_available, execution_failed, outcome_unknown, unknown], description: Safe category only; never a provider error, tool name, or credential. }
+        action: { type: [string, 'null'], enum: [approve, clarify, retry, view_details, null], description: Null when no current authorized action exists. }
+        event_sequence: { type: integer, format: int64, minimum: 0, description: Must match the event_sequence of the Task snapshot. }
     TaskPage:
       type: object
       required: [items, next_cursor]

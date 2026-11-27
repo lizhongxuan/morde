@@ -661,15 +661,19 @@ func (state *cloudDSHSessionState) currentActivity() (string, string) {
 	return state.activeActivities[activityID], activityID
 }
 
-func cloudDSHModelFence(fence app.AgentInstanceFence, sessionID string, through int64) app.ModelTaskFence {
+func cloudDSHModelFence(fence app.AgentInstanceFence, sessionID string, through int64, revisions ...int64) app.ModelTaskFence {
+	revision := int64(0)
+	if len(revisions) != 0 {
+		revision = revisions[0]
+	}
 	return app.ModelTaskFence{TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID, LeaseOwner: fence.LeaseOwner,
-		LeaseVersion: fence.LeaseVersion, AgentInstanceID: fence.AgentInstanceID, AgentGeneration: fence.AgentGeneration,
+		TaskRevision: revision, LeaseVersion: fence.LeaseVersion, AgentInstanceID: fence.AgentInstanceID, AgentGeneration: fence.AgentGeneration,
 		AgentSessionID: sessionID, AgentRootSessionID: fence.AgentSessionID, AuthorizationVersion: fence.AuthorizationVersion,
 		ThroughSequence: through, EngineVersion: fence.EngineVersion, ProfileVersion: fence.ProfileVersion}
 }
 
-func cloudDSHModelFencePointer(fence app.AgentInstanceFence, sessionID string, through int64) *app.ModelTaskFence {
-	modelFence := cloudDSHModelFence(fence, sessionID, through)
+func cloudDSHModelFencePointer(fence app.AgentInstanceFence, sessionID string, through int64, revisions ...int64) *app.ModelTaskFence {
+	modelFence := cloudDSHModelFence(fence, sessionID, through, revisions...)
 	return &modelFence
 }
 
@@ -2122,8 +2126,37 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	pendingModels := make(map[string]*cloudDSHPendingModelCall)
 	queuedModelIDs := make([]string, 0, cloudDSHMaxPendingModelCalls)
 	activeModelIDs := make(map[string]struct{})
+	recoveryCallStarted := false
+	recoveryCallSucceeded := false
 	startModel := func(id string) {
 		pending := pendingModels[id]
+		var recoveryStartErr error
+		if intent := value.ModelRecovery; intent != nil {
+			beginAttempt, replayOnly, allowed := cloudDSHModelRecoveryStartAllowed(intent.State, id, intent.FailedCallID, intent.RecoveryCallID,
+				recoveryCallStarted, recoveryCallSucceeded)
+			if !allowed {
+				recoveryStartErr = errors.New("task model recovery outcome is not confirmed")
+			} else if beginAttempt || replayOnly {
+				if pending.identity.SessionID != rootIdentity.SessionID {
+					recoveryStartErr = errors.New("task model recovery must use the root session")
+				} else if checkpoint, ok := cloudDSHReadOnlyRecoveryCheckpointFor(value, pending.state, pending.modelCall, len(childSessions) > 0); !ok ||
+					checkpoint.ThroughSequence != intent.CheckpointThroughSequence || !bytes.Equal(checkpoint.Digest, intent.CheckpointDigest) ||
+					!bytes.Equal(checkpoint.ToolsetDigest, intent.ToolsetDigest) {
+					recoveryStartErr = errors.New("task model recovery checkpoint or toolset changed")
+				} else if beginAttempt {
+					if starter, ok := e.options.Tools.(cloudDSHTaskModelRecoveryAttemptStarter); !ok {
+						recoveryStartErr = errors.New("task model recovery attempt gate is unavailable")
+					} else if err := starter.BeginTaskModelRecoveryAttempt(ctx, *intent, fence); err != nil {
+						recoveryStartErr = errors.New("task model recovery attempt could not be confirmed")
+					} else {
+						recoveryCallStarted = true
+					}
+				} else {
+					pending.modelCall.ReplayTaskModelResponseOnly = true
+					recoveryCallStarted = true
+				}
+			}
+		}
 		modelCtx, cancelModel := context.WithCancel(ctx)
 		explicitCtx, cancelExplicit := context.WithCancel(context.Background())
 		modelCtx = app.WithModelExplicitCancellation(modelCtx, explicitCtx)
@@ -2143,7 +2176,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				}
 			}
 			if proofOK {
-				pending.stream = newCloudDSHTextStream(modelCtx, e.options.TextStreams, *modelCall.Task, modelCall.CallID, proof)
+				streamCallID := modelCall.CallID
+				if modelCall.Task != nil && modelCall.Task.RecoveryCallID != "" {
+					streamCallID = modelCall.Task.RecoveryCallID
+				}
+				pending.stream = newCloudDSHTextStream(modelCtx, e.options.TextStreams, *modelCall.Task, streamCallID, proof)
 				if pending.stream != nil {
 					modelCall.Request.OnTextDelta = pending.stream.append
 				}
@@ -2156,7 +2193,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			defer cancelExplicit()
 			var response app.ModelResponse
 			var err error
-			if protectsMemory && memoryValidator.ValidatePersonalMemoryProof(modelCtx, value, memoryProof, memoryVersions) != nil {
+			if recoveryStartErr != nil {
+				err = recoveryStartErr
+			} else if protectsMemory && memoryValidator.ValidatePersonalMemoryProof(modelCtx, value, memoryProof, memoryVersions) != nil {
 				err = errCloudDSHPersonalMemoryChanged
 			} else {
 				response, err = e.options.Models.Complete(modelCtx, modelCall)
@@ -2372,11 +2411,20 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 							continue
 						}
 					}
-					return cloudDSHModelResultErrorFor(result.err)
+					if pending.identity.SessionID == rootIdentity.SessionID {
+						if checkpoint, ok := cloudDSHReadOnlyRecoveryCheckpointFor(value, pending.state, pending.modelCall, len(childSessions) > 0); ok {
+							return cloudDSHModelResultErrorForCall(result.err, pending.modelCall, checkpoint)
+						}
+					}
+					return cloudDSHModelResultErrorForCall(result.err, pending.modelCall)
 				}
 				if failure := cloudDSHModelResponseFailureDiagnostic(result.response, pending.state.definitions); failure.Category != "" {
 					return cloudDSHModelResultError{category: failure.Category, reasonCode: failure.ReasonCode,
 						toolName: failure.ToolName, toolCallID: failure.ToolCallID, stage: failure.Stage}
+				}
+				if intent := value.ModelRecovery; intent != nil && pending.modelCall.Task != nil &&
+					pending.modelCall.Task.RecoveryCallID == intent.RecoveryCallID && pending.modelCall.CallID == intent.FailedCallID {
+					recoveryCallSucceeded = true
 				}
 				if !steerPending && pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through {
 					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
@@ -2897,7 +2945,12 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if cancelRequested {
 				continue
 			}
-			modelCall := app.ModelCall{Source: app.ModelCallTask, Task: cloudDSHModelFencePointer(fence, state.identity.SessionID, state.through),
+			modelFence := cloudDSHModelFence(fence, state.identity.SessionID, state.through, cloudDSHTaskRevision(value))
+			if intent := value.ModelRecovery; intent != nil && intent.FailedCallID == frame.ID &&
+				(intent.State == task.ModelRecoveryScheduled || intent.State == task.ModelRecoveryAttempting) && state.identity.SessionID == rootIdentity.SessionID {
+				modelFence.RecoveryCallID = intent.RecoveryCallID
+			}
+			modelCall := app.ModelCall{Source: app.ModelCallTask, Task: &modelFence,
 				ModelID: value.ModelID, CallID: frame.ID, RawRequest: append(json.RawMessage(nil), frame.Request...), ImageResolver: state.images}
 			var memoryVersions []app.CloudDSHMemoryVersion
 			if protectsMemory {

@@ -34,6 +34,8 @@ type taskModelResponseIdentity struct {
 	TaskOwnerID          string `json:"task_owner_id"`
 	TaskID               string `json:"task_id"`
 	CallID               string `json:"call_id"`
+	DSHCallID            string `json:"dsh_call_id,omitempty"`
+	TaskRevision         int64  `json:"task_revision,omitempty"`
 	RequestDigest        string `json:"request_digest"`
 	ModelID              string `json:"model_id"`
 	ProviderModel        string `json:"provider_model"`
@@ -79,13 +81,19 @@ func taskModelResponseAAD(reservation ModelCallReservation) (taskModelResponseId
 		reservation.Task.AgentGeneration < 1 || reservation.Task.AgentInstanceID == "" || len(reservation.Task.AgentInstanceID) > 128 ||
 		!dshModelIdentityPattern.MatchString(reservation.Task.AgentSessionID) ||
 		!dshModelIdentityPattern.MatchString(reservation.Task.AgentRootSessionID) ||
-		reservation.Task.AuthorizationVersion < 1 || reservation.Task.ThroughSequence < 0 ||
+		reservation.Task.AuthorizationVersion < 1 || reservation.Task.TaskRevision < 0 || reservation.Task.ThroughSequence < 0 ||
 		!idempotencyKeyPattern.MatchString(reservation.CallID) || reservation.Task.EngineVersion == "" ||
 		reservation.Task.ProfileVersion == "" {
 		return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response identity is invalid")
 	}
+	dshCallID := reservation.DSHCallID
+	if dshCallID == "" {
+		dshCallID = reservation.CallID
+	}
 	expectedCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, reservation.Task.ThroughSequence)
-	if err != nil || expectedCallID != reservation.CallID {
+	if err != nil || expectedCallID != dshCallID || reservation.Task.RecoveryCallID != "" &&
+		(reservation.Task.RecoveryCallID != reservation.CallID || reservation.Task.RecoveryCallID == dshCallID) ||
+		reservation.Task.RecoveryCallID == "" && reservation.CallID != dshCallID {
 		return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response call identity is invalid")
 	}
 	identity := taskModelResponseIdentity{Version: 1, OwnerID: reservation.OwnerID, TaskOwnerID: reservation.Task.OwnerID,
@@ -96,6 +104,10 @@ func taskModelResponseAAD(reservation ModelCallReservation) (taskModelResponseId
 		AgentSessionID: reservation.Task.AgentSessionID, AgentRootSessionID: reservation.Task.AgentRootSessionID,
 		AuthorizationVersion: reservation.Task.AuthorizationVersion, ThroughSequence: reservation.Task.ThroughSequence,
 		EngineVersion: reservation.Task.EngineVersion, ProfileVersion: reservation.Task.ProfileVersion}
+	if reservation.Task.RecoveryCallID != "" {
+		identity.DSHCallID = dshCallID
+		identity.TaskRevision = reservation.Task.TaskRevision
+	}
 	aad, err := json.Marshal(identity)
 	if err != nil {
 		return taskModelResponseIdentity{}, nil, domain.NewError(domain.CodeInternal, "task model response identity could not be encoded")

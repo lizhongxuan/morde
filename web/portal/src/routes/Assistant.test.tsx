@@ -70,6 +70,41 @@ const defaultAvailableModels: AvailableModels = {
 };
 let availableModelsResponse = defaultAvailableModels;
 const server = setupServer(http.get('*/api/available-models', () => HttpResponse.json(availableModelsResponse)));
+type TaskEventStreamMock = {
+  url: string;
+  request: Request;
+  closed: boolean;
+  send: (type: string, value: unknown) => void;
+  finish: () => void;
+};
+let taskEventStreams: TaskEventStreamMock[] = [];
+function installTaskEventStreamFetch() {
+  const fallbackFetch = globalThis.fetch;
+  const encoder = new TextEncoder();
+  vi.stubGlobal('fetch', (input: RequestInfo | URL, init?: RequestInit) => {
+    const rawURL = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    const parsedURL = new URL(rawURL, window.location.origin);
+    if (!/^\/api\/tasks\/[^/]+\/events$/.test(parsedURL.pathname)) return fallbackFetch(input, init);
+    const request = new Request(parsedURL, init);
+    let streamController: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const stream: TaskEventStreamMock = {
+      url: `${parsedURL.pathname}${parsedURL.search}`, request, closed: false,
+      send(type, value) {
+        if (!stream.closed) streamController?.enqueue(encoder.encode(`event: ${type}\ndata: ${JSON.stringify(value)}\n\n`));
+      },
+      finish() {
+        if (stream.closed) return;
+        stream.closed = true;
+        streamController?.close();
+      },
+    };
+    taskEventStreams.push(stream);
+    return Promise.resolve(new Response(new ReadableStream<Uint8Array>({
+      start(controller) { streamController = controller; },
+      cancel() { stream.closed = true; },
+    }), { headers: { 'Content-Type': 'text/event-stream', 'X-Trace-Id': 'e'.repeat(32) } }));
+  });
+}
 const otherModel = { ...model, id: 'p7654321', name: '备用模型' };
 const targetHost: Awaited<ReturnType<typeof portalApi.hosts>>['items'][number] = {
   id: 'h1234567', name: '测试电脑', owner_id: 'u1234567', template_id: 'std', isolation: 'container', state: 'running', state_reason: '',
@@ -87,7 +122,7 @@ const task = {
   model_id: model.id, objective: message.content, status: 'completed' as const, queue_priority: 'normal' as const, event_sequence: 0, current_step: null,
   step_count: 0, completed_step_count: 0,
   budget: { active_seconds: 600, tool_calls: 10, model_tokens: 1000 }, usage: { active_seconds: 2, tool_calls: 0, model_tokens: 12 },
-  dependencies: [], child_jobs: [], result_review: null,
+  dependencies: [], child_jobs: [], result_review: null, attention: null,
   created_at: timestamp, updated_at: timestamp, result: reply.content, waiting_reason: null, steps: [], batch_items: [],
   artifacts: [], pending_request: null, clarification_request: null, stop_request: null, assistant_message: null, finished_at: timestamp,
 } satisfies Awaited<ReturnType<typeof portalApi.task>>;
@@ -97,6 +132,7 @@ function asLegacyTask(value: Task): Task {
   delete legacy.dependencies;
   delete legacy.child_jobs;
   delete legacy.result_review;
+  delete legacy.attention;
   return legacy as unknown as Task;
 }
 let acceptedMessageSequence = 0;
@@ -210,6 +246,8 @@ describe('Assistant durable tasks', () => {
     server.listen();
   });
   beforeEach(() => {
+    taskEventStreams = [];
+    installTaskEventStreamFetch();
     availableModelsResponse = defaultAvailableModels;
     acceptedMessageSequence = 0;
     tesseractMock.createWorker.mockReset();
@@ -239,6 +277,20 @@ describe('Assistant durable tasks', () => {
   });
   afterEach(() => { cleanup(); server.resetHandlers(); localStorage.clear(); authUser.id = 'u1234567'; Reflect.deleteProperty(window, 'morde'); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
   afterAll(() => server.close());
+
+  it('sends the manual model recovery request with its revision fence and idempotency key', async () => {
+    const requestBody = { expected_revision: 4, expected_event_sequence: 8 };
+    let received: { id: string; key: string | null; body: unknown } | undefined;
+    server.use(http.post('*/api/tasks/:id/model-recovery-retries', async ({ request, params }) => {
+      received = { id: String(params.id), key: request.headers.get('Idempotency-Key'), body: await request.json() };
+      return HttpResponse.json({ ...task, status: 'queued', current_revision: 4, event_sequence: 9 }, { status: 202 });
+    }));
+
+    const result = await portalApi.retryTaskModelRecovery(task.id, requestBody, 'manual-recovery-key');
+
+    expect(received).toEqual({ id: task.id, key: 'manual-recovery-key', body: requestBody });
+    expect(result).toMatchObject({ id: task.id, current_revision: 4, event_sequence: 9 });
+  });
 
   it.each([
     ['web_search', 'running', '网页搜索 · 进行中'],
@@ -4686,7 +4738,7 @@ describe('Assistant durable tasks', () => {
     await user.click(within(panel).getByRole('button', { name: /更多任务/ }));
     await waitFor(() => expect(panel.querySelectorAll('.task-activity-card')).toHaveLength(12));
     expect(within(panel).queryByRole('button', { name: /更多任务/ })).not.toBeInTheDocument();
-    const labels = { waiting_user: '等待你处理', completed: '已完成', running: '执行中', paused: '已暂停',
+    const labels = { waiting_user: '已中断', completed: '已完成', running: '执行中', paused: '已暂停',
       failed: '失败', cancelling: '正在停止', queued: '排队中' } as const;
     for (const item of items) {
       const row = panel.querySelector<HTMLElement>(`.task-activity-card[data-task-id="${item.id}"]`);
@@ -4697,7 +4749,7 @@ describe('Assistant durable tasks', () => {
 
   it('shows each server Task state distinctly in the task list', async () => {
     const labels = {
-      queued: '排队中', running: '执行中', waiting_user: '等待你处理', pausing: '正在暂停', paused: '已暂停',
+      queued: '排队中', running: '执行中', waiting_user: '已中断', pausing: '正在暂停', paused: '已暂停',
       cancelling: '正在停止', completed: '已完成', failed: '失败', cancelled: '已取消',
     } as const;
     const items = Object.entries(labels).map(([status], index) => ({ ...task,
@@ -4848,22 +4900,12 @@ describe('Assistant durable tasks', () => {
     mockCommon({ conversations: [conversation], messages: [] });
     vi.mocked(portalApi.conversationTasks).mockResolvedValue({ items, next_cursor: null, pending_count: 0 });
     vi.mocked(portalApi.task).mockImplementation(async (id) => items.find((item) => item.id === id)!);
-    const sources: Array<{ url: string; closed: boolean }> = [];
-    class TestEventSource {
-      onopen: ((event: Event) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      closed = false;
-      constructor(public url: string) { sources.push(this); }
-      addEventListener() {}
-      close() { this.closed = true; }
-    }
-    vi.stubGlobal('EventSource', TestEventSource);
     renderPage();
-    await waitFor(() => expect(sources).toHaveLength(4));
-    const missing = items.find((item) => !sources.some((source) => source.url.includes(item.id)))!;
+    await waitFor(() => expect(taskEventStreams).toHaveLength(4));
+    const missing = items.find((item) => !taskEventStreams.some((source) => source.url.includes(item.id)))!;
     await findTaskActivity(missing.id);
-    await waitFor(() => expect(sources.some((source) => source.url.includes(missing.id) && !source.closed)).toBe(true));
-    expect(sources.filter((source) => !source.closed)).toHaveLength(4);
+    await waitFor(() => expect(taskEventStreams.some((source) => source.url.includes(missing.id) && !source.closed)).toBe(true));
+    expect(taskEventStreams.filter((source) => !source.closed)).toHaveLength(4);
   });
 
   it('keeps event cursors and invalidation isolated by task', async () => {
@@ -4874,37 +4916,25 @@ describe('Assistant durable tasks', () => {
     mockCommon({ conversations: [conversation], messages: [message, { ...message, id: 'm2345678', task_id: second.id }] });
     vi.mocked(portalApi.conversationTasks).mockResolvedValue({ items: allTasks, next_cursor: null, pending_count: 0 });
     vi.spyOn(portalApi, 'task').mockImplementation(async (id) => allTasks.find((item) => item.id === id)!);
-    const sources: Array<{ url: string; listeners: Map<string, EventListener> }> = [];
-    class TestEventSource {
-      onopen: ((event: Event) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      listeners = new Map<string, EventListener>();
-      constructor(public url: string) { sources.push(this); }
-      addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener); }
-      close() {}
-    }
-    vi.stubGlobal('EventSource', TestEventSource);
     const { client } = renderPage();
-    await waitFor(() => expect(sources).toHaveLength(4));
-    expect(sources.map((source) => source.url)).toEqual(expect.arrayContaining([
+    await waitFor(() => expect(taskEventStreams).toHaveLength(4));
+    expect(taskEventStreams.map((source) => source.url)).toEqual(expect.arrayContaining([
       `/api/tasks/${first.id}/events?after=3`, `/api/tasks/${second.id}/events?after=7`,
     ]));
-    expect(sources.map((source) => source.url)).not.toEqual(expect.arrayContaining(
+    expect(taskEventStreams.map((source) => source.url)).not.toEqual(expect.arrayContaining(
       allTasks.slice(4).map((item) => `/api/tasks/${item.id}/events?after=3`),
     ));
     const invalidate = vi.spyOn(client, 'invalidateQueries');
-    const source = sources.find((item) => item.url.includes(second.id))!;
-    await act(async () => source.listeners.get('task.step')?.(new MessageEvent('task.step', { data: JSON.stringify({ task_id: first.id, sequence: 8 }) })));
+    const source = taskEventStreams.find((item) => item.url.includes(second.id))!;
+    await act(async () => { source.send('task.step', { task_id: first.id, sequence: 8 }); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(invalidate).not.toHaveBeenCalled();
-    await act(async () => source.listeners.get('task.step')?.(new MessageEvent('task.step', { data: JSON.stringify({ task_id: second.id, sequence: 8 }) })));
+    await act(async () => { source.send('task.step', { task_id: second.id, sequence: 8 }); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['task', second.id] });
     expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ['conversation-messages', conversation.id] });
     const calls = invalidate.mock.calls.length;
-    await act(async () => source.listeners.get('task.step')?.(new MessageEvent('task.step', { data: JSON.stringify({ task_id: second.id, sequence: 8 }) })));
+    await act(async () => { source.send('task.step', { task_id: second.id, sequence: 8 }); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(invalidate).toHaveBeenCalledTimes(calls);
-    await act(async () => source.listeners.get('task.step')?.(new MessageEvent('task.step', { data: JSON.stringify({
-      task_id: second.id, sequence: 9, payload: { phase: 'started' },
-    }) })));
+    await act(async () => { source.send('task.step', { task_id: second.id, sequence: 9, payload: { phase: 'started' } }); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ['conversation-messages', conversation.id] });
   });
 
@@ -4917,23 +4947,13 @@ describe('Assistant durable tasks', () => {
     } as unknown as Task;
     mockCommon({ conversations: [conversation], messages: [message] });
     const getTask = vi.mocked(portalApi.task).mockResolvedValue(currentTask);
-    const sources: Array<{ listeners: Map<string, EventListener> }> = [];
-    class TestEventSource {
-      onopen: ((event: Event) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      listeners = new Map<string, EventListener>();
-      constructor(public url: string) { sources.push(this); }
-      addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener); }
-      close() {}
-    }
-    vi.stubGlobal('EventSource', TestEventSource);
     const { client } = renderPage();
-    await waitFor(() => expect(sources).toHaveLength(1));
+    await waitFor(() => expect(taskEventStreams).toHaveLength(1));
     const invalidate = vi.spyOn(client, 'invalidateQueries');
 
-    await act(async () => sources[0]?.listeners.get('task.result')?.(new MessageEvent('task.result', { data: JSON.stringify({
+    await act(async () => { taskEventStreams[0]?.send('task.result', {
       task_id: task.id, sequence: 11, task_revision: 2, status: 'completed', result: '旧修订结果不能覆盖当前任务',
-    }) })));
+    }); await new Promise((resolve) => setTimeout(resolve, 0)); });
 
     await waitFor(() => expect(getTask.mock.calls.length).toBeGreaterThan(1));
     const panel = await findTaskActivity(task.id);
@@ -4947,59 +4967,33 @@ describe('Assistant durable tasks', () => {
     const running = { ...task, status: 'running' as const, result: null, finished_at: null, event_sequence: 3 };
     mockCommon({ conversations: [conversation], messages: [message] });
     const read = vi.mocked(portalApi.task).mockResolvedValue(running);
-    const sources: Array<{ url: string; listeners: Map<string, EventListener>; closed: boolean; onerror: ((event: Event) => void) | null }> = [];
-    class TestEventSource {
-      onopen: ((event: Event) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      listeners = new Map<string, EventListener>();
-      closed = false;
-      constructor(public url: string) { sources.push(this); }
-      addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener); }
-      close() { this.closed = true; }
-    }
-    vi.stubGlobal('EventSource', TestEventSource);
     renderPage();
-    await waitFor(() => expect(sources).toHaveLength(1));
-    await act(async () => sources[0]!.listeners.get('task.step')?.(new MessageEvent('task.step', {
-      data: JSON.stringify({ task_id: task.id, sequence: 4 }),
-    })));
-    await act(async () => sources[0]!.onerror?.(new Event('error')));
+    await waitFor(() => expect(taskEventStreams).toHaveLength(1));
+    await act(async () => { taskEventStreams[0]!.send('task.step', { task_id: task.id, sequence: 4 }); await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await act(async () => { taskEventStreams[0]!.finish(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     await waitFor(() => expect(read.mock.calls.length).toBeGreaterThanOrEqual(2));
-    expect(sources[0]!.closed).toBe(true);
-    expect(sources).toHaveLength(1);
-    await act(async () => sources[0]!.listeners.get('task.step')?.(new MessageEvent('task.step', {
-      data: JSON.stringify({ task_id: task.id, sequence: 5 }),
-    })));
+    expect(taskEventStreams[0]!.closed).toBe(true);
+    expect(taskEventStreams).toHaveLength(1);
     read.mockResolvedValue({ ...running, event_sequence: 4 });
-    await waitFor(() => expect(sources).toHaveLength(2), { timeout: 3000 });
-    expect(sources[1]!.url).toBe(`/api/tasks/${task.id}/events?after=4`);
+    await waitFor(() => expect(taskEventStreams).toHaveLength(2), { timeout: 3000 });
+    expect(taskEventStreams[1]!.url).toBe(`/api/tasks/${task.id}/events?after=4`);
   });
 
   it('backs off an event stream reconnect when the task snapshot remains available', async () => {
     const running = { ...task, status: 'running' as const, result: null, finished_at: null, event_sequence: 3 };
     mockCommon({ conversations: [conversation], messages: [message] });
     const read = vi.spyOn(portalApi, 'task').mockResolvedValue(running);
-    const sources: Array<{ url: string; onerror: ((event: Event) => void) | null; closed: boolean }> = [];
-    class TestEventSource {
-      onopen: ((event: Event) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      closed = false;
-      constructor(public url: string) { sources.push(this); }
-      addEventListener() {}
-      close() { this.closed = true; }
-    }
-    vi.stubGlobal('EventSource', TestEventSource);
     renderPage();
-    await waitFor(() => expect(sources).toHaveLength(1));
+    await waitFor(() => expect(taskEventStreams).toHaveLength(1));
 
     const readCount = read.mock.calls.length;
-    await act(async () => sources[0]!.onerror?.(new Event('error')));
+    await act(async () => { taskEventStreams[0]!.finish(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     await waitFor(() => expect(read.mock.calls.length).toBeGreaterThan(readCount));
-    expect(sources[0]!.closed).toBe(true);
-    expect(sources).toHaveLength(1);
+    expect(taskEventStreams[0]!.closed).toBe(true);
+    expect(taskEventStreams).toHaveLength(1);
 
-    await waitFor(() => expect(sources).toHaveLength(2), { timeout: 3000 });
-    expect(sources[1]!.url).toBe(`/api/tasks/${task.id}/events?after=${running.event_sequence}`);
+    await waitFor(() => expect(taskEventStreams).toHaveLength(2), { timeout: 3000 });
+    expect(taskEventStreams[1]!.url).toBe(`/api/tasks/${task.id}/events?after=${running.event_sequence}`);
   });
 
   it('keeps two task workchains isolated in their own panels', async () => {
@@ -5065,32 +5059,19 @@ describe('Assistant durable tasks', () => {
     let history: ConversationMessage[] = [message];
     vi.mocked(portalApi.conversationMessages).mockImplementation(async () => ({ items: history, next_cursor: null }));
     const getTask = vi.spyOn(portalApi, 'task').mockResolvedValue(running);
-    const sources: Array<{ url: string; listeners: Map<string, EventListener>; closed: boolean }> = [];
-    class TestEventSource {
-      onopen: ((event: Event) => void) | null = null;
-      onerror: ((event: Event) => void) | null = null;
-      listeners = new Map<string, EventListener>();
-      closed = false;
-      constructor(public url: string) { sources.push(this); }
-      addEventListener(type: string, listener: EventListener) { this.listeners.set(type, listener); }
-      close() { this.closed = true; }
-    }
-    vi.stubGlobal('EventSource', TestEventSource);
     renderPage();
     await findTaskActivity(task.id);
-    await waitFor(() => expect(sources).toHaveLength(1));
+    await waitFor(() => expect(taskEventStreams).toHaveLength(1));
 
     history = [message, interrupted];
     getTask.mockResolvedValue(recovered);
-    await act(async () => sources[0]!.listeners.get('task.snapshot_required')?.(
-      new MessageEvent('task.snapshot_required', { data: JSON.stringify({ sequence: 11 }) }),
-    ));
+    await act(async () => { taskEventStreams[0]!.send('task.snapshot_required', { sequence: 11 }); await new Promise((resolve) => setTimeout(resolve, 0)); });
 
     expect(await screen.findByText('断线期间保留的上一轮回复')).toBeInTheDocument();
     expect(await screen.findByText('当前回复')).toBeInTheDocument();
-    await waitFor(() => expect(sources).toHaveLength(2));
-    expect(sources[0]!.closed).toBe(true);
-    expect(sources[1]!.url).toBe(`/api/tasks/${task.id}/events?after=11`);
+    await waitFor(() => expect(taskEventStreams).toHaveLength(2));
+    expect(taskEventStreams[0]!.closed).toBe(true);
+    expect(taskEventStreams[1]!.url).toBe(`/api/tasks/${task.id}/events?after=11`);
   });
 
   it('keeps task work items beside the composer without the removed progress section', async () => {
@@ -5142,8 +5123,10 @@ describe('Assistant durable tasks', () => {
   });
 
   it('shows a recovery interruption without task action buttons', async () => {
-    const pending = { ...message, id: 'm2345678', content: '继续', delivery_status: 'pending' as const };
-    mockCommon({ conversations: [conversation], messages: [message, pending] });
+    const pending = { ...message, id: 'm2345678', content: '继续', task_id: undefined, related_task_id: undefined,
+      delivery_status: 'pending' as const };
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    mockCommon({ conversations: [conversation], messages: [source, pending] });
     const interrupted = { ...task, status: 'waiting_user' as const, result: null, finished_at: null,
       waiting_reason: 'dsh_recovery_unresolved', current_step: 's2345678', steps: [{
         id: 's1234567', sequence: 1, attempt: 1, retryable: false, kind: 'tool' as const, status: 'succeeded' as const,
@@ -5164,14 +5147,168 @@ describe('Assistant durable tasks', () => {
     expect(await within(activity).findByText('状态：状态待确认')).toBeInTheDocument();
     expect(screen.queryByText(/category:/)).not.toBeInTheDocument();
     expect(screen.queryByText('Review cloud task recovery')).not.toBeInTheDocument();
-    expect(document.querySelector('.chat-message-task-recovery')).toBeNull();
-    for (const userMessage of screen.getAllByRole('article', { name: '你的消息' })) {
-      expect(within(userMessage).queryByRole('status')).not.toBeInTheDocument();
-      expect(within(userMessage).queryByRole('button')).not.toBeInTheDocument();
-    }
+    expect(await screen.findByRole('status', { name: '任务状态：已中断' })).toHaveTextContent('当前没有可用的继续操作');
+    expect(screen.getByRole('button', { name: '查看任务详情' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '等待接收' })).not.toBeInTheDocument();
     expect(within(activity).queryByRole('button', { name: /暂停任务|停止任务|补充任务/u })).not.toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: '消息内容' })).toBeEnabled();
+  });
+
+  it('uses the server Task attention in the panel and beside its original conversation message', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const attentionTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
+      finished_at: null, event_sequence: 8,
+      attention: { kind: 'result_unverified', reason: 'do-not-display-provider-diagnostic', action: null, event_sequence: 8 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [attentionTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
+    renderPage();
+
+    expect(await screen.findByRole('status', { name: '任务状态：结果待核对' })).toHaveTextContent('执行结果尚未确认');
+    expect(screen.queryByText('do-not-display-provider-diagnostic')).not.toBeInTheDocument();
+    const activity = await findTaskActivity(task.id);
+    expect(activity.querySelector('.task-activity-status')).toHaveTextContent('结果待核对');
+    expect(within(activity).queryByRole('button', { name: /暂停任务|停止任务|补充任务|再试一次/u })).not.toBeInTheDocument();
+  });
+
+  it('offers a fenced model recovery retry only for the current server-confirmed retry snapshot', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const retryableTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'model_call_failed', finished_at: null,
+      current_revision: 4, desired_revision: 4, event_sequence: 8,
+      attention: { kind: 'paused_retryable', reason: 'retry_available', action: 'retry', event_sequence: 8 },
+    } as unknown as Task;
+    const recoveringTask = {
+      ...retryableTask, status: 'queued' as const, event_sequence: 9,
+      attention: { kind: 'recovering', reason: 'recovery_scheduled', action: null, event_sequence: 9 },
+    } as unknown as Task;
+    let latestTask = retryableTask;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [retryableTask] });
+    vi.spyOn(portalApi, 'task').mockImplementation(async () => latestTask);
+    let finishRetry: ((value: Task) => void) | undefined;
+    const retry = vi.spyOn(portalApi, 'retryTaskModelRecovery').mockImplementation(async () => new Promise((resolve) => {
+      finishRetry = resolve;
+    }));
+    const { client } = renderPage();
+
+    expect(await screen.findByRole('status', { name: '任务状态：已暂停，可重试' })).toBeInTheDocument();
+    const activity = await findTaskActivity(task.id);
+    const inlineStatus = screen.getByRole('status', { name: '任务状态：已暂停，可重试' });
+    const inlineRetry = within(inlineStatus).getByRole('button', { name: '重试任务' });
+    const detailRetry = within(activity).getByRole('button', { name: '重试任务' });
+    expect(inlineRetry).toBeEnabled();
+    expect(detailRetry).toBeEnabled();
+
+    await userEvent.setup().click(inlineRetry);
+    await waitFor(() => expect(retry).toHaveBeenCalledWith(task.id,
+      { expected_revision: 4, expected_event_sequence: 8 }, expect.any(String)));
+    expect(inlineRetry).toBeDisabled();
+    expect(detailRetry).toBeDisabled();
+    latestTask = recoveringTask;
+    await act(async () => { finishRetry?.(recoveringTask); });
+
+    expect(await screen.findByText('已提交任务恢复请求，正在更新最新状态。')).toBeInTheDocument();
+    await waitFor(() => expect(client.getQueryData<Task>(['task', task.id])?.event_sequence).toBe(9));
+    await waitFor(() => expect(screen.queryByRole('button', { name: '重试任务' })).not.toBeInTheDocument());
+    expect(screen.getByRole('status', { name: '任务状态：正在恢复' })).toBeInTheDocument();
+  });
+
+  it.each([
+    ['stale event sequence', { kind: 'paused_retryable', reason: 'retry_available', action: 'retry', event_sequence: 7 }],
+    ['unverified result', { kind: 'result_unverified', reason: 'outcome_unknown', action: 'retry', event_sequence: 8 }],
+    ['unsupported retry reason', { kind: 'paused_retryable', reason: 'unknown', action: 'retry', event_sequence: 8 }],
+  ])('does not offer model recovery retry for a %s attention snapshot', async (_caseName, attention) => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const ineligibleTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'model_call_unknown', finished_at: null,
+      current_revision: 4, desired_revision: 4, event_sequence: 8, attention,
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [ineligibleTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(ineligibleTask);
+    const retry = vi.spyOn(portalApi, 'retryTaskModelRecovery');
+    renderPage();
+
+    await screen.findByRole('article', { name: '你的消息' });
+    expect(screen.queryByRole('button', { name: '重试任务' })).not.toBeInTheDocument();
+    expect(retry).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['server denied the action', { kind: 'needs_user_action', reason: 'approval_required', action: null, event_sequence: 8 }],
+    ['the attention snapshot is stale', { kind: 'needs_user_action', reason: 'approval_required', action: 'approve', event_sequence: 7 }],
+  ])('does not show a pending approval as actionable when %s', async (_caseName, attention) => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const approval = { id: 'k1234567', version: 4, kind: 'approval' as const, status: 'pending' as const,
+      title: '写入文件', object: '工作区文件', content: '创建报告.md', impact: '会新增一个文件',
+      disclosures: unknownApprovalDisclosures, expires_at: null };
+    const waitingTask = {
+      ...task, status: 'waiting_user' as const, result: null, finished_at: null, event_sequence: 8,
+      waiting_reason: 'approval_required', pending_request: approval,
+      attention,
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [waitingTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(waitingTask);
+    renderPage();
+
+    expect(await screen.findByRole('status', { name: '任务状态：已中断' })).toBeInTheDocument();
+    expect(screen.queryByRole('region', { name: '需要批准的操作' })).not.toBeInTheDocument();
+    expect(screen.queryByText('需要你操作')).not.toBeInTheDocument();
+  });
+
+  it('refreshes the inline Task attention from the latest Task snapshot', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const attentionTask = {
+      ...task, status: 'waiting_user' as const, result: null, finished_at: null, event_sequence: 8,
+      waiting_reason: 'dsh_recovery_unresolved',
+      attention: { kind: 'interrupted', reason: 'recovery_unresolved', action: 'view_details', event_sequence: 8 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [attentionTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
+    const { client } = renderPage();
+    expect(await screen.findByRole('status', { name: '任务状态：已中断' })).toBeInTheDocument();
+
+    await act(async () => {
+      client.setQueryData(['task', task.id], {
+        ...attentionTask, status: 'completed', result: '任务已完成', result_message_published: true,
+        event_sequence: 9, attention: null,
+      });
+    });
+
+    await waitFor(() => expect(screen.queryByRole('status', { name: '任务状态：已中断' })).not.toBeInTheDocument());
+    expect(screen.queryByRole('button', { name: '查看任务详情' })).not.toBeInTheDocument();
+  });
+
+  it('does not add an inline Task attention beside an already delivered assistant reply', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const terminalReply = { ...reply, id: 'm7654322', sequence: 2, task_id: task.id, delivery_status: 'applied' as const };
+    const attentionTask = {
+      ...task, status: 'waiting_user' as const, result: null, finished_at: null, event_sequence: 8,
+      waiting_reason: 'dsh_recovery_unresolved',
+      attention: { kind: 'interrupted', reason: 'recovery_unresolved', action: 'view_details', event_sequence: 8 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source, terminalReply], tasks: [attentionTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
+    renderPage();
+
+    expect(await screen.findByText('你好！')).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: '任务状态：已中断' })).not.toBeInTheDocument();
+  });
+
+  it('shows the acknowledgement only when the current user’s message is explicitly acknowledged by the server', async () => {
+    const acknowledged = { ...message, actor_id: authUser.id, agent_acknowledged: true } as ConversationMessage;
+    const fastAnswer = { ...reply, id: 'm7654322', sequence: 3, role: 'user' as const, content: '快答',
+      actor_id: authUser.id, agent_acknowledged: false } as unknown as ConversationMessage;
+    const otherUser = { ...message, id: 'm7654323', sequence: 4, task_id: 'q7654321', content: '其他人的请求',
+      actor_id: 'u7654321', agent_acknowledged: true } as ConversationMessage;
+    mockCommon({ conversations: [conversation], messages: [acknowledged, fastAnswer, otherUser] });
+    renderPage();
+
+    const userMessages = await screen.findAllByRole('article', { name: '你的消息' });
+    expect(within(userMessages[0]!).getByRole('img', { name: '已接下后台任务' })).toHaveTextContent('👌🏻');
+    expect(within(userMessages[1]!).queryByRole('img', { name: '已接下后台任务' })).not.toBeInTheDocument();
+    expect(within(userMessages[2]!).queryByRole('img', { name: '已接下后台任务' })).not.toBeInTheDocument();
+    expect(screen.queryAllByRole('img', { name: '已接下后台任务' })).toHaveLength(1);
   });
 
   it('explains a model input limit after a Task has already started', async () => {
@@ -5215,39 +5352,24 @@ describe('Assistant durable tasks', () => {
       id: 's1234567', sequence: 1, attempt: 1, retryable: false, kind: 'tool' as const, status: 'running' as const, title: '正在整理资料', summary: '', created_at: timestamp,
     }] };
     const getTask = vi.spyOn(portalApi, 'task').mockResolvedValueOnce(runningTask).mockResolvedValue({ ...runningTask, event_sequence: 3 });
-    let sourceURL = '';
-    const sourceURLs: string[] = [];
-    let sourceOpen: ((event: Event) => void) | null = null;
-    let sourceError: ((event: Event) => void) | null = null;
-    const eventHandlers = new Map<string, (event: MessageEvent<string>) => void>();
-    class TestEventSource {
-      get onopen() { return sourceOpen; }
-      set onopen(handler: ((event: Event) => void) | null) { sourceOpen = handler; }
-      get onerror() { return sourceError; }
-      set onerror(handler: ((event: Event) => void) | null) { sourceError = handler; }
-      constructor(url: string) { sourceURL = url; sourceURLs.push(url); }
-      addEventListener(type: string, handler: EventListener) { eventHandlers.set(type, handler as (event: MessageEvent<string>) => void); }
-      close() {}
-    }
-    vi.stubGlobal('EventSource', TestEventSource);
     renderPage();
     await openTaskDynamics();
     await findTaskActivity(task.id);
 
-    await waitFor(() => expect(sourceURL).not.toBe(''));
-    expect(sourceURL).toBe(`/api/tasks/${task.id}/events?after=${task.event_sequence}`);
-    await act(async () => sourceOpen?.(new Event('open')));
+    await waitFor(() => expect(taskEventStreams).toHaveLength(1));
+    expect(taskEventStreams[0]!.url).toBe(`/api/tasks/${task.id}/events?after=${task.event_sequence}`);
+    expect(taskEventStreams[0]!.request.headers.get('x-request-id')).toBeTruthy();
+    expect(taskEventStreams[0]!.request.headers.get('traceparent')).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
     expect(screen.getAllByText('正在整理资料').length).toBeGreaterThan(0);
-    await act(async () => eventHandlers.get('task.step')?.(new MessageEvent('task.step', { data: JSON.stringify({
+    await act(async () => { taskEventStreams[0]!.send('task.step', {
       task_id: task.id, sequence: 3, type: 'task.step', created_at: timestamp, payload: { secret: 'must stay private' },
-    }) })));
+    }); await new Promise((resolve) => setTimeout(resolve, 0)); });
     await waitFor(() => expect(getTask).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(sourceURLs).toHaveLength(2));
-    expect(sourceURLs[1]).toBe(`/api/tasks/${task.id}/events?after=3`);
-    await act(async () => sourceError?.(new Event('error')));
+    await waitFor(() => expect(taskEventStreams).toHaveLength(2));
+    expect(taskEventStreams[1]!.url).toBe(`/api/tasks/${task.id}/events?after=3`);
+    await act(async () => { taskEventStreams[1]!.finish(); await new Promise((resolve) => setTimeout(resolve, 0)); });
     expect(screen.getByText('连接中断，正在重连…')).toBeInTheDocument();
-    await waitFor(() => expect(sourceURLs).toHaveLength(3), { timeout: 3000 });
-    await act(async () => sourceOpen?.(new Event('open')));
+    await waitFor(() => expect(taskEventStreams).toHaveLength(3), { timeout: 3000 });
     expect(screen.queryByText('连接中断，正在重连…')).not.toBeInTheDocument();
     expect(screen.queryByText('任务步骤已更新')).not.toBeInTheDocument();
     expect(screen.queryByText('must stay private')).not.toBeInTheDocument();
@@ -5280,7 +5402,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
     await openTaskDynamics();
     const activity = await findTaskActivity(task.id);
-    expect(activity.querySelector('.task-activity-status')).toHaveTextContent('等待你处理');
+    expect(activity.querySelector('.task-activity-status')).toHaveTextContent('需要你操作');
     expect(activity.querySelector('.task-activity-status')).not.toHaveTextContent('已完成');
     expect(within(activity).queryByRole('region', { name: '需要批准的操作' })).not.toBeInTheDocument();
     const approvalCard = await screen.findByRole('region', { name: '需要批准的操作' });

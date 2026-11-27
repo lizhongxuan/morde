@@ -936,6 +936,9 @@ func (s *Store) ListConversationTasks(ctx context.Context, actorID, projectID, c
 		if err := populateTaskRevisionProjection(ctx, tx, items); err != nil {
 			return err
 		}
+		if err := loadTaskModelRecoveryIntents(ctx, tx, items); err != nil {
+			return err
+		}
 		projectionItems := items
 		if int32(len(projectionItems)) > limit {
 			projectionItems = projectionItems[:limit]

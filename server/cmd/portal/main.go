@@ -55,8 +55,10 @@ import (
 
 const defaultConfigPath = "/etc/cloudhost/portal.yaml"
 const legacyPCPortalEnabledEnv = "CH_PORTAL_LEGACY_PC_ENABLED"
+const taskModelRecoveryAutoEnv = "MORDE_TASK_MODEL_RECOVERY_AUTO"
 
 var _ api.TaskRequirementConfirmationService = (*app.TaskService)(nil)
+var _ api.TaskModelRecoveryRetryService = (*app.TaskService)(nil)
 
 func parseLegacyPCPortalEnabled(value string, set bool) (bool, error) {
 	if !set {
@@ -65,6 +67,17 @@ func parseLegacyPCPortalEnabled(value string, set bool) (bool, error) {
 	enabled, err := strconv.ParseBool(value)
 	if err != nil {
 		return false, fmt.Errorf("%s must be a boolean: %w", legacyPCPortalEnabledEnv, err)
+	}
+	return enabled, nil
+}
+
+func parseTaskModelRecoveryAuto(value string, set bool) (bool, error) {
+	if !set {
+		return false, nil
+	}
+	enabled, err := strconv.ParseBool(value)
+	if err != nil {
+		return false, fmt.Errorf("%s must be a boolean: %w", taskModelRecoveryAutoEnv, err)
 	}
 	return enabled, nil
 }
@@ -165,6 +178,10 @@ func serve(ctx context.Context, configPath string) error {
 		return err
 	}
 	legacyPCPortalEnabled, err := parseLegacyPCPortalEnabled(os.LookupEnv(legacyPCPortalEnabledEnv))
+	if err != nil {
+		return err
+	}
+	taskModelRecoveryAutoEnabled, err := parseTaskModelRecoveryAuto(os.LookupEnv(taskModelRecoveryAutoEnv))
 	if err != nil {
 		return err
 	}
@@ -757,6 +774,7 @@ func serve(ctx context.Context, configPath string) error {
 	var taskValidationReviewWorker *worker.TaskValidationReviewWorker
 	var taskTerminalDeliveryWorker *worker.TaskTerminalDeliveryWorker
 	var taskAgentStopReconciler worker.TaskAgentStopReconciler
+	var checkpoints *app.AgentCheckpointService
 	if cfg.CloudDSH.Enabled {
 		executionControlService, err = app.NewExecutionControlService(store, countedAudit)
 		if err != nil {
@@ -765,12 +783,13 @@ func serve(ctx context.Context, configPath string) error {
 		cloudDSHWorkers, workerErr := newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync, resolveAgentWorkspacePath,
 			modelGateway, sealer, mcpConnectors, recordCapture, personalDataService, personalSyncService,
 			personalAttachmentService, goalService, schedules, projects,
-			hubService, workerSuffix, serviceInstanceID, dataKey, logger, registry)
+			hubService, workerSuffix, serviceInstanceID, dataKey, taskModelRecoveryAutoEnabled, logger, registry)
 		if workerErr != nil {
 			return fmt.Errorf("initialize cloud dsh task worker: %w", workerErr)
 		}
 		taskWorker = cloudDSHWorkers.taskWorker
 		taskAgentStopReconciler = cloudDSHWorkers.accountRuntimes
+		checkpoints = cloudDSHWorkers.checkpoints
 		coordinatorCheckpoints, err := app.NewConversationCoordinatorCheckpointService(store, sealer)
 		if err != nil {
 			return err
@@ -1017,6 +1036,7 @@ func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttach
 type cloudDSHTaskWorkerBundle struct {
 	taskWorker      *worker.TaskWorker
 	accountRuntimes *worker.CloudDSHAccountRuntimeManager
+	checkpoints     *app.AgentCheckpointService
 }
 
 func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorizer app.TaskAuthorizer,
@@ -1025,7 +1045,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, recordCapture *app.RecordCaptureService,
 	personalData *app.PersonalMutationService, personalSync *app.PersonalSyncService,
 	personalFiles *app.PersonalAttachmentService, goals *app.GoalService, schedules *app.ScheduleService, projects *app.ProjectService, hubService *app.HubService,
-	workerID, serviceInstanceID string, historyCursorKey []byte, logger *zap.Logger, metrics prometheus.Registerer) (*cloudDSHTaskWorkerBundle, error) {
+	workerID, serviceInstanceID string, historyCursorKey []byte, taskModelRecoveryAutoEnabled bool, logger *zap.Logger, metrics prometheus.Registerer) (*cloudDSHTaskWorkerBundle, error) {
 	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
@@ -1070,6 +1090,9 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	tools, err := app.NewCloudDSHToolBrokerWithPersonalDataAndSchedules(store, toolRuntime, mcpConnectors, newMCPConnectorToolClient(),
 		recordCapture, personalData, personalSync, goals, personalFiles, projects, schedules, hubService)
 	if err != nil {
+		return nil, err
+	}
+	if err := tools.SetTaskModelRecoveryAutoEnabled(taskModelRecoveryAutoEnabled); err != nil {
 		return nil, err
 	}
 	if err := tools.SetAgentMessageSourceReader(checkpoints); err != nil {
@@ -1145,7 +1168,7 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	if err != nil {
 		return nil, err
 	}
-	return &cloudDSHTaskWorkerBundle{taskWorker: taskWorker, accountRuntimes: accountRuntimes}, nil
+	return &cloudDSHTaskWorkerBundle{taskWorker: taskWorker, accountRuntimes: accountRuntimes, checkpoints: checkpoints}, nil
 }
 
 func migrate(ctx context.Context, configPath, action string, stdout io.Writer) error {

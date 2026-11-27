@@ -57,6 +57,12 @@ type taskServiceStub struct {
 	stepRetryRevision            int64
 	stepRetryAttempt             int64
 	stepRetryIdempotency         string
+	modelRecoveryTaskID          string
+	modelRecoveryRevision        int64
+	modelRecoveryEventSequence   int64
+	modelRecoveryIdempotency     string
+	modelRecoveryCalls           int
+	modelRecoveryDetails         app.TaskDetails
 	actionTaskID                 string
 	action                       task.Action
 	actionExpected               task.Status
@@ -269,6 +275,14 @@ func (s *taskServiceStub) RetryStep(_ context.Context, _ identity.Principal, tas
 	s.stepRetryRevision, s.stepRetryAttempt = revision, attempt
 	s.stepRetryIdempotency = idempotencyKey
 	return s.stepRetryResult, s.err
+}
+
+func (s *taskServiceStub) RetryTaskModelRecovery(_ context.Context, _ identity.Principal, taskID string,
+	revision, eventSequence int64, idempotencyKey string) (app.TaskDetails, error) {
+	s.modelRecoveryCalls++
+	s.modelRecoveryTaskID, s.modelRecoveryRevision, s.modelRecoveryEventSequence = taskID, revision, eventSequence
+	s.modelRecoveryIdempotency = idempotencyKey
+	return s.modelRecoveryDetails, s.err
 }
 
 func (s *taskServiceStub) RequestAction(ctx context.Context, principal identity.Principal, taskID string, action task.Action, expected task.Status, key string) (app.TaskActionResult, error) {
@@ -631,6 +645,64 @@ func TestTaskResponseIncludesBatchAttemptAndArtifactAssociation(t *testing.T) {
 		view.Artifacts[0].Verified || view.Artifacts[0].WorkspaceID != nil || view.Artifacts[0].WorkspaceRevision != nil ||
 		view.Artifacts[0].SizeBytes != nil || view.Artifacts[0].SHA256 != nil {
 		t.Fatalf("batch response metadata = %#v", view)
+	}
+}
+
+func TestTaskResponseIncludesCurrentAttentionAndRejectsStaleAttention(t *testing.T) {
+	current := apiTestTask()
+	current.EventSequence = 7
+	action := app.TaskAttentionActionApprove
+	attention := &app.TaskAttention{Kind: app.TaskAttentionNeedsUserAction, Reason: "approval_required", Action: &action, EventSequence: 7}
+	view, err := toTaskResponse(app.TaskDetails{Task: current, Attention: attention})
+	if err != nil || view.Attention == nil || view.Attention.EventSequence != current.EventSequence || view.Attention.Action == nil || *view.Attention.Action != action {
+		t.Fatalf("current attention response = %#v err=%v", view.Attention, err)
+	}
+	encoded, err := json.Marshal(view)
+	if err != nil || !strings.Contains(string(encoded), `"attention":{"kind":"needs_user_action"`) || !strings.Contains(string(encoded), `"event_sequence":7`) {
+		t.Fatalf("Task response omitted its attention contract: %s err=%v", encoded, err)
+	}
+
+	attention.EventSequence++
+	if _, err := toTaskResponse(app.TaskDetails{Task: current, Attention: attention}); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("stale attention response error = %v, want internal", err)
+	}
+}
+
+func TestTaskModelRecoveryRetryReturnsUpdatedTaskAndUsesRevisionFence(t *testing.T) {
+	updated := apiTestTask()
+	updated.Status = task.StatusQueued
+	updated.EventSequence = 8
+	revision := int64(2)
+	updated.CurrentRevision, updated.DesiredRevision = &revision, &revision
+	service := &taskServiceStub{modelRecoveryDetails: app.TaskDetails{Task: updated}}
+	engine := taskAPIRouter(service, nil)
+	request := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/model-recovery-retries",
+		strings.NewReader(`{"expected_revision":2,"expected_event_sequence":7}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Idempotency-Key", "model-retry-0001")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusAccepted || service.modelRecoveryCalls != 1 || service.modelRecoveryTaskID != "q1234567" ||
+		service.modelRecoveryRevision != 2 || service.modelRecoveryEventSequence != 7 || service.modelRecoveryIdempotency != "model-retry-0001" {
+		t.Fatalf("status=%d calls=%d captured=%#v body=%s", response.Code, service.modelRecoveryCalls, service, response.Body.String())
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(response.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if string(body["id"]) != `"q1234567"` || string(body["status"]) != `"queued"` || string(body["event_sequence"]) != `8` {
+		t.Fatalf("response did not return the updated Task snapshot: %s", response.Body.String())
+	}
+
+	service.modelRecoveryCalls = 0
+	bad := httptest.NewRequest(http.MethodPost, "/api/tasks/q1234567/model-recovery-retries",
+		strings.NewReader(`{"expected_revision":2,"expected_event_sequence":7,"force":true}`))
+	bad.Header.Set("Content-Type", "application/json")
+	bad.Header.Set("Idempotency-Key", "model-retry-0002")
+	badResponse := httptest.NewRecorder()
+	engine.ServeHTTP(badResponse, bad)
+	if badResponse.Code != http.StatusBadRequest || service.modelRecoveryCalls != 0 {
+		t.Fatalf("unknown retry input was accepted: status=%d calls=%d body=%s", badResponse.Code, service.modelRecoveryCalls, badResponse.Body.String())
 	}
 }
 

@@ -2207,6 +2207,35 @@ type TaskModelCallResponse struct {
 	ProviderReportedModel pgtype.Text        `json:"provider_reported_model"`
 }
 
+type TaskModelRecoverySchedule struct {
+	TaskID               string             `json:"task_id"`
+	OwnerID              string             `json:"owner_id"`
+	InitiatorID          string             `json:"initiator_id"`
+	TaskRevision         int64              `json:"task_revision"`
+	AuthorizationVersion int64              `json:"authorization_version"`
+	AgentInstanceID      string             `json:"agent_instance_id"`
+	AgentGeneration      int64              `json:"agent_generation"`
+	AgentSessionID       string             `json:"agent_session_id"`
+	FailedLeaseOwner     string             `json:"failed_lease_owner"`
+	FailedLeaseVersion   int64              `json:"failed_lease_version"`
+	EngineVersion        string             `json:"engine_version"`
+	ProfileVersion       string             `json:"profile_version"`
+	FailedCallID         string             `json:"failed_call_id"`
+	FailedModelID        string             `json:"failed_model_id"`
+	FailedRequestDigest  []byte             `json:"failed_request_digest"`
+	FailedThroughSeq     int64              `json:"failed_through_seq"`
+	CheckpointThroughSeq int64              `json:"checkpoint_through_seq"`
+	CheckpointDigest     []byte             `json:"checkpoint_digest"`
+	ToolsetDigest        []byte             `json:"toolset_digest"`
+	RecoveryCallID       string             `json:"recovery_call_id"`
+	State                string             `json:"state"`
+	Automatic            bool               `json:"automatic"`
+	EventSequence        int64              `json:"event_sequence"`
+	AttemptStartedAt     pgtype.Timestamptz `json:"attempt_started_at"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+}
+
 type TaskOperation struct {
 	ID                          string             `json:"id"`
 	TaskID                      string             `json:"task_id"`
@@ -2344,11 +2373,12 @@ type TaskRevisionIntent struct {
 }
 
 type TaskRevisionStart struct {
-	TaskID        string             `json:"task_id"`
-	Revision      int64              `json:"revision"`
-	StepID        string             `json:"step_id"`
-	EventSequence int64              `json:"event_sequence"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	TaskID                   string             `json:"task_id"`
+	Revision                 int64              `json:"revision"`
+	StepID                   string             `json:"step_id"`
+	EventSequence            int64              `json:"event_sequence"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	AcknowledgementMessageID pgtype.Text        `json:"acknowledgement_message_id"`
 }
 
 type TaskSandboxCallReceipt struct {

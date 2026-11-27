@@ -61,6 +61,10 @@ type TaskStepRetryService interface {
 	RetryStep(context.Context, identity.Principal, string, string, int64, int64, string) (app.TaskStepRetryResult, error)
 }
 
+type TaskModelRecoveryRetryService interface {
+	RetryTaskModelRecovery(context.Context, identity.Principal, string, int64, int64, string) (app.TaskDetails, error)
+}
+
 type TaskRevisionFencedActionService interface {
 	RequestActionWithRevisionFence(context.Context, identity.Principal, string, task.Action, task.Status, *app.TaskActionRevisionFence, string) (app.TaskActionResult, error)
 }
@@ -188,6 +192,7 @@ type taskValidationResponse struct {
 type taskResponse struct {
 	taskSummaryResponse
 	EventSequence                   int64                                  `json:"event_sequence"`
+	Attention                       *app.TaskAttention                     `json:"attention"`
 	Result                          *string                                `json:"result"`
 	ValidationDetail                *app.TaskValidationEvidenceRecord      `json:"validation_detail,omitempty"`
 	CurrentRevisionStarted          *bool                                  `json:"current_revision_started,omitempty"`
@@ -674,6 +679,9 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	if retryService, ok := service.(TaskStepRetryService); ok {
 		group.POST("/tasks/:id/steps/:step_id/retries", h.retryTaskStep(retryService))
 	}
+	if recoveryService, ok := service.(TaskModelRecoveryRetryService); ok {
+		group.POST("/tasks/:id/model-recovery-retries", h.retryTaskModelRecovery(recoveryService))
+	}
 	if fetchService, ok := service.(TaskFileFetchQueryService); ok {
 		group.GET("/tasks/:id/file-fetches/:fetch_id", h.getTaskFileFetch(fetchService))
 	}
@@ -683,6 +691,45 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	group.POST("/tasks/:id/inputs", h.addTaskInput(service))
 	group.POST("/tasks/:id/approvals/:approval_id/responses", h.respondToTaskApproval(service))
 	group.GET("/tasks/:id/events", h.streamTaskEvents(service))
+}
+
+type taskModelRecoveryRetryRequest struct {
+	ExpectedRevision      int64 `json:"expected_revision"`
+	ExpectedEventSequence int64 `json:"expected_event_sequence"`
+}
+
+func (h *api) retryTaskModelRecovery(service TaskModelRecoveryRetryService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		var request taskModelRecoveryRetryRequest
+		if !decodeStrictTaskJSON(c, &request) {
+			return
+		}
+		if request.ExpectedRevision < 0 || request.ExpectedEventSequence < 0 {
+			writeError(c, domain.InvalidArgument("task_model_recovery", "retry request is invalid"))
+			return
+		}
+		details, err := service.RetryTaskModelRecovery(c.Request.Context(), principal, taskID,
+			request.ExpectedRevision, request.ExpectedEventSequence, c.GetHeader("Idempotency-Key"))
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		response, err := toTaskResponse(details)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		c.JSON(http.StatusAccepted, response)
+	}
 }
 
 func (h *api) confirmTaskRequirementManifest(service TaskRequirementConfirmationService) gin.HandlerFunc {
@@ -1537,7 +1584,8 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 	if err != nil {
 		return taskResponse{}, err
 	}
-	if value.Task.EventSequence < 0 || (value.CurrentRevisionStarted != nil && value.Task.CurrentRevision == nil) {
+	if value.Task.EventSequence < 0 || !app.ValidTaskAttention(value.Attention, value.Task.EventSequence) ||
+		(value.CurrentRevisionStarted != nil && value.Task.CurrentRevision == nil) {
 		return taskResponse{}, domain.NewError(domain.CodeInternal, "internal error")
 	}
 	if value.Plan != nil && (value.Plan.Validate() != nil || value.Task.CurrentRevision == nil || value.Plan.TaskRevision != *value.Task.CurrentRevision) {
@@ -1548,7 +1596,7 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		return taskResponse{}, err
 	}
 	response := taskResponse{
-		taskSummaryResponse: summary, EventSequence: value.Task.EventSequence,
+		taskSummaryResponse: summary, EventSequence: value.Task.EventSequence, Attention: value.Attention,
 		Result: stringPointer(value.Task.Result), CurrentRevisionStarted: value.CurrentRevisionStarted, ResultMessagePending: value.ResultMessagePending,
 		ResultMessagePublished: value.ResultMessagePublished, WaitingReason: stringPointer(value.Task.WaitingReason),
 		Steps: make([]taskStepResponse, 0, len(value.Steps)), Agents: make([]taskAgentResponse, 0, len(value.Agents)), BatchItems: make([]taskBatchItemResponse, 0, len(value.BatchItems)),
