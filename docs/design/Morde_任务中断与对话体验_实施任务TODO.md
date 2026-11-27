@@ -66,7 +66,7 @@
 ## T07 · P0：合并和灰度门槛（进行中；发布验收未完成）
 
 - [x] 隔离工作树回归：`go test ./internal/api ./internal/app ./cmd/portal -count=1`；恢复专属 Worker 测试（含完整搜索恢复 E2E）；本机 PostgreSQL `go test ./internal/store/postgres -run 'Test(DurableRecoveredToolAdmission|PostgresTaskModelRecovery)' -count=1`；DSH Runtime 恢复启动协议测试；PC `npm test -- src/routes/Assistant.test.tsx`（289/289）。2026-11-28 当前结果与命令见下方记录。
-- [ ] 用打包 PC 完成端到端回归，保存目标 commit、任务/事件关联、三种页面状态与实际派发次数；全量 worker 包测试当前未通过，测试 Runtime 在本机握手前退出（`account Agent Runtime handshake is invalid`），需在 DSH Runtime 可启动的环境重跑。
+- [ ] 用打包 PC 完成端到端回归，保存目标 commit、任务/事件关联、三种页面状态与实际派发次数；全量 Worker 包仍未通过，2026-11-28 的具体失败见下方记录，修复/补齐对应测试环境后重跑。
 - [ ] 真实 `morde-pc` 交互尚未稳定通过：本轮 `make pc` 构建并启动客户端后，隔离旁聊的无工具快答一直停留在连接状态，未收到助手回复；早先一次快速问答通过不代表当前连接稳定。仍需确认未知结果只保留在任务详情、原对话只显示自然语言说明，且终态回告模型未知时仍能收到确定性说明。
 - [ ] 正例：快答无 👌🏻；耗时任务一次 👌🏻；可重试故障自动恢复后出结果；耗尽后原对话收到说明；真实审批能继续。
 - [ ] 反例：结果或用量未知、工具不在授权范围、权限撤销、用户取消、checkpoint 不匹配、写入结果不明、两个 Worker 竞争。断言不发生不安全派发、跨账号展示或重复交付。
@@ -89,8 +89,9 @@
 - 通过：API、app、Portal：`go test ./internal/api ./internal/app ./cmd/portal -count=1`。恢复专属 Worker 组（包含完整 E2E）：`CH_TEST_DATABASE_URL=... go test ./internal/worker -run 'Test(CloudDSHReadOnlyRecovery|CloudDSHModelRecoveryStartRequiresExactAttemptAndConfirmedResponse|CloudDSHModelResultErrorForCallKeepsOnlyMatchingNoDispatchEvidence|CloudDSHModelResultErrorForCallKeepsOnlyMatchingProviderRejectEvidence|CloudDSHModelRecoveryResumesAfterSettledSearch)$' -count=1`。本机隔离 PostgreSQL：`go test ./internal/store/postgres -run 'Test(DurableRecoveredToolAdmission|PostgresTaskModelRecovery)' -count=1`。
 - T05 完整 E2E 通过：合成只读搜索结算一次，随后模型模拟零用量 429；原 Worker 停止，另一个 Worker 以新 generation 认领并恢复同一 Task；持久搜索结果被重放而没有第二次派发；最终答复写回原 conversation 一次。恢复期间若 checkpoint 后新增追问或 steer，Worker 拒绝沿用旧恢复调用身份；对应两个反例单测通过。
 - 通过：Runtime 恢复启动协议 `node --test --test-name-pattern='account runtime accepts a fenced model recovery start' test/runtime.test.mjs`；恢复预算身份 Runtime 组 `node --test test/model-budget-recovery-runtime.test.mjs`（3/3）；PC Portal `npm test -- src/routes/Assistant.test.tsx`（289/289，既有验证）；`gofmt` 与 `git diff --check` 无输出。
+- 未通过：全量 `go test ./internal/worker -count=1`（337.8 秒）。本次干净隔离树报告三个失败：模型预算 PostgreSQL/HTTP E2E 的响应账本与最终 DSH frame identity 不匹配；A30 PC bridge 用例缺少隔离工作树生成的 `clients/desktop/harness/dsh-nanomuse/lib/cloud.js`；终态文案断言与共享工作区未提交的 `task_terminal_delivery.go` 文案调整不一致。恢复专属 Worker/PostgreSQL 定向测试仍通过；该整包门槛不计为通过。
 - PC 实机：本轮 `make pc` 的 Portal、workbench 和 desktop 构建均成功，实际 `morde-pc` 窗口打开。新旁聊的无工具快答提交后持续停留在连接状态，未见助手回复；此前一次快答曾通过，本轮不能复验为稳定。没有在该旁聊重试，也没有重放历史任务。
-- 服务器：本轮 `/healthz` 曾返回 `ok`；随后 `/readyz` 请求超时，SSH 在 banner 阶段超时，无法核对服务器运行 commit、迁移或日志。因此不记录为本轮已部署版本，也不在服务器改库或操作未确认任务。
+- 服务器：本轮首次 `/healthz` 曾短暂返回 `ok`；随后 `/healthz` 与 `/readyz` 均超时，SSH 多次在 banner 阶段超时，无法核对服务器运行 commit、迁移或日志。因此不记录为本轮已部署版本，也不在服务器改库或操作未确认任务。
 - 灰度：`MORDE_TASK_MODEL_RECOVERY_AUTO` 继续默认关闭；未对线上任务执行重放或状态变更，尚无可比较的灰度指标。
 - T07 仍未完成：PC 快答/工具搜索路径没有稳定通过；全量 Worker 套件、剩余正反例、真实审批/并发入口、部署 commit 核验、灰度指标与截图事故 Task ID 仍待完成。不得据隔离 E2E 将整体验收或灰度标为通过。
 
