@@ -11,7 +11,7 @@ const start = {
   type: 'start', version: 1, context_role: 'coordinator', conversation_id: 'conversation_recovery',
   message_id: 'm1234567', owner_id: 'user_recovery', actor_id: 'actor_recovery', agent_id: 'agent_recovery',
   generation: 1, authorization_version: 1, session_id: 'session_recovery', purpose: 'compaction',
-  operation_id: 'operation_recovery', model: 'test-model', tools: [], context_window_tokens: 32_768,
+  operation_id: 'operation_recovery', model: 'test-model', tools: [], context_window_tokens: 32_768, max_tokens: 1_024,
   system_prompt: 'Generate a reliable summary of the authorized conversation.',
   source_messages: [
     { kind: 'message', id: 'm1234567', object_type: '', version: 0, sequence: 1, role: 'user',
@@ -61,6 +61,7 @@ async function run(t, { outcome = 'success', pages = [], resume = false } = {}) 
           through_seq: page.through_seq, payload: page.payload, sha256: page.sha256 })
       }
     } else if (frame.type === 'model') {
+      assert.equal(frame.request.max_tokens, start.max_tokens)
       if (outcome === 'cancel') {
         send({ type: 'cancel', ...fence(frame) })
       } else if (outcome === 'overflow' || outcome === 'failure') {

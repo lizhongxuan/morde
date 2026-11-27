@@ -601,3 +601,10 @@ R17 的 `WorkflowTrace` v1 已能从 owner-scoped PostgreSQL 快照关联 route�
 本地 OpenHands 为 Agent Canvas 前端源码，Claude Agent SDK 可参考权限合同；未找到 Microsoft Agent Framework 的独立源码。Magentic-UI 是本地参考项目，不等同 Microsoft Agent Framework。
 
 资料入口：[Muse 逆向工程](<muse-harness-reverse-engineering.md>) · [开源映射](<muse-steps-open-source-mapping.md>) · [测试主卷](<muse-harness-replication-test-cases.md>) · [测试补充卷](<muse-harness-replication-test-cases-supplement.md>) · [一体化实施方案](<Morde%20复刻%20Muse%20一体化实施与验收%20TODO.md>) · [分步任务](<实施任务TODO/00-总大纲.md>)。
+
+### 2026-11-27 生产长输入与历史摘要问题
+
+- 线上 PC 已成功分块提交约 38 KB 消息，服务端返回 202 并持久化原文；原文接收不是故障点。
+- 长消息路由把“总结文章”分类成普通回复；由于路由只看有界预览，服务端安全门拒绝用预览回答并返回澄清。修复路由规则：要求总结、分析、翻译或抽取长消息原文时创建 Task，再由 Task Agent 读取受授权原文。
+- 长历史压缩日志确认模型以 `stop_reason=length` 结束且输出文本为空。修复摘要调用以关闭隐藏思考，并将 DSH 摘要压缩显式预算设为 512–2048 tokens，同时从输入预算留出相应空间。
+- 代码已修复；本轮生产部署与实际 `morde-pc` 对话验收结果见[验证记录](../../验证记录/Morde_Harness_最终流程测试用例.md)。

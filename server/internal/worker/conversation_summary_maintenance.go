@@ -332,8 +332,14 @@ func conversationSummaryMaintenanceTokenBudget(contextWindow int) int {
 		return 0
 	}
 	headroom := min(4096, contextWindow/8)
-	maxTokens := min(2048, max(256, contextWindow/16))
-	return contextWindow - headroom - maxTokens
+	return contextWindow - headroom - conversationSummaryMaintenanceOutputTokens(contextWindow)
+}
+
+func conversationSummaryMaintenanceOutputTokens(contextWindow int) int {
+	if contextWindow < 4096 || contextWindow > app.MaxModelContextWindowTokens {
+		return 0
+	}
+	return min(2048, max(512, contextWindow/8))
 }
 
 func conversationSummaryMaintenanceInputBytes(previous string, sources []app.ConversationSummaryPromptSource) int {

@@ -1544,12 +1544,15 @@ export async function runAgent(ipc, frame) {
   const compactionBudget = Number.isSafeInteger(frame.context_window_tokens)
     ? hermesCompactionBudget(frame.context_window_tokens, frame.max_tokens ?? 0)
     : undefined
+  const compactionMaxTokens = frame.purpose === 'compaction' && Number.isSafeInteger(frame.max_tokens)
+    ? frame.max_tokens
+    : Math.min(2048, Math.max(256, Math.floor((frame.context_window_tokens ?? 4096) * 0.0625)))
   const compactionConfig = frame.purpose === 'compaction' ? {
     auto: false,
     thresholdRatio: compactionBudget.thresholdTokens / frame.context_window_tokens,
     headroomTokens: 0,
     retainTokens: compactionBudget.tailTokens,
-    maxTokens: Math.min(2048, Math.max(256, Math.floor(frame.context_window_tokens * 0.0625))),
+    maxTokens: compactionMaxTokens,
     compactionRetries: 0,
     maxOverflowRetries: 0,
   } : Number.isSafeInteger(frame.context_window_tokens) ? {

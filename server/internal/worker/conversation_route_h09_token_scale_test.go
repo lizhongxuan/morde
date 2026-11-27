@@ -59,8 +59,8 @@ func h09RunSyntheticTokenCorpus(t *testing.T, cumulativeTokens int) {
 	worker.options.Models = models
 
 	tokenBudget := conversationSummaryMaintenanceTokenBudget(h09SyntheticContextWindow)
-	if tokenBudget != 3_328 {
-		t.Fatalf("synthetic test context token budget = %d, want 3328", tokenBudget)
+	if tokenBudget != 3_072 {
+		t.Fatalf("synthetic test context token budget = %d, want 3072", tokenBudget)
 	}
 	compactions := 0
 	for len(store.summary.Sources) < sourceCount {

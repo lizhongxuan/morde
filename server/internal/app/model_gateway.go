@@ -495,7 +495,15 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	if call.Source == ModelCallTask || call.Source == ModelCallCompaction || call.Source == ModelCallReview {
 		request := call.Request
-		s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, call.Source != ModelCallCompaction)
+		if call.Source == ModelCallCompaction {
+			// Summary requests have a small, strict output budget. Do not spend it
+			// on hidden reasoning, even when the account-wide GPT-6 setting asks
+			// normal Task calls to use maximum reasoning.
+			request.DisableThinking = true
+			request.ReasoningEffort = ""
+		} else {
+			s.applyGPT6LunaReasoning(endpoint.Endpoint, &request, true)
+		}
 		call.Request = request
 		ownerID, digest, reserve, err = validateModelCall(call)
 		if err != nil {

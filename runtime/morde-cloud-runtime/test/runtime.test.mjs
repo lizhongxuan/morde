@@ -7026,7 +7026,7 @@ test('restores a durably checkpointed DSH compaction after runtime restart', asy
   const operationID = 'operation_compact_456'
   const { prompt: _prompt, ...base } = coordinatorStart('m4567890')
   const startFrame = {
-    ...base, purpose: 'compaction', operation_id: operationID, context_window_tokens: 32_768,
+    ...base, purpose: 'compaction', operation_id: operationID, context_window_tokens: 32_768, max_tokens: 1_024,
     source_messages: [
       { kind: 'message', id: 'm1234567', object_type: '', version: 0, sequence: 1, role: 'user', content: '请用中文回答。'.repeat(40) },
       { kind: 'message', id: 'm2345678', object_type: '', version: 0, sequence: 2, role: 'assistant', content: '我会继续使用中文。'.repeat(40) },
@@ -7039,7 +7039,10 @@ test('restores a durably checkpointed DSH compaction after runtime restart', asy
       savedPages.push(frame)
       send(proc, { type: 'checkpoint_ack', id: frame.id, ok: true, through_seq: frame.through_seq, sha256: frame.sha256 })
     }
-    if (frame.type === 'model') replyCoordinatorWithText(proc, frame, '中文')
+    if (frame.type === 'model') {
+      assert.equal(frame.request.max_tokens, startFrame.max_tokens)
+      replyCoordinatorWithText(proc, frame, '中文')
+    }
     if (frame.type === 'coordinator_settled') send(proc, { ...account, type: 'runtime_shutdown' })
     if (['coordinator_failed', 'coordinator_terminated', 'protocol_error'].includes(frame.type)) {
       send(proc, { ...account, type: 'runtime_shutdown' })
