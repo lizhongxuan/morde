@@ -26,6 +26,7 @@ const (
 	ConversationSummarySourceMemory      = "memory"
 	MaxConversationSummarySources        = 8192
 	MaxConversationSummaryBytes          = 256 << 10
+	MaxConversationSummaryCharacters     = 16_000
 	MaxConversationSummaryCiphertext     = 1 << 20
 	MaxConversationSummaryInputPageBytes = 64 << 10
 )
@@ -145,16 +146,17 @@ type ConversationSummaryCheckpoint struct {
 }
 
 type ConversationSummaryCommit struct {
-	Claim           ConversationRouteClaim
-	Identity        ConversationSummaryIdentity
-	OperationID     string
-	LeaseOwner      string
-	LeaseVersion    int64
-	BaselineVersion int64
-	SummarySHA256   []byte
-	SourcesSHA256   []byte
-	Ciphertext      []byte
-	Sources         []ConversationSummarySource
+	Claim              ConversationRouteClaim
+	Identity           ConversationSummaryIdentity
+	OperationID        string
+	LeaseOwner         string
+	LeaseVersion       int64
+	BaselineVersion    int64
+	PendingPredecessor bool
+	SummarySHA256      []byte
+	SourcesSHA256      []byte
+	Ciphertext         []byte
+	Sources            []ConversationSummarySource
 }
 
 type ConversationSummaryOperationRelease struct {

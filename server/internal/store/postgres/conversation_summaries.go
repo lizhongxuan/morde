@@ -720,9 +720,12 @@ func (s *Store) CommitConversationSummary(ctx context.Context, command app.Conve
 		if identity != command.Identity {
 			return domain.NewError(domain.CodeConflict, "conversation summary authorization changed")
 		}
-		previousMessageID, err := conversationSummaryPredecessorMessageID(ctx, tx, command.Claim, identity)
+		previousMessageID, pendingPredecessor, err := conversationSummaryPredecessorMessageID(ctx, tx, command.Claim, identity)
 		if err != nil {
 			return err
+		}
+		if pendingPredecessor != command.PendingPredecessor {
+			return domain.NewError(domain.CodeConflict, "conversation predecessor state changed during summary")
 		}
 		descendants, err := conversationRouteDescendantIDs(ctx, tx, command.Claim)
 		if err != nil {
@@ -845,7 +848,13 @@ SELECT source.source_order,source.kind,
       WHEN source.kind='task_result' THEN result.payload_sha256 ELSE NULL END
 FROM requested source
 LEFT JOIN conversation_messages m ON source.kind='message' AND m.id=source.id AND m.owner_id=$6
- AND m.conversation_id=$7 AND m.sequence=source.sequence AND m.delivery_status='applied'
+ AND m.conversation_id=$7 AND m.sequence=source.sequence AND (m.delivery_status='applied' OR
+   (m.id=$14 AND m.role='user' AND m.delivery_status='pending' AND EXISTS (
+     SELECT 1 FROM conversation_message_routes predecessor WHERE predecessor.message_id=m.id
+       AND predecessor.service_instance_id=$11::uuid AND predecessor.owner_id=m.owner_id
+       AND predecessor.actor_id=m.actor_id AND predecessor.conversation_id=m.conversation_id
+       AND predecessor.state IN ('routed','waiting_user','waiting_adjustment') AND predecessor.awaiting_predecessor=false
+   )))
  AND m.id<>$13 AND m.id<>ALL($15::text[]) AND (m.sequence<$12 OR m.id=$14)
  AND NOT EXISTS (SELECT 1 FROM personal_history_suppressions suppression
    WHERE suppression.service_instance_id=$11::uuid AND suppression.owner_id=$6 AND suppression.message_id=m.id)

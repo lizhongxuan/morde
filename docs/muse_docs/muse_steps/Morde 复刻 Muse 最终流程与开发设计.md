@@ -101,4 +101,5 @@ flowchart TD
 - 线上 PC 已成功分块提交约 38 KB 消息，服务端返回 202 并持久化原文；原文接收不是故障点。
 - 长消息路由把“总结文章”分类成普通回复；由于路由只看有界预览，服务端安全门拒绝用预览回答并返回澄清。修复路由规则：要求总结、分析、翻译或抽取长消息原文时创建 Task，再由 Task Agent 读取受授权原文。
 - 长历史压缩日志确认模型以 `stop_reason=length` 结束且输出文本为空。修复摘要调用以关闭隐藏思考，并将 DSH 摘要压缩显式预算设为 512–2048 tokens，同时从输入预算留出相应空间。
+- **OpenClaw 式摘要维护（当前仅本地工作树）：**适配 OpenClaw 的有效 reserve 与 `80% reserve` 输出预算策略；摘要输出随模型窗口扩大，provider 无最大输出元数据时仍受 8,192 tokens 保护。持久摘要保留 16,000 Unicode 字符硬上限。用 Goal/Constraints/Progress/Blocked/Decisions/Next Steps/Context 结构提示 DSH，并把确切前序的未完成用户请求纳入有来源证明的摘要输入；摘要输入哈希和提交事务复核 pending 状态，摘要明确保留未完成/待确认，不把 `waiting_user` 当作完成。此项尚未提交、部署或完成 PC 实机回归。
 - 代码已修复；本轮生产部署与实际 `morde-pc` 对话验收结果见[验证记录](../../验证记录/Morde_Harness_最终流程测试用例.md)。

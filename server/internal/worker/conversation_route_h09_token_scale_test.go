@@ -14,12 +14,12 @@ import (
 const (
 	h09SyntheticTokensPerSource = 1_000
 	h09SyntheticSourceBytes     = 8 << 10
-	h09SyntheticPreviousTokens  = 2_300
+	h09SyntheticPreviousTokens  = 512
 	h09SyntheticContextWindow   = 4_096
 )
 
 // This is synthetic estimator evidence only. The fixture assigns 1,000 tokens
-// to each source and 2,300 tokens to any non-empty prior summary; it does not
+// to each source and 512 tokens to any non-empty prior summary; it does not
 // use a real model tokenizer, DSH runtime, provider, or PostgreSQL store.
 // Estimate calls here are deterministic stubs: production collects a byte-capped
 // candidate prefix before token selection, so this test bounds final compact
@@ -59,8 +59,8 @@ func h09RunSyntheticTokenCorpus(t *testing.T, cumulativeTokens int) {
 	worker.options.Models = models
 
 	tokenBudget := conversationSummaryMaintenanceTokenBudget(h09SyntheticContextWindow)
-	if tokenBudget != 3_072 {
-		t.Fatalf("synthetic test context token budget = %d, want 3072", tokenBudget)
+	if tokenBudget != 2_765 {
+		t.Fatalf("synthetic test context token budget = %d, want 2765", tokenBudget)
 	}
 	compactions := 0
 	for len(store.summary.Sources) < sourceCount {
@@ -130,6 +130,30 @@ func h09RunSyntheticTokenCorpus(t *testing.T, cumulativeTokens int) {
 	}
 	if len(models.estimateRequests) == 0 {
 		t.Fatal("synthetic estimator was not used by incremental summary selection")
+	}
+}
+
+func TestConversationSummaryBudgetsScaleWithModelWindow(t *testing.T) {
+	for _, test := range []struct {
+		window int
+		input  int
+		output int
+	}{
+		{window: 4_096, input: 2_765, output: 819},
+		{window: 8_192, input: 5_530, output: 1_638},
+		{window: 16_384, input: 11_060, output: 3_276},
+		{window: 32_768, input: 22_119, output: 6_553},
+		{window: 65_536, input: 53_248, output: 8_192},
+	} {
+		if got := conversationSummaryMaintenanceTokenBudget(test.window); got != test.input {
+			t.Errorf("window %d input budget = %d, want %d", test.window, got, test.input)
+		}
+		if got := conversationSummaryMaintenanceOutputTokens(test.window); got != test.output {
+			t.Errorf("window %d output budget = %d, want %d", test.window, got, test.output)
+		}
+	}
+	if conversationSummaryMaintenanceOutputTokens(0) != 0 || conversationSummaryMaintenanceTokenBudget(app.MaxModelContextWindowTokens+1) != 0 {
+		t.Fatal("invalid model windows must not receive a summary budget")
 	}
 }
 

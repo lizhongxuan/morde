@@ -21,12 +21,13 @@ type ConversationSummaryInputPageRequest struct {
 }
 
 type ConversationSummaryInputPage struct {
-	Identity         ConversationSummaryIdentity
-	BoundarySequence int64
-	Head             ConversationSummaryHead
-	Summary          *StoredConversationSummary
-	Sources          []ConversationSummaryPromptSource
-	Next             *ConversationSummaryInputCursor
+	Identity           ConversationSummaryIdentity
+	BoundarySequence   int64
+	Head               ConversationSummaryHead
+	Summary            *StoredConversationSummary
+	Sources            []ConversationSummaryPromptSource
+	PendingPredecessor bool
+	Next               *ConversationSummaryInputCursor
 }
 
 type ConversationSummaryInputPageStore interface {

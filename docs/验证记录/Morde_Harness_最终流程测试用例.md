@@ -2840,3 +2840,11 @@ Tokenizer 与 token 统计来源：
 - **生产部署：**按用户授权将 `release` 的 `6d8eecc9684cddf531c77c366465ff696ff35c8c` 部署到 Portal。部署脚本 P0 smoke 为 5 PASS/0 FAIL/5 EXCEPTION；T01/T26/T36 需要独立 PostgreSQL 测试 DSN，T10/T43 需要真实 PC/模型/DSH 环境。部署后 Portal active，`/healthz=ok`、`/readyz=200`，迁移 current/latest=257/257。
 - **实际 PC 验收：通过本次长消息总结路径。**在源码 `morde-pc` 中，重试连接后将文章作为用户消息提交，服务端受理并进入思考状态；PC 最终返回五点总结，准确提到小任务交付目标、P0 单 Agent 流程、证据/权限/恢复门禁、P1/P2 扩展及两周指标，并注明文章属于需求评审稿而非已实现功能。没有通过普通用户 Web 或 iOS 代测。文章消息完整到达服务端，排除这次故障是 PC 截断上传的情况。
 - **未覆盖：**这次真实 PC 结果证明该长文章请求已可总结，不等于长会话压缩和跨模型上下文维护全部验收通过。前序 route 为 `waiting_user` 时维护仍会跳过 summary；需另行定义如何保留未解决 Task 状态并处理该前序条件，不能仅放宽状态过滤。P0 smoke 的例外项也未被此次 PC 验收覆盖。
+
+<a id="openclaw-summary-maintenance-2026-11-27"></a>
+### OpenClaw 式会话摘要维护改造（2026-11-27，本地）
+
+- **预算策略：**参考仓内 `project/openclaw` 的 compaction reserve、`0.8 × reserve` 输出预算及默认 16,000 字符持久摘要上限。Morde 使用 `reserve=min(16,384, contextWindow/4)`，摘要输出 `min(8,192, floor(0.8×reserve))`，输入预算另扣模型 headroom；摘要保存最多 16,000 Unicode 字符，同时保留 256 KiB 存储防线。8,192 tokens 是 provider 输出上限未进入模型连接元数据前的保守硬帽。
+- **未完成前序：**只允许 claim 明确指定的前序消息在 route 为 `routed`/`waiting_user`/`waiting_adjustment` 且非 `awaiting_predecessor` 时作为有证明的来源；pending 前序状态进入摘要 operation digest 与提交校验，摘要提示保留未完成/待确认，避免把它当作已完成。其他前序状态继续失败关闭。DSH compaction prompt 改为结构化 Goal、Constraints、Progress、Blocked、Decisions、Next Steps、Critical Context 格式。
+- **自动化：**`go test ./internal/app -run 'TestValidateConversationSummaryModelResponseNamesFirstFailure|TestSealConversationSummaryNamesTextFailure' -count=1` 通过；Worker 动态预算、pending 状态、summary commit 与 H09 合成增量覆盖定向用例通过。`go test ./internal/store/postgres -run '^TestConversationSummaryInputIncludesUnresolvedPredecessorWithoutMarkingItComplete$' -count=1` 因 `CH_TEST_DATABASE_URL` 未设置而跳过，不能作为 PostgreSQL 行为通过。DSH Runtime 的结构化摘要 prompt 回归和实际 PC/DSH 复测待执行。
+- **状态：**仅本地未提交代码；尚未推送/部署。M10-03/M10-06、真实长会话总结与多模型窗口恢复仍 pending；保留摘要来源证明、租户/授权隔离、旧摘要和原始历史的既有约束。

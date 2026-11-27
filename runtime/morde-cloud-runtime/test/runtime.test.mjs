@@ -6948,6 +6948,8 @@ test('account runtime compacts a bounded text-only conversation through the DSH 
       assert.equal(frame.id, coordinatorCompactionModelCallID(frame.conversation_id, operationID, frame.session_id, frame.through_seq))
       assert.deepEqual(frame.request.tools, [])
       assert.ok(JSON.stringify(frame.request).includes(previousSummaryText))
+      assert.ok(JSON.stringify(frame.request).includes('## 目标'))
+      assert.ok(JSON.stringify(frame.request).includes('### 阻塞或待确认'))
       assert.ok(frame.request.messages.length >= 2)
       assert.ok(frame.request.messages.every(message => message.content.every(block => block.type === 'text')))
       replyCoordinatorWithText(proc, frame, '已确认：用户偏好中文；Morde 开发优先复用 DSH。')

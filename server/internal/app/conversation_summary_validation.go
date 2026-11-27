@@ -77,7 +77,7 @@ func validateConversationSummaryText(text string) *ConversationSummaryValidation
 	case strings.ContainsRune(text, '\x00'):
 		return &ConversationSummaryValidationFailure{Reason: ConversationSummaryFailureNULByte,
 			TextBytes: len(text)}
-	case len(text) > MaxConversationSummaryBytes:
+	case len(text) > MaxConversationSummaryBytes || utf8.RuneCountInString(text) > MaxConversationSummaryCharacters:
 		return &ConversationSummaryValidationFailure{Reason: ConversationSummaryFailureTooLarge,
 			TextBytes: len(text)}
 	}

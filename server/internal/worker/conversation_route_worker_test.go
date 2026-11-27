@@ -1640,6 +1640,27 @@ func TestConversationRouteWorkerCommitsBoundedDSHSummaryBeforeRouting(t *testing
 	}
 }
 
+func TestConversationRouteWorkerMarksPendingPredecessorSummaryIncomplete(t *testing.T) {
+	worker, route, models, store, sealer, identity, _ := newSummaryRouteWorkerHarness(t,
+		strings.Repeat("事实", 13_000), 100_000,
+		CloudDSHConversationSummaryResult{Text: "Keep the preceding request unresolved.", ModelID: "p1234567", SessionID: "summary-session", Through: 12})
+	route.claim.Input.PreviousClientMessageID = "previous-client-message"
+	page := worker.options.SummaryInputs.(summaryInputPageStub).page
+	page.PendingPredecessor = true
+	worker.options.SummaryInputs = summaryInputPageStub{page: page}
+	committed, err := worker.compactConversationSummary(context.Background(), route.claim, "p1234567")
+	if err != nil || !committed || !models.request.PendingPredecessor || !store.commit.PendingPredecessor {
+		t.Fatalf("pending predecessor state was not carried through compaction: committed=%t request=%+v commit=%+v err=%v",
+			committed, models.request, store.commit, err)
+	}
+	opened, err := app.OpenConversationSummary(sealer, app.StoredConversationSummary{Identity: identity, Version: 1,
+		OperationID: "o1234567", SummarySHA256: store.commit.SummarySHA256, SourcesSHA256: store.commit.SourcesSHA256,
+		Ciphertext: store.commit.Ciphertext, Sources: store.commit.Sources})
+	if err != nil || !strings.HasPrefix(opened.Text, conversationSummaryIncompleteNotice+"\n\n") {
+		t.Fatalf("pending predecessor summary was not marked incomplete: text=%q err=%v", opened.Text, err)
+	}
+}
+
 func TestConversationRouteWorkerTriggersSummaryByTokenPressureBeforeTransportWatermark(t *testing.T) {
 	worker, route, models, store, _, _, _ := newSummaryRouteWorkerHarness(t, strings.Repeat("x", 22_000), 32_768,
 		CloudDSHConversationSummaryResult{Text: "short summary", ModelID: "p1234567", SessionID: "summary-session", Through: 12})
@@ -1758,7 +1779,7 @@ func TestConversationRouteWorkerRejectsInvalidSummaryResultsAndKeepsRouting(t *t
 		commitErr    error
 	}{
 		{name: "empty", modelID: "p1234567", contextBytes: 100_000},
-		{name: "oversized", text: strings.Repeat("x", conversationSummaryMaintenanceMaxOutputBytes+1), modelID: "p1234567", contextBytes: 100_000},
+		{name: "oversized", text: strings.Repeat("x", app.MaxConversationSummaryCharacters+1), modelID: "p1234567", contextBytes: 100_000},
 		{name: "model changed", text: "short", modelID: "p7654321", contextBytes: 100_000},
 		{name: "not smaller", text: strings.Repeat("x", 12_000), modelID: "p1234567", contextBytes: 16_000},
 		{name: "commit failed", text: "short", modelID: "p1234567", contextBytes: 100_000, commitErr: errors.New("synthetic commit failure")},

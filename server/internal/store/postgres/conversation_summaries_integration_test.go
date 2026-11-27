@@ -167,8 +167,9 @@ func TestConversationMessageAcceptanceContinuesDuringSummaryModelCall(t *testing
 }
 
 func commitRouteTestSummary(t *testing.T, f routeActionsTestFixture, claim app.ConversationRouteClaim, baseline int64,
-	text string, sources []app.ConversationSummarySource) {
+	text string, sources []app.ConversationSummarySource, pendingPredecessor ...bool) {
 	t.Helper()
+	pending := len(pendingPredecessor) > 0 && pendingPredecessor[0]
 	identity, err := app.ConversationSummaryScopeForClaim(claim)
 	if err != nil {
 		t.Fatal(err)
@@ -203,7 +204,7 @@ func commitRouteTestSummary(t *testing.T, f routeActionsTestFixture, claim app.C
 	}
 	if err := f.store.CommitConversationSummary(context.Background(), app.ConversationSummaryCommit{
 		Claim: claim, Identity: identity, OperationID: operationID, LeaseOwner: operation.LeaseOwner,
-		LeaseVersion: operation.LeaseVersion, BaselineVersion: baseline, SummarySHA256: sealed.SummarySHA256,
+		LeaseVersion: operation.LeaseVersion, BaselineVersion: baseline, PendingPredecessor: pending, SummarySHA256: sealed.SummarySHA256,
 		SourcesSHA256: sealed.SourcesSHA256, Ciphertext: sealed.Ciphertext, Sources: sealed.Sources,
 	}); err != nil {
 		t.Fatal(err)

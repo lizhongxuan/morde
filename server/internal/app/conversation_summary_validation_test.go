@@ -18,6 +18,7 @@ func TestValidateConversationSummaryModelResponseNamesFirstFailure(t *testing.T)
 		{"blank text", ModelResponse{StopReason: "stop", Text: "  \n "}, ConversationSummaryFailureBlankText},
 		{"invalid utf-8", ModelResponse{StopReason: "stop", Text: "bad\xffsummary"}, ConversationSummaryFailureInvalidUTF8},
 		{"nul byte", ModelResponse{StopReason: "stop", Text: "a\x00b"}, ConversationSummaryFailureNULByte},
+		{"too many characters", ModelResponse{StopReason: "stop", Text: strings.Repeat("中", MaxConversationSummaryCharacters+1)}, ConversationSummaryFailureTooLarge},
 		{"too large", ModelResponse{StopReason: "stop", Text: strings.Repeat("x", MaxConversationSummaryBytes+1)}, ConversationSummaryFailureTooLarge},
 	}
 	for _, tc := range cases {
@@ -87,10 +88,11 @@ func TestSealConversationSummaryNamesTextFailure(t *testing.T) {
 		text string
 		want string
 	}{
-		"blank text":    {"  ", ConversationSummaryFailureBlankText},
-		"invalid utf-8": {"bad\xffsummary", ConversationSummaryFailureInvalidUTF8},
-		"nul byte":      {"a\x00b", ConversationSummaryFailureNULByte},
-		"too large":     {strings.Repeat("x", MaxConversationSummaryBytes+1), ConversationSummaryFailureTooLarge},
+		"blank text":          {"  ", ConversationSummaryFailureBlankText},
+		"invalid utf-8":       {"bad\xffsummary", ConversationSummaryFailureInvalidUTF8},
+		"nul byte":            {"a\x00b", ConversationSummaryFailureNULByte},
+		"too many characters": {strings.Repeat("中", MaxConversationSummaryCharacters+1), ConversationSummaryFailureTooLarge},
+		"too large":           {strings.Repeat("x", MaxConversationSummaryBytes+1), ConversationSummaryFailureTooLarge},
 	} {
 		t.Run(name, func(t *testing.T) {
 			output := base
