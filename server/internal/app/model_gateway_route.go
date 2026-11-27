@@ -601,6 +601,7 @@ func (s *ModelGatewayService) CompleteConversationCoordinatorModel(ctx context.C
 		return ModelResponse{}, domain.InvalidArgument("model_call", "coordinator model request must be text-only and have no tools")
 	}
 	request.JSONMode = true
+	request.DisableThinking = true
 	for _, item := range request.Input {
 		if len(item.Images) != 0 {
 			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "coordinator model request cannot include images")
