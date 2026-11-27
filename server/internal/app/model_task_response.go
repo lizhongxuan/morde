@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -74,6 +75,12 @@ type taskModelResponseEnvelope struct {
 }
 
 func taskModelResponseAAD(reservation ModelCallReservation) (taskModelResponseIdentity, []byte, error) {
+	adaptiveBudget := reservation.BudgetPlanID != "" || reservation.BudgetCallID != "" || reservation.BudgetRequestDigest != ""
+	if adaptiveBudget && (!idempotencyKeyPattern.MatchString(reservation.BudgetPlanID) ||
+		!idempotencyKeyPattern.MatchString(reservation.BudgetCallID) ||
+		!modelBudgetDigestPattern.MatchString(reservation.BudgetRequestDigest)) {
+		return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response budget identity is invalid")
+	}
 	if reservation.Source != ModelCallTask || reservation.Task == nil || reservation.OwnerID != reservation.Task.InitiatorID ||
 		!domain.ValidUserID(reservation.OwnerID) || !domain.ValidUserID(reservation.Task.OwnerID) || !domain.ValidTaskID(reservation.Task.TaskID) ||
 		!domain.ValidModelConnectionID(reservation.ModelID) || taskValidationModelIdentityRouteKey(reservation.ProviderEndpoint) == "" || len(reservation.RequestDigest) != sha256.Size ||
@@ -99,7 +106,12 @@ func taskModelResponseAAD(reservation ModelCallReservation) (taskModelResponseId
 	recoveryLedgerCallID, ledgerRecoveryErr := TaskModelRecoveryCallID(reservation.Task.TaskID, reservation.Task.TaskRevision,
 		failedCallID, reservation.Task.ThroughSequence)
 	if reservation.Task.RecoveryCallID == "" {
-		if dshCallID != failedCallID || reservation.CallID != failedCallID || reservation.Task.RecoveryDSHCallID != "" {
+		if adaptiveBudget {
+			if dshCallID != failedCallID || !strings.HasPrefix(reservation.CallID, "mdl_") || reservation.CallID == dshCallID ||
+				reservation.Task.RecoveryDSHCallID != "" {
+				return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response call identity is invalid")
+			}
+		} else if dshCallID != failedCallID || reservation.CallID != failedCallID || reservation.Task.RecoveryDSHCallID != "" {
 			return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response call identity is invalid")
 		}
 	} else if dshRecoveryErr != nil || ledgerRecoveryErr != nil || dshCallID != recoveryDSHCallID ||
@@ -115,8 +127,10 @@ func taskModelResponseAAD(reservation ModelCallReservation) (taskModelResponseId
 		AgentSessionID: reservation.Task.AgentSessionID, AgentRootSessionID: reservation.Task.AgentRootSessionID,
 		AuthorizationVersion: reservation.Task.AuthorizationVersion, ThroughSequence: reservation.Task.ThroughSequence,
 		EngineVersion: reservation.Task.EngineVersion, ProfileVersion: reservation.Task.ProfileVersion}
-	if reservation.Task.RecoveryCallID != "" {
+	if reservation.Task.RecoveryCallID != "" || adaptiveBudget && dshCallID != reservation.CallID {
 		identity.DSHCallID = dshCallID
+	}
+	if reservation.Task.RecoveryCallID != "" {
 		identity.TaskRevision = reservation.Task.TaskRevision
 	}
 	aad, err := json.Marshal(identity)

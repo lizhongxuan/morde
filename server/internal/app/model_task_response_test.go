@@ -83,6 +83,51 @@ func TestTaskModelResponseSealOpenAndRejectsChangedFence(t *testing.T) {
 	}
 }
 
+func TestTaskModelResponseBindsAdaptiveLedgerAndFinalDSHCallIDsSeparately(t *testing.T) {
+	sealer, reservation := taskModelResponseFixture(t)
+	reservation.Task = normalizedModelTaskFence(reservation.Task)
+	reservation.Task.ThroughSequence = 7
+	ledgerCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dshCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, reservation.Task.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ledgerCallID == dshCallID {
+		t.Fatal("fixture must keep prepare ledger and final DSH call identities distinct")
+	}
+	reservation.CallID, reservation.DSHCallID = ledgerCallID, dshCallID
+	reservation.BudgetPlanID, reservation.BudgetCallID, reservation.BudgetRequestDigest =
+		"budget-plan-123", "budget-call-123", strings.Repeat("a", 64)
+	response := ModelResponse{Text: "budgeted response", Usage: ModelUsage{Known: true, InputTokens: 4, OutputTokens: 2},
+		StopReason: "stop", ProviderReportedModel: "provider-snapshot-3"}
+	record, err := SealTaskModelResponse(sealer, reservation, response)
+	if err != nil {
+		t.Fatalf("seal budgeted response with separate ledger and DSH identities: %v", err)
+	}
+	if got, err := OpenTaskModelResponse(sealer, record, reservation); err != nil || got.Text != response.Text {
+		t.Fatalf("budgeted response did not round trip with separate IDs: response=%+v err=%v", got, err)
+	}
+
+	changedFrame := reservation
+	changedFrame.DSHCallID, _ = DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, 6)
+	if _, err := OpenTaskModelResponse(sealer, record, changedFrame); err == nil {
+		t.Fatal("adaptive response opened for a different final DSH frame")
+	}
+	changedLedger := reservation
+	changedLedger.CallID, _ = DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, 4)
+	if _, err := OpenTaskModelResponse(sealer, record, changedLedger); err == nil {
+		t.Fatal("adaptive response opened for a different ledger call")
+	}
+	partialBudget := reservation
+	partialBudget.BudgetRequestDigest = ""
+	if _, err := SealTaskModelResponse(sealer, partialBudget, response); err == nil {
+		t.Fatal("response with a partial adaptive budget identity was sealed")
+	}
+}
+
 func TestTaskModelResponseBindsRecoveryLedgerAndDSHFrameSeparately(t *testing.T) {
 	sealer, reservation := taskModelResponseFixture(t)
 	dshCallID := reservation.CallID
