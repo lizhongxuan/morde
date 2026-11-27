@@ -8097,6 +8097,96 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         default: { $ref: '#/components/responses/Error' }
+  /api/admin/observability/overview:
+    get:
+      tags: [Admin]
+      operationId: getAdminObservabilityOverview
+      summary: Read independent Harness observability source health and request spans
+      description: Administrators only. Each source reports its own coverage state; unavailable DSH checkpoints do not hide span data.
+      security: [{ portalSession: [] }]
+      responses:
+        '200':
+          description: Source health and 24-hour request aggregates
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminObservabilityOverview' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/observability/traces:
+    get:
+      tags: [Admin]
+      operationId: listAdminObservabilityTraces
+      summary: Search distributed traces and linked conversation Tasks
+      description: Administrators only. Search is bounded and cursors are opaque.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: trace_id, in: query, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+        - { name: request_id, in: query, schema: { type: string, maxLength: 255 } }
+        - { name: task_id, in: query, schema: { type: string, maxLength: 128 } }
+        - { name: q, in: query, schema: { type: string, maxLength: 256 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string, maxLength: 512 } }
+      responses:
+        '200':
+          description: Trace summaries and span coverage
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminObservabilityTracePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/observability/traces/{trace_id}:
+    get:
+      tags: [Admin]
+      operationId: getAdminObservabilityTrace
+      summary: Read the bounded spans for one trace
+      description: Administrators only. Span attributes use an allowlist and details are not cacheable.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: trace_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+      responses:
+        '200':
+          description: Span tree and coverage state
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminObservabilityTrace' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/admin/observability/traces/{trace_id}/events:
+    get:
+      tags: [Admin]
+      operationId: listAdminObservabilityTraceEvents
+      summary: Read a committed DSH checkpoint event page for a trace-linked Task
+      description: Administrators only. Only digest-verified committed events are returned; checkpoint content is redacted and never modified.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: trace_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+        - { name: agent_session_id, in: query, schema: { type: string, maxLength: 128 } }
+        - { name: from_sequence, in: query, schema: { type: integer, format: int64, minimum: 0 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
+      responses:
+        '200':
+          description: Session tree, committed event page, and explicit coverage state
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminObservabilityTraceEvents' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/admin/model-connections:
     get:
       tags: [Admin]
@@ -13806,6 +13896,114 @@ components:
         summary: { $ref: '#/components/schemas/AdminUsageSummary' }
         by_day: { type: array, items: { $ref: '#/components/schemas/AdminUsageDay' } }
         by_model: { type: array, items: { $ref: '#/components/schemas/AdminUsageModel' } }
+      additionalProperties: false
+    AdminObservabilityStatus:
+      type: string
+      enum: [available, partial, unavailable, disabled]
+    AdminObservabilitySource:
+      type: object
+      required: [status, reason, updated_at]
+      properties:
+        status: { $ref: '#/components/schemas/AdminObservabilityStatus' }
+        reason: { type: [string, 'null'], maxLength: 256 }
+        updated_at: { type: [string, 'null'], format: date-time }
+      additionalProperties: false
+    AdminObservabilityOverview:
+      type: object
+      required: [sources, spans_24h]
+      properties:
+        sources:
+          type: object
+          required: [spans, dsh_events]
+          properties:
+            spans: { $ref: '#/components/schemas/AdminObservabilitySource' }
+            dsh_events: { $ref: '#/components/schemas/AdminObservabilitySource' }
+          additionalProperties: false
+        spans_24h:
+          type: object
+          required: [request_count, error_count, p95_duration_ms]
+          properties:
+            request_count: { type: integer, format: int64, minimum: 0 }
+            error_count: { type: integer, format: int64, minimum: 0 }
+            p95_duration_ms: { type: number, minimum: 0 }
+          additionalProperties: false
+      additionalProperties: false
+    AdminObservabilityTraceSummary:
+      type: object
+      required: [trace_id, request_id, task_id, started_at, ended_at, status, span_count, error_count]
+      properties:
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        request_id: { type: [string, 'null'], maxLength: 255 }
+        task_id: { type: [string, 'null'], maxLength: 128 }
+        started_at: { type: string, format: date-time }
+        ended_at: { type: [string, 'null'], format: date-time }
+        status: { type: string, enum: [ok, error, partial] }
+        span_count: { type: integer, format: int64, minimum: 0 }
+        error_count: { type: integer, format: int64, minimum: 0 }
+      additionalProperties: false
+    AdminObservabilityTracePage:
+      type: object
+      required: [items, next_cursor, sources]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/AdminObservabilityTraceSummary' } }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
+        sources:
+          type: object
+          required: [spans]
+          properties:
+            spans: { $ref: '#/components/schemas/AdminObservabilitySource' }
+          additionalProperties: false
+      additionalProperties: false
+    AdminObservabilitySpan:
+      type: object
+      required: [span_id, parent_span_id, name, kind, status, start_at, end_at, attributes, events]
+      properties:
+        span_id: { type: string, pattern: '^[0-9a-f]{16}$' }
+        parent_span_id: { type: [string, 'null'], pattern: '^[0-9a-f]{16}$' }
+        name: { type: string, minLength: 1, maxLength: 256 }
+        kind: { type: string, enum: [unspecified, internal, server, client, producer, consumer] }
+        status: { type: string, enum: [unset, ok, error] }
+        start_at: { type: string, format: date-time }
+        end_at: { type: [string, 'null'], format: date-time }
+        attributes: { type: object, additionalProperties: true }
+        events: { type: array, items: { type: object, additionalProperties: true } }
+      additionalProperties: false
+    AdminObservabilityTrace:
+      type: object
+      required: [trace_id, spans, coverage]
+      properties:
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        spans: { type: array, maxItems: 500, items: { $ref: '#/components/schemas/AdminObservabilitySpan' } }
+        coverage: { $ref: '#/components/schemas/AdminObservabilitySource' }
+      additionalProperties: false
+    AdminObservabilityAgentSession:
+      type: object
+      required: [session_id, parent_session_id, step_id, role]
+      properties:
+        session_id: { type: string, minLength: 1, maxLength: 128 }
+        parent_session_id: { type: [string, 'null'], maxLength: 128 }
+        step_id: { type: [string, 'null'], maxLength: 128 }
+        role: { type: string, enum: [root, subagent] }
+      additionalProperties: false
+    AdminObservabilityDSHEvent:
+      type: object
+      required: [session_id, sequence, time, type, data]
+      properties:
+        session_id: { type: string, minLength: 1, maxLength: 128 }
+        sequence: { type: integer, format: int64, minimum: 0 }
+        time: { type: string, format: date-time }
+        type: { type: string, minLength: 1, maxLength: 128 }
+        data: {}
+      additionalProperties: false
+    AdminObservabilityTraceEvents:
+      type: object
+      required: [task_id, agent_sessions, events, next_sequence, coverage]
+      properties:
+        task_id: { type: [string, 'null'], maxLength: 128 }
+        agent_sessions: { type: array, maxItems: 128, items: { $ref: '#/components/schemas/AdminObservabilityAgentSession' } }
+        events: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/AdminObservabilityDSHEvent' } }
+        next_sequence: { type: [integer, 'null'], format: int64, minimum: 0 }
+        coverage: { $ref: '#/components/schemas/AdminObservabilitySource' }
       additionalProperties: false
     EvaluationScore:
       type: string

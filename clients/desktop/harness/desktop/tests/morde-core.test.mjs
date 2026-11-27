@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, mordeUserDataDirectory, portalOrigin, withTimeout } from '../out/morde-core.js';
+import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, mordeUserDataDirectory, portalOrigin, tracedFetch, withTimeout } from '../out/morde-core.js';
 
 const future = '2099-01-01T00:00:00Z';
 const serviceInstanceID = '12345678-1234-4234-8234-123456789abc';
@@ -51,6 +51,22 @@ test('withTimeout stops a hanging operation when its deadline expires', async ()
   await assert.rejects(withTimeout(new Promise(() => {}), 1, () => { throw new Error('stop unavailable'); }), /timed out/i);
 });
 
+test('tracedFetch adds a valid W3C context and preserves caller request IDs', async () => {
+  let request;
+  const response = await tracedFetch(async (input, init) => {
+    request = new Request(input, init);
+    return new Response('{}', { headers: { 'X-Trace-Id': 'a'.repeat(32) } });
+  }, 'https://portal.example/api/test', { headers: { 'X-Request-Id': 'caller-request-id' } });
+
+  const traceparent = request.headers.get('traceparent');
+  assert.match(traceparent, /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+  const [, traceID, spanID] = traceparent.split('-');
+  assert.notEqual(traceID, '0'.repeat(32));
+  assert.notEqual(spanID, '0'.repeat(16));
+  assert.equal(request.headers.get('X-Request-Id'), 'caller-request-id');
+  assert.equal(response.headers.get('X-Trace-Id'), 'a'.repeat(32));
+});
+
 test('account login sends one password request and receives separate Client, Sync and Web credentials', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];
@@ -65,7 +81,7 @@ test('account login sends one password request and receives separate Client, Syn
     assert.equal(calls[0].options.method, undefined);
     assert.equal(calls[0].options.body, undefined);
     assert.equal(calls[1].url, 'https://portal.example/api/auth/client-login');
-    assert.equal(calls[1].options.headers['Idempotency-Key'], 'retry-1');
+    assert.equal(new Headers(calls[1].options.headers).get('Idempotency-Key'), 'retry-1');
     assert.deepEqual(JSON.parse(calls[1].options.body), { name: 'user', password: 'password', platform: 'desktop', display_name: 'morde-pc', client_instance_id: attempt().clientInstanceID, attempt_generation: 1 });
     assert.equal(result.credentials.clientCredential, 'client-secret');
     assert.equal(result.credentials.serviceInstanceID, serviceInstanceID);
@@ -101,8 +117,8 @@ test('project sync reads the account default computer through its short-lived Po
     const result = await new MordeAPI(() => credentials).userPreferences(session);
     assert.deepEqual(result, { defaultHostID: 'h1234567' });
     assert.equal(calls[0].url, 'https://portal.example/api/me/preferences');
-    assert.equal(calls[0].options.headers.cookie, 'ch_portal=web-secret');
-    assert.equal('authorization' in calls[0].options.headers, false);
+    assert.equal(new Headers(calls[0].options.headers).get('cookie'), 'ch_portal=web-secret');
+    assert.equal(new Headers(calls[0].options.headers).has('authorization'), false);
     globalThis.fetch = async () => json({ default_host_id: '../other' });
     await assert.rejects(() => new MordeAPI(() => credentials).userPreferences(session), /Invalid host ID/);
   } finally { globalThis.fetch = originalFetch; }
@@ -123,9 +139,9 @@ test('Host embed tickets use the short-lived Portal session and reject targets o
     assert.deepEqual(result, { exchangeURL: 'https://h1234567.hosts.example.test/__ch/embed-auth', ticket: 'A'.repeat(43),
       embedNonce: 'B'.repeat(32), targets: ['browser', 'terminal'] });
     assert.equal(calls[0].url, 'https://portal.example/api/hosts/h1234567/embed-tickets');
-    assert.equal(calls[0].options.headers.cookie, 'ch_portal=web-secret');
-    assert.equal(calls[0].options.headers.origin, credentials.origin);
-    assert.equal('authorization' in calls[0].options.headers, false);
+    assert.equal(new Headers(calls[0].options.headers).get('cookie'), 'ch_portal=web-secret');
+    assert.equal(new Headers(calls[0].options.headers).get('origin'), credentials.origin);
+    assert.equal(new Headers(calls[0].options.headers).has('authorization'), false);
     assert.deepEqual(JSON.parse(calls[0].options.body), { conversation_id: 'c1234567', target: 'browser', targets: ['browser', 'terminal'] });
     await assert.rejects(() => api.issueHostEmbedTicket('h1234567', 'c1234567', 'browser', ['browser'], session), /Invalid Morde Host embed ticket response/);
     await assert.rejects(() => api.issueHostEmbedTicket('h1234567', '../other', 'browser', ['browser'], session), /Invalid Morde Host embed request/);
@@ -156,7 +172,7 @@ test('Workspace sync device challenge uses Client auth and strictly decodes its 
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, 'https://portal.example/api/workspaces/w1234567/sync-device-challenges');
     assert.equal(calls[0].options.method, 'POST');
-    assert.equal(calls[0].options.headers.authorization, 'Bearer client-secret');
+    assert.equal(new Headers(calls[0].options.headers).get('authorization'), 'Bearer client-secret');
     assert.deepEqual(JSON.parse(calls[0].options.body), { device_id: syncDeviceID, certificate_der: certificateDER.toString('base64') });
     assert.deepEqual([...result.nonce], [...Buffer.alloc(32, 1)]);
     assert.deepEqual([...result.signingPayload], [...Buffer.from('proof payload')]);
@@ -175,8 +191,8 @@ test('Workspace sync device registration sends the proof and idempotency key wit
     assert.equal(calls.length, 1);
     assert.equal(calls[0].url, 'https://portal.example/api/workspaces/w1234567/sync-devices');
     assert.equal(calls[0].options.method, 'POST');
-    assert.equal(calls[0].options.headers.authorization, 'Bearer client-secret');
-    assert.equal(calls[0].options.headers['Idempotency-Key'], 'register-retry-1');
+    assert.equal(new Headers(calls[0].options.headers).get('authorization'), 'Bearer client-secret');
+    assert.equal(new Headers(calls[0].options.headers).get('Idempotency-Key'), 'register-retry-1');
     assert.deepEqual(JSON.parse(calls[0].options.body), { challenge_id: 'n1234567', signature: signature.toString('base64') });
     assert.equal(result.folderID, syncRegistration.folder_id);
     assert.equal(result.serverDeviceID, syncServerDeviceID);
@@ -223,7 +239,7 @@ test('web renewal and logout only use the fixed Client bearer routes', async () 
     assert.equal((await api.webSession()).credential, 'new-web-secret');
     await api.logout();
     assert.deepEqual(calls.map((call) => call.url), ['https://portal.example/api/auth/client-web-session', 'https://portal.example/api/auth/client-logout']);
-    assert.ok(calls.every((call) => call.options.headers.authorization === 'Bearer client-secret'));
+  assert.ok(calls.every((call) => new Headers(call.options.headers).get('authorization') === 'Bearer client-secret'));
     assert.equal(calls.every((call) => !call.options.body), true);
   } finally { globalThis.fetch = originalFetch; }
 });
@@ -271,10 +287,10 @@ test('project folder registration uses a Portal cookie and sends metadata only',
     const registered = await api.registerHostProjectFolder('h1234567', 'demo', session, 'registration-key');
     assert.equal(listed[0].folderID, folder.folder_id);
     assert.equal(registered.relativePath, 'project/demo');
-    assert.equal(calls[0].options.headers.cookie, 'ch_portal=portal-cookie-secret');
-    assert.equal(calls[0].options.headers.authorization, undefined);
-    assert.equal(calls[1].options.headers.origin, credentials.origin);
-    assert.equal(calls[1].options.headers['Idempotency-Key'], 'registration-key');
+    assert.equal(new Headers(calls[0].options.headers).get('cookie'), 'ch_portal=portal-cookie-secret');
+    assert.equal(new Headers(calls[0].options.headers).get('authorization'), null);
+    assert.equal(new Headers(calls[1].options.headers).get('origin'), credentials.origin);
+    assert.equal(new Headers(calls[1].options.headers).get('Idempotency-Key'), 'registration-key');
     assert.deepEqual(JSON.parse(calls[1].options.body), { project_name: 'demo' });
     assert.equal(JSON.stringify(calls).includes('file'), false);
     await assert.rejects(() => api.registerHostProjectFolder('../bad', 'demo', session, 'key'), /Invalid host ID/);

@@ -545,6 +545,14 @@ func taskStepSanitizedText(raw string) (string, bool) {
 	return clean, clean != raw
 }
 
+// SanitizeAdminAgentDiagnosticText applies the same credential and private-key
+// redaction used for existing Task execution disclosures before admin views
+// render event data.
+func SanitizeAdminAgentDiagnosticText(raw string) string {
+	clean, _ := taskStepSanitizedText(raw)
+	return clean
+}
+
 func truncateTaskStepDisclosure(value string, maxBytes int) (string, bool) {
 	if maxBytes < 1 {
 		return "", value != ""

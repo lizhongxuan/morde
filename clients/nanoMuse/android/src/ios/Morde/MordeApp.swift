@@ -9498,6 +9498,8 @@ private struct MordeIndependentSendTarget {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
         if let key { request.setValue(key, forHTTPHeaderField: "Idempotency-Key") }
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
@@ -9542,6 +9544,7 @@ private struct MordeIndependentSendTarget {
 #endif
         (data, response) = try await urlSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        traceContext.recordResponse(for: request, response: http)
         var recordedUnconfirmedLogout = false
         if http.statusCode == 401 && scheduleAuthorized, let credential,
            let currentInstallation = installation,
@@ -9604,6 +9607,8 @@ private struct MordeIndependentSendTarget {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         let temporaryURL: URL
@@ -9627,6 +9632,7 @@ private struct MordeIndependentSendTarget {
             MIFLibraryTemporaryFileCleanup.discard(temporaryURL)
             throw URLError(.badServerResponse)
         }
+        traceContext.recordResponse(for: request, response: http)
         var recordedUnconfirmedLogout = false
         if http.statusCode == 401, let currentInstallation = installation,
            let currentScope = authorizationScope(for: currentInstallation), let requestScope,
@@ -10204,6 +10210,8 @@ private struct MordeIndependentSendTarget {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         if method != "GET", let origin = URLComponents(string: normalizedOrigin)?.string {
             request.setValue(origin, forHTTPHeaderField: "Origin")
         }
@@ -10214,6 +10222,7 @@ private struct MordeIndependentSendTarget {
         }
         let (data, response) = try await sensitiveURLSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        traceContext.recordResponse(for: request, response: http)
         guard self.response(http, matchesOrigin: normalizedOrigin) else { throw URLError(.badServerResponse) }
         return (data, http)
     }
@@ -10373,6 +10382,8 @@ private struct MordeIndependentSendTarget {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         request.setValue("ch_portal=\(ownerSession.credential)", forHTTPHeaderField: "Cookie")
         var origin = URLComponents()
         origin.scheme = base.scheme
@@ -10384,6 +10395,7 @@ private struct MordeIndependentSendTarget {
         if let body { request.httpBody = body }
         let (data, response) = try await sensitiveURLSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        traceContext.recordResponse(for: request, response: http)
         guard self.response(http, matchesOrigin: requestScope.serviceOrigin) else { throw URLError(.badServerResponse) }
         guard requestScope == currentDataScope,
               ownerPortalSessionScope == ownerSession.installationScope else { throw CancellationError() }
@@ -10440,6 +10452,8 @@ private struct MordeIndependentSendTarget {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue(UUID().uuidString, forHTTPHeaderField: "X-Request-Id")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         request.setValue("ch_portal=\(portalSession.credential)", forHTTPHeaderField: "Cookie")
         var origin = URLComponents()
         origin.scheme = base.scheme
@@ -10452,6 +10466,7 @@ private struct MordeIndependentSendTarget {
         if let body { request.httpBody = body }
         let (data, response) = try await urlSession.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        traceContext.recordResponse(for: request, response: http)
         if http.statusCode == 401, renewalAttempt == 0 {
             guard requestScope == currentDataScope, portalSessionScope == requestScope else { throw CancellationError() }
             portalSessionCredential = nil
@@ -12751,8 +12766,11 @@ private struct MordeIndependentSendTarget {
         request.setValue("no-store", forHTTPHeaderField: "Cache-Control")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
         let (bytes, response) = try await urlSession.bytes(for: request)
         guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+        traceContext.recordResponse(for: request, response: http)
         guard !Task.isCancelled, signedIn, requestScope == currentDataScope else { throw CancellationError() }
         if http.statusCode == 401 {
             if MordeUnauthorizedResponsePolicy.shouldClearAuthorization(
@@ -14130,8 +14148,11 @@ private struct MordeIndependentSendTarget {
                 var request = URLRequest(url: url)
                 request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
                 request.cachePolicy = .reloadIgnoringLocalCacheData
+                let traceContext = MordeTraceContext()
+                traceContext.inject(into: &request)
                 let (bytes, response) = try await urlSession.bytes(for: request)
                 guard let http = response as? HTTPURLResponse else { throw URLError(.badServerResponse) }
+                traceContext.recordResponse(for: request, response: http)
                 guard !Task.isCancelled, taskScope == currentDataScope else { return }
                 if http.statusCode == 401 {
                     if MordeUnauthorizedResponsePolicy.shouldClearAuthorization(

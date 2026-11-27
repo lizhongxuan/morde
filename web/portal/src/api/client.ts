@@ -21,10 +21,26 @@ function requestId() {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
 
+function randomHex(byteLength: number) {
+  const bytes = new Uint8Array(byteLength);
+  if (globalThis.crypto?.getRandomValues) globalThis.crypto.getRandomValues(bytes);
+  else for (let index = 0; index < bytes.length; index++) bytes[index] = Math.floor(Math.random() * 256);
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function traceparent() {
+  let traceId = randomHex(16);
+  let spanId = randomHex(8);
+  if (/^0+$/.test(traceId)) traceId = `${traceId.slice(0, -1)}1`;
+  if (/^0+$/.test(spanId)) spanId = `${spanId.slice(0, -1)}1`;
+  return `00-${traceId}-${spanId}-01`;
+}
+
 export async function requestFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const headers = new Headers(input instanceof Request ? input.headers : undefined);
   new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
   headers.set("X-Request-Id", headers.get("X-Request-Id") ?? requestId());
+  headers.set("traceparent", headers.get("traceparent") ?? traceparent());
   const method = (init?.method ?? (input instanceof Request ? input.method : "GET")).toUpperCase();
   if (method !== "GET" && method !== "HEAD" && !(init?.body instanceof FormData)) {
     headers.set("Content-Type", headers.get("Content-Type") ?? "application/json");
@@ -36,6 +52,11 @@ export async function requestFetch(input: RequestInfo | URL, init?: RequestInit)
     if (error instanceof TypeError) window.dispatchEvent(new Event("morde:api-network-error"));
     throw error;
   }
+  const requestTraceID = headers.get("traceparent")?.split("-")[1] ?? "";
+  const responseTraceID = response.headers.get("X-Trace-Id") ?? requestTraceID;
+  window.dispatchEvent(new CustomEvent("morde:api-trace", {
+    detail: { request_id: headers.get("X-Request-Id"), trace_id: responseTraceID, status: response.status },
+  }));
   window.dispatchEvent(new Event("morde:api-network-recovered"));
   const path = new URL(typeof input === "string" || input instanceof URL ? input : input.url, window.location.origin).pathname;
   if (response.status === 401 && path !== "/api/auth/login" && path !== "/api/me" && window.location.pathname !== "/login") {

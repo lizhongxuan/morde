@@ -46,6 +46,8 @@ const (
 	ActionCodexSessionDelete           Action = "codex.session.delete"
 	ActionCodexEventPageRead           Action = "codex.event.page.read"
 	ActionCodexEventStreamRead         Action = "codex.event.stream.read"
+	ActionObservabilityTraceRead       Action = "observability.trace.read"
+	ActionObservabilityAgentEventsRead Action = "observability.agent_events.read"
 	ActionCodexCommandCreate           Action = "codex.command.create"
 	ActionCodexCommandClaim            Action = "codex.command.claim"
 	ActionCodexCommandResult           Action = "codex.command.result"
@@ -96,6 +98,7 @@ func (a Action) Valid() bool {
 		ActionAPIKeyCreate, ActionAPIKeyDelete, ActionDevicePair, ActionDeviceDeny, ActionDeviceRevoke, ActionDeviceGrant,
 		ActionClientPair, ActionClientDeny, ActionClientLogin, ActionClientWebSession, ActionClientScheduleGrant, ActionClientRevoke,
 		ActionCodexSessionGrant, ActionCodexProfileConnection, ActionCodexSessionListRead, ActionCodexSessionDelete, ActionCodexEventPageRead, ActionCodexEventStreamRead,
+		ActionObservabilityTraceRead, ActionObservabilityAgentEventsRead,
 		ActionCodexCommandCreate, ActionCodexCommandClaim, ActionCodexCommandResult,
 		ActionCodexApprovalDecision, ActionCodexApprovalResult,
 		ActionHostRestoreRecovery, ActionWorkspaceDelete, ActionUserCreate, ActionUserUpdate, ActionPersonalDataQuotaUpdate, ActionAdminNudgePolicyUpdate,

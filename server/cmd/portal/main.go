@@ -24,6 +24,9 @@ import (
 	"github.com/pressly/goose/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"go.opentelemetry.io/otel/attribute"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/resource"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -45,6 +48,7 @@ import (
 	"morde/server/internal/storage/workspacecurrent"
 	"morde/server/internal/storage/workspacefs"
 	"morde/server/internal/store/postgres"
+	"morde/server/internal/tracing"
 	"morde/server/internal/worker"
 	"morde/server/migrations"
 )
@@ -209,6 +213,31 @@ func serve(ctx context.Context, configPath string) error {
 	if err := postgres.CheckSchema(ctx, pool); err != nil {
 		return err
 	}
+	spanExporter, err := tracing.NewPostgresSpanExporterWithLogger(pool, logger)
+	if err != nil {
+		return fmt.Errorf("initialize observability span exporter: %w", err)
+	}
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithBatcher(spanExporter,
+			sdktrace.WithMaxQueueSize(512),
+			sdktrace.WithMaxExportBatchSize(128),
+			sdktrace.WithBatchTimeout(time.Second),
+			sdktrace.WithExportTimeout(4*time.Second)),
+		sdktrace.WithResource(resource.NewSchemaless(attribute.String("service.name", "morde-portal"))),
+	)
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := tracerProvider.Shutdown(shutdownCtx); err != nil {
+			logger.Error("shutdown observability tracer provider failed", zap.Error(err))
+		}
+	}()
+	retentionStop, retentionDone := startObservabilityRetention(ctx, spanExporter, logger)
+	defer func() {
+		retentionStop()
+		<-retentionDone
+	}()
 	store := postgres.New(pool)
 	serviceInstanceID, err := store.ServiceInstanceID(ctx)
 	if err != nil {
@@ -812,7 +841,7 @@ func serve(ctx context.Context, configPath string) error {
 		Hosts: hosts, HostSharing: hostSharing, HostEmbedTickets: embedTicketExchanger, ServiceInstanceID: serviceInstanceID,
 		WorkspaceFiles: workspaceSync, TaskObservation: tasks, Control: controlService, Runtime: runtime, ActivityLeases: store, InputPermits: store,
 		TerminalSessions: store, TerminalAIO: aioClient, Auth: credentials, Audit: auditService,
-		Logger: logger, Metrics: registry,
+		Logger: logger, Metrics: registry, TracerProvider: tracerProvider,
 	})
 	if err != nil {
 		return err
@@ -846,7 +875,9 @@ func serve(ctx context.Context, configPath string) error {
 		PersonalDataQuota: personalDataQuotaService, PersonalDataQuotaUser: personalDataQuotaUserService,
 		PersonalAttachments: personalAttachmentService, PersonalHistoryImport: personalHistoryImportService,
 		Onboarding: onboardingService, Admin: admin, AdminConsole: adminConsole, AdminQualityActivity: adminQualityActivity, AdminControls: adminControls,
-		AdminOperations:          adminOperations,
+		AdminOperations: adminOperations,
+		Observability: api.AdminObservabilityDeps{Reader: store, LinkWriter: store,
+			ExportHealth: portalSpanExportHealth{exporter: spanExporter}, AgentCheckpoints: checkpoints},
 		AdminModelBudgetDefaults: adminModelBudgetDefaults,
 		AdminModelDefaults:       adminModelDefaults,
 		RecordConsents:           recordConsents, RecordAccess: recordAccess, RecordCaptureStatus: recordCapture,
@@ -855,7 +886,7 @@ func serve(ctx context.Context, configPath string) error {
 		Readiness:  readiness{pool: pool, clients: router, profiles: cfg.Orchestrator.Profiles, instance: cfg.Instance}, MCP: mcpHandler,
 		MCPDisabled: !cfg.MCP.Enabled,
 	}, api.Options{
-		Logger: logger, Metrics: registry, ServiceInstanceID: serviceInstanceID, APIMaxBodyBytes: cfg.HTTP.APIMaxBodyBytes,
+		Logger: logger, Metrics: registry, TracerProvider: tracerProvider, ServiceInstanceID: serviceInstanceID, APIMaxBodyBytes: cfg.HTTP.APIMaxBodyBytes,
 		MCPMaxBodyBytes: cfg.HTTP.MCPMaxBodyBytes, CookieSecure: cfg.Domains.CookieSecure,
 		SessionTTL: cfg.Security.SessionTTL,
 		HostScheme: cfg.Domains.Scheme, PortalDomain: cfg.Domains.Portal, HostSuffix: cfg.Domains.HostSuffix,
@@ -1396,6 +1427,54 @@ func newLogger(cfg config.Log) (*zap.Logger, error) {
 	options.Level = zap.NewAtomicLevelAt(level)
 	options.Encoding = cfg.Format
 	return options.Build()
+}
+
+func startObservabilityRetention(parent context.Context, exporter *tracing.PostgresSpanExporter, logger *zap.Logger) (context.CancelFunc, <-chan struct{}) {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(time.Hour)
+		defer ticker.Stop()
+		purge := func() {
+			for batch := 0; batch < 10; batch++ {
+				cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour)
+				deleted, err := exporter.PurgeExpiredSpans(ctx, cutoff, 1000)
+				if err != nil {
+					if ctx.Err() == nil {
+						logger.Warn("purge observability spans failed", zap.Error(err))
+					}
+					return
+				}
+				if deleted < 1000 {
+					return
+				}
+			}
+		}
+		purge()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				purge()
+			}
+		}
+	}()
+	return cancel, done
+}
+
+type portalSpanExportHealth struct {
+	exporter *tracing.PostgresSpanExporter
+}
+
+func (h portalSpanExportHealth) Health() app.AdminObservabilityExportHealth {
+	if h.exporter == nil {
+		return app.AdminObservabilityExportHealth{Status: "unavailable", ReasonCode: "exporter_unconfigured"}
+	}
+	value := h.exporter.Health()
+	return app.AdminObservabilityExportHealth{Status: value.Status, ReasonCode: value.ReasonCode,
+		FailedBatches: value.FailedBatches, LastSuccessAt: value.LastSuccessAt}
 }
 
 func readKey(path string) ([]byte, error) {

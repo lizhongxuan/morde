@@ -8,6 +8,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+	"go.uber.org/zap"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -532,6 +535,11 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 			return
 		}
 		c.Request = c.Request.WithContext(app.WithExpectedServiceInstance(c.Request.Context(), instanceID))
+		spanContext := trace.SpanFromContext(c.Request.Context()).SpanContext()
+		traceID, traceSpanID := "", ""
+		if spanContext.IsValid() {
+			traceID, traceSpanID = spanContext.TraceID().String(), spanContext.SpanID().String()
+		}
 		message, replayed, err := service.AcceptConversationMessage(c.Request.Context(), principal, conversationID, app.AcceptConversationMessageCommand{
 			ServiceInstanceID: instanceID, ClientMessageID: request.ClientMessageID,
 			PreviousClientMessageID: request.PreviousClientMessageID, ReferenceTaskID: request.ReferenceTaskID,
@@ -548,6 +556,23 @@ func (h *api) acceptConversationMessage(service TaskService) gin.HandlerFunc {
 			message.ClientMessageID != request.ClientMessageID || message.Content != request.Content {
 			writeError(c, domain.NewError(domain.CodeInternal, "internal error"))
 			return
+		}
+		span := trace.SpanFromContext(c.Request.Context())
+		span.SetAttributes(
+			attribute.String("morde.user_id", principal.UserID),
+			attribute.String("morde.conversation_id", conversationID),
+			attribute.String("morde.message_id", message.ID),
+		)
+		if message.TaskID != "" {
+			span.SetAttributes(attribute.String("morde.task_id", message.TaskID))
+		}
+		if h.deps.Observability.LinkWriter != nil && traceID != "" && traceSpanID != "" {
+			if err := h.deps.Observability.LinkWriter.LinkAcceptedMessageTrace(c.Request.Context(), traceID, traceSpanID,
+				c.GetString("request_id"), message.ID); err != nil {
+				h.options.Logger.Warn("record conversation trace link failed", zap.Error(err),
+					zap.String("trace_id", traceID), zap.String("span_id", traceSpanID),
+					zap.String("request_id", c.GetString("request_id")), zap.String("message_id", message.ID))
+			}
 		}
 		view, err := toMessageResponse(message)
 		if err != nil {

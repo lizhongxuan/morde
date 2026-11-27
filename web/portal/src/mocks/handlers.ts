@@ -3300,6 +3300,28 @@ export const handlers = [
       limit: { hosts: 100, ...capacityLimit }, allocated: { hosts: hosts.filter(occupiesResources).length, ...usage },
       hosts_by_state: hostsByState(), agents_by_state: {} });
   }),
+  http.get("/api/admin/observability/overview", ({ cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    return json({
+      sources: {
+        spans: { status: "available", reason: "本地演示环境当前没有 trace 样本。", updated_at: now() },
+        dsh_events: { status: "disabled", reason: "本地演示环境未连接 DSH 事件存储。", updated_at: null },
+      },
+      spans_24h: { request_count: 0, error_count: 0, p95_duration_ms: 0 },
+    }, 200, { "Cache-Control": "no-store" });
+  }),
+  http.get("/api/admin/observability/traces", ({ cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    return json({ items: [], next_cursor: null, sources: { spans: { status: "available", reason: "本地演示环境当前没有 trace 样本。", updated_at: now() } } }, 200, { "Cache-Control": "no-store" });
+  }),
+  http.get("/api/admin/observability/traces/:trace_id", ({ params, cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    return json({ trace_id: String(params.trace_id), spans: [], coverage: { status: "unavailable", reason: "本地演示环境不包含 trace 详情。", updated_at: null } }, 200, { "Cache-Control": "no-store" });
+  }),
+  http.get("/api/admin/observability/traces/:trace_id/events", ({ cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    return json({ task_id: null, agent_sessions: [], events: [], next_sequence: null, coverage: { status: "disabled", reason: "本地演示环境未连接 DSH 事件存储。", updated_at: null } }, 200, { "Cache-Control": "no-store" });
+  }),
   http.get("/api/admin/model-connections", ({ cookies }) => {
     if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
     return json({ items: modelConnections.filter((item) => item.shared) });

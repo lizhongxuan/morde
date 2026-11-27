@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
@@ -53,6 +54,7 @@ type Deps struct {
 	Audit             app.AuditWriter
 	Logger            *zap.Logger
 	Metrics           prometheus.Registerer
+	TracerProvider    trace.TracerProvider
 }
 
 type gateway struct {
@@ -103,7 +105,7 @@ func New(d Deps) (http.Handler, error) {
 	if len(cookieKey) != 32 {
 		return nil, fmt.Errorf("host cookie key must contain exactly 32 bytes")
 	}
-	base, err := httpserver.Base(httpserver.Options{Server: "gateway", Logger: d.Logger, Metrics: d.Metrics})
+	base, err := httpserver.Base(httpserver.Options{Server: "gateway", Logger: d.Logger, Metrics: d.Metrics, TracerProvider: d.TracerProvider})
 	if err != nil {
 		return nil, fmt.Errorf("configure gateway HTTP middleware: %w", err)
 	}

@@ -501,6 +501,12 @@ export const portalApi = {
   adminOverview: async () => unwrapApiResponse(await api.GET('/api/admin/overview')),
   adminModelConnections: async () => unwrapApiResponse(await api.GET('/api/admin/model-connections')),
   adminUsage: async (days: 7 | 30 | 90) => unwrapApiResponse(await api.GET('/api/admin/usage', { params: { query: { days } } })),
+  adminObservabilityOverview: async () => unwrapApiResponse(await api.GET('/api/admin/observability/overview', { cache: 'no-store' })),
+  adminObservabilityTraces: async (query: NonNullable<operations['listAdminObservabilityTraces']['parameters']['query']>) =>
+    unwrapApiResponse(await api.GET('/api/admin/observability/traces', { params: { query }, cache: 'no-store' })),
+  adminObservabilityTrace: async (traceID: string) => unwrapApiResponse(await api.GET('/api/admin/observability/traces/{trace_id}', { params: { path: { trace_id: traceID } }, cache: 'no-store' })),
+  adminObservabilityEvents: async (traceID: string, query: NonNullable<operations['listAdminObservabilityTraceEvents']['parameters']['query']>) =>
+    unwrapApiResponse(await api.GET('/api/admin/observability/traces/{trace_id}/events', { params: { path: { trace_id: traceID }, query }, cache: 'no-store' })),
   adminQuality: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/quality', { params: { query: { days } } })),
   createBlindEvaluationBatch: async (body: operations['createBlindEvaluationBatch']['requestBody']['content']['application/json']) =>
     unwrapApiResponse(await api.POST('/api/admin/evaluation-batches', { body })),

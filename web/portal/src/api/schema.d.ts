@@ -5708,6 +5708,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/observability/overview": {
+        parameters: { query?: never; header?: never; path?: never; cookie?: never; };
+        /** Administrator-only Harness observability overview. Responses are not cached. */
+        get: operations["getAdminObservabilityOverview"];
+        put?: never; post?: never; delete?: never; options?: never; head?: never; patch?: never; trace?: never;
+    };
+    "/api/admin/observability/traces": {
+        parameters: { query?: never; header?: never; path?: never; cookie?: never; };
+        /** Search traces by trace, request, task, or free-text query. */
+        get: operations["listAdminObservabilityTraces"];
+        put?: never; post?: never; delete?: never; options?: never; head?: never; patch?: never; trace?: never;
+    };
+    "/api/admin/observability/traces/{trace_id}": {
+        parameters: { query?: never; header?: never; path?: never; cookie?: never; };
+        /** Read a trace and its recorded spans. */
+        get: operations["getAdminObservabilityTrace"];
+        put?: never; post?: never; delete?: never; options?: never; head?: never; patch?: never; trace?: never;
+    };
+    "/api/admin/observability/traces/{trace_id}/events": {
+        parameters: { query?: never; header?: never; path?: never; cookie?: never; };
+        /** Read recorded DSH events for a trace. */
+        get: operations["listAdminObservabilityTraceEvents"];
+        put?: never; post?: never; delete?: never; options?: never; head?: never; patch?: never; trace?: never;
+    };
     "/api/admin/quality": {
         parameters: {
             query?: never;
@@ -10591,6 +10615,76 @@ export interface components {
             summary: components["schemas"]["AdminUsageSummary"];
             by_day: components["schemas"]["AdminUsageDay"][];
             by_model: components["schemas"]["AdminUsageModel"][];
+        };
+        AdminObservabilityStatus: "available" | "partial" | "unavailable" | "disabled";
+        AdminObservabilitySource: {
+            status: components["schemas"]["AdminObservabilityStatus"];
+            reason: string | null;
+            /** Format: date-time */
+            updated_at: string | null;
+        };
+        AdminObservabilityOverview: {
+            sources: {
+                spans: components["schemas"]["AdminObservabilitySource"];
+                dsh_events: components["schemas"]["AdminObservabilitySource"];
+            };
+            spans_24h: { request_count: number; error_count: number; p95_duration_ms: number };
+        };
+        AdminObservabilityTraceSummary: {
+            trace_id: string;
+            request_id: string | null;
+            task_id: string | null;
+            /** Format: date-time */
+            started_at: string;
+            /** Format: date-time */
+            ended_at: string | null;
+            status: string;
+            span_count: number;
+            error_count: number;
+        };
+        AdminObservabilityTracePage: {
+            items: components["schemas"]["AdminObservabilityTraceSummary"][];
+            next_cursor: string | null;
+            sources: { spans: components["schemas"]["AdminObservabilitySource"] };
+        };
+        AdminObservabilitySpan: {
+            span_id: string;
+            parent_span_id: string | null;
+            name: string;
+            kind: string;
+            status: string;
+            /** Format: date-time */
+            start_at: string;
+            /** Format: date-time */
+            end_at: string | null;
+            attributes: { [key: string]: unknown };
+            events: unknown[];
+        };
+        AdminObservabilityTrace: {
+            trace_id: string;
+            spans: components["schemas"]["AdminObservabilitySpan"][];
+            coverage: components["schemas"]["AdminObservabilitySource"];
+        };
+        AdminObservabilityAgentSession: {
+            session_id: string;
+            parent_session_id: string | null;
+            step_id: string | null;
+            role: string;
+        };
+        AdminObservabilityDSHEvent: {
+            session_id: string;
+            sequence: number;
+            /** Format: date-time */
+            time: string;
+            type: string;
+            data: unknown;
+        };
+        AdminObservabilityTraceEvents: {
+            task_id: string | null;
+            agent_sessions: components["schemas"]["AdminObservabilityAgentSession"][];
+            events: components["schemas"]["AdminObservabilityDSHEvent"][];
+            next_sequence: number | null;
+            coverage: components["schemas"]["AdminObservabilitySource"];
         };
         /** @enum {string} */
         EvaluationScore: "0" | "1" | "N/A";
@@ -21028,6 +21122,54 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminObservabilityOverview: {
+        parameters: { query?: never; header?: never; path?: never; cookie?: never; };
+        requestBody?: never;
+        responses: {
+            200: { headers: { "Cache-Control"?: "no-store"; [name: string]: unknown; }; content: { "application/json": components["schemas"]["AdminObservabilityOverview"]; }; };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminObservabilityTraces: {
+        parameters: {
+            query?: { trace_id?: string; request_id?: string; task_id?: string; q?: string; limit?: number; cursor?: string; };
+            header?: never; path?: never; cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: { headers: { "Cache-Control"?: "no-store"; [name: string]: unknown; }; content: { "application/json": components["schemas"]["AdminObservabilityTracePage"]; }; };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminObservabilityTrace: {
+        parameters: { query?: never; header?: never; path: { trace_id: string; }; cookie?: never; };
+        requestBody?: never;
+        responses: {
+            200: { headers: { "Cache-Control"?: "no-store"; [name: string]: unknown; }; content: { "application/json": components["schemas"]["AdminObservabilityTrace"]; }; };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminObservabilityTraceEvents: {
+        parameters: {
+            query?: { agent_session_id?: string; from_sequence?: number; limit?: number; };
+            header?: never; path: { trace_id: string; }; cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            200: { headers: { "Cache-Control"?: "no-store"; [name: string]: unknown; }; content: { "application/json": components["schemas"]["AdminObservabilityTraceEvents"]; }; };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };

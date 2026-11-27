@@ -12,6 +12,10 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"go.opentelemetry.io/otel/codes"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/sdk/trace/tracetest"
+	oteltrace "go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zaptest/observer"
 
@@ -38,10 +42,17 @@ func TestBaseRequestIDLogAndMetrics(t *testing.T) {
 	if got := response.Header().Get(requestIDHeader); got != "request-123" {
 		t.Fatalf("response request id = %q", got)
 	}
+	if got := response.Header().Get(traceIDHeader); !validTraceID(got) {
+		t.Fatalf("response trace id = %q, want valid W3C trace id", got)
+	}
 	if got := logs.FilterMessage("http request").Len(); got != 1 {
 		t.Fatalf("access log count = %d, want 1", got)
 	}
 	fields := logs.FilterMessage("http request").All()[0].ContextMap()
+	if fields["trace_id"] != response.Header().Get(traceIDHeader) || !validSpanID(fields["span_id"]) ||
+		fields["trace_export_state"] != "disabled" || fields["trace_context_state"] != "missing" {
+		t.Fatalf("trace log fields = %#v", fields)
+	}
 	for key, want := range map[string]any{
 		"request_id": "request-123",
 		"server":     "api",
@@ -75,6 +86,153 @@ func TestBaseRequestIDLogAndMetrics(t *testing.T) {
 	if got := histogram.Metric[0].Histogram.GetSampleCount(); got != 1 {
 		t.Fatalf("duration sample count = %d, want 1", got)
 	}
+}
+
+func TestTraceContextCreatesServerSpanAndKeepsRequestIDSeparate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	core, logs := observer.New(zap.DebugLevel)
+	logger := zap.New(core)
+	registry := prometheus.NewRegistry()
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exporter)),
+	)
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	middleware, err := Base(Options{Server: "api", Logger: logger, Metrics: registry, TracerProvider: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := gin.New()
+	engine.Use(middleware...)
+	engine.GET("/traced/:id", func(c *gin.Context) {
+		c.Status(http.StatusServiceUnavailable)
+	})
+
+	parentTraceID := "0123456789abcdef0123456789abcdef"
+	parentSpanID := "0123456789abcdef"
+	req := httptest.NewRequest(http.MethodGet, "/traced/private-id", nil)
+	req.Header.Set("traceparent", "00-"+parentTraceID+"-"+parentSpanID+"-01")
+	req.Header.Set(requestIDHeader, "request-123")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, req)
+
+	if response.Code != http.StatusServiceUnavailable || response.Header().Get(requestIDHeader) != "request-123" {
+		t.Fatalf("response = %d request_id=%q", response.Code, response.Header().Get(requestIDHeader))
+	}
+	if got := response.Header().Get(traceIDHeader); got != parentTraceID {
+		t.Fatalf("response trace id = %q, want incoming %q", got, parentTraceID)
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 1 {
+		t.Fatalf("exported spans = %d, want 1", len(spans))
+	}
+	span := spans[0]
+	if span.Name != "GET /traced/:id" || span.SpanContext.TraceID().String() != parentTraceID ||
+		span.SpanContext.SpanID().String() == parentSpanID || span.Parent.SpanID().String() != parentSpanID || span.Status.Code != codes.Error {
+		t.Fatalf("server span = %#v", span)
+	}
+	attributes := make(map[string]any, len(span.Attributes))
+	for _, value := range span.Attributes {
+		attributes[string(value.Key)] = value.Value.AsInterface()
+	}
+	if attributes["http.route"] != "/traced/:id" || attributes["http.response.status_code"] != int64(http.StatusServiceUnavailable) ||
+		attributes["morde.request_id"] != "request-123" || attributes["morde.trace.context_state"] != "accepted" {
+		t.Fatalf("server span attributes = %#v", attributes)
+	}
+	logFields := logs.FilterMessage("http request").All()[0].ContextMap()
+	if logFields["trace_id"] != parentTraceID || logFields["span_id"] != span.SpanContext.SpanID().String() ||
+		logFields["trace_export_state"] != "recording" {
+		t.Fatalf("access log trace fields = %#v", logFields)
+	}
+}
+
+func TestTraceContextInvalidHeaderStartsNewTrace(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	registry := prometheus.NewRegistry()
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exporter)),
+	)
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	middleware, err := Base(Options{Server: "api", Logger: zap.NewNop(), Metrics: registry, TracerProvider: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := gin.New()
+	engine.Use(middleware...)
+	engine.GET("/traced", func(c *gin.Context) { c.Status(http.StatusOK) })
+	req := httptest.NewRequest(http.MethodGet, "/traced", nil)
+	req.Header.Set("traceparent", "not-a-traceparent")
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, req)
+
+	traceID := response.Header().Get(traceIDHeader)
+	if !validTraceID(traceID) || traceID == "not-a-traceparent" {
+		t.Fatalf("response trace id = %q, want new valid id", traceID)
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 1 || spans[0].Parent.IsValid() || spans[0].SpanContext.TraceID().String() != traceID {
+		t.Fatalf("invalid parent was not discarded: %#v", spans)
+	}
+	for _, attr := range spans[0].Attributes {
+		if attr.Key == "morde.trace.context_state" && attr.Value.AsString() != "invalid" {
+			t.Fatalf("trace context state = %q, want invalid", attr.Value.AsString())
+		}
+	}
+}
+
+func TestTraceContextMissingHeaderCreatesRootSpan(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	registry := prometheus.NewRegistry()
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exporter)),
+	)
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	middleware, err := Base(Options{Server: "api", Logger: zap.NewNop(), Metrics: registry, TracerProvider: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := gin.New()
+	engine.Use(middleware...)
+	engine.GET("/traced", func(c *gin.Context) { c.Status(http.StatusOK) })
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/traced", nil))
+
+	traceID := response.Header().Get(traceIDHeader)
+	if !validTraceID(traceID) {
+		t.Fatalf("response trace id = %q, want valid id", traceID)
+	}
+	spans := exporter.GetSpans()
+	if len(spans) != 1 || spans[0].Parent.IsValid() || spans[0].SpanContext.TraceID().String() != traceID {
+		t.Fatalf("missing parent did not create a root span: %#v", spans)
+	}
+	for _, attr := range spans[0].Attributes {
+		if attr.Key == "morde.trace.context_state" && attr.Value.AsString() != "missing" {
+			t.Fatalf("trace context state = %q, want missing", attr.Value.AsString())
+		}
+	}
+}
+
+func validTraceID(value any) bool {
+	text, ok := value.(string)
+	if !ok {
+		return false
+	}
+	traceID, err := oteltrace.TraceIDFromHex(text)
+	return err == nil && traceID.IsValid()
+}
+
+func validSpanID(value any) bool {
+	text, ok := value.(string)
+	if !ok {
+		return false
+	}
+	spanID, err := oteltrace.SpanIDFromHex(text)
+	return err == nil && spanID.IsValid()
 }
 
 func TestGatewayAccessLogIncludesProxyContext(t *testing.T) {
@@ -234,6 +392,10 @@ func TestWriteErrorBodyRetryAfterAndLogOnce(t *testing.T) {
 	if got := logs.FilterMessage("http request failed").Len(); got != 1 {
 		t.Fatalf("5xx log count = %d, want 1", got)
 	}
+	requestFailure := logs.FilterMessage("http request failed").All()[0].ContextMap()
+	if requestFailure["trace_id"] != response.Header().Get(traceIDHeader) || !validSpanID(requestFailure["span_id"]) {
+		t.Fatalf("error log trace fields = %#v", requestFailure)
+	}
 
 	engine.GET("/waking", func(c *gin.Context) {
 		WriteError(c, domain.NewError(domain.CodeHostNotReady, "host is not ready"))
@@ -305,6 +467,8 @@ func TestRecoveryHidesPanicAndFinalizesRequest(t *testing.T) {
 	}
 	if got := logs.FilterMessage("http panic").All()[0].ContextMap(); got["stack"] == nil || strings.Contains(got["stack"].(string), "panic secret") {
 		t.Fatalf("panic log does not contain a safe stack: %#v", got)
+	} else if !validTraceID(got["trace_id"]) || !validSpanID(got["span_id"]) {
+		t.Fatalf("panic log trace fields = %#v", got)
 	}
 	if got := metricFamily(t, registry, "cloudhost_http_requests_total").Metric[0].Counter.GetValue(); got != 1 {
 		t.Fatalf("panic request metric = %v, want 1", got)

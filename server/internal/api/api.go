@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
@@ -101,6 +102,7 @@ type Deps struct {
 	AdminQualityActivity         AdminQualityActivityService
 	AdminControls                AdminControlsService
 	AdminOperations              AdminOperationsService
+	Observability                 AdminObservabilityDeps
 	AdminModelBudgetDefaults     AdminModelBudgetDefaultService
 	AdminModelDefaults           AdminModelDefaultService
 	RecordConsents               RecordConsentService
@@ -120,6 +122,7 @@ type Deps struct {
 type Options struct {
 	Logger                *zap.Logger
 	Metrics               prometheus.Registerer
+	TracerProvider        trace.TracerProvider
 	ServiceInstanceID     string
 	APIMaxBodyBytes       int64
 	MCPMaxBodyBytes       int64
@@ -163,7 +166,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 		return nil, errors.New("api preview port minimum must be between 1 and 65535")
 	}
 
-	middleware, err := httpserver.Base(httpserver.Options{Server: "api", Logger: options.Logger, Metrics: options.Metrics})
+	middleware, err := httpserver.Base(httpserver.Options{Server: "api", Logger: options.Logger, Metrics: options.Metrics, TracerProvider: options.TracerProvider})
 	if err != nil {
 		return nil, err
 	}
@@ -270,6 +273,7 @@ func New(deps Deps, options Options) (*gin.Engine, error) {
 	h.registerAdminRecords(group)
 	h.registerAdminPersonalDataQuota(group)
 	h.registerAdminModelUsage(group)
+	h.registerAdminObservability(group)
 	engine.NoRoute(h.noRoute)
 	engine.NoMethod(func(c *gin.Context) {
 		httpserver.WriteError(c, domain.NewError(domain.CodeNotFound, "not found"))

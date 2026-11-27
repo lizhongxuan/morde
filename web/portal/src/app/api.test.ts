@@ -7,6 +7,31 @@ import { createMessageVariant, messageVariantContentTooLong } from './message-va
 describe('typed Portal API client', () => {
   afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
 
+  it('sends a W3C trace context and exposes the server trace ID for diagnostics', async () => {
+    let request: Request | undefined;
+    const received: { request_id?: string | null; trace_id?: string; status?: number }[] = [];
+    const onTrace = (event: Event) => received.push((event as CustomEvent).detail);
+    window.addEventListener('morde:api-trace', onTrace);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(new URL(typeof input === 'string' ? input : input.toString(), window.location.origin), init);
+      return new Response('{}', { headers: { 'X-Trace-Id': 'a'.repeat(32) } });
+    }));
+
+    try {
+      await requestFetch('/api/test', { headers: { 'X-Request-Id': 'existing-request-id' } });
+    } finally {
+      window.removeEventListener('morde:api-trace', onTrace);
+    }
+
+    const traceparent = request!.headers.get('traceparent') ?? '';
+    expect(traceparent).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    const [, traceID, spanID] = traceparent.split('-');
+    expect(traceID).not.toBe('0'.repeat(32));
+    expect(spanID).not.toBe('0'.repeat(16));
+    expect(request!.headers.get('X-Request-Id')).toBe('existing-request-id');
+    expect(received).toEqual([{ request_id: 'existing-request-id', trace_id: 'a'.repeat(32), status: 200 }]);
+  });
+
   it('builds a same-origin URL for a Task artifact download', () => {
     expect(portalApi.taskArtifactContentURL('q1234567', 'a7654321'))
       .toBe('/api/tasks/q1234567/artifacts/a7654321/content');

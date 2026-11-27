@@ -4,7 +4,7 @@ import { existsSync, readFileSync, writeFileSync, renameSync, mkdirSync, rmSync 
 import { access, lstat, realpath } from "node:fs/promises";
 import { constants as fsConstants } from "node:fs";
 import { basename, dirname, isAbsolute, join, posix, resolve, win32 } from "node:path";
-import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, withTimeout, type ClientLoginAttempt, type Credentials, type HostEmbedTarget, type ProjectSyncFolder, type WebSession } from "./morde-core";
+import { MordeAPI, checkedId, credentialExpired, credentialExpiresSoon, gatewayURL, localGatewayOrigin, mordeUserDataDirectory, portalOrigin, tracedFetch, withTimeout, type ClientLoginAttempt, type Credentials, type HostEmbedTarget, type ProjectSyncFolder, type WebSession } from "./morde-core";
 import { checkedDirectory, MordeSync, pathsOverlap, SyncRunError, validateSyncScope, type HandoffRecord, type HandoffTarget, type Mapping, type PreservedFile, type ProjectHostApplicationStatus, type SyncCheckpoint } from "./morde-sync";
 import { MordeSyncthingNode, type ManagedWorkspaceFolder } from "./morde-node";
 import { MordeCodexRuntime, type CodexPersistentState } from "./morde-codex";
@@ -16,7 +16,10 @@ app.setName("Morde");
 const userData = mordeUserDataDirectory(app.getPath("appData"), process.env.MORDE_TEST_USER_DATA);
 mkdirSync(userData, { recursive: true, mode: 0o700 });
 app.setPath("userData", userData);
-const systemFetch: typeof fetch = (input, init) => net.fetch(typeof input === "string" ? input : input instanceof URL ? input.href : input.url, init);
+const systemFetch: typeof fetch = (input, init) => tracedFetch(
+  (requestInput, requestInit) => net.fetch(typeof requestInput === "string" ? requestInput : requestInput instanceof URL ? requestInput.href : requestInput.url, requestInit),
+  input, init,
+);
 const hostEmbedFetch: typeof fetch = (input, init) => {
   const options = init;
   const body = options?.body;
