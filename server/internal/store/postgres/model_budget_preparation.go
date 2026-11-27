@@ -199,7 +199,11 @@ FROM model_call_ledger WHERE owner_id=$1 AND NOT personal_model`, call.OwnerID).
 		if unknown {
 			return 0, "", domain.NewError(domain.CodeInvalidState, "model usage is unknown and requires reconciliation")
 		}
-		if running >= maxConcurrent {
+		claims, err := modelBudgetCapacitySlotClaimsInTx(ctx, tx, call.OwnerID, call.Task.TaskID, preparation.BudgetCallID)
+		if err != nil {
+			return 0, "", err
+		}
+		if int64(running)+claims >= int64(maxConcurrent) {
 			limited := domain.NewError(domain.CodeRateLimited, "model concurrency limit reached")
 			limited.Details["reason"] = "model_concurrency_limit"
 			limited.Details["stage"] = "reservation"

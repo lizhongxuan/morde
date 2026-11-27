@@ -19,6 +19,32 @@ func TestValidStoredRouteDecisionAcceptsStructuredExplicitNewWithoutLexiconMatch
 	}
 }
 
+func TestValidStoredRouteDecisionKeepsLongReplyFieldsBehindExplicitLongMode(t *testing.T) {
+	context := app.ConversationRouteContext{Content: "Explain this carefully"}
+	for _, decision := range []app.ConversationRouteDecision{
+		{Action: app.ConversationRouteReply, Reply: "A long answer.", LongReply: true},
+		{Action: app.ConversationRouteReply, Reply: "A partial answer.", LongReply: true, Partial: true},
+		{Action: app.ConversationRouteClarify, Question: "Please narrow the question.", LongReply: true},
+	} {
+		if !validStoredRouteDecision(decision, context, true) {
+			t.Fatalf("valid explicit long-form decision was rejected: %+v", decision)
+		}
+		if validStoredRouteDecision(decision, context) {
+			t.Fatalf("long-form decision was accepted on the default short path: %+v", decision)
+		}
+	}
+	for _, decision := range []app.ConversationRouteDecision{
+		{Action: app.ConversationRouteReply, Reply: "A long answer."},
+		{Action: app.ConversationRouteReply, Reply: "A partial answer.", LongReply: true, Cancelled: true},
+		{Action: app.ConversationRouteNew, LongReply: true},
+		{Action: app.ConversationRouteClarify, Question: "Please narrow the question.", LongReply: true, Partial: true},
+	} {
+		if validStoredRouteDecision(decision, context, true) {
+			t.Fatalf("invalid long-form decision was accepted: %+v", decision)
+		}
+	}
+}
+
 func TestValidStoredRouteDecisionAcceptsBoundedDirectReadOnlyTools(t *testing.T) {
 	context := app.ConversationRouteContext{Content: "查找这个主题的公开资料"}
 	for _, test := range []struct {

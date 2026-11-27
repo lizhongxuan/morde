@@ -150,6 +150,37 @@ VALUES ($1,$2,'agent-1',1,'session-1','engine','profile','revision-supervisor',$
 	return f, gateway, provider, fence, call
 }
 
+func TestPostgresTaskModelTruncationPersistsEncryptedPartialAndReplaysWithoutProvider(t *testing.T) {
+	f, gateway, provider, _, call := revisionGatewayFixture(t)
+	provider.response = &app.ModelResponse{Reasoning: "private reasoning", Text: "saved visible prefix",
+		StopReason: "length", ProviderReportedModel: "provider-snapshot-3",
+		Usage: app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4}}
+
+	response, err := gateway.Complete(context.Background(), call)
+	var upstream *domain.Error
+	if response.Text != "" || !errors.As(err, &upstream) || upstream.Details["reason"] != string(app.ModelErrorTruncatedResponse) ||
+		provider.calls.Load() != 1 {
+		t.Fatalf("Task truncation result = %#v err=%v provider calls=%d", response, err, provider.calls.Load())
+	}
+	var state string
+	var inputTokens, outputTokens int64
+	var ciphertext []byte
+	query := `SELECT ledger.state,ledger.input_tokens,ledger.output_tokens,response.response_ciphertext FROM model_call_ledger ledger JOIN task_model_call_responses response ON response.owner_id=ledger.owner_id AND response.source=ledger.source AND response.call_id=ledger.call_id WHERE ledger.owner_id=$1 AND ledger.source='task' AND ledger.call_id=$2`
+	if err := f.store.pool.QueryRow(context.Background(), query, f.ownerID, call.CallID).Scan(&state, &inputTokens, &outputTokens, &ciphertext); err != nil {
+		t.Fatal(err)
+	}
+	if state != "settled" || inputTokens != 8 || outputTokens != 4 || len(ciphertext) == 0 ||
+		strings.Contains(string(ciphertext), "saved visible prefix") || strings.Contains(string(ciphertext), "private reasoning") {
+		t.Fatalf("truncated Task response was not settled and sealed: state=%q input=%d output=%d ciphertext=%d",
+			state, inputTokens, outputTokens, len(ciphertext))
+	}
+
+	response, err = gateway.Complete(context.Background(), call)
+	if response.Text != "" || !errors.As(err, &upstream) || upstream.Details["reason"] != string(app.ModelErrorTruncatedResponse) || provider.calls.Load() != 1 {
+		t.Fatalf("settled partial replay dispatched provider again: response=%#v err=%v calls=%d", response, err, provider.calls.Load())
+	}
+}
+
 func acceptRevisionForGateway(t *testing.T, f routeActionsTestFixture, fence app.ModelTaskFence) {
 	t.Helper()
 	claim := f.receive(t, "revision-model-update", "change the request", app.ConversationRoutingInput{ReferenceTaskID: fence.TaskID})

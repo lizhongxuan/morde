@@ -512,7 +512,8 @@ ORDER BY (state IN ('reserved','dispatched')) DESC,(phase=$3 AND attempt=$4) DES
 			}
 			if legacyPrior && state == "settled" {
 				var value app.ConversationRouteDecision
-				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context) {
+				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context,
+					call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm) {
 					return domain.NewError(domain.CodeInvalidState, "settled legacy route decision is invalid")
 				}
 				if staleAttemptZeroRouteDecision(value, call.Route.Context) {
@@ -528,7 +529,8 @@ ORDER BY (state IN ('reserved','dispatched')) DESC,(phase=$3 AND attempt=$4) DES
 					return err
 				}
 				var value app.ConversationRouteDecision
-				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context) {
+				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context,
+					call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm) {
 					return domain.NewError(domain.CodeInvalidState, "settled coordinator route decision is invalid")
 				}
 				if staleAttemptZeroRouteDecision(value, call.Route.Context) {
@@ -548,6 +550,10 @@ ORDER BY (state IN ('reserved','dispatched')) DESC,(phase=$3 AND attempt=$4) DES
 				if err := json.Unmarshal(result, &value); err != nil {
 					return fmt.Errorf("decode route decision: %w", err)
 				}
+				if !validStoredRouteDecision(value, call.Route.Context,
+					call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm) {
+					return domain.NewError(domain.CodeInvalidState, "settled route decision is invalid")
+				}
 				decision = &value
 				return nil
 			default:
@@ -559,6 +565,16 @@ ORDER BY (state IN ('reserved','dispatched')) DESC,(phase=$3 AND attempt=$4) DES
 		}
 		if err := checkModelCaller(ctx, tx, call); err != nil {
 			return err
+		}
+		if call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm {
+			var cancelled bool
+			if err := tx.QueryRow(ctx, `SELECT cancel_requested_at IS NOT NULL FROM conversation_message_routes
+WHERE message_id=$1 AND actor_id=$2 AND state='processing' AND lease_owner=$3 AND lease_version=$4 FOR UPDATE`,
+				call.Route.Claim.Message.ID, call.OwnerID, call.Route.Claim.LeaseOwner, call.Route.Claim.LeaseVersion).Scan(&cancelled); err != nil {
+				return domain.NewError(domain.CodeConflict, "long-form conversation route is no longer current")
+			} else if cancelled {
+				return domain.NewError(domain.CodeConflict, "long-form conversation reply was cancelled before dispatch")
+			}
 		}
 		if call.ProjectID != "" && !call.PersonalModel && projectCall == nil {
 			return app.ErrRouteProjectReservationRequired
@@ -788,6 +804,16 @@ func (s *Store) BeginConversationRouteModelCall(ctx context.Context, call app.Mo
 		if err := checkModelCaller(ctx, tx, call); err != nil {
 			return err
 		}
+		if call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm {
+			var cancelled bool
+			if err := tx.QueryRow(ctx, `SELECT cancel_requested_at IS NOT NULL FROM conversation_message_routes
+WHERE message_id=$1 AND actor_id=$2 AND state='processing' AND lease_owner=$3 AND lease_version=$4 FOR UPDATE`,
+				call.Route.Claim.Message.ID, call.OwnerID, call.Route.Claim.LeaseOwner, call.Route.Claim.LeaseVersion).Scan(&cancelled); err != nil {
+				return domain.NewError(domain.CodeConflict, "long-form conversation route is no longer current")
+			} else if cancelled {
+				return domain.NewError(domain.CodeConflict, "long-form conversation reply was cancelled before dispatch")
+			}
+		}
 		var state, modelID string
 		var digest []byte
 		var version time.Time
@@ -864,7 +890,8 @@ WHERE r.message_id=$1 AND r.actor_id=$2 AND r.lease_owner=$3 AND r.lease_version
 // worker's lease expired after dispatch.
 func (s *Store) SettleConversationRouteModelCall(ctx context.Context, call app.ModelCallReservation, decision *app.ConversationRouteDecision, usage app.ModelUsage, unknown bool) error {
 	if call.Source != app.ModelCallRoute || call.Route == nil || !domain.ValidUserID(call.OwnerID) ||
-		(!unknown && (decision == nil || !validStoredRouteDecision(*decision, call.Route.Context) || !usage.Known || usage.InputTokens < 0 || usage.OutputTokens < 0 ||
+		(!unknown && (decision == nil || !validStoredRouteDecision(*decision, call.Route.Context,
+			call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm) || !usage.Known || usage.InputTokens < 0 || usage.OutputTokens < 0 ||
 			usage.InputTokens > math.MaxInt64-usage.OutputTokens)) {
 		return domain.InvalidArgument("route_model", "route model settlement is invalid")
 	}
@@ -996,9 +1023,32 @@ WHERE message_id=$1 AND call_id=$3 AND state IN ('dispatched','unknown')`, call.
 	return nil
 }
 
-func validStoredRouteDecision(value app.ConversationRouteDecision, context app.ConversationRouteContext) bool {
+func validStoredRouteDecision(value app.ConversationRouteDecision, context app.ConversationRouteContext, longReplyMode ...bool) bool {
+	allowLongReply := len(longReplyMode) == 1 && longReplyMode[0]
 	if !app.ValidConversationRouteModelOutput(value.ModelOutput) ||
 		!app.ValidConversationRouteFileDeliveryIntent(value.Action, value.FileDeliveryIntent) {
+		return false
+	}
+	if value.Cancelled {
+		return false
+	}
+	if allowLongReply {
+		if !value.LongReply || value.ModelOutput != "" || value.FileDeliveryIntent != "" || value.Acknowledge || value.ExplicitNew ||
+			value.TaskID != "" || value.TargetMessageID != "" || value.ExpectedRevision != 0 || len(value.DependencyTaskIDs) != 0 ||
+			len(value.AggregateMessageIDs) != 0 || value.ToolName != "" || value.ToolArguments != "" || value.InvalidOutput {
+			return false
+		}
+		switch value.Action {
+		case app.ConversationRouteReply:
+			return value.Question == "" && app.ValidConversationLongReply(value.Reply)
+		case app.ConversationRouteClarify:
+			return !value.Partial && value.Reply == "" && value.Question != "" && utf8.ValidString(value.Question) &&
+				!strings.ContainsRune(value.Question, '\x00') && utf8.RuneCountInString(value.Question) <= 200
+		default:
+			return false
+		}
+	}
+	if value.LongReply || value.Partial {
 		return false
 	}
 	if value.InvalidOutput {
@@ -1111,7 +1161,7 @@ WHERE message_id=$1 AND actor_id=$2 AND phase=$3 AND attempt=$4`, claim.Message.
 		}
 		var decision app.ConversationRouteDecision
 		if state != "settled" || modelID != value.ModelID || json.Unmarshal(encoded, &decision) != nil ||
-			!validStoredRouteDecision(decision, value) {
+			!validStoredRouteDecision(decision, value, fence.Claim.Input.ResponseMode == app.ConversationResponseLongForm) {
 			return domain.NewError(domain.CodeInvalidState, "coordinator model result is not safely recoverable")
 		}
 		invalidOutput = decision.InvalidOutput

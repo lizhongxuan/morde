@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain/task"
 )
 
 func TestCloudDSHCapacityWaitSurvivesBudgetDenialPipeFailure(t *testing.T) {
@@ -33,9 +34,13 @@ func (stub cloudDSHModelBudgetPlannerStub) PrepareModelBudget(context.Context, C
 	return stub.plan, nil
 }
 
+func (cloudDSHModelBudgetPlannerStub) SupportsTaskModelBudgetAdmission(context.Context, task.Task) (bool, error) {
+	return true, nil
+}
+
 func TestCloudDSHModelBudgetAdmissionIsOptIn(t *testing.T) {
 	start := map[string]any{"type": "start"}
-	configureCloudDSHModelBudgetAdmission(start, nil, 2048)
+	configureCloudDSHModelBudgetAdmission(start, nil, false, 2048)
 	if _, exists := start["model_budget_admission"]; exists {
 		t.Fatal("default start frame enabled model budget admission")
 	}
@@ -44,12 +49,23 @@ func TestCloudDSHModelBudgetAdmissionIsOptIn(t *testing.T) {
 	}
 
 	optInStart := map[string]any{"type": "start"}
-	configureCloudDSHModelBudgetAdmission(optInStart, cloudDSHModelBudgetPlannerStub{plan: CloudDSHModelBudgetPlan{PlanID: "plan_1", MaxTokens: 64}}, 2048)
+	configureCloudDSHModelBudgetAdmission(optInStart, cloudDSHModelBudgetPlannerStub{plan: CloudDSHModelBudgetPlan{PlanID: "plan_1", MaxTokens: 64}}, true, 2048)
 	if enabled, ok := optInStart["model_budget_admission"].(bool); !ok || !enabled {
 		t.Fatal("planner-backed start frame did not opt into model budget admission")
 	}
 	if _, exists := optInStart["max_tokens"]; exists {
 		t.Fatal("planner-backed start frame retained the legacy output cap")
+	}
+}
+
+func TestCloudDSHModelBudgetAdmissionKeepsUnlistedTaskOnLegacyCap(t *testing.T) {
+	start := map[string]any{"type": "start"}
+	configureCloudDSHModelBudgetAdmission(start, cloudDSHModelBudgetPlannerStub{}, false, 2048)
+	if _, exists := start["model_budget_admission"]; exists {
+		t.Fatal("unlisted task route enabled model budget admission")
+	}
+	if maxTokens, ok := start["max_tokens"].(int64); !ok || maxTokens != 2048 {
+		t.Fatalf("unlisted task route did not retain its legacy cap: %#v", start["max_tokens"])
 	}
 }
 

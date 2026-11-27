@@ -41,13 +41,13 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3`, owner.UserID, stale.Source, sta
 	}
 	if _, err := store.pool.Exec(ctx, `INSERT INTO model_call_ledger(owner_id,source,call_id,request_digest,model_id,provider_model,task_id,
  reserved_tokens,state,created_at) VALUES ($1,'task','stale-task-call',decode(repeat('03',32),'hex'),'p1234567','test-model',
- 'q1234567',100,'dispatched',clock_timestamp()-interval '3 minutes')`, owner.UserID); err != nil {
+	 'q1234567',100,'dispatched',clock_timestamp()-interval '3 minutes')`, owner.UserID); err != nil {
 		t.Fatal(err)
 	}
 
 	marked, err := store.MarkStaleModelCallsUnknown(ctx)
-	if err != nil || marked != 2 {
-		t.Fatalf("MarkStaleModelCallsUnknown() = %d, %v", marked, err)
+	if err != nil || marked != 1 {
+		t.Fatalf("MarkStaleModelCallsUnknown() before Task deadline = %d, %v", marked, err)
 	}
 	if err := store.BeginModelCallDispatch(ctx, stale); err == nil {
 		t.Fatal("recovered stale call started a provider request")
@@ -61,6 +61,18 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3`, owner.UserID, stale.Source, sta
 	if err := store.pool.QueryRow(ctx, `SELECT state,settled_at::text FROM model_call_ledger WHERE owner_id=$1 AND source='client' AND call_id=$2`,
 		owner.UserID, fresh.CallID).Scan(&freshState, &freshSettled); err != nil || freshState != "dispatched" || freshSettled != nil {
 		t.Fatalf("fresh client call = %q, %v, %v", freshState, freshSettled, err)
+	}
+	var earlyTaskState string
+	if err := store.pool.QueryRow(ctx, `SELECT state FROM model_call_ledger WHERE owner_id=$1 AND source='task' AND call_id='stale-task-call'`, owner.UserID).
+		Scan(&earlyTaskState); err != nil || earlyTaskState != "dispatched" {
+		t.Fatalf("Task call before its long timeout = %q, %v", earlyTaskState, err)
+	}
+	if _, err := store.pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-interval '13 minutes'
+WHERE owner_id=$1 AND source='task' AND call_id='stale-task-call'`, owner.UserID); err != nil {
+		t.Fatal(err)
+	}
+	if marked, err := store.MarkStaleModelCallsUnknown(ctx); err != nil || marked != 1 {
+		t.Fatalf("MarkStaleModelCallsUnknown() after Task deadline = %d, %v", marked, err)
 	}
 	var taskUsage *int64
 	if err := store.pool.QueryRow(ctx, `SELECT l.state,t.usage_model_tokens FROM model_call_ledger l JOIN tasks t ON t.id=l.task_id
@@ -172,7 +184,7 @@ func TestPostgresLateKnownModelUsageSettlesUnknownCall(t *testing.T) {
 	}
 	if _, err := store.pool.Exec(ctx, `INSERT INTO model_call_ledger(owner_id,source,call_id,request_digest,model_id,provider_model,task_id,
  reserved_tokens,state,created_at) VALUES ($1,'task','late-task-call',decode(repeat('04',32),'hex'),'p1234567','test-model',
- 'q1234567',100,'dispatched',clock_timestamp()-interval '3 minutes')`, principal.UserID); err != nil {
+	 'q1234567',100,'dispatched',clock_timestamp()-interval '13 minutes')`, principal.UserID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-interval '3 minutes'

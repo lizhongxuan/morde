@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -317,6 +318,65 @@ WHERE task_id=$1`, f.task.ID, mustID(t, domain.NewMessageID)); err != nil {
 	}
 	if _, err := f.route.store.pool.Exec(ctx, `UPDATE task_events SET task_revision=1 WHERE task_id=$1 AND sequence=$2`, f.task.ID, eventSequence); err == nil {
 		t.Fatal("completed output allowed its result revision to change")
+	}
+}
+
+func TestCloudDSHStreamPersistsLargeReplyAsBoundedDeltas(t *testing.T) {
+	f := newCloudDSHStreamFixture(t)
+	ctx := context.Background()
+	first := f.delta
+	first.Text = "x"
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, first); err != nil || !appended {
+		t.Fatalf("start large reply stream: appended=%t err=%v", appended, err)
+	}
+	second := first
+	second.Text = strings.Repeat("y", app.MaxAssistantMessageBytes)
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, second); err != nil || !appended {
+		t.Fatalf("append bounded large reply delta: appended=%t err=%v", appended, err)
+	}
+	var content, snapshot string
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT content FROM conversation_messages WHERE id=$1`, first.MessageID).Scan(&content); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT content FROM task_assistant_message_snapshots WHERE task_id=$1`, f.task.ID).Scan(&snapshot); err != nil {
+		t.Fatal(err)
+	}
+	want := first.Text + second.Text
+	if len(want) <= app.MaxAssistantMessageBytes || len(content) != len(want) || content != want || snapshot != want {
+		t.Fatalf("durable stream content mismatch: want bytes=%d conversation=%d snapshot=%d", len(want), len(content), len(snapshot))
+	}
+	nearLimit := strings.Repeat("z", app.MaxAssistantReplyBytes-1)
+	if _, err := f.route.store.pool.Exec(ctx, `UPDATE conversation_messages SET content=$2 WHERE id=$1`, first.MessageID, nearLimit); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.route.store.pool.Exec(ctx, `UPDATE task_assistant_message_snapshots SET content=$2 WHERE task_id=$1`, f.task.ID, nearLimit); err != nil {
+		t.Fatal(err)
+	}
+	var eventCountBefore int
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1`, f.task.ID).Scan(&eventCountBefore); err != nil {
+		t.Fatal(err)
+	}
+	overflow := first
+	overflow.Text = "yy"
+	if appended, err := f.route.store.AppendCloudDSHTextDelta(ctx, overflow); appended || domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("reply overflow was not rejected before persistence: appended=%t err=%v", appended, err)
+	}
+	var conversationBytes, snapshotBytes int
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT octet_length(content) FROM conversation_messages WHERE id=$1`, first.MessageID).Scan(&conversationBytes); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT octet_length(content) FROM task_assistant_message_snapshots WHERE task_id=$1`, f.task.ID).Scan(&snapshotBytes); err != nil {
+		t.Fatal(err)
+	}
+	if conversationBytes != app.MaxAssistantReplyBytes-1 || snapshotBytes != app.MaxAssistantReplyBytes-1 {
+		t.Fatalf("overflow changed durable content: conversation=%d snapshot=%d", conversationBytes, snapshotBytes)
+	}
+	var eventCountAfter int
+	if err := f.route.store.pool.QueryRow(ctx, `SELECT count(*) FROM task_events WHERE task_id=$1`, f.task.ID).Scan(&eventCountAfter); err != nil {
+		t.Fatal(err)
+	}
+	if eventCountAfter != eventCountBefore {
+		t.Fatalf("overflow created a task event: before=%d after=%d", eventCountBefore, eventCountAfter)
 	}
 }
 

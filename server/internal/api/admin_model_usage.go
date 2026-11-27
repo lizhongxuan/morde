@@ -21,15 +21,32 @@ type ModelUsageAdmin interface {
 }
 
 type unknownModelCallResponse struct {
-	OwnerID        string              `json:"owner_id"`
-	Source         app.ModelCallSource `json:"source"`
-	CallID         string              `json:"call_id"`
-	ModelID        string              `json:"model_id"`
-	ProviderModel  string              `json:"provider_model"`
-	TaskID         string              `json:"task_id,omitempty"`
-	ReservedTokens int64               `json:"reserved_tokens"`
-	CreatedAt      time.Time           `json:"created_at"`
-	UnknownAt      time.Time           `json:"unknown_at"`
+	OwnerID               string                              `json:"owner_id"`
+	Source                app.ModelCallSource                 `json:"source"`
+	CallID                string                              `json:"call_id"`
+	ModelID               string                              `json:"model_id"`
+	ProviderModel         string                              `json:"provider_model"`
+	TaskID                string                              `json:"task_id,omitempty"`
+	ReservedTokens        int64                               `json:"reserved_tokens"`
+	CreatedAt             time.Time                           `json:"created_at"`
+	UnknownAt             time.Time                           `json:"unknown_at"`
+	AdaptiveBudgetOverage *adaptiveModelBudgetOverageResponse `json:"adaptive_budget_overage,omitempty"`
+}
+
+type adaptiveModelBudgetOverageResponse struct {
+	Status               string  `json:"status"`
+	ReasonCode           string  `json:"reason_code"`
+	ReservedInputTokens  int64   `json:"reserved_input_tokens"`
+	ReservedOutputTokens int64   `json:"reserved_output_tokens"`
+	ReportedInputTokens  int64   `json:"reported_input_tokens"`
+	ReportedOutputTokens int64   `json:"reported_output_tokens"`
+	InputOverageTokens   int64   `json:"input_overage_tokens"`
+	OutputOverageTokens  int64   `json:"output_overage_tokens"`
+	ProjectID            *string `json:"project_id,omitempty"`
+	Currency             *string `json:"currency,omitempty"`
+	ReservedMicros       *int64  `json:"reserved_micros,omitempty"`
+	ReportedMicros       *int64  `json:"reported_micros,omitempty"`
+	MoneyOverageMicros   *int64  `json:"money_overage_micros,omitempty"`
 }
 
 type modelUsageReconcileRequest struct {
@@ -143,11 +160,22 @@ func (h *api) listUnknownModelUsage(c *gin.Context) {
 	}
 	response := make([]unknownModelCallResponse, 0, len(items))
 	for _, item := range items {
-		response = append(response, unknownModelCallResponse{
+		row := unknownModelCallResponse{
 			OwnerID: item.OwnerID, Source: item.Source, CallID: item.CallID, ModelID: item.ModelID,
 			ProviderModel: item.ProviderModel, TaskID: item.TaskID, ReservedTokens: item.ReservedTokens,
 			CreatedAt: item.CreatedAt, UnknownAt: item.UnknownAt,
-		})
+		}
+		if overage := item.AdaptiveBudgetOverage; overage != nil {
+			row.AdaptiveBudgetOverage = &adaptiveModelBudgetOverageResponse{
+				Status: overage.Status, ReasonCode: overage.ReasonCode,
+				ReservedInputTokens: overage.ReservedInputTokens, ReservedOutputTokens: overage.ReservedOutputTokens,
+				ReportedInputTokens: overage.ReportedInputTokens, ReportedOutputTokens: overage.ReportedOutputTokens,
+				InputOverageTokens: overage.InputOverageTokens, OutputOverageTokens: overage.OutputOverageTokens,
+				ProjectID: overage.ProjectID, Currency: overage.Currency, ReservedMicros: overage.ReservedMicros,
+				ReportedMicros: overage.ReportedMicros, MoneyOverageMicros: overage.MoneyOverageMicros,
+			}
+		}
+		response = append(response, row)
 	}
 	c.JSON(http.StatusOK, gin.H{"items": response})
 }

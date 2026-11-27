@@ -231,6 +231,7 @@ max_output_catalog_version=NULL,max_output_source_url=NULL,updated_at=clock_time
 	if err != nil {
 		t.Fatal(err)
 	}
+	call.LedgerCallID = dshCallID
 	call.RawRequest = finalProjection
 	call.BudgetPlanID, call.BudgetCallID, call.BudgetRequestDigest = plan.PlanID, budgetCallID, requestDigest
 	response, err := gateway.Complete(ctx, call)

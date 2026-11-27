@@ -425,7 +425,7 @@ COALESCE(activity_phase='model' AND activity_state='started' AND
 FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2
   AND (parent_session_id IS NULL OR task_revision=$3)
 ORDER BY (parent_session_id IS NULL) DESC,created_at,session_id`, value.ID, value.OwnerID, *value.CurrentRevision,
-		staleAfter.Milliseconds(), app.ModelCallTimeout.Milliseconds())
+		staleAfter.Milliseconds(), app.TaskModelCallTimeout.Milliseconds())
 	if err != nil {
 		return false, false, fmt.Errorf("read current Task agent activity: %w", err)
 	}

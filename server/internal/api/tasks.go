@@ -1628,7 +1628,7 @@ func toTaskResponse(value app.TaskDetails) (taskResponse, error) {
 		if !domain.ValidMessageID(message.ID) || !domain.ValidConversationID(message.ConversationID) ||
 			message.ConversationID != value.Task.ConversationID || message.TaskID != value.Task.ID ||
 			(message.Sequence < 1 && status == "completed") || message.Sequence < 0 || message.Role != conversation.RoleAssistant || len(message.Content) == 0 ||
-			len(message.Content) > app.MaxAssistantMessageBytes || !utf8.ValidString(message.Content) ||
+			len(message.Content) > app.MaxAssistantReplyBytes || !utf8.ValidString(message.Content) ||
 			strings.ContainsRune(message.Content, '\x00') || message.CreatedAt.IsZero() ||
 			(assistant.TaskRevision != nil && *assistant.TaskRevision < 0) ||
 			(assistant.ResultEventSequence != nil && (*assistant.ResultEventSequence < 1 || assistant.TaskRevision == nil)) {

@@ -41,6 +41,16 @@ func lookupModelContextCapacity(baseURL, modelID string) (modelContextCapacityEn
 	return modelContextCapacityEntry{}, false
 }
 
+func modelContextWindowCapacityNeedsRefresh(record ModelConnectionRecord) bool {
+	entry, ok := lookupModelContextCapacity(record.BaseURL, record.ModelName)
+	if !ok {
+		return record.ContextWindowSource == ModelContextWindowModelCatalog
+	}
+	return record.ContextWindowSource != ModelContextWindowModelCatalog || record.ContextWindowTokens == nil ||
+		*record.ContextWindowTokens != entry.contextTokens || record.ContextWindowCatalogVersion == nil ||
+		*record.ContextWindowCatalogVersion != entry.catalogVersion || record.ContextWindowOverrideTokens != nil
+}
+
 func rejectDefaultModelContextOverride(baseURL, modelID string, override *int) error {
 	if override == nil {
 		return nil

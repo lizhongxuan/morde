@@ -32,6 +32,12 @@ models:
   # proxy_url: http://127.0.0.1:7897
   # Add one explicit, versioned rate per model before enabling project model calls.
   project_rates: []
+  # Adaptive Task admission is opt-in and must stay disabled until its rollout gates pass.
+  output_budget_admission_enabled: false
+  # Shadow planning is observation-only and does not change the provider output cap.
+  # Add reviewed strategy fields and exact routes for shadow or later pilot admission.
+  output_budget_shadow:
+    enabled: false
 orchestrator:
   profiles:
     container:

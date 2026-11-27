@@ -117,10 +117,14 @@ ORDER BY r.created_at,r.message_id FOR UPDATE OF r SKIP LOCKED LIMIT 1`,
 		if err := json.Unmarshal(authorization, &claim.Authorization); err != nil {
 			return fmt.Errorf("decode conversation routing authorization: %w", err)
 		}
+		leaseSeconds := int64(duration / time.Second)
+		if claim.Input.ResponseMode == app.ConversationResponseLongForm && leaseSeconds < int64((app.ConversationLongReplyTimeout+time.Minute)/time.Second) {
+			leaseSeconds = int64((app.ConversationLongReplyTimeout + time.Minute) / time.Second)
+		}
 		err = tx.QueryRow(ctx, `UPDATE conversation_message_routes
 SET state='processing',lease_owner=$2,lease_version=lease_version+1,
     lease_expires_at=clock_timestamp()+($3::bigint * interval '1 second'),updated_at=clock_timestamp()
-WHERE message_id=$1 RETURNING lease_version,lease_expires_at`, claim.Message.ID, workerID, int64(duration/time.Second)).
+WHERE message_id=$1 RETURNING lease_version,lease_expires_at`, claim.Message.ID, workerID, leaseSeconds).
 			Scan(&claim.LeaseVersion, &claim.LeaseExpiresAt)
 		if err != nil {
 			return fmt.Errorf("lease conversation route: %w", err)

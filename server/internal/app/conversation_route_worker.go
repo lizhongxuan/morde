@@ -40,6 +40,19 @@ type ConversationRouteClassifier interface {
 	ClassifyConversationRoute(context.Context, ConversationRouteClaim, ConversationRouteContext) (ConversationRouteDecision, error)
 }
 
+// ConversationRouteLongReplyGenerator creates one bounded no-tools reply for
+// an explicitly selected long-form message. It is separate from classification
+// so the user receives the requested answer without an extra model round trip.
+type ConversationRouteLongReplyGenerator interface {
+	GenerateConversationLongReply(context.Context, ConversationRouteClaim, ConversationRouteContext) (ConversationRouteDecision, error)
+}
+
+// ConversationRouteCancellationChecker reads the durable cancellation marker
+// while a long-form provider request is in flight.
+type ConversationRouteCancellationChecker interface {
+	ConversationRouteCancellationRequested(context.Context, ConversationRouteClaim) (bool, error)
+}
+
 // ConversationRouteActions performs each action and completes the route in the
 // same transaction, after rechecking authorization and the routing snapshot.
 type ConversationRouteActions interface {

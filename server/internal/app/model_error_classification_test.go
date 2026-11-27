@@ -86,6 +86,7 @@ func TestClassifyModelClientErrorKinds(t *testing.T) {
 		{ModelErrorInvalidResponse, "", FailoverFormatError},
 		{ModelErrorEmptyResponse, "", FailoverIncompleteResponse},
 		{ModelErrorTruncatedResponse, "", FailoverIncompleteResponse},
+		{ModelErrorContentFiltered, "", FailoverGuardrailBlocked},
 		// Provider-code refinement wins over the kind.
 		{ModelErrorInvalidRequest, "context_length_exceeded", FailoverContextOverflow},
 		{ModelErrorInvalidRequest, "model_not_found", FailoverModelNotFound},

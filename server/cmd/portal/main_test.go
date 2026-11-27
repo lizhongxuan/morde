@@ -24,6 +24,7 @@ import (
 	"morde/server/internal/domain/project"
 	"morde/server/internal/domain/schedule"
 	"morde/server/internal/domain/task"
+	"morde/server/internal/worker"
 )
 
 type expiredTaskModelBudgetPreparationCleanerProbe struct {
@@ -32,6 +33,62 @@ type expiredTaskModelBudgetPreparationCleanerProbe struct {
 	count int32
 	err   error
 	calls int
+}
+
+type cloudDSHModelBudgetPreparationServiceProbe struct {
+	calls                int
+	eligibilityCalls     int
+	eligible             bool
+	eligibilityErr       error
+	eligibilityTaskValue task.Task
+}
+
+func (probe *cloudDSHModelBudgetPreparationServiceProbe) PrepareTaskModelBudget(context.Context,
+	app.TaskModelBudgetPrepareRequest) (app.TaskModelBudgetPlan, error) {
+	probe.calls++
+	return app.TaskModelBudgetPlan{PlanID: "plan_test_123", MaxTokens: 4096}, nil
+}
+
+func (probe *cloudDSHModelBudgetPreparationServiceProbe) SupportsTaskModelBudgetAdmission(_ context.Context, value task.Task) (bool, error) {
+	probe.eligibilityCalls++
+	probe.eligibilityTaskValue = value
+	return probe.eligible, probe.eligibilityErr
+}
+
+func TestCloudDSHModelBudgetPlannerBootstrapIsOptIn(t *testing.T) {
+	planner, err := cloudDSHModelBudgetPlannerFor(false, nil)
+	if err != nil || planner != nil {
+		t.Fatalf("default-off planner = %v, err=%v", planner, err)
+	}
+	if _, err := cloudDSHModelBudgetPlannerFor(true, nil); err == nil {
+		t.Fatal("enabled admission accepted a missing preparation service")
+	}
+
+	service := &cloudDSHModelBudgetPreparationServiceProbe{eligible: true}
+	planner, err = cloudDSHModelBudgetPlannerFor(true, service)
+	if err != nil || planner == nil {
+		t.Fatalf("enabled planner = %v, err=%v", planner, err)
+	}
+	plan, err := planner.PrepareModelBudget(context.Background(), worker.CloudDSHModelBudgetPlanRequest{})
+	if err != nil || plan.PlanID != "plan_test_123" || plan.MaxTokens != 4096 || service.calls != 1 {
+		t.Fatalf("planner result=%+v calls=%d err=%v", plan, service.calls, err)
+	}
+	taskValue := task.Task{ID: "q1234567", InitiatorID: "u1234567", ModelID: "p1234567"}
+	if eligible, err := planner.SupportsTaskModelBudgetAdmission(context.Background(), taskValue); err != nil || !eligible ||
+		service.eligibilityCalls != 1 || service.eligibilityTaskValue.ID != taskValue.ID ||
+		service.eligibilityTaskValue.InitiatorID != taskValue.InitiatorID || service.eligibilityTaskValue.ModelID != taskValue.ModelID {
+		t.Fatalf("planner eligibility=%t task=%+v calls=%d err=%v", eligible, service.eligibilityTaskValue, service.eligibilityCalls, err)
+	}
+
+	service.eligible = false
+	if eligible, err := planner.SupportsTaskModelBudgetAdmission(context.Background(), taskValue); err != nil || eligible || service.eligibilityCalls != 2 {
+		t.Fatalf("unlisted route eligibility=%t calls=%d err=%v, want false without error", eligible, service.eligibilityCalls, err)
+	}
+
+	service.eligibilityErr = errors.New("endpoint unavailable")
+	if eligible, err := planner.SupportsTaskModelBudgetAdmission(context.Background(), taskValue); err == nil || eligible || service.eligibilityCalls != 3 {
+		t.Fatalf("eligibility resolver failure=%t calls=%d err=%v, want propagated error", eligible, service.eligibilityCalls, err)
+	}
 }
 
 func (probe *expiredTaskModelBudgetPreparationCleanerProbe) CleanupExpiredTaskModelBudgetPreparations(ctx context.Context,
@@ -530,6 +587,44 @@ func TestModelUsageMetricsUseBoundedLabelsAndCountSettledUsage(t *testing.T) {
 	}
 	if strings.Contains(body, "untrusted-model-name") || strings.Contains(body, "999") {
 		t.Fatalf("unbounded model label escaped into metrics:\n%s", body)
+	}
+}
+
+func TestModelBudgetShadowMetricsUseBoundedLabelsAndKeepRouteOutOfLabels(t *testing.T) {
+	registry := prometheus.NewRegistry()
+	metrics, err := newModelBudgetShadowMetrics(registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	metrics.observe(app.ModelOutputBudgetShadowObservation{Phase: "plan", Stage: "subtask", Outcome: "calculated",
+		RouteFingerprint: "sha256:private-route-fingerprint", StrategyVersion: "private-strategy-version",
+		CurrentOutputCap: 2048, GoalTokens: 4096, MinimumTokens: 512, SafeTokens: 3072, SendTokens: 3072})
+	metrics.observe(app.ModelOutputBudgetShadowObservation{Phase: "result", Stage: "subtask", Outcome: "calculated",
+		FailureClass: "timeout", UsageKnown: true, ActualOutputTokens: 2876})
+	metrics.observe(app.ModelOutputBudgetShadowObservation{Phase: "result", Stage: "long_form", Outcome: "calculated",
+		FailureClass: "content_filtered"})
+	metrics.observe(app.ModelOutputBudgetShadowObservation{Phase: "plan", Stage: "model-provider-secret", Outcome: "user-prompt-secret",
+		BlockReason: "private-request-text", RouteFingerprint: "private-route", StrategyVersion: "private-version"})
+
+	response := httptest.NewRecorder()
+	metricsHandler(registry).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body := response.Body.String()
+	for _, expected := range []string{
+		`cloudhost_model_budget_shadow_observations_total{outcome="calculated",phase="plan",reason="none",stage="subtask"} 1`,
+		`cloudhost_model_budget_shadow_failures_total{failure_class="timeout",stage="subtask"} 1`,
+		`cloudhost_model_budget_shadow_failures_total{failure_class="content_filtered",stage="long_form"} 1`,
+		`cloudhost_model_budget_shadow_output_tokens_count{field="current_cap",stage="subtask"} 1`,
+		`cloudhost_model_budget_shadow_output_tokens_count{field="actual",stage="subtask"} 1`,
+		`cloudhost_model_budget_shadow_observations_total{outcome="unknown",phase="plan",reason="unknown",stage="unknown"} 1`,
+	} {
+		if !strings.Contains(body, expected) {
+			t.Errorf("model budget shadow metrics missing %q:\n%s", expected, body)
+		}
+	}
+	for _, secret := range []string{"private-route-fingerprint", "private-strategy-version", "model-provider-secret", "user-prompt-secret", "private-request-text"} {
+		if strings.Contains(body, secret) {
+			t.Fatalf("unbounded or private shadow value escaped into metrics: %s", body)
+		}
 	}
 }
 

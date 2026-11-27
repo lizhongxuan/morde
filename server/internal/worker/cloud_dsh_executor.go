@@ -32,6 +32,8 @@ import (
 
 const cloudDSHMaxFrame = 4 << 20
 const cloudDSHMaxText = app.MaxDSHModelResponseTextBytes
+const cloudDSHMaxModelResponseContentBytes = 2 << 20
+const cloudDSHMaxModelResponseBlockBytes = 256 << 10
 
 // This is the persisted Morde checkpoint/protocol compatibility identifier, not the upstream DSH package release.
 // Changing it requires migrating existing durable Task agent instances and checkpoints.
@@ -202,7 +204,7 @@ func cloudDSHModelErrorCategory(err error) string {
 			switch app.ModelClientErrorKind(reason) {
 			case app.ModelErrorAuthentication, app.ModelErrorAccess, app.ModelErrorRateLimited, app.ModelErrorQuota,
 				app.ModelErrorInvalidRequest, app.ModelErrorUnavailable, app.ModelErrorTimeout, app.ModelErrorTransport,
-				app.ModelErrorInvalidResponse:
+				app.ModelErrorInvalidResponse, app.ModelErrorContentFiltered:
 				return reason
 			}
 		}
@@ -413,10 +415,12 @@ type CloudDSHModelBudgetPlan struct {
 // supplied. Production budget admission and ledger settlement are separate
 // contracts and are not implemented by this interface.
 type CloudDSHModelBudgetPlanner interface {
+	SupportsTaskModelBudgetAdmission(context.Context, task.Task) (bool, error)
 	PrepareModelBudget(context.Context, CloudDSHModelBudgetPlanRequest) (CloudDSHModelBudgetPlan, error)
 }
 
 type CloudDSHModelBudgetPreparationService interface {
+	SupportsTaskModelBudgetAdmission(context.Context, task.Task) (bool, error)
 	PrepareTaskModelBudget(context.Context, app.TaskModelBudgetPrepareRequest) (app.TaskModelBudgetPlan, error)
 }
 
@@ -450,8 +454,16 @@ func (adapter *cloudDSHModelBudgetPlannerAdapter) PrepareModelBudget(ctx context
 	return CloudDSHModelBudgetPlan{PlanID: plan.PlanID, MaxTokens: plan.MaxTokens}, nil
 }
 
-func configureCloudDSHModelBudgetAdmission(start map[string]any, planner CloudDSHModelBudgetPlanner, legacyMaxTokens int64) {
-	if planner == nil {
+func (adapter *cloudDSHModelBudgetPlannerAdapter) SupportsTaskModelBudgetAdmission(ctx context.Context, value task.Task) (bool, error) {
+	if adapter == nil || adapter.service == nil {
+		return false, errors.New("adaptive model budget preparation service is unavailable")
+	}
+	return adapter.service.SupportsTaskModelBudgetAdmission(ctx, value)
+}
+
+func configureCloudDSHModelBudgetAdmission(start map[string]any, planner CloudDSHModelBudgetPlanner,
+	enabledForTask bool, legacyMaxTokens int64) {
+	if planner == nil || !enabledForTask {
 		start["max_tokens"] = legacyMaxTokens
 		return
 	}
@@ -1856,7 +1868,7 @@ func validCloudDSHJSONObject(raw []byte) bool {
 }
 
 func cloudDSHModelResponseFailureDiagnostic(response app.ModelResponse, definitions []app.AgentToolDefinition) app.AgentModelFailureDiagnostic {
-	if !app.ValidDSHModelResponse(response) {
+	if !app.ValidDSHModelResponse(response) && !app.ValidTaskModelTextTruncation(response) {
 		reasonCode := "response_shape_invalid"
 		toolName := ""
 		toolCallID := ""
@@ -1953,38 +1965,44 @@ func writeCloudDSHFrame(ctx context.Context, target io.WriteCloser, frame any) e
 }
 
 func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, identity cloudDSHIdentity, response app.ModelResponse) error {
+	if err := ctx.Err(); err != nil {
+		return context.Cause(ctx)
+	}
+	knownTextTruncation := app.ValidTaskModelTextTruncation(response)
 	if response.Usage.InputTokens < 0 || response.Usage.OutputTokens < 0 ||
 		response.Usage.InputTokens > 1<<53-1 || response.Usage.OutputTokens > 1<<53-1 ||
-		(len(response.ToolCalls) == 0 && response.StopReason != "stop") || (len(response.ToolCalls) > 0 && response.StopReason != "tool_calls") {
+		(len(response.ToolCalls) == 0 && response.StopReason != "stop" && !knownTextTruncation) ||
+		(len(response.ToolCalls) > 0 && response.StopReason != "tool_calls") ||
+		knownTextTruncation && (len(response.ToolCalls) != 0 || response.Reasoning != "" || !cloudDSHID.MatchString(id)) {
 		return errors.New("dsh model usage is invalid")
 	}
 	chunks := make([]any, 0, 7+len(response.ToolCalls))
 	blockIndex := 0
-	if response.Reasoning != "" {
-		chunks = append(chunks,
-			map[string]any{"type": "block-start", "index": blockIndex, "blockType": "reasoning"},
-			map[string]any{"type": "reasoning-delta", "index": blockIndex, "text": response.Reasoning},
-			map[string]any{"type": "block-end", "index": blockIndex, "block": map[string]any{"type": "reasoning", "text": response.Reasoning}},
-		)
-		blockIndex++
+	var err error
+	chunks, blockIndex, err = appendCloudDSHModelContent(chunks, blockIndex, "reasoning", response.Reasoning)
+	if err != nil {
+		return err
 	}
-	if response.Text != "" {
-		chunks = append(chunks,
-			map[string]any{"type": "block-start", "index": blockIndex, "blockType": "text"},
-			map[string]any{"type": "text-delta", "index": blockIndex, "text": response.Text},
-			map[string]any{"type": "block-end", "index": blockIndex, "block": map[string]any{"type": "text", "text": response.Text}},
-		)
-		blockIndex++
+	chunks, blockIndex, err = appendCloudDSHModelContent(chunks, blockIndex, "text", response.Text)
+	if err != nil {
+		return err
 	}
 	for index, call := range response.ToolCalls {
 		chunks = append(chunks, map[string]any{"type": "tool-call-delta", "index": blockIndex + index,
 			"id": call.CallID, "name": call.Name, "argumentsDelta": call.Arguments})
 	}
 	finishReason := "stop"
-	if len(response.ToolCalls) > 0 {
+	if knownTextTruncation {
+		finishReason = "max-tokens"
+	} else if len(response.ToolCalls) > 0 {
 		finishReason = "tool-calls"
 	}
 	finishChunk := map[string]any{"type": "finish", "reason": map[string]any{"kind": finishReason}}
+	if knownTextTruncation {
+		finishChunk["replayState"] = map[string]any{"response": map[string]any{
+			"morde_task_text_truncated": true, "morde_task_call_id": id,
+		}}
+	}
 	if len(response.ToolCalls) > 0 {
 		messageID := response.ToolCalls[0].CurrentTaskTurnMessageID
 		if messageID != "" {
@@ -2008,6 +2026,23 @@ func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, i
 			"agent_id": identity.AgentID, "session_id": identity.SessionID, "generation": identity.Generation,
 			"authorization_version": identity.AuthorizationVersion, "id": id}
 	}
+	// Validate every encoded frame before writing any of them. In particular,
+	// block-end repeats the final block contents, so checking only delta sizes
+	// would allow JSON escaping to produce an oversized IPC line after a visible
+	// prefix had already been delivered.
+	for index, chunk := range chunks {
+		message := frame("model_chunk")
+		message["index"] = index
+		message["chunk"] = chunk
+		if !cloudDSHModelFrameWithinLimit(message) {
+			return errors.New("dsh model response frame exceeds the size limit")
+		}
+	}
+	message := frame("model_end")
+	message["ok"] = true
+	if !cloudDSHModelFrameWithinLimit(message) {
+		return errors.New("dsh model response end frame exceeds the size limit")
+	}
 	for index, chunk := range chunks {
 		message := frame("model_chunk")
 		message["index"] = index
@@ -2016,9 +2051,73 @@ func writeCloudDSHModel(ctx context.Context, target io.WriteCloser, id string, i
 			return err
 		}
 	}
-	message := frame("model_end")
+	message = frame("model_end")
 	message["ok"] = true
 	return writeCloudDSHFrame(ctx, target, message)
+}
+
+func appendCloudDSHModelContent(chunks []any, firstBlockIndex int, blockType, content string) ([]any, int, error) {
+	if content == "" {
+		return chunks, firstBlockIndex, nil
+	}
+	if !utf8.ValidString(content) || len(content) > cloudDSHMaxModelResponseContentBytes {
+		return nil, firstBlockIndex, errors.New("dsh model response content is invalid or too large")
+	}
+	blockTexts, err := splitCloudDSHUTF8(content, cloudDSHMaxModelResponseBlockBytes)
+	if err != nil {
+		return nil, firstBlockIndex, err
+	}
+	deltaType := "text-delta"
+	if blockType == "reasoning" {
+		deltaType = "reasoning-delta"
+	}
+	for _, blockText := range blockTexts {
+		blockIndex := firstBlockIndex
+		firstBlockIndex++
+		chunks = append(chunks, map[string]any{"type": "block-start", "index": blockIndex, "blockType": blockType})
+		deltas, err := splitCloudDSHUTF8(blockText, app.MaxAssistantMessageBytes)
+		if err != nil {
+			return nil, firstBlockIndex, err
+		}
+		for _, delta := range deltas {
+			chunks = append(chunks, map[string]any{"type": deltaType, "index": blockIndex, "text": delta})
+		}
+		chunks = append(chunks, map[string]any{"type": "block-end", "index": blockIndex,
+			"block": map[string]any{"type": blockType, "text": blockText}})
+	}
+	return chunks, firstBlockIndex, nil
+}
+
+// splitCloudDSHUTF8 splits valid UTF-8 text at rune boundaries. Each returned
+// string is at most maxBytes, so byte-based protocol and persistence limits
+// remain deterministic for multi-byte text.
+func splitCloudDSHUTF8(content string, maxBytes int) ([]string, error) {
+	if maxBytes < 1 || !utf8.ValidString(content) {
+		return nil, errors.New("dsh model response text is invalid")
+	}
+	parts := make([]string, 0, (len(content)+maxBytes-1)/maxBytes)
+	for len(content) > 0 {
+		end := len(content)
+		if end > maxBytes {
+			end = maxBytes
+			for end > 0 && !utf8.RuneStart(content[end]) {
+				end--
+			}
+		}
+		if end == 0 {
+			return nil, errors.New("dsh model response text cannot be split safely")
+		}
+		parts = append(parts, content[:end])
+		content = content[end:]
+	}
+	return parts, nil
+}
+
+func cloudDSHModelFrameWithinLimit(frame any) bool {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	return encoder.Encode(frame) == nil && buffer.Len() <= cloudDSHMaxFrame
 }
 
 func writeCloudDSHModelFailure(ctx context.Context, target io.WriteCloser, id string, identity cloudDSHIdentity) error {

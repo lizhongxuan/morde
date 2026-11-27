@@ -167,7 +167,7 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 		w.options.Logger.Warn("conversation route model capacity is unknown; using minimum supported window",
 			zap.String("job", "conversation_route"))
 	}
-	if snapshot.Context.ResultReview == nil {
+	if snapshot.Context.ResultReview == nil && claim.Input.ResponseMode != app.ConversationResponseLongForm {
 		compacted, err := w.compactConversationSummary(routeCtx, claim, modelID)
 		if err != nil {
 			if routeCtx.Err() != nil {
@@ -224,6 +224,17 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if err := fitConversationRouteContext(&classifyContext, contextWindow); err != nil {
 		return true, w.failRoute(ctx, claim, "message_too_long",
 			conversationRouteBudgetDiagnostic(err, "worker_context_fit", contextWindow, capacityKnown, classifyContext))
+	}
+	if claim.Input.ResponseMode == app.ConversationResponseLongForm {
+		generator, ok := w.options.Models.(app.ConversationRouteLongReplyGenerator)
+		if !ok {
+			return true, w.failRoute(ctx, claim, "model_unavailable", errors.New("long-form conversation model path is unavailable"))
+		}
+		decision, err := w.generateLongConversationReply(routeCtx, claim, classifyContext, generator)
+		if err != nil {
+			return true, w.failRoute(ctx, claim, "model_unavailable", err)
+		}
+		return true, w.options.Actions.ApplyConversationRoute(routeCtx, claim, snapshot, decision)
 	}
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	if classifyContext.Content != "" || len(classifyContext.Candidates) != 0 || classifyContext.ReferenceTaskID != "" ||
@@ -347,6 +358,77 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	}
 	w.observeRouteDecision(claim, decision, "applied")
 	return true, nil
+}
+
+func (w *ConversationRouteWorker) generateLongConversationReply(ctx context.Context, claim app.ConversationRouteClaim,
+	value app.ConversationRouteContext, generator app.ConversationRouteLongReplyGenerator) (app.ConversationRouteDecision, error) {
+	checker, ok := w.options.Actions.(app.ConversationRouteCancellationChecker)
+	if !ok {
+		return app.ConversationRouteDecision{}, errors.New("long-form conversation cancellation check is unavailable")
+	}
+	cancelledDecision := app.ConversationRouteDecision{Action: app.ConversationRouteReply, LongReply: true, Cancelled: true}
+	requested, err := checker.ConversationRouteCancellationRequested(ctx, claim)
+	if err != nil {
+		return app.ConversationRouteDecision{}, err
+	}
+	if requested {
+		return cancelledDecision, nil
+	}
+	callCtx, cancelCall := context.WithTimeout(ctx, app.ConversationLongReplyTimeout)
+	watchCtx, stopWatch := context.WithCancel(ctx)
+	cancelled := make(chan struct{}, 1)
+	watchErrors := make(chan error, 1)
+	watchDone := make(chan struct{})
+	go func() {
+		defer close(watchDone)
+		ticker := time.NewTicker(250 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-watchCtx.Done():
+				return
+			case <-ticker.C:
+				requested, checkErr := checker.ConversationRouteCancellationRequested(watchCtx, claim)
+				if checkErr != nil {
+					select {
+					case watchErrors <- checkErr:
+					default:
+					}
+					cancelCall()
+					return
+				}
+				if requested {
+					select {
+					case cancelled <- struct{}{}:
+					default:
+					}
+					cancelCall()
+					return
+				}
+			}
+		}
+	}()
+	decision, callErr := generator.GenerateConversationLongReply(callCtx, claim, value)
+	stopWatch()
+	cancelCall()
+	<-watchDone
+	select {
+	case <-cancelled:
+		return cancelledDecision, nil
+	case watchErr := <-watchErrors:
+		return app.ConversationRouteDecision{}, watchErr
+	default:
+	}
+	// A cancellation can race with the final provider response and the watcher
+	// tick. Recheck before allowing a settled answer to become visible.
+	requested, checkErr := checker.ConversationRouteCancellationRequested(ctx, claim)
+	if checkErr != nil {
+		return app.ConversationRouteDecision{}, checkErr
+	}
+	if requested {
+		return cancelledDecision, nil
+	}
+	return decision, callErr
 }
 
 // conversationRouteRetryAfterHorizon is the durable route queue's horizon

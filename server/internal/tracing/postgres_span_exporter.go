@@ -28,7 +28,7 @@ const (
 	maxAttributeStringBytes = 1024
 	maxSpanAttributesBytes  = 8 << 10
 	maxResourceAttrsBytes   = 4 << 10
-	maxNestedAttrsBytes     = 512
+	maxNestedAttrsBytes     = 1024
 	maxSpanEvents           = 32
 	maxSpanLinks            = 16
 	defaultExportTimeout    = 3 * time.Second
@@ -554,7 +554,11 @@ func allowedAttribute(key string, allow attributeAllowList) bool {
 		}
 	case eventAttributeList:
 		switch key {
-		case "exception.type", "exception.escaped", "morde.failure_code", "morde.status", "morde.phase":
+		case "exception.type", "exception.escaped", "morde.failure_code", "morde.status", "morde.phase",
+			"morde.budget.route_fingerprint", "morde.budget.strategy_version", "morde.budget.stage", "morde.budget.outcome",
+			"morde.budget.block_reason", "morde.budget.limiting_dimensions", "morde.budget.goal_tokens", "morde.budget.minimum_tokens",
+			"morde.budget.safe_tokens", "morde.budget.send_tokens", "morde.budget.current_output_cap", "morde.budget.usage_known",
+			"morde.budget.actual_output_tokens", "morde.budget.stop_reason", "morde.budget.failure_class":
 			return true
 		}
 	case linkAttributeList:

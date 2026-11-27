@@ -1012,12 +1012,6 @@ func modelBudgetCapacityRecoveryWaitFixture(t *testing.T) (routeActionsTestFixtu
 	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET usage_model_tokens=0 WHERE id=$1`, claimed.ID); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.store.pool.Exec(ctx, `UPDATE task_agent_checkpoints SET agent_instance_id=$3,agent_generation=$4,
-engine_version=$5,profile_version=$6,auth_version=$7,lease_version=$8 WHERE task_id=$1 AND agent_session_id=$2 AND through_seq=0`,
-		claimed.ID, lease.Fence.AgentSessionID, lease.Fence.AgentInstanceID, lease.Fence.AgentGeneration,
-		lease.Fence.EngineVersion, lease.Fence.ProfileVersion, lease.Fence.AuthorizationVersion, lease.Fence.LeaseVersion); err != nil {
-		t.Fatalf("persist recovery Agent checkpoint: %v", err)
-	}
 	recoveryFence := originalFence
 	recoveryFence.AgentInstanceID, recoveryFence.AgentGeneration = lease.Fence.AgentInstanceID, lease.Fence.AgentGeneration
 	recoveryFence.LeaseOwner, recoveryFence.LeaseVersion = lease.Fence.LeaseOwner, lease.Fence.LeaseVersion
@@ -1029,6 +1023,15 @@ engine_version=$5,profile_version=$6,auth_version=$7,lease_version=$8 WHERE task
 		RequestDigest: hex.EncodeToString(digest[:]), InputTokenReservation: 25, MinimumOutputTokens: 25}
 	if err := f.store.WaitForTaskModelBudgetCapacity(ctx, request); err != nil {
 		t.Fatalf("persist recovery capacity wait: %v", err)
+	}
+	// Recovery admission must still see the prior stopped writer's checkpoint.
+	// Once the wait is persisted, the waiting Agent owns that checkpoint and its
+	// stop receipt is the proof used by capacity reconciliation.
+	if _, err := f.store.pool.Exec(ctx, `UPDATE task_agent_checkpoints SET agent_instance_id=$3,agent_generation=$4,
+engine_version=$5,profile_version=$6,auth_version=$7,lease_version=$8 WHERE task_id=$1 AND agent_session_id=$2 AND through_seq=0`,
+		claimed.ID, lease.Fence.AgentSessionID, lease.Fence.AgentInstanceID, lease.Fence.AgentGeneration,
+		lease.Fence.EngineVersion, lease.Fence.ProfileVersion, lease.Fence.AuthorizationVersion, lease.Fence.LeaseVersion); err != nil {
+		t.Fatalf("persist waiting recovery Agent checkpoint: %v", err)
 	}
 	return f, recoveryFence, request, intent
 }

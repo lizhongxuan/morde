@@ -35,7 +35,7 @@ describe('typed Portal API client', () => {
   it('creates a new request and trace ID for each retried request', async () => {
     const requests: Request[] = [];
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push(new Request(new URL(typeof input === 'string' ? input : input.toString(), window.location.origin), init));
+      requests.push(input instanceof Request ? new Request(input, init) : new Request(new URL(String(input), window.location.origin), init));
       return Response.json({ ok: true });
     }));
 
@@ -367,6 +367,59 @@ describe('typed Portal API client', () => {
     expect(requests.map((request) => request.headers.get('Idempotency-Key'))).toEqual(['retry-key-001', 'retry-key-002']);
     expect(requests.every((request) => request.headers.get('X-Morde-Actor-ID') === 'u1234567'
       && request.headers.get('X-Morde-Service-Instance-ID') === 'instance-a')).toBe(true);
+  });
+
+  it('cancels one personal conversation message with its session and actor scope', async () => {
+    let request: Request | undefined;
+    const cancelledMessage = { id: 'm1234567', conversation_id: 'c1234567', role: 'user', content: '继续', sequence: 2 };
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(new URL(typeof input === 'string' ? input : input.toString(), window.location.origin), init);
+      return Response.json({ message: cancelledMessage, replayed: true }, { status: 202 });
+    }));
+
+    await expect(portalApi.cancelConversationMessage('c1234567', 'm1234567', 'instance-a', 'u1234567'))
+      .resolves.toMatchObject({ message: cancelledMessage, replayed: true });
+    expect(request?.method).toBe('POST');
+    expect(new URL(request!.url).pathname).toBe('/api/conversations/c1234567/messages/m1234567/cancel');
+    expect(request?.body).toBeNull();
+    expect(request?.headers.get('X-Morde-Service-Instance-ID')).toBe('instance-a');
+    expect(request?.headers.get('X-Morde-Actor-ID')).toBe('u1234567');
+  });
+
+  it('does not send a conversation cancellation without both identity headers', async () => {
+    const fetch = vi.fn();
+    vi.stubGlobal('fetch', fetch);
+
+    await expect(portalApi.cancelConversationMessage('c1234567', 'm1234567', '', 'u1234567'))
+      .rejects.toThrow('服务或账号身份尚未确认。');
+    await expect(portalApi.cancelConversationMessage('c1234567', 'm1234567', 'instance-a', ''))
+      .rejects.toThrow('服务或账号身份尚未确认。');
+    expect(fetch).not.toHaveBeenCalled();
+  });
+
+  it('cancels a project conversation message with project, conversation, service, and actor scope', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(input instanceof Request ? new Request(input, init) : new Request(new URL(String(input), window.location.origin), init));
+      return Response.json({ message: { id: 'm1234567', conversation_id: 'c7654321' }, replayed: false }, { status: 202 });
+    }));
+
+    await expect(projectApi.cancelProjectConversationMessage('j1234567', 'c7654321', 'm1234567', 'instance-a', 'u1234567'))
+      .resolves.toMatchObject({ message: { id: 'm1234567', conversation_id: 'c7654321' }, replayed: false });
+    expect(new URL(requests[0]!.url).pathname).toBe('/api/projects/j1234567/conversations/c7654321/messages/m1234567/cancel');
+    expect(requests[0]!.method).toBe('POST');
+    expect(requests[0]!.body).toBeNull();
+    expect(requests[0]!.headers.get('X-Morde-Service-Instance-ID')).toBe('instance-a');
+    expect(requests[0]!.headers.get('X-Morde-Actor-ID')).toBe('u1234567');
+  });
+
+  it('rejects a cancellation response for another conversation message', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => Response.json({
+      message: { id: 'm7654321', conversation_id: 'c7654321' }, replayed: false,
+    }, { status: 202 })));
+
+    await expect(portalApi.cancelConversationMessage('c1234567', 'm1234567', 'instance-a', 'u1234567'))
+      .rejects.toThrow('取消消息响应与当前会话不匹配。');
   });
 
   it('reads personal and project retry eligibility with their exact message and actor scopes', async () => {

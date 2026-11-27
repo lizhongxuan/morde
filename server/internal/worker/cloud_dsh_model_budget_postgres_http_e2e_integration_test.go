@@ -125,22 +125,103 @@ func (capture *modelBudgetPostgresHTTPPlannerCapture) PrepareModelBudget(ctx con
 	return plan, nil
 }
 
+func (capture *modelBudgetPostgresHTTPPlannerCapture) SupportsTaskModelBudgetAdmission(ctx context.Context, value task.Task) (bool, error) {
+	return capture.inner.SupportsTaskModelBudgetAdmission(ctx, value)
+}
+
 type modelBudgetPostgresHTTPModels struct {
 	*app.ModelGatewayService
-	mu       sync.Mutex
-	attempts []app.ModelCall
-	calls    []app.ModelCall
-	first    app.ModelResponse
-	replay   app.ModelResponse
-	lastErr  error
+	mu                           sync.Mutex
+	attempts                     []app.ModelCall
+	calls                        []app.ModelCall
+	first                        app.ModelResponse
+	replay                       app.ModelResponse
+	lastErr                      error
+	cancelBeforeNextGateway      bool
+	afterNoDispatch              func(app.ModelCall, error) error
+	replayAfterNextGatewayError  bool
+	afterGatewayErrorAndReplay   func(app.ModelCall, error, error) error
+	beforeNextGateway            func(app.ModelCall) error
+	retryAfterNextGatewayError   bool
+	afterGatewayErrorBeforeRetry func(app.ModelCall, error) error
 }
 
 func (models *modelBudgetPostgresHTTPModels) Complete(ctx context.Context, call app.ModelCall) (app.ModelResponse, error) {
 	models.mu.Lock()
 	models.attempts = append(models.attempts, call)
+	cancelBeforeGateway := models.cancelBeforeNextGateway
+	models.cancelBeforeNextGateway = false
+	afterNoDispatch := models.afterNoDispatch
+	models.afterNoDispatch = nil
+	replayAfterError := models.replayAfterNextGatewayError
+	models.replayAfterNextGatewayError = false
+	afterErrorAndReplay := models.afterGatewayErrorAndReplay
+	models.afterGatewayErrorAndReplay = nil
+	beforeGateway := models.beforeNextGateway
+	models.beforeNextGateway = nil
+	retryAfterError := models.retryAfterNextGatewayError
+	models.retryAfterNextGatewayError = false
+	afterErrorBeforeRetry := models.afterGatewayErrorBeforeRetry
+	models.afterGatewayErrorBeforeRetry = nil
 	models.mu.Unlock()
-	response, err := models.ModelGatewayService.Complete(ctx, call)
+	attemptCtx := ctx
+	var cancel context.CancelFunc
+	if cancelBeforeGateway {
+		attemptCtx, cancel = context.WithCancel(ctx)
+		cancel()
+	}
+	if beforeGateway != nil {
+		if err := beforeGateway(call); err != nil {
+			models.mu.Lock()
+			models.lastErr = err
+			models.mu.Unlock()
+			return app.ModelResponse{}, err
+		}
+	}
+	response, err := models.ModelGatewayService.Complete(attemptCtx, call)
+	if cancelBeforeGateway {
+		cancel()
+		if err == nil {
+			failure := errors.New("cancelled pre-dispatch Gateway call unexpectedly succeeded")
+			models.mu.Lock()
+			models.lastErr = failure
+			models.mu.Unlock()
+			return app.ModelResponse{}, failure
+		}
+		if afterNoDispatch != nil {
+			if checkErr := afterNoDispatch(call, err); checkErr != nil {
+				models.mu.Lock()
+				models.lastErr = errors.Join(err, checkErr)
+				models.mu.Unlock()
+				return app.ModelResponse{}, models.lastErr
+			}
+		}
+		// The canceled child context was only for this Gateway attempt. The
+		// DSH/Worker call context remains live, so retry the same signed call.
+		response, err = models.ModelGatewayService.Complete(ctx, call)
+	}
+	if err != nil && retryAfterError {
+		var retryCheckErr error
+		if afterErrorBeforeRetry != nil {
+			retryCheckErr = afterErrorBeforeRetry(call, err)
+		}
+		if retryCheckErr != nil {
+			err = errors.Join(err, retryCheckErr)
+		} else {
+			// Retry only after the test's injected storage fault is removed. The
+			// same signed DSH model call and budget identity must remain usable.
+			response, err = models.ModelGatewayService.Complete(context.WithoutCancel(ctx), call)
+		}
+	}
 	if err != nil {
+		if replayAfterError {
+			_, replayErr := models.ModelGatewayService.Complete(context.WithoutCancel(ctx), call)
+			if afterErrorAndReplay != nil {
+				if checkErr := afterErrorAndReplay(call, err, replayErr); checkErr != nil {
+					err = errors.Join(err, checkErr)
+				}
+			}
+		}
 		models.mu.Lock()
 		models.lastErr = err
 		models.mu.Unlock()
@@ -469,5 +550,587 @@ FROM model_budget_preparations preparation JOIN model_call_ledger ledger
 	}
 	if providerCalls.Load() != 1 {
 		t.Fatalf("settled replay dispatched to the local HTTP provider again: calls=%d", providerCalls.Load())
+	}
+}
+
+func TestCloudDSHModelBudgetPostgresHTTPUsesVerifiedModelCapAboveLegacyLimit(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	store, pool := newF01TemporaryStore(t)
+	owner := createF01User(t, ctx, store)
+	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO model_account_budgets(owner_id,token_limit,max_concurrent)
+VALUES ($1,100000,4) ON CONFLICT (owner_id) DO UPDATE SET token_limit=EXCLUDED.token_limit,max_concurrent=EXCLUDED.max_concurrent`, owner.ID); err != nil {
+		t.Fatalf("configure synthetic account model budget: %v", err)
+	}
+
+	const (
+		providerModel = "synthetic-budget-large-cap-v1"
+		apiKey        = "synthetic-budget-large-cap-only"
+		outputCap     = 40_000
+	)
+	var providerCalls atomic.Int32
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		providerCalls.Add(1)
+		if request.Method != http.MethodPost || request.URL.Path != "/responses" ||
+			request.Header.Get("Authorization") != "Bearer "+apiKey ||
+			!bytes.HasPrefix([]byte(request.Header.Get("Content-Type")), []byte("application/json")) {
+			http.Error(writer, "unexpected synthetic provider request", http.StatusBadRequest)
+			return
+		}
+		var body modelBudgetPostgresHTTPProviderRequest
+		if err := json.NewDecoder(io.LimitReader(request.Body, 1<<20)).Decode(&body); err != nil {
+			http.Error(writer, "invalid synthetic provider request", http.StatusBadRequest)
+			return
+		}
+		hasUserText := false
+		for _, input := range body.Input {
+			if input.Role != "user" {
+				continue
+			}
+			for _, content := range input.Content {
+				hasUserText = hasUserText || content.Type == "input_text" && content.Text != ""
+			}
+		}
+		if body.Model != providerModel || body.MaxOutputTokens != outputCap || !hasUserText {
+			http.Error(writer, "request did not preserve its signed model cap and input", http.StatusBadRequest)
+			return
+		}
+		writer.Header().Set("Content-Type", "application/json")
+		// A short response keeps this protocol test within the currently deployed
+		// response-text limit; this case proves the signed request cap only.
+		_, _ = io.WriteString(writer, `{"model":"synthetic-budget-large-cap-v1","text":"Signed large-cap request verified.","input_tokens":8,"output_tokens":12}`)
+	}))
+	defer provider.Close()
+	providerClient := &modelBudgetPostgresHTTPClient{endpoint: provider.URL + "/responses", client: provider.Client()}
+
+	audit, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(store, store, store, audit, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
+	}, f01DefaultHosts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := credentials.VerifySession(ctx, createF01Session(t, ctx, store, owner.ID))
+	if err != nil || principal.Kind != identity.KindSession || principal.UserID != owner.ID {
+		t.Fatalf("verify synthetic owner session: principal=%#v err=%v", principal, err)
+	}
+	sealer, err := app.NewSealer(bytes.Repeat([]byte{0x61}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connections, err := app.NewModelConnectionService(store, sealer, providerClient, []string{"api.openai.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextWindow, modelMaxOutput := 128_000, 64_000
+	connection, err := connections.Create(ctx, principal, app.ModelConnectionCommand{
+		Name: "Budget large-cap synthetic route", BaseURL: "https://api.openai.com/v1", ModelName: providerModel, APIKey: apiKey,
+		ContextWindowOverrideTokens: &contextWindow, ContextWindowOverridePresent: true,
+		MaxOutputOverrideTokens: &modelMaxOutput, MaxOutputOverridePresent: true,
+	})
+	if err != nil {
+		t.Fatalf("create synthetic model route: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE model_connections SET checked_at=clock_timestamp(),capability_text=true,
+capability_tools=false,capability_vision=false WHERE id=$1`, connection.ID); err != nil {
+		t.Fatalf("enable synthetic text-only route: %v", err)
+	}
+	gateway, err := app.NewModelGatewayService(store, connections, providerClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.SetModelResponseSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	stages := []app.ModelOutputBudgetStageDefinition{
+		{Stage: "short_answer", GoalTokens: outputCap, MinimumTokens: 128},
+		{Stage: "tool_step", GoalTokens: outputCap, MinimumTokens: 128},
+		{Stage: "subtask", GoalTokens: outputCap, MinimumTokens: 128},
+		{Stage: "summary", GoalTokens: outputCap, MinimumTokens: 128},
+		{Stage: "long_form", GoalTokens: outputCap, MinimumTokens: 128},
+		{Stage: "text_continuation", GoalTokens: outputCap, MinimumTokens: 128},
+	}
+	if err := gateway.SetModelOutputBudgetStrategy(app.ModelOutputBudgetStrategyDefinition{Version: "dsh-large-cap-e2e-v1",
+		Models: []app.ModelOutputBudgetModelDefinition{{BaseURL: connection.BaseURL, Model: providerModel, Stages: stages}}}); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := app.NewTaskService(store, credentials, f01ConfiguredModels{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	submission, err := tasks.Submit(ctx, principal, app.SubmitTaskCommand{
+		ModelID: connection.ID, Objective: "Return the synthetic large-cap verification sentence.",
+		Budget: task.Budget{ActiveSeconds: 60, ToolCalls: 1, ModelTokens: 50_000}, IdempotencyKey: "budget-large-cap-submit-001",
+	})
+	if err != nil {
+		t.Fatalf("submit synthetic large-cap E2E Task: %v", err)
+	}
+	claimed, found, err := store.ClaimNextTask(ctx, "budget-large-cap-task-worker", 2*time.Minute)
+	if err != nil || !found || claimed.ID != submission.Task.ID {
+		t.Fatalf("claim synthetic large-cap E2E Task: found=%t task=%q err=%v", found, claimed.ID, err)
+	}
+
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("local Node is unavailable; the actual DSH runtime cannot run")
+	}
+	node, err = filepath.Abs(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeScript, err := filepath.Abs(filepath.Join("..", "..", "..", "runtime", "morde-cloud-runtime", "bin.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, accountRuntimes, _ := newF01ConversationRuntime(t, store, node, runtimeScript,
+		"budget-large-cap-supervisor", bytes.Repeat([]byte{0x62}, 32))
+	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner, err := NewCloudDSHModelBudgetPlanner(gateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plannerCapture := &modelBudgetPostgresHTTPPlannerCapture{inner: planner}
+	models := &modelBudgetPostgresHTTPModels{ModelGatewayService: gateway}
+	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
+		SupervisorID: "budget-large-cap-supervisor", AccountRuntimes: accountRuntimes, Instances: instances,
+		Checkpoints: checkpoints, Models: models, ModelBudgetPlanner: plannerCapture,
+		ToolCapabilities: cloudDSHTestToolCapability{allowed: false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := executor.ExecuteTask(ctx, claimed); !errors.Is(err, ErrCloudDSHCompletionPending) {
+		models.mu.Lock()
+		lastErr, attempts := models.lastErr, len(models.attempts)
+		models.mu.Unlock()
+		plannerCapture.mu.Lock()
+		planCount := len(plannerCapture.plans)
+		plannerCapture.mu.Unlock()
+		t.Fatalf("large-cap DSH execution = %v, gateway_error=%v attempts=%d plans=%d; want successful result awaiting separate Task completion",
+			err, lastErr, attempts, planCount)
+	}
+
+	plannerCapture.mu.Lock()
+	preparedRequests := append([]CloudDSHModelBudgetPlanRequest(nil), plannerCapture.requests...)
+	preparedPlans := append([]CloudDSHModelBudgetPlan(nil), plannerCapture.plans...)
+	plannerCapture.mu.Unlock()
+	if len(preparedRequests) != 1 || len(preparedPlans) != 1 || preparedPlans[0].MaxTokens != outputCap {
+		t.Fatalf("large-cap DSH prepare requests/plans = %d/%#v, want one plan capped at %d", len(preparedRequests), preparedPlans, outputCap)
+	}
+	models.mu.Lock()
+	calls := append([]app.ModelCall(nil), models.calls...)
+	models.mu.Unlock()
+	if len(calls) != 1 || calls[0].Task == nil || calls[0].BudgetPlanID != preparedPlans[0].PlanID ||
+		calls[0].BudgetCallID != preparedRequests[0].CallID {
+		t.Fatalf("large-cap final DSH calls = %d, want one call bound to its PostgreSQL plan", len(calls))
+	}
+	var finalProjection struct {
+		MaxTokens int `json:"max_tokens"`
+	}
+	if err := json.Unmarshal(calls[0].RawRequest, &finalProjection); err != nil || finalProjection.MaxTokens != outputCap {
+		t.Fatalf("large-cap final DSH max_tokens=%d err=%v, want %d", finalProjection.MaxTokens, err, outputCap)
+	}
+	providerClient.mu.Lock()
+	providerCaps := append([]int(nil), providerClient.maxCaps...)
+	providerClient.mu.Unlock()
+	if providerCalls.Load() != 1 || len(providerCaps) != 1 || providerCaps[0] != outputCap {
+		t.Fatalf("large-cap fake provider calls/caps = %d/%v, want one HTTP request at %d", providerCalls.Load(), providerCaps, outputCap)
+	}
+
+	var ledgerState string
+	var sendTokens, inputReservedTokens, reservedTokens, actualInputTokens, actualOutputTokens int64
+	var consumed bool
+	if err := pool.QueryRow(ctx, `SELECT ledger.state,preparation.send_tokens,preparation.input_reserved_tokens,
+ledger.reserved_tokens,ledger.input_tokens,ledger.output_tokens,(preparation.consumed_at IS NOT NULL)
+FROM model_budget_preparations preparation JOIN model_call_ledger ledger
+ ON ledger.owner_id=preparation.owner_id AND ledger.source=preparation.source AND ledger.call_id=preparation.call_id
+WHERE preparation.owner_id=$1 AND preparation.task_id=$2 AND preparation.source='task'`, owner.ID, submission.Task.ID).
+		Scan(&ledgerState, &sendTokens, &inputReservedTokens, &reservedTokens, &actualInputTokens, &actualOutputTokens, &consumed); err != nil {
+		t.Fatalf("read settled large-cap budget ledger: %v", err)
+	}
+	if ledgerState != "settled" || !consumed || sendTokens != int64(outputCap) ||
+		reservedTokens != inputReservedTokens+sendTokens || actualInputTokens != 8 || actualOutputTokens != 12 {
+		t.Fatalf("large-cap ledger state/plan/usage mismatch: state=%q consumed=%t send=%d reserved=%d input_hold=%d usage=%d/%d",
+			ledgerState, consumed, sendTokens, reservedTokens, inputReservedTokens, actualInputTokens, actualOutputTokens)
+	}
+	models.mu.Lock()
+	firstResponse, replayResponse := models.first, models.replay
+	models.mu.Unlock()
+	if firstResponse.Text != "Signed large-cap request verified." || replayResponse.Text != firstResponse.Text ||
+		replayResponse.Usage != firstResponse.Usage || providerCalls.Load() != 1 {
+		t.Fatal("large-cap settled replay did not return the saved response without another provider request")
+	}
+}
+
+func TestCloudDSHModelBudgetPostgresHTTPFailureEdges(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+	store, pool := newF01TemporaryStore(t)
+	owner := createF01User(t, ctx, store)
+	if _, err := pool.Exec(ctx, `UPDATE owner_execution_controls SET state='enabled' WHERE owner_id=$1`, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO model_account_budgets(owner_id,token_limit,max_concurrent)
+VALUES ($1,100000,4) ON CONFLICT (owner_id) DO UPDATE SET token_limit=EXCLUDED.token_limit,max_concurrent=EXCLUDED.max_concurrent`, owner.ID); err != nil {
+		t.Fatalf("configure synthetic account model budget: %v", err)
+	}
+
+	const (
+		providerModel = "synthetic-budget-edge-v1"
+		apiKey        = "synthetic-budget-edge-only"
+		outputCap     = 3072
+	)
+	const (
+		providerOK int32 = iota
+		providerHTTPFailure
+		providerTimeout
+		providerCancel
+	)
+	var providerMode atomic.Int32
+	var providerCalls atomic.Int32
+	var cancelMu sync.Mutex
+	var cancelTask context.CancelFunc
+	provider := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		providerCalls.Add(1)
+		if request.Method != http.MethodPost || request.URL.Path != "/responses" ||
+			request.Header.Get("Authorization") != "Bearer "+apiKey ||
+			!bytes.HasPrefix([]byte(request.Header.Get("Content-Type")), []byte("application/json")) {
+			http.Error(writer, "unexpected synthetic provider request", http.StatusBadRequest)
+			return
+		}
+		var body modelBudgetPostgresHTTPProviderRequest
+		if err := json.NewDecoder(io.LimitReader(request.Body, 1<<20)).Decode(&body); err != nil {
+			http.Error(writer, "invalid synthetic provider request", http.StatusBadRequest)
+			return
+		}
+		hasUserText := false
+		for _, input := range body.Input {
+			if input.Role != "user" {
+				continue
+			}
+			for _, content := range input.Content {
+				hasUserText = hasUserText || content.Type == "input_text" && content.Text != ""
+			}
+		}
+		if body.Model != providerModel || body.MaxOutputTokens != outputCap || !hasUserText {
+			http.Error(writer, "request did not preserve its signed model cap and input", http.StatusBadRequest)
+			return
+		}
+		switch providerMode.Load() {
+		case providerHTTPFailure:
+			http.Error(writer, "synthetic upstream unavailable", http.StatusServiceUnavailable)
+		case providerTimeout:
+			<-request.Context().Done()
+		case providerCancel:
+			cancelMu.Lock()
+			stopTask := cancelTask
+			cancelMu.Unlock()
+			if stopTask != nil {
+				stopTask()
+			}
+			<-request.Context().Done()
+		default:
+			writer.Header().Set("Content-Type", "application/json")
+			_, _ = io.WriteString(writer, `{"model":"synthetic-budget-edge-v1","text":"Synthetic DSH budget edge verified.","input_tokens":8,"output_tokens":6}`)
+		}
+	}))
+	defer provider.Close()
+	providerHTTPClient := provider.Client()
+	providerHTTPClient.Timeout = 250 * time.Millisecond
+	providerClient := &modelBudgetPostgresHTTPClient{endpoint: provider.URL + "/responses", client: providerHTTPClient}
+
+	audit, err := app.NewAuditService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := app.NewCredentialService(store, store, store, audit, app.CredentialOptions{
+		SessionTTL: time.Hour, TicketTTL: time.Minute, LoginLimit: 5, LoginWindow: time.Minute,
+	}, f01DefaultHosts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	principal, err := credentials.VerifySession(ctx, createF01Session(t, ctx, store, owner.ID))
+	if err != nil || principal.Kind != identity.KindSession || principal.UserID != owner.ID {
+		t.Fatalf("verify synthetic owner session: principal=%#v err=%v", principal, err)
+	}
+	sealer, err := app.NewSealer(bytes.Repeat([]byte{0x51}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	connections, err := app.NewModelConnectionService(store, sealer, providerClient, []string{"api.openai.com"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextWindow, modelMaxOutput := 32768, 8192
+	connection, err := connections.Create(ctx, principal, app.ModelConnectionCommand{
+		Name: "Budget edge synthetic route", BaseURL: "https://api.openai.com/v1", ModelName: providerModel, APIKey: apiKey,
+		ContextWindowOverrideTokens: &contextWindow, ContextWindowOverridePresent: true,
+		MaxOutputOverrideTokens: &modelMaxOutput, MaxOutputOverridePresent: true,
+	})
+	if err != nil {
+		t.Fatalf("create synthetic model route: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE model_connections SET checked_at=clock_timestamp(),capability_text=true,
+capability_tools=false,capability_vision=false WHERE id=$1`, connection.ID); err != nil {
+		t.Fatalf("enable synthetic text-only route: %v", err)
+	}
+	gateway, err := app.NewModelGatewayService(store, connections, providerClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := gateway.SetModelResponseSealer(sealer); err != nil {
+		t.Fatal(err)
+	}
+	stages := []app.ModelOutputBudgetStageDefinition{
+		{Stage: "short_answer", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "tool_step", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "subtask", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "summary", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "long_form", GoalTokens: outputCap, MinimumTokens: 64},
+		{Stage: "text_continuation", GoalTokens: outputCap, MinimumTokens: 64},
+	}
+	if err := gateway.SetModelOutputBudgetStrategy(app.ModelOutputBudgetStrategyDefinition{Version: "dsh-pg-http-edge-v1",
+		Models: []app.ModelOutputBudgetModelDefinition{{BaseURL: connection.BaseURL, Model: providerModel, Stages: stages}}}); err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := app.NewTaskService(store, credentials, f01ConfiguredModels{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("local Node is unavailable; the actual DSH runtime cannot run")
+	}
+	node, err = filepath.Abs(node)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeScript, err := filepath.Abs(filepath.Join("..", "..", "..", "runtime", "morde-cloud-runtime", "bin.mjs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	instances, accountRuntimes, _ := newF01ConversationRuntime(t, store, node, runtimeScript,
+		"budget-edge-supervisor", bytes.Repeat([]byte{0x52}, 32))
+	checkpoints, err := app.NewAgentCheckpointService(store, sealer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	planner, err := NewCloudDSHModelBudgetPlanner(gateway)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plannerCapture := &modelBudgetPostgresHTTPPlannerCapture{inner: planner}
+	models := &modelBudgetPostgresHTTPModels{ModelGatewayService: gateway}
+	executor, err := NewCloudDSHExecutor(CloudDSHExecutorOptions{
+		SupervisorID: "budget-edge-supervisor", AccountRuntimes: accountRuntimes, Instances: instances,
+		Checkpoints: checkpoints, Models: models, ModelBudgetPlanner: plannerCapture,
+		ToolCapabilities: cloudDSHTestToolCapability{allowed: false},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runTask := func(key string, budget task.Budget, cancelOnProvider bool) (app.ModelCall, error) {
+		submission, submitErr := tasks.Submit(ctx, principal, app.SubmitTaskCommand{
+			ModelID: connection.ID, Objective: "Reply with the synthetic budget edge verification sentence.",
+			Budget: budget, IdempotencyKey: key,
+		})
+		if submitErr != nil {
+			return app.ModelCall{}, fmt.Errorf("submit edge Task %q: %w", key, submitErr)
+		}
+		claimed, found, claimErr := store.ClaimNextTask(ctx, "budget-edge-task-worker", 2*time.Minute)
+		if claimErr != nil || !found || claimed.ID != submission.Task.ID {
+			return app.ModelCall{}, fmt.Errorf("claim edge Task %q: found=%t task=%q err=%w", key, found, claimed.ID, claimErr)
+		}
+		taskCtx, cancelTaskCtx := context.WithTimeout(ctx, 60*time.Second)
+		if cancelOnProvider {
+			cancelMu.Lock()
+			cancelTask = cancelTaskCtx
+			cancelMu.Unlock()
+		}
+		executionErr := executor.ExecuteTask(taskCtx, claimed)
+		cancelTaskCtx()
+		cancelMu.Lock()
+		cancelTask = nil
+		cancelMu.Unlock()
+		models.mu.Lock()
+		defer models.mu.Unlock()
+		if len(models.attempts) == 0 {
+			return app.ModelCall{}, fmt.Errorf("edge Task %q reached no Gateway attempts", key)
+		}
+		return models.attempts[len(models.attempts)-1], executionErr
+	}
+
+	assertLedger := func(call app.ModelCall, wantState string) error {
+		if call.Task == nil || call.LedgerCallID == "" || call.BudgetPlanID == "" {
+			return fmt.Errorf("captured DSH call is missing Task/budget identity: task=%v ledger=%q plan=%q", call.Task != nil, call.LedgerCallID, call.BudgetPlanID)
+		}
+		var state string
+		if err := pool.QueryRow(ctx, `SELECT state FROM model_call_ledger WHERE owner_id=$1 AND source='task' AND call_id=$2`,
+			owner.ID, call.LedgerCallID).Scan(&state); err != nil {
+			return fmt.Errorf("read model ledger %q: %w", call.LedgerCallID, err)
+		}
+		if state != wantState {
+			return fmt.Errorf("model ledger %q state=%q, want %q", call.LedgerCallID, state, wantState)
+		}
+		return nil
+	}
+
+	providerMode.Store(providerOK)
+	models.mu.Lock()
+	models.cancelBeforeNextGateway = true
+	models.afterNoDispatch = func(call app.ModelCall, callErr error) error {
+		if callErr == nil {
+			return errors.New("canceled pre-dispatch Gateway attempt had no error")
+		}
+		if err := assertLedger(call, "prepared"); err != nil {
+			return err
+		}
+		if calls := providerCalls.Load(); calls != 0 {
+			return fmt.Errorf("provider was contacted before the recoverable retry: calls=%d", calls)
+		}
+		return nil
+	}
+	models.mu.Unlock()
+	call, executionErr := runTask("budget-edge-pre-dispatch-cancel-001", task.Budget{ActiveSeconds: 60, ToolCalls: 1, ModelTokens: 50000}, false)
+	if !errors.Is(executionErr, ErrCloudDSHCompletionPending) {
+		t.Fatalf("pre-dispatch cancel/retry Task result=%v, want successful model result awaiting Task completion", executionErr)
+	}
+	if err := assertLedger(call, "settled"); err != nil || providerCalls.Load() != 1 {
+		t.Fatalf("pre-dispatch cancellation did not recover safely: ledger_error=%v provider_calls=%d", err, providerCalls.Load())
+	}
+
+	unknownCases := []struct {
+		name            string
+		mode            int32
+		cancelOnRequest bool
+	}{
+		{name: "provider timeout", mode: providerTimeout},
+		{name: "provider HTTP failure", mode: providerHTTPFailure},
+		{name: "Task cancellation after provider dispatch", mode: providerCancel, cancelOnRequest: true},
+	}
+	for index, testCase := range unknownCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			providerMode.Store(testCase.mode)
+			callsBefore := providerCalls.Load()
+			models.mu.Lock()
+			models.replayAfterNextGatewayError = true
+			models.afterGatewayErrorAndReplay = func(call app.ModelCall, callErr, replayErr error) error {
+				if callErr == nil || replayErr == nil {
+					return fmt.Errorf("provider failure/replay errors = %v/%v, want both errors", callErr, replayErr)
+				}
+				if err := assertLedger(call, "unknown"); err != nil {
+					return err
+				}
+				if calls := providerCalls.Load(); calls != callsBefore+1 {
+					return fmt.Errorf("unknown call/replay provider dispatch count=%d, want exactly one new HTTP request", calls-callsBefore)
+				}
+				return nil
+			}
+			models.mu.Unlock()
+			budget := task.Budget{ActiveSeconds: 60, ToolCalls: 1, ModelTokens: 50000}
+			key := fmt.Sprintf("budget-edge-unknown-%03d", index+1)
+			call, executionErr := runTask(key, budget, testCase.cancelOnRequest)
+			if executionErr == nil {
+				t.Fatal("DSH Task succeeded after an unknown provider result")
+			}
+			if err := assertLedger(call, "unknown"); err != nil {
+				t.Fatal(err)
+			}
+			if calls := providerCalls.Load(); calls != callsBefore+1 {
+				t.Fatalf("unknown provider outcome caused %d HTTP requests, want exactly one", calls-callsBefore)
+			}
+		})
+	}
+
+	const dispatchFaultSQL = `CREATE OR REPLACE FUNCTION fail_model_budget_dispatch_test() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'UPDATE' AND OLD.state = 'prepared' AND NEW.state = 'dispatched' THEN
+    RAISE EXCEPTION 'injected prepared-to-dispatched failure';
+  END IF;
+  IF TG_OP = 'DELETE' AND OLD.state = 'prepared' THEN
+    RAISE EXCEPTION 'injected prepared reservation release failure';
+  END IF;
+  IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER fail_model_budget_dispatch_test
+BEFORE UPDATE OF state ON model_call_ledger
+FOR EACH ROW EXECUTE FUNCTION fail_model_budget_dispatch_test();
+CREATE TRIGGER fail_model_budget_release_test
+BEFORE DELETE ON model_call_ledger
+FOR EACH ROW EXECUTE FUNCTION fail_model_budget_dispatch_test();`
+	const dropDispatchFaultSQL = `DROP TRIGGER IF EXISTS fail_model_budget_dispatch_test ON model_call_ledger;
+DROP TRIGGER IF EXISTS fail_model_budget_release_test ON model_call_ledger;
+DROP FUNCTION IF EXISTS fail_model_budget_dispatch_test();`
+	dropDispatchFault := func() error {
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cleanupCancel()
+		_, err := pool.Exec(cleanupCtx, dropDispatchFaultSQL)
+		return err
+	}
+	t.Cleanup(func() {
+		if err := dropDispatchFault(); err != nil {
+			t.Errorf("drop injected model dispatch fault: %v", err)
+		}
+	})
+	callsBefore := providerCalls.Load()
+	providerMode.Store(providerOK)
+	models.mu.Lock()
+	models.beforeNextGateway = func(app.ModelCall) error {
+		if _, err := pool.Exec(ctx, dispatchFaultSQL); err != nil {
+			return fmt.Errorf("install model dispatch fault trigger: %w", err)
+		}
+		return nil
+	}
+	models.retryAfterNextGatewayError = true
+	models.afterGatewayErrorBeforeRetry = func(call app.ModelCall, firstErr error) error {
+		if firstErr == nil {
+			return errors.New("injected dispatch failure did not reach Gateway.Complete")
+		}
+		if err := assertLedger(call, "prepared"); err != nil {
+			return fmt.Errorf("dispatch transaction failure changed prepared ledger: %w", err)
+		}
+		var consumed bool
+		if err := pool.QueryRow(ctx, `SELECT consumed_at IS NOT NULL FROM model_budget_preparations
+WHERE owner_id=$1 AND source='task' AND call_id=$2 AND plan_id=$3`, owner.ID, call.LedgerCallID, call.BudgetPlanID).Scan(&consumed); err != nil {
+			return fmt.Errorf("read failed dispatch preparation consumption: %w", err)
+		}
+		if consumed {
+			return errors.New("failed dispatch transaction consumed its prepared budget plan")
+		}
+		if calls := providerCalls.Load(); calls != callsBefore {
+			return fmt.Errorf("provider HTTP count after dispatch transaction failure=%d, want %d", calls, callsBefore)
+		}
+		if err := dropDispatchFault(); err != nil {
+			return fmt.Errorf("remove injected model dispatch fault before retry: %w", err)
+		}
+		return nil
+	}
+	models.mu.Unlock()
+
+	call, executionErr = runTask("budget-edge-dispatch-transaction-failure-001",
+		task.Budget{ActiveSeconds: 60, ToolCalls: 1, ModelTokens: 50000}, false)
+	if !errors.Is(executionErr, ErrCloudDSHCompletionPending) {
+		models.mu.Lock()
+		lastErr := models.lastErr
+		models.mu.Unlock()
+		t.Fatalf("dispatch transaction failure/retry Task result=%v, gateway error=%v, provider calls=%d; want successful model result awaiting Task completion",
+			executionErr, lastErr, providerCalls.Load())
+	}
+	if err := assertLedger(call, "settled"); err != nil || providerCalls.Load() != callsBefore+1 {
+		t.Fatalf("dispatch transaction retry did not settle exactly once: ledger_error=%v provider_calls=%d before=%d",
+			err, providerCalls.Load(), callsBefore)
 	}
 }

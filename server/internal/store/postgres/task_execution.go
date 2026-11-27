@@ -773,7 +773,7 @@ VALUES ($1,$2,$3,$4,'streaming',$5)`, delta.TaskID, delta.MessageID, delta.TurnI
 			(snapshotRevision.Valid && snapshotRevision.Int64 != currentRevision) || (!snapshotRevision.Valid && currentRevision != 0) {
 			return domain.NewError(domain.CodeInvalidState, "assistant message snapshot identity is already finalized")
 		}
-		if len(content)+len(delta.Delta) > app.MaxAssistantMessageBytes {
+		if len(content)+len(delta.Delta) > app.MaxAssistantReplyBytes {
 			return domain.InvalidArgument("text_delta", "assistant message exceeds the size limit")
 		}
 		if _, err := tx.Exec(ctx, `UPDATE task_assistant_message_snapshots
@@ -1810,7 +1810,7 @@ func (s *Store) CommitTaskProgress(ctx context.Context, progress app.TaskProgres
 	if message := progress.AssistantMessage; message != nil {
 		if message.Role != conversation.RoleAssistant || message.TaskID != progress.TaskID || message.OwnerID == "" ||
 			message.ConversationID == "" || progress.Status != task.StatusRunning || progress.Event.Type != "task.step" ||
-			len(message.Content) > app.MaxAssistantMessageBytes || !utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') {
+			len(message.Content) > app.MaxAssistantReplyBytes || !utf8.ValidString(message.Content) || strings.ContainsRune(message.Content, '\x00') {
 			return task.Event{}, domain.InvalidArgument("assistant_message", "assistant message fields are invalid")
 		}
 		if err := validateMessage(*message); err != nil {

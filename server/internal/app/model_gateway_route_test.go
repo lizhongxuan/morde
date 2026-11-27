@@ -53,6 +53,56 @@ func routeGatewayFixture() (ConversationRouteClaim, ConversationRouteContext) {
 	return claim, ConversationRouteContext{ActorID: claim.Message.ActorID, RouteAttempt: 1, ModelID: "p1234567", Content: claim.Message.Content}
 }
 
+func TestGenerateConversationLongReplyUsesVerifiedModelLimitAndSettlesOneTextOnlyCall(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	claim.Input.ResponseMode = ConversationResponseLongForm
+	value.ModelID = "p1234567"
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	partial := strings.Repeat("A useful answer. ", 200)
+	client := &modelGatewayClientTest{response: ModelResponse{Text: partial, StopReason: "length",
+		Usage: ModelUsage{Known: true, InputTokens: 100, OutputTokens: 800}}}
+	window, outputLimit := 32_768, 8192
+	resolver := &modelGatewayResolverTest{contextWindow: &window, maxOutputTokens: &outputLimit}
+	service, err := NewModelGatewayService(store, resolver, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision, err := service.GenerateConversationLongReply(context.Background(), claim, value)
+	if err != nil || decision.Action != ConversationRouteReply || !decision.LongReply || !decision.Partial || decision.Reply != partial ||
+		client.calls != 1 || store.begins != 1 || store.unknown || store.decision == nil || !store.decision.Partial ||
+		client.request.MaxOutputTokens != outputLimit || len(client.request.Tools) != 0 || client.request.JSONMode ||
+		resolver.tools || resolver.image || store.reservation.ReservedTokens < int64(outputLimit+100) {
+		t.Fatalf("long-form call missed its verified text-only contract: decision=%+v stored=%+v reserved=%d request=%+v calls=%d begins=%d err=%v",
+			decision, store.decision, store.reservation.ReservedTokens, client.request, client.calls, store.begins, err)
+	}
+	deadline, ok := client.ctx.Deadline()
+	if !ok || time.Until(deadline) > ConversationLongReplyTimeout {
+		t.Fatalf("long-form call deadline was not bounded to four minutes: %v %t", deadline, ok)
+	}
+	replayed, err := service.GenerateConversationLongReply(context.Background(), claim, value)
+	if err != nil || !replayed.Partial || replayed.Reply != partial || client.calls != 1 || store.begins != 1 {
+		t.Fatalf("settled long reply was not recovered without a second provider call: decision=%+v calls=%d begins=%d err=%v",
+			replayed, client.calls, store.begins, err)
+	}
+}
+
+func TestGenerateConversationLongReplyRequiresVerifiedCapacityBeforeReservation(t *testing.T) {
+	claim, value := routeGatewayFixture()
+	claim.Input.ResponseMode = ConversationResponseLongForm
+	store := &routeGatewayStoreTest{modelGatewayStoreTest: &modelGatewayStoreTest{}}
+	client := &modelGatewayClientTest{response: ModelResponse{Text: "no dispatch", StopReason: "stop",
+		Usage: ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}}}
+	service, err := NewModelGatewayService(store, &modelGatewayResolverTest{}, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.GenerateConversationLongReply(context.Background(), claim, value); domain.CodeOf(err) != domain.CodeUnsupported ||
+		store.reserveN != 0 || store.begins != 0 || client.calls != 0 {
+		t.Fatalf("unverified model capacity reached reservation or provider: err=%v reserve=%d begin=%d calls=%d",
+			err, store.reserveN, store.begins, client.calls)
+	}
+}
+
 func TestLegacyRouteModelRequestAddsDirectToolContractForStructurallyEligibleContexts(t *testing.T) {
 	query := "请搜索公开网站关于日本央行利率政策的最新信息"
 	eligible := ConversationRouteContext{ActorID: "u1234567", Content: query}

@@ -203,6 +203,11 @@ WHERE task_id=$1 AND owner_id=$2 AND session_id=$3`, fence.TaskID, fence.OwnerID
 		if err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, `UPDATE model_budget_capacity_call_deadlines SET slot_reserved_at=NULL
+WHERE owner_id=$1 AND task_id=$2 AND budget_call_id=$3 AND slot_reserved_at IS NOT NULL`,
+			fence.InitiatorID, fence.TaskID, request.BudgetCallID); err != nil {
+			return fmt.Errorf("release model budget capacity slot claim before re-wait: %w", err)
+		}
 		var recoveryCallID, recoveryDSHCallID string
 		if fence.RecoveryCallID != "" {
 			recoveryCallID, recoveryDSHCallID = fence.RecoveryCallID, fence.RecoveryDSHCallID
@@ -245,6 +250,16 @@ $28,CASE WHEN $29 THEN NULL ELSE clock_timestamp() END,$30)`, fence.InitiatorID,
 			createdDeadline, deadline.DeadlineAt)
 		if err != nil {
 			return fmt.Errorf("persist Task model budget capacity wait: %w", err)
+		}
+		claimed, err := tx.Exec(ctx, `UPDATE model_budget_capacity_call_deadlines
+SET slot_reserved_at=CASE WHEN deadline_at>clock_timestamp() THEN COALESCE(slot_reserved_at,clock_timestamp()) ELSE NULL END
+WHERE owner_id=$1 AND task_id=$2 AND budget_call_id=$3`,
+			fence.InitiatorID, fence.TaskID, request.BudgetCallID)
+		if err != nil {
+			return fmt.Errorf("reserve future model budget capacity slot for waiter: %w", err)
+		}
+		if claimed.RowsAffected() != 1 {
+			return domain.NewError(domain.CodeConflict, "model budget capacity deadline disappeared before slot reservation")
 		}
 		payload, err := json.Marshal(map[string]any{"status": string(task.StatusWaitingUser), "reason": app.TaskModelBudgetCapacityWaitReason,
 			"waiting_reason": app.TaskModelBudgetCapacityWaitReason, "message": "模型调用并发额度暂满，任务将在额度释放后自动继续。"})
@@ -704,6 +719,38 @@ func listOldestModelBudgetCapacityWaitPerOwner(ctx context.Context, tx pgx.Tx, l
 
 type modelBudgetCapacityCandidate struct{ OwnerID, TaskID, ProjectID string }
 
+// modelBudgetCapacitySlotClaimsInTx counts requeued waiters whose newly freed
+// account concurrency slot was reserved by the reconciler. The owner ledger
+// advisory lock serializes this read with both requeue and model admission. A
+// claim stays active while its Task is queued or running and is cleared in the
+// same transaction that prepares its model call.
+func modelBudgetCapacitySlotClaimsInTx(ctx context.Context, tx pgx.Tx, ownerID, taskID, budgetCallID string) (int64, error) {
+	var count int64
+	err := tx.QueryRow(ctx, `WITH candidates AS (
+  SELECT deadline.owner_id,deadline.task_id,deadline.budget_call_id,deadline.first_wait_at,
+    COALESCE(wait.last_reconciled_at,wait.created_at,deadline.first_wait_at) AS priority_at
+  FROM model_budget_capacity_call_deadlines deadline
+  JOIN tasks current ON current.id=deadline.task_id AND current.owner_id=deadline.task_owner_id
+  LEFT JOIN model_budget_capacity_waits wait ON wait.owner_id=deadline.owner_id AND wait.task_id=deadline.task_id
+    AND wait.budget_call_id=deadline.budget_call_id
+  WHERE deadline.owner_id=$1 AND deadline.slot_reserved_at IS NOT NULL
+    AND deadline.task_revision=current.current_revision AND deadline.task_revision=current.desired_revision
+    AND current.initiator_id=deadline.owner_id
+    AND ((wait.task_id IS NOT NULL AND current.status='waiting_user' AND current.waiting_reason='model_budget_capacity'
+          AND wait.expires_at>clock_timestamp())
+      OR (wait.task_id IS NULL AND current.status IN ('queued','running')))
+), ranked AS (
+  SELECT task_id,budget_call_id,row_number() OVER (ORDER BY priority_at,first_wait_at,task_id,budget_call_id) AS position
+  FROM candidates
+)
+SELECT count(*)::bigint FROM ranked
+WHERE position=1 AND NOT (task_id=$2 AND budget_call_id=$3)`, ownerID, taskID, budgetCallID).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count reserved model budget capacity slots: %w", err)
+	}
+	return count, nil
+}
+
 func tryLockModelBudgetLedgerOwner(ctx context.Context, tx pgx.Tx, ownerID string) (bool, error) {
 	var locked bool
 	if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock(hashtextextended('morde:model-ledger:' || $1,0))`, ownerID).Scan(&locked); err != nil {
@@ -942,8 +989,12 @@ FROM model_call_ledger WHERE owner_id=$1 AND NOT personal_model`, wait.OwnerID).
 	if accountSpent >= accountLimit {
 		return modelBudgetCapacityHardExhausted, nil
 	}
+	claims, err := modelBudgetCapacitySlotClaimsInTx(ctx, tx, wait.OwnerID, wait.TaskID, wait.BudgetCallID)
+	if err != nil {
+		return modelBudgetCapacityDeferred, err
+	}
 	accountRemaining := accountLimit - accountSpent
-	if active >= maxConcurrent || accountReserved >= accountRemaining ||
+	if int64(active)+claims >= int64(maxConcurrent) || accountReserved >= accountRemaining ||
 		accountReserved > 0 && accountRemaining-accountReserved < minimumTokens {
 		return modelBudgetCapacityDeferred, nil
 	}
@@ -1011,12 +1062,23 @@ func requeueModelBudgetCapacityTask(ctx context.Context, tx pgx.Tx, wait modelBu
 	if !task.CanTransitionWithReason(task.StatusWaitingUser, task.StatusQueued, app.TaskModelBudgetCapacityWaitReason) {
 		return domain.NewError(domain.CodeInvalidState, "model budget capacity Task transition is not permitted")
 	}
+	claim, err := tx.Exec(ctx, `UPDATE model_budget_capacity_call_deadlines
+SET slot_reserved_at=COALESCE(slot_reserved_at,clock_timestamp())
+WHERE owner_id=$1 AND task_id=$2 AND budget_call_id=$3 AND task_revision=$4
+AND deadline_at>clock_timestamp()`,
+		wait.OwnerID, wait.TaskID, wait.BudgetCallID, wait.Fence.TaskRevision)
+	if err != nil {
+		return fmt.Errorf("reserve model budget capacity slot for oldest waiter: %w", err)
+	}
+	if claim.RowsAffected() != 1 {
+		return domain.NewError(domain.CodeConflict, "model budget capacity deadline changed before slot reservation")
+	}
 	waitingReason := ""
 	if wait.Fence.RecoveryCallID != "" {
 		waitingReason = taskModelRecoveryScheduledReason
 	}
 	var sequence int64
-	err := tx.QueryRow(ctx, `UPDATE tasks SET status='queued',waiting_reason=$4,finished_at=NULL,event_seq=event_seq+1,updated_at=clock_timestamp()
+	err = tx.QueryRow(ctx, `UPDATE tasks SET status='queued',waiting_reason=$4,finished_at=NULL,event_seq=event_seq+1,updated_at=clock_timestamp()
 WHERE id=$1 AND owner_id=$2 AND status='waiting_user' AND waiting_reason=$3 AND lease_owner='' AND lease_expires_at IS NULL
  AND current_revision=$5 AND desired_revision=$5 AND auth_version=$6 AND lease_version=$7
 RETURNING event_seq`, wait.TaskID, wait.TaskOwnerID, app.TaskModelBudgetCapacityWaitReason, waitingReason,

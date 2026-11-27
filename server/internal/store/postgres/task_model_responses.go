@@ -52,9 +52,33 @@ func (s *Store) RecoverTaskModelResponse(ctx context.Context, request app.ModelC
 		if err := checkModelCaller(ctx, tx, request); err != nil {
 			return err
 		}
+		adaptiveBudget := request.BudgetPlanID != "" || request.BudgetCallID != "" || request.BudgetRequestDigest != ""
 		if request.Task.RecoveryCallID != "" {
 			if err := verifyTaskModelRecoveryAttemptForReservation(ctx, tx, request); err != nil {
 				return err
+			}
+			if adaptiveBudget {
+				if err := verifyTaskModelBudgetPreparationInTx(ctx, tx, request, map[string]bool{"prepared": true, "settled": true}, true); err != nil {
+					return err
+				}
+			}
+		} else if adaptiveBudget {
+			if !validModelBudgetPreparationID(request.BudgetPlanID) || !validModelBudgetPreparationID(request.BudgetCallID) ||
+				len(request.BudgetRequestDigest) != 64 {
+				return domain.InvalidArgument("task_model_response", "adaptive Task model response identity is incomplete")
+			}
+			if err := verifyTaskModelBudgetPreparationInTx(ctx, tx, request, map[string]bool{"prepared": true, "settled": true}, true); err != nil {
+				return err
+			}
+			var preparedDSHCallID string
+			var preparedThrough int64
+			if err := tx.QueryRow(ctx, `SELECT dsh_call_id,through_sequence FROM model_budget_preparations
+WHERE owner_id=$1 AND source='task' AND call_id=$2`, request.OwnerID, request.CallID).Scan(&preparedDSHCallID, &preparedThrough); err != nil {
+				return domain.NewError(domain.CodeInvalidState, "adaptive Task model response preparation is unavailable")
+			}
+			canonicalPreparedID, err := app.DSHModelCallID(request.Task.TaskID, request.Task.AgentSessionID, preparedThrough)
+			if err != nil || preparedDSHCallID != canonicalPreparedID || request.CallID != preparedDSHCallID {
+				return domain.NewError(domain.CodeConflict, "adaptive Task model response ledger identity changed")
 			}
 		} else if request.DSHCallID != "" && request.CallID != request.DSHCallID {
 			return domain.NewError(domain.CodeInvalidState, "Task model response frame identity changed")

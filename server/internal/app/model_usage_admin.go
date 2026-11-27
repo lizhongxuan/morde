@@ -13,15 +13,32 @@ import (
 )
 
 type UnknownModelCall struct {
-	OwnerID        string
-	Source         ModelCallSource
-	CallID         string
-	ModelID        string
-	ProviderModel  string
-	TaskID         string
-	ReservedTokens int64
-	CreatedAt      time.Time
-	UnknownAt      time.Time
+	OwnerID               string
+	Source                ModelCallSource
+	CallID                string
+	ModelID               string
+	ProviderModel         string
+	TaskID                string
+	ReservedTokens        int64
+	CreatedAt             time.Time
+	UnknownAt             time.Time
+	AdaptiveBudgetOverage *AdaptiveModelBudgetOverage
+}
+
+type AdaptiveModelBudgetOverage struct {
+	Status               string
+	ReasonCode           string
+	ReservedInputTokens  int64
+	ReservedOutputTokens int64
+	ReportedInputTokens  int64
+	ReportedOutputTokens int64
+	InputOverageTokens   int64
+	OutputOverageTokens  int64
+	ProjectID            *string
+	Currency             *string
+	ReservedMicros       *int64
+	ReportedMicros       *int64
+	MoneyOverageMicros   *int64
 }
 
 type ModelAccountBudget struct {

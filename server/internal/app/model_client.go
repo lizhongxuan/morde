@@ -9,13 +9,21 @@ import (
 	"unicode/utf8"
 )
 
-// ModelCallTimeout bounds both dispatch authorization and the provider request.
+// ModelCallTimeout bounds short non-Task model calls.
 const ModelCallTimeout = 45 * time.Second
+
+// TaskModelCallTimeout bounds a single Task model request, including long
+// visible replies. It remains finite; cancellation and Task lifecycle fences
+// can still stop the request earlier.
+const TaskModelCallTimeout = 10 * time.Minute
 
 type ModelEndpoint struct {
 	BaseURL string
 	APIKey  string
 	ModelID string
+	// VerifiedMaxOutputTokens is populated only by the Gateway after an
+	// adaptive Task plan is validated against the current model capability.
+	VerifiedMaxOutputTokens int
 }
 
 type ModelInput struct {
@@ -93,11 +101,15 @@ func ValidProviderReportedModel(value string) bool {
 }
 
 type ModelResponse struct {
-	Reasoning             string `json:"-"`
-	Text                  string
-	ToolCalls             []ModelToolCall
-	Usage                 ModelUsage
-	StopReason            string
+	Reasoning  string `json:"-"`
+	Text       string
+	ToolCalls  []ModelToolCall
+	Usage      ModelUsage
+	StopReason string
+	// KnownTextTruncation is set only by ModelGateway after validating a signed
+	// Task call and a known-usage, pure-text provider truncation. Worker may map
+	// that result to DSH's max-tokens finish; provider adapters cannot assert it.
+	KnownTextTruncation   bool                       `json:"-"`
 	ProviderReportedModel string                     `json:"-"`
 	TaskValidationReview  *TaskValidationReviewModel `json:"-"`
 }
@@ -150,6 +162,7 @@ const (
 	ModelErrorInvalidResponse   ModelClientErrorKind = "invalid_response"
 	ModelErrorEmptyResponse     ModelClientErrorKind = "empty_response"
 	ModelErrorTruncatedResponse ModelClientErrorKind = "truncated_response"
+	ModelErrorContentFiltered   ModelClientErrorKind = "content_filtered"
 )
 
 type ModelClientError struct {

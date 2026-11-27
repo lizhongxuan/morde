@@ -717,7 +717,7 @@ decode(repeat('01',29),'hex'),true,true,now()) RETURNING updated_at`, principal.
 	if err := store.ReserveModelCall(ctx, stale); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-interval '3 minutes'
+	if _, err := store.pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-interval '13 minutes'
 WHERE owner_id=$1 AND source=$2 AND call_id=$3`, stale.OwnerID, stale.Source, stale.CallID); err != nil {
 		t.Fatal(err)
 	}
