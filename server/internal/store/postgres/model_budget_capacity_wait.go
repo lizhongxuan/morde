@@ -96,7 +96,10 @@ func (s *Store) WaitForTaskModelBudgetCapacity(ctx context.Context, request app.
 			return err
 		}
 		var sharedModel bool
-		if err := tx.QueryRow(ctx, `SELECT owner_id IS NULL FROM model_connections WHERE id=$1`, request.ModelID).Scan(&sharedModel); err != nil || !sharedModel {
+		var providerModel string
+		var connectionVersion time.Time
+		if err := tx.QueryRow(ctx, `SELECT owner_id IS NULL,model_name,updated_at FROM model_connections WHERE id=$1`, request.ModelID).
+			Scan(&sharedModel, &providerModel, &connectionVersion); err != nil || !sharedModel {
 			return domain.NewError(domain.CodeConflict, "capacity wait requires the same shared platform model route")
 		}
 
@@ -133,7 +136,8 @@ FROM tasks WHERE id=$1 AND owner_id=$2 AND initiator_id=$3 FOR UPDATE`, fence.Ta
 
 		call := app.ModelCallReservation{Source: app.ModelCallTask, Task: &fence, OwnerID: fence.InitiatorID,
 			ProjectID: request.ProjectID, ModelID: request.ModelID, CallID: request.LedgerCallID,
-			DSHCallID: request.DSHCallID, BudgetCallID: request.BudgetCallID}
+			DSHCallID: request.DSHCallID, BudgetCallID: request.BudgetCallID, ProviderModel: providerModel,
+			ConnectionVersion: connectionVersion, PersonalModel: false}
 		if err := checkModelCaller(ctx, tx, call); err != nil {
 			return err
 		}
