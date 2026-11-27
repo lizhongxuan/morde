@@ -35,6 +35,24 @@ func TestTaskTransitions(t *testing.T) {
 	}
 }
 
+func TestTaskTransitionsWithReasonOnlyRequeuesOrPausesCapacityWaits(t *testing.T) {
+	for _, tc := range []struct {
+		from, to Status
+		reason   string
+		want     bool
+	}{
+		{StatusWaitingUser, StatusQueued, "model_budget_capacity", true},
+		{StatusWaitingUser, StatusPaused, "model_budget_capacity", true},
+		{StatusWaitingUser, StatusQueued, "approval_required", false},
+		{StatusWaitingUser, StatusPaused, "clarification_required", false},
+		{StatusWaitingUser, StatusQueued, "", false},
+	} {
+		if got := CanTransitionWithReason(tc.from, tc.to, tc.reason); got != tc.want {
+			t.Errorf("CanTransitionWithReason(%q, %q, %q) = %t, want %t", tc.from, tc.to, tc.reason, got, tc.want)
+		}
+	}
+}
+
 func TestStepCountsExcludeBudgetSteps(t *testing.T) {
 	total, completed := StepCounts([]Step{
 		{Kind: "plan", Status: StepSucceeded},

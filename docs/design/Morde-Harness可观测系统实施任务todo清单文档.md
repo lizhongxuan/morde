@@ -31,7 +31,7 @@
   - 修改：`server/internal/tracing/`、`server/migrations/`、`server/internal/store/postgres/`、`server/cmd/portal/main.go`；Span 与带有效 trace ID 的结构化日志复用同一 pgxpool，各自限队列、批次、载荷、查询和 7 天分批清理。
   - 已验收：本地 PostgreSQL 16 临时库执行所有 goose migrations；Span exporter 与关联日志写入、读取、分页和 retention 定向集成测试通过。
   - 已部署：测试机单机 Portal + 现有 PostgreSQL，Span、日志和清理器没有新增进程或容器；首次发布前保存 Portal、后台资源与数据库备份，迁移版本到 262。
-  - 已验收：测试机实际 PC 请求成功写入 Span 与关联日志；后台可检索。首次部署后观测到 Span identity/name 校验失败，导致最近批次部分不可用、历史记录仍可查；诊断版已将失败分类并在管理页说明。代码检查发现固定路由标签与 HTTP 方法拼接可能形成 `GET preview` 这类非法 span 名；本地已改为稳定格式 `http.get.preview`，HTTP middleware/tracing 包测试通过。部署当前工作区构建时，Portal 因测试机 schema=262、当前迁移最新版本=264 而拒绝启动；已回滚至诊断版。迁移 263/264 涉及独立 Task 恢复和模型输出上限功能，本次未擅自应用。修复版尚未上线。未做 4 核 / 8 GiB 压力、队列溢出与资源峰值测量。
+  - 已验收：测试机实际 PC 请求成功写入 Span 与关联日志；后台可检索。曾观测到 Span identity/name 校验失败，诊断版保留历史并分类说明。固定路由名已改为稳定格式 `http.get.preview`；当前测试机源码 HEAD 为 `fdb5567a`，在线二进制含 `invalid_span_name` 分类诊断。未做 4 核 / 8 GiB 压力、队列溢出与资源峰值测量。
 
 - [~] **O03（依赖 O01）打通客户端和 Portal trace context**
   - 修改：`server/internal/httpserver`、`server/internal/api`、`server/internal/gateway`、`web/portal/src/api`、桌面客户端和 iOS 请求封装、`server/openapi/portal.yaml`；新增 Trace middleware/span 与响应头，访问日志带 `trace_id` / `span_id`。客户端继续传 `X-Request-Id`。
@@ -53,7 +53,7 @@
 - [~] **O06（依赖 O02、O05）完善敏感数据治理与采集健康**
   - 修改：`server/internal/tracing`、日志字段、checkpoint read projection、健康计数；span 仅保留受控维度，访问/查看记录写管理员审计；恢复 checkpoint 原文密文保持不变，诊断展示做边界验证和必要脱敏。
   - 已完成部分：Span 与 zap 日志字段 allowlist、消息凭据 scrub、载荷/队列/导出健康限制、事件投影脱敏和详情查看审计已实现，并有定向测试。
-  - 已验收：实际查看仅由管理员 API 返回并经过审计；后台说明模型内部未记录内容不可见。诊断版导出故障保留历史结果并显示来源缺口，且能说明校验失败类别。路由名称修复目前只通过本地定向测试，尚未在线复验。
+  - 已验收：实际查看仅由管理员 API 返回并经过审计；后台说明模型内部未记录内容不可见。诊断版导出故障保留历史结果并显示来源缺口，且能说明校验失败类别。当前线上版本完成管理员登录与观测页验收；未执行真实凭据扫描。
   - 未验收：真实凭据扫描、队列溢出/DB 故障演练，以及生产负载下资源、保留与脱敏边界仍待单独验证。
 
 - [x] **O07（依赖 O02–O06）实现管理员查询 API**
@@ -70,14 +70,14 @@
 - [~] **O09（依赖 O02、O06、O07）准备单机发布与回滚方案**
   - 修改：`deploy/single/README.md`、Portal migration/rollback checklist；无额外 Compose/systemd observability stack。迁移可滚动发布，DB query/队列/属性/保留均有界。
   - 已完成：单机发布文档仅依赖 Portal + 现有 PostgreSQL；观测迁移 00258–00261、旧二进制回滚保留表、禁止 Goose Down、队列/批次/保留上限。
-  - 已验收：测试机 Linux/amd64 发布；Portal 与 admin assets 保留发布前备份，迁移前另存数据库 dump；为此前部署版本将主机迁移至 262。最新工作区二进制因 schema 版本差异未能启动，从 `/opt/morde/backups/observability-route-name-20261127T100004Z/portal` 成功回滚至诊断版；当前 Portal active、health=`ok`、readiness=200。仅现有 Portal 与 PostgreSQL，无新增服务。
-  - 未验收：未实际演练数据库回滚；资源峰值、磁盘增长和关停高负载 flush 尚未测量。首次启动因缺少迁移 262 被服务拒绝，按备份保护流程执行兼容迁移后恢复正常。当前工作区最新迁移 263/264 尚未部署，本次不应用其独立业务数据变更；span 命名修复版尚未成功部署。
+  - 已验收：测试机单机 Portal + 现有 PostgreSQL 运行，无新增服务。2026-11-28 复核：源码 HEAD=`fdb5567a`，Portal active、SHA-256=`8f4c4480698ba5c5b80f8d7eac5d6cdc92971303cbbad0493d6a4841731efa37`，数据库 schema=269（与二进制迁移版本一致），health=`ok`、readiness=200。未登录观测 API 返回 401；管理员实际登录后从菜单打开可观测页，概览和 trace 列表 API 均返回 200、页面显示 50 条 trace，浏览器无运行时错误。已运行版本包含本轮修复，无需再次部署。
+  - 未验收：未实际演练数据库回滚；资源峰值、磁盘增长和关停高负载 flush 尚未测量。工作区另有与本目标无关的未提交改动，未打入服务器。
 
 - [~] **O10（依赖 O03–O09）端到端验收并更新 Harness 记录**
   - 修改：Harness 总流程、实施任务状态和验证记录；使用合成对话。
-  - 已验收：实际 `morde-pc` 发送合成直接对话与 Task 请求；管理员页按 trace 查询到 HTTP → Task attempt → DSH session/model/tool spans、已提交事件与关联日志。Task-less 对话和 `needs_user` 均有明确解释。发布到用户指定单机测试主机后通过 health/readiness 检查。
+  - 已验收：实际 `morde-pc` 发送合成直接对话与 Task 请求；管理员页按 trace 查询到 HTTP → Task attempt → DSH session/model/tool spans、已提交事件与关联日志。Task-less 对话和 `needs_user` 均有明确解释。当前线上版本实际登录并打开观测页；概览和 trace 列表读取成功，未展开非合成会话详情。测试主机 health/readiness 正常。
   - 未完成：iOS 测试机对话、子 Agent、已批准工具调用结果/错误、重试/恢复、普通用户 API 权限、凭据脱敏扫描、组件故障演练与单机压力/资源测试。合成 Task 的 PC 审批列表没有对应待确认项，因此未绕过授权；不能据此声称工具调用完整闭环。
 
 **执行顺序：**O01 → O02 / O03 → O04 → O05 → O06 → O07 → O08 / O09 → O10。O04 与 O05 共改 DSH 运行时及 Worker，按文件串行集成。单机 Portal/PostgreSQL 故障时不承诺后台可用。
 
-**本轮验证：** PostgreSQL 定向集成 `TestAdminObservabilityTraceSessionsExplainTasklessMessage`、`TestAdminObservabilityTraceSessionsDetectSpansBeyondCheckpoint` 通过；API `TestMergeExporterHealthExplainsSpanExportFailures`、`TestExporterHealth`、管理员隔离用例及 tracing `TestMakeSpanRecordClassifiesInvalidSpanNames` 通过。Portal 全量测试 72 文件 / 988 用例通过，TypeScript 与 ESLint 通过；Runtime 全量 258 通过 / 1 跳过。最新代码变更后 `go test ./internal/httpserver ./internal/tracing -count=1` 通过。`make pc` 构建并在实际 Morde PC 发起合成对话。测试机当前运行回滚后的诊断版（SHA-256 `bed1254bc8fd70d79f6c7c1d88d9023e704dc094eeef732a30c33656941d522c`），schema=262、health=`ok`、readiness=200、后台 HTML=200、未认证观测 API=401；诊断版重启后 588 条服务日志中未发现新 Span identity/name 分类错误。管理员页面实际看见 HTTP trace、Task/DSH Span、checkpoint 和关联日志。Span 命名修复版 SHA-256 `59c1ff149ad1b84df169618d3441def61fc24425548fb4d0a5296a0a10b92d0f` 启动与 host 当前 schema 不兼容（工作区最新迁移 264，数据库 262），已回滚；只读 `portal migrate status` 正常退出。未应用会改变 Task/model 数据结构及记录的迁移 263/264。完整 `make test` 仍有既存失败 `TestConversationRouteWorkerTriggersSummaryByTokenPressureBeforeTransportWatermark`；未执行 iOS 远程对话及压力/数据库回滚演练。
+**本轮验证（2026-11-28）：** 在 `fdb5567a` 隔离 worktree 执行 `go test ./internal/httpserver ./internal/tracing -count=1` 通过。线上 Portal 运行且数据库迁移版本 `269/269`，health=`ok`、readiness=200；未认证观测 API=401。用管理员会话实际打开 `/admin/observability`，概览/trace 列表 API=200、显示 50 条记录、页面错误数=0。线上源码 HEAD=`fdb5567a`、Portal 二进制 SHA-256=`8f4c4480698ba5c5b80f8d7eac5d6cdc92971303cbbad0493d6a4841731efa37`；服务器已是目标版本，本轮未重复部署或迁移。此前定向 PostgreSQL 集成、API、Portal 72 个测试文件 / 988 用例、TypeScript、ESLint、Runtime 258 通过 / 1 跳过以及实际 `morde-pc` 合成对话和管理员详情验收均保留。完整 `make test` 已知失败 `TestConversationRouteWorkerTriggersSummaryByTokenPressureBeforeTransportWatermark`；未执行 iOS 远程对话、子 Agent / 并发恢复端到端、凭据扫描、故障与资源压力、数据库回滚演练。工作区其余未提交改动未部署。

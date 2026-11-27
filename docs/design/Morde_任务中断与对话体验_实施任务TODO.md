@@ -12,13 +12,14 @@
 | 3 | T05 恢复调度、T06 手动重试 | T01；T06 依赖 T05 的恢复资格判断 | Runtime / 数据库 / PC |
 | 4 | T07 端到端验收与灰度 | T01–T06 | 测试 / 发布 |
 
-## T01 · P0：区分「轮到用户」和「系统停住了」（实现完成；事故根因未定位）
+## T01 · P0：区分「轮到用户」和「系统停住了」（状态路径已确认；截图对应调用仍待 ID）
 
 **入口：** `server/internal/app/cloud_dsh_tool_broker.go`（`pauseRecovery`）、`server/internal/app/task_terminal_delivery.go`、任务详情 API。保留原 DB 状态和诊断记录，先新增兼容的展示语义，字段名按现有 API 惯例落定。
 
 - [x] 定义五类状态：需要你操作、正在恢复、已暂停可重试、已中断、结果待核对。输出归类原因、合法操作（可空）及状态版本或事件序号。未知原因保守降级；不暴露内部工具名、原始错误、凭据。
 - [x] 单测：只有**当前有效、当前用户可操作**的审批/澄清才是「需要你操作」；只有确有持久化恢复安排才是「正在恢复」；没有服务器确认的动作时，返回空操作。
-- [ ] 截图事故排查并行进行：拿到 Task ID 后查第一条失败事件、模型账本、末个有效 checkpoint；区分运行失败与通知失败。**未定位：** PC 可见的历史任务详情没有可关联到截图事故的 Task ID/首条失败事件，不能据任务文案认定根因；部署前未拿到可核查的对应账本和 checkpoint。
+- [x] 已确认通用状态路径：`CloudDSHToolBroker.pauseRecovery` 将无法安全确认的模型回复步骤写为 `unknown`，Task 进入 `waiting_user / dsh_recovery_unresolved`，并持久化允许名单内的失败分类；这会终止当前执行轮次，防止对未知操作盲目重放。
+- [ ] 截图对应的具体调用仍待 Task ID：需查首个失败事件、模型账本、末个有效 checkpoint，判断是 provider/网络错误、回复校验失败、Runtime 恢复错误还是终态回告失败。截图只有标题和时间，不能据通用摘要断定是哪一种。
 
 ## T02 · P0：让 PC 标签和按钮始终匹配（实现完成；实机状态验收完成）
 
@@ -26,6 +27,7 @@
 
 - [x] 任务卡、右侧详情和对话共用同一状态映射；把 `waiting_user / dsh_recovery_unresolved` 且无入口的场景显示为「已中断」或「结果待核对」；不显示「等待你处理」。
 - [x] 真实审批/澄清在原对话尽可能就地操作；无权限、请求过期或已处理时不渲染可点击入口。服务端兼容回退只信有效的审批/澄清，不自行推断能重试。
+- [x] `result_unverified` 保留在任务详情，但不再在原用户消息下重复渲染状态气泡或“查看任务详情”按钮。
 - [ ] PC 测试：自动化已覆盖未知/过期状态、权限不足、快答与确认标记、刷新与事件游标缺口；实机已看到「结果待核对」且无普通重试入口。跨端同时操作与全部旧事件乱序场景尚未完成实机验收。
 
 ## T03 · P0：停止在原对话发内部日志，保证中断也能回告（实现完成；新闻 E2E 待补）
@@ -33,7 +35,8 @@
 **入口：** `server/internal/worker/task_terminal_delivery_worker.go`、`server/internal/app/task_terminal_delivery.go`、PC 原对话任务事件订阅/重载。
 
 - [x] 主对话用服务端确认的状态显示「拿没拿到结果、接下来由谁做、能点什么」。移除失败/等待消息里的步骤计数、通用「对账」和内部名字；诊断留任务详情。正常结果与现有验收证据保持绑定。
-- [x] 用已提交任务状态作为无模型的回告来源。终态文案调用失败、超时或账本结果未知时，原对话仍有可重载的状态；不重新派发结果未知的文案调用。用任务修订与来源事件去重，避免状态卡和模型兜底重复。
+- [x] 等待状态的无工具说明模型接收事件中的 allowlist 失败分类或已确认的 Runtime 停止/租约过期事实；不向模型传 provider 原文、工具名或内部错误码。无法取得分类时明确说记录不足以判断原因。
+- [x] 说明模型调用结果未知时，使用同一 outbox 来源持久化并发布一条确定性系统说明，不重派模型请求；独立记录回告类型，允许模型结果晚到时结算用量但不覆盖已发布说明。
 - [x] 验收：新闻任务没有已核实结果时，只说「这次没能拿到已核实的新闻，任务已中断」；不可用的「再试一次」不显示。只有已登记真实恢复时才说「我会再查一次」。自动化用例覆盖无核实结果和无恢复安排；实际新闻查询 E2E 尚未完成。
 
 ## T04 · P1：把 👌🏻 接回原请求气泡（实现完成；跨页实机回归待补）
@@ -64,6 +67,7 @@
 
 - [x] 隔离工作树验证：`go test ./internal/api ./internal/app ./cmd/portal -count=1`；恢复专属 `go test ./internal/worker -run 'Test(CloudDSHReadOnlyRecovery|CloudDSHModelRecoveryStartRequiresExactAttemptAndConfirmedResponse|CloudDSHModelResultErrorForCallKeepsOnlyMatchingNoDispatchEvidence|CloudDSHModelResultErrorForCallKeepsOnlyMatchingProviderRejectEvidence)' -count=1`；本机 PostgreSQL `go test ./internal/store/postgres -run TestPostgresTaskModelRecovery -count=1`（4 个集成用例）；PC `npm test -- src/routes/Assistant.test.tsx`（289/289）。
 - [ ] 用打包 PC 完成端到端回归，保存目标 commit、任务/事件关联、三种页面状态与实际派发次数；全量 worker 包测试当前未通过，测试 Runtime 在本机握手前退出（`account Agent Runtime handshake is invalid`），需在 DSH Runtime 可启动的环境重跑。
+- [ ] 本次改动尚未在真实 `morde-pc` 交互验收；需确认未知结果只保留在任务详情，原对话只显示 assistant 自然语言说明，终态回告模型未知时仍能收到确定性说明。
 - [ ] 正例：快答无 👌🏻；耗时任务一次 👌🏻；可重试故障自动恢复后出结果；耗尽后原对话收到说明；真实审批能继续。
 - [ ] 反例：结果或用量未知、工具不在授权范围、权限撤销、用户取消、checkpoint 不匹配、写入结果不明、两个 Worker 竞争。断言不发生不安全派发、跨账号展示或重复交付。
 - [ ] 自动恢复独立灰度并可关闭；关闭后仍保留状态修复与原对话回告。比较「无入口却提示等待用户」次数、任务回告覆盖率、恢复成功率及额外模型调用。任何重复副作用或跨权限展示立即停用自动恢复。

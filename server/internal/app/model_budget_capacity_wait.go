@@ -12,6 +12,7 @@ const (
 	TaskModelBudgetCapacityWaitReason         = "model_budget_capacity"
 	TaskModelBudgetCapacityExpiredReason      = "model_budget_capacity_timeout"
 	TaskModelBudgetCapacityExhaustedReason    = "model_budget_exhausted"
+	TaskModelBudgetCapacityInvalidatedReason  = "model_budget_capacity_invalidated"
 	TaskModelBudgetCapacityWaitTimeout        = 5 * time.Minute
 	TaskModelBudgetCapacityReconcileBatchSize = 100
 )

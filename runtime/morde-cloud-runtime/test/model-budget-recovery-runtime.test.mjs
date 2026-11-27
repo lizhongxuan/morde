@@ -135,3 +135,42 @@ test('recovery budget plan and final model frame use the authorized recovery DSH
     output.destroy()
   }
 })
+
+test('recovery final model frame uses its authorized DSH identity without budget admission', async () => {
+  const start = recoveryFrame()
+  delete start.model_budget_admission
+  assert.equal(validStart(start), true)
+  const identity = Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+    .map(key => [key, start[key]]))
+  const input = new PassThrough()
+  const output = new PassThrough()
+  const ipc = new WorkerIPC(input, output)
+  writeFrame(input, start)
+  await ipc.start.promise
+
+  try {
+    const recoveryCallID = start.model_recovery.recovery_dsh_call_id
+    const request = { provider: 'morde', model: start.model,
+      messages: [{ role: 'user', content: [{ type: 'text', text: 'resume' }] }], tools: [] }
+    const recoveryThrough = start.model_recovery.checkpoint_through_seq + 5
+    const streamPromise = (async () => {
+      const chunks = []
+      for await (const chunk of ipc.streamModel(identity, recoveryCallID, recoveryThrough,
+        request, undefined)) chunks.push(chunk)
+      return chunks
+    })()
+    const model = await nextOutputFrame(output)
+    assert.equal(model.type, 'model')
+    assert.equal(model.id, recoveryCallID)
+    assert.equal(model.through_seq, recoveryThrough)
+    assert.equal(Object.hasOwn(model, 'budget_call_id'), false)
+
+    writeFrame(input, { type: 'model_chunk', ...identity, id: recoveryCallID, index: 0,
+      chunk: { type: 'finish', reason: { kind: 'stop' } } })
+    writeFrame(input, { type: 'model_end', ...identity, id: recoveryCallID, ok: true })
+    assert.equal((await streamPromise).length, 1)
+  } finally {
+    input.destroy()
+    output.destroy()
+  }
+})

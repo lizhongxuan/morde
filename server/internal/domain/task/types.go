@@ -608,6 +608,17 @@ func CanTransition(from, to Status) bool {
 	}
 }
 
+// CanTransitionWithReason permits workflow-specific transitions only when the
+// persisted reason names the workflow that owns the edge. Generic Task state
+// transitions remain conservative for all other waiting_user reasons.
+func CanTransitionWithReason(from, to Status, reason string) bool {
+	if from == StatusWaitingUser && reason == "model_budget_capacity" &&
+		(to == StatusQueued || to == StatusPaused) {
+		return true
+	}
+	return CanTransition(from, to)
+}
+
 func CanTransitionOperation(from, to OperationStatus) bool {
 	switch from {
 	case OperationPrepared:

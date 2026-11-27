@@ -2450,6 +2450,7 @@ export async function runAgent(ipc, frame) {
       if (sessionDurable.agentState?.toolFailure) throw new Error('tool result is unavailable')
       if (sessionDurable.through <= sessionDurable.lastModelThrough) throw new Error('model request has no new durable prefix')
       const requestThrough = sessionDurable.through
+      const previousModelThrough = sessionDurable.lastModelThrough
       const deliveryVersion = sessionDurable.messageDeliveryVersion
       sessionDurable.modelDeliveryVersion = deliveryVersion
       sessionDurable.lastModelThrough = requestThrough
@@ -2466,8 +2467,10 @@ export async function runAgent(ipc, frame) {
       }
       const recovery = sessionDurable.start.model_recovery
       const recoveryFrame = recovery && options.purpose !== 'compaction' &&
-        budgetAdmission?.through_seq === recovery.checkpoint_through_seq &&
-        budgetAdmission?.dsh_call_id === recovery.recovery_dsh_call_id
+        previousModelThrough < 0 && requestThrough >= recovery.checkpoint_through_seq &&
+        (sessionDurable.start.model_budget_admission !== true ||
+          budgetAdmission?.through_seq === recovery.checkpoint_through_seq &&
+          budgetAdmission?.dsh_call_id === recovery.recovery_dsh_call_id)
       const taskContext = sessionDurable.identity.context_role !== 'coordinator' &&
         sessionDurable.identity.context_role !== 'task_validation_review'
       const id = taskContext

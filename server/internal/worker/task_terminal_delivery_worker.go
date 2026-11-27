@@ -164,14 +164,12 @@ func (w *TaskTerminalDeliveryWorker) deliverClaim(ctx context.Context, claim app
 		}
 		return w.publishReady(workCtx, ready)
 	case app.TaskTerminalDeliveryModelUnknown:
-		changed, err := w.options.Store.MarkTaskTerminalDeliveryUnknownClaim(context.WithoutCancel(ctx), claim)
-		if err != nil {
-			return errors.Join(callErr, err)
-		}
-		if !changed && callErr == nil {
-			return errors.New("unknown Task terminal delivery call lost its active claim")
-		}
-		return callErr
+		// The explanation call has no tools or external side effects. If its
+		// reply cannot be recovered now, persist one deterministic explanation
+		// against the same outbox source instead of leaving the conversation
+		// without a response. A late model result cannot replace a published
+		// fallback or create a second assistant message.
+		return w.persistAndPublishSystemState(workCtx, claim, facts)
 	case app.TaskTerminalDeliveryModelStale:
 		_, invalidateErr := w.options.Store.InvalidateTaskTerminalDeliveryClaim(context.WithoutCancel(ctx), claim)
 		return errors.Join(callErr, invalidateErr)
@@ -181,16 +179,10 @@ func (w *TaskTerminalDeliveryWorker) deliverClaim(ctx context.Context, claim app
 		}
 		return w.persistAndPublishSystemState(workCtx, claim, facts)
 	default:
-		// Unknown dispositions are treated as ambiguous. Preserve the stable
-		// call identity and never synthesize a response or retry another call.
-		changed, markErr := w.options.Store.MarkTaskTerminalDeliveryUnknownClaim(context.WithoutCancel(ctx), claim)
-		if markErr != nil {
-			return errors.Join(callErr, markErr)
-		}
-		if !changed && callErr == nil {
-			return errors.New("unrecognized Task terminal delivery disposition lost its active claim")
-		}
-		return callErr
+		// Never make another model call for an unrecognized outcome. The
+		// deterministic reply is tied to this source and can only be published
+		// once, so it remains safe even if the model call later settles.
+		return w.persistAndPublishSystemState(workCtx, claim, facts)
 	}
 }
 
@@ -205,33 +197,33 @@ func (w *TaskTerminalDeliveryWorker) publishReady(ctx context.Context, claim app
 	if !app.ValidTaskTerminalDeliverySourceFacts(claim, facts) {
 		return errors.New("verified reply-ready Task terminal delivery facts are invalid")
 	}
-	raw, err := app.BuildTaskTerminalDeliveryDSHModelRequest(facts.ModelID, facts)
-	if err != nil {
-		return err
-	}
-	fence, err := claim.ModelFence()
-	if err != nil {
-		return err
-	}
-	response, recovered, err := w.options.Models.RecoverTaskTerminalDeliveryDSHModelResponse(ctx, fence, raw)
-	if err != nil {
-		return err
-	}
 	var content string
-	if recovered {
-		if !validTerminalDeliveryModelResponse(response) {
-			return errors.New("recovered Task terminal delivery model response is invalid")
-		}
-		content = strings.TrimSpace(response.Text)
+	fallback, fallbackErr := app.OpenTaskTerminalDeliveryReply(w.options.ReplySealer, claim)
+	if fallbackErr == nil && fallback.Kind == app.TaskTerminalDeliveryReplySystemState {
+		content = fallback.Text
 	} else {
-		fallback, err := app.OpenTaskTerminalDeliveryReply(w.options.ReplySealer, claim)
+		raw, err := app.BuildTaskTerminalDeliveryDSHModelRequest(facts.ModelID, facts)
 		if err != nil {
 			return err
 		}
-		if fallback.Kind != app.TaskTerminalDeliveryReplySystemState {
-			return errors.New("reply-ready Task terminal delivery has no recoverable model response")
+		fence, err := claim.ModelFence()
+		if err != nil {
+			return err
 		}
-		content = fallback.Text
+		response, recovered, err := w.options.Models.RecoverTaskTerminalDeliveryDSHModelResponse(ctx, fence, raw)
+		if err != nil {
+			return err
+		}
+		if recovered {
+			if !validTerminalDeliveryModelResponse(response) {
+				return errors.New("recovered Task terminal delivery model response is invalid")
+			}
+			content = strings.TrimSpace(response.Text)
+		} else if fallbackErr == nil && fallback.Kind == app.TaskTerminalDeliveryReplySystemState {
+			content = fallback.Text
+		} else {
+			return errors.New("reply-ready Task terminal delivery has no recoverable response")
+		}
 	}
 	_, _, err = w.options.Store.PublishTaskTerminalDeliveryReply(ctx, claim, content)
 	return err
@@ -265,7 +257,12 @@ func terminalDeliverySystemStateReply(facts app.TaskTerminalDeliverySourceFacts)
 	case app.TaskTerminalDeliverySourceCancellation:
 		return "任务已停止；未完成的部分没有交付。可以查看任务详情。"
 	case app.TaskTerminalDeliverySourceWaiting:
-		return "任务已暂停。" + app.TaskTerminalDeliveryWaitingExplanation(facts.WaitingReason) + "可以查看任务详情。"
+		diagnosis := facts.RecoveryDiagnosis
+		if diagnosis == "" {
+			diagnosis = app.TaskTerminalDeliveryWaitingExplanation(facts.WaitingReason)
+		}
+		return "这次任务没有形成可核实的答复。" + diagnosis +
+			"执行进度保留在任务详情中。"
 	case app.TaskTerminalDeliverySourceValidation:
 		if facts.ValidationState == app.TaskValidationPass || facts.ValidationState == app.TaskValidationPassNotes {
 			return "任务结果已通过验证。验证依据可在任务详情查看。"

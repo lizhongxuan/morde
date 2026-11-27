@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 )
 
@@ -31,6 +32,15 @@ func TestCloudDSHReadOnlyRecoveryRequiresExactRootCheckpointAndToolset(t *testin
 	candidate, ok := cloudDSHReadOnlyRecoveryCheckpointFor(value, state, call, false)
 	if !ok || candidate.ThroughSequence != 5 || len(candidate.Digest) != 32 || len(candidate.ToolsetDigest) != 32 {
 		t.Fatalf("valid read-only checkpoint = %+v, %t", candidate, ok)
+	}
+	freshState := *state
+	freshState.resume = false
+	freshState.restoreThrough = -1
+	freshState.restoreDigest = nil
+	freshState.readThrough = -1
+	candidate, ok = cloudDSHReadOnlyRecoveryCheckpointFor(value, &freshState, call, false)
+	if !ok || candidate.ThroughSequence != 5 || len(candidate.Digest) != 32 || len(candidate.ToolsetDigest) != 32 {
+		t.Fatalf("valid fresh-session recovery checkpoint = %+v, %t", candidate, ok)
 	}
 
 	cases := []struct {
@@ -80,9 +90,23 @@ func recoveryTestTool(name string) app.AgentToolDefinition {
 }
 
 func TestCloudDSHReadOnlyRecoveryToolsetUsesClosedAllowlist(t *testing.T) {
-	for _, name := range []string{"morde_web_search", "morde_web_read"} {
+	for _, name := range []string{"morde_web_search", "morde_web_read", cloudDSHResultEvidenceToolName} {
 		if !cloudDSHReadOnlyRecoveryToolset([]app.AgentToolDefinition{recoveryTestTool(name)}) {
 			t.Errorf("read-only tool %q was rejected", name)
+		}
+	}
+	attachmentReader := recoveryTestTool("morde_read_task_attachment")
+	attachmentReader.RequiredScope = identity.ScopeTaskRead
+	attachmentReader.Strict = true
+	if !cloudDSHReadOnlyRecoveryToolset([]app.AgentToolDefinition{attachmentReader}) {
+		t.Fatal("current-Task attachment reader with task:read was rejected")
+	}
+	for _, attachmentReader := range []app.AgentToolDefinition{
+		recoveryTestTool("morde_read_task_attachment"),
+		{ModelTool: app.ModelTool{Name: "morde_read_task_attachment", Strict: true}, RequiredScope: identity.ScopeWorkspaceSync},
+	} {
+		if cloudDSHReadOnlyRecoveryToolset([]app.AgentToolDefinition{attachmentReader}) {
+			t.Fatal("attachment reader without its exact task:read scope was accepted")
 		}
 	}
 	for _, name := range []string{"ask_user", "dsh_delegate", "morde_workspace_read", "morde_workspace_write", "morde_mcp_call",
@@ -90,6 +114,68 @@ func TestCloudDSHReadOnlyRecoveryToolsetUsesClosedAllowlist(t *testing.T) {
 		if cloudDSHReadOnlyRecoveryToolset([]app.AgentToolDefinition{recoveryTestTool(name)}) {
 			t.Errorf("tool %q passed the read-only allowlist", name)
 		}
+	}
+}
+
+func TestCloudDSHReadOnlyRecoveryAllowsOnlyReconciledActivities(t *testing.T) {
+	call := app.ModelCall{CallID: "mdl_failed_call_1"}
+	state := &cloudDSHSessionState{activeActivities: map[string]string{},
+		history: &cloudDSHCheckpointHistory{calls: make(map[string]*cloudDSHToolCall)}}
+	if !cloudDSHRecoveryActivitiesSafeForCheckpoint(state, call) {
+		t.Fatal("recovery rejected a session with no active activity")
+	}
+
+	state.activeActivities[call.CallID] = "model"
+	if !cloudDSHRecoveryActivitiesSafeForCheckpoint(state, call) {
+		t.Fatal("recovery rejected the matching failed model activity")
+	}
+
+	recoveryTask := &app.ModelTaskFence{TaskID: "q1234567", AgentSessionID: "session_recovery", ThroughSequence: 15,
+		RecoveryCallID: "mrc_recovery_call", RecoveryDSHCallID: "mdr_recovery_call"}
+	failedCallID, err := app.DSHModelCallID(recoveryTask.TaskID, recoveryTask.AgentSessionID, recoveryTask.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.activeActivities = map[string]string{failedCallID: "model"}
+	call = app.ModelCall{CallID: recoveryTask.RecoveryDSHCallID, Task: recoveryTask}
+	if !cloudDSHRecoveryActivitiesSafeForCheckpoint(state, call) {
+		t.Fatal("recovery rejected the matching failed model activity during retry")
+	}
+	state.activeActivities[recoveryTask.RecoveryDSHCallID] = "model"
+	if !cloudDSHRecoveryActivitiesSafeForCheckpoint(state, call) {
+		t.Fatal("recovery rejected the matching failed and recovery model activities")
+	}
+	state.activeActivities = map[string]string{}
+	delete(state.activeActivities, call.CallID)
+	state.activeActivities["call_search_1"] = "tool"
+	state.history.calls["call_search_1"] = &cloudDSHToolCall{name: "morde_web_search", callSeen: true,
+		resultSeen: true, reconciled: true, status: app.AgentToolSucceeded}
+	if !cloudDSHRecoveryActivitiesSafeForCheckpoint(state, call) {
+		t.Fatal("recovery rejected a completed, reconciled read-only tool call")
+	}
+
+	for _, test := range []struct {
+		name       string
+		activities map[string]string
+		calls      map[string]*cloudDSHToolCall
+	}{
+		{name: "different model call", activities: map[string]string{"mdl_other_call_1": "model"}},
+		{name: "unreconciled tool", activities: map[string]string{"call_search_1": "tool"}, calls: map[string]*cloudDSHToolCall{
+			"call_search_1": {name: "morde_web_search", callSeen: true, resultSeen: true, status: app.AgentToolSucceeded}}},
+		{name: "failed read-only tool", activities: map[string]string{"call_search_1": "tool"}, calls: map[string]*cloudDSHToolCall{
+			"call_search_1": {name: "morde_web_search", callSeen: true, resultSeen: true, reconciled: true, status: app.AgentToolFailed}}},
+		{name: "private read tool", activities: map[string]string{"call_search_1": "tool"}, calls: map[string]*cloudDSHToolCall{
+			"call_search_1": {name: "morde_workspace_read", callSeen: true, resultSeen: true, reconciled: true, status: app.AgentToolSucceeded}}},
+		{name: "checkpoint activity", activities: map[string]string{"checkpoint_15": "checkpoint"}},
+		{name: "model and tool", activities: map[string]string{call.CallID: "model", "call_tool_1": "tool"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state.activeActivities = test.activities
+			state.history.calls = test.calls
+			if cloudDSHRecoveryActivitiesSafeForCheckpoint(state, call) {
+				t.Fatal("recovery accepted an unrelated or additional active activity")
+			}
+		})
 	}
 }
 

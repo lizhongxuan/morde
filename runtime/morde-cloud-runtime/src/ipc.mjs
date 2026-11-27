@@ -321,6 +321,7 @@ export class WorkerIPC {
     this.images = new Map()
     this.imageCacheBytes = 0
     this.models = new Map()
+    this.recoveryModelCallUsed = false
     this.cancelledModels = new Map()
     this.messageDeliveries = new Map()
     this.pendingMessageDeliveries = []
@@ -1136,11 +1137,15 @@ export class WorkerIPC {
       const recovery = this.startFrame?.model_recovery
       const taskContext = identity.context_role !== 'coordinator' && identity.context_role !== 'task_validation_review'
       if (taskContext) {
-        const recoveryPlan = recovery && budgetAdmission?.through_seq === recovery.checkpoint_through_seq &&
-          budgetAdmission?.dsh_call_id === recovery.recovery_dsh_call_id
-        const expectedID = recoveryPlan
+        const recoveryFrame = recovery && id === recovery.recovery_dsh_call_id && this.startFrame?.resume === true &&
+          (this.startFrame?.model_budget_admission === true
+            ? through === recovery.checkpoint_through_seq && budgetAdmission?.through_seq === recovery.checkpoint_through_seq &&
+              budgetAdmission?.dsh_call_id === recovery.recovery_dsh_call_id
+            : through >= recovery.checkpoint_through_seq && budgetAdmission === undefined && !this.recoveryModelCallUsed)
+        const expectedID = recoveryFrame
           ? recovery.recovery_dsh_call_id : modelCallID(identity.task_id, identity.session_id, through)
         if (id !== expectedID) throw new Error('model call identity does not match the authorized Task frame')
+        if (recoveryFrame && this.startFrame?.model_budget_admission !== true) this.recoveryModelCallUsed = true
       }
       if (budgetAdmission !== undefined) {
         if (this.startFrame?.model_budget_admission !== true || !isObject(budgetAdmission) ||

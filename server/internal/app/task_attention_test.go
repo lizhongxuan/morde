@@ -136,6 +136,8 @@ func TestTaskAttentionExplainsModelBudgetWaitAndPause(t *testing.T) {
 			wantKind: TaskAttentionInterrupted},
 		{name: "minimum budget unavailable", status: task.StatusPaused, reason: TaskModelBudgetCapacityExhaustedReason,
 			wantKind: TaskAttentionInterrupted},
+		{name: "capacity wait invalidated", status: task.StatusPaused, reason: TaskModelBudgetCapacityInvalidatedReason,
+			wantKind: TaskAttentionInterrupted},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

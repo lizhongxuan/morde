@@ -936,7 +936,10 @@ FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR 
 		return fmt.Errorf("lock task model Agent Session: %w", err)
 	}
 	if fence.AgentSessionID == rootSessionID {
-		if parentSessionID != "" || stepID != "" || sessionThrough != through || !bytes.Equal(sessionDigest, checkpointDigest) {
+		recoveryCall := fence.RecoveryCallID != "" && fence.RecoveryDSHCallID != ""
+		if parentSessionID != "" || stepID != "" || sessionThrough != through || !bytes.Equal(sessionDigest, checkpointDigest) ||
+			(!recoveryCall && sessionThrough != fence.ThroughSequence) ||
+			(recoveryCall && sessionThrough < fence.ThroughSequence) {
 			return domain.NewError(domain.CodeInvalidState, "task model root checkpoint is not committed")
 		}
 	} else {
@@ -955,11 +958,33 @@ FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 AND session_id=$3 FOR 
 			return domain.NewError(domain.CodeUnauthenticated, "task model child Agent Session is not running")
 		}
 	}
-	if sessionThrough != fence.ThroughSequence || len(sessionDigest) != 32 {
+	recoveryCall := fence.RecoveryCallID != "" && fence.RecoveryDSHCallID != ""
+	if (!recoveryCall && sessionThrough != fence.ThroughSequence) ||
+		(recoveryCall && sessionThrough < fence.ThroughSequence) || len(sessionDigest) != 32 {
 		return domain.NewError(domain.CodeInvalidState, "task model Agent Session checkpoint head is not committed")
 	}
 	var checkpoint bool
-	err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_checkpoints c
+	if recoveryCall {
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_model_recovery_schedules recovery
+JOIN task_agent_checkpoints c ON c.task_id=recovery.task_id AND c.owner_id=recovery.owner_id
+JOIN task_agent_instances i ON i.task_id=c.task_id AND i.owner_id=c.owner_id
+ AND i.agent_generation=c.agent_generation AND i.agent_instance_id=c.agent_instance_id
+ AND i.agent_session_id=c.agent_root_session_id AND i.engine_version=c.engine_version
+ AND i.profile_version=c.profile_version AND i.auth_version=c.auth_version AND i.lease_version=c.lease_version
+WHERE recovery.task_id=$1 AND recovery.owner_id=$2 AND recovery.recovery_call_id=$10
+ AND recovery.recovery_dsh_call_id=$11 AND recovery.state='attempting'
+ AND c.agent_session_id=$3 AND c.agent_root_session_id=$4
+ AND c.through_seq=$5 AND c.digest=recovery.checkpoint_digest
+ AND octet_length($6::bytea)=32
+ AND c.auth_version=$7 AND c.engine_version=$8 AND c.profile_version=$9
+ AND c.agent_generation<=recovery.agent_generation AND c.lease_version<=recovery.failed_lease_version
+ AND i.state='stopped' AND ((i.stop_receipt IS NOT NULL AND i.stop_receipt_digest=sha256(i.stop_receipt))
+   OR (i.guardian_stop_attestation IS NOT NULL AND i.guardian_stop_attestation_digest=sha256(i.guardian_stop_attestation))))`,
+			fence.TaskID, fence.OwnerID, fence.AgentSessionID, rootSessionID, fence.ThroughSequence, sessionDigest,
+			fence.AuthorizationVersion, fence.EngineVersion, fence.ProfileVersion,
+			fence.RecoveryCallID, fence.RecoveryDSHCallID).Scan(&checkpoint)
+	} else {
+		err = tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM task_agent_checkpoints c
 JOIN task_agent_instances i ON i.task_id=c.task_id AND i.owner_id=c.owner_id
  AND i.agent_generation=c.agent_generation AND i.agent_instance_id=c.agent_instance_id
  AND i.agent_session_id=c.agent_root_session_id AND i.engine_version=c.engine_version
@@ -967,9 +992,13 @@ JOIN task_agent_instances i ON i.task_id=c.task_id AND i.owner_id=c.owner_id
 WHERE c.task_id=$1 AND c.owner_id=$2 AND c.agent_session_id=$3 AND c.agent_root_session_id=$4
  AND c.through_seq=$5 AND c.digest=$6 AND c.auth_version=$7 AND c.engine_version=$8 AND c.profile_version=$9
  AND ((c.agent_generation=$10 AND i.state='active') OR (c.agent_generation<$10 AND i.state='stopped')))`,
-		fence.TaskID, fence.OwnerID, fence.AgentSessionID, rootSessionID, fence.ThroughSequence, sessionDigest,
-		fence.AuthorizationVersion, fence.EngineVersion, fence.ProfileVersion, fence.AgentGeneration).Scan(&checkpoint)
-	if err != nil || !checkpoint {
+			fence.TaskID, fence.OwnerID, fence.AgentSessionID, rootSessionID, fence.ThroughSequence, sessionDigest,
+			fence.AuthorizationVersion, fence.EngineVersion, fence.ProfileVersion, fence.AgentGeneration).Scan(&checkpoint)
+	}
+	if err != nil {
+		return fmt.Errorf("verify task model checkpoint: %w", err)
+	}
+	if !checkpoint {
 		return domain.NewError(domain.CodeInvalidState, "task checkpoint is not committed")
 	}
 	// Resource ownership and revocation are checked before installation credentials.

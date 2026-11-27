@@ -111,7 +111,7 @@ export async function requestFetch(input: RequestInfo | URL, init?: RequestInit)
   try {
     response = await fetch(input, { ...init, headers, credentials: "include" });
   } catch (error) {
-    if (!init?.signal?.aborted && error instanceof TypeError) window.dispatchEvent(new Event("morde:api-network-error"));
+    if (!init?.signal?.aborted && error instanceof TypeError) window.dispatchEvent(new CustomEvent("morde:api-network-error", { detail: { source: "request" } }));
     throw error;
   }
   const requestTraceID = headers.get("traceparent")?.split("-")[1] ?? "";
@@ -120,7 +120,9 @@ export async function requestFetch(input: RequestInfo | URL, init?: RequestInit)
   window.dispatchEvent(new CustomEvent("morde:api-trace", {
     detail: { request_id: headers.get("X-Request-Id"), trace_id: responseTraceID, status: response.status },
   }));
-  window.dispatchEvent(new Event("morde:api-network-recovered"));
+  window.dispatchEvent(new CustomEvent(response.status >= 500 ? "morde:api-network-error" : "morde:api-network-recovered", {
+    detail: { source: "request" },
+  }));
   const path = new URL(typeof input === "string" || input instanceof URL ? input : input.url, window.location.origin).pathname;
   if (response.status === 401 && path !== "/api/auth/login" && path !== "/api/me" && window.location.pathname !== "/login") {
     const next = `${window.location.pathname}${window.location.search}`;

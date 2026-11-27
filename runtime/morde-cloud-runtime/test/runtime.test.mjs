@@ -9,7 +9,7 @@ import { fileURLToPath } from 'node:url'
 import test from 'node:test'
 import { AccountRuntime, workspaceWorkingDirectory } from '../src/account-runtime.mjs'
 import {
-  coordinatorCompactionModelCallID, coordinatorModelCallID, DurableSession, ENGINE_VERSION, modelCallID,
+  coordinatorCompactionModelCallID, coordinatorModelCallID, DurableSession, ENGINE_VERSION, modelCallID, modelRecoveryCallIDs,
   TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, runAgent, taskValidationReviewModelCallID, validDelegateSelection, validMessageDelivery, validStart,
 } from '../src/engine.mjs'
 import { WorkerIPC } from '../src/ipc.mjs'
@@ -8323,6 +8323,49 @@ test('account runtime forwards the bounded task context capacity to DSH', async 
   assert.equal(code, 0, `frames: ${child.frames.map(frame => frame.type).join(', ')}`)
   assert.ok(child.frames.some(frame => frame.type === 'task_started'))
   assert.equal(child.frames.some(frame => frame.type === 'protocol_error'), false)
+})
+
+test('account runtime accepts a fenced model recovery start', async t => {
+  const taskID = 'task_model_recovery'
+  const sessionID = `session_${taskID}`
+  const checkpointThrough = 4
+  const failedCallID = modelCallID(taskID, sessionID, checkpointThrough)
+  const recoveryCallIDs = modelRecoveryCallIDs(taskID, 1, failedCallID, checkpointThrough)
+  const recoveryStart = {
+    ...accountTask(taskID),
+    resume: true,
+    checkpoint_through_seq: checkpointThrough,
+    checkpoint_sha256: '12'.repeat(32),
+    model_recovery: {
+      task_id: taskID,
+      task_revision: 1,
+      session_id: sessionID,
+      authorization_version: 1,
+      checkpoint_through_seq: checkpointThrough,
+      checkpoint_sha256: '12'.repeat(32),
+      failed_call_id: failedCallID,
+      recovery_dsh_call_id: recoveryCallIDs.dshCallID,
+      recovery_call_id: recoveryCallIDs.ledgerCallID,
+    },
+  }
+  delete recoveryStart.prompt
+  const protocolErrors = []
+  const child = launchAccount((frame, proc) => {
+    if (frame.type === 'runtime_ready') send(proc, recoveryStart)
+    if (frame.type === 'protocol_error') {
+      protocolErrors.push(frame.code)
+      send(proc, { ...account, type: 'runtime_shutdown' })
+    }
+    if (frame.type === 'task_started') send(proc, { ...account, type: 'runtime_shutdown' })
+    if (frame.type === 'runtime_stopped') proc.stdin.end()
+  })
+  t.after(() => child.child.kill())
+  const closed = once(child.child, 'close')
+  send(child.child, account)
+  const [code] = await closed
+  assert.equal(code, 0, `frames: ${child.frames.map(frame => frame.type).join(', ')}`)
+  assert.ok(child.frames.some(frame => frame.type === 'task_started' && frame.task_id === taskID))
+  assert.equal(protocolErrors.includes('invalid_task_start'), false)
 })
 
 test('account runtime accepts a new Task after settlement and rejects duplicate identity', async t => {

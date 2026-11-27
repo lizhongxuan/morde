@@ -206,6 +206,23 @@ describe('typed Portal API client', () => {
     }
   });
 
+  it('keeps the client shell in a connection state for failed server responses', async () => {
+    const events: string[] = [];
+    const onError = () => events.push('error');
+    const onRecovered = () => events.push('recovered');
+    window.addEventListener('morde:api-network-error', onError);
+    window.addEventListener('morde:api-network-recovered', onRecovered);
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(Response.json({ error: { code: 'internal' } }, { status: 503 })));
+
+    try {
+      await requestFetch('/api/me');
+      expect(events).toEqual(['error']);
+    } finally {
+      window.removeEventListener('morde:api-network-error', onError);
+      window.removeEventListener('morde:api-network-recovered', onRecovered);
+    }
+  });
+
   it('reads owner-scoped memory history using the signed cursor and fixed memory route', async () => {
     let request: Request | undefined;
     vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {

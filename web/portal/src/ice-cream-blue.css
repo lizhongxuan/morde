@@ -307,6 +307,26 @@
   background: var(--brand);
   border-radius: var(--radius-bubble) var(--radius-bubble) 8px var(--radius-bubble);
 }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-agent-acknowledged {
+  position: absolute;
+  right: -15px;
+  bottom: -15px;
+  z-index: 1;
+  width: 30px;
+  height: 30px;
+  box-sizing: border-box;
+  display: grid;
+  place-items: center;
+  border: 2px solid #fff;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 7px rgb(44 72 112 / 18%);
+  font-size: 17px;
+  line-height: 1;
+}
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-body:has(> .chat-message-user .chat-message-agent-acknowledged) .chat-message-meta {
+  margin-top: 16px;
+}
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-expand { color: #fff; }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-assistant {
   width: fit-content;

@@ -41,6 +41,7 @@ const TASK_PROCESS_ADMIT_KEYS = ['type', 'server_instance_id', 'runtime_id', 'ru
 const ACCOUNT_START_KEYS = [
   'type', 'version', 'traceparent', ...TASK_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',
   'runtime_sequence', 'task_revision', 'conversation_id', 'model', 'tools', 'prompt', 'initial_message', 'initial_context', 'revision_messages', 'resume', 'checkpoint_through_seq', 'checkpoint_sha256', 'max_tokens', 'context_window_tokens', 'background_jobs', 'step_retry', 'model_budget_admission',
+  'model_recovery',
 ]
 const COORDINATOR_START_KEYS = [
   'type', 'version', ...COORDINATOR_FENCE_FIELDS, 'server_instance_id', 'runtime_id', 'runtime_generation',

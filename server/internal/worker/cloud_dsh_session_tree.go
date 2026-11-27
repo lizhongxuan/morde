@@ -2313,19 +2313,28 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			beginAttempt, replayOnly, allowed := cloudDSHModelRecoveryStartAllowed(intent.State, id, intent.RecoveryDSHCallID,
 				recoveryCallStarted, recoveryCallSucceeded)
 			if !allowed {
-				recoveryStartErr = errors.New("task model recovery outcome is not confirmed")
+				recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_not_allowed",
+					reasonCode: "recovery_call_identity_mismatch"}
 			} else if beginAttempt || replayOnly {
 				if pending.identity.SessionID != rootIdentity.SessionID {
-					recoveryStartErr = errors.New("task model recovery must use the root session")
+					recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_not_allowed",
+						reasonCode: "recovery_session_mismatch"}
 				} else if checkpoint, ok := cloudDSHReadOnlyRecoveryCheckpointFor(value, pending.state, pending.modelCall, len(childSessions) > 0); !ok ||
 					checkpoint.ThroughSequence != intent.CheckpointThroughSequence || !bytes.Equal(checkpoint.Digest, intent.CheckpointDigest) ||
 					!bytes.Equal(checkpoint.ToolsetDigest, intent.ToolsetDigest) {
-					recoveryStartErr = errors.New("task model recovery checkpoint or toolset changed")
+					failureReason := cloudDSHReadOnlyRecoveryCheckpointFailureReason(value, pending.state, pending.modelCall, len(childSessions) > 0)
+					if failureReason == "" {
+						failureReason = "scheduled_checkpoint_or_toolset_digest_changed"
+					}
+					recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_checkpoint_invalid",
+						reasonCode: failureReason}
 				} else if beginAttempt {
 					if starter, ok := e.options.Tools.(cloudDSHTaskModelRecoveryAttemptStarter); !ok {
-						recoveryStartErr = errors.New("task model recovery attempt gate is unavailable")
+						recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_unavailable",
+							reasonCode: "attempt_gate_unavailable"}
 					} else if err := starter.BeginTaskModelRecoveryAttempt(ctx, *intent, fence); err != nil {
-						recoveryStartErr = errors.New("task model recovery attempt could not be confirmed")
+						recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_unavailable",
+							reasonCode: "attempt_start_not_confirmed"}
 					} else {
 						recoveryCallStarted = true
 					}
@@ -2645,7 +2654,11 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					pending.modelCall.CallID == intent.RecoveryDSHCallID {
 					recoveryCallSucceeded = true
 				}
-				if !steerPending && pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through {
+				recoveryModelCall := value.ModelRecovery != nil && pending.modelCall.Task != nil &&
+					pending.modelCall.Task.RecoveryCallID == value.ModelRecovery.RecoveryCallID &&
+					pending.modelCall.Task.RecoveryDSHCallID == value.ModelRecovery.RecoveryDSHCallID &&
+					pending.modelCall.CallID == value.ModelRecovery.RecoveryDSHCallID
+				if !steerPending && pending.modelCall.Task != nil && pending.modelCall.Task.ThroughSequence < pending.state.through && !recoveryModelCall {
 					result.response = app.ModelResponse{Text: "A new task input arrived during this model call. Re-evaluate the current task before taking action.",
 						StopReason: "stop", Usage: result.response.Usage, ProviderReportedModel: result.response.ProviderReportedModel}
 				} else if !steerPending && pending.stream.hasVisibleText() {

@@ -122,13 +122,18 @@ func storeTaskTerminalDeliveryModelResponseInTx(ctx context.Context, tx pgx.Tx,
 	}
 	switch stored.State {
 	case TaskTerminalDeliveryStateReplyReady, TaskTerminalDeliveryStatePublished:
+		if stored.ResponseKind == app.TaskTerminalDeliveryResponseSystem {
+			// The user-facing fallback has already won the durable source. A
+			// late model settlement may settle usage, but cannot replace that reply.
+			return true, nil
+		}
 		if !bytes.Equal(stored.ResponseCiphertext, ciphertext) || !bytes.Equal(stored.ResponseSHA256, ciphertextDigest) {
 			return false, domain.NewError(domain.CodeIdempotencyConflict, "terminal delivery response was settled differently")
 		}
 		return true, nil
 	case TaskTerminalDeliveryStateClaimed, TaskTerminalDeliveryStateUnknown, "pending":
 		result, err := tx.Exec(ctx, `UPDATE task_terminal_delivery_outbox
-SET state='reply_ready',lease_owner=NULL,lease_expires_at=NULL,response_ciphertext=$3,response_sha256=$4,
+SET state='reply_ready',lease_owner=NULL,lease_expires_at=NULL,response_kind='model_response',response_ciphertext=$3,response_sha256=$4,
     updated_at=clock_timestamp()
 WHERE id=$1 AND claim_generation=$2 AND state IN ('claimed','unknown','pending')
   AND model_call_id=$5 AND response_ciphertext IS NULL AND response_sha256 IS NULL`,
@@ -268,6 +273,9 @@ func (s *Store) RecoverTaskTerminalDeliveryModelResponse(ctx context.Context,
 			len(stored.ResponseSHA256) != 32 {
 			return nil
 		}
+		if stored.ResponseKind == app.TaskTerminalDeliveryResponseSystem {
+			return nil
+		}
 		current, err := taskTerminalDeliverySourceCurrentInTx(ctx, tx, stored)
 		if err != nil || !current {
 			return err
@@ -356,7 +364,11 @@ FROM model_call_ledger WHERE owner_id=$1 AND source='terminal_delivery' AND call
 		case "settled":
 			switch stored.State {
 			case TaskTerminalDeliveryStateReplyReady:
-				disposition = app.TaskTerminalDeliveryModelReplyReady
+				if stored.ResponseKind == app.TaskTerminalDeliveryResponseSystem {
+					disposition = app.TaskTerminalDeliveryModelFallbackSafe
+				} else {
+					disposition = app.TaskTerminalDeliveryModelReplyReady
+				}
 			case TaskTerminalDeliveryStateClaimed, TaskTerminalDeliveryStateUnknown:
 				disposition = app.TaskTerminalDeliveryModelFallbackSafe
 			}

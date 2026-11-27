@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"morde/server/internal/app"
 	"morde/server/internal/domain"
 )
 
@@ -56,6 +57,7 @@ type TaskTerminalDeliveryClaim struct {
 	LeaseOwner                string
 	LeaseExpiresAt            time.Time
 	ModelCallID               string
+	ResponseKind              string
 	ResponseCiphertext        []byte
 	ResponseSHA256            []byte
 	PublishedMessageID        string
@@ -107,7 +109,7 @@ const taskTerminalDeliverySelectColumns = `delivery.id,delivery.task_id,delivery
 delivery.task_revision,delivery.authorization_version,delivery.source_kind,delivery.source_event_sequence,delivery.source_event_type,
 delivery.source_sha256,delivery.result_sha256,delivery.validation_claim_generation,delivery.verdict_sha256,delivery.state,
 delivery.claim_generation,COALESCE(delivery.lease_owner,''),delivery.lease_expires_at,COALESCE(delivery.model_call_id,''),
-delivery.response_ciphertext,delivery.response_sha256,COALESCE(delivery.published_message_id,'')`
+COALESCE(delivery.response_kind,''),delivery.response_ciphertext,delivery.response_sha256,COALESCE(delivery.published_message_id,'')`
 
 // ClaimTaskTerminalDeliveryOutbox leases current source rows. Reclaiming an
 // expired or unknown row increments its generation but preserves its stable
@@ -259,7 +261,7 @@ func (s *Store) MarkTaskTerminalDeliveryReplyReady(ctx context.Context, claim Ta
 		}
 		result, err := tx.Exec(ctx, `UPDATE task_terminal_delivery_outbox
 SET state='reply_ready',lease_owner=NULL,lease_expires_at=NULL,
-    response_ciphertext=$4,response_sha256=$5,updated_at=clock_timestamp()
+    response_kind='system_state',response_ciphertext=$4,response_sha256=$5,updated_at=clock_timestamp()
 WHERE id=$1 AND state='claimed' AND claim_generation=$2 AND lease_owner=$3
   AND lease_expires_at>clock_timestamp() AND model_call_id=$6
   AND response_ciphertext IS NULL AND response_sha256 IS NULL`,
@@ -273,6 +275,7 @@ WHERE id=$1 AND state='claimed' AND claim_generation=$2 AND lease_owner=$3
 			updatedClaim.State = TaskTerminalDeliveryStateReplyReady
 			updatedClaim.LeaseOwner = ""
 			updatedClaim.LeaseExpiresAt = time.Time{}
+			updatedClaim.ResponseKind = app.TaskTerminalDeliveryResponseSystem
 			updatedClaim.ResponseCiphertext = append([]byte(nil), ciphertext...)
 			updatedClaim.ResponseSHA256 = append([]byte(nil), digest[:]...)
 		}
@@ -323,6 +326,7 @@ func (s *Store) MarkTaskTerminalDeliveryPublishedInTx(ctx context.Context, tx pg
 	}
 	if stored.State == TaskTerminalDeliveryStatePublished {
 		if stored.PublishedMessageID != messageID ||
+			stored.ResponseKind != ready.ResponseKind ||
 			!bytes.Equal(stored.ResponseSHA256, ready.ResponseSHA256) ||
 			!bytes.Equal(stored.ResponseCiphertext, ready.ResponseCiphertext) {
 			return false, domain.NewError(domain.CodeIdempotencyConflict, "Task terminal delivery was published with another result")
@@ -330,6 +334,7 @@ func (s *Store) MarkTaskTerminalDeliveryPublishedInTx(ctx context.Context, tx pg
 		return false, nil
 	}
 	if stored.State != TaskTerminalDeliveryStateReplyReady || leaseActive || stored.LeaseOwner != "" ||
+		stored.ResponseKind != ready.ResponseKind ||
 		!bytes.Equal(stored.ResponseSHA256, ready.ResponseSHA256) ||
 		!bytes.Equal(stored.ResponseCiphertext, ready.ResponseCiphertext) {
 		return false, nil
@@ -347,10 +352,10 @@ WHERE id=$1 AND state='reply_ready' AND claim_generation=$2`, stored.ID, stored.
 		return false, nil
 	}
 	result, err := tx.Exec(ctx, `UPDATE task_terminal_delivery_outbox
-SET state='published',published_message_id=$3,updated_at=clock_timestamp()
+SET state='published',published_message_id=$4,updated_at=clock_timestamp()
 WHERE id=$1 AND state='reply_ready' AND claim_generation=$2
-  AND response_sha256=$4 AND response_ciphertext=$5 AND published_message_id IS NULL`,
-		ready.ID, ready.ClaimGeneration, messageID, ready.ResponseSHA256, ready.ResponseCiphertext)
+  AND response_kind=$3 AND response_sha256=$5 AND response_ciphertext=$6 AND published_message_id IS NULL`,
+		ready.ID, ready.ClaimGeneration, ready.ResponseKind, messageID, ready.ResponseSHA256, ready.ResponseCiphertext)
 	if err != nil {
 		return false, fmt.Errorf("mark Task terminal delivery published: %w", err)
 	}
@@ -502,7 +507,7 @@ func scanTaskTerminalDeliveryClaim(scanner interface{ Scan(...any) error },
 		&claim.ID, &claim.TaskID, &claim.OwnerID, &claim.ConversationID, &claim.InitiatorID,
 		&claim.TaskRevision, &claim.AuthorizationVersion, &claim.SourceKind, &claim.SourceEventSequence, &claim.SourceEventType,
 		&claim.SourceSHA256, &claim.ResultSHA256, &validationGeneration, &claim.VerdictSHA256, &claim.State,
-		&claim.ClaimGeneration, &claim.LeaseOwner, &leaseExpiresAt, &claim.ModelCallID,
+		&claim.ClaimGeneration, &claim.LeaseOwner, &leaseExpiresAt, &claim.ModelCallID, &claim.ResponseKind,
 		&claim.ResponseCiphertext, &claim.ResponseSHA256, &claim.PublishedMessageID,
 	}
 	var leaseActive bool
@@ -549,15 +554,25 @@ func validTaskTerminalDeliveryClaim(claim TaskTerminalDeliveryClaim) bool {
 	case TaskTerminalDeliveryStateClaimed:
 		return claim.LeaseOwner != "" && strings.TrimSpace(claim.LeaseOwner) == claim.LeaseOwner &&
 			len(claim.LeaseOwner) <= 128 && !claim.LeaseExpiresAt.IsZero() &&
-			claim.ResponseCiphertext == nil && claim.ResponseSHA256 == nil && claim.PublishedMessageID == ""
+			claim.ResponseKind == "" && claim.ResponseCiphertext == nil && claim.ResponseSHA256 == nil && claim.PublishedMessageID == ""
 	case TaskTerminalDeliveryStateReplyReady:
 		if claim.LeaseOwner != "" || !claim.LeaseExpiresAt.IsZero() || claim.PublishedMessageID != "" ||
+			!validPostgresTaskTerminalDeliveryResponseKind(claim.ResponseKind) ||
 			len(claim.ResponseCiphertext) == 0 || len(claim.ResponseCiphertext) > MaxTaskTerminalDeliveryResponseCiphertext ||
 			len(claim.ResponseSHA256) != sha256.Size {
 			return false
 		}
 		digest := sha256.Sum256(claim.ResponseCiphertext)
 		return bytes.Equal(digest[:], claim.ResponseSHA256)
+	default:
+		return false
+	}
+}
+
+func validPostgresTaskTerminalDeliveryResponseKind(value string) bool {
+	switch value {
+	case app.TaskTerminalDeliveryResponseModel, app.TaskTerminalDeliveryResponseSystem, app.TaskTerminalDeliveryResponseLegacy:
+		return true
 	default:
 		return false
 	}

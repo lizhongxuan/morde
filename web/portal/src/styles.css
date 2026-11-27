@@ -1994,8 +1994,10 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 }
 .morde-network-connecting { min-width: max-content; min-height: 30px; padding: 0 13px; display: inline-flex; align-items: center; gap: 8px; border: 1px solid #bfdbfe; border-radius: 999px; color: #2563eb; background: #eff6ff; font-size: 12px; font-weight: 650; }
 .morde-network-connecting > span { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #3b82f6; animation: morde-network-breathe 1.6s ease-in-out infinite; }
+.morde-network-connecting-label { display: inline-block; animation: morde-network-label-breathe 1.25s ease-in-out infinite; }
 @keyframes morde-network-breathe { 0%, 100% { opacity: .55; transform: scale(.82); } 50% { opacity: 1; transform: scale(1.18); } }
-@media (prefers-reduced-motion: reduce) { .morde-network-connecting > span { animation: none; } }
+@keyframes morde-network-label-breathe { 0%, 100% { opacity: .62; transform: translateY(0); } 50% { opacity: 1; transform: translateY(-1px); } }
+@media (prefers-reduced-motion: reduce) { .morde-network-connecting > span, .morde-network-connecting-label { animation: none; } }
 .morde-shell:not(.morde-admin-shell).morde-shell-assistant-workspace .morde-top-actions-assistant {
   grid-column: 2;
   width: 100%;

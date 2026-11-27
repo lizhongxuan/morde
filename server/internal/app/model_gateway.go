@@ -73,6 +73,9 @@ type ModelCall struct {
 	Summary                     *ConversationSummaryModelFence
 	ModelID                     string
 	CallID                      string
+	// LedgerCallID selects the durable Task model-call ledger row for an
+	// adaptive-budgeted DSH frame. It is empty for every legacy call.
+	LedgerCallID                string
 	BudgetPlanID                string
 	BudgetCallID                string
 	BudgetRequestDigest         string
@@ -668,12 +671,15 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if call.Source == ModelCallTask && call.Task.RecoveryCallID != "" {
 		if !idempotencyKeyPattern.MatchString(call.Task.RecoveryCallID) ||
 			!idempotencyKeyPattern.MatchString(call.Task.RecoveryDSHCallID) || call.Task.RecoveryCallID == call.CallID ||
-			call.Task.RecoveryDSHCallID != call.CallID {
+			call.Task.RecoveryDSHCallID != call.CallID ||
+			call.LedgerCallID != "" && call.LedgerCallID != call.Task.RecoveryCallID {
 			return ModelResponse{}, domain.InvalidArgument("model_call", "invalid task recovery call identity")
 		}
 		ledgerCallID = call.Task.RecoveryCallID
 	} else if call.Source == ModelCallTask && call.Task.RecoveryDSHCallID != "" {
 		return ModelResponse{}, domain.InvalidArgument("model_call", "incomplete task recovery call identity")
+	} else if call.Source == ModelCallTask && call.LedgerCallID != "" {
+		ledgerCallID = call.LedgerCallID
 	}
 	reservation := ModelCallReservation{
 		Source: call.Source, Principal: call.Principal, Task: call.Task, Review: call.Review,
@@ -1127,7 +1133,9 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 	}
 	adaptiveBudget := call.BudgetPlanID != "" || call.BudgetCallID != "" || call.BudgetRequestDigest != ""
 	if adaptiveBudget && (call.Source != ModelCallTask || !idempotencyKeyPattern.MatchString(call.BudgetPlanID) ||
-		!idempotencyKeyPattern.MatchString(call.BudgetCallID) || !modelBudgetDigestPattern.MatchString(call.BudgetRequestDigest)) {
+		!idempotencyKeyPattern.MatchString(call.BudgetCallID) || !modelBudgetDigestPattern.MatchString(call.BudgetRequestDigest) ||
+		!idempotencyKeyPattern.MatchString(call.LedgerCallID)) ||
+		!adaptiveBudget && call.LedgerCallID != "" {
 		return "", empty, 0, domain.InvalidArgument("model_call", "invalid adaptive model budget identity")
 	}
 	ownerID := call.Principal.UserID
@@ -1151,7 +1159,8 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task model call identity or request")
 		}
 		if call.Task.RecoveryCallID == "" && call.Task.RecoveryDSHCallID == "" {
-			if id != call.CallID || call.Task.RecoveryDSHCallID != "" {
+			if id != call.CallID || call.Task.RecoveryDSHCallID != "" ||
+				adaptiveBudget && !strings.HasPrefix(call.LedgerCallID, "mdl_") {
 				return "", empty, 0, domain.InvalidArgument("model_call", "invalid task model call identity")
 			}
 		} else {
@@ -1159,7 +1168,8 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 			recoveryLedgerCallID, ledgerErr := TaskModelRecoveryCallID(call.Task.TaskID, call.Task.TaskRevision, id, call.Task.ThroughSequence)
 			if dshErr != nil || ledgerErr != nil || call.Task.RecoveryDSHCallID != recoveryDSHCallID ||
 				call.Task.RecoveryCallID != recoveryLedgerCallID || call.CallID != recoveryDSHCallID ||
-				call.Task.RecoveryDSHCallID == call.Task.RecoveryCallID || call.Task.RecoveryCallID == id {
+				call.Task.RecoveryDSHCallID == call.Task.RecoveryCallID || call.Task.RecoveryCallID == id ||
+				adaptiveBudget && call.LedgerCallID != recoveryLedgerCallID {
 				return "", empty, 0, domain.InvalidArgument("model_call", "invalid task recovery call identity")
 			}
 		}

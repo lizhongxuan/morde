@@ -22,11 +22,13 @@ CREATE TABLE model_budget_capacity_waits (
   ledger_call_id              text NOT NULL CHECK (ledger_call_id ~ '^[A-Za-z0-9_-]{8,128}$'),
   budget_call_id              text NOT NULL CHECK (budget_call_id ~ '^[A-Za-z0-9_-]{8,128}$'),
   request_digest              bytea NOT NULL CHECK (octet_length(request_digest) = 32),
+  checkpoint_digest           bytea NOT NULL CHECK (octet_length(checkpoint_digest) = 32),
   input_token_reservation      bigint NOT NULL CHECK (input_token_reservation BETWEEN 0 AND 2000000),
   minimum_output_tokens       bigint NOT NULL CHECK (minimum_output_tokens BETWEEN 1 AND 2000000),
   minimum_project_micros      bigint NOT NULL CHECK (minimum_project_micros >= 0),
   project_budget_currency     text NOT NULL DEFAULT '' CHECK (project_budget_currency = '' OR project_budget_currency ~ '^[A-Z]{3}$'),
   created_at                  timestamptz NOT NULL DEFAULT clock_timestamp(),
+  last_reconciled_at          timestamptz,
   expires_at                  timestamptz NOT NULL,
   PRIMARY KEY (task_id),
   FOREIGN KEY (task_id, task_owner_id) REFERENCES tasks(id, owner_id) ON DELETE CASCADE,
@@ -42,6 +44,8 @@ CREATE TABLE model_budget_capacity_waits (
 
 CREATE INDEX model_budget_capacity_waits_fifo
   ON model_budget_capacity_waits(created_at, owner_id, task_id);
+CREATE INDEX model_budget_capacity_waits_owner_fair
+  ON model_budget_capacity_waits(owner_id, (COALESCE(last_reconciled_at, created_at)), created_at, task_id);
 
 -- +goose Down
 -- +goose StatementBegin
@@ -55,4 +59,5 @@ $$;
 -- +goose StatementEnd
 
 DROP INDEX model_budget_capacity_waits_fifo;
+DROP INDEX model_budget_capacity_waits_owner_fair;
 DROP TABLE model_budget_capacity_waits;

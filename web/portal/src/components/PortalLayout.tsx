@@ -121,6 +121,7 @@ export function PortalLayout() {
   const [assistantWorkspaceWidth, setAssistantWorkspaceWidth] = useState<number | null>(null);
   const [assistantPanelTab, setAssistantPanelTab] = useState<AssistantPanelTab>('tasks');
   const [networkTrouble, setNetworkTrouble] = useState(() => typeof navigator !== 'undefined' && !navigator.onLine);
+  const [networkReadTrouble, setNetworkReadTrouble] = useState(false);
   const [assistantOpenPanelTabs, setAssistantOpenPanelTabs] = useState<AssistantPanelTab[]>(['tasks']);
   const assistantPanelToggle = useRef<HTMLButtonElement>(null);
   const focusAssistantPanelToggle = useCallback(() => assistantPanelToggle.current?.focus(), []);
@@ -143,8 +144,14 @@ export function PortalLayout() {
     const syncBrowserNetwork = () => setNetworkTrouble(!navigator.onLine);
     const onOffline = () => setNetworkTrouble(true);
     const onOnline = () => setNetworkTrouble(false);
-    const onNetworkError = () => setNetworkTrouble(true);
-    const onNetworkRecovered = () => setNetworkTrouble(false);
+    const onNetworkError = (event: Event) => {
+      if ((event as CustomEvent<{ source?: string }>).detail?.source === 'read') setNetworkReadTrouble(true);
+      else setNetworkTrouble(true);
+    };
+    const onNetworkRecovered = (event: Event) => {
+      if ((event as CustomEvent<{ source?: string }>).detail?.source === 'read') setNetworkReadTrouble(false);
+      else setNetworkTrouble(false);
+    };
     syncBrowserNetwork();
     window.addEventListener('offline', onOffline);
     window.addEventListener('online', onOnline);
@@ -228,7 +235,7 @@ export function PortalLayout() {
       <span className="morde-top-divider" aria-hidden="true" />
       {hasCollapsibleSidebar && <button type="button" className="morde-top-control" aria-label={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} title={contextSidebarCollapsed ? '展开侧边栏' : '折叠侧边栏'} aria-expanded={!contextSidebarCollapsed} aria-controls="context-sidebar" onClick={() => setContextSidebarCollapsed((collapsed) => !collapsed)}><MordeIcon name="panel" /></button>}
       {isAssistantPage && <div className="morde-top-navigation-status"><ToastNoticeCenter /></div>}
-    </div>{isAssistantPage && networkTrouble && <div className="morde-network-connecting-slot"><div className="morde-network-connecting" role="status" aria-live="polite"><span aria-hidden="true" />连接网络中</div></div>}<div className={`morde-top-actions${isAssistantPage ? ' morde-top-actions-assistant' : ''}`}>{!isAssistantPage && <ToastNoticeCenter autoOpenErrors />}{isAssistantPage ? <>
+    </div>{isAssistantPage && (networkTrouble || networkReadTrouble) && <div className="morde-network-connecting-slot"><div className="morde-network-connecting" role="status" aria-live="polite"><span aria-hidden="true" /><span className="morde-network-connecting-label">连接中...</span></div></div>}<div className={`morde-top-actions${isAssistantPage ? ' morde-top-actions-assistant' : ''}`}>{!isAssistantPage && <ToastNoticeCenter autoOpenErrors />}{isAssistantPage ? <>
       {assistantPanelOpen && <nav className="morde-workspace-tabs" aria-label="对话工作区">
       <div className="morde-workspace-tab-list">{assistantPanelTabs.filter(({ id }) => assistantOpenPanelTabs.includes(id)).map(({ id: tab, label, icon }) => {
         const active = assistantPanelTab === tab;

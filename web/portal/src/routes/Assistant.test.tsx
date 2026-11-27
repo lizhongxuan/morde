@@ -5154,7 +5154,7 @@ describe('Assistant durable tasks', () => {
     expect(screen.getByRole('textbox', { name: '消息内容' })).toBeEnabled();
   });
 
-  it('uses the server Task attention in the panel and beside its original conversation message', async () => {
+  it('keeps an unverified result in Task details without adding a chat bubble or button', async () => {
     const source = { ...message, actor_id: authUser.id } as ConversationMessage;
     const attentionTask = {
       ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
@@ -5165,10 +5165,11 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
     renderPage();
 
-    expect(await screen.findByRole('status', { name: '任务状态：结果待核对' })).toHaveTextContent('执行结果尚未确认');
+    expect(screen.queryByRole('status', { name: '任务状态：结果待核对' })).not.toBeInTheDocument();
     expect(screen.queryByText('do-not-display-provider-diagnostic')).not.toBeInTheDocument();
     const activity = await findTaskActivity(task.id);
     expect(activity.querySelector('.task-activity-status')).toHaveTextContent('结果待核对');
+    expect(document.querySelector('.chat-message-task-attention')).not.toBeInTheDocument();
     expect(within(activity).queryByRole('button', { name: /暂停任务|停止任务|补充任务|再试一次/u })).not.toBeInTheDocument();
   });
 
@@ -5229,6 +5230,24 @@ describe('Assistant durable tasks', () => {
       .toHaveTextContent('系统会在等待期限内自动重试');
     const activity = await findTaskActivity(task.id);
     expect(activity.querySelector('.task-activity-status')).toHaveTextContent('等待模型容量');
+    expect(within(activity).queryByRole('button', { name: /重试任务|补充任务|审批/u })).not.toBeInTheDocument();
+  });
+
+  it('explains when a model capacity wait is invalidated and paused', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const pausedTask = {
+      ...task, status: 'paused' as const, result: null, waiting_reason: 'model_budget_capacity_invalidated',
+      finished_at: null, event_sequence: 8,
+      attention: { kind: 'interrupted', reason: 'model_budget_capacity_invalidated', action: null, event_sequence: 8 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [pausedTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(pausedTask);
+    renderPage();
+
+    expect(await screen.findByRole('status', { name: '任务状态：运行条件已变化，已暂停' }))
+      .toHaveTextContent('授权或模型运行条件发生变化');
+    const activity = await findTaskActivity(task.id);
+    expect(activity.querySelector('.task-activity-status')).toHaveTextContent('运行条件已变化，已暂停');
     expect(within(activity).queryByRole('button', { name: /重试任务|补充任务|审批/u })).not.toBeInTheDocument();
   });
 

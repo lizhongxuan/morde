@@ -61,6 +61,7 @@ func (s *taskTerminalDeliveryStoreStub) PersistTaskTerminalDeliveryReplyReady(_ 
 	s.persisted++
 	ready := claim
 	ready.State = app.TaskTerminalDeliveryStateReplyReady
+	ready.ResponseKind = app.TaskTerminalDeliveryResponseSystem
 	ready.LeaseOwner = ""
 	ready.LeaseExpiresAt = time.Time{}
 	ready.ResponseCiphertext = append([]byte(nil), ciphertext...)
@@ -132,16 +133,17 @@ func (g *taskTerminalDeliveryGatewayStub) RecoverTaskTerminalDeliveryDSHModelRes
 	return value.response, value.found, value.err
 }
 
-func TestTaskTerminalDeliveryWorkerUnknownDoesNotFallbackOrPublish(t *testing.T) {
+func TestTaskTerminalDeliveryWorkerUnknownPublishesOneSystemFallback(t *testing.T) {
 	store, claim := taskTerminalDeliveryTestStore(t, app.TaskTerminalDeliveryStateClaimed)
 	providerErr := errors.New("provider outcome is ambiguous")
 	gateway := &taskTerminalDeliveryGatewayStub{modelID: "p1234567", completeStatus: app.TaskTerminalDeliveryModelUnknown,
 		completeErr: providerErr}
 	worker := newTaskTerminalDeliveryTestWorker(t, store, gateway)
 	found, err := worker.RunOnce(context.Background())
-	if !found || !errors.Is(err, providerErr) || store.unknown != 1 || store.persisted != 0 || store.published != 0 || gateway.completeCalls != 1 {
-		t.Fatalf("unknown model call handling: found=%t err=%v unknown=%d fallback=%d published=%d completes=%d",
-			found, err, store.unknown, store.persisted, store.published, gateway.completeCalls)
+	if !found || err != nil || store.unknown != 0 || store.persisted != 1 || store.published != 1 || gateway.completeCalls != 1 ||
+		!strings.Contains(store.publishedText, "这次没有拿到已核实的结果") {
+		t.Fatalf("unknown model call handling: found=%t err=%v unknown=%d fallback=%d published=%d completes=%d text=%q",
+			found, err, store.unknown, store.persisted, store.published, gateway.completeCalls, store.publishedText)
 	}
 	if gateway.lastFence.ModelCallID != claim.ModelCallID || gateway.lastFence.LeaseOwner != claim.LeaseOwner {
 		t.Fatalf("Gateway dispatch fence changed claim identity: %+v", gateway.lastFence)
@@ -164,7 +166,7 @@ func TestTaskTerminalDeliveryWorkerNotDispatchedUsesSystemStateReply(t *testing.
 		t.Fatalf("definite pre-dispatch fallback: found=%t err=%v persisted=%d published=%d text=%q",
 			found, err, store.persisted, store.published, store.publishedText)
 	}
-	if gateway.recoverCalls != 2 || gateway.completeCalls != 1 {
+	if gateway.recoverCalls != 1 || gateway.completeCalls != 1 {
 		t.Fatalf("unexpected call path: recoveries=%d completes=%d", gateway.recoverCalls, gateway.completeCalls)
 	}
 	var request map[string]any
@@ -214,7 +216,7 @@ func TestBuildTaskTerminalDeliveryModelRequestVerifiesDigestAndOmitsInternalIden
 		app.TaskTerminalDeliveryFailureExplanation("provider_unavailable"), `\"failure_explanation\"`,
 		"never expose message IDs, source hashes, checkpoint markers, internal tool names, or internal status/error codes",
 		"Do not list step counts or treat operational progress steps as evidence of task results",
-		"the result is unconfirmed and that no safe retry is available"} {
+		"do not suggest repeating a potentially side-effecting action"} {
 		if !bytes.Contains(raw, []byte(fact)) {
 			t.Fatalf("model request omitted progress or safe-delivery rule %q: %s", fact, raw)
 		}
@@ -232,17 +234,16 @@ func TestBuildTaskTerminalDeliveryModelRequestVerifiesDigestAndOmitsInternalIden
 
 func TestTaskTerminalDeliveryWaitingReasonUsesSafeCategories(t *testing.T) {
 	for _, test := range []struct {
-		reason      string
-		want        string
-		explanation string
+		reason string
+		want   string
 	}{
-		{reason: "tool_result_unknown", want: "unknown_outcome", explanation: "结果尚未确认"},
-		{reason: "mcp_result_unknown", want: "unknown_outcome", explanation: "结果尚未确认"},
-		{reason: "dsh_recovery_unresolved", want: "reconciliation_required", explanation: "暂时无法安全继续"},
-		{reason: "model_retry_ladder_exhausted", want: "external_dependency", explanation: "当前没有可确认的后续操作"},
-		{reason: "model_context_limit", want: "external_dependency", explanation: "当前没有可确认的后续操作"},
-		{reason: "tool_call_budget", want: "external_dependency", explanation: "当前没有可确认的后续操作"},
-		{reason: "unexpected_private_reason", want: "reconciliation_required", explanation: "暂时无法安全继续"},
+		{reason: "tool_result_unknown", want: "unknown_outcome"},
+		{reason: "mcp_result_unknown", want: "unknown_outcome"},
+		{reason: "dsh_recovery_unresolved", want: "reconciliation_required"},
+		{reason: "model_retry_ladder_exhausted", want: "external_dependency"},
+		{reason: "model_context_limit", want: "external_dependency"},
+		{reason: "tool_call_budget", want: "external_dependency"},
+		{reason: "unexpected_private_reason", want: "reconciliation_required"},
 	} {
 		safeReason := app.SafeTaskTerminalDeliveryWaitingReason(test.reason)
 		if safeReason != test.want {
@@ -252,9 +253,18 @@ func TestTaskTerminalDeliveryWaitingReasonUsesSafeCategories(t *testing.T) {
 			Identity:      app.TaskTerminalDeliveryIdentity{SourceKind: app.TaskTerminalDeliverySourceWaiting},
 			WaitingReason: safeReason,
 		})
-		if !strings.Contains(fallback, test.explanation) || strings.Contains(fallback, test.reason) || strings.Contains(fallback, test.want) {
+		if !strings.Contains(fallback, app.TaskTerminalDeliveryWaitingExplanation(safeReason)) ||
+			strings.Contains(fallback, test.reason) || strings.Contains(fallback, test.want) {
 			t.Fatalf("waiting fallback exposed a code or omitted the user-facing explanation: %q", fallback)
 		}
+	}
+	diagnosis := "模型服务暂时不可用。"
+	withDiagnosis := terminalDeliverySystemStateReply(app.TaskTerminalDeliverySourceFacts{
+		Identity:      app.TaskTerminalDeliveryIdentity{SourceKind: app.TaskTerminalDeliverySourceWaiting},
+		WaitingReason: "external_dependency", RecoveryDiagnosis: diagnosis,
+	})
+	if !strings.Contains(withDiagnosis, diagnosis) || strings.Contains(withDiagnosis, "当前没有可确认的后续操作") {
+		t.Fatalf("waiting fallback ignored the safe recovery diagnosis: %q", withDiagnosis)
 	}
 }
 
@@ -275,7 +285,8 @@ func TestTerminalDeliverySystemStateReplyDoesNotInventNewsResultsOrRetryActions(
 		TaskStatus: "waiting_user", WaitingReason: "reconciliation_required",
 		StepCounts: app.TaskTerminalDeliveryStepCounts{Total: 1, Succeeded: 1},
 	})
-	if !strings.Contains(waiting, "任务已暂停") || !strings.Contains(waiting, "暂时无法安全继续") ||
+	if !strings.Contains(waiting, "这次任务没有形成可核实的答复") || !strings.Contains(waiting, "现有记录无法确定具体的中断原因") ||
+		strings.Contains(waiting, "结果待核对") || strings.Contains(waiting, "状态待确认") ||
 		strings.Contains(waiting, "对账") || strings.Contains(waiting, "再试一次") || strings.Contains(waiting, "正在查") {
 		t.Fatalf("unknown waiting result offered an unsupported action: %q", waiting)
 	}
@@ -318,6 +329,7 @@ func taskTerminalDeliveryTestStore(t *testing.T, state string) (*taskTerminalDel
 		claim.LeaseOwner = "terminal-worker"
 		claim.LeaseExpiresAt = time.Now().Add(time.Minute)
 	} else {
+		claim.ResponseKind = app.TaskTerminalDeliveryResponseModel
 		claim.ResponseCiphertext = []byte("synthetic encrypted gateway response")
 		digest := sha256.Sum256(claim.ResponseCiphertext)
 		claim.ResponseSHA256 = digest[:]

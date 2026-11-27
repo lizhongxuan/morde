@@ -249,6 +249,10 @@ type cloudDSHModelRecoveryFailureSource interface {
 }
 
 func cloudDSHModelResultErrorForCall(err error, call app.ModelCall, checkpoints ...cloudDSHReadOnlyRecoveryCheckpoint) error {
+	var preclassified cloudDSHModelResultError
+	if errors.As(err, &preclassified) && preclassified.stage != "" {
+		return preclassified
+	}
 	failure := cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err)}
 	var source cloudDSHModelRecoveryFailureSource
 	if !errors.As(err, &source) || call.Source != app.ModelCallTask || call.Task == nil ||

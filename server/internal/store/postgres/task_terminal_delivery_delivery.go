@@ -109,7 +109,8 @@ func (s *Store) ReadTaskTerminalDeliverySourceFacts(ctx context.Context,
 		if !sameTaskTerminalDeliverySource(stored, storedClaim) || stored.State != claim.State ||
 			stored.State == TaskTerminalDeliveryStateClaimed && (!leaseActive || stored.LeaseOwner != storedClaim.LeaseOwner ||
 				!stored.LeaseExpiresAt.Equal(storedClaim.LeaseExpiresAt)) ||
-			stored.State == TaskTerminalDeliveryStateReplyReady && (!bytes.Equal(stored.ResponseCiphertext, storedClaim.ResponseCiphertext) ||
+			stored.State == TaskTerminalDeliveryStateReplyReady && (stored.ResponseKind != storedClaim.ResponseKind ||
+				!bytes.Equal(stored.ResponseCiphertext, storedClaim.ResponseCiphertext) ||
 				!bytes.Equal(stored.ResponseSHA256, storedClaim.ResponseSHA256)) {
 			return nil
 		}
@@ -176,7 +177,8 @@ func (s *Store) InvalidateTaskTerminalDeliveryClaim(ctx context.Context, claim a
 		}
 		if stored.State == TaskTerminalDeliveryStateClaimed && (!leaseActive || stored.LeaseOwner != requested.LeaseOwner ||
 			!stored.LeaseExpiresAt.Equal(requested.LeaseExpiresAt)) ||
-			stored.State == TaskTerminalDeliveryStateReplyReady && (!bytes.Equal(stored.ResponseCiphertext, requested.ResponseCiphertext) ||
+			stored.State == TaskTerminalDeliveryStateReplyReady && (stored.ResponseKind != requested.ResponseKind ||
+				!bytes.Equal(stored.ResponseCiphertext, requested.ResponseCiphertext) ||
 				!bytes.Equal(stored.ResponseSHA256, requested.ResponseSHA256)) {
 			return nil
 		}
@@ -210,7 +212,8 @@ func (s *Store) PublishTaskTerminalDeliveryReply(ctx context.Context, ready app.
 			return nil
 		}
 		if stored.State == TaskTerminalDeliveryStatePublished {
-			if stored.PublishedMessageID == "" || !bytes.Equal(stored.ResponseCiphertext, requested.ResponseCiphertext) ||
+			if stored.PublishedMessageID == "" || stored.ResponseKind != requested.ResponseKind ||
+				!bytes.Equal(stored.ResponseCiphertext, requested.ResponseCiphertext) ||
 				!bytes.Equal(stored.ResponseSHA256, requested.ResponseSHA256) {
 				return domain.NewError(domain.CodeIdempotencyConflict, "Task terminal delivery was published with another response")
 			}
@@ -225,6 +228,7 @@ func (s *Store) PublishTaskTerminalDeliveryReply(ctx context.Context, ready app.
 			return nil
 		}
 		if stored.State != TaskTerminalDeliveryStateReplyReady || leaseActive || stored.LeaseOwner != "" ||
+			stored.ResponseKind != requested.ResponseKind ||
 			!bytes.Equal(stored.ResponseCiphertext, requested.ResponseCiphertext) ||
 			!bytes.Equal(stored.ResponseSHA256, requested.ResponseSHA256) {
 			return nil
@@ -292,6 +296,7 @@ func appTaskTerminalDeliveryClaim(claim TaskTerminalDeliveryClaim) app.TaskTermi
 		VerdictSHA256:             append([]byte(nil), claim.VerdictSHA256...),
 	}, State: claim.State, ClaimGeneration: claim.ClaimGeneration, LeaseOwner: claim.LeaseOwner,
 		LeaseExpiresAt: claim.LeaseExpiresAt, ModelCallID: claim.ModelCallID,
+		ResponseKind:       claim.ResponseKind,
 		ResponseCiphertext: append([]byte(nil), claim.ResponseCiphertext...), ResponseSHA256: append([]byte(nil), claim.ResponseSHA256...),
 		PublishedMessageID: claim.PublishedMessageID}
 }
@@ -305,8 +310,9 @@ func postgresTaskTerminalDeliveryClaim(claim app.TaskTerminalDeliveryClaim) Task
 		ValidationClaimGeneration: cloneTerminalDeliveryGeneration(claim.ValidationClaimGeneration),
 		VerdictSHA256:             append([]byte(nil), claim.VerdictSHA256...), State: claim.State,
 		ClaimGeneration: claim.ClaimGeneration, LeaseOwner: claim.LeaseOwner, LeaseExpiresAt: claim.LeaseExpiresAt,
-		ModelCallID: claim.ModelCallID, ResponseCiphertext: append([]byte(nil), claim.ResponseCiphertext...),
-		ResponseSHA256: append([]byte(nil), claim.ResponseSHA256...), PublishedMessageID: claim.PublishedMessageID}
+		ModelCallID: claim.ModelCallID, ResponseKind: claim.ResponseKind,
+		ResponseCiphertext: append([]byte(nil), claim.ResponseCiphertext...),
+		ResponseSHA256:     append([]byte(nil), claim.ResponseSHA256...), PublishedMessageID: claim.PublishedMessageID}
 }
 
 func cloneTerminalDeliveryGeneration(value *int64) *int64 {
@@ -389,6 +395,7 @@ FOR SHARE OF task,event`, claim.TaskID, claim.OwnerID, claim.SourceEventSequence
 	case TaskTerminalDeliverySourceCancellation:
 	case TaskTerminalDeliverySourceWaiting:
 		facts.WaitingReason = safeTaskTerminalWaitingReason(waitingReason)
+		facts.RecoveryDiagnosis = app.TaskTerminalDeliveryRecoveryDiagnosisFromEvent(eventPayload)
 	case TaskTerminalDeliverySourceValidation:
 		validation, err := readTaskTerminalDeliveryValidationFactsInTx(ctx, tx, claim, result)
 		if err != nil {

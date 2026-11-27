@@ -305,12 +305,15 @@ func (s *Store) BeginTaskModelRecoveryAttempt(ctx context.Context, intent task.M
 		if ownerID != intent.OwnerID {
 			return domain.NewError(domain.CodeUnauthenticated, "task owner changed before recovery attempt")
 		}
-		if current, err := lockAuthorizedAgentTask(ctx, tx, fence); err != nil {
+		current, err := lockAuthorizedAgentTask(ctx, tx, fence)
+		if err != nil {
 			return err
-		} else if current.InitiatorID != intent.InitiatorID || current.ProjectID != projectFence.projectID ||
+		}
+		if current.InitiatorID != intent.InitiatorID || current.ProjectID != projectFence.projectID ||
 			current.InstanceID != fence.AgentInstanceID || current.Generation != fence.AgentGeneration || current.SessionID != intent.AgentSessionID ||
 			current.EngineVersion != intent.EngineVersion || current.ProfileVersion != intent.ProfileVersion ||
-			current.CheckpointThrough != intent.CheckpointThroughSequence || !bytes.Equal(current.CheckpointDigest, intent.CheckpointDigest) {
+			current.CheckpointThrough < intent.CheckpointThroughSequence ||
+			current.CheckpointThrough == intent.CheckpointThroughSequence && !bytes.Equal(current.CheckpointDigest, intent.CheckpointDigest) {
 			return domain.NewError(domain.CodeConflict, "Task recovery checkpoint or authorization changed")
 		}
 		currentTask, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: intent.TaskID, OwnerID: ownerID})
@@ -320,6 +323,10 @@ func (s *Store) BeginTaskModelRecoveryAttempt(ctx context.Context, intent task.M
 		if currentTask.CurrentRevision != intent.TaskRevision || currentTask.DesiredRevision != intent.TaskRevision ||
 			currentTask.AuthVersion != intent.AuthorizationVersion {
 			return domain.NewError(domain.CodeConflict, "Task revision or authorization changed before recovery attempt")
+		}
+		if currentTask.CheckpointThroughSeq != current.CheckpointThrough ||
+			!bytes.Equal(currentTask.CheckpointDigest, current.CheckpointDigest) {
+			return domain.NewError(domain.CodeConflict, "Task recovery checkpoint changed during attempt start")
 		}
 		if err := verifyProjectTaskWorkspaceFence(ctx, tx, intent.TaskID, projectFence); err != nil {
 			return err
@@ -334,13 +341,26 @@ func (s *Store) BeginTaskModelRecoveryAttempt(ctx context.Context, intent task.M
 			!currentAgent.ExpiresAt.After(time.Now()) {
 			return domain.NewError(domain.CodeConflict, "Task recovery Agent lease is no longer current")
 		}
-		if err := verifyTaskModelRecoveryCheckpoint(ctx, tx, task.Task{ID: intent.TaskID, OwnerID: intent.OwnerID,
+		recoveryCheckpointTask := task.Task{ID: intent.TaskID, OwnerID: intent.OwnerID,
 			AgentInstanceID: intent.AgentInstanceID, AgentGeneration: intent.AgentGeneration, AgentSessionID: intent.AgentSessionID,
 			AgentEngineVersion: intent.EngineVersion, AgentProfileVersion: intent.ProfileVersion,
 			CheckpointThroughSequence: intent.CheckpointThroughSequence, CheckpointDigest: append([]byte(nil), intent.CheckpointDigest...),
 			Lease:         task.Lease{Version: intent.FailedLeaseVersion},
-			Authorization: task.Authorization{Version: intent.AuthorizationVersion}}, intent.CheckpointThroughSequence, intent.CheckpointDigest); err != nil {
-			return err
+			Authorization: task.Authorization{Version: intent.AuthorizationVersion}}
+		if currentTask.CheckpointThroughSeq == intent.CheckpointThroughSequence {
+			if err := verifyTaskModelRecoveryCheckpoint(ctx, tx, recoveryCheckpointTask,
+				intent.CheckpointThroughSequence, intent.CheckpointDigest); err != nil {
+				return err
+			}
+		} else {
+			if err := verifyTaskModelRecoveryCheckpointHistory(ctx, tx, recoveryCheckpointTask,
+				intent.CheckpointThroughSequence, intent.CheckpointDigest); err != nil {
+				return err
+			}
+			if err := verifyTaskModelRecoveryCurrentCheckpoint(ctx, tx, fence,
+				currentTask.CheckpointThroughSeq, currentTask.CheckpointDigest); err != nil {
+				return err
+			}
 		}
 		stored, found, err := loadTaskModelRecoveryIntent(ctx, tx, intent.TaskID, ownerID, intent.TaskRevision, true)
 		if err != nil {
@@ -510,6 +530,82 @@ func verifyTaskModelRecoveryCheckpoint(ctx context.Context, tx pgx.Tx, value tas
 	}
 	if !matches || value.CheckpointThroughSequence != through || !bytes.Equal(value.CheckpointDigest, digest) {
 		return domain.NewError(domain.CodeConflict, "Task recovery checkpoint is no longer current")
+	}
+	return nil
+}
+
+// verifyTaskModelRecoveryCheckpointHistory confirms that the checkpoint bound
+// to the scheduled recovery is still present after a resumed Worker has
+// replayed it and advanced the root session head. The scheduled checkpoint
+// remains anchored to its stopped writer; the caller separately validates the
+// active Worker checkpoint that now heads the same root session.
+func verifyTaskModelRecoveryCheckpointHistory(ctx context.Context, tx pgx.Tx, value task.Task,
+	through int64, digest []byte) error {
+	if through < 0 || len(digest) != 32 || value.AgentSessionID == "" || value.AgentInstanceID == "" ||
+		value.AgentGeneration < 1 || value.Authorization.Version < 1 || value.Lease.Version < 1 ||
+		value.AgentEngineVersion == "" || value.AgentProfileVersion == "" {
+		return domain.NewError(domain.CodeConflict, "Task recovery checkpoint history is invalid")
+	}
+	var matches bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+ SELECT 1 FROM task_agent_sessions root
+ JOIN task_agent_checkpoints checkpoint ON checkpoint.task_id=root.task_id AND checkpoint.owner_id=root.owner_id
+   AND checkpoint.agent_session_id=root.session_id AND checkpoint.agent_root_session_id=root.session_id
+ JOIN task_agent_instances writer ON writer.task_id=checkpoint.task_id AND writer.owner_id=checkpoint.owner_id
+   AND writer.agent_instance_id=checkpoint.agent_instance_id AND writer.agent_generation=checkpoint.agent_generation
+   AND writer.agent_session_id=checkpoint.agent_session_id AND writer.engine_version=checkpoint.engine_version
+   AND writer.profile_version=checkpoint.profile_version AND writer.auth_version=checkpoint.auth_version
+   AND writer.lease_version=checkpoint.lease_version
+ WHERE root.task_id=$1 AND root.owner_id=$2 AND root.session_id=$3 AND root.parent_session_id IS NULL
+   AND root.root_checkpoint_through_seq >= $4 AND root.root_checkpoint_baseline_known
+   AND checkpoint.agent_generation<=$6 AND checkpoint.lease_version<=$7
+   AND checkpoint.through_seq=$4 AND checkpoint.digest=$5 AND checkpoint.engine_version=$8
+   AND checkpoint.profile_version=$9 AND checkpoint.auth_version=$10
+   AND writer.state='stopped' AND ((writer.stop_receipt IS NOT NULL AND writer.stop_receipt_digest=sha256(writer.stop_receipt))
+     OR (writer.guardian_stop_attestation IS NOT NULL AND writer.guardian_stop_attestation_digest=sha256(writer.guardian_stop_attestation)))
+)`, value.ID, value.OwnerID, value.AgentSessionID, through, digest, value.AgentGeneration, value.Lease.Version,
+		value.AgentEngineVersion, value.AgentProfileVersion, value.Authorization.Version).Scan(&matches); err != nil {
+		return fmt.Errorf("verify Task model recovery checkpoint history: %w", err)
+	}
+	if !matches {
+		return domain.NewError(domain.CodeConflict, "Task recovery checkpoint history is no longer available")
+	}
+	return nil
+}
+
+// verifyTaskModelRecoveryCurrentCheckpoint checks that the replayed checkpoint
+// is the durable head of the same root session and was written under the
+// current active Worker fence before the one-shot recovery attempt is consumed.
+func verifyTaskModelRecoveryCurrentCheckpoint(ctx context.Context, tx pgx.Tx, fence app.AgentInstanceFence,
+	through int64, digest []byte) error {
+	if through < 0 || len(digest) != 32 {
+		return domain.NewError(domain.CodeConflict, "Task recovery current checkpoint is invalid")
+	}
+	var matches bool
+	if err := tx.QueryRow(ctx, `SELECT EXISTS (
+ SELECT 1 FROM task_agent_sessions root
+ JOIN task_agent_checkpoints checkpoint ON checkpoint.task_id=root.task_id AND checkpoint.owner_id=root.owner_id
+   AND checkpoint.agent_session_id=root.session_id AND checkpoint.agent_root_session_id=root.session_id
+ JOIN task_agent_instances writer ON writer.task_id=checkpoint.task_id AND writer.owner_id=checkpoint.owner_id
+   AND writer.agent_instance_id=checkpoint.agent_instance_id AND writer.agent_generation=checkpoint.agent_generation
+   AND writer.agent_session_id=checkpoint.agent_session_id AND writer.engine_version=checkpoint.engine_version
+   AND writer.profile_version=checkpoint.profile_version AND writer.auth_version=checkpoint.auth_version
+   AND writer.lease_version=checkpoint.lease_version
+ WHERE root.task_id=$1 AND root.owner_id=$2 AND root.session_id=$3 AND root.parent_session_id IS NULL
+   AND root.checkpoint_through_seq=$4 AND root.checkpoint_digest=$5
+   AND root.root_checkpoint_through_seq=$4 AND root.root_checkpoint_baseline_known
+   AND checkpoint.agent_instance_id=$6 AND checkpoint.agent_generation=$7 AND checkpoint.agent_session_id=$3
+   AND checkpoint.through_seq=$4 AND checkpoint.digest=$5 AND checkpoint.engine_version=$8
+   AND checkpoint.profile_version=$9 AND checkpoint.auth_version=$10 AND checkpoint.lease_version=$11
+   AND writer.state='active' AND writer.lease_owner=$12 AND writer.lease_version=$11
+   AND writer.auth_version=$10
+)`, fence.TaskID, fence.OwnerID, fence.AgentSessionID, through, digest, fence.AgentInstanceID,
+		fence.AgentGeneration, fence.EngineVersion, fence.ProfileVersion, fence.AuthorizationVersion,
+		fence.LeaseVersion, fence.LeaseOwner).Scan(&matches); err != nil {
+		return fmt.Errorf("verify Task model recovery current checkpoint: %w", err)
+	}
+	if !matches {
+		return domain.NewError(domain.CodeConflict, "Task recovery current checkpoint is no longer available")
 	}
 	return nil
 }
@@ -806,8 +902,25 @@ func verifyTaskModelRecoveryReservation(ctx context.Context, tx pgx.Tx, request 
    AND current.status='running' AND current.current_revision=$4 AND current.desired_revision=$4
    AND current.auth_version=$5 AND current.agent_instance_id=$15 AND current.agent_generation=$14
    AND current.agent_session_id=$6 AND current.agent_engine_version=$12 AND current.agent_profile_version=$13
-   AND current.checkpoint_through_seq=$11 AND current.checkpoint_digest=recovery.checkpoint_digest
+   AND current.checkpoint_through_seq >= $11
+   AND (current.checkpoint_through_seq > $11 OR current.checkpoint_digest=recovery.checkpoint_digest)
    AND current.lease_owner=$16 AND current.lease_version=$18
+   AND EXISTS (SELECT 1 FROM task_agent_checkpoints old_checkpoint
+     JOIN task_agent_instances old_writer ON old_writer.task_id=old_checkpoint.task_id
+       AND old_writer.owner_id=old_checkpoint.owner_id AND old_writer.agent_instance_id=old_checkpoint.agent_instance_id
+       AND old_writer.agent_generation=old_checkpoint.agent_generation AND old_writer.agent_session_id=old_checkpoint.agent_session_id
+       AND old_writer.engine_version=old_checkpoint.engine_version AND old_writer.profile_version=old_checkpoint.profile_version
+       AND old_writer.auth_version=old_checkpoint.auth_version AND old_writer.lease_version=old_checkpoint.lease_version
+     WHERE old_checkpoint.task_id=$1 AND old_checkpoint.owner_id=$2 AND old_checkpoint.agent_session_id=$6
+       AND old_checkpoint.agent_root_session_id=$6 AND old_checkpoint.through_seq=$11
+       AND old_checkpoint.digest=recovery.checkpoint_digest AND old_checkpoint.engine_version=$12
+       AND old_checkpoint.profile_version=$13 AND old_checkpoint.auth_version=$5
+       AND old_checkpoint.agent_generation<=recovery.agent_generation
+       AND old_checkpoint.lease_version<=recovery.failed_lease_version
+       AND old_writer.state='stopped' AND ((old_writer.stop_receipt IS NOT NULL
+         AND old_writer.stop_receipt_digest=sha256(old_writer.stop_receipt))
+         OR (old_writer.guardian_stop_attestation IS NOT NULL
+         AND old_writer.guardian_stop_attestation_digest=sha256(old_writer.guardian_stop_attestation))))
 )`, fence.TaskID, fence.OwnerID, fence.InitiatorID, fence.TaskRevision, fence.AuthorizationVersion,
 		fence.AgentRootSessionID, failedCallID, fence.RecoveryDSHCallID, fence.RecoveryCallID, request.ModelID,
 		fence.ThroughSequence, fence.EngineVersion, fence.ProfileVersion, fence.AgentGeneration, fence.AgentInstanceID,
@@ -817,6 +930,23 @@ func verifyTaskModelRecoveryReservation(ctx context.Context, tx pgx.Tx, request 
 	}
 	if !eligible {
 		return domain.NewError(domain.CodeConflict, "Task model recovery attempt is no longer current")
+	}
+	var currentThrough int64
+	var currentDigest []byte
+	if err := tx.QueryRow(ctx, `SELECT checkpoint_through_seq,checkpoint_digest FROM tasks
+WHERE id=$1 AND owner_id=$2 AND initiator_id=$3`, fence.TaskID, fence.OwnerID, fence.InitiatorID).
+		Scan(&currentThrough, &currentDigest); err != nil {
+		return fmt.Errorf("read current Task model recovery checkpoint: %w", err)
+	}
+	if currentThrough > fence.ThroughSequence {
+		if err := verifyTaskModelRecoveryCurrentCheckpoint(ctx, tx, app.AgentInstanceFence{
+			TaskID: fence.TaskID, OwnerID: fence.OwnerID, InitiatorID: fence.InitiatorID,
+			AgentInstanceID: fence.AgentInstanceID, AgentGeneration: fence.AgentGeneration, AgentSessionID: fence.AgentSessionID,
+			LeaseOwner: fence.LeaseOwner, LeaseVersion: fence.LeaseVersion, AuthorizationVersion: fence.AuthorizationVersion,
+			EngineVersion: fence.EngineVersion, ProfileVersion: fence.ProfileVersion,
+		}, currentThrough, currentDigest); err != nil {
+			return err
+		}
 	}
 	return nil
 }

@@ -285,6 +285,9 @@ function taskAttentionPresentation(task: AssistantTaskStatusInput, actorID?: str
           if (attention.reason === 'model_budget_exhausted') {
             return { kind: attention.kind, label: '预算不足，已暂停', detail: '当前预算无法满足模型调用最低额度，任务已暂停。', action: null };
           }
+          if (attention.reason === 'model_budget_capacity_invalidated') {
+            return { kind: attention.kind, label: '运行条件已变化，已暂停', detail: '等待期间授权或模型运行条件发生变化，任务已暂停。请检查后重新提交。', action: null };
+          }
           return { kind: attention.kind, label: '已中断', detail: '这次没有拿到已核实的结果。', action: attention.action ?? null };
         case 'result_unverified':
           return { kind: attention.kind, label: '结果待核对', detail: '执行结果尚未确认，暂不能安全地重复操作。', action: attention.action ?? null };
@@ -303,6 +306,9 @@ function taskAttentionPresentation(task: AssistantTaskStatusInput, actorID?: str
   }
   if (task.status === 'paused' && task.waiting_reason === 'model_budget_exhausted') {
     return { kind: 'interrupted', label: '预算不足，已暂停', detail: '当前预算无法满足模型调用最低额度，任务已暂停。', action: null };
+  }
+  if (task.status === 'paused' && task.waiting_reason === 'model_budget_capacity_invalidated') {
+    return { kind: 'interrupted', label: '运行条件已变化，已暂停', detail: '等待期间授权或模型运行条件发生变化，任务已暂停。请检查后重新提交。', action: null };
   }
   if (task.status !== 'waiting_user') return null;
   if (task.waiting_reason === 'model_budget_capacity') {
@@ -4099,6 +4105,7 @@ export function Assistant() {
                     item.role === 'assistant' && item.task_id === messageTask.id && item.delivery_status === 'applied'));
                   const showTaskAttention = Boolean(message.role === 'user' && messageTask && taskAttention &&
                     taskAttention.kind !== 'needs_user_action' && !ambiguousAcknowledgementTaskIDs.has(messageTaskID) &&
+                    taskAttention.kind !== 'result_unverified' &&
                     !taskHasTerminalReply &&
                     (acknowledgedUserMessageByTaskID.get(messageTaskID) ?? latestUserMessageByTaskID.get(messageTaskID)) === message.id);
                   const canRetryModelRecovery = Boolean(user?.id && messageTask && taskAttention?.kind === 'paused_retryable' &&

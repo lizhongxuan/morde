@@ -58,7 +58,8 @@ func ValidTaskAttention(value *TaskAttention, eventSequence int64) bool {
 		return value.Reason == "retry_available" && (value.Action == nil || *value.Action == TaskAttentionActionRetry)
 	case TaskAttentionInterrupted:
 		return (value.Reason == "execution_failed" || value.Reason == "unknown" ||
-			value.Reason == TaskModelBudgetCapacityExpiredReason || value.Reason == TaskModelBudgetCapacityExhaustedReason) && value.Action == nil
+			value.Reason == TaskModelBudgetCapacityExpiredReason || value.Reason == TaskModelBudgetCapacityExhaustedReason ||
+			value.Reason == TaskModelBudgetCapacityInvalidatedReason) && value.Action == nil
 	case TaskAttentionResultUnverified:
 		return value.Reason == "outcome_unknown" && value.Action == nil
 	default:
@@ -75,7 +76,7 @@ func (s *TaskService) taskAttention(ctx context.Context, principal identity.Prin
 		return attention
 	}
 	budgetPaused := value.Status == task.StatusPaused && (value.WaitingReason == TaskModelBudgetCapacityExpiredReason ||
-		value.WaitingReason == TaskModelBudgetCapacityExhaustedReason)
+		value.WaitingReason == TaskModelBudgetCapacityExhaustedReason || value.WaitingReason == TaskModelBudgetCapacityInvalidatedReason)
 	if value.Status != task.StatusWaitingUser && value.Status != task.StatusFailed && !budgetPaused {
 		return nil
 	}

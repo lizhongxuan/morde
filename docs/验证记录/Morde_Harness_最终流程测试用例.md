@@ -2848,3 +2848,12 @@ Tokenizer 与 token 统计来源：
 - **未完成前序：**只允许 claim 明确指定的前序消息在 route 为 `routed`/`waiting_user`/`waiting_adjustment` 且非 `awaiting_predecessor` 时作为有证明的来源；pending 前序状态进入摘要 operation digest 与提交校验，摘要提示保留未完成/待确认，避免把它当作已完成。其他前序状态继续失败关闭。DSH compaction prompt 改为结构化 Goal、Constraints、Progress、Blocked、Decisions、Next Steps、Critical Context 格式。
 - **自动化：**`go test ./internal/app -run 'TestValidateConversationSummaryModelResponseNamesFirstFailure|TestSealConversationSummaryNamesTextFailure' -count=1` 通过；Worker 动态预算、pending 状态、summary commit 与 H09 合成增量覆盖定向用例通过。`go test ./internal/store/postgres -run '^TestConversationSummaryInputIncludesUnresolvedPredecessorWithoutMarkingItComplete$' -count=1` 因 `CH_TEST_DATABASE_URL` 未设置而跳过，不能作为 PostgreSQL 行为通过。DSH Runtime 的结构化摘要 prompt 回归和实际 PC/DSH 复测待执行。
 - **状态：**仅本地未提交代码；尚未推送/部署。M10-03/M10-06、真实长会话总结与多模型窗口恢复仍 pending；保留摘要来源证明、租户/授权隔离、旧摘要和原始历史的既有约束。
+
+<a id="task-unknown-result-conversation-reply-2026-11-28"></a>
+### Task 未知结果与原对话回告排查（2026-11-28，本地未验收）
+
+- **截图可证事实：**新闻 Task 进入 `waiting_user / dsh_recovery_unresolved`；主步骤为“核对任务恢复状态”，摘要为“模型服务未返回可确认的结果”，界面另在原用户消息下显示“结果待核对”卡片和详情按钮。截图未显示 Task ID。
+- **通用根因：**`CloudDSHToolBroker.pauseRecovery` 在模型回复无法安全确认或恢复证据不足时持久化 `unknown` 步骤并暂停 Task；这是防止未知操作被重放的安全栅栏。前端再把 `result_unverified` 重复显示为聊天状态卡。TaskTerminalDelivery 的说明模型此前只拿到通用等待原因，未获得事件中已脱敏的失败分类；说明模型调用本身若账本为 unknown，则 outbox 保留 unknown 而不向会话交付兜底说明。
+- **改动：**等待说明使用事件内的 allowlist 失败分类或 Runtime 停止/租约过期事实生成安全诊断事实，让无工具模型解释可用证据；若该说明调用仍无法确认，用同一 outbox 发布确定性说明，不发起第二次模型调用。outbox 增加 `response_kind` 区分模型说明和系统兜底，允许晚到结算记录用量而不替换已发布兜底。PC 原对话隐藏 `result_unverified` 状态卡，Task 详情仍保留状态。
+- **个例边界：**截图对应调用仍未关联。拿到 Task ID 后需查该任务的首条恢复事件、Model Gateway ledger、已确认工具账本和 checkpoint；在此之前不能断言具体是 timeout、网络错误、非法模型回复、Runtime 故障或配置问题。
+- **验证状态：**本轮没有运行测试，也没有启动并操作源码 `morde-pc`；改动尚未部署。相关 server/PC 自动化回归、迁移回归、晚到模型结算竞态和真实 PC 对话交付均待验。

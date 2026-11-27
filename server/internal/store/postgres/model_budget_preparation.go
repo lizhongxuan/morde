@@ -36,6 +36,9 @@ func (s *Store) PrepareTaskModelBudget(ctx context.Context, preparation app.Mode
 		if existing, found, err := loadExistingModelBudgetPreparation(ctx, tx, preparation); err != nil {
 			return err
 		} else if found {
+			if err := clearModelBudgetCapacityCallDeadlineAfterPrepare(ctx, tx, preparation); err != nil {
+				return err
+			}
 			result = existing
 			return nil
 		}
@@ -119,6 +122,9 @@ VALUES ($1,'task',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$1
 			preparation.InputTokenReservation, modelBudgetPreparationTTL.Seconds())
 		if err != nil {
 			return fmt.Errorf("persist adaptive model budget preparation: %w", err)
+		}
+		if err := clearModelBudgetCapacityCallDeadlineAfterPrepare(ctx, tx, preparation); err != nil {
+			return err
 		}
 		result = app.ModelBudgetReservationResult{PlanID: preparation.PlanID, MaxOutputTokens: sendTokens}
 		return nil
