@@ -722,6 +722,108 @@ func TestProviderRateLimitCarriesBoundedRetryAfter(t *testing.T) {
 	}
 }
 
+func TestProviderRateLimitCarriesRetryAfterMilliseconds(t *testing.T) {
+	client := newTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
+		response := jsonResponse(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_exceeded"}}`)
+		response.Header.Set("Retry-After-Ms", "2500.1")
+		return response, nil
+	}))
+	_, err := client.Complete(context.Background(), app.ModelRequest{
+		Endpoint: testEndpoint(), Input: []app.ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 10,
+	})
+	var providerErr *app.ModelClientError
+	if !errors.As(err, &providerErr) || providerErr.Kind != app.ModelErrorRateLimited || providerErr.RetryAfter != 2501*time.Millisecond {
+		t.Fatalf("provider rate-limit millisecond hint = %#v, err=%v", providerErr, err)
+	}
+}
+
+func TestProviderRateLimitUsesExhaustedQuotaResetWhenNoExplicitHint(t *testing.T) {
+	now := time.Date(2026, 11, 27, 12, 0, 0, 0, time.UTC)
+	for _, test := range []struct {
+		name       string
+		status     int
+		headers    http.Header
+		want       time.Duration
+		wantOK     bool
+		wantBeyond bool
+	}{
+		{
+			name:   "OpenAI exhausted token bucket",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"x-ratelimit-remaining-tokens": {"0"},
+				"x-ratelimit-reset-tokens":     {"1m2.5s"},
+			},
+			want:   62500 * time.Millisecond,
+			wantOK: true,
+		},
+		{
+			name:   "Anthropic exhausted input bucket",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"anthropic-ratelimit-input-tokens-remaining": {"0"},
+				"anthropic-ratelimit-input-tokens-reset":     {now.Add(1500 * time.Millisecond).Format(time.RFC3339Nano)},
+			},
+			want:   1500 * time.Millisecond,
+			wantOK: true,
+		},
+		{
+			name:   "explicit hint takes precedence over reset",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"Retry-After":                  {"7"},
+				"x-ratelimit-remaining-tokens": {"0"},
+				"x-ratelimit-reset-tokens":     {"25h"},
+			},
+			want:   7 * time.Second,
+			wantOK: true,
+		},
+		{
+			name:   "millisecond header beyond horizon fails closed",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"Retry-After-Ms": {"86400001"},
+			},
+			wantBeyond: true,
+			wantOK:     true,
+		},
+		{
+			name:   "remaining quota ignores reset",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"x-ratelimit-remaining-tokens": {"1"},
+				"x-ratelimit-reset-tokens":     {"9s"},
+			},
+		},
+		{
+			name:   "non-rate-limit status ignores reset",
+			status: http.StatusServiceUnavailable,
+			headers: http.Header{
+				"x-ratelimit-remaining-tokens": {"0"},
+				"x-ratelimit-reset-tokens":     {"9s"},
+			},
+		},
+		{
+			name:   "over-horizon reset fails closed",
+			status: http.StatusTooManyRequests,
+			headers: http.Header{
+				"x-ratelimit-remaining-tokens": {"0"},
+				"x-ratelimit-reset-tokens":     {"25h"},
+			},
+			wantBeyond: true,
+			wantOK:     true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got, gotOK, gotBeyond := parseProviderRetryAfterHeaders(test.status, test.headers, now)
+			if got != test.want || gotOK != test.wantOK || gotBeyond != test.wantBeyond {
+				t.Fatalf("parseProviderRetryAfterHeaders() = %s, %t, %t; want %s, %t, %t",
+					got, gotOK, gotBeyond, test.want, test.wantOK, test.wantBeyond)
+			}
+		})
+	}
+}
+
 func TestProviderRateLimitMarksRetryAfterBeyondDurableHorizon(t *testing.T) {
 	client := newTestClient(t, roundTripFunc(func(*http.Request) (*http.Response, error) {
 		response := jsonResponse(http.StatusTooManyRequests, `{"error":{"type":"rate_limit_exceeded"}}`)

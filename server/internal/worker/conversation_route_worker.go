@@ -370,29 +370,26 @@ func conversationRouteRateLimitDelay(claim app.ConversationRouteClaim, err error
 		routeErr.Details["reason"] != string(app.ModelErrorRateLimited) || routeErr.Details["stage"] != "provider_status" {
 		return 0, false
 	}
-	if app.ClassifyModelClientError(err).Reason != app.FailoverRateLimit {
+	classification := app.ClassifyModelClientError(err)
+	if !classification.Known || classification.Reason != app.FailoverRateLimit {
 		return 0, false
 	}
 	if routeErr.Details["retry_after_exceeds_durable_horizon"] == "true" || routeErr.RetryAfter > conversationRouteRetryAfterHorizon {
 		// The durable route queue supports at most 24 hours; do not retry earlier than the provider requested.
 		return 0, true
 	}
-	if routeErr.RetryAfter > 0 {
-		retryAfter := routeErr.RetryAfter
-		delay := retryAfter / time.Second
-		if retryAfter%time.Second != 0 {
-			delay++
-		}
-		return delay * time.Second, true
-	}
-	attempt := int(claim.RouteAttempt) + 1
-	if attempt > app.ModelRetryMaxRetries {
+	// Use the shared failover decision for the same-provider retry budget and
+	// Retry-After handling. The route store remains authoritative for the
+	// durable rejected-attempt count and next-attempt schedule.
+	if claim.RouteAttempt < 0 || claim.RouteAttempt >= int64(app.ModelRetryMaxRetries) {
 		return 0, true
 	}
-	delay, ok := app.ModelRetryDelay(attempt, 0, conversationRouteRetryAfterHorizon, rand.Float64)
-	if !ok {
+	decision := app.DecideModelRetry(classification, int(claim.RouteAttempt), routeErr.RetryAfter,
+		conversationRouteRetryAfterHorizon, rand.Float64)
+	if decision.Action != app.ModelRetryActionRetry {
 		return 0, true
 	}
+	delay := decision.Delay
 	// The store requires whole seconds; round up so the wait is never
 	// shorter than the ladder computed.
 	seconds := delay / time.Second

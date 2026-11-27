@@ -381,7 +381,8 @@ FROM conversation_messages WHERE conversation_id=$1`, mainConversation.Conversat
 	}
 	apiDeps := api.Deps{Hosts: hostService, TLSAuthorizer: nativeAcceptanceTLS{}, Verifier: credentials,
 		Auth: nativeAcceptanceAuth{credentials: credentials, users: users}, ClientLogin: clients, Tasks: tasks, Conversations: conversations,
-		WorkspaceOps: workspaceOps, Onboarding: onboarding,
+		TaskPCDeliveryObservations: tasks,
+		WorkspaceOps:               workspaceOps, Onboarding: onboarding,
 		PersonalData: personalData, PersonalSync: personalSync, PersonalDataQuotaUser: personalQuotaUser,
 		PersonalAttachments: personalAttachments,
 		ModelConnections:    models, ModelGateway: gateway, ExecutionControl: execution,

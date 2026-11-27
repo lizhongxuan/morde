@@ -1203,6 +1203,12 @@ func TestConversationRouteRateLimitDelayUsesRetryLadder(t *testing.T) {
 	if delay, ok := conversationRouteRateLimitDelay(claim(3), providerRateLimit(0)); !ok || delay != 0 {
 		t.Fatalf("spent ladder delay = %v, %t, want (0, true)", delay, ok)
 	}
+	if delay, ok := conversationRouteRateLimitDelay(claim(3), providerRateLimit(90*time.Second)); !ok || delay != 0 {
+		t.Fatalf("spent ladder with Retry-After delay = %v, %t, want (0, true)", delay, ok)
+	}
+	if delay, ok := conversationRouteRateLimitDelay(claim(-1), providerRateLimit(0)); !ok || delay != 0 {
+		t.Fatalf("invalid negative attempt delay = %v, %t, want (0, true)", delay, ok)
+	}
 	// Anything but a confirmed provider 429 is not a ladder retry.
 	if _, ok := conversationRouteRateLimitDelay(claim(0), domain.NewError(domain.CodeRateLimited, "rate limited")); ok {
 		t.Fatal("unconfirmed rate limit was treated as a ladder retry")
