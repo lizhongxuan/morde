@@ -19,9 +19,10 @@ import (
 )
 
 type a10LocalModelStubRequest struct {
-	Model        string `json:"model"`
-	Instructions string `json:"instructions"`
-	Prompt       string `json:"prompt"`
+	Model           string `json:"model"`
+	Instructions    string `json:"instructions"`
+	Prompt          string `json:"prompt"`
+	MaxOutputTokens int    `json:"max_output_tokens"`
 }
 
 type a10LocalModelStubResponse struct {
@@ -56,6 +57,7 @@ func (client a10LocalHTTPModelClient) Complete(ctx context.Context, request app.
 	}
 	payload, err := json.Marshal(a10LocalModelStubRequest{
 		Model: request.Endpoint.ModelID, Instructions: request.Instructions, Prompt: prompt.String(),
+		MaxOutputTokens: request.MaxOutputTokens,
 	})
 	if err != nil {
 		return app.ModelResponse{}, err
@@ -137,6 +139,14 @@ func (store *a10LocalGatewayStore) SettleModelCall(_ context.Context, value app.
 
 func (*a10LocalGatewayStore) RecoverTaskModelResponse(context.Context, app.ModelCallReservation) (app.TaskModelResponseRecord, bool, error) {
 	return app.TaskModelResponseRecord{}, false, nil
+}
+
+func (*a10LocalGatewayStore) ValidateTaskModelBudgetPreparation(_ context.Context, reservation app.ModelCallReservation) error {
+	if reservation.Source != app.ModelCallTask || reservation.Task == nil || reservation.BudgetPlanID == "" ||
+		reservation.BudgetCallID == "" || reservation.DSHCallID == "" {
+		return errors.New("synthetic Task model budget plan is invalid")
+	}
+	return nil
 }
 
 func (*a10LocalGatewayStore) ModelTaskProjectID(_ context.Context, fence app.ModelTaskFence) (string, error) {

@@ -20,6 +20,12 @@ type ModelConnectionRecord struct {
 	Name                        string
 	BaseURL                     string
 	ModelName                   string
+	MaxOutputTokens             *int
+	MaxOutputOverrideTokens     *int
+	MaxOutputSource             ModelMaxOutputSource
+	MaxOutputResolvedAt         *time.Time
+	MaxOutputCatalogVersion     *string
+	MaxOutputSourceURL          *string
 	ContextWindowTokens         *int
 	ContextWindowOverrideTokens *int
 	ContextWindowSource         ModelContextWindowSource
@@ -49,6 +55,12 @@ type ModelConnectionView struct {
 	Name                        string
 	BaseURL                     string
 	ModelName                   string
+	MaxOutputTokens             *int
+	MaxOutputOverrideTokens     *int
+	MaxOutputSource             ModelMaxOutputSource
+	MaxOutputResolvedAt         *time.Time
+	MaxOutputCatalogVersion     *string
+	MaxOutputSourceURL          *string
 	ContextWindowTokens         *int
 	ContextWindowOverrideTokens *int
 	ContextWindowSource         ModelContextWindowSource
@@ -87,6 +99,8 @@ type ModelConnectionCommand struct {
 	Name                         string
 	BaseURL                      string
 	ModelName                    string
+	MaxOutputOverrideTokens      *int
+	MaxOutputOverridePresent     bool
 	ContextWindowOverrideTokens  *int
 	ContextWindowOverridePresent bool
 	LegacyContextWindowTokens    *int
@@ -228,6 +242,13 @@ func (s *ModelConnectionService) Create(ctx context.Context, principal identity.
 	if err := rejectDefaultModelContextOverride(baseURL, modelName, override); err != nil {
 		return ModelConnectionView{}, err
 	}
+	maxOutputOverride, err := explicitModelMaxOutputOverride(command)
+	if err != nil {
+		return ModelConnectionView{}, err
+	}
+	if err := rejectSystemModelMaxOutputOverride(baseURL, modelName, maxOutputOverride); err != nil {
+		return ModelConnectionView{}, err
+	}
 	id, err := domain.NewModelConnectionID()
 	if err != nil {
 		return ModelConnectionView{}, fmt.Errorf("generate model connection id: %w", err)
@@ -240,12 +261,17 @@ func (s *ModelConnectionService) Create(ctx context.Context, principal identity.
 	if command.Shared {
 		ownerID = ""
 	}
+	if ownerID == "" && maxOutputOverride != nil {
+		return ModelConnectionView{}, domain.InvalidArgument("max_output_override_tokens", "max output override is only available for personal custom model connections")
+	}
 	record := ModelConnectionRecord{
 		ID: id, OwnerID: ownerID, Name: strings.TrimSpace(command.Name), BaseURL: baseURL,
-		ModelName: modelName, ContextWindowTokens: copyInt(override),
+		ModelName: modelName, MaxOutputTokens: copyInt(maxOutputOverride), MaxOutputOverrideTokens: copyInt(maxOutputOverride),
+		ContextWindowTokens:         copyInt(override),
 		ContextWindowOverrideTokens: copyInt(override), ContextWindowSource: source, APIKeyCipher: ciphertext,
 	}
 	applyModelContextCapacity(&record, time.Now().UTC())
+	applyModelMaxOutputCapacity(&record, time.Now().UTC())
 	record, err = s.store.CreateModelConnection(ctx, record)
 	if err != nil {
 		return ModelConnectionView{}, err
@@ -286,6 +312,18 @@ func (s *ModelConnectionService) Update(ctx context.Context, principal identity.
 	if err != nil {
 		return ModelConnectionView{}, err
 	}
+	requestedMaxOutputOverride, err := explicitModelMaxOutputOverride(command)
+	if err != nil {
+		return ModelConnectionView{}, err
+	}
+	if command.MaxOutputOverridePresent {
+		if err := rejectSystemModelMaxOutputOverride(strings.TrimRight(strings.TrimSpace(command.BaseURL), "/"), strings.TrimSpace(command.ModelName), requestedMaxOutputOverride); err != nil {
+			return ModelConnectionView{}, err
+		}
+		if current.OwnerID == "" && requestedMaxOutputOverride != nil {
+			return ModelConnectionView{}, domain.InvalidArgument("max_output_override_tokens", "max output override is only available for personal custom model connections")
+		}
+	}
 	if command.ContextWindowOverridePresent || command.LegacyContextWindowPresent {
 		if err := rejectDefaultModelContextOverride(strings.TrimRight(strings.TrimSpace(command.BaseURL), "/"), strings.TrimSpace(command.ModelName), requestedOverride); err != nil {
 			return ModelConnectionView{}, err
@@ -313,12 +351,31 @@ func (s *ModelConnectionService) Update(ctx context.Context, principal identity.
 		current.ContextWindowResolvedAt = nil
 		current.ContextWindowCatalogVersion = nil
 	}
+	switch {
+	case command.MaxOutputOverridePresent:
+		current.MaxOutputOverrideTokens = copyInt(requestedMaxOutputOverride)
+		current.MaxOutputTokens = copyInt(requestedMaxOutputOverride)
+		current.MaxOutputSource = ModelMaxOutputOverride
+		current.MaxOutputResolvedAt = nil
+		current.MaxOutputCatalogVersion = nil
+		current.MaxOutputSourceURL = nil
+	case routeChanged:
+		current.MaxOutputTokens = nil
+		current.MaxOutputOverrideTokens = nil
+		current.MaxOutputSource = ModelMaxOutputUnknown
+		current.MaxOutputResolvedAt = nil
+		current.MaxOutputCatalogVersion = nil
+		current.MaxOutputSourceURL = nil
+	}
 	if routeChanged || keyChanged {
 		current.Capabilities = ModelCapabilities{ModelID: current.ID}
 		current.CheckedAt = nil
 	}
 	if routeChanged || keyChanged || command.ContextWindowOverridePresent || command.LegacyContextWindowPresent {
 		applyModelContextCapacity(&current, time.Now().UTC())
+	}
+	if routeChanged || keyChanged || command.MaxOutputOverridePresent || modelMaxOutputCapacityNeedsRefresh(current) {
+		applyModelMaxOutputCapacity(&current, time.Now().UTC())
 	}
 	updated, err := s.store.UpdateModelConnection(ctx, current)
 	if err != nil {
@@ -445,7 +502,10 @@ func (s *ModelConnectionService) ResolveGatewayEndpoint(ctx context.Context, own
 		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
 	}
 	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt,
-		Personal: record.OwnerID != "", ContextWindowTokens: copyInt(record.ContextWindowTokens)}, nil
+		Personal: record.OwnerID != "", ContextWindowTokens: copyInt(record.ContextWindowTokens), ContextWindowSource: record.ContextWindowSource,
+		ContextWindowCatalogVersion: copyString(record.ContextWindowCatalogVersion),
+		MaxOutputTokens:             copyInt(record.MaxOutputTokens), MaxOutputSource: record.MaxOutputSource,
+		MaxOutputResolvedAt: copyTime(record.MaxOutputResolvedAt), MaxOutputCatalogVersion: copyString(record.MaxOutputCatalogVersion)}, nil
 }
 
 func (s *ModelConnectionService) ResolveProbeEndpoint(ctx context.Context, principal identity.Principal, id string) (ModelGatewayEndpoint, error) {
@@ -470,7 +530,10 @@ func (s *ModelConnectionService) ResolveProbeEndpoint(ctx context.Context, princ
 		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
 	}
 	return ModelGatewayEndpoint{Endpoint: ModelEndpoint{BaseURL: record.BaseURL, APIKey: string(key), ModelID: record.ModelName}, Version: record.UpdatedAt,
-		Personal: record.OwnerID != "", ContextWindowTokens: copyInt(record.ContextWindowTokens)}, nil
+		Personal: record.OwnerID != "", ContextWindowTokens: copyInt(record.ContextWindowTokens), ContextWindowSource: record.ContextWindowSource,
+		ContextWindowCatalogVersion: copyString(record.ContextWindowCatalogVersion),
+		MaxOutputTokens:             copyInt(record.MaxOutputTokens), MaxOutputSource: record.MaxOutputSource,
+		MaxOutputResolvedAt: copyTime(record.MaxOutputResolvedAt), MaxOutputCatalogVersion: copyString(record.MaxOutputCatalogVersion)}, nil
 }
 
 func (s *ModelConnectionService) SaveProbeCapabilities(ctx context.Context, principal identity.Principal, id string, expected time.Time, capabilities ModelCapabilities) (ModelCapabilities, error) {
@@ -578,14 +641,39 @@ func modelConnectionView(record ModelConnectionRecord) ModelConnectionView {
 	if source == "" {
 		source = ModelContextWindowUnknown
 	}
+	maxOutputTokens := copyInt(record.MaxOutputTokens)
+	maxOutputOverrideTokens := copyInt(record.MaxOutputOverrideTokens)
+	maxOutputSource := modelMaxOutputSource(record.MaxOutputSource)
+	maxOutputResolvedAt := copyTime(record.MaxOutputResolvedAt)
+	maxOutputCatalogVersion := copyString(record.MaxOutputCatalogVersion)
+	maxOutputSourceURL := copyString(record.MaxOutputSourceURL)
+	if modelMaxOutputCapacityNeedsRefresh(record) {
+		// A read must never expose a capacity resolved for another catalog version or route.
+		maxOutputTokens = nil
+		maxOutputOverrideTokens = nil
+		maxOutputSource = ModelMaxOutputUnknown
+		maxOutputResolvedAt = nil
+		maxOutputCatalogVersion = nil
+		maxOutputSourceURL = nil
+	}
 	return ModelConnectionView{
 		ID: record.ID, Name: record.Name, BaseURL: record.BaseURL, ModelName: record.ModelName,
 		ContextWindowTokens: copyInt(record.ContextWindowTokens), ContextWindowOverrideTokens: copyInt(record.ContextWindowOverrideTokens),
 		ContextWindowSource: source, ContextWindowResolvedAt: copyTime(record.ContextWindowResolvedAt),
 		ContextWindowCatalogVersion: copyString(record.ContextWindowCatalogVersion),
-		Shared:                      record.OwnerID == "", HasAPIKey: len(record.APIKeyCipher) > 0,
+		MaxOutputTokens:             maxOutputTokens, MaxOutputOverrideTokens: maxOutputOverrideTokens,
+		MaxOutputSource: maxOutputSource, MaxOutputResolvedAt: maxOutputResolvedAt,
+		MaxOutputCatalogVersion: maxOutputCatalogVersion, MaxOutputSourceURL: maxOutputSourceURL,
+		Shared: record.OwnerID == "", HasAPIKey: len(record.APIKeyCipher) > 0,
 		Capabilities: record.Capabilities, CheckedAt: record.CheckedAt, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}
+}
+
+func modelMaxOutputSource(value ModelMaxOutputSource) ModelMaxOutputSource {
+	if value == "" {
+		return ModelMaxOutputUnknown
+	}
+	return value
 }
 
 func copyInt(value *int) *int {
@@ -610,6 +698,13 @@ func copyTime(value *time.Time) *time.Time {
 	}
 	copy := *value
 	return &copy
+}
+
+func (endpoint ModelGatewayEndpoint) MaxOutputCatalogVersionValue() string {
+	if endpoint.MaxOutputCatalogVersion == nil {
+		return ""
+	}
+	return *endpoint.MaxOutputCatalogVersion
 }
 
 func explicitContextWindowOverride(command ModelConnectionCommand) (*int, ModelContextWindowSource, error) {

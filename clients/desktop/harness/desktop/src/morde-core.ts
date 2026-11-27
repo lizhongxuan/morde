@@ -85,19 +85,24 @@ export function checkedId(kind: keyof typeof IDS, value: unknown): string {
   return value;
 }
 
-function requestFailure(response: Response, method: string, path: string, unauthorized: string): Error {
-  if (response.status === 401) return new Error(unauthorized);
+function responseReference(response: Response): string {
   const requestID = response.headers.get("x-request-id");
   const traceID = response.headers.get("x-trace-id");
   const references = [requestID && REQUEST_ID.test(requestID) ? `request ID ${requestID}` : "",
     traceID && /^[0-9a-f]{32}$/.test(traceID) ? `trace ID ${traceID}` : ""].filter(Boolean);
-  const reference = references.length ? `; ${references.join(", ")}` : "";
+  return references.length ? `; ${references.join(", ")}` : "";
+}
+
+function requestFailure(response: Response, method: string, path: string, unauthorized: string): Error {
+  const reference = responseReference(response);
+  if (response.status === 401) return new Error(`${unauthorized}${reference}`);
   return new Error(`Morde returned HTTP ${response.status} (${method} ${path})${reference}`);
 }
 
 function traceParent(): string {
   const traceID = randomUUID().replaceAll("-", "");
-  const spanID = randomUUID().replaceAll("-", "").slice(-16);
+  let spanID = randomUUID().replaceAll("-", "").slice(-16);
+  if (/^0+$/.test(spanID)) spanID = `${spanID.slice(0, -1)}1`;
   return `00-${traceID}-${spanID}-01`;
 }
 
@@ -284,7 +289,7 @@ export class MordeAPI {
         headers: { accept: "application/json" }, cache: "no-store", redirect: "error", signal: AbortSignal.timeout(20_000),
       });
     } catch { throw new Error("无法确认 Morde 服务版本，请检查网络和服务地址后重试。未发送账号信息。"); }
-    if (!response.ok) throw new Error("Morde 服务不支持客户端登录或暂不可用，请升级服务后重试。未发送账号信息。");
+    if (!response.ok) throw new Error(`Morde 服务不支持客户端登录或暂不可用，请升级服务后重试。未发送账号信息。${responseReference(response)}`);
     const value = await response.json().catch(() => null) as Record<string, unknown> | null;
     const features = value?.supported_features;
     if (!value || typeof value.service_instance_id !== "string" ||
@@ -367,7 +372,7 @@ export class MordeAPI {
         rate_limited: "登录尝试过于频繁，请稍后重试。",
         forbidden: "请先修改密码，再继续使用客户端。",
       };
-      const error = new Error(messages[body?.error?.code ?? ""] ?? (response.status === 401 ? messages.unauthenticated : `Morde 登录失败（HTTP ${response.status}）。`));
+      const error = new Error(`${messages[body?.error?.code ?? ""] ?? (response.status === 401 ? messages.unauthenticated : `Morde 登录失败（HTTP ${response.status}）。`)}${responseReference(response)}`);
       Object.assign(error, { code: body?.error?.code, reason: body?.error?.details?.reason });
       throw error;
     }

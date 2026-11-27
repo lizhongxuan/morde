@@ -1076,6 +1076,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .task-panel-toggle .morde-icon { width: 15px; height: 15px; }
 .assistant-page .conversation-view { min-height: 0; padding: 21px 28px 42px; scroll-padding-bottom: 42px; }
 .assistant-page .message-list { width: min(100%, 770px); max-width: none; gap: 12px; }
+.assistant-page .chat-thinking-row { width: min(100%, 770px); margin-inline: auto; }
 .conversation-time-divider { justify-self: center; margin-bottom: 6px; color: #9ba6b5; font-size: 11px; }
 .chat-message-row { display: flex; align-items: flex-start; gap: 11px; min-width: 0; }
 .chat-message-row-user { justify-content: flex-end; }
@@ -2099,6 +2100,7 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
   padding: 28px 0 24px;
   gap: 14px;
 }
+.morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-page .chat-thinking-row { width: min(100%, 760px); }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-row { gap: 10px; }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-row-pending { margin-top: 14px; }
 .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-row-user .chat-message-body { max-width: min(82%, 520px); }

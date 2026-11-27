@@ -23,8 +23,9 @@ var observabilityTraceIDPattern = regexp.MustCompile(`^[0-9a-f]{32}$`)
 func (s *Store) GetAdminObservabilityOverview(ctx context.Context) (app.AdminObservabilityOverview, error) {
 	var result app.AdminObservabilityOverview
 	result.SpansSource = app.AdminObservabilitySource{Status: "unavailable", Reason: observabilityReason("span source query failed")}
+	result.LogsSource = app.AdminObservabilitySource{Status: "unavailable", Reason: observabilityReason("correlated log source query failed")}
 	result.EventsSource = app.AdminObservabilitySource{Status: "unavailable", Reason: observabilityReason("DSH checkpoint source query failed")}
-	var latestSpan, latestEvent pgtype.Timestamptz
+	var latestSpan, latestLog, latestEvent pgtype.Timestamptz
 	var requestCount, errorCount int64
 	var p95 float64
 	spanCtx, cancelSpans := context.WithTimeout(ctx, 1200*time.Millisecond)
@@ -39,6 +40,13 @@ FROM observability_spans WHERE start_time >= clock_timestamp()-interval '24 hour
 	if err == nil {
 		result.RequestCount, result.ErrorCount, result.P95DurationMS = requestCount, errorCount, p95
 		result.SpansSource = observabilitySource(latestSpan, requestCount > 0, "no HTTP span has been exported yet")
+	}
+	var logCount int64
+	logCtx, cancelLogs := context.WithTimeout(ctx, 1200*time.Millisecond)
+	logErr := s.pool.QueryRow(logCtx, `SELECT count(*),max(occurred_at) FROM observability_logs WHERE occurred_at >= clock_timestamp()-interval '24 hours'`).Scan(&logCount, &latestLog)
+	cancelLogs()
+	if logErr == nil {
+		result.LogsSource = observabilitySource(latestLog, logCount > 0, "no trace-correlated structured logs have been exported yet")
 	}
 	var eventCount int64
 	eventCtx, cancelEvents := context.WithTimeout(ctx, 1200*time.Millisecond)
@@ -96,11 +104,18 @@ func (s *Store) ListAdminObservabilityTraces(ctx context.Context, query app.Admi
 		query.Query = strings.ReplaceAll(query.Query, "_", "!_")
 		query.Query = "%" + query.Query + "%"
 	}
- 	rows, err := s.pool.Query(ctx, `WITH linked AS (
- SELECT link.trace_id,max(link.request_id) AS request_id,max(message.task_id) AS task_id,
-  min(link.created_at) AS first_at,max(link.created_at) AS last_at
+	rows, err := s.pool.Query(ctx, `WITH link_rows AS (
+ SELECT link.trace_id,link.request_id,message.task_id,link.created_at
  FROM observability_trace_links link LEFT JOIN conversation_messages message ON message.id=link.message_id
- GROUP BY link.trace_id
+ UNION ALL
+ SELECT task_link.task_trace_id,task_link.request_id,task_link.task_id,task_link.created_at
+ FROM observability_task_attempt_links task_link
+ UNION ALL
+ SELECT task_link.origin_trace_id,task_link.request_id,task_link.task_id,task_link.created_at
+ FROM observability_task_attempt_links task_link
+), linked AS (
+ SELECT trace_id,max(request_id) AS request_id,max(task_id) AS task_id,min(created_at) AS first_at,max(created_at) AS last_at
+ FROM link_rows GROUP BY trace_id
 ), expanded AS (
  SELECT span.trace_id,span.start_time,span.end_time,span.status,
   COALESCE(NULLIF(span.attributes->>'morde.request_id',''),linked.request_id) AS request_id,
@@ -170,9 +185,15 @@ func (s *Store) GetAdminObservabilityTrace(ctx context.Context, traceID string) 
 	if !observabilityTraceIDPattern.MatchString(traceID) {
 		return app.AdminObservabilityTraceDetail{}, domain.InvalidArgument("trace_id", "trace ID is invalid")
 	}
-	rows, err := s.pool.Query(ctx, `SELECT span_id,parent_span_id,name,span_kind,status,start_time,end_time,attributes,events,
+	rows, err := s.pool.Query(ctx, `SELECT trace_id,span_id,parent_span_id,name,span_kind,status,start_time,end_time,attributes,links,events,
  dropped_attributes+dropped_links+dropped_events
-FROM observability_spans WHERE trace_id=$1 ORDER BY start_time,span_id LIMIT $2`, traceID, maxAdminObservabilitySpans+1)
+FROM observability_spans
+WHERE trace_id=$1 OR trace_id IN (
+ SELECT task_trace_id FROM observability_task_attempt_links WHERE origin_trace_id=$1
+ UNION
+ SELECT origin_trace_id FROM observability_task_attempt_links WHERE task_trace_id=$1
+)
+ORDER BY start_time,trace_id,span_id LIMIT $2`, traceID, maxAdminObservabilitySpans+1)
 	if err != nil {
 		return app.AdminObservabilityTraceDetail{}, fmt.Errorf("read observability trace spans: %w", err)
 	}
@@ -182,9 +203,13 @@ FROM observability_spans WHERE trace_id=$1 ORDER BY start_time,span_id LIMIT $2`
 	truncated := false
 	for rows.Next() {
 		var span app.AdminObservabilitySpan
-		if err := rows.Scan(&span.SpanID, &span.ParentSpanID, &span.Name, &span.Kind, &span.Status, &span.StartAt, &span.EndAt,
-			&span.Attributes, &span.Events, &span.DroppedCount); err != nil {
+		var parentSpanID string
+		if err := rows.Scan(&span.TraceID, &span.SpanID, &parentSpanID, &span.Name, &span.Kind, &span.Status, &span.StartAt, &span.EndAt,
+			&span.Attributes, &span.Links, &span.Events, &span.DroppedCount); err != nil {
 			return app.AdminObservabilityTraceDetail{}, fmt.Errorf("scan observability span: %w", err)
+		}
+		if parentSpanID != "" {
+			span.ParentSpanID = &parentSpanID
 		}
 		if len(spans) == maxAdminObservabilitySpans {
 			truncated = true
@@ -200,6 +225,9 @@ FROM observability_spans WHERE trace_id=$1 ORDER BY start_time,span_id LIMIT $2`
 		if len(span.Events) == 0 {
 			span.Events = []byte(`[]`)
 		}
+		if len(span.Links) == 0 {
+			span.Links = []byte(`[]`)
+		}
 		spans = append(spans, span)
 	}
 	if err := rows.Err(); err != nil {
@@ -207,7 +235,8 @@ FROM observability_spans WHERE trace_id=$1 ORDER BY start_time,span_id LIMIT $2`
 	}
 	if len(spans) == 0 {
 		var linked bool
-		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM observability_trace_links WHERE trace_id=$1)`, traceID).Scan(&linked); err != nil {
+		if err := s.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM observability_trace_links WHERE trace_id=$1)
+ OR EXISTS(SELECT 1 FROM observability_task_attempt_links WHERE origin_trace_id=$1 OR task_trace_id=$1)`, traceID).Scan(&linked); err != nil {
 			return app.AdminObservabilityTraceDetail{}, fmt.Errorf("check observability trace link: %w", err)
 		}
 		if !linked {
@@ -218,11 +247,65 @@ FROM observability_spans WHERE trace_id=$1 ORDER BY start_time,span_id LIMIT $2`
 			Source: app.AdminObservabilitySource{Status: "partial", Reason: &reason}}, nil
 	}
 	source := app.AdminObservabilitySource{Status: "available"}
-	if dropped || truncated {
-		reason := "some span attributes, links, events, or span rows were dropped by configured limits"
+	unexportedTaskAttempt, attemptCheckErr := s.hasUnexportedTaskAttempt(ctx, traceID)
+	if dropped || truncated || incompleteObservabilitySpanTree(spans) || unexportedTaskAttempt || attemptCheckErr != nil {
+		reason := "some span attributes, links, events, rows, or parent relationships are missing because of configured limits or incomplete capture"
+		if attemptCheckErr != nil {
+			reason = "task attempt span coverage could not be checked"
+		}
 		source.Status, source.Reason = "partial", &reason
 	}
 	return app.AdminObservabilityTraceDetail{TraceID: traceID, Spans: spans, Source: source}, nil
+}
+
+func incompleteObservabilitySpanTree(spans []app.AdminObservabilitySpan) bool {
+	byID := make(map[string]app.AdminObservabilitySpan, len(spans))
+	for _, span := range spans {
+		byID[span.TraceID+"/"+span.SpanID] = span
+	}
+	for _, span := range spans {
+		if span.ParentSpanID != nil {
+			if _, found := byID[span.TraceID+"/"+*span.ParentSpanID]; !found {
+				return true
+			}
+		}
+	}
+	state := make(map[string]uint8, len(spans))
+	var visits func(string) bool
+	visits = func(spanKey string) bool {
+		switch state[spanKey] {
+		case 1:
+			return true
+		case 2:
+			return false
+		}
+		state[spanKey] = 1
+		span := byID[spanKey]
+		if span.ParentSpanID != nil && visits(span.TraceID+"/"+*span.ParentSpanID) {
+			return true
+		}
+		state[spanKey] = 2
+		return false
+	}
+	for _, span := range spans {
+		if visits(span.TraceID + "/" + span.SpanID) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Store) hasUnexportedTaskAttempt(ctx context.Context, traceID string) (bool, error) {
+	var exists bool
+	err := s.pool.QueryRow(ctx, `SELECT EXISTS(
+ SELECT 1 FROM observability_task_attempt_links link
+ WHERE (link.origin_trace_id=$1 OR link.task_trace_id=$1)
+  AND NOT EXISTS (SELECT 1 FROM observability_spans span WHERE span.trace_id=link.task_trace_id AND span.span_id=link.task_span_id)
+)`, traceID).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("check unexported observability Task attempt: %w", err)
+	}
+	return exists, nil
 }
 
 func (s *Store) GetAdminObservabilityTraceSessions(ctx context.Context, traceID string) (app.AdminObservabilityTraceSessions, error) {
@@ -240,29 +323,77 @@ func (s *Store) GetAdminObservabilityTraceSessions(ctx context.Context, traceID 
  FROM observability_trace_links link
  JOIN conversation_messages message ON message.id=link.message_id
  WHERE link.trace_id=$1
+	UNION ALL
+	SELECT task_id,created_at AS linked_at FROM observability_task_attempt_links
+	WHERE origin_trace_id=$1 OR task_trace_id=$1
 )
 SELECT task.id,task.owner_id FROM linked_tasks
 JOIN tasks task ON task.id=linked_tasks.task_id
 ORDER BY linked_tasks.linked_at DESC LIMIT 1`, traceID).Scan(&taskID, &ownerID)
 	if errors.Is(err, pgx.ErrNoRows) {
+		var linkedMessage, messageHasTask bool
+		if linkErr := s.pool.QueryRow(ctx, `SELECT EXISTS(
+ SELECT 1 FROM observability_trace_links link
+ JOIN conversation_messages message ON message.id=link.message_id
+ WHERE link.trace_id=$1
+ UNION ALL
+ SELECT 1 FROM observability_spans span
+ JOIN conversation_messages message ON message.id=span.attributes->>'morde.message_id'
+ WHERE span.trace_id=$1
+), EXISTS(
+ SELECT 1 FROM observability_trace_links link
+ JOIN conversation_messages message ON message.id=link.message_id
+ WHERE link.trace_id=$1 AND NULLIF(message.task_id,'') IS NOT NULL
+ UNION ALL
+ SELECT 1 FROM observability_spans span
+ JOIN conversation_messages message ON message.id=span.attributes->>'morde.message_id'
+ WHERE span.trace_id=$1 AND NULLIF(message.task_id,'') IS NOT NULL
+)`, traceID).Scan(&linkedMessage, &messageHasTask); linkErr != nil {
+			return app.AdminObservabilityTraceSessions{}, fmt.Errorf("check observability trace message link: %w", linkErr)
+		}
+		if linkedMessage {
+			reason := "trace is linked to a conversation message, but no DSH checkpoint Task is available"
+			if messageHasTask {
+				reason = "trace is linked to a conversation message with a Task, but the Task record is unavailable"
+			}
+			return app.AdminObservabilityTraceSessions{Sessions: []app.AdminObservabilityAgentSession{}, Source: app.AdminObservabilitySource{Status: "partial", Reason: &reason}}, nil
+		}
 		reason := "trace is not linked to a conversation message or Task"
 		return app.AdminObservabilityTraceSessions{Sessions: []app.AdminObservabilityAgentSession{}, Source: app.AdminObservabilitySource{Status: "unavailable", Reason: &reason}}, nil
 	}
 	if err != nil {
 		return app.AdminObservabilityTraceSessions{}, fmt.Errorf("resolve observability trace Task: %w", err)
 	}
-	rows, err := s.pool.Query(ctx, `SELECT session_id,COALESCE(parent_session_id,''),COALESCE(step_id,''),checkpoint_through_seq
-FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 ORDER BY created_at,session_id LIMIT 128`, taskID, ownerID)
+	rows, err := s.pool.Query(ctx, `SELECT session.session_id,COALESCE(session.parent_session_id,''),COALESCE(session.step_id,''),session.checkpoint_through_seq,
+ COALESCE(observed.max_event_sequence,-1)
+FROM task_agent_sessions session
+LEFT JOIN (
+ SELECT span.attributes->>'morde.agent_session_id' AS session_id,
+  max(CASE WHEN span.attributes->>'morde.event_sequence' ~ '^[0-9]{1,18}$'
+    THEN (span.attributes->>'morde.event_sequence')::bigint ELSE -1 END) AS max_event_sequence
+ FROM observability_task_attempt_links task_link
+ JOIN observability_spans span ON span.trace_id=task_link.task_trace_id
+ WHERE task_link.task_id=$1 AND span.attributes->>'morde.task_id'=$1
+ GROUP BY span.attributes->>'morde.agent_session_id'
+) observed ON observed.session_id=session.session_id
+WHERE session.task_id=$1 AND session.owner_id=$2 ORDER BY session.created_at,session.session_id LIMIT 129`, taskID, ownerID)
 	if err != nil {
 		return app.AdminObservabilityTraceSessions{}, fmt.Errorf("list observability Agent sessions: %w", err)
 	}
 	defer rows.Close()
 	sessions := make([]app.AdminObservabilityAgentSession, 0)
 	var hasUncheckpointed bool
+	var hasUncheckpointedEvents bool
+	var truncated bool
 	for rows.Next() {
+		if len(sessions) == 128 {
+			truncated = true
+			break
+		}
 		var session app.AdminObservabilityAgentSession
 		var parentID, stepID string
-		if err := rows.Scan(&session.SessionID, &parentID, &stepID, &session.ThroughSequence); err != nil {
+		var maxObservedSequence int64
+		if err := rows.Scan(&session.SessionID, &parentID, &stepID, &session.ThroughSequence, &maxObservedSequence); err != nil {
 			return app.AdminObservabilityTraceSessions{}, fmt.Errorf("scan observability Agent session: %w", err)
 		}
 		if parentID != "" {
@@ -276,6 +407,8 @@ FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 ORDER BY created_at,se
 		}
 		if session.ThroughSequence < 0 {
 			hasUncheckpointed = true
+		} else if maxObservedSequence > session.ThroughSequence {
+			hasUncheckpointedEvents = true
 		}
 		sessions = append(sessions, session)
 	}
@@ -287,8 +420,14 @@ FROM task_agent_sessions WHERE task_id=$1 AND owner_id=$2 ORDER BY created_at,se
 	if len(sessions) == 0 {
 		reason := "Task has no DSH session yet"
 		source.Status, source.Reason = "partial", &reason
+	} else if truncated {
+		reason := "Task has more Agent sessions than the response limit; some sessions are not shown"
+		source.Status, source.Reason = "partial", &reason
 	} else if hasUncheckpointed {
 		reason := "one or more DSH sessions have no committed checkpoint yet"
+		source.Status, source.Reason = "partial", &reason
+	} else if hasUncheckpointedEvents {
+		reason := "one or more DSH spans record event sequences beyond the last committed checkpoint"
 		source.Status, source.Reason = "partial", &reason
 	}
 	return app.AdminObservabilityTraceSessions{TaskID: &taskValue, OwnerID: &ownerValue, Sessions: sessions, Source: source}, nil

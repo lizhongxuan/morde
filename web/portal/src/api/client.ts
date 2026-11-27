@@ -111,11 +111,12 @@ export async function requestFetch(input: RequestInfo | URL, init?: RequestInit)
   try {
     response = await fetch(input, { ...init, headers, credentials: "include" });
   } catch (error) {
-    if (error instanceof TypeError) window.dispatchEvent(new Event("morde:api-network-error"));
+    if (!init?.signal?.aborted && error instanceof TypeError) window.dispatchEvent(new Event("morde:api-network-error"));
     throw error;
   }
   const requestTraceID = headers.get("traceparent")?.split("-")[1] ?? "";
-  const responseTraceID = response.headers.get("X-Trace-Id") ?? requestTraceID;
+  const headerTraceID = response.headers.get("X-Trace-Id");
+  const responseTraceID = headerTraceID && /^[0-9a-f]{32}$/.test(headerTraceID) ? headerTraceID : requestTraceID;
   window.dispatchEvent(new CustomEvent("morde:api-trace", {
     detail: { request_id: headers.get("X-Request-Id"), trace_id: responseTraceID, status: response.status },
   }));
@@ -142,12 +143,21 @@ export function unwrapApiResponse<T>(result: { data?: T; error?: unknown; respon
       : {};
     const retryText = result.response.headers.get("Retry-After");
     const retry = retryText === null ? undefined : Number(retryText);
+    const requestID = result.response.headers.get("X-Request-Id");
+    const traceID = result.response.headers.get("X-Trace-Id");
+    const serverDetails = isRecord(raw.details) ? { ...raw.details } : {};
+    delete serverDetails.request_id;
+    delete serverDetails.trace_id;
     throw new ApiError({
       message: typeof raw.message === "string" ? raw.message : "请求失败，请稍后重试",
       code: typeof raw.code === "string" ? raw.code : "internal",
       status: result.response.status,
       retryAfter: retry !== undefined && Number.isFinite(retry) ? retry : undefined,
-      details: isRecord(raw.details) ? raw.details : {},
+      details: {
+        ...serverDetails,
+        ...(requestID && /^[A-Za-z0-9._:-]{1,128}$/.test(requestID) ? { request_id: requestID } : {}),
+        ...(traceID && /^[0-9a-f]{32}$/.test(traceID) ? { trace_id: traceID } : {}),
+      },
     });
   }
   if (result.data === undefined && result.response.status !== 204) {

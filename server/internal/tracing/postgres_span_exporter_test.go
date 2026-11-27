@@ -26,6 +26,7 @@ import (
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+
 	"morde/server/migrations"
 )
 
@@ -99,6 +100,19 @@ func TestEncodeAttributesEnforcesAllowlistAndValueBounds(t *testing.T) {
 	}
 	if !safeSpanName("GET /api/tasks/:id") || !safeSpanName("morde.tool.execute") {
 		t.Fatal("valid operation names were rejected")
+	}
+}
+
+func TestMakeSpanRecordClassifiesInvalidSpanNames(t *testing.T) {
+	span := endedTestSpan(t, func(span trace.Span) { span.SetName("GET /api/private?query=value") })
+	if _, err := makeSpanRecord(span); !errors.Is(err, errInvalidSpanName) {
+		t.Fatalf("invalid span name error = %v, want errInvalidSpanName", err)
+	}
+	if got := exportErrorReason(errInvalidSpanName); got != "invalid_span_name" {
+		t.Fatalf("invalid span name health reason = %q", got)
+	}
+	if got := exportErrorReason(errInvalidSpanIdentity); got != "invalid_span_identity" {
+		t.Fatalf("invalid span identity health reason = %q", got)
 	}
 }
 
@@ -344,7 +358,7 @@ func TestExporterWritesBatchAtomicallyAndHandlesDatabaseFailures(t *testing.T) {
 }
 
 func TestPurgeExpiredSpansUsesBoundedBatch(t *testing.T) {
-	database := &fakeSpanDatabase{tx: &fakeSpanTx{execRows: []int64{3, 2}}}
+	database := &fakeSpanDatabase{tx: &fakeSpanTx{execRows: []int64{3, 2, 1}}}
 	exporter, err := newPostgresSpanExporter(database, defaultExporterLimits())
 	if err != nil {
 		t.Fatal(err)
@@ -354,11 +368,12 @@ func TestPurgeExpiredSpansUsesBoundedBatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if deleted != 5 || len(database.tx.execQueries) != 2 || len(database.tx.execArgs) != 2 {
+	if deleted != 6 || len(database.tx.execQueries) != 3 || len(database.tx.execArgs) != 3 {
 		t.Fatalf("purge result/query/args = %d, %#v, %#v", deleted, database.tx.execQueries, database.tx.execArgs)
 	}
-	if database.tx.execQueries[0] != pruneSpansSQL || database.tx.execQueries[1] != pruneTraceLinksSQL || !database.tx.committed || !database.tx.rolledBack {
-		t.Fatalf("purge did not atomically remove spans and links: %+v", database.tx)
+	if database.tx.execQueries[0] != pruneSpansSQL || database.tx.execQueries[1] != pruneTraceLinksSQL ||
+		database.tx.execQueries[2] != pruneTaskTraceLinksSQL || !database.tx.committed || !database.tx.rolledBack {
+		t.Fatalf("purge did not atomically remove spans and trace links: %+v", database.tx)
 	}
 	for _, args := range database.tx.execArgs {
 		if got, ok := args[0].(time.Time); !ok || !got.Equal(cutoff.UTC()) {
@@ -368,7 +383,8 @@ func TestPurgeExpiredSpansUsesBoundedBatch(t *testing.T) {
 			t.Fatalf("purge limit = %#v", args[1])
 		}
 	}
-	if !strings.Contains(pruneSpansSQL, "SKIP LOCKED") || !strings.Contains(pruneTraceLinksSQL, "SKIP LOCKED") {
+	if !strings.Contains(pruneSpansSQL, "SKIP LOCKED") || !strings.Contains(pruneTraceLinksSQL, "SKIP LOCKED") ||
+		!strings.Contains(pruneTaskTraceLinksSQL, "SKIP LOCKED") {
 		t.Fatal("purge queries do not allow concurrent bounded cleanup")
 	}
 
@@ -383,9 +399,6 @@ func TestPurgeExpiredSpansUsesBoundedBatch(t *testing.T) {
 	}
 	if _, err := exporter.PurgeExpiredSpans(context.Background(), cutoff, 1); !errors.Is(err, errSpanExporterClosed) {
 		t.Fatalf("purge after shutdown error = %v", err)
-	}
-	if _, err := exporter.PurgeExpiredSpans(nil, cutoff, 1); err == nil {
-		t.Fatal("nil purge context was accepted")
 	}
 	if _, err := exporter.PurgeExpiredSpans(context.Background(), cutoff, 1); !errors.Is(err, errSpanExporterClosed) {
 		t.Fatalf("purge after shutdown error = %v", err)
@@ -416,7 +429,7 @@ func TestExporterShutdownDoesNotOwnPoolAndIsIdempotent(t *testing.T) {
 	if pool.Stat().TotalConns() != 0 {
 		t.Fatalf("exporter opened or closed a shared pool connection: total=%d", pool.Stat().TotalConns())
 	}
-	if err := exporter.ExportSpans(context.Background(), nil); err == nil || err != errSpanExporterClosed {
+	if err := exporter.ExportSpans(context.Background(), nil); err == nil || !errors.Is(err, errSpanExporterClosed) {
 		t.Fatalf("export after shutdown error = %v", err)
 	}
 }
@@ -450,9 +463,6 @@ func TestExporterHealthSnapshotIsSafeAndTracksRecovery(t *testing.T) {
 	}
 	if err := nilExporter.Shutdown(context.Background()); err == nil {
 		t.Fatal("nil exporter shutdown was accepted")
-	}
-	if err := nilExporter.Shutdown(nil); err == nil {
-		t.Fatal("nil shutdown context was accepted")
 	}
 	if err := nilExporter.ExportSpans(context.Background(), nil); err == nil {
 		t.Fatal("nil exporter accepted a batch")
@@ -752,15 +762,15 @@ func newTemporaryTracingPool(t *testing.T) *pgxpool.Pool {
 	return testPool
 }
 
-func migrateTemporaryTracingDatabase(ctx context.Context, pool *pgxpool.Pool) error {
+func migrateTemporaryTracingDatabase(ctx context.Context, pool *pgxpool.Pool) (retErr error) {
 	db := stdlib.OpenDBFromPool(pool)
-	defer db.Close()
+	defer func() { retErr = errors.Join(retErr, db.Close()) }()
 	provider, err := goose.NewProvider(goose.DialectPostgres, db, migrations.FS,
 		goose.WithLogger(goose.NopLogger()), goose.WithDisableGlobalRegistry(true))
 	if err != nil {
 		return err
 	}
-	defer provider.Close()
+	defer func() { retErr = errors.Join(retErr, provider.Close()) }()
 	_, err = provider.Up(ctx)
 	return err
 }

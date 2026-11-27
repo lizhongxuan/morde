@@ -30,6 +30,24 @@ function contextWindowSourceLabel(source: AdminModelConnection['context_window_s
   }
 }
 
+function outputLimitSourceLabel(source: AdminModelConnection['max_output_source']) {
+  switch (source) {
+    case 'override': return '高级覆盖';
+    case 'model_catalog': return 'Morde 模型目录';
+    default: return '暂未识别';
+  }
+}
+
+function safeOutputSourceURL(value: string | null | undefined) {
+  if (!value) return undefined;
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && !url.username && !url.password ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function AdminModels() {
   const client = useQueryClient();
   const { notify } = useToast();
@@ -160,11 +178,12 @@ export function AdminModels() {
     {query.isPending && !query.data ? <div className="loading-card" role="status">正在加载平台模型连接…</div>
       : query.isError && !query.data ? <FloatingError inline className="error-card" role="alert">{errorDetails(query.error).message}<button className="button button-secondary" type="button" onClick={() => void query.refetch()}>重试</button></FloatingError>
         : !models.length ? <div className="empty-card compact"><h2>尚未配置平台模型</h2><p>可选择 GPT 或 DeepSeek 预设，也可以手动填写其他兼容服务。</p><button type="button" className="button button-secondary" onClick={openCreate}>添加平台模型</button></div>
-          : <div className="table-wrap"><table><thead><tr><th>连接</th><th>服务地址</th><th>上下文窗口</th><th>密钥</th><th>能力 / 检查状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
+          : <div className="table-wrap"><table><thead><tr><th>连接</th><th>服务地址</th><th>上下文窗口</th><th>单次生成上限</th><th>密钥</th><th>能力 / 检查状态</th><th>更新时间</th><th>操作</th></tr></thead><tbody>
             {models.map((model) => <tr key={model.id}>
               <td><strong>{model.name}</strong><small className="table-sub">{model.model_name}</small></td>
               <td className="mono">{model.base_url}</td>
               <td>{model.context_window_tokens ? `${model.context_window_tokens.toLocaleString()} tokens` : '暂未识别'}<small className="table-sub">来源：{contextWindowSourceLabel(model.context_window_source)}{model.context_window_catalog_version ? ` · 目录 ${model.context_window_catalog_version}` : ''}</small></td>
+              <td>{model.max_output_tokens == null ? '暂未识别' : `${model.max_output_tokens.toLocaleString()} tokens`}<small className="table-sub">来源：{outputLimitSourceLabel(model.max_output_source)}{model.max_output_catalog_version ? ` · 目录版本 ${model.max_output_catalog_version}` : ''}{safeOutputSourceURL(model.max_output_source_url) && <> · <a href={safeOutputSourceURL(model.max_output_source_url)} target="_blank" rel="noopener noreferrer">查看来源</a></>}</small></td>
               <td>{model.has_api_key ? '已配置' : '未配置'}</td>
               <td>{model.checked_at ? <><span>{capabilitySummary(model.capabilities)} · 流式能力{model.capabilities.text_stream ? '可用' : '未验证'}</span><small className="table-sub">已检查 · {formatDate(model.checked_at)}</small></> : <span className="muted">尚未检查</span>}
                 {checked?.id === model.id && <p className="notice notice-info model-check-result">本次检查：{capabilitySummary(checked.capabilities)}</p>}
@@ -214,7 +233,7 @@ function ModelConnectionFormView({ form, setForm, presetID, setPresetID, isEditi
         const preset = modelConnectionPresets.find((item) => item.id === event.target.value);
         setPresetID(preset?.id ?? (event.target.value === 'custom' ? 'custom' : ''));
         if (preset) setForm({ ...form, name: preset.name, baseURL: preset.baseURL, modelName: preset.modelName, contextWindowOverrideTokens: '', clearContextWindowOverride: false });
-        else if (event.target.value === 'custom' && legacyOverride != null) setForm({ ...form, contextWindowOverrideTokens: String(legacyOverride), clearContextWindowOverride: false });
+        else if (event.target.value === 'custom') setForm({ ...form, contextWindowOverrideTokens: legacyOverride == null ? '' : String(legacyOverride), clearContextWindowOverride: false });
       }}>
         <option value="">选择服务商和模型</option>
         <option value="custom">自定义兼容模型</option>
@@ -227,10 +246,10 @@ function ModelConnectionFormView({ form, setForm, presetID, setPresetID, isEditi
         <optgroup label="Z.ai / GLM">
           {modelConnectionPresets.filter((preset) => preset.id.startsWith('glm-')).map((preset) => <option key={preset.id} value={preset.id}>{preset.modelName}</option>)}
         </optgroup>
-      </select><small className="muted">系统预设的上下文窗口由 Morde 自动识别；连接检查会发起模型调用，可能产生用量。</small></div>
+      </select><small className="muted">系统预设按服务端返回信息显示上下文窗口和单次生成上限；连接检查会发起模型调用，可能产生用量。</small></div>
       <div><label htmlFor="admin-model-name">显示名称</label><input id="admin-model-name" value={form.name} maxLength={80} required onChange={(event) => setForm({ ...form, name: event.target.value })} /></div>
       <div><label htmlFor="admin-model-provider-name">模型名</label><input id="admin-model-provider-name" value={form.modelName} maxLength={256} required readOnly={isPresetSelection} onChange={(event) => { setPresetID('custom'); setForm({ ...form, modelName: event.target.value, contextWindowOverrideTokens: '', clearContextWindowOverride: false }); }} /></div>
-      {isSystemRoute && <p className="muted connection-form-wide">上下文窗口由 Morde 模型目录自动识别，不能手工修改。</p>}
+      {isSystemRoute && <p className="muted connection-form-wide">系统预设按服务端返回目录信息显示上下文窗口和单次生成上限；不能手工修改。</p>}
       {!isSystemRoute && <div className="connection-form-wide"><label htmlFor="admin-model-context-window">上下文窗口高级覆盖（tokens，可选）</label><input id="admin-model-context-window" type="number" min={4096} max={2000000} step={1} value={form.contextWindowOverrideTokens} onChange={(event) => setForm({ ...form, contextWindowOverrideTokens: event.target.value, clearContextWindowOverride: false })} /><small className="muted">只用于自动发现不到容量的自定义服务；留空则保持未知。</small></div>}
       {isSystemRoute && isEditing && legacyOverride != null && <div className="connection-form-wide notice notice-info"><p>此系统预设保留了旧手工容量 {legacyOverride.toLocaleString()} tokens。</p><button type="button" className="button button-secondary button-small" disabled={form.clearContextWindowOverride} onClick={() => setForm({ ...form, clearContextWindowOverride: true })}>{form.clearContextWindowOverride ? '保存时将清除旧值' : '清除旧手工值，使用 Morde 目录容量'}</button></div>}
       <div className="connection-form-wide"><label htmlFor="admin-model-base-url">服务地址</label><input id="admin-model-base-url" type="url" pattern="https://.*" value={form.baseURL} required readOnly={isPresetSelection} onChange={(event) => { setPresetID('custom'); setForm({ ...form, baseURL: event.target.value, contextWindowOverrideTokens: '', clearContextWindowOverride: false }); }} /><small className="muted">只接受 HTTPS；服务端还会执行出站地址校验。</small></div>

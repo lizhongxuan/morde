@@ -24,13 +24,19 @@ type AdminObservabilityLinkWriter interface {
 
 type AdminObservabilityDeps struct {
 	Reader           app.AdminObservabilityReader
+	Logs             app.AdminObservabilityLogReader
 	LinkWriter       AdminObservabilityLinkWriter
 	ExportHealth     AdminObservabilityExportHealthProvider
+	LogHealth        AdminObservabilityLogHealthProvider
 	AgentCheckpoints AdminAgentCheckpointHistoryReader
 }
 
 type AdminObservabilityExportHealthProvider interface {
 	Health() app.AdminObservabilityExportHealth
+}
+
+type AdminObservabilityLogHealthProvider interface {
+	Health() app.AdminObservabilityLogHealth
 }
 
 type AdminAgentCheckpointHistoryReader interface {
@@ -40,6 +46,7 @@ type AdminAgentCheckpointHistoryReader interface {
 type adminObservabilityOverviewResponse struct {
 	Sources struct {
 		Spans     app.AdminObservabilitySource `json:"spans"`
+		Logs      app.AdminObservabilitySource `json:"logs"`
 		DSHEvents app.AdminObservabilitySource `json:"dsh_events"`
 	} `json:"sources"`
 	Spans24h struct {
@@ -80,6 +87,7 @@ func (h *api) registerAdminObservability(group *gin.RouterGroup) {
 	group.GET("/admin/observability/traces", h.listAdminObservabilityTraces)
 	group.GET("/admin/observability/traces/:trace_id", h.getAdminObservabilityTrace)
 	group.GET("/admin/observability/traces/:trace_id/events", h.listAdminObservabilityTraceEvents)
+	group.GET("/admin/observability/traces/:trace_id/logs", h.listAdminObservabilityTraceLogs)
 }
 
 func (h *api) getAdminObservabilityOverview(c *gin.Context) {
@@ -90,6 +98,7 @@ func (h *api) getAdminObservabilityOverview(c *gin.Context) {
 	response := adminObservabilityOverviewResponse{}
 	if h.deps.Observability.Reader == nil {
 		response.Sources.Spans = unavailableObservabilitySource("span reader is not configured")
+		response.Sources.Logs = unavailableObservabilitySource("correlated log reader is not configured")
 		response.Sources.DSHEvents = unavailableObservabilitySource("checkpoint reader is not configured")
 		c.JSON(http.StatusOK, response)
 		return
@@ -102,6 +111,7 @@ func (h *api) getAdminObservabilityOverview(c *gin.Context) {
 		return
 	}
 	response.Sources.Spans = value.SpansSource
+	response.Sources.Logs = value.LogsSource
 	response.Sources.DSHEvents = value.EventsSource
 	response.Spans24h.RequestCount = value.RequestCount
 	response.Spans24h.ErrorCount = value.ErrorCount
@@ -109,6 +119,7 @@ func (h *api) getAdminObservabilityOverview(c *gin.Context) {
 	if h.deps.Observability.ExportHealth != nil {
 		response.Sources.Spans = mergeExporterHealth(response.Sources.Spans, h.deps.Observability.ExportHealth.Health())
 	}
+	response.Sources.Logs = mergeCorrelatedLogHealth(response.Sources.Logs, h.deps.Observability.LogHealth)
 	c.JSON(http.StatusOK, response)
 }
 
@@ -257,6 +268,14 @@ func (h *api) listAdminObservabilityTraceEvents(c *gin.Context) {
 			page, pageErr := h.deps.Observability.AgentCheckpoints.ReadAdminPage(ctx, *sessions.TaskID, *sessions.OwnerID, sessionID, fromSequence)
 			if pageErr != nil {
 				response.Coverage = app.AdminObservabilitySource{Status: "partial", Reason: observabilityStringPointer("checkpoint page could not be read")}
+			} else if page.Coverage == app.AgentCheckpointCoverageEmpty {
+				response.Coverage = app.AdminObservabilitySource{Status: "partial", Reason: observabilityStringPointer("尚无已提交的 DSH checkpoint")}
+			} else if len(page.Payload) == 0 {
+				response.Coverage = checkpointPageCoverage(page.Coverage, page.Reason, sessions.Source)
+				if response.Coverage.Status == "available" {
+					response.Coverage.Status = "partial"
+					response.Coverage.Reason = observabilityStringPointer("当前 checkpoint 未返回可展示事件")
+				}
 			} else {
 				events, parseErr := parseAdminDSHCheckpointPage(sessionID, page.Payload, fromSequence, limit)
 				if parseErr != nil {
@@ -264,8 +283,11 @@ func (h *api) listAdminObservabilityTraceEvents(c *gin.Context) {
 				} else {
 					response.Events = events
 					response.Coverage = checkpointPageCoverage(page.Coverage, page.Reason, sessions.Source)
-					if len(events) > 0 && events[len(events)-1].Sequence < page.Watermark {
+					if len(events) > 0 && (len(events) == limit || page.NextFrom <= page.Watermark || page.Coverage == app.AgentCheckpointCoveragePartial) {
 						next := events[len(events)-1].Sequence + 1
+						response.NextSequence = &next
+					} else if len(events) == 0 && page.NextFrom <= page.Watermark {
+						next := page.NextFrom
 						response.NextSequence = &next
 					}
 				}
@@ -362,6 +384,10 @@ func redactAdminDiagnosticValue(key string, value any) any {
 
 func adminSensitiveDiagnosticKey(key string) bool {
 	normalized := strings.ToLower(strings.NewReplacer("_", "", "-", "", ".", "").Replace(key))
+	switch normalized {
+	case "inputtokens", "outputtokens", "prompttokens", "completiontokens", "reasoningtokens", "cachedinputtokens", "totaltokens":
+		return false
+	}
 	for _, marker := range []string{"password", "passwd", "passphrase", "secret", "token", "apikey", "authorization", "credential", "privatekey", "accesskey", "refreshkey"} {
 		if strings.Contains(normalized, marker) {
 			return true
@@ -386,8 +412,16 @@ func mergeExporterHealth(source app.AdminObservabilitySource, health app.AdminOb
 	}
 	reason := "span exporter health is unavailable"
 	switch health.ReasonCode {
-	case "export_failed":
+	case "export_failed", "span_export_failed":
 		reason = "最近一次 span 批次导出失败，历史记录仍可检索"
+	case "export_timeout":
+		reason = "span 批次导出超时，部分记录可能延迟或缺失"
+	case "export_cancelled":
+		reason = "span 批次导出已取消，部分记录可能缺失"
+	case "invalid_span_name":
+		reason = "span 名称不符合允许格式，所在批次未写入；可查看 Portal 诊断日志"
+	case "invalid_span_identity":
+		reason = "span 标识或时间无效，所在批次未写入；可查看 Portal 诊断日志"
 	case "queue_full":
 		reason = "span 队列发生溢出，部分记录可能缺失"
 	case "exporter_shutdown":
@@ -428,6 +462,17 @@ func valueOrEmpty(value *string) string {
 }
 
 func checkpointPageCoverage(status, reason string, fallback app.AdminObservabilitySource) app.AdminObservabilitySource {
+	switch status {
+	case app.AgentCheckpointCoverageComplete:
+		status = "available"
+	case app.AgentCheckpointCoverageEmpty:
+		status = "partial"
+		if reason == "" {
+			reason = "尚无已提交的 DSH checkpoint"
+		}
+	case app.AgentCheckpointCoveragePartial:
+		status = "partial"
+	}
 	if status != "available" && status != "partial" && status != "unavailable" && status != "disabled" {
 		status = "partial"
 	}

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, requestFetch } from '../api/client';
+import { ApiError, consumeServerSentEvents, requestFetch, unwrapApiResponse } from '../api/client';
 import { enterHostInNewTab, portalApi } from './api';
 import { projectApi } from './project-api';
 import { createMessageVariant, messageVariantContentTooLong } from './message-variants';
@@ -30,6 +30,100 @@ describe('typed Portal API client', () => {
     expect(spanID).not.toBe('0'.repeat(16));
     expect(request!.headers.get('X-Request-Id')).toBe('existing-request-id');
     expect(received).toEqual([{ request_id: 'existing-request-id', trace_id: 'a'.repeat(32), status: 200 }]);
+  });
+
+  it('creates a new request and trace ID for each retried request', async () => {
+    const requests: Request[] = [];
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push(new Request(new URL(typeof input === 'string' ? input : input.toString(), window.location.origin), init));
+      return Response.json({ ok: true });
+    }));
+
+    await requestFetch('/api/test');
+    await requestFetch('/api/test');
+
+    const requestIDs = requests.map((request) => request.headers.get('x-request-id'));
+    const traceparents = requests.map((request) => request.headers.get('traceparent'));
+    expect(requestIDs.every(Boolean)).toBe(true);
+    expect(new Set(requestIDs).size).toBe(2);
+    expect(traceparents.every((value) => value && /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/.test(value))).toBe(true);
+    expect(new Set(traceparents).size).toBe(2);
+  });
+
+  it('retains response trace IDs on typed API errors', () => {
+    let thrown: unknown;
+    try {
+      unwrapApiResponse({ error: { error: { code: 'internal', message: 'unavailable' } }, response: new Response('{}', {
+        status: 500, headers: { 'X-Request-Id': '123e4567-e89b-42d3-a456-426614174000', 'X-Trace-Id': 'd'.repeat(32) },
+      }) });
+    } catch (error) { thrown = error; }
+    expect(thrown).toBeInstanceOf(ApiError);
+    expect((thrown as ApiError).details).toMatchObject({
+      request_id: '123e4567-e89b-42d3-a456-426614174000', trace_id: 'd'.repeat(32),
+    });
+  });
+
+  it('reads streamed task events while tracing and cancelling the request', async () => {
+    let request: Request | undefined;
+    const received: { request_id?: string | null; trace_id?: string; status?: number }[] = [];
+    const onTrace = (event: Event) => received.push((event as CustomEvent).detail);
+    window.addEventListener('morde:api-trace', onTrace);
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(new URL(typeof input === 'string' ? input : input.toString(), window.location.origin), init);
+      return new Response('event: task.message\r\ndata: {"part":\r\ndata: "one"}\r\n\r\n', {
+        headers: { 'Content-Type': 'text/event-stream', 'X-Trace-Id': 'c'.repeat(32) },
+      });
+    }));
+    const events: { event: string; data: string; id: string }[] = [];
+    const controller = new AbortController();
+    try {
+      const response = await requestFetch('/api/tasks/q1234567/events?after=2', {
+        headers: { accept: 'text/event-stream' }, signal: controller.signal,
+      });
+      await consumeServerSentEvents(response, (event) => events.push(event), controller.signal);
+    } finally {
+      window.removeEventListener('morde:api-trace', onTrace);
+    }
+
+    expect(request!.headers.get('accept')).toBe('text/event-stream');
+    expect(request!.headers.get('x-request-id')).toBeTruthy();
+    expect(request!.headers.get('traceparent')).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    expect(events).toEqual([{ event: 'task.message', data: '{"part":\n"one"}', id: '' }]);
+    expect(received[0]).toMatchObject({ request_id: request!.headers.get('x-request-id'), trace_id: 'c'.repeat(32), status: 200 });
+  });
+
+  it('cancels a pending streamed response when the owning request is cancelled', async () => {
+    let streamCancelled = false;
+    const stream = new ReadableStream<Uint8Array>({ cancel: () => { streamCancelled = true; } });
+    const controller = new AbortController();
+    const consuming = consumeServerSentEvents(new Response(stream), () => undefined, controller.signal);
+    controller.abort();
+    await consuming;
+    expect(streamCancelled).toBe(true);
+  });
+
+  it('passes trace headers through fetch cancellation without marking it as a network outage', async () => {
+    const controller = new AbortController();
+    const events: string[] = [];
+    const onNetworkError = () => events.push('network-error');
+    window.addEventListener('morde:api-network-error', onNetworkError);
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn((input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(new URL(typeof input === 'string' ? input : input.toString(), window.location.origin), init);
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new TypeError('aborted')), { once: true });
+      });
+    }));
+    try {
+      const pending = requestFetch('/api/tasks/q1234567/events', { signal: controller.signal });
+      controller.abort();
+      await expect(pending).rejects.toThrow('aborted');
+    } finally {
+      window.removeEventListener('morde:api-network-error', onNetworkError);
+    }
+    expect(request!.headers.get('x-request-id')).toBeTruthy();
+    expect(request!.headers.get('traceparent')).toMatch(/^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/);
+    expect(events).toEqual([]);
   });
 
   it('builds a same-origin URL for a Task artifact download', () => {

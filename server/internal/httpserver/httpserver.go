@@ -227,7 +227,6 @@ func traceContext(provider trace.TracerProvider, logger *zap.Logger) gin.Handler
 				TraceID: traceID, SpanID: spanID, TraceFlags: parentSC.TraceFlags(), TraceState: parentSC.TraceState(),
 			})
 			ctx = trace.ContextWithSpanContext(ctx, spanContext)
-			span = trace.SpanFromContext(ctx)
 			if provider != nil {
 				exportState = "disabled"
 			}
@@ -246,7 +245,7 @@ func traceContext(provider trace.TracerProvider, logger *zap.Logger) gin.Handler
 			state.finalizers = append(state.finalizers, func(c *gin.Context) {
 				status := c.Writer.Status()
 				requestSpan := trace.SpanFromContext(c.Request.Context())
-				requestSpan.SetName(c.Request.Method + " " + route(c))
+				requestSpan.SetName(httpSpanName(c.Request.Method, route(c)))
 				requestSpan.SetAttributes(
 					attribute.String("http.request.method", c.Request.Method),
 					attribute.String("http.route", route(c)),
@@ -394,6 +393,32 @@ func route(c *gin.Context) string {
 		return label
 	}
 	return "unmatched"
+}
+
+func httpSpanName(method, routeName string) string {
+	method = metricMethod(method)
+	if routeName == "*" || safeHTTPRoute(routeName) {
+		candidate := method + " " + routeName
+		return candidate
+	}
+	if validLabel(routeName) {
+		return "http." + strings.ToLower(method) + "." + routeName
+	}
+	return "http." + strings.ToLower(method) + ".other"
+}
+
+func safeHTTPRoute(routeName string) bool {
+	if routeName == "" || routeName[0] != '/' {
+		return false
+	}
+	for i := 0; i < len(routeName); i++ {
+		ch := routeName[i]
+		isASCIIAlphaNumeric := ch >= 'a' && ch <= 'z' || ch >= 'A' && ch <= 'Z' || ch >= '0' && ch <= '9'
+		if !isASCIIAlphaNumeric && !strings.ContainsRune("._-/:{}*", rune(ch)) {
+			return false
+		}
+	}
+	return true
 }
 
 func authKind(c *gin.Context) string {

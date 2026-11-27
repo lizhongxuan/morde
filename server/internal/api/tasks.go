@@ -147,6 +147,7 @@ type taskSummaryResponse struct {
 	ModelID                     string                    `json:"model_id"`
 	Objective                   string                    `json:"objective"`
 	Status                      task.Status               `json:"status"`
+	WaitingReason               *string                   `json:"waiting_reason"`
 	QueuePriority               task.QueuePriority        `json:"queue_priority"`
 	CurrentStep                 *string                   `json:"current_step"`
 	StepCount                   int64                     `json:"step_count"`
@@ -1472,7 +1473,8 @@ func toTaskSummaryResponseWithK2(value task.Task, projection app.TaskK2Projectio
 		WorkspaceID: value.WorkspaceID, InputRevision: value.InputRevision, CurrentRevision: value.CurrentRevision,
 		DesiredRevision: value.DesiredRevision, WorkspaceCheckpointRevision: value.WorkspaceCheckpointRevision,
 		ApplicationID: value.ApplicationID, ConversationID: value.ConversationID,
-		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, QueuePriority: priority, CurrentStep: stringPointer(value.CurrentStep),
+		ModelID: value.ModelID, Objective: value.Objective, Status: value.Status, WaitingReason: stringPointer(value.WaitingReason),
+		QueuePriority: priority, CurrentStep: stringPointer(value.CurrentStep),
 		StepCount: value.StepCount, CompletedStepCount: value.CompletedStepCount,
 		Budget: taskBudgetResponse(value.Budget), Usage: taskUsageResponse{
 			ActiveSeconds: value.Usage.ActiveSeconds, ToolCalls: value.Usage.ToolCalls, ModelTokens: value.Usage.ModelTokens,

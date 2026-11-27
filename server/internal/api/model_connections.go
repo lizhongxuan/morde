@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net/http"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +29,12 @@ type modelConnectionResponse struct {
 	Name                        string                       `json:"name"`
 	BaseURL                     string                       `json:"base_url"`
 	ModelName                   string                       `json:"model_name"`
+	MaxOutputTokens             *int                         `json:"max_output_tokens"`
+	MaxOutputOverrideTokens     *int                         `json:"max_output_override_tokens"`
+	MaxOutputSource             app.ModelMaxOutputSource     `json:"max_output_source"`
+	MaxOutputResolvedAt         *time.Time                   `json:"max_output_resolved_at"`
+	MaxOutputCatalogVersion     *string                      `json:"max_output_catalog_version"`
+	MaxOutputSourceURL          *string                      `json:"max_output_source_url"`
 	ContextWindowTokens         *int                         `json:"context_window_tokens"`
 	ContextWindowOverrideTokens *int                         `json:"context_window_override_tokens"`
 	ContextWindowSource         app.ModelContextWindowSource `json:"context_window_source"`
@@ -70,6 +77,7 @@ type createModelConnectionRequest struct {
 	Name                        string                `json:"name"`
 	BaseURL                     string                `json:"base_url"`
 	ModelName                   string                `json:"model_name"`
+	MaxOutputOverrideTokens     optionalContextWindow `json:"max_output_override_tokens"`
 	ContextWindowTokens         optionalContextWindow `json:"context_window_tokens"`
 	ContextWindowOverrideTokens optionalContextWindow `json:"context_window_override_tokens"`
 	APIKey                      string                `json:"api_key"`
@@ -80,6 +88,7 @@ type updateModelConnectionRequest struct {
 	Name                        string                `json:"name"`
 	BaseURL                     string                `json:"base_url"`
 	ModelName                   string                `json:"model_name"`
+	MaxOutputOverrideTokens     optionalContextWindow `json:"max_output_override_tokens"`
 	ContextWindowTokens         optionalContextWindow `json:"context_window_tokens"`
 	ContextWindowOverrideTokens optionalContextWindow `json:"context_window_override_tokens"`
 	APIKey                      string                `json:"api_key"`
@@ -116,6 +125,15 @@ func applyContextWindowRequest(command *app.ModelConnectionCommand, legacy, over
 		command.LegacyContextWindowPresent = true
 		command.LegacyContextWindowTokens = legacy.Value
 	}
+	return nil
+}
+
+func applyModelMaxOutputRequest(command *app.ModelConnectionCommand, override optionalContextWindow) error {
+	if override.Present && override.Value != nil && (*override.Value < 1 || *override.Value > app.MaxModelOutputTokens) {
+		return domain.InvalidArgument("max_output_override_tokens", "max output override is outside the allowed range")
+	}
+	command.MaxOutputOverridePresent = override.Present
+	command.MaxOutputOverrideTokens = override.Value
 	return nil
 }
 
@@ -262,6 +280,10 @@ func (h *api) createModelConnection(c *gin.Context) {
 		writeError(c, err)
 		return
 	}
+	if err := applyModelMaxOutputRequest(&command, request.MaxOutputOverrideTokens); err != nil {
+		writeError(c, err)
+		return
+	}
 	item, err := h.deps.ModelConnections.Create(c.Request.Context(), principal, command)
 	if err != nil {
 		writeError(c, err)
@@ -305,6 +327,10 @@ func (h *api) updateModelConnection(c *gin.Context) {
 		APIKey: request.APIKey,
 	}
 	if err := applyContextWindowRequest(&command, request.ContextWindowTokens, request.ContextWindowOverrideTokens); err != nil {
+		writeError(c, err)
+		return
+	}
+	if err := applyModelMaxOutputRequest(&command, request.MaxOutputOverrideTokens); err != nil {
 		writeError(c, err)
 		return
 	}
@@ -455,6 +481,7 @@ func modelAccount(c *gin.Context) (identity.Principal, bool) {
 func toModelConnectionResponse(item app.ModelConnectionView) (modelConnectionResponse, error) {
 	if !domain.ValidModelConnectionID(item.ID) || item.Name == "" || item.BaseURL == "" || item.ModelName == "" || !item.HasAPIKey ||
 		item.CreatedAt.IsZero() || item.UpdatedAt.IsZero() || item.Capabilities.TextStream && !item.Capabilities.Text ||
+		!validModelMaxOutputCapacityView(item) ||
 		(item.CheckedAt == nil && (item.Capabilities.Text || item.Capabilities.TextStream || item.Capabilities.Tools || item.Capabilities.Vision ||
 			item.Capabilities.MediaGeneration.ImageGeneration || item.Capabilities.MediaGeneration.VideoGeneration || item.Capabilities.MediaGeneration.SpeechGeneration)) {
 		return modelConnectionResponse{}, domain.NewError(domain.CodeInternal, "internal error")
@@ -463,14 +490,48 @@ func toModelConnectionResponse(item app.ModelConnectionView) (modelConnectionRes
 	if source == "" {
 		source = app.ModelContextWindowUnknown
 	}
+	maxOutputSource := item.MaxOutputSource
+	if maxOutputSource == "" {
+		maxOutputSource = app.ModelMaxOutputUnknown
+	}
 	return modelConnectionResponse{
 		ID: item.ID, Name: item.Name, BaseURL: item.BaseURL, ModelName: item.ModelName,
+		MaxOutputTokens: item.MaxOutputTokens, MaxOutputOverrideTokens: item.MaxOutputOverrideTokens,
+		MaxOutputSource: maxOutputSource, MaxOutputResolvedAt: item.MaxOutputResolvedAt,
+		MaxOutputCatalogVersion: item.MaxOutputCatalogVersion, MaxOutputSourceURL: item.MaxOutputSourceURL,
 		ContextWindowTokens: item.ContextWindowTokens, ContextWindowOverrideTokens: item.ContextWindowOverrideTokens,
 		ContextWindowSource: source, ContextWindowResolvedAt: item.ContextWindowResolvedAt,
 		ContextWindowCatalogVersion: item.ContextWindowCatalogVersion, Shared: item.Shared, HasAPIKey: item.HasAPIKey,
 		Capabilities: modelConnectionCapabilitiesFrom(item.Capabilities),
 		CheckedAt:    item.CheckedAt, CreatedAt: item.CreatedAt, UpdatedAt: item.UpdatedAt,
 	}, nil
+}
+
+func validModelMaxOutputCapacityView(item app.ModelConnectionView) bool {
+	source := item.MaxOutputSource
+	if source == "" {
+		source = app.ModelMaxOutputUnknown
+	}
+	switch source {
+	case app.ModelMaxOutputUnknown:
+		return item.MaxOutputTokens == nil && item.MaxOutputOverrideTokens == nil && item.MaxOutputResolvedAt == nil &&
+			item.MaxOutputCatalogVersion == nil && item.MaxOutputSourceURL == nil
+	case app.ModelMaxOutputOverride:
+		return item.MaxOutputTokens != nil && item.MaxOutputOverrideTokens != nil && *item.MaxOutputTokens == *item.MaxOutputOverrideTokens &&
+			*item.MaxOutputTokens >= 1 && *item.MaxOutputTokens <= app.MaxModelOutputTokens && item.MaxOutputResolvedAt == nil &&
+			item.MaxOutputCatalogVersion == nil && item.MaxOutputSourceURL == nil
+	case app.ModelMaxOutputModelCatalog:
+		if item.MaxOutputTokens == nil || *item.MaxOutputTokens < 1 || *item.MaxOutputTokens > app.MaxModelOutputTokens ||
+			item.MaxOutputOverrideTokens != nil || item.MaxOutputResolvedAt == nil || item.MaxOutputCatalogVersion == nil ||
+			*item.MaxOutputCatalogVersion == "" || len(*item.MaxOutputCatalogVersion) > 64 || item.MaxOutputSourceURL == nil ||
+			len(*item.MaxOutputSourceURL) == 0 || len(*item.MaxOutputSourceURL) > 2048 {
+			return false
+		}
+		parsed, err := url.Parse(*item.MaxOutputSourceURL)
+		return err == nil && strings.EqualFold(parsed.Scheme, "https") && parsed.Host != ""
+	default:
+		return false
+	}
 }
 
 func decodeStrictModelJSON(c *gin.Context, target any) bool {

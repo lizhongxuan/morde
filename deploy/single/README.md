@@ -102,6 +102,14 @@ Host 入口会在 Morde Runtime 进程意外退出后采用 1–30 秒有界退�
 
 验证脚本在 `verify/`。只配置指向本机的测试服务，使用合成数据；测试输出保存在本地。runsc 不可用或真实 OpenSandbox 缺失时，应记录未完成，禁止将 mock UI 结果当作真实主机验收。首版没有暂停/唤醒、直连令牌、公开预览、VSCode、通知及一键安装器。
 
+## Harness 可观测系统发布
+
+可观测系统继续运行在现有 Portal 与 PostgreSQL 上：不新增容器、服务、对外端口或数据库连接池。Portal 使用本地 OpenTelemetry Go SDK 和有界 PostgreSQL span exporter；span、消息关联和 trace 关联日志保留 7 天，DSH 事件只读现有加密 checkpoint，清理任务不会触碰 checkpoint。Span 队列上限 512、单批最多 128 spans、单 span payload 上限 64 KiB、单批 4 MiB；zap 日志镜像队列上限 512、单批最多 64 条、单条属性不超过 8 KiB。导出或日志写入失败时业务继续，管理页显示采集缺口。
+
+发布时按常规单机升级顺序先完成本地 PostgreSQL 备份，再构建目标 Linux 架构的 Portal，运行 `portal migrate up` 应用 `00258_observability_spans.sql`、`00259_observability_trace_links.sql`、`00260_observability_logs.sql` 和 `00261_observability_task_attempt_links.sql`，然后安装并重启 Portal。迁移为追加表和索引；迁移不创建其他进程。新服务就绪后以管理员检查 `/admin/observability` 的来源状态、span 树与跨 attempt link、关联日志和 DSH checkpoint 详情。4 核 / 8 GiB 单机继续受现有 PostgreSQL 内存限制；发布后观察 Portal 延迟、PostgreSQL 内存和磁盘增长，确认所有 7 天观测保留清理持续运行。
+
+回滚时停止 Portal、恢复上一版 Portal 二进制并重启；保留四张观测表及迁移版本。旧版会忽略这些追加表，保留历史诊断数据。不要为应用回滚执行 Goose Down：它会删除 Span、消息/attempt 关联和日志数据；DSH checkpoint 不属于这些迁移，也不得清理或重建。若数据库恢复需要回退，使用同一时点的数据库与既有密文备份流程并遵循下方恢复步骤。
+
 ## 离线备份与恢复
 
 `backup/backup.py` 的 v4 bundle 包含四个本地数据根：PostgreSQL 完整数据目录、连续 WAL 归档、Workspace 不可变块、Site 发布物，以及 Morde-managed、`cloudhost` Compose 和已知旧 Host/Workspace Docker named volumes。个人附件块、记录正文及记录专用附件随 PostgreSQL 目录备份；Workspace 当前文件投影不归档，恢复后由数据库 revision 与块库重建。校验覆盖校验和、tar 路径、控制文件、WAL 段、卷归档与块/发布物结构，不逐行核对业务引用。

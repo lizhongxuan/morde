@@ -90,10 +90,21 @@ func taskModelResponseAAD(reservation ModelCallReservation) (taskModelResponseId
 	if dshCallID == "" {
 		dshCallID = reservation.CallID
 	}
-	expectedCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, reservation.Task.ThroughSequence)
-	if err != nil || expectedCallID != dshCallID || reservation.Task.RecoveryCallID != "" &&
-		(reservation.Task.RecoveryCallID != reservation.CallID || reservation.Task.RecoveryCallID == dshCallID) ||
-		reservation.Task.RecoveryCallID == "" && reservation.CallID != dshCallID {
+	failedCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, reservation.Task.ThroughSequence)
+	if err != nil {
+		return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response call identity is invalid")
+	}
+	recoveryDSHCallID, dshRecoveryErr := TaskModelRecoveryDSHCallID(reservation.Task.TaskID, reservation.Task.TaskRevision,
+		failedCallID, reservation.Task.ThroughSequence)
+	recoveryLedgerCallID, ledgerRecoveryErr := TaskModelRecoveryCallID(reservation.Task.TaskID, reservation.Task.TaskRevision,
+		failedCallID, reservation.Task.ThroughSequence)
+	if reservation.Task.RecoveryCallID == "" {
+		if dshCallID != failedCallID || reservation.CallID != failedCallID || reservation.Task.RecoveryDSHCallID != "" {
+			return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response call identity is invalid")
+		}
+	} else if dshRecoveryErr != nil || ledgerRecoveryErr != nil || dshCallID != recoveryDSHCallID ||
+		reservation.CallID != recoveryLedgerCallID || reservation.Task.RecoveryDSHCallID != recoveryDSHCallID ||
+		reservation.Task.RecoveryCallID != recoveryLedgerCallID || reservation.CallID == dshCallID {
 		return taskModelResponseIdentity{}, nil, domain.InvalidArgument("task_model_response", "task model response call identity is invalid")
 	}
 	identity := taskModelResponseIdentity{Version: 1, OwnerID: reservation.OwnerID, TaskOwnerID: reservation.Task.OwnerID,

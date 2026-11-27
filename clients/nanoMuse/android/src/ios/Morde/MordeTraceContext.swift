@@ -9,7 +9,9 @@ struct MordeTraceContext: Equatable {
 
     init() {
         traceID = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
-        spanID = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().suffix(16))
+        let candidate = String(UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased().suffix(16))
+        spanID = candidate == String(repeating: "0", count: 16)
+            ? String(candidate.dropLast()) + "1" : candidate
     }
 
     var traceparent: String { "00-\(traceID)-\(spanID)-01" }

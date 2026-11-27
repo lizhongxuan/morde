@@ -26,6 +26,15 @@ describe("portal error messages", () => {
     expect(errorMessage(new ApiError({ code: "new_code", status: 400, message: "具体错误" }))).toBe("具体错误");
   });
 
+  it("adds response request and trace IDs to API error diagnostics", () => {
+    const error = new ApiError({ code: "internal", status: 500, message: "private server detail", details: {
+      request_id: "123e4567-e89b-42d3-a456-426614174000", trace_id: "a".repeat(32),
+    } });
+    expect(errorMessage(error)).toContain("request ID 123e4567-e89b-42d3-a456-426614174000");
+    expect(errorMessage(error)).toContain(`trace ID ${'a'.repeat(32)}`);
+    expect(errorMessage(error)).not.toContain("private server detail");
+  });
+
   it("hides parser internals when an API returns non-JSON content", () => {
     expect(errorMessage(new SyntaxError(`Unexpected token '<', "<!doctype "... is not valid JSON`)))
       .toBe("服务器响应格式异常，请稍后重试");

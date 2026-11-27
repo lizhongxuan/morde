@@ -1,10 +1,10 @@
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { BasicCompactionEngine } from '../vendor/deepseek-harness/packages/compaction/compaction-basic/dist/index.js'
-import LlmRuntime, { BlockAssembler, CONTEXT_WINDOW_EXCEEDED_CODE, LlmAdapter, LlmError, MessageId, createToolResultMessage, createUserMessage, freezeMessage } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { AssistantStreamAccumulator, BlockAssembler, CONTEXT_WINDOW_EXCEEDED_CODE, LlmAdapter, LlmError, MessageId, createToolResultMessage, createUserMessage, freezeMessage, projectFilesToText, projectToolUpdates } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import * as checkpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
 import SessionPersistence, { assertContiguous, assertStoredId, assertVersion, materializeAppendBatch, materializeCreateHeader, validateStoredEvents } from '@deepseek-ai/dsh-session-persistence'
@@ -28,6 +28,8 @@ const MAX_TOOL_OUTPUT_BYTES = 1024 * 1024
 const ID = /^[A-Za-z0-9_-]{1,128}$/
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/
 const DIGEST = /^[a-f0-9]{64}$/
+const TRACEPARENT = /^00-([a-f0-9]{32})-([a-f0-9]{16})-([a-f0-9]{2})$/
+const MODEL_BUDGET_IDENTITY_FIELDS = ['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
 export const MODEL_FAILURE_SUMMARIES = Object.freeze({
   [CONTEXT_WINDOW_EXCEEDED_CODE]: 'The model context window was exceeded.',
   MODEL_PROVIDER_RATE_LIMITED: 'The model provider rate limit was reached.',
@@ -740,6 +742,126 @@ export function modelCallID(taskID, sessionID, throughSeq) {
   return `mdl_${createHash('sha256').update(input, 'utf8').digest('hex')}`
 }
 
+export function modelRecoveryCallIDs(taskID, taskRevision, failedCallID, throughSeq) {
+  if (!ID.test(taskID) || !Number.isSafeInteger(taskRevision) || taskRevision < 0 || !ID.test(failedCallID) ||
+      !Number.isSafeInteger(throughSeq) || throughSeq < 0) throw new Error('invalid model recovery identity')
+  const identity = `${taskID}\n${taskRevision}\n${failedCallID}\n${throughSeq}`
+  const dshCallID = `mdr_${createHash('sha256').update(`morde-task-model-recovery-dsh-v1\n${identity}`, 'utf8').digest('hex')}`
+  const ledgerCallID = `mrc_${createHash('sha256').update(`morde-task-model-recovery-v1\n${identity}`, 'utf8').digest('hex')}`
+  return { dshCallID, ledgerCallID }
+}
+
+function validModelRecoveryStart(frame) {
+  const recovery = frame.model_recovery
+  const keys = ['task_id', 'task_revision', 'session_id', 'authorization_version', 'checkpoint_through_seq',
+    'checkpoint_sha256', 'failed_call_id', 'recovery_dsh_call_id', 'recovery_call_id']
+  if (!isObject(recovery) || !exactKeys(recovery, keys) || frame.resume !== true ||
+      recovery.task_id !== frame.task_id || recovery.task_revision !== frame.task_revision ||
+      recovery.session_id !== frame.session_id || recovery.authorization_version !== frame.authorization_version ||
+      recovery.checkpoint_through_seq !== frame.checkpoint_through_seq || recovery.checkpoint_sha256 !== frame.checkpoint_sha256 ||
+      !ID.test(recovery.task_id ?? '') || !Number.isSafeInteger(recovery.task_revision) || recovery.task_revision < 0 ||
+      !ID.test(recovery.session_id ?? '') || !Number.isSafeInteger(recovery.authorization_version) || recovery.authorization_version < 1 ||
+      !Number.isSafeInteger(recovery.checkpoint_through_seq) || recovery.checkpoint_through_seq < 0 ||
+      !DIGEST.test(recovery.checkpoint_sha256 ?? '') || !ID.test(recovery.failed_call_id ?? '') ||
+      !ID.test(recovery.recovery_dsh_call_id ?? '') || !ID.test(recovery.recovery_call_id ?? '')) return false
+  let failedCallID
+  let expectedRecoveryIDs
+  try {
+    failedCallID = modelCallID(recovery.task_id, recovery.session_id, recovery.checkpoint_through_seq)
+    expectedRecoveryIDs = modelRecoveryCallIDs(recovery.task_id, recovery.task_revision, failedCallID, recovery.checkpoint_through_seq)
+  } catch {
+    return false
+  }
+  return recovery.failed_call_id === failedCallID && recovery.recovery_dsh_call_id === expectedRecoveryIDs.dshCallID &&
+    recovery.recovery_call_id === expectedRecoveryIDs.ledgerCallID && recovery.recovery_dsh_call_id !== recovery.failed_call_id &&
+    recovery.recovery_dsh_call_id !== recovery.recovery_call_id
+}
+
+export class ModelBudgetPlanStore {
+  constructor() {
+    this.plans = new Map()
+  }
+
+  save(plan, signal) {
+    if (!isObject(plan) || typeof plan.call_id !== 'string' || typeof plan.dsh_call_id !== 'string' || !ID.test(plan.dsh_call_id) ||
+        typeof plan.budget_plan_id !== 'string' ||
+        typeof plan.request_digest !== 'string' || !DIGEST.test(plan.request_digest) ||
+        !Number.isSafeInteger(plan.max_tokens) || plan.max_tokens <= 0 || !isObject(plan.identity) ||
+        !Number.isSafeInteger(plan.through_seq) || plan.through_seq < 0 ||
+        !signal || typeof signal.throwIfAborted !== 'function' || typeof signal.addEventListener !== 'function') {
+      throw new Error('model budget plan is invalid')
+    }
+    const sessionID = plan.identity.session_id
+    if (typeof sessionID !== 'string' || [...this.plans.values()].some(existing => existing.plan.identity.session_id === sessionID)) {
+      throw new Error('model budget plan already exists for the session')
+    }
+    const key = JSON.stringify([sessionID, plan.request_digest, plan.max_tokens, plan.call_id])
+    this.plans.set(key, { plan: structuredClone(plan), signal })
+  }
+
+  take(sessionID, signal) {
+    const match = [...this.plans].find(([, entry]) => entry.plan.identity.session_id === sessionID)
+    if (!match) throw new Error('model budget plan is missing')
+    const [key, entry] = match
+    if (entry.signal !== signal) throw new Error('model budget plan does not match this model call signal')
+    this.plans.delete(key)
+    if ([...this.plans.values()].some(candidate => candidate.plan.identity.session_id === sessionID)) {
+      throw new Error('multiple model budget plans are pending for the session')
+    }
+    return entry.plan
+  }
+
+  clearSession(sessionID) {
+    for (const [key, entry] of this.plans) {
+      if (entry.plan.identity.session_id === sessionID) this.plans.delete(key)
+    }
+  }
+}
+
+export function projectModelBudgetDraft(messages, tools, toolHistory, llm) {
+  if (!Array.isArray(messages) || !isObject(llm) || typeof llm.fileReadPath !== 'function') {
+    throw new Error('model budget draft projection is unavailable')
+  }
+  const fileProjectedMessages = projectFilesToText(messages, ref => llm.fileReadPath(ref))
+  const projected = projectToolUpdates(fileProjectedMessages, tools ?? [], undefined, toolHistory)
+  return { messages: projected.messages, tools: projected.tools ?? [] }
+}
+
+function activeTaskCompactionPosition(session) {
+  let turn
+  let step
+  let completedStep = 0
+  for (const event of session.snapshotEvents()) {
+    const data = event.data ?? {}
+    if (event.type === 'turn/start') {
+      if (turn !== undefined || !Number.isSafeInteger(data.turn) || data.turn < 1) {
+        throw new Error('model budget compaction has no valid active DSH turn')
+      }
+      turn = data.turn
+      step = undefined
+      completedStep = 0
+    } else if (event.type === 'step/start' && data.turn === turn) {
+      if (turn === undefined || step !== undefined || !Number.isSafeInteger(data.step) || data.step < 1) {
+        throw new Error('model budget compaction has no valid active DSH step')
+      }
+      step = data.step
+    } else if (event.type === 'step/end' && data.turn === turn) {
+      if (turn === undefined || step !== data.step) throw new Error('model budget compaction DSH step is unbalanced')
+      completedStep = data.step
+      step = undefined
+    } else if (event.type === 'turn/end' && data.turn === turn) {
+      if (turn === undefined || step !== undefined) throw new Error('model budget compaction DSH turn is unbalanced')
+      turn = undefined
+      completedStep = 0
+    }
+  }
+  if (turn === undefined) throw new Error('model budget compaction is outside an active DSH turn')
+  // DSH invokes pressure compaction before opening the next step. An open step
+  // identifies model-switch/overflow compaction; otherwise the next step is
+  // exactly the active turn's completed-step count plus one.
+  return { turn, step: step ?? completedStep + 1 }
+}
+
 export function coordinatorModelCallID(conversationID, messageID, sessionID, throughSeq) {
   if (![conversationID, messageID, sessionID].every(value => ID.test(value)) ||
       !Number.isSafeInteger(throughSeq) || throughSeq < 0) throw new Error('invalid coordinator model call identity')
@@ -782,9 +904,17 @@ function validTaskStartMessage(message, identity) {
 }
 
 export function validStart(frame) {
-  if (frame.version !== 1 || frame.type !== 'start') return false
+  if (![1, 2].includes(frame.version) || frame.type !== 'start') return false
+  const tracedStart = frame.version === 2
+  if (tracedStart) {
+    const match = typeof frame.traceparent === 'string' ? TRACEPARENT.exec(frame.traceparent) : null
+    if (!match || /^0+$/.test(match[1]) || /^0+$/.test(match[2]) || frame.context_role !== undefined) return false
+  } else if (Object.hasOwn(frame, 'traceparent')) return false
   const coordinator = frame.context_role === 'coordinator'
   const taskValidationReview = frame.context_role === 'task_validation_review'
+  if (frame.model_budget_admission !== undefined &&
+      (frame.model_budget_admission !== true || coordinator || taskValidationReview)) return false
+  if ((coordinator || taskValidationReview) && tracedStart) return false
   if (taskValidationReview) {
     const allowed = [
       'type', 'version', ...TASK_VALIDATION_REVIEW_IDENTITY_FIELDS, 'model', 'tools', 'system_prompt', 'prompt', 'max_tokens',
@@ -879,6 +1009,7 @@ export function validStart(frame) {
     if (frame.initial_message === undefined && !(coordinator && frame.purpose === 'compaction') &&
         (typeof frame.prompt !== 'string' || !frame.prompt.trim() || Buffer.byteLength(frame.prompt) > MAX_CHECKPOINT_PAYLOAD_BYTES / 2)) return false
   }
+  if (frame.model_recovery !== undefined && (coordinator || taskValidationReview || !validModelRecoveryStart(frame))) return false
   if (frame.step_retry !== undefined && !validStepRetryStart(frame, frame.step_retry)) return false
   if (coordinator && frame.resume === true && frame.prompt !== undefined) return false
   return frame.max_tokens === undefined || (Number.isSafeInteger(frame.max_tokens) && frame.max_tokens > 0 && frame.max_tokens <= 1_000_000 &&
@@ -1049,6 +1180,7 @@ export class DurableSession {
     this.through = -1
     this.digest = start.resume === true ? start.checkpoint_sha256 : ''
     this.lastModelThrough = -1
+    this.modelBudgetPlans = new ModelBudgetPlanStore()
     this.currentTaskTurnMessageIDs = new Map()
     this.failure = undefined
     this.serial = Promise.resolve()
@@ -1673,26 +1805,74 @@ export async function runAgent(ipc, frame) {
         }
       }
       const generate = async (sourceMessages, prompt) => {
+        const messages = [...sourceMessages, compactionMessage(prompt)]
+        const budgetDurable = durables.get(agent.session.id)
+        const budgetedTask = budgetDurable?.start.model_budget_admission === true
+        let maxTokens = this.config.maxTokens
+        let budgetPosition
+        if (budgetedTask) {
+          signal.throwIfAborted()
+          await budgetDurable.flush(agent.session)
+          signal.throwIfAborted()
+          const through = budgetDurable.through
+          if (!Number.isSafeInteger(through) || through < 0) {
+            throw new Error('model budget compaction baseline checkpoint is unavailable')
+          }
+          budgetPosition = activeTaskCompactionPosition(agent.session)
+          budgetDurable.modelBudgetPlans.clearSession(budgetDurable.identity.session_id)
+          const callID = randomUUID()
+          const dshCallID = modelCallID(budgetDurable.identity.task_id, budgetDurable.identity.session_id, through)
+          const providerDraft = projectModelBudgetDraft(messages, [], undefined, ctx.llm)
+          const plan = await ipc.prepareModelBudget(budgetDurable.identity, through, callID, dshCallID, {
+            ...budgetPosition,
+            signal,
+            config: { provider: 'morde', model: frame.model, purpose: 'compaction', maxTokens },
+            ...providerDraft,
+          })
+          signal.throwIfAborted()
+          if (plan.call_id !== callID || plan.through_seq !== through ||
+              !MODEL_BUDGET_IDENTITY_FIELDS.every(key => plan.identity?.[key] === budgetDurable.identity[key])) {
+            throw new Error('model budget compaction plan does not match its durable request')
+          }
+          budgetDurable.modelBudgetPlans.save(plan, signal)
+          maxTokens = plan.max_tokens
+        }
         const assembler = new BlockAssembler()
-        for await (const chunk of ctx.llm.stream({ provider: 'morde', model: frame.model,
-          messages: [...sourceMessages, compactionMessage(prompt)], tools: [], maxTokens: this.config.maxTokens,
-          sessionId: agent.session.id, purpose: 'compaction', signal })) assembler.push(chunk)
-        const finish = assembler.finish
-        if (finish.kind !== 'stop') {
-          const code = finish.kind === 'error' || finish.kind === 'aborted' ? finish.failure.code : 'MAX_TOKENS'
-          throw new LlmError('conversation summary generation did not finish safely', code)
+        const stream = budgetedTask ? new AssistantStreamAccumulator() : undefined
+        try {
+          for await (const chunk of ctx.llm.stream({ provider: 'morde', model: frame.model,
+            messages, tools: [], maxTokens, sessionId: agent.session.id, purpose: 'compaction', signal })) {
+            stream?.push({ time: Date.now(), chunk })
+            assembler.push(chunk)
+          }
+          const finish = assembler.finish
+          if (finish.kind !== 'stop') {
+            const code = finish.kind === 'error' || finish.kind === 'aborted' ? finish.failure.code : 'MAX_TOKENS'
+            throw new LlmError('conversation summary generation did not finish safely', code)
+          }
+          const output = assembler.blocks()
+          if (!output.length || output.some(block => block.type !== 'text')) {
+            throw new LlmError('conversation summary must contain text only', 'UNSUPPORTED_CONTENT')
+          }
+          const text = output.map(block => block.text).join('').trim()
+          if (!text || Buffer.byteLength(text, 'utf8') > MAX_COMPACTION_SUMMARY_BYTES) {
+            throw new LlmError('conversation summary is empty or exceeds its output limit', 'RESULT_TOO_LARGE')
+          }
+          return { summary: [{ type: 'text', text }], rawOutput: output, llmStreamCall: true,
+            provider: 'morde', model: frame.model, maxTokens,
+            ...(assembler.usage === undefined ? {} : { usage: assembler.usage }) }
+        } catch (error) {
+          if (budgetedTask && error?.code === CONTEXT_WINDOW_EXCEEDED_CODE) {
+            signal.throwIfAborted()
+            if (!budgetPosition || !stream) throw new Error('model budget compaction attempt checkpoint is unavailable')
+            agent.session.append('assistant/attempt', {
+              turn: budgetPosition.turn, step: budgetPosition.step, stream: [...stream.snapshot()],
+            })
+            await budgetDurable.flush(agent.session)
+            signal.throwIfAborted()
+          }
+          throw error
         }
-        const output = assembler.blocks()
-        if (!output.length || output.some(block => block.type !== 'text')) {
-          throw new LlmError('conversation summary must contain text only', 'UNSUPPORTED_CONTENT')
-        }
-        const text = output.map(block => block.text).join('').trim()
-        if (!text || Buffer.byteLength(text, 'utf8') > MAX_COMPACTION_SUMMARY_BYTES) {
-          throw new LlmError('conversation summary is empty or exceeds its output limit', 'RESULT_TOO_LARGE')
-        }
-        return { summary: [{ type: 'text', text }], rawOutput: output, llmStreamCall: true,
-          provider: 'morde', model: frame.model, maxTokens: this.config.maxTokens,
-          ...(assembler.usage === undefined ? {} : { usage: assembler.usage }) }
       }
       try {
         const summary = await generate(restored, COMPACTION_SUMMARY_PROMPT)
@@ -1769,6 +1949,34 @@ export async function runAgent(ipc, frame) {
           if (subject === agent) observeStatus(status)
         })
         observeStatus(agent.status)
+      }
+      if (sessionDurable.start.model_budget_admission === true) {
+        agentCtx.on('agent/request-budget', async payload => {
+          const budgetDurable = durables.get(payload?.agent?.id)
+          if (budgetDurable !== sessionDurable || payload.agent !== agent || sessionDurable.agent !== agent ||
+              payload.signal === undefined || !isObject(payload.config) || !Array.isArray(payload.messages)) {
+            throw new Error('model budget request has no matching durable session')
+          }
+          await sessionDurable.flush(agent.session)
+          payload.signal.throwIfAborted()
+          const through = sessionDurable.through
+          if (!Number.isSafeInteger(through) || through < 0) throw new Error('model budget baseline checkpoint is unavailable')
+          sessionDurable.modelBudgetPlans.clearSession(sessionDurable.identity.session_id)
+          const callID = randomUUID()
+          const recovery = sessionDurable.start.model_recovery
+          const dshCallID = recovery && through === recovery.checkpoint_through_seq
+            ? recovery.recovery_dsh_call_id
+            : modelCallID(sessionDurable.identity.task_id, sessionDurable.identity.session_id, through)
+          const providerDraft = projectModelBudgetDraft(payload.messages, payload.tools, payload.toolHistory, ctx.llm)
+          const plan = await ipc.prepareModelBudget(sessionDurable.identity, through, callID, dshCallID, { ...payload, ...providerDraft })
+          payload.signal.throwIfAborted()
+          if (plan.call_id !== callID || plan.through_seq !== through ||
+              !MODEL_BUDGET_IDENTITY_FIELDS.every(key => plan.identity?.[key] === sessionDurable.identity[key])) {
+            throw new Error('model budget plan does not match the durable request')
+          }
+          sessionDurable.modelBudgetPlans.save(plan, payload.signal)
+          return { maxTokens: plan.max_tokens }
+        })
       }
       const retryMode = sessionDurable === durable && sessionDurable.start.step_retry !== undefined
       const tools = retryMode ? [] : (sessionDurable.start.tools ?? [])
@@ -1869,6 +2077,7 @@ export async function runAgent(ipc, frame) {
       const dispose = handle.dispose.bind(handle)
       handle.dispose = async (...args) => {
         sessionDurable.stopHeartbeats()
+        sessionDurable.modelBudgetPlans.clearSession(sessionDurable.identity.session_id)
         return dispose(...args)
       }
       return handle
@@ -1924,6 +2133,7 @@ export async function runAgent(ipc, frame) {
   async function runChildSession(child, callID, argumentsValue, parentAgent, signal, job) {
     const childStart = {
       type: 'start', version: 1, ...child.identity, task_revision: frame.task_revision, model: frame.model, tools: child.tools,
+      ...(frame.model_budget_admission === true ? { model_budget_admission: true } : {}),
       ...(child.through < 0 ? { prompt: `# ${argumentsValue.title}\n\n${argumentsValue.objective}` } : {
         resume: true, checkpoint_through_seq: child.through, checkpoint_sha256: child.digest,
       }),
@@ -2032,6 +2242,7 @@ export async function runAgent(ipc, frame) {
         await handle.dispose()
       }
       if (durables.get(child.identity.session_id) === durableChild) durables.delete(child.identity.session_id)
+      durableChild.modelBudgetPlans.clearSession(durableChild.identity.session_id)
       childOwners.delete(child.identity.session_id)
     }
   }
@@ -2249,7 +2460,21 @@ export async function runAgent(ipc, frame) {
         tools: options.tools ?? [],
         ...(options.maxTokens === undefined ? {} : { max_tokens: options.maxTokens }),
       }
-      const id = sessionDurable.identity.context_role === 'task_validation_review'
+      let budgetAdmission
+      if (sessionDurable.start.model_budget_admission === true) {
+        budgetAdmission = sessionDurable.modelBudgetPlans.take(sessionDurable.identity.session_id, options.signal)
+      }
+      const recovery = sessionDurable.start.model_recovery
+      const recoveryFrame = recovery && options.purpose !== 'compaction' &&
+        budgetAdmission?.through_seq === recovery.checkpoint_through_seq &&
+        budgetAdmission?.dsh_call_id === recovery.recovery_dsh_call_id
+      const taskContext = sessionDurable.identity.context_role !== 'coordinator' &&
+        sessionDurable.identity.context_role !== 'task_validation_review'
+      const id = taskContext
+        ? recoveryFrame
+          ? recovery.recovery_dsh_call_id
+          : modelCallID(sessionDurable.identity.task_id, sessionDurable.identity.session_id, requestThrough)
+        : sessionDurable.identity.context_role === 'task_validation_review'
         ? taskValidationReviewModelCallID(sessionDurable.identity.owner_id, sessionDurable.identity.task_id,
           sessionDurable.identity.task_revision, sessionDurable.identity.result_event_sequence,
           sessionDurable.identity.result_sha256, sessionDurable.identity.claim_generation,
@@ -2261,9 +2486,16 @@ export async function runAgent(ipc, frame) {
           : coordinatorModelCallID(sessionDurable.identity.conversation_id, sessionDurable.identity.message_id,
             sessionDurable.identity.session_id, requestThrough)
         : modelCallID(sessionDurable.identity.task_id, sessionDurable.identity.session_id, requestThrough)
+      if (sessionDurable.start.model_budget_admission === true) {
+        if (!MODEL_BUDGET_IDENTITY_FIELDS.every(key => budgetAdmission.identity?.[key] === sessionDurable.identity[key]) ||
+            budgetAdmission.through_seq > requestThrough || options.maxTokens !== budgetAdmission.max_tokens ||
+            recoveryFrame && (budgetAdmission.through_seq !== recovery.checkpoint_through_seq || id !== recovery.recovery_dsh_call_id)) {
+          throw new Error('model budget plan does not match the final DSH request cap')
+        }
+      }
       const chunks = []
       await sessionDurable.runActivity('model', id, options.signal, async () => {
-        for await (const chunk of ipc.streamModel(sessionDurable.identity, id, requestThrough, request, options.signal)) chunks.push(chunk)
+        for await (const chunk of ipc.streamModel(sessionDurable.identity, id, requestThrough, request, options.signal, budgetAdmission)) chunks.push(chunk)
       })
       const finishChunk = chunks.findLast(chunk => chunk.type === 'finish')
       const currentTaskTurnMessageID = currentTaskTurnMessageIDFromReplayState(finishChunk?.replayState)
@@ -2601,6 +2833,7 @@ export async function runAgent(ipc, frame) {
     }
     return { type: 'settled', ...identity, state: resultState, through_seq: durable.through }
   } finally {
+    durable.modelBudgetPlans.clearSession(durable.identity.session_id)
     ipc.closeMessageDelivery()
     ipc.onCancel = undefined
     ipc.onFailure = undefined

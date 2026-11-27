@@ -55,13 +55,23 @@ func TestTaskModelGatewayEmitsRetryableFailureOnlyAfterConfirmedZeroUsageSettlem
 		[]byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[],"max_tokens":16}`),
 		ModelResponse{})
 	call.Task.TaskRevision = 7
-	call.Task.RecoveryCallID = "mrc_retry_123"
+	failedCallID := call.CallID
+	var err error
+	call.Task.RecoveryCallID, err = TaskModelRecoveryCallID(call.Task.TaskID, call.Task.TaskRevision, failedCallID, call.Task.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call.Task.RecoveryDSHCallID, err = TaskModelRecoveryDSHCallID(call.Task.TaskID, call.Task.TaskRevision, failedCallID, call.Task.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call.CallID = call.Task.RecoveryDSHCallID
 	client.err = &ModelClientError{Kind: ModelErrorRateLimited, Stage: "provider_status", ConfirmedNoUsage: true}
-	_, err := service.Complete(context.Background(), call)
+	_, err = service.Complete(context.Background(), call)
 	var retryable *TaskModelRetryableFailureError
 	if !errors.As(err, &retryable) || client.calls != 1 || store.settleN != 1 || store.settlement.Unknown ||
 		!store.settlement.Usage.Known || store.settlement.Usage.InputTokens != 0 || store.settlement.Usage.OutputTokens != 0 ||
-		store.settlement.CallID != call.Task.RecoveryCallID || store.reservation.DSHCallID != call.CallID ||
+		store.settlement.CallID != call.Task.RecoveryCallID || store.reservation.DSHCallID != call.Task.RecoveryDSHCallID ||
 		store.reservation.CallID != call.Task.RecoveryCallID || store.settlement.TaskCall != nil {
 		t.Fatalf("confirmed retryable provider rejection was not settled under a separate attempt identity: error=%T %v settlement=%+v reservation=%+v",
 			err, err, store.settlement, store.reservation)

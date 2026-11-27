@@ -45,6 +45,8 @@ flowchart TD
 
 **路由动作**包括 `reply`、`status`、`new`、`join`、`update`、`steer`、`stop`、`stop_all`、`clarify` 和受限 `tool`。分类服务失败或返回无效结果时先保留原消息并持久记录；只有确认可安全重试时才重新处理。
 
+**模型预算状态（2026-11-27）：** 锁定 DSH 已接入 opt-in 的逐次预算请求钩子与 Worker/Runtime 计划协议；预算账本和单次 plan 由服务端 PostgreSQL 路径实现。恢复 attempt 持久化了独立的 DSH frame ID 与 ledger call ID，unknown 仍 fail closed；定向 PG 测试通过，但尚无统一 DSH runtime → PostgreSQL → fake provider 进程级验收。默认 Worker 未注入 planner，生产模型请求仍走现有上限。只有 DSH、账本、取消/恢复与端到端 provider 门禁验收后，才能接入生产策略；上述代码接缝不代表当前发送上限已改变。
+
 **按图执行时的关键分支：**
 
 - 普通问答、进度、澄清和停止可直接回到对话；复杂工作才通过准入后建立或修订 Task。合并只发生在 prior request 明确 `joinable` 且作用范围与授权匹配时。

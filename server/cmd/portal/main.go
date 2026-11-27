@@ -25,8 +25,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel/attribute"
-	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
@@ -230,6 +230,20 @@ func serve(ctx context.Context, configPath string) error {
 	if err := postgres.CheckSchema(ctx, pool); err != nil {
 		return err
 	}
+	correlatedLogs, err := tracing.NewPostgresCorrelatedLogStore(pool, logger)
+	if err != nil {
+		return fmt.Errorf("initialize correlated observability log store: %w", err)
+	}
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := correlatedLogs.Shutdown(shutdownCtx); err != nil {
+			logger.Warn("shutdown correlated observability log store failed", zap.Error(err))
+		}
+	}()
+	logger = logger.WithOptions(zap.WrapCore(func(core zapcore.Core) zapcore.Core {
+		return tracing.NewCorrelatedLogCore(core, correlatedLogs)
+	}))
 	spanExporter, err := tracing.NewPostgresSpanExporterWithLogger(pool, logger)
 	if err != nil {
 		return fmt.Errorf("initialize observability span exporter: %w", err)
@@ -250,7 +264,7 @@ func serve(ctx context.Context, configPath string) error {
 			logger.Error("shutdown observability tracer provider failed", zap.Error(err))
 		}
 	}()
-	retentionStop, retentionDone := startObservabilityRetention(ctx, spanExporter, logger)
+	retentionStop, retentionDone := startObservabilityRetention(ctx, spanExporter, correlatedLogs, logger)
 	defer func() {
 		retentionStop()
 		<-retentionDone
@@ -783,7 +797,7 @@ func serve(ctx context.Context, configPath string) error {
 		cloudDSHWorkers, workerErr := newCloudDSHTaskWorker(cfg.CloudDSH, store, credentials, runtimeControl, workspaceSync, resolveAgentWorkspacePath,
 			modelGateway, sealer, mcpConnectors, recordCapture, personalDataService, personalSyncService,
 			personalAttachmentService, goalService, schedules, projects,
-			hubService, workerSuffix, serviceInstanceID, dataKey, taskModelRecoveryAutoEnabled, logger, registry)
+			hubService, workerSuffix, serviceInstanceID, dataKey, tracerProvider, taskModelRecoveryAutoEnabled, logger, registry)
 		if workerErr != nil {
 			return fmt.Errorf("initialize cloud dsh task worker: %w", workerErr)
 		}
@@ -896,6 +910,7 @@ func serve(ctx context.Context, configPath string) error {
 		Onboarding: onboardingService, Admin: admin, AdminConsole: adminConsole, AdminQualityActivity: adminQualityActivity, AdminControls: adminControls,
 		AdminOperations: adminOperations,
 		Observability: api.AdminObservabilityDeps{Reader: store, LinkWriter: store,
+			Logs: store, LogHealth: portalCorrelatedLogHealth{store: correlatedLogs},
 			ExportHealth: portalSpanExportHealth{exporter: spanExporter}, AgentCheckpoints: checkpoints},
 		AdminModelBudgetDefaults: adminModelBudgetDefaults,
 		AdminModelDefaults:       adminModelDefaults,
@@ -925,7 +940,8 @@ func serve(ctx context.Context, configPath string) error {
 	}
 	background, err := worker.New(worker.Options{
 		Application: workerApplicationAdapter{WorkerApp: workerApp, workspaceBlockGC: workspaceBlockGC,
-			workspaceSyncNodeProvisioner: workspaceSyncNodeProvisioner, hostUsage: hostUsageService, logger: logger}, CreateQueue: queue, Interval: cfg.Reconciler.Interval,
+			workspaceSyncNodeProvisioner: workspaceSyncNodeProvisioner, modelBudgetCapacityWaits: store,
+			hostUsage: hostUsageService, logger: logger}, CreateQueue: queue, Interval: cfg.Reconciler.Interval,
 		ActivityFlushInterval: cfg.Reconciler.ActivityFlushInterval, HostUsageInterval: worker.HostUsageSampleInterval,
 		Logger: logger, Registerer: registry,
 	})
@@ -968,7 +984,7 @@ func serve(ctx context.Context, configPath string) error {
 	logger.Info("portal starting", zap.String("instance", cfg.Instance), zap.Int64("migration_version", migrationVersion), zap.String("api", cfg.Listen.API), zap.String("gateway", cfg.Listen.Gateway), zap.String("metrics", cfg.Listen.Metrics))
 	personalCleanupCtx, stopPersonalCleanup := context.WithCancel(ctx)
 	defer stopPersonalCleanup()
-	go runPersonalDataCleanup(personalCleanupCtx, personalAttachmentService, personalDataQuotaService, tasks, logger)
+	go runPersonalDataCleanup(personalCleanupCtx, personalAttachmentService, personalDataQuotaService, tasks, store, logger)
 	fileFetchCleanupCtx, stopFileFetchCleanup := context.WithCancel(ctx)
 	defer stopFileFetchCleanup()
 	go runTaskFileFetchCleanup(fileFetchCleanupCtx, tasks, logger)
@@ -1001,8 +1017,20 @@ func runTaskFileFetchCleanup(ctx context.Context, tasks *app.TaskService, logger
 	}
 }
 
+type expiredTaskModelBudgetPreparationCleaner interface {
+	CleanupExpiredTaskModelBudgetPreparations(context.Context, int32) (int32, error)
+}
+
+func cleanupExpiredTaskModelBudgetPreparations(ctx context.Context, cleaner expiredTaskModelBudgetPreparationCleaner,
+	limit int32) (int32, error) {
+	if cleaner == nil {
+		return 0, nil
+	}
+	return cleaner.CleanupExpiredTaskModelBudgetPreparations(ctx, limit)
+}
+
 func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttachmentService, quota *app.PersonalDataQuotaService,
-	tasks *app.TaskService, logger *zap.Logger) {
+	tasks *app.TaskService, budgetPreparations expiredTaskModelBudgetPreparationCleaner, logger *zap.Logger) {
 	const (
 		batchLimit int32 = 1000
 		interval         = time.Minute
@@ -1023,6 +1051,11 @@ func runPersonalDataCleanup(ctx context.Context, attachments *app.PersonalAttach
 		}
 		if _, err := tasks.CleanupExpiredConversationMessageUploads(cleanupCtx, time.Now().UTC(), batchLimit); err != nil && logger != nil {
 			logger.Warn("expired conversation message upload cleanup failed", zap.Error(err))
+		}
+		if count, err := cleanupExpiredTaskModelBudgetPreparations(cleanupCtx, budgetPreparations, batchLimit); err != nil && logger != nil {
+			logger.Warn("expired adaptive model budget cleanup failed", zap.Error(err))
+		} else if count > 0 && logger != nil {
+			logger.Info("expired adaptive model budget cleanup completed", zap.Int32("records", count))
 		}
 		cancel()
 		select {
@@ -1045,7 +1078,8 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	sealer *app.Sealer, mcpConnectors *app.MCPConnectorService, recordCapture *app.RecordCaptureService,
 	personalData *app.PersonalMutationService, personalSync *app.PersonalSyncService,
 	personalFiles *app.PersonalAttachmentService, goals *app.GoalService, schedules *app.ScheduleService, projects *app.ProjectService, hubService *app.HubService,
-	workerID, serviceInstanceID string, historyCursorKey []byte, taskModelRecoveryAutoEnabled bool, logger *zap.Logger, metrics prometheus.Registerer) (*cloudDSHTaskWorkerBundle, error) {
+	workerID, serviceInstanceID string, historyCursorKey []byte, tracerProvider *sdktrace.TracerProvider,
+	taskModelRecoveryAutoEnabled bool, logger *zap.Logger, metrics prometheus.Registerer) (*cloudDSHTaskWorkerBundle, error) {
 	supervisorKey, err := readProtectedKey(cfg.SupervisorKeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read cloud_dsh.supervisor_key_file: %w", err)
@@ -1148,7 +1182,8 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 		return nil, err
 	}
 	executor, err := worker.NewCloudDSHExecutor(worker.CloudDSHExecutorOptions{
-		SupervisorID: cfg.SupervisorID, Logger: logger, SummarySealer: sealer, AccountRuntimes: accountRuntimes,
+		SupervisorID: cfg.SupervisorID, Logger: logger, TracerProvider: tracerProvider,
+		ObservabilityContext: store, AttemptTraceLinker: store, SummarySealer: sealer, AccountRuntimes: accountRuntimes,
 		Instances: instances, Checkpoints: checkpoints, Models: models, Tools: tools, AgentActivity: store,
 		Children: childSessions, Completion: tools, RevisionStops: store, TextStreams: store, ProjectContexts: store,
 	})
@@ -1452,7 +1487,8 @@ func newLogger(cfg config.Log) (*zap.Logger, error) {
 	return options.Build()
 }
 
-func startObservabilityRetention(parent context.Context, exporter *tracing.PostgresSpanExporter, logger *zap.Logger) (context.CancelFunc, <-chan struct{}) {
+func startObservabilityRetention(parent context.Context, exporter *tracing.PostgresSpanExporter,
+	logs *tracing.PostgresCorrelatedLogStore, logger *zap.Logger) (context.CancelFunc, <-chan struct{}) {
 	ctx, cancel := context.WithCancel(parent)
 	done := make(chan struct{})
 	go func() {
@@ -1467,10 +1503,23 @@ func startObservabilityRetention(parent context.Context, exporter *tracing.Postg
 					if ctx.Err() == nil {
 						logger.Warn("purge observability spans failed", zap.Error(err))
 					}
-					return
+					break
 				}
 				if deleted < 1000 {
-					return
+					break
+				}
+			}
+			for batch := 0; batch < 10; batch++ {
+				cutoff := time.Now().UTC().Add(-7 * 24 * time.Hour)
+				deleted, err := logs.PurgeExpired(ctx, cutoff, 1000)
+				if err != nil {
+					if ctx.Err() == nil {
+						logger.Warn("purge correlated observability logs failed", zap.Error(err))
+					}
+					break
+				}
+				if deleted < 1000 {
+					break
 				}
 			}
 		}
@@ -1489,6 +1538,19 @@ func startObservabilityRetention(parent context.Context, exporter *tracing.Postg
 
 type portalSpanExportHealth struct {
 	exporter *tracing.PostgresSpanExporter
+}
+
+type portalCorrelatedLogHealth struct {
+	store *tracing.PostgresCorrelatedLogStore
+}
+
+func (h portalCorrelatedLogHealth) Health() app.AdminObservabilityLogHealth {
+	if h.store == nil {
+		return app.AdminObservabilityLogHealth{Status: "unavailable", ReasonCode: "log_store_unavailable"}
+	}
+	value := h.store.Health()
+	return app.AdminObservabilityLogHealth{Status: value.Status, DroppedRecords: value.DroppedRecords,
+		FailedBatches: value.FailedBatches, ReasonCode: value.ReasonCode, LastSuccessAt: value.LastSuccessAt}
 }
 
 func (h portalSpanExportHealth) Health() app.AdminObservabilityExportHealth {

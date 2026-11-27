@@ -121,6 +121,15 @@ func taskModelRecoveryTestCallID(t *testing.T, fence app.ModelTaskFence, call ap
 	return value
 }
 
+func taskModelRecoveryTestDSHCallID(t *testing.T, fence app.ModelTaskFence, call app.ModelCall) string {
+	t.Helper()
+	value, err := app.TaskModelRecoveryDSHCallID(fence.TaskID, fence.TaskRevision, call.CallID, fence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return value
+}
+
 func TestPostgresTaskModelRecoveryPersistsAndConsumesOneStableAttempt(t *testing.T) {
 	f, failure, call, fence := createTaskModelRecoveryNoDispatch(t)
 	ctx := context.Background()
@@ -134,9 +143,11 @@ func TestPostgresTaskModelRecoveryPersistsAndConsumesOneStableAttempt(t *testing
 		CheckpointThroughSequence: details.Task.CheckpointThroughSequence, CheckpointDigest: checkpointDigest,
 		ToolsetDigest: toolsetDigest[:], Auto: true}
 	wantRecoveryCallID := taskModelRecoveryTestCallID(t, fence, call)
+	wantRecoveryDSHCallID := taskModelRecoveryTestDSHCallID(t, fence, call)
 	intent, accepted, err := f.store.ScheduleTaskModelRecovery(ctx, command)
 	if err != nil || !accepted || intent.State != task.ModelRecoveryScheduled || intent.FailedCallID != call.CallID ||
-		intent.RecoveryCallID != wantRecoveryCallID || intent.FailedLeaseVersion != fence.LeaseVersion {
+		intent.RecoveryCallID != wantRecoveryCallID || intent.RecoveryDSHCallID != wantRecoveryDSHCallID ||
+		intent.FailedLeaseVersion != fence.LeaseVersion {
 		t.Fatalf("schedule durable recovery: intent=%+v accepted=%t err=%v", intent, accepted, err)
 	}
 	var status, reason string
@@ -149,7 +160,8 @@ func TestPostgresTaskModelRecoveryPersistsAndConsumesOneStableAttempt(t *testing
 			status, reason, leaseOwner, leaseVersion, eventSequence, intent, err)
 	}
 	projected, err := f.store.GetTask(ctx, fence.TaskID, f.ownerID)
-	if err != nil || projected.Task.ModelRecovery == nil || projected.Task.ModelRecovery.RecoveryCallID != wantRecoveryCallID {
+	if err != nil || projected.Task.ModelRecovery == nil || projected.Task.ModelRecovery.RecoveryCallID != wantRecoveryCallID ||
+		projected.Task.ModelRecovery.RecoveryDSHCallID != wantRecoveryDSHCallID {
 		t.Fatalf("GetTask did not project recovery schedule: task=%+v err=%v", projected.Task, err)
 	}
 	replay, accepted, err := f.store.ScheduleTaskModelRecovery(ctx, command)
@@ -190,7 +202,7 @@ func TestPostgresTaskModelRecoveryPersistsAndConsumesOneStableAttempt(t *testing
 	}
 	stored, found, err := f.store.GetTaskModelRecovery(ctx, fence.TaskID, f.ownerID, *details.Task.CurrentRevision)
 	if err != nil || !found || stored.State != task.ModelRecoveryAttempting || stored.AttemptStartedAt == nil ||
-		stored.RecoveryCallID != wantRecoveryCallID || stored.ToolsetDigest == nil {
+		stored.RecoveryCallID != wantRecoveryCallID || stored.RecoveryDSHCallID != wantRecoveryDSHCallID || stored.ToolsetDigest == nil {
 		t.Fatalf("attempting recovery record=%+v found=%t err=%v", stored, found, err)
 	}
 	confirmTaskModelRecoveryAgentStop(t, f.store, key, lease.Fence, nonce)
@@ -257,7 +269,9 @@ WHERE owner_id=$1 AND source='task' AND call_id=$2`, fence.InitiatorID, failedCa
 		CheckpointDigest:          append([]byte(nil), details.Task.CheckpointDigest...),
 		ToolsetDigest:             toolsetDigest[:], Auto: true}
 	intent, accepted, err := f.store.ScheduleTaskModelRecovery(ctx, command)
-	if err != nil || !accepted || intent.FailedCallID != failedCall.CallID || intent.RecoveryCallID == failedCall.CallID {
+	wantRecoveryDSHCallID := taskModelRecoveryTestDSHCallID(t, fence, failedCall)
+	if err != nil || !accepted || intent.FailedCallID != failedCall.CallID || intent.RecoveryCallID == failedCall.CallID ||
+		intent.RecoveryDSHCallID != wantRecoveryDSHCallID || intent.RecoveryDSHCallID == intent.FailedCallID {
 		t.Fatalf("schedule safe retry with distinct identity: intent=%+v accepted=%t err=%v", intent, accepted, err)
 	}
 	claimed, found, err := f.store.ClaimNextTask(ctx, "recovery-rejection-worker", time.Minute)
@@ -292,6 +306,7 @@ WHERE owner_id=$1 AND source='task' AND call_id=$2`, fence.InitiatorID, failedCa
 	recoveryFence.LeaseOwner, recoveryFence.LeaseVersion = lease.Fence.LeaseOwner, lease.Fence.LeaseVersion
 	recoveryFence.AgentRootSessionID = recoveryFence.AgentSessionID
 	recoveryFence.RecoveryCallID = intent.RecoveryCallID
+	recoveryFence.RecoveryDSHCallID = intent.RecoveryDSHCallID
 	response := app.ModelResponse{Text: "recovered result", StopReason: "stop", ProviderReportedModel: "test-model",
 		Usage: app.ModelUsage{Known: true, InputTokens: 8, OutputTokens: 3}}
 	recoveryProvider := &revisionProviderTest{response: &response}
@@ -305,7 +320,7 @@ WHERE owner_id=$1 AND source='task' AND call_id=$2`, fence.InitiatorID, failedCa
 	}
 	setTaskModelResponseSealer(t, recoveryGateway)
 	recoveryCall := app.ModelCall{Source: app.ModelCallTask, Task: &recoveryFence, ModelID: failedCall.ModelID,
-		CallID: failedCall.CallID, RawRequest: append([]byte(nil), failedCall.RawRequest...)}
+		CallID: intent.RecoveryDSHCallID, RawRequest: append([]byte(nil), failedCall.RawRequest...)}
 	got, err := recoveryGateway.Complete(ctx, recoveryCall)
 	if err != nil || got.Text != response.Text || recoveryProvider.calls.Load() != 1 {
 		t.Fatalf("controlled model attempt did not deliver result: response=%+v calls=%d err=%v", got, recoveryProvider.calls.Load(), err)

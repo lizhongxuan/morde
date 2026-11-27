@@ -129,6 +129,31 @@ func NewProjectBudgetService(store ProjectBudgetStore, access ProjectAccessCheck
 	return &ProjectBudgetService{store: store, access: access, rates: rates}, nil
 }
 
+func (s *ProjectBudgetService) projectRateSnapshot(ctx context.Context, modelID string) (project.RateSnapshot, error) {
+	if s == nil || ctx == nil || !domain.ValidModelConnectionID(modelID) {
+		return project.RateSnapshot{}, domain.NewError(domain.CodeUnsupported, "project model rate is unavailable")
+	}
+	rate, err := s.rates.ProjectRateSnapshot(ctx, modelID)
+	if err != nil || rate.Validate() != nil || rate.ModelID != modelID {
+		return project.RateSnapshot{}, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
+	}
+	return rate, nil
+}
+
+func ProjectModelCallRequestDigest(projectID, actorID, taskID string, source ModelCallSource, callID, modelID string,
+	usage project.Usage, requestDigest []byte) ([]byte, error) {
+	return hashIdempotencyRequest(struct {
+		ProjectID string
+		ActorID   string
+		TaskID    string
+		Source    ModelCallSource
+		CallID    string
+		ModelID   string
+		Usage     project.Usage
+		Request   []byte
+	}{projectID, actorID, taskID, source, callID, modelID, usage, requestDigest})
+}
+
 func (s *ProjectBudgetService) GetBudget(ctx context.Context, principal identity.Principal, projectID string) (ProjectBudgetView, error) {
 	if ctx == nil {
 		return ProjectBudgetView{}, domain.InvalidArgument("context", "project budget context is required")
@@ -274,16 +299,8 @@ func (s *ProjectBudgetService) reserveTaskModelCall(ctx context.Context, project
 	if err != nil || reservedMicros < 1 {
 		return ProjectModelReservation{}, false, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
 	}
-	digest, err := hashIdempotencyRequest(struct {
-		ProjectID string
-		ActorID   string
-		TaskID    string
-		Source    ModelCallSource
-		CallID    string
-		ModelID   string
-		Usage     project.Usage
-		Request   []byte
-	}{projectID, call.OwnerID, call.Task.TaskID, call.Source, call.CallID, call.ModelID, usage, call.RequestDigest})
+	digest, err := ProjectModelCallRequestDigest(projectID, call.OwnerID, call.Task.TaskID, call.Source, call.CallID,
+		call.ModelID, usage, call.RequestDigest)
 	if err != nil {
 		return ProjectModelReservation{}, false, err
 	}

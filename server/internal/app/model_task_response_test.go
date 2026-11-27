@@ -88,9 +88,25 @@ func TestTaskModelResponseBindsRecoveryLedgerAndDSHFrameSeparately(t *testing.T)
 	dshCallID := reservation.CallID
 	reservation.Task = normalizedModelTaskFence(reservation.Task)
 	reservation.Task.TaskRevision = 9
-	reservation.Task.RecoveryCallID = "mrc_recovery_123"
+	failedCallID, err := DSHModelCallID(reservation.Task.TaskID, reservation.Task.AgentSessionID, reservation.Task.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation.Task.RecoveryCallID, err = TaskModelRecoveryCallID(reservation.Task.TaskID, reservation.Task.TaskRevision,
+		failedCallID, reservation.Task.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reservation.Task.RecoveryDSHCallID, err = TaskModelRecoveryDSHCallID(reservation.Task.TaskID, reservation.Task.TaskRevision,
+		failedCallID, reservation.Task.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
 	reservation.CallID = reservation.Task.RecoveryCallID
-	reservation.DSHCallID = dshCallID
+	reservation.DSHCallID = reservation.Task.RecoveryDSHCallID
+	if reservation.DSHCallID == dshCallID {
+		t.Fatal("recovery DSH identity reused the failed call identity")
+	}
 	response := ModelResponse{Text: "recovered", Usage: ModelUsage{Known: true, InputTokens: 2, OutputTokens: 1},
 		StopReason: "stop", ProviderReportedModel: "provider-snapshot-3"}
 	record, err := SealTaskModelResponse(sealer, reservation, response)

@@ -395,6 +395,17 @@ test('task start accepts only paired delegate plan selector schemas', () => {
   assert.equal(validStart({ ...start, tools: [invalid, fileReadTool] }), false)
 })
 
+test('task start accepts only a valid versioned W3C trace context', () => {
+  const traceparent = `00-${'abcdef'.repeat(5) + 'ab'}-${'fedcba'.repeat(2) + 'fedc'}-01`
+  assert.equal(validStart({ ...start, version: 2, traceparent }), true)
+  assert.equal(validStart({ ...start, traceparent }), false)
+  assert.equal(validStart({ ...start, version: 2 }), false)
+  assert.equal(validStart({ ...start, version: 2, traceparent: `00-${'0'.repeat(32)}-${'fedcba'.repeat(2) + 'fedc'}-01` }), false)
+  assert.equal(validStart({ ...start, version: 2, traceparent: `00-${'abcdef'.repeat(5) + 'ab'}-${'0'.repeat(16)}-01` }), false)
+  assert.equal(validStart({ ...start, version: 2, traceparent: traceparent.toUpperCase() }), false)
+  assert.equal(validStart({ ...taskValidationReviewStart(), version: 2, traceparent }), false)
+})
+
 test('delegate plan selector values must be a valid pair', () => {
   const args = { title: 'Read', objective: 'Read source', tool_names: ['file_read'] }
   assert.equal(validDelegateSelection(args), true)
@@ -7603,7 +7614,8 @@ test('account runtime waits for external Task process admission before dispatchi
 
   send({ stdin: input }, account)
   await waitFor(frame => frame.type === 'runtime_ready')
-  const startFrame = accountTask('task_admission', 'must wait for Guardian', 1)
+  const startFrame = { ...accountTask('task_admission', 'must wait for Guardian', 1), version: 2,
+    traceparent: `00-${'a'.repeat(32)}-${'b'.repeat(16)}-01` }
   send({ stdin: input }, startFrame)
   const processReady = await waitFor(frame => frame.type === 'task_process_ready' && frame.task_id === startFrame.task_id)
   await new Promise(resolve => setTimeout(resolve, 40))

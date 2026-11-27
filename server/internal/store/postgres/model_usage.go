@@ -62,6 +62,14 @@ func modelCallIsPersonal(ctx context.Context, tx pgx.Tx, ownerID string, source 
 
 // reserveModelCallInTx records every call; only platform models reserve platform budgets.
 func reserveModelCallInTx(ctx context.Context, tx pgx.Tx, request app.ModelCallReservation, projectReservation *app.ProjectModelReservation) error {
+	return reserveModelCallInTxWithState(ctx, tx, request, projectReservation, "dispatched")
+}
+
+func reserveModelCallInTxWithState(ctx context.Context, tx pgx.Tx, request app.ModelCallReservation,
+	projectReservation *app.ProjectModelReservation, initialState string) error {
+	if initialState != "prepared" && initialState != "dispatched" {
+		return domain.NewError(domain.CodeInvalidState, "model call reservation state is invalid")
+	}
 	if err := lockModelLedgerOwner(ctx, tx, request.OwnerID); err != nil {
 		return err
 	}
@@ -182,7 +190,7 @@ WHERE project_id=$1 AND source='terminal_delivery' AND call_id=$2 FOR UPDATE`,
 		var running int32
 		var unknown bool
 		err = tx.QueryRow(ctx, `SELECT COALESCE(SUM(CASE WHEN state='settled' THEN input_tokens+output_tokens WHEN state='rejected' THEN 0 ELSE reserved_tokens END),0),
-  count(*) FILTER (WHERE state='dispatched'), COALESCE(bool_or(state='unknown'),false)
+			  count(*) FILTER (WHERE state IN ('prepared','dispatched')), COALESCE(bool_or(state='unknown'),false)
 	  FROM model_call_ledger WHERE owner_id=$1 AND NOT personal_model`, request.OwnerID).Scan(&used, &running, &unknown)
 		if err != nil {
 			return fmt.Errorf("read model usage: %w", err)
@@ -207,7 +215,7 @@ WHERE project_id=$1 AND source='terminal_delivery' AND call_id=$2 FOR UPDATE`,
 			return domain.NewError(domain.CodeInvalidState, "task model usage is unavailable")
 		}
 		var pending int64
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(reserved_tokens),0) FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state='dispatched'`, request.Task.TaskID).Scan(&pending); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(reserved_tokens),0) FROM model_call_ledger WHERE task_id=$1 AND source='task' AND state IN ('prepared','dispatched')`, request.Task.TaskID).Scan(&pending); err != nil {
 			return fmt.Errorf("read task model reservations: %w", err)
 		}
 		if taskUsed > taskLimit || pending > taskLimit-taskUsed || request.ReservedTokens > taskLimit-taskUsed-pending {
@@ -241,10 +249,10 @@ WHERE project_id=$1 AND source='terminal_delivery' AND call_id=$2 FOR UPDATE`,
 		 (owner_id,source,call_id,request_digest,model_id,provider_model,task_id,reserved_tokens,state,created_at,personal_model,
 		  review_task_revision,review_result_event_sequence,review_result_sha256,review_claim_generation,
 		  terminal_delivery_id,terminal_delivery_claim_generation)
-		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'dispatched',clock_timestamp(),$9,$10,$11,$12,$13,$14,$15)`, request.OwnerID, string(request.Source), request.CallID,
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$16,clock_timestamp(),$9,$10,$11,$12,$13,$14,$15)`, request.OwnerID, string(request.Source), request.CallID,
 		request.RequestDigest, request.ModelID, request.ProviderModel, taskID, request.ReservedTokens, request.PersonalModel,
 		reviewTaskRevision, reviewResultSequence, reviewResultSHA256, reviewClaimGeneration,
-		terminalDeliveryID, terminalDeliveryClaimGeneration); err != nil {
+		terminalDeliveryID, terminalDeliveryClaimGeneration, initialState); err != nil {
 		return fmt.Errorf("reserve model call: %w", err)
 	}
 	if request.Source == app.ModelCallCompaction {
@@ -462,7 +470,14 @@ FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE
 			&reviewTaskRevision, &reviewResultSequence, &reviewResultSHA256, &reviewClaimGeneration); err != nil {
 			return storeError("find model dispatch", "model call", err)
 		}
-		if state != "dispatched" || modelID != request.ModelID || !bytes.Equal(priorDigest, request.RequestDigest) {
+		if request.BudgetPlanID != "" {
+			if request.Source != app.ModelCallTask || state != "prepared" || modelID != request.ModelID || !bytes.Equal(priorDigest, request.RequestDigest) {
+				return domain.NewError(domain.CodeInvalidState, "prepared model call is no longer awaiting dispatch")
+			}
+			if err := verifyTaskModelBudgetPreparationInTx(ctx, tx, request, map[string]bool{"prepared": true}, true); err != nil {
+				return err
+			}
+		} else if state != "dispatched" || modelID != request.ModelID || !bytes.Equal(priorDigest, request.RequestDigest) {
 			return domain.NewError(domain.CodeInvalidState, "model call is no longer awaiting dispatch")
 		}
 		if request.Source == app.ModelCallReview && !modelCallReviewAttributionMatches(storedTaskID, reviewTaskRevision,
@@ -475,6 +490,24 @@ FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE
 			}
 			if err := s.beginTerminalDeliveryModelDispatchInTx(ctx, tx, request); err != nil {
 				return err
+			}
+		} else if request.BudgetPlanID != "" {
+			result, err := tx.Exec(ctx, `UPDATE model_call_ledger SET state='dispatched',created_at=clock_timestamp()
+WHERE owner_id=$1 AND source='task' AND call_id=$2 AND state='prepared'`, request.OwnerID, request.CallID)
+			if err != nil || result.RowsAffected() != 1 {
+				if err != nil {
+					return fmt.Errorf("mark prepared model dispatch start: %w", err)
+				}
+				return domain.NewError(domain.CodeConflict, "prepared model call changed before dispatch")
+			}
+			result, err = tx.Exec(ctx, `UPDATE model_budget_preparations SET consumed_at=clock_timestamp()
+WHERE owner_id=$1 AND source='task' AND call_id=$2 AND plan_id=$3 AND budget_call_id=$4 AND consumed_at IS NULL`,
+				request.OwnerID, request.CallID, request.BudgetPlanID, request.BudgetCallID)
+			if err != nil || result.RowsAffected() != 1 {
+				if err != nil {
+					return fmt.Errorf("consume prepared model budget plan: %w", err)
+				}
+				return domain.NewError(domain.CodeConflict, "prepared model budget plan changed before dispatch")
 			}
 		} else if _, err := tx.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()
 WHERE owner_id=$1 AND source=$2 AND call_id=$3 AND state='dispatched'`, request.OwnerID, string(request.Source), request.CallID); err != nil {
@@ -515,6 +548,7 @@ VALUES ($1,'task',$2,$3,$4,$1,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)`, 
 // shortcut: the existing ledger has no distinct pre-dispatch state; call only
 // when the gateway can prove no provider request was sent.
 func (s *Store) AbandonModelCallReservation(ctx context.Context, request app.ModelCallReservation) error {
+	adaptiveBudget := request.BudgetPlanID != "" || request.BudgetCallID != "" || request.BudgetRequestDigest != ""
 	if !domain.ValidUserID(request.OwnerID) || !domain.ValidModelConnectionID(request.ModelID) ||
 		len(request.RequestDigest) != 32 || request.ReservedTokens <= 0 || len(request.CallID) < 8 || len(request.CallID) > 128 ||
 		(request.ProjectID != "" && !project.ValidID(request.ProjectID)) ||
@@ -530,6 +564,10 @@ func (s *Store) AbandonModelCallReservation(ctx context.Context, request app.Mod
 		(request.ProjectID != "" && request.Source == app.ModelCallProbe) {
 		return domain.InvalidArgument("model_call", "invalid model reservation release")
 	}
+	if adaptiveBudget && (request.Source != app.ModelCallTask || request.BudgetPlanID == "" || request.BudgetCallID == "" ||
+		!app.ValidModelBudgetRequestDigest(request.BudgetRequestDigest)) {
+		return domain.InvalidArgument("model_call", "invalid adaptive model reservation release")
+	}
 	return s.WithTx(ctx, func(tx pgx.Tx) error {
 		if err := lockModelLedgerOwner(ctx, tx, request.OwnerID); err != nil {
 			return err
@@ -543,6 +581,11 @@ func (s *Store) AbandonModelCallReservation(ctx context.Context, request app.Mod
 		}
 		if !personal {
 			if _, _, err := lockPlatformModelBudget(ctx, tx, request.OwnerID); err != nil {
+				return err
+			}
+		}
+		if adaptiveBudget {
+			if err := verifyTaskModelBudgetPreparationInTx(ctx, tx, request, map[string]bool{"prepared": true, "dispatched": true}, false); err != nil {
 				return err
 			}
 		}
@@ -595,7 +638,8 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, request.OwnerID, str
 				&terminalDeliveryID, &terminalDeliveryClaimGeneration, &terminalDeliveryDispatchStarted); err != nil {
 			return storeError("find model reservation release", "model call", err)
 		}
-		if state != "dispatched" || modelID != request.ModelID || providerModel != request.ProviderModel ||
+		stateAllowed := state == "dispatched" || adaptiveBudget && state == "prepared"
+		if !stateAllowed || modelID != request.ModelID || providerModel != request.ProviderModel ||
 			taskID != expectedTaskID || reservedTokens != request.ReservedTokens || !bytes.Equal(priorDigest, request.RequestDigest) {
 			return domain.NewError(domain.CodeConflict, "model reservation is no longer undispatched")
 		}
@@ -606,6 +650,17 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, request.OwnerID, str
 		if request.Source == app.ModelCallTerminalDelivery && (terminalDeliveryID == nil || terminalDeliveryClaimGeneration == nil ||
 			*terminalDeliveryID != request.TerminalDelivery.DeliveryID || taskID != expectedTaskID || terminalDeliveryDispatchStarted) {
 			return domain.NewError(domain.CodeConflict, "terminal delivery model reservation may already have been dispatched")
+		}
+		if adaptiveBudget {
+			result, err := tx.Exec(ctx, `DELETE FROM model_budget_preparations
+WHERE owner_id=$1 AND source='task' AND call_id=$2 AND plan_id=$3 AND budget_call_id=$4`,
+				request.OwnerID, request.CallID, request.BudgetPlanID, request.BudgetCallID)
+			if err != nil {
+				return fmt.Errorf("delete undispatched model budget plan: %w", err)
+			}
+			if result.RowsAffected() != 1 {
+				return domain.NewError(domain.CodeConflict, "model budget plan changed before release")
+			}
 		}
 		if request.ProjectID != "" && !personal {
 			result, err := tx.Exec(ctx, `DELETE FROM project_budget_ledger WHERE project_id=$1 AND source=$2 AND call_id=$3 AND status='reserved'`,
@@ -626,8 +681,12 @@ WHERE owner_id=$1 AND source=$2 AND call_id=$3 FOR UPDATE`, request.OwnerID, str
 				return domain.NewError(domain.CodeConflict, "project model reservation identity is unavailable")
 			}
 		}
+		deleteState := `state='dispatched'`
+		if adaptiveBudget {
+			deleteState = `state IN ('prepared','dispatched')`
+		}
 		result, err := tx.Exec(ctx, `DELETE FROM model_call_ledger WHERE owner_id=$1 AND source=$2 AND call_id=$3
-AND state='dispatched' AND model_id=$4 AND request_digest=$5`, request.OwnerID, string(request.Source), request.CallID,
+AND `+deleteState+` AND model_id=$4 AND request_digest=$5`, request.OwnerID, string(request.Source), request.CallID,
 			request.ModelID, request.RequestDigest)
 		if err != nil {
 			return fmt.Errorf("release model token reservation: %w", err)

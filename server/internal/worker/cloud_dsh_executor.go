@@ -12,12 +12,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
@@ -46,6 +51,19 @@ var ErrCloudDSHCompletionPending = errors.New("dsh completion requires output ve
 // ErrCloudDSHWaitingForUser means the broker durably paused the task before
 // returning a tool result, so the dsh process must stop without failing it.
 var ErrCloudDSHWaitingForUser = errors.New("dsh task is waiting for user input")
+var errCloudDSHModelBudgetCapacityWaiting = errors.New("dsh task is waiting for model capacity")
+
+func cloudDSHModelBudgetPlanDenialError(planErr, denialWriteErr error) error {
+	if errors.Is(planErr, app.ErrTaskModelBudgetCapacityWaiting) {
+		// The wait row and Task state are already durable. A broken runtime pipe
+		// must not turn this safe wait into a generic recovery failure.
+		return errCloudDSHModelBudgetCapacityWaiting
+	}
+	if denialWriteErr != nil {
+		return denialWriteErr
+	}
+	return errors.New("dsh model budget plan was denied")
+}
 
 var errCloudDSHTerminalToolAttempt = errors.New("dsh tool attempt was durably terminated")
 
@@ -233,7 +251,8 @@ type cloudDSHModelRecoveryFailureSource interface {
 func cloudDSHModelResultErrorForCall(err error, call app.ModelCall, checkpoints ...cloudDSHReadOnlyRecoveryCheckpoint) error {
 	failure := cloudDSHModelResultError{category: cloudDSHModelErrorCategory(err)}
 	var source cloudDSHModelRecoveryFailureSource
-	if !errors.As(err, &source) || call.Source != app.ModelCallTask || call.Task == nil {
+	if !errors.As(err, &source) || call.Source != app.ModelCallTask || call.Task == nil ||
+		call.Task.RecoveryCallID != "" || call.Task.RecoveryDSHCallID != "" {
 		return failure
 	}
 	evidence := source.TaskModelRecoveryFailureEvidence()
@@ -357,6 +376,84 @@ type CloudDSHModels interface {
 	Complete(context.Context, app.ModelCall) (app.ModelResponse, error)
 }
 
+// CloudDSHModelBudgetPlanRequest is the validated provider-bound input and
+// DSH-local context used by the opt-in P0 budget-plan probe. Request excludes
+// max_tokens; Config and ToolHistory are available to planning but excluded
+// from RequestDigest, which covers only provider/model/messages/tools.
+type CloudDSHModelBudgetPlanRequest struct {
+	Fence             app.AgentInstanceFence
+	TaskRevision      int64
+	SessionID         string
+	ModelID           string
+	ThroughSeq        int64
+	Turn              int64
+	Step              int64
+	CallID            string
+	DSHCallID         string
+	RecoveryCallID    string
+	RecoveryDSHCallID string
+	RequestDigest     string
+	Request           json.RawMessage
+	Config            json.RawMessage
+	ToolHistory       json.RawMessage
+}
+
+// CloudDSHModelBudgetPlan is an opaque, one-call plan returned to the DSH
+// runtime. It does not represent an account or Task budget reservation.
+type CloudDSHModelBudgetPlan struct {
+	PlanID    string
+	MaxTokens int
+}
+
+// CloudDSHModelBudgetPlanner enables the P0 opt-in worker/runtime probe when
+// supplied. Production budget admission and ledger settlement are separate
+// contracts and are not implemented by this interface.
+type CloudDSHModelBudgetPlanner interface {
+	PrepareModelBudget(context.Context, CloudDSHModelBudgetPlanRequest) (CloudDSHModelBudgetPlan, error)
+}
+
+type CloudDSHModelBudgetPreparationService interface {
+	PrepareTaskModelBudget(context.Context, app.TaskModelBudgetPrepareRequest) (app.TaskModelBudgetPlan, error)
+}
+
+type cloudDSHModelBudgetPlannerAdapter struct {
+	service CloudDSHModelBudgetPreparationService
+}
+
+func NewCloudDSHModelBudgetPlanner(service CloudDSHModelBudgetPreparationService) (CloudDSHModelBudgetPlanner, error) {
+	if service == nil {
+		return nil, errors.New("adaptive model budget preparation service is required")
+	}
+	return &cloudDSHModelBudgetPlannerAdapter{service: service}, nil
+}
+
+func (adapter *cloudDSHModelBudgetPlannerAdapter) PrepareModelBudget(ctx context.Context, request CloudDSHModelBudgetPlanRequest) (CloudDSHModelBudgetPlan, error) {
+	if adapter == nil || adapter.service == nil {
+		return CloudDSHModelBudgetPlan{}, errors.New("adaptive model budget preparation service is unavailable")
+	}
+	plan, err := adapter.service.PrepareTaskModelBudget(ctx, app.TaskModelBudgetPrepareRequest{
+		Fence: func() app.ModelTaskFence {
+			fence := cloudDSHModelFence(request.Fence, request.SessionID, request.ThroughSeq, request.TaskRevision)
+			fence.RecoveryCallID, fence.RecoveryDSHCallID = request.RecoveryCallID, request.RecoveryDSHCallID
+			return fence
+		}(), DSHCallID: request.DSHCallID, ModelID: request.ModelID, ThroughSequence: request.ThroughSeq,
+		Turn: request.Turn, Step: request.Step, BudgetCallID: request.CallID,
+		RequestDigest: request.RequestDigest, ProviderRequest: append(json.RawMessage(nil), request.Request...),
+	})
+	if err != nil {
+		return CloudDSHModelBudgetPlan{}, err
+	}
+	return CloudDSHModelBudgetPlan{PlanID: plan.PlanID, MaxTokens: plan.MaxTokens}, nil
+}
+
+func configureCloudDSHModelBudgetAdmission(start map[string]any, planner CloudDSHModelBudgetPlanner, legacyMaxTokens int64) {
+	if planner == nil {
+		start["max_tokens"] = legacyMaxTokens
+		return
+	}
+	start["model_budget_admission"] = true
+}
+
 type CloudDSHTaskContextWindowResolver interface {
 	ResolveTaskContextWindow(context.Context, task.Task) (*int, error)
 }
@@ -469,29 +566,36 @@ type CloudDSHCompleter interface {
 }
 
 type CloudDSHExecutorOptions struct {
-	SupervisorID     string
-	Logger           *zap.Logger
-	SummarySealer    *app.Sealer
-	AccountRuntimes  *CloudDSHAccountRuntimeManager
-	Instances        CloudDSHInstances
-	Checkpoints      CloudDSHCheckpoints
-	Models           CloudDSHModels
-	ToolCapabilities CloudDSHModelToolCapability
-	ProjectContexts  CloudDSHProjectContexts
-	StreamCapability CloudDSHTextStreamingCapability
-	TextStreams      CloudDSHTextStreamStore
-	AgentActivity    app.TaskAgentActivityRecorder
-	RevisionStops    CloudDSHRevisionStopWitness
-	Tools            CloudDSHTools
-	Children         CloudDSHChildSessions
-	Completion       CloudDSHCompleter
+	SupervisorID         string
+	Logger               *zap.Logger
+	TracerProvider       trace.TracerProvider
+	ObservabilityContext app.TaskObservabilityContextReader
+	AttemptTraceLinker   app.TaskAttemptTraceLinker
+	SummarySealer        *app.Sealer
+	AccountRuntimes      *CloudDSHAccountRuntimeManager
+	Instances            CloudDSHInstances
+	Checkpoints          CloudDSHCheckpoints
+	Models               CloudDSHModels
+	ModelBudgetPlanner   CloudDSHModelBudgetPlanner
+	ToolCapabilities     CloudDSHModelToolCapability
+	ProjectContexts      CloudDSHProjectContexts
+	StreamCapability     CloudDSHTextStreamingCapability
+	TextStreams          CloudDSHTextStreamStore
+	AgentActivity        app.TaskAgentActivityRecorder
+	RevisionStops        CloudDSHRevisionStopWitness
+	Tools                CloudDSHTools
+	Children             CloudDSHChildSessions
+	Completion           CloudDSHCompleter
 	// MaxSubagentDepth bounds delegation hops from the root session (0
 	// keeps the app.DefaultMaxSubagentDepth of 2). It is the single
 	// configurable for the E12 subagent depth limit.
 	MaxSubagentDepth int
 }
 
-type CloudDSHExecutor struct{ options CloudDSHExecutorOptions }
+type CloudDSHExecutor struct {
+	options CloudDSHExecutorOptions
+	tracer  trace.Tracer
+}
 
 func NewCloudDSHExecutor(options CloudDSHExecutorOptions) (*CloudDSHExecutor, error) {
 	if !cloudDSHID.MatchString(options.SupervisorID) || options.AccountRuntimes == nil ||
@@ -507,7 +611,11 @@ func NewCloudDSHExecutor(options CloudDSHExecutorOptions) (*CloudDSHExecutor, er
 	if options.Logger == nil {
 		options.Logger = zap.NewNop()
 	}
-	return &CloudDSHExecutor{options: options}, nil
+	provider := options.TracerProvider
+	if provider == nil {
+		provider = noop.NewTracerProvider()
+	}
+	return &CloudDSHExecutor{options: options, tracer: provider.Tracer("morde/server/internal/worker")}, nil
 }
 
 // maxSubagentDepth is the configured E12 delegation limit (0 keeps the
@@ -721,6 +829,14 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	ctx, attemptSpan := e.startTaskAttemptTrace(ctx, value)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			cloudDSHEndSpan(attemptSpan, "failed", errors.New("task attempt panicked"))
+			panic(recovered)
+		}
+		cloudDSHEndSpan(attemptSpan, cloudDSHAttemptSpanStatus(retErr), retErr)
+	}()
 	projectRecovery := recoveringAgent && value.ProjectID != "" && value.CheckpointThroughSequence >= 0
 	if projectRecovery {
 		if e.options.ProjectContexts == nil {
@@ -905,7 +1021,8 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 	// A disconnected child is reclaimed from its durable checkpoint; the operation ledger decides whether a tool can be replayed.
 	if err != nil && !errors.Is(err, errCloudDSHConnectionInterrupted) && !errors.Is(err, errCloudDSHBackgroundOutputPending) &&
 		!errors.Is(err, ErrCloudDSHCompletionPending) && !errors.Is(err, errCloudDSHModelResultUnavailable) &&
-		!errors.Is(err, errCloudDSHPersonalMemoryChanged) && !errors.Is(err, errCloudDSHTerminalToolAttempt) && recoveringAgent && ctx.Err() == nil {
+		!errors.Is(err, errCloudDSHPersonalMemoryChanged) && !errors.Is(err, errCloudDSHTerminalToolAttempt) &&
+		!errors.Is(err, errCloudDSHModelBudgetCapacityWaiting) && recoveringAgent && ctx.Err() == nil {
 		if recoveryTools, ok := e.options.Tools.(CloudDSHRecoveryTools); ok {
 			pauseCtx, cancelPause := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			err = errors.Join(err, pauseCloudDSHRecovery(pauseCtx, recoveryTools, value))
@@ -920,7 +1037,7 @@ func (e *CloudDSHExecutor) ExecuteTask(ctx context.Context, value task.Task) (re
 			return cause
 		}
 	}
-	if errors.Is(err, ErrCloudDSHWaitingForUser) {
+	if errors.Is(err, ErrCloudDSHWaitingForUser) || errors.Is(err, errCloudDSHModelBudgetCapacityWaiting) {
 		return nil
 	}
 	if errors.Is(err, errCloudDSHTerminalToolAttempt) {
@@ -1039,7 +1156,14 @@ type cloudDSHFrame struct {
 	Payload                  string          `json:"payload,omitempty"`
 	SHA256                   string          `json:"sha256,omitempty"`
 	Request                  json.RawMessage `json:"request,omitempty"`
+	Config                   json.RawMessage `json:"config,omitempty"`
+	ToolHistory              json.RawMessage `json:"tool_history,omitempty"`
 	CallID                   string          `json:"call_id,omitempty"`
+	DSHCallID                string          `json:"dsh_call_id,omitempty"`
+	BudgetCallID             string          `json:"budget_call_id,omitempty"`
+	Turn                     *int64          `json:"turn,omitempty"`
+	Step                     *int64          `json:"step,omitempty"`
+	BudgetPlanID             string          `json:"budget_plan_id,omitempty"`
 	CurrentTaskTurnMessageID string          `json:"current_task_turn_message_id,omitempty"`
 	RequestKind              string          `json:"request_kind,omitempty"`
 	RequestDigest            string          `json:"request_digest,omitempty"`
@@ -1107,6 +1231,7 @@ func readCloudDSHFrames(ctx context.Context, source io.Reader, out chan<- cloudD
 var cloudDSHFrameOptionalFields = map[string][]string{
 	"failed":    {"reason"},
 	"tool_call": {"current_task_turn_message_id"},
+	"model":     {"budget_plan_id", "budget_call_id", "request_digest"},
 }
 
 func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
@@ -1132,6 +1257,7 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 		"checkpoint":            {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq", "through_seq", "payload", "sha256"},
 		"checkpoint_read":       {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "from_seq"},
 		"model":                 {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "request", "sha256"},
+		"model_budget_prepare":  {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "dsh_call_id", "turn", "step", "request_digest", "request", "config", "tool_history"},
 		"tool_call":             {"type", "id", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "name", "arguments"},
 		"child_create":          {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "arguments"},
 		"child_settle":          {"type", "task_id", "owner_id", "agent_id", "generation", "authorization_version", "session_id", "through_seq", "call_id", "status", "sha256", "summary"},
@@ -1183,6 +1309,18 @@ func decodeCloudDSHFrame(raw []byte) (cloudDSHFrame, error) {
 		if _, exists := keys["current_task_turn_message_id"]; exists &&
 			(!validCloudDSHJSONStringField(keys, "current_task_turn_message_id") || !domain.ValidMessageID(frame.CurrentTaskTurnMessageID)) {
 			return cloudDSHFrame{}, errors.New("invalid dsh current Task turn message identity")
+		}
+	}
+	if frame.Type == "model" {
+		_, hasPlan := keys["budget_plan_id"]
+		_, hasCall := keys["budget_call_id"]
+		_, hasDigest := keys["request_digest"]
+		if hasPlan || hasCall || hasDigest {
+			if _, ok := cloudDSHDigestBytes(frame.RequestDigest); !hasPlan || !hasCall || !hasDigest ||
+				!cloudDSHID.MatchString(frame.BudgetPlanID) || !cloudDSHID.MatchString(frame.BudgetCallID) ||
+				!validCloudDSHJSONStringField(keys, "request_digest") || !ok {
+				return cloudDSHFrame{}, errors.New("invalid dsh model budget identity")
+			}
 		}
 	}
 	if !validCloudDSHObservationFrame(frame, keys) {
@@ -1320,6 +1458,180 @@ func cloudDSHDigest(data []byte, encoded string) bool {
 func cloudDSHDigestBytes(encoded string) ([]byte, bool) {
 	want, err := hex.DecodeString(encoded)
 	return want, err == nil && len(encoded) == 64 && len(want) == sha256.Size && encoded == strings.ToLower(encoded)
+}
+
+func cloudDSHModelBudgetRequestDigest(raw []byte) (string, bool) {
+	if len(raw) == 0 || len(raw) > cloudDSHMaxFrame || !utf8.Valid(raw) || !uniqueCloudDSHJSON(raw) {
+		return "", false
+	}
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(raw, &fields) != nil || fields == nil {
+		return "", false
+	}
+	subset := make(map[string]json.RawMessage, 4)
+	for _, key := range []string{"provider", "model", "messages", "tools"} {
+		value, ok := fields[key]
+		if !ok {
+			return "", false
+		}
+		subset[key] = value
+	}
+	encoded, err := json.Marshal(subset)
+	if err != nil {
+		return "", false
+	}
+	canonical, ok := cloudDSHCanonicalJSONStringify(encoded)
+	if !ok {
+		return "", false
+	}
+	digest := sha256.Sum256(canonical)
+	return hex.EncodeToString(digest[:]), true
+}
+
+func cloudDSHCanonicalJSONStringify(raw []byte) ([]byte, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.UseNumber()
+	var value any
+	if decoder.Decode(&value) != nil || decoder.Decode(new(any)) != io.EOF {
+		return nil, false
+	}
+	var output bytes.Buffer
+	if !appendCloudDSHCanonicalJSON(&output, value) {
+		return nil, false
+	}
+	return output.Bytes(), true
+}
+
+func appendCloudDSHCanonicalJSON(output *bytes.Buffer, value any) bool {
+	switch typed := value.(type) {
+	case nil:
+		output.WriteString("null")
+	case bool:
+		output.WriteString(strconv.FormatBool(typed))
+	case string:
+		appendCloudDSHJSONString(output, typed)
+	case json.Number:
+		encoded, ok := cloudDSHCanonicalJSNumber(typed)
+		if !ok {
+			return false
+		}
+		output.WriteString(encoded)
+	case []any:
+		output.WriteByte('[')
+		for index, item := range typed {
+			if index > 0 {
+				output.WriteByte(',')
+			}
+			if !appendCloudDSHCanonicalJSON(output, item) {
+				return false
+			}
+		}
+		output.WriteByte(']')
+	case map[string]any:
+		keys := make([]string, 0, len(typed))
+		for key := range typed {
+			keys = append(keys, key)
+		}
+		sort.Slice(keys, func(left, right int) bool {
+			return cloudDSHJSONStringifyKeyLess(keys[left], keys[right])
+		})
+		output.WriteByte('{')
+		for index, key := range keys {
+			if index > 0 {
+				output.WriteByte(',')
+			}
+			appendCloudDSHJSONString(output, key)
+			output.WriteByte(':')
+			if !appendCloudDSHCanonicalJSON(output, typed[key]) {
+				return false
+			}
+		}
+		output.WriteByte('}')
+	default:
+		return false
+	}
+	return true
+}
+
+func cloudDSHJSONStringifyKeyLess(left, right string) bool {
+	leftUnits, rightUnits := utf16.Encode([]rune(left)), utf16.Encode([]rune(right))
+	for index := 0; index < len(leftUnits) && index < len(rightUnits); index++ {
+		if leftUnits[index] != rightUnits[index] {
+			return leftUnits[index] < rightUnits[index]
+		}
+	}
+	return len(leftUnits) < len(rightUnits)
+}
+
+func appendCloudDSHJSONString(output *bytes.Buffer, value string) {
+	const hex = "0123456789abcdef"
+	output.WriteByte('"')
+	for _, char := range value {
+		switch char {
+		case '"', '\\':
+			output.WriteByte('\\')
+			output.WriteRune(char)
+		case '\b':
+			output.WriteString("\\b")
+		case '\f':
+			output.WriteString("\\f")
+		case '\n':
+			output.WriteString("\\n")
+		case '\r':
+			output.WriteString("\\r")
+		case '\t':
+			output.WriteString("\\t")
+		default:
+			if char < 0x20 {
+				output.WriteString("\\u00")
+				output.WriteByte(hex[byte(char)>>4])
+				output.WriteByte(hex[byte(char)&0x0f])
+			} else {
+				output.WriteRune(char)
+			}
+		}
+	}
+	output.WriteByte('"')
+}
+
+func cloudDSHCanonicalJSNumber(value json.Number) (string, bool) {
+	number, err := strconv.ParseFloat(value.String(), 64)
+	if err != nil || math.IsInf(number, 0) || math.IsNaN(number) {
+		return "", false
+	}
+	if number == 0 {
+		return "0", true
+	}
+	sign := ""
+	if number < 0 {
+		sign = "-"
+		number = -number
+	}
+	scientific := strconv.FormatFloat(number, 'e', -1, 64)
+	parts := strings.SplitN(scientific, "e", 2)
+	if len(parts) != 2 {
+		return "", false
+	}
+	exponent, err := strconv.Atoi(parts[1])
+	if err != nil {
+		return "", false
+	}
+	digits := strings.ReplaceAll(parts[0], ".", "")
+	if number >= 1e-6 && number < 1e21 {
+		decimal := exponent + 1
+		if decimal >= len(digits) {
+			return sign + digits + strings.Repeat("0", decimal-len(digits)), true
+		}
+		if decimal > 0 {
+			return sign + digits[:decimal] + "." + digits[decimal:], true
+		}
+		return sign + "0." + strings.Repeat("0", -decimal) + digits, true
+	}
+	coefficient := parts[0]
+	if exponent >= 0 {
+		return sign + coefficient + "e+" + strconv.Itoa(exponent), true
+	}
+	return sign + coefficient + "e" + strconv.Itoa(exponent), true
 }
 
 func cloudDSHToolPayload(definitions []app.AgentToolDefinition) []map[string]any {

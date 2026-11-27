@@ -147,6 +147,32 @@ func TestTraceContextCreatesServerSpanAndKeepsRequestIDSeparate(t *testing.T) {
 	}
 }
 
+func TestTraceContextUsesSafeNameForFixedRouteLabels(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	exporter := tracetest.NewInMemoryExporter()
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithSampler(sdktrace.AlwaysSample()),
+		sdktrace.WithSpanProcessor(sdktrace.NewSimpleSpanProcessor(exporter)),
+	)
+	t.Cleanup(func() { _ = provider.Shutdown(context.Background()) })
+	middleware, err := Base(Options{Server: "gateway", Logger: zap.NewNop(), Metrics: prometheus.NewRegistry(), TracerProvider: provider})
+	if err != nil {
+		t.Fatal(err)
+	}
+	engine := gin.New()
+	engine.Use(middleware...)
+	engine.NoRoute(func(c *gin.Context) {
+		SetRoute(c, "preview")
+		c.Status(http.StatusNotFound)
+	})
+	engine.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/missing/private-path", nil))
+
+	spans := exporter.GetSpans()
+	if len(spans) != 1 || spans[0].Name != "http.get.preview" {
+		t.Fatalf("unmatched route span = %#v, want safe fixed-label span name", spans)
+	}
+}
+
 func TestTraceContextInvalidHeaderStartsNewTrace(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	registry := prometheus.NewRegistry()

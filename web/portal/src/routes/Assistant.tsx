@@ -269,6 +269,9 @@ function taskAttentionPresentation(task: AssistantTaskStatusInput, actorID?: str
           }
           break;
         case 'recovering':
+          if (attention.reason === 'model_budget_capacity') {
+            return { kind: attention.kind, label: '等待模型容量', detail: '模型并发容量暂时占满，系统会在等待期限内自动重试。', action: null };
+          }
           return { kind: attention.kind, label: '正在恢复', detail: '服务端已安排继续处理。', action: attention.action ?? null };
         case 'paused_retryable':
           if (attention.reason === 'retry_available' && attention.action === 'retry' && taskModelRecoveryRetryIsAvailable(task)) {
@@ -276,6 +279,12 @@ function taskAttentionPresentation(task: AssistantTaskStatusInput, actorID?: str
           }
           return { kind: 'interrupted', label: '已中断', detail: '这次任务已暂停，当前没有可用的继续操作。', action: attention.action ?? null };
         case 'interrupted':
+          if (attention.reason === 'model_budget_capacity_timeout') {
+            return { kind: attention.kind, label: '等待超时，已暂停', detail: '等待模型并发容量超时，任务已暂停。', action: null };
+          }
+          if (attention.reason === 'model_budget_exhausted') {
+            return { kind: attention.kind, label: '预算不足，已暂停', detail: '当前预算无法满足模型调用最低额度，任务已暂停。', action: null };
+          }
           return { kind: attention.kind, label: '已中断', detail: '这次没有拿到已核实的结果。', action: attention.action ?? null };
         case 'result_unverified':
           return { kind: attention.kind, label: '结果待核对', detail: '执行结果尚未确认，暂不能安全地重复操作。', action: attention.action ?? null };
@@ -289,7 +298,16 @@ function taskAttentionPresentation(task: AssistantTaskStatusInput, actorID?: str
     return null;
   }
 
+  if (task.status === 'paused' && task.waiting_reason === 'model_budget_capacity_timeout') {
+    return { kind: 'interrupted', label: '等待超时，已暂停', detail: '等待模型并发容量超时，任务已暂停。', action: null };
+  }
+  if (task.status === 'paused' && task.waiting_reason === 'model_budget_exhausted') {
+    return { kind: 'interrupted', label: '预算不足，已暂停', detail: '当前预算无法满足模型调用最低额度，任务已暂停。', action: null };
+  }
   if (task.status !== 'waiting_user') return null;
+  if (task.waiting_reason === 'model_budget_capacity') {
+    return { kind: 'recovering', label: '等待模型容量', detail: '模型并发容量暂时占满，系统会在等待期限内自动重试。', action: null };
+  }
   if (taskAttentionActionIsAvailableForCurrentUser(task, 'approve', actorID)) {
     return { kind: 'needs_user_action', label: '需要你操作', detail: '请在这条对话中审核待处理的操作。', action: 'approve' };
   }

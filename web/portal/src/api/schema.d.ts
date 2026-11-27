@@ -305,7 +305,7 @@ export interface paths {
         put?: never;
         /**
          * Log in to the portal
-         * @description Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. An account marked for a password change receives a restricted session until it changes its password.
+         * @description Sets the ch_portal session cookie only for approved accounts. Login attempts are rate limited. Correct credentials for pending, rejected, or disabled accounts return the matching account status without a session. Initial or reset passwords do not require a loopback connection; an account marked for a password change receives a restricted session until it changes its password, with no access to other APIs or onboarding side effects.
          */
         post: operations["login"];
         delete?: never;
@@ -3925,7 +3925,7 @@ export interface paths {
         put?: never;
         /**
          * Confirm the exact current Task verification requirement manifest
-         * @description Requires an authenticated Task reader and an Idempotency-Key. This records only an explicit positive confirmation of the exact current server-resolved plan manifest; it does not verify that the manifest is complete or mark H07 verified. Task revision, plan revision, plan event sequence, digest, and current authorization are rechecked transactionally. Stale, cancelled, unauthorized, or changed plans are rejected.
+         * @description Requires an authenticated Task reader and an Idempotency-Key. The user attests that the reviewed candidate manifest is complete and accurately represents the applicable Task requirements. The server separately rechecks each source identity and digest before using this attestation for H07. Task revision, plan revision, plan event sequence, digest, and current authorization are rechecked transactionally. Stale, cancelled, unauthorized, or changed plans are rejected.
          */
         post: operations["confirmTaskRequirementManifest"];
         delete?: never;
@@ -4242,6 +4242,28 @@ export interface paths {
          * @description Portal session only. The caller must currently be able to read this Task and own its running Host. The raw ticket is returned once, expires within 60 seconds, and is persisted server-side only as a hash. It grants read-only Task status/events and verified artifact metadata; it grants no Host control or Workspace file access.
          */
         post: operations["issueTaskWorkbenchObservationTicket"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/pc-delivery-observations": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Record a desktop client-visible Task reply
+         * @description Accepts only the Task initiator's client web session bound to an active desktop installation, with current access to the conversation, and a completed assistant message bound to the exact persisted task.result event for this Task and revision. The server records its own observation time and installation identity; request bodies contain no message content.
+         */
+        post: operations["observeTaskReplyInPC"];
         delete?: never;
         options?: never;
         head?: never;
@@ -5693,6 +5715,106 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/observability/overview": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read independent Harness observability source health and request spans
+         * @description Administrators only. Each source reports its own coverage state; unavailable DSH checkpoints do not hide span data.
+         */
+        get: operations["getAdminObservabilityOverview"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/observability/traces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Search distributed traces and linked conversation Tasks
+         * @description Administrators only. Search is bounded and cursors are opaque.
+         */
+        get: operations["listAdminObservabilityTraces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/observability/traces/{trace_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the bounded spans for one trace
+         * @description Administrators only. Span attributes use an allowlist and details are not cacheable.
+         */
+        get: operations["getAdminObservabilityTrace"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/observability/traces/{trace_id}/events": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a committed DSH checkpoint event page for a trace-linked Task
+         * @description Administrators only. Only digest-verified committed events are returned; checkpoint content is redacted and never modified.
+         */
+        get: operations["listAdminObservabilityTraceEvents"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/observability/traces/{trace_id}/logs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read trace-correlated structured Portal logs
+         * @description Administrators only. Results contain allowlisted fields, are bounded and are never cacheable.
+         */
+        get: operations["listAdminObservabilityTraceLogs"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/model-connections": {
         parameters: {
             query?: never;
@@ -5730,30 +5852,6 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
-    "/api/admin/observability/overview": {
-        parameters: { query?: never; header?: never; path?: never; cookie?: never; };
-        /** Administrator-only Harness observability overview. Responses are not cached. */
-        get: operations["getAdminObservabilityOverview"];
-        put?: never; post?: never; delete?: never; options?: never; head?: never; patch?: never; trace?: never;
-    };
-    "/api/admin/observability/traces": {
-        parameters: { query?: never; header?: never; path?: never; cookie?: never; };
-        /** Search traces by trace, request, task, or free-text query. */
-        get: operations["listAdminObservabilityTraces"];
-        put?: never; post?: never; delete?: never; options?: never; head?: never; patch?: never; trace?: never;
-    };
-    "/api/admin/observability/traces/{trace_id}": {
-        parameters: { query?: never; header?: never; path?: never; cookie?: never; };
-        /** Read a trace and its recorded spans. */
-        get: operations["getAdminObservabilityTrace"];
-        put?: never; post?: never; delete?: never; options?: never; head?: never; patch?: never; trace?: never;
-    };
-    "/api/admin/observability/traces/{trace_id}/events": {
-        parameters: { query?: never; header?: never; path?: never; cookie?: never; };
-        /** Read recorded DSH events for a trace. */
-        get: operations["listAdminObservabilityTraceEvents"];
-        put?: never; post?: never; delete?: never; options?: never; head?: never; patch?: never; trace?: never;
-    };
     "/api/admin/quality": {
         parameters: {
             query?: never;
@@ -5766,6 +5864,26 @@ export interface paths {
          * @description Does not inspect conversation content. Returns unavailable until a separately consented quality sample source is configured.
          */
         get: operations["getAdminQuality"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/users/{id}/tasks/{task_id}/workflow-trace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read a source-bound workflow trace for a Task
+         * @description Reads Task, route, Agent, model-call, operation, approval, validation, conversation-delivery and Host ledger facts from one database snapshot. It exposes only ledger metadata and hashes, preserves unavailable relationships as gaps, and does not infer Task success or a quality score. PC-side observation remains unavailable until its adapter is provided. Administrators only.
+         */
+        get: operations["getAdminTaskWorkflowTrace"];
         put?: never;
         post?: never;
         delete?: never;
@@ -6765,6 +6883,8 @@ export interface components {
              */
             base_url: string;
             model_name: string;
+            /** @description Optional output-capacity metadata override for personal custom model routes. This records provider-documented capacity and does not change the gateway dispatch limit. System presets are maintained by Morde. */
+            max_output_override_tokens?: number | null;
             /**
              * @deprecated
              * @description Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens.
@@ -6787,6 +6907,8 @@ export interface components {
              */
             base_url: string;
             model_name: string;
+            /** @description Optional output-capacity metadata override for personal custom model routes. Omitted preserves it for an unchanged route; route changes clear it unless a new value is supplied; null clears it. This records provider-documented capacity and does not change the gateway dispatch limit. System presets are maintained by Morde. */
+            max_output_override_tokens?: number | null;
             /**
              * @deprecated
              * @description Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens.
@@ -6817,6 +6939,27 @@ export interface components {
             /** Format: uri */
             base_url: string;
             model_name: string;
+            /** @description Additive response field. Effective model output-capacity metadata for this exact configured route; null means unknown. It does not imply that the current gateway can dispatch this many tokens. Older servers may omit it. */
+            max_output_tokens?: number | null;
+            /** @description Additive response field. Explicit output-capacity metadata override for personal custom routes only. Older servers may omit it. */
+            max_output_override_tokens?: number | null;
+            /**
+             * @description Additive response field. Older servers may omit it.
+             * @enum {string}
+             */
+            max_output_source?: "unknown" | "override" | "model_catalog";
+            /**
+             * Format: date-time
+             * @description Additive response field. Older servers may omit it.
+             */
+            max_output_resolved_at?: string | null;
+            /** @description Additive response field. Older servers may omit it. */
+            max_output_catalog_version?: string | null;
+            /**
+             * Format: uri
+             * @description Additive response field. Older servers may omit it.
+             */
+            max_output_source_url?: string | null;
             /** @description Effective capacity for the configured route */
             context_window_tokens: number | null;
             /** @description Explicit advanced override for custom routes only. */
@@ -8352,6 +8495,7 @@ export interface components {
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
             observation?: components["schemas"]["ScheduleObservation"] | null;
+            /** @description Optional explicit opt-in to one active personal rule revision. The server resolves and stores the exact source memory revision. */
             personal_rule?: components["schemas"]["SchedulePersonalRuleSelection"] | null;
         } & unknown;
         ScheduleUpdateRequest: {
@@ -8373,6 +8517,7 @@ export interface components {
             misfire_policy?: components["schemas"]["ScheduleMisfirePolicy"];
             notification_events?: components["schemas"]["ScheduleNotificationEvent"][];
             observation?: components["schemas"]["ScheduleObservation"] | null;
+            /** @description Omission preserves the current binding; null removes it; an object replaces it with one explicitly selected candidate revision. */
             personal_rule?: components["schemas"]["SchedulePersonalRuleSelection"] | null;
         };
         ScheduleActionRequest: {
@@ -9623,7 +9768,10 @@ export interface components {
             end_byte: number;
             evidence_refs: components["schemas"]["TaskValidationEvidenceRef"][];
             performance_comparison?: components["schemas"]["TaskValidationPerformanceComparison"];
-            /** @description Server-derived locator availability for the exact evidence steps cited by this claim; this is not a correctness verdict. */
+            /**
+             * @description Server-derived locator availability for the exact evidence steps cited by this claim; this is not a correctness verdict.
+             * @enum {string}
+             */
             source_location_state?: "mapped" | "partial" | "unavailable" | "restricted" | "no_locator" | "truncated";
             /** @description References into the response's deduplicated source_locations list. */
             source_location_ids?: string[];
@@ -9635,7 +9783,7 @@ export interface components {
             event_sequence: number;
             result_sha256: string;
             claims: components["schemas"]["TaskValidationEvidenceClaim"][];
-            /** @description Server-validated locators referenced by claim source_location_ids. Workspace paths require current Task Workspace access. */
+            /** @description Server-validated locators used by claim source_location_ids. Workspace paths are returned only when the reader is authorized for the Task Workspace. */
             source_locations?: components["schemas"]["TaskStepSourceLocation"][];
         };
         TaskSummary: {
@@ -9667,6 +9815,8 @@ export interface components {
             model_id: string;
             objective: string;
             status: components["schemas"]["TaskStatus"];
+            /** @description Safe Task wait/pause reason used for status presentation; clients should not infer a user action from the reason alone. */
+            waiting_reason?: string | null;
             /** @description User priority for queued work; tasks waiting for 15 minutes or longer are promoted into an age-ordered fairness band. */
             queue_priority: components["schemas"]["TaskQueuePriority"];
             current_step: string | null;
@@ -9821,7 +9971,10 @@ export interface components {
             expected_plan_revision: number;
             /** Format: int64 */
             expected_plan_event_sequence: number;
-            /** @constant */
+            /**
+             * @description Authenticated user declaration that the reviewed obligation list is complete and faithfully expresses the applicable requirements.
+             * @constant
+             */
             requirements_complete_attested: true;
         };
         TaskRequirementManifestConfirmation: {
@@ -9839,13 +9992,6 @@ export interface components {
             attested_at: string;
             /** Format: date-time */
             confirmed_at: string;
-        };
-        TaskRequirementManifestStatus: {
-            manifest_digest: string;
-            /** @constant */
-            requirements_complete_attested: true;
-            /** Format: date-time */
-            attested_at: string;
         };
         TaskStepRetryRequest: {
             /** Format: int64 */
@@ -10230,6 +10376,14 @@ export interface components {
             /** Format: date-time */
             expires_at: string;
         };
+        TaskPCDeliveryObservationRequest: {
+            message_id: components["schemas"]["MessageId"];
+            /**
+             * Format: int64
+             * @description Exact revision represented by the completed assistant message.
+             */
+            task_revision: number;
+        };
         /** @description Read-only Task projection. It contains no objective, Task result, event payload, file path, mutation field, or Host control capability. */
         TaskWorkbenchObservationSnapshot: {
             task_id: components["schemas"]["TaskId"];
@@ -10277,8 +10431,12 @@ export interface components {
             steps: components["schemas"]["TaskStep"][];
             /** @description Latest advisory plan for the current Task revision. It never grants authorization; prior revisions remain in the task event history. */
             plan?: components["schemas"]["TaskPlan"] | null;
-            /** Format: int64 */
+            /**
+             * Format: int64
+             * @description Durable Task event sequence for the current plan
+             */
             plan_event_sequence?: number;
+            /** @description Present only for a current plan manifest with a matching authenticated user completeness attestation. */
             requirement_manifest_confirmation?: components["schemas"]["TaskRequirementManifestStatus"];
             /** @description Task-scoped model call totals from the authorized account/project usage ledger. Costs retain currency and rate snapshot versions; unknown */
             billing?: components["schemas"]["TaskBilling"];
@@ -10314,6 +10472,13 @@ export interface components {
         TaskPage: {
             items: components["schemas"]["TaskSummary"][];
             next_cursor: string | null;
+        };
+        TaskRequirementManifestStatus: {
+            manifest_digest: string;
+            /** @constant */
+            requirements_complete_attested: true;
+            /** Format: date-time */
+            attested_at: string;
         };
         TaskApprovalPage: {
             items: components["schemas"]["TaskApprovalItem"][];
@@ -10665,6 +10830,7 @@ export interface components {
             by_day: components["schemas"]["AdminUsageDay"][];
             by_model: components["schemas"]["AdminUsageModel"][];
         };
+        /** @enum {string} */
         AdminObservabilityStatus: "available" | "partial" | "unavailable" | "disabled";
         AdminObservabilitySource: {
             status: components["schemas"]["AdminObservabilityStatus"];
@@ -10675,9 +10841,16 @@ export interface components {
         AdminObservabilityOverview: {
             sources: {
                 spans: components["schemas"]["AdminObservabilitySource"];
+                logs: components["schemas"]["AdminObservabilitySource"];
                 dsh_events: components["schemas"]["AdminObservabilitySource"];
             };
-            spans_24h: { request_count: number; error_count: number; p95_duration_ms: number };
+            spans_24h: {
+                /** Format: int64 */
+                request_count: number;
+                /** Format: int64 */
+                error_count: number;
+                p95_duration_ms: number;
+            };
         };
         AdminObservabilityTraceSummary: {
             trace_id: string;
@@ -10687,27 +10860,47 @@ export interface components {
             started_at: string;
             /** Format: date-time */
             ended_at: string | null;
-            status: string;
+            /** @enum {string} */
+            status: "ok" | "error" | "partial";
+            /** Format: int64 */
             span_count: number;
+            /** Format: int64 */
             error_count: number;
         };
         AdminObservabilityTracePage: {
             items: components["schemas"]["AdminObservabilityTraceSummary"][];
             next_cursor: string | null;
-            sources: { spans: components["schemas"]["AdminObservabilitySource"] };
+            sources: {
+                spans: components["schemas"]["AdminObservabilitySource"];
+            };
         };
         AdminObservabilitySpan: {
+            trace_id: string;
             span_id: string;
             parent_span_id: string | null;
             name: string;
-            kind: string;
-            status: string;
+            /** @enum {string} */
+            kind: "unspecified" | "internal" | "server" | "client" | "producer" | "consumer";
+            /** @enum {string} */
+            status: "unset" | "ok" | "error";
             /** Format: date-time */
             start_at: string;
             /** Format: date-time */
             end_at: string | null;
-            attributes: { [key: string]: unknown };
-            events: unknown[];
+            attributes: {
+                [key: string]: unknown;
+            };
+            links: components["schemas"]["AdminObservabilitySpanLink"][];
+            events: {
+                [key: string]: unknown;
+            }[];
+        };
+        AdminObservabilitySpanLink: {
+            trace_id: string;
+            span_id: string;
+            attributes: {
+                [key: string]: unknown;
+            };
         };
         AdminObservabilityTrace: {
             trace_id: string;
@@ -10718,10 +10911,12 @@ export interface components {
             session_id: string;
             parent_session_id: string | null;
             step_id: string | null;
-            role: string;
+            /** @enum {string} */
+            role: "root" | "subagent";
         };
         AdminObservabilityDSHEvent: {
             session_id: string;
+            /** Format: int64 */
             sequence: number;
             /** Format: date-time */
             time: string;
@@ -10732,7 +10927,28 @@ export interface components {
             task_id: string | null;
             agent_sessions: components["schemas"]["AdminObservabilityAgentSession"][];
             events: components["schemas"]["AdminObservabilityDSHEvent"][];
+            /** Format: int64 */
             next_sequence: number | null;
+            coverage: components["schemas"]["AdminObservabilitySource"];
+        };
+        AdminObservabilityLog: {
+            /** Format: date-time */
+            time: string;
+            /** @enum {string} */
+            severity: "debug" | "info" | "warn" | "error" | "dpanic" | "panic" | "fatal";
+            service: string;
+            message: string;
+            trace_id: string;
+            span_id: string | null;
+            request_id: string | null;
+            task_id: string | null;
+            attributes: {
+                [key: string]: unknown;
+            };
+        };
+        AdminObservabilityLogPage: {
+            items: components["schemas"]["AdminObservabilityLog"][];
+            next_cursor: string | null;
             coverage: components["schemas"]["AdminObservabilitySource"];
         };
         /** @enum {string} */
@@ -10904,6 +11120,56 @@ export interface components {
             pending_reason?: string;
             review_count: number;
             arbitration_count: number;
+        };
+        WorkflowTrace: {
+            /** @constant */
+            version: 1;
+            trace_id: string;
+            run_id?: string;
+            /** @enum {string} */
+            data_class: "synthetic" | "live-scripted" | "live-observed";
+            /** Format: date-time */
+            captured_at: string;
+            /** @enum {string} */
+            coverage: "declared_complete" | "partial" | "unknown";
+            coverage_source_ids: string[];
+            sources: components["schemas"]["WorkflowSource"][];
+            nodes: components["schemas"]["WorkflowNode"][];
+            edges: components["schemas"]["WorkflowEdge"][];
+            gaps: components["schemas"]["WorkflowGap"][];
+        };
+        WorkflowSource: {
+            id: string;
+            /** @enum {string} */
+            kind: "task_ledger" | "agent_ledger" | "model_call_ledger" | "operation_ledger" | "approval_ledger" | "validation_ledger" | "conversation_output" | "pc_observation" | "authorization_snapshot" | "runtime_snapshot" | "host_snapshot" | "route_result" | "local_test" | "code_inspection" | "evaluation_run";
+            locator: string;
+            sha256?: string;
+        };
+        WorkflowNode: {
+            id: string;
+            /** @enum {string} */
+            kind: "route" | "task" | "agent" | "model_call" | "operation" | "approval" | "validation" | "delivery" | "host" | "runtime" | "authorization";
+            /** @enum {string} */
+            state: "started" | "running" | "settled" | "completed" | "failed" | "waiting" | "waiting_user" | "pending" | "approved" | "rejected" | "expired" | "cancelled" | "unknown" | "unavailable";
+            source_ids: string[];
+        };
+        WorkflowEdge: {
+            id: string;
+            from: string;
+            to: string;
+            /** @enum {string} */
+            kind: "created" | "handoff" | "invoked" | "returned" | "approved" | "rejected" | "verified" | "delivered" | "resumed" | "routed" | "targets" | "authorized" | "approval_requested";
+            source_ids: string[];
+        };
+        WorkflowGap: {
+            id: string;
+            /** @enum {string} */
+            stage: "route" | "task" | "agent" | "model_call" | "operation" | "approval" | "verification" | "delivery" | "host" | "runtime" | "authorization" | "provenance";
+            scope: string;
+            /** @enum {string} */
+            state: "absent" | "not_run" | "unavailable" | "unknown";
+            count?: number;
+            source_ids: string[];
         };
         AdminQuality: {
             /** @enum {integer} */
@@ -18131,7 +18397,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Persisted confirmation fact for the exact current manifest. */
+            /** @description Persisted user completeness attestation for the exact current manifest. */
             200: {
                 headers: {
                     "Cache-Control"?: "no-store";
@@ -18597,6 +18863,34 @@ export interface operations {
                 };
             };
             400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    observeTaskReplyInPC: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["TaskPCDeliveryObservationRequest"];
+            };
+        };
+        responses: {
+            /** @description The PC-visible observation was recorded idempotently. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
@@ -21161,6 +21455,153 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    getAdminObservabilityOverview: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source health and 24-hour request aggregates */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminObservabilityOverview"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminObservabilityTraces: {
+        parameters: {
+            query?: {
+                trace_id?: string;
+                request_id?: string;
+                task_id?: string;
+                q?: string;
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Trace summaries and span coverage */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminObservabilityTracePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminObservabilityTrace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                trace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Span tree and coverage state */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminObservabilityTrace"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminObservabilityTraceEvents: {
+        parameters: {
+            query?: {
+                agent_session_id?: string;
+                from_sequence?: number;
+                limit?: number;
+            };
+            header?: never;
+            path: {
+                trace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Session tree, committed event page, and explicit coverage state */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminObservabilityTraceEvents"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    listAdminObservabilityTraceLogs: {
+        parameters: {
+            query?: {
+                request_id?: string;
+                task_id?: string;
+                limit?: number;
+                cursor?: string;
+            };
+            header?: never;
+            path: {
+                trace_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Correlated log page and explicit capture coverage */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AdminObservabilityLogPage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
     listAdminModelConnections: {
         parameters: {
             query?: never;
@@ -21210,54 +21651,6 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
-    getAdminObservabilityOverview: {
-        parameters: { query?: never; header?: never; path?: never; cookie?: never; };
-        requestBody?: never;
-        responses: {
-            200: { headers: { "Cache-Control"?: "no-store"; [name: string]: unknown; }; content: { "application/json": components["schemas"]["AdminObservabilityOverview"]; }; };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            default: components["responses"]["Error"];
-        };
-    };
-    listAdminObservabilityTraces: {
-        parameters: {
-            query?: { trace_id?: string; request_id?: string; task_id?: string; q?: string; limit?: number; cursor?: string; };
-            header?: never; path?: never; cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: { headers: { "Cache-Control"?: "no-store"; [name: string]: unknown; }; content: { "application/json": components["schemas"]["AdminObservabilityTracePage"]; }; };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            default: components["responses"]["Error"];
-        };
-    };
-    getAdminObservabilityTrace: {
-        parameters: { query?: never; header?: never; path: { trace_id: string; }; cookie?: never; };
-        requestBody?: never;
-        responses: {
-            200: { headers: { "Cache-Control"?: "no-store"; [name: string]: unknown; }; content: { "application/json": components["schemas"]["AdminObservabilityTrace"]; }; };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            default: components["responses"]["Error"];
-        };
-    };
-    listAdminObservabilityTraceEvents: {
-        parameters: {
-            query?: { agent_session_id?: string; from_sequence?: number; limit?: number; };
-            header?: never; path: { trace_id: string; }; cookie?: never;
-        };
-        requestBody?: never;
-        responses: {
-            200: { headers: { "Cache-Control"?: "no-store"; [name: string]: unknown; }; content: { "application/json": components["schemas"]["AdminObservabilityTraceEvents"]; }; };
-            401: components["responses"]["Unauthorized"];
-            403: components["responses"]["Forbidden"];
-            404: components["responses"]["NotFound"];
-            default: components["responses"]["Error"];
-        };
-    };
     getAdminQuality: {
         parameters: {
             query?: {
@@ -21281,6 +21674,34 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getAdminTaskWorkflowTrace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: string;
+                task_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Source-bound execution graph with explicit coverage gaps */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkflowTrace"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };
     };

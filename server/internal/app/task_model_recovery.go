@@ -49,12 +49,23 @@ type TaskModelRecoveryStore interface {
 }
 
 func TaskModelRecoveryCallID(taskID string, revision int64, failedCallID string, throughSequence int64) (string, error) {
+	return taskModelRecoveryIdentity("morde-task-model-recovery-v1", "mrc_", taskID, revision, failedCallID, throughSequence)
+}
+
+// TaskModelRecoveryDSHCallID creates a new DSH model-frame identity for the
+// one authorized recovery attempt. It is distinct from both the failed frame
+// and the durable model-call ledger identity.
+func TaskModelRecoveryDSHCallID(taskID string, revision int64, failedCallID string, throughSequence int64) (string, error) {
+	return taskModelRecoveryIdentity("morde-task-model-recovery-dsh-v1", "mdr_", taskID, revision, failedCallID, throughSequence)
+}
+
+func taskModelRecoveryIdentity(domainVersion, prefix, taskID string, revision int64, failedCallID string, throughSequence int64) (string, error) {
 	if !domain.ValidTaskID(taskID) || revision < 0 || throughSequence < 0 || !idempotencyKeyPattern.MatchString(failedCallID) {
 		return "", domain.InvalidArgument("task_model_recovery", "recovery call identity is invalid")
 	}
-	digest := sha256.Sum256([]byte("morde-task-model-recovery-v1\n" + taskID + "\n" + strconv.FormatInt(revision, 10) +
+	digest := sha256.Sum256([]byte(domainVersion + "\n" + taskID + "\n" + strconv.FormatInt(revision, 10) +
 		"\n" + failedCallID + "\n" + strconv.FormatInt(throughSequence, 10)))
-	return "mrc_" + hex.EncodeToString(digest[:]), nil
+	return prefix + hex.EncodeToString(digest[:]), nil
 }
 
 func ValidateTaskModelRecoveryCommand(value TaskModelRecoveryCommand) error {
@@ -71,6 +82,7 @@ func ValidateTaskModelRecoveryCommand(value TaskModelRecoveryCommand) error {
 		fence.AgentRootSessionID != fence.AgentSessionID || fence.AgentGeneration < 1 || fence.LeaseOwner == "" ||
 		fence.LeaseVersion < 1 || fence.AuthorizationVersion < 1 || fence.ThroughSequence < 0 ||
 		fence.EngineVersion == "" || fence.ProfileVersion == "" || fence.TaskRevision != *value.Task.CurrentRevision ||
+		fence.RecoveryCallID != "" || fence.RecoveryDSHCallID != "" ||
 		!evidence.UsageKnown || evidence.InputTokens != 0 || evidence.OutputTokens != 0 ||
 		!domain.ValidModelConnectionID(evidence.ModelID) || len(evidence.RequestDigest) != sha256.Size {
 		return domain.InvalidArgument("task_model_recovery", "model dispatch proof is invalid")
@@ -114,6 +126,11 @@ func ValidTaskModelRecoveryIntent(value task.ModelRecoveryIntent) bool {
 	}
 	expected, err := TaskModelRecoveryCallID(value.TaskID, value.TaskRevision, value.FailedCallID, value.FailedThroughSequence)
 	if err != nil || expected != value.RecoveryCallID {
+		return false
+	}
+	expectedDSHCallID, err := TaskModelRecoveryDSHCallID(value.TaskID, value.TaskRevision, value.FailedCallID, value.FailedThroughSequence)
+	if err != nil || expectedDSHCallID != value.RecoveryDSHCallID || value.RecoveryDSHCallID == value.RecoveryCallID ||
+		value.RecoveryDSHCallID == value.FailedCallID {
 		return false
 	}
 	switch value.State {

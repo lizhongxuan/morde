@@ -18,6 +18,7 @@
 
 ## Agent Runtime 与 DSH 插件
 
+- 服务端 Portal 可使用 OpenTelemetry Go Trace SDK。按 [`server/AGENTS.md`](server/AGENTS.md) 固定依赖版本、注入 `TracerProvider`、传播 W3C Trace Context，并遵守字段白名单、队列/载荷上限和本地存储保留期；禁止依赖全局 Provider、自动注入或网络遥测出口。
 - Morde Harness 的端到端总流程及各步骤说明统一维护在[《Morde 复刻 Muse 最终流程与开发设计》](<docs/muse_docs/muse_steps/Morde 复刻 Muse 最终流程与开发设计.md>)，实施任务拆解在[实施任务 TODO](docs/muse_docs/muse_steps/实施任务TODO/00-总大纲.md)。开始修改 Harness 会话、路由、Task、工具执行、验证或交付流程前先阅读这些文档；后续持续优化时同步更新总流程图、实施任务 TODO 及相关验证记录，保持步骤语义和实际状态一致。总流程图描述目标，不代表对应能力已实现或验收通过。
 - Morde 云端 AI Agent 统一使用 DSH（DeepSeek Harness）作为唯一的 Agent Runtime。对话、并发任务和子 Agent 可以分别拥有执行上下文，但不另外实现 Agent 循环或并行引入第二套 Agent Runtime。GPT、DeepSeek 等模型继续通过 Morde 模型网关接入。
 - 开发或调整 Agent 能力前，先查看当前项目已接入的 DSH 组件和 [DSH 上游插件](https://github.com/deepseek-ai/deepseek-harness)，包括工具、MCP、技能、子 Agent、会话和沙箱等；有符合需求的插件时优先直接复用，通过插件和 provider 机制做必要适配，避免重复开发。没有合适插件、版本不兼容或无法满足现有约束时，说明原因并选择最小可行方案。

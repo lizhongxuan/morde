@@ -121,6 +121,34 @@ func TestTaskAttentionKeepsUnknownOutcomesAndNoScheduleConservative(t *testing.T
 	}
 }
 
+func TestTaskAttentionExplainsModelBudgetWaitAndPause(t *testing.T) {
+	revision := int64(1)
+	service := &TaskService{}
+	tests := []struct {
+		name     string
+		status   task.Status
+		reason   string
+		wantKind TaskAttentionKind
+	}{
+		{name: "capacity is retrying automatically", status: task.StatusWaitingUser, reason: TaskModelBudgetCapacityWaitReason,
+			wantKind: TaskAttentionRecovering},
+		{name: "capacity wait expired", status: task.StatusPaused, reason: TaskModelBudgetCapacityExpiredReason,
+			wantKind: TaskAttentionInterrupted},
+		{name: "minimum budget unavailable", status: task.StatusPaused, reason: TaskModelBudgetCapacityExhaustedReason,
+			wantKind: TaskAttentionInterrupted},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			value := attentionTask(revision, test.status, test.reason)
+			attention := service.taskAttention(context.Background(), taskTestPrincipal(), TaskDetails{Task: value})
+			if attention == nil || attention.Kind != test.wantKind || attention.Reason != test.reason ||
+				attention.Action != nil || !ValidTaskAttention(attention, value.EventSequence) {
+				t.Fatalf("Task attention = %#v; want kind=%q reason=%q without action", attention, test.wantKind, test.reason)
+			}
+		})
+	}
+}
+
 func TestTaskAttentionRequiresPersistedCurrentRecoveryForRetryOrRecovering(t *testing.T) {
 	for _, test := range []struct {
 		name        string
@@ -206,13 +234,14 @@ func (s *taskAttentionRecoveryStore) GetTaskModelRecovery(_ context.Context, tas
 func attentionRecoveryIntent(value task.Task, state task.ModelRecoveryState) task.ModelRecoveryIntent {
 	callID, _ := DSHModelCallID(value.ID, "session_123", 5)
 	recoveryCallID, _ := TaskModelRecoveryCallID(value.ID, *value.CurrentRevision, callID, 5)
+	recoveryDSHCallID, _ := TaskModelRecoveryDSHCallID(value.ID, *value.CurrentRevision, callID, 5)
 	return task.ModelRecoveryIntent{TaskID: value.ID, OwnerID: value.OwnerID, InitiatorID: value.InitiatorID,
 		TaskRevision: *value.CurrentRevision, AuthorizationVersion: value.Authorization.Version, AgentInstanceID: "agent_123",
 		AgentGeneration: 2, AgentSessionID: "session_123", FailedLeaseOwner: "worker-1", FailedLeaseVersion: 4,
 		EngineVersion: "engine", ProfileVersion: "profile", FailedCallID: callID, FailedModelID: "p1234567",
 		FailedRequestDigest: make([]byte, 32), FailedThroughSequence: 5,
 		CheckpointThroughSequence: 5, CheckpointDigest: make([]byte, 32), ToolsetDigest: make([]byte, 32),
-		RecoveryCallID: recoveryCallID, State: state, EventSequence: value.EventSequence}
+		RecoveryCallID: recoveryCallID, RecoveryDSHCallID: recoveryDSHCallID, State: state, EventSequence: value.EventSequence}
 }
 
 func TestValidTaskAttentionBindsActionToCurrentEvent(t *testing.T) {

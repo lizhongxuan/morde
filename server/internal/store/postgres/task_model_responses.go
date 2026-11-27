@@ -76,6 +76,12 @@ FROM model_call_ledger WHERE owner_id=$1 AND source='task' AND call_id=$2 FOR UP
 			!bytes.Equal(requestDigest, request.RequestDigest) {
 			return domain.NewError(domain.CodeIdempotencyConflict, "Task model response call identity changed")
 		}
+		// Adaptive budgeting creates the ledger row before ModelGateway's
+		// response-replay check. A still-prepared call has not been dispatched,
+		// so it may continue through the normal fenced dispatch path below.
+		if state == "prepared" {
+			return nil
+		}
 		if state != "settled" || inputTokens == nil || outputTokens == nil {
 			return domain.NewError(domain.CodeInvalidState, "Task model call has no recoverable settled response")
 		}

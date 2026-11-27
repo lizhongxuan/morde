@@ -35,7 +35,9 @@ const (
 )
 
 var (
-	errSpanExporterClosed = errors.New("postgres span exporter is shut down")
+	errSpanExporterClosed  = errors.New("postgres span exporter is shut down")
+	errInvalidSpanIdentity = errors.New("span identity is invalid")
+	errInvalidSpanName     = errors.New("span name is invalid")
 )
 
 const insertSpanSQL = `INSERT INTO observability_spans
@@ -62,6 +64,16 @@ const pruneTraceLinksSQL = `WITH expired AS (
  FOR UPDATE SKIP LOCKED
 )
 DELETE FROM observability_trace_links AS links USING expired
+WHERE links.ctid=expired.ctid`
+
+const pruneTaskTraceLinksSQL = `WITH expired AS (
+ SELECT ctid FROM observability_task_attempt_links
+ WHERE created_at < $1
+ ORDER BY created_at,task_id,attempt
+ LIMIT $2
+ FOR UPDATE SKIP LOCKED
+)
+DELETE FROM observability_task_attempt_links AS links USING expired
 WHERE links.ctid=expired.ctid`
 
 // PostgresSpanExporter stores low-sensitivity span metadata using the Portal's
@@ -265,10 +277,14 @@ func (e *PostgresSpanExporter) PurgeExpiredSpans(ctx context.Context, cutoff tim
 	if err != nil {
 		return 0, fmt.Errorf("purge expired trace links: %w", err)
 	}
+	taskLinks, err := tx.Exec(cleanupCtx, pruneTaskTraceLinksSQL, cutoff.UTC(), limit)
+	if err != nil {
+		return 0, fmt.Errorf("purge expired Task trace links: %w", err)
+	}
 	if err := tx.Commit(cleanupCtx); err != nil {
 		return 0, fmt.Errorf("commit observability retention transaction: %w", err)
 	}
-	return spans.RowsAffected() + links.RowsAffected(), nil
+	return spans.RowsAffected() + links.RowsAffected() + taskLinks.RowsAffected(), nil
 }
 
 // Shutdown prevents new exports but leaves the shared pool open. The SDK
@@ -365,6 +381,10 @@ func (e *PostgresSpanExporter) recordFailure(err error) {
 
 func exportErrorReason(err error) string {
 	switch {
+	case errors.Is(err, errInvalidSpanName):
+		return "invalid_span_name"
+	case errors.Is(err, errInvalidSpanIdentity):
+		return "invalid_span_identity"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "export_timeout"
 	case errors.Is(err, context.Canceled):
@@ -399,8 +419,11 @@ type spanRecord struct {
 
 func makeSpanRecord(span sdktrace.ReadOnlySpan) (spanRecord, error) {
 	spanContext := span.SpanContext()
-	if !spanContext.IsValid() || span.EndTime().IsZero() || span.StartTime().IsZero() || span.EndTime().Before(span.StartTime()) || span.Name() == "" || len(span.Name()) > 256 || !safeSpanName(span.Name()) {
-		return spanRecord{}, errors.New("span identity or name is invalid")
+	if !spanContext.IsValid() || span.EndTime().IsZero() || span.StartTime().IsZero() || span.EndTime().Before(span.StartTime()) {
+		return spanRecord{}, errInvalidSpanIdentity
+	}
+	if span.Name() == "" || len(span.Name()) > 256 || !safeSpanName(span.Name()) {
+		return spanRecord{}, errInvalidSpanName
 	}
 	attributes, err := encodeAttributes(span.Attributes(), spanAttributeList)
 	if err != nil {
@@ -491,9 +514,6 @@ func encodeAttributes(values []attribute.KeyValue, allow attributeAllowList) ([]
 		}
 		encodedBytes += entryBytes
 		attributes[key] = encoded
-	}
-	if attributes == nil {
-		attributes = make(map[string]any)
 	}
 	encoded, err := json.Marshal(attributes)
 	if err != nil {
@@ -660,7 +680,8 @@ func safeSpanName(value string) bool {
 
 func safeOperationToken(value string) bool {
 	for _, r := range value {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._-/:{}*", r)) {
+		isASCIIAlphaNumeric := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+		if !isASCIIAlphaNumeric && !strings.ContainsRune("._-/:{}*", r) {
 			return false
 		}
 	}
@@ -672,7 +693,8 @@ func safeMetadataText(value string, maxBytes int) bool {
 		return false
 	}
 	for _, r := range value {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._-/:{}*", r)) {
+		isASCIIAlphaNumeric := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+		if !isASCIIAlphaNumeric && !strings.ContainsRune("._-/:{}*", r) {
 			return false
 		}
 	}
@@ -684,7 +706,8 @@ func safeScopeName(value string) bool {
 		return false
 	}
 	for _, r := range value {
-		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || strings.ContainsRune("._/-", r)) {
+		isASCIIAlphaNumeric := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9'
+		if !isASCIIAlphaNumeric && !strings.ContainsRune("._/-", r) {
 			return false
 		}
 	}

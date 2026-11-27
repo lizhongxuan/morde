@@ -20,13 +20,14 @@ flowchart LR
   C -->|登录后补传脱敏诊断| P
   P & W & B --> T[OpenTelemetry Trace SDK]
   T -->|有界异步 SpanExporter| L[(现有 PostgreSQL)]
+  P & W & B -->|带 trace ID 的结构化日志镜像| L
   D -->|AEAD 加密 checkpoint 事件| L
   P & W & B --> M[进程内现有指标]
   A[管理后台] --> Q[Portal 管理员 API]
   Q --> L & M
 ```
 
-采用 OpenTelemetry Trace SDK 做标准上下文、父子 Span 和异步链接；Portal 用有界 `BatchSpanProcessor` 将低敏 Span 写入**现有** PostgreSQL，不额外运行 Collector、Phoenix、Loki、Tempo 或 Prometheus 服务。指标复用进程内现有 registry 和任务 / 模型账本。DSH 的完整会话事件直接读取现有 AEAD 加密 checkpoint，管理员页面由 Morde 自己展示，不引入第二个 Agent 可观测平台。Span 属性只存脱敏路由、状态、耗时及关联 ID；完整思考/工具文本不进入 Span，保持 checkpoint 原样加密。所有页面只经 Portal 管理 API 访问，后端和数据库不对客户端暴露。
+采用 OpenTelemetry Trace SDK 做标准上下文、父子 Span 和异步链接；Portal 用有界 `BatchSpanProcessor` 将低敏 Span 写入**现有** PostgreSQL，并以 zap Core 包装器将带有效 trace ID 的结构化日志经独立有界队列写入 `observability_logs`。日志只保留字段白名单及经凭据 scrub 的消息；Span 与关联日志均保留 7 天。不额外运行 Collector、Phoenix、Loki、Tempo 或 Prometheus 服务。指标复用进程内现有 registry 和任务 / 模型账本。DSH 的完整会话事件直接读取现有 AEAD 加密 checkpoint，管理员页面由 Morde 自己展示，不引入第二个 Agent 可观测平台。Span 属性只存脱敏路由、状态、耗时及关联 ID；完整思考/工具文本不进入 Span，保持 checkpoint 原样加密。所有页面只经 Portal 管理 API 访问，后端和数据库不对客户端暴露。
 
 **资源边界：**现有 4 核 / 8 GiB 主机不增加独立容器或进程，但新增 Span 写入会占用现有 PostgreSQL 资源。必须限制 exporter 队列、单 Span 属性、批量写入、查询超时和 7 天 Span 保留；checkpoint 属于 DSH 恢复数据，不由观测清理任务删除。超过队列/存储门槛时保留业务执行，后台显示缺失原因。主 PostgreSQL 故障仍会影响管理登录和观测查询。
 
@@ -36,6 +37,7 @@ flowchart LR
 
 - 每次 PC / iOS 发起请求前创建分布式 `trace_id`，用 W3C `traceparent` 传给服务端；服务端解析、校验并创建子 span。无有效上下文时服务端生成新链路；所有响应通过 `X-Trace-Id` 返回最终 ID。PC 页面、桌面主进程及本地桥接、iOS 和服务端的相关日志均记录 `trace_id`、`span_id`；继续保留 `X-Request-Id` 及其原语义。
 - 请求接收、路由和 Task 入队时保存追踪上下文；Worker、DSH IPC、Model Gateway、Tool Broker 和可观测的云端电脑调用继续传递。单个异步任务可沿用来源链路；长任务恢复、重试、多个消息合并或并行分支可以建立新链路并用 span link 关联来源。后续状态查询、SSE 重连和审批请求各有自己的请求链路，通过业务 ID 与原任务关联。持久化消息 / Task / attempt 与链路的多对多映射，支持重启后查询。
+- 每次 Worker claim 建立独立的 Task attempt root span，并用 Span Link 指向接受消息的 HTTP span；attempt 使用持久 lease claim version 标识，不把 HTTP span 生命周期伪装成 Task 父 Span。管理员 Trace 详情按 attempt link 合并显示源请求、Task spans 与日志，并保留各 Span 的原 trace ID。
 - 同时记录 `user_id`、`conversation_id`、`message_id`、`task_id`、`agent_session_id`、`parent_agent_session_id`、`model_call_id`、`tool_call_id`、`attempt` 等适用字段；普通问答无需 Task 的字段留空。ID 只用于关联，不作为授权、幂等或执行成功的依据。外部传入的追踪头不影响权限或采样策略。
 - 客户端请求未送达时保留本地 trace 与脱敏错误，登录后通过有界诊断批次接口补传；无法补传时显示缺口，不伪造服务端记录。客户端本地队列限量/加密并在服务端按当前账号核验，登录前数据保持匿名，不跨账号归属；补传接口不生成递归诊断。
 
@@ -68,11 +70,14 @@ DSH 接入优先复用当前 `0.2.2-rc.1` 的 `session/event`、checkpoint 和�
 
 所有页面及查询、详情 API 在服务端校验管理员身份；隐藏菜单不代替鉴权。记录管理员查看详情的审计信息，不将查看内容写入审计日志。非管理员不能通过 API、存储端点或猜测 ID 访问。
 
+管理员 API 包含 `GET /api/admin/observability/traces/{trace_id}/logs`，按 trace 必选、request/task 可选过滤并使用不透明游标分页；空结果、队列丢弃、写入失败和查询错误分别提供 coverage 原因，不允许用空数组暗示完整。
+
 ## 6. 可靠性与保留
 
 - OpenTelemetry SDK 使用有界 `BatchSpanProcessor`；自定义 exporter 复用现有 pgxpool、单事务批量写入并限制 SQL 超时。Span 失败或队列满不阻断业务，健康接口 / 管理页面报告 dropped/error 和不完整范围。Span 写入/查询必须有独立连接预算或并发门槛，不能耗尽业务连接池。
+- 结构化日志镜像使用一个后台 writer、512 条非阻塞队列、每批最多 64 条、单条属性最多 8 KiB 和 3 秒 SQL 超时；关闭时先排空。只存有效 trace ID 日志，未关联日志继续留在 stdout；队列或数据库故障不阻断请求并在 coverage 中显示缺口。
 - DSH checkpoint 事件以 `(task_id, agent_session_id, seq)` 去重，管理员只读端校验授权、AAD、digest 和连续水位；只允许读取已提交 checkpoint。恢复 checkpoint 原文密文不被观测系统改写。最后 checkpoint 之后的数据、进程崩溃前尚未 flush 的内容和无法解密的数据均显示缺口原因。
-- OpenTelemetry Span 保留 7 天，定时批量清理只作用于观测 Span 表；业务账本和 DSH checkpoint 按既有保留规则处理。请求量、错误率和耗时趋势由 HTTP Span 计算，进程重启后历史保留在表中；没有足够 Span 覆盖时显示 `partial`，不能用零填充。主机资源历史不作为首期能力。Span 标签使用有限维度，用户、任务及 trace ID 仅作查询字段。
+- OpenTelemetry Span 与关联日志保留 7 天，定时批量清理只作用于 `observability_spans`、`observability_logs` 及两类 trace link 表；业务账本和 DSH checkpoint 按既有保留规则处理。请求量、错误率和耗时趋势由 HTTP Span 计算，进程重启后历史保留在表中；没有足够 Span 或日志覆盖时显示 `partial`，不能用零填充。主机资源历史不作为首期能力。Span 标签使用有限维度，用户、任务及 trace ID 仅作查询字段。
 
 ## 7. 实施顺序与验收
 

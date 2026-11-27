@@ -102,7 +102,7 @@ type Deps struct {
 	AdminQualityActivity         AdminQualityActivityService
 	AdminControls                AdminControlsService
 	AdminOperations              AdminOperationsService
-	Observability                 AdminObservabilityDeps
+	Observability                AdminObservabilityDeps
 	AdminModelBudgetDefaults     AdminModelBudgetDefaultService
 	AdminModelDefaults           AdminModelDefaultService
 	RecordConsents               RecordConsentService

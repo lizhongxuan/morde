@@ -21,6 +21,7 @@ type AdminObservabilityExportHealth struct {
 
 type AdminObservabilityOverview struct {
 	SpansSource   AdminObservabilitySource `json:"spans_source"`
+	LogsSource    AdminObservabilitySource `json:"logs_source"`
 	EventsSource  AdminObservabilitySource `json:"events_source"`
 	RequestCount  int64                    `json:"request_count"`
 	ErrorCount    int64                    `json:"error_count"`
@@ -53,14 +54,16 @@ type AdminObservabilityTracePage struct {
 }
 
 type AdminObservabilitySpan struct {
+	TraceID      string          `json:"trace_id"`
 	SpanID       string          `json:"span_id"`
-	ParentSpanID string          `json:"parent_span_id"`
+	ParentSpanID *string         `json:"parent_span_id"`
 	Name         string          `json:"name"`
 	Kind         string          `json:"kind"`
 	Status       string          `json:"status"`
 	StartAt      time.Time       `json:"start_at"`
 	EndAt        time.Time       `json:"end_at"`
 	Attributes   json.RawMessage `json:"attributes"`
+	Links        json.RawMessage `json:"links"`
 	Events       json.RawMessage `json:"events"`
 	DroppedCount int             `json:"-"`
 }

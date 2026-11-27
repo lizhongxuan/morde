@@ -212,6 +212,8 @@ enum MordeHubRelay {
         request.cachePolicy = .reloadIgnoringLocalCacheData
         request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization")
         request.setValue(endpoint.origin, forHTTPHeaderField: "Origin")
+        let traceContext = MordeTraceContext()
+        traceContext.inject(into: &request)
 
         let session = URLSession(configuration: .ephemeral)
         let socket = session.webSocketTask(with: request)
@@ -220,17 +222,29 @@ enum MordeHubRelay {
             session.invalidateAndCancel()
         }
         socket.resume()
-        try await socket.send(.string(#"{"type":"hello"}"#))
-        let welcome = try await receiveText(from: socket, timeout: 15)
-        _ = try MordeHubRelayPolicy.validateWelcome(welcome, target: target)
+        var responseRecorded = false
+        do {
+            try await socket.send(.string(#"{"type":"hello"}"#))
+            let welcome = try await receiveText(from: socket, timeout: 15)
+            if let response = socket.response as? HTTPURLResponse {
+                traceContext.recordResponse(for: request, response: response)
+                responseRecorded = true
+            }
+            _ = try MordeHubRelayPolicy.validateWelcome(welcome, target: target)
 
-        let callID = UUID().uuidString.lowercased()
-        let call = try MordeHubRelayPolicy.makeOpenCall(url: openURL, target: target, id: callID)
-        guard let callText = String(data: call, encoding: .utf8) else { throw MordeHubRelayError.malformedFrame }
-        try await socket.send(.string(callText))
+            let callID = UUID().uuidString.lowercased()
+            let call = try MordeHubRelayPolicy.makeOpenCall(url: openURL, target: target, id: callID)
+            guard let callText = String(data: call, encoding: .utf8) else { throw MordeHubRelayError.malformedFrame }
+            try await socket.send(.string(callText))
 
-        try await awaitOpenConfirmation(target: target, callID: callID) {
-            try await receiveText(from: socket, timeout: 30)
+            try await awaitOpenConfirmation(target: target, callID: callID) {
+                try await receiveText(from: socket, timeout: 30)
+            }
+        } catch {
+            if !responseRecorded, let response = socket.response as? HTTPURLResponse {
+                traceContext.recordResponse(for: request, response: response)
+            }
+            throw error
         }
     }
 

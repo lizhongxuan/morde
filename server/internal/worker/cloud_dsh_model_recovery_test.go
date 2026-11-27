@@ -95,7 +95,7 @@ func TestCloudDSHReadOnlyRecoveryToolsetUsesClosedAllowlist(t *testing.T) {
 
 func TestCloudDSHModelRecoveryStartRequiresExactAttemptAndConfirmedResponse(t *testing.T) {
 	const failedCallID = "mdl_failed_123"
-	const recoveryCallID = "mrc_recovery_123"
+	const recoveryDSHCallID = "mdr_recovery_123"
 	for _, test := range []struct {
 		name                  string
 		state                 task.ModelRecoveryState
@@ -104,17 +104,17 @@ func TestCloudDSHModelRecoveryStartRequiresExactAttemptAndConfirmedResponse(t *t
 		wantBegin, wantReplay bool
 		wantAllowed           bool
 	}{
-		{name: "scheduled exact frame begins once", state: task.ModelRecoveryScheduled, callID: failedCallID, wantBegin: true, wantAllowed: true},
-		{name: "scheduled new call cannot bypass begin", state: task.ModelRecoveryScheduled, callID: "mdl_next_123"},
-		{name: "scheduled duplicate before response is denied", state: task.ModelRecoveryScheduled, callID: failedCallID, started: true},
+		{name: "scheduled exact recovery frame begins once", state: task.ModelRecoveryScheduled, callID: recoveryDSHCallID, wantBegin: true, wantAllowed: true},
+		{name: "scheduled failed frame cannot be replayed", state: task.ModelRecoveryScheduled, callID: failedCallID},
+		{name: "scheduled duplicate before response is denied", state: task.ModelRecoveryScheduled, callID: recoveryDSHCallID, started: true},
 		{name: "scheduled continuation after response", state: task.ModelRecoveryScheduled, callID: "mdl_next_123", started: true, succeeded: true, wantAllowed: true},
-		{name: "attempting exact frame only replays", state: task.ModelRecoveryAttempting, callID: failedCallID, wantReplay: true, wantAllowed: true},
+		{name: "attempting exact frame only replays", state: task.ModelRecoveryAttempting, callID: recoveryDSHCallID, wantReplay: true, wantAllowed: true},
 		{name: "attempting new steer call is denied", state: task.ModelRecoveryAttempting, callID: "mdl_steered_123"},
-		{name: "attempting replay duplicate before response is denied", state: task.ModelRecoveryAttempting, callID: failedCallID, started: true},
+		{name: "attempting replay duplicate before response is denied", state: task.ModelRecoveryAttempting, callID: recoveryDSHCallID, started: true},
 		{name: "replayed response permits continuation", state: task.ModelRecoveryAttempting, callID: "mdl_next_123", started: true, succeeded: true, wantAllowed: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			begin, replay, allowed := cloudDSHModelRecoveryStartAllowed(test.state, test.callID, failedCallID, recoveryCallID,
+			begin, replay, allowed := cloudDSHModelRecoveryStartAllowed(test.state, test.callID, recoveryDSHCallID,
 				test.started, test.succeeded)
 			if begin != test.wantBegin || replay != test.wantReplay || allowed != test.wantAllowed {
 				t.Fatalf("start decision = begin:%t replay:%t allowed:%t", begin, replay, allowed)

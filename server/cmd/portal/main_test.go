@@ -26,6 +26,48 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+type expiredTaskModelBudgetPreparationCleanerProbe struct {
+	ctx   context.Context
+	limit int32
+	count int32
+	err   error
+	calls int
+}
+
+func (probe *expiredTaskModelBudgetPreparationCleanerProbe) CleanupExpiredTaskModelBudgetPreparations(ctx context.Context,
+	limit int32) (int32, error) {
+	probe.calls++
+	probe.ctx, probe.limit = ctx, limit
+	return probe.count, probe.err
+}
+
+func TestCleanupExpiredTaskModelBudgetPreparationsDelegatesBoundedBatch(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := &expiredTaskModelBudgetPreparationCleanerProbe{count: 3}
+
+	count, err := cleanupExpiredTaskModelBudgetPreparations(ctx, probe, 1000)
+	if err != nil {
+		t.Fatalf("clean expired Task model budget preparations: %v", err)
+	}
+	if count != 3 || probe.calls != 1 || probe.ctx != ctx || probe.limit != 1000 {
+		t.Fatalf("cleanup delegation = count %d, probe %#v", count, probe)
+	}
+}
+
+func TestCleanupExpiredTaskModelBudgetPreparationsHandlesUnavailableCleanerAndError(t *testing.T) {
+	ctx := context.Background()
+	if count, err := cleanupExpiredTaskModelBudgetPreparations(ctx, nil, 1000); count != 0 || err != nil {
+		t.Fatalf("nil cleaner result = (%d, %v), want (0, nil)", count, err)
+	}
+
+	wantErr := errors.New("database unavailable")
+	probe := &expiredTaskModelBudgetPreparationCleanerProbe{err: wantErr}
+	if _, err := cleanupExpiredTaskModelBudgetPreparations(ctx, probe, 1000); !errors.Is(err, wantErr) {
+		t.Fatalf("cleanup error = %v, want %v", err, wantErr)
+	}
+}
+
 type cloudDSHTaskServiceProbe struct {
 	api.TaskService
 	submits, accepts, lists, conversationLists, retries, answers int

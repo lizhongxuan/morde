@@ -5214,6 +5214,24 @@ describe('Assistant durable tasks', () => {
     expect(screen.getByRole('status', { name: '任务状态：正在恢复' })).toBeInTheDocument();
   });
 
+  it('shows a model capacity wait as an automatic retry with no user action', async () => {
+    const source = { ...message, actor_id: authUser.id } as ConversationMessage;
+    const waitingTask = {
+      ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'model_budget_capacity',
+      finished_at: null, event_sequence: 8,
+      attention: { kind: 'recovering', reason: 'model_budget_capacity', action: null, event_sequence: 8 },
+    } as unknown as Task;
+    mockCommon({ conversations: [conversation], messages: [source], tasks: [waitingTask] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(waitingTask);
+    renderPage();
+
+    expect(await screen.findByRole('status', { name: '任务状态：等待模型容量' }))
+      .toHaveTextContent('系统会在等待期限内自动重试');
+    const activity = await findTaskActivity(task.id);
+    expect(activity.querySelector('.task-activity-status')).toHaveTextContent('等待模型容量');
+    expect(within(activity).queryByRole('button', { name: /重试任务|补充任务|审批/u })).not.toBeInTheDocument();
+  });
+
   it.each([
     ['stale event sequence', { kind: 'paused_retryable', reason: 'retry_available', action: 'retry', event_sequence: 7 }],
     ['unverified result', { kind: 'result_unverified', reason: 'outcome_unknown', action: 'retry', event_sequence: 8 }],

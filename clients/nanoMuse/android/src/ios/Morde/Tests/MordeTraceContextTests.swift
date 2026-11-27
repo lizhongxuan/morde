@@ -17,10 +17,16 @@ final class MordeTraceContextTests: XCTestCase {
         XCTAssertEqual(parts[1].count, 32)
         XCTAssertEqual(parts[2].count, 16)
         XCTAssertEqual(parts[3], "01")
+        XCTAssertTrue(traceparent.lowercased() == traceparent)
         XCTAssertTrue(parts[1].allSatisfy(\.isHexDigit))
         XCTAssertTrue(parts[2].allSatisfy(\.isHexDigit))
         XCTAssertNotEqual(String(parts[1]), String(repeating: "0", count: 32))
         XCTAssertNotEqual(String(parts[2]), String(repeating: "0", count: 16))
+
+        var generatedRequest = URLRequest(url: request.url!)
+        context.inject(into: &generatedRequest)
+        XCTAssertNotNil(generatedRequest.value(forHTTPHeaderField: "X-Request-Id"))
+        XCTAssertEqual(generatedRequest.value(forHTTPHeaderField: "traceparent"), traceparent)
 
         let response = try XCTUnwrap(HTTPURLResponse(url: request.url!, statusCode: 200,
             httpVersion: "HTTP/1.1", headerFields: ["X-Trace-Id": String(repeating: "a", count: 32)]))

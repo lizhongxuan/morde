@@ -53,11 +53,12 @@ func ValidTaskAttention(value *TaskAttention, eventSequence int64) bool {
 		return (value.Reason == "approval_required" && value.Action != nil && *value.Action == TaskAttentionActionApprove) ||
 			(value.Reason == "clarification_required" && value.Action != nil && *value.Action == TaskAttentionActionClarify)
 	case TaskAttentionRecovering:
-		return value.Reason == "recovery_scheduled" && value.Action == nil
+		return (value.Reason == "recovery_scheduled" || value.Reason == TaskModelBudgetCapacityWaitReason) && value.Action == nil
 	case TaskAttentionPausedRetryable:
 		return value.Reason == "retry_available" && (value.Action == nil || *value.Action == TaskAttentionActionRetry)
 	case TaskAttentionInterrupted:
-		return (value.Reason == "execution_failed" || value.Reason == "unknown") && value.Action == nil
+		return (value.Reason == "execution_failed" || value.Reason == "unknown" ||
+			value.Reason == TaskModelBudgetCapacityExpiredReason || value.Reason == TaskModelBudgetCapacityExhaustedReason) && value.Action == nil
 	case TaskAttentionResultUnverified:
 		return value.Reason == "outcome_unknown" && value.Action == nil
 	default:
@@ -73,10 +74,20 @@ func (s *TaskService) taskAttention(ctx context.Context, principal identity.Prin
 	if attention := s.taskModelRecoveryAttention(ctx, principal, value); attention != nil {
 		return attention
 	}
-	if value.Status != task.StatusWaitingUser && value.Status != task.StatusFailed && value.Status != task.StatusCancelled {
+	budgetPaused := value.Status == task.StatusPaused && (value.WaitingReason == TaskModelBudgetCapacityExpiredReason ||
+		value.WaitingReason == TaskModelBudgetCapacityExhaustedReason)
+	if value.Status != task.StatusWaitingUser && value.Status != task.StatusFailed && !budgetPaused {
 		return nil
 	}
 	attention := &TaskAttention{EventSequence: value.EventSequence}
+	if value.Status == task.StatusWaitingUser && value.WaitingReason == TaskModelBudgetCapacityWaitReason {
+		attention.Kind, attention.Reason = TaskAttentionRecovering, TaskModelBudgetCapacityWaitReason
+		return attention
+	}
+	if budgetPaused {
+		attention.Kind, attention.Reason = TaskAttentionInterrupted, value.WaitingReason
+		return attention
+	}
 	if value.Status == task.StatusWaitingUser && value.WaitingReason == "approval_required" &&
 		currentPendingApproval(details) && s.taskControlAvailable(ctx, principal, value.HostID) {
 		action := TaskAttentionActionApprove

@@ -614,7 +614,8 @@ func TestCloudDSHCoordinatorRunsBoundedSummarySessionThroughDSH(t *testing.T) {
 			result, models.summaryCalls, runtime.startCalls, runtime.stopCalls, runtime.writeCalls)
 	}
 	if runtime.startRequest["purpose"] != "compaction" || runtime.startRequest["operation_id"] != operation.OperationID ||
-		runtime.startRequest["context_window_tokens"] != 32_768 || runtime.startRequest["max_tokens"] != 2_048 ||
+		runtime.startRequest["context_window_tokens"] != 32_768 ||
+		runtime.startRequest["max_tokens"] != conversationSummaryMaintenanceOutputTokens(32_768) ||
 		len(runtime.startRequest["tools"].([]any)) != 0 ||
 		len(runtime.startRequest["source_messages"].([]map[string]any)) != len(sources) {
 		t.Fatalf("summary session start was not strictly fenced: %+v", runtime.startRequest)

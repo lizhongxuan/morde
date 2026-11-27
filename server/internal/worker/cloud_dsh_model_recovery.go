@@ -11,22 +11,22 @@ type cloudDSHReadOnlyRecoveryCheckpoint struct {
 	ToolsetDigest   []byte
 }
 
-func cloudDSHModelRecoveryStartAllowed(state task.ModelRecoveryState, callID, failedCallID, recoveryCallID string,
+func cloudDSHModelRecoveryStartAllowed(state task.ModelRecoveryState, callID, recoveryDSHCallID string,
 	attemptStarted, attemptSucceeded bool) (beginAttempt, replayOnly, allowed bool) {
 	switch state {
 	case task.ModelRecoveryScheduled:
 		if !attemptStarted {
-			return callID == failedCallID, false, callID == failedCallID
+			return callID == recoveryDSHCallID, false, callID == recoveryDSHCallID
 		}
-		if !attemptSucceeded || callID == failedCallID {
+		if !attemptSucceeded || callID == recoveryDSHCallID {
 			return false, false, false
 		}
 		return false, false, true
 	case task.ModelRecoveryAttempting:
 		if !attemptStarted {
-			return false, callID == failedCallID, callID == failedCallID
+			return false, callID == recoveryDSHCallID, callID == recoveryDSHCallID
 		}
-		if !attemptSucceeded || callID == failedCallID {
+		if !attemptSucceeded || callID == recoveryDSHCallID {
 			return false, false, false
 		}
 		return false, false, true
@@ -47,7 +47,7 @@ func cloudDSHReadOnlyRecoveryCheckpointFor(value task.Task, state *cloudDSHSessi
 		state.identity.AgentID != value.AgentInstanceID || state.identity.Generation != value.AgentGeneration ||
 		state.identity.SessionID != value.AgentSessionID ||
 		state.identity.AuthorizationVersion != value.Authorization.Version ||
-		state.identity.SessionID != call.Task.AgentSessionID || state.through < 0 || state.through != call.Task.ThroughSequence ||
+		state.identity.SessionID != call.Task.AgentSessionID || state.through < 0 ||
 		value.CurrentRevision == nil || value.DesiredRevision == nil || *value.CurrentRevision != *value.DesiredRevision ||
 		call.Task.TaskID != value.ID || call.Task.OwnerID != value.OwnerID || call.Task.InitiatorID != value.InitiatorID ||
 		call.Task.LeaseOwner != value.Lease.Owner || call.Task.LeaseVersion != value.Lease.Version ||
@@ -61,12 +61,25 @@ func cloudDSHReadOnlyRecoveryCheckpointFor(value task.Task, state *cloudDSHSessi
 		!cloudDSHReadOnlyRecoveryToolset(state.definitions) {
 		return cloudDSHReadOnlyRecoveryCheckpoint{}, false
 	}
+	if call.Task.RecoveryDSHCallID == "" {
+		if state.through != call.Task.ThroughSequence {
+			return cloudDSHReadOnlyRecoveryCheckpoint{}, false
+		}
+	} else if call.Task.ThroughSequence != state.restoreThrough || state.through < state.restoreThrough {
+		return cloudDSHReadOnlyRecoveryCheckpoint{}, false
+	}
 	digest, ok := cloudDSHToolDefinitionsSummary(state.definitions)
 	if !ok {
 		return cloudDSHReadOnlyRecoveryCheckpoint{}, false
 	}
-	return cloudDSHReadOnlyRecoveryCheckpoint{ThroughSequence: state.through,
-		Digest: append([]byte(nil), state.checkpointDigest...), ToolsetDigest: append([]byte(nil), digest[:]...)}, true
+	checkpointThrough := state.through
+	checkpointDigest := state.checkpointDigest
+	if call.Task.RecoveryDSHCallID != "" {
+		checkpointThrough = state.restoreThrough
+		checkpointDigest = state.restoreDigest
+	}
+	return cloudDSHReadOnlyRecoveryCheckpoint{ThroughSequence: checkpointThrough,
+		Digest: append([]byte(nil), checkpointDigest...), ToolsetDigest: append([]byte(nil), digest[:]...)}, true
 }
 
 func (state *cloudDSHSessionState) historyReadyForModelRecovery() bool {

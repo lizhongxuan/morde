@@ -522,6 +522,8 @@ export const portalApi = {
   adminObservabilityTrace: async (traceID: string) => unwrapApiResponse(await api.GET('/api/admin/observability/traces/{trace_id}', { params: { path: { trace_id: traceID } }, cache: 'no-store' })),
   adminObservabilityEvents: async (traceID: string, query: NonNullable<operations['listAdminObservabilityTraceEvents']['parameters']['query']>) =>
     unwrapApiResponse(await api.GET('/api/admin/observability/traces/{trace_id}/events', { params: { path: { trace_id: traceID }, query }, cache: 'no-store' })),
+  adminObservabilityLogs: async (traceID: string, query: NonNullable<operations['listAdminObservabilityTraceLogs']['parameters']['query']>) =>
+    unwrapApiResponse(await api.GET('/api/admin/observability/traces/{trace_id}/logs', { params: { path: { trace_id: traceID }, query }, cache: 'no-store' })),
   adminQuality: async (days: 7 | 30 | 90 = 7) => unwrapApiResponse(await api.GET('/api/admin/quality', { params: { query: { days } } })),
   createBlindEvaluationBatch: async (body: operations['createBlindEvaluationBatch']['requestBody']['content']['application/json']) =>
     unwrapApiResponse(await api.POST('/api/admin/evaluation-batches', { body })),

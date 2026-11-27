@@ -1512,6 +1512,20 @@ func TestTaskValidationEvidenceIsDetailOnlyAndBoundToResult(t *testing.T) {
 	}
 }
 
+func TestTaskSummaryCarriesSafeWaitReason(t *testing.T) {
+	value := apiTestTask()
+	value.Status = task.StatusWaitingUser
+	value.WaitingReason = "model_budget_capacity"
+	response, err := toTaskSummaryResponseWithK2(value, app.TaskK2Projection{})
+	if err != nil || response.WaitingReason == nil || *response.WaitingReason != value.WaitingReason {
+		t.Fatalf("Task summary wait reason = %v, err=%v; want %q", response.WaitingReason, err, value.WaitingReason)
+	}
+	encoded, err := json.Marshal(response)
+	if err != nil || !strings.Contains(string(encoded), `"waiting_reason":"model_budget_capacity"`) {
+		t.Fatalf("Task summary JSON omitted safe wait reason: %s err=%v", encoded, err)
+	}
+}
+
 func TestGetTaskRouteDoesNotCacheValidationDetails(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	current := apiTestTask()

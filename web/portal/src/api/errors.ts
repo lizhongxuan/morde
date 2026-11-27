@@ -34,7 +34,14 @@ export function errorMessage(error: unknown): string {
     return "网络连接失败，请检查网络后重试";
   }
   if (!(error instanceof ApiError)) return error instanceof Error ? error.message : "操作失败，请重试";
-  const message = ERROR_MESSAGES[error.code] || error.message || "操作失败，请重试";
+  const baseMessage = ERROR_MESSAGES[error.code] || error.message || "操作失败，请重试";
+  const references = [
+    typeof error.details?.request_id === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(error.details.request_id)
+      ? `request ID ${error.details.request_id}` : "",
+    typeof error.details?.trace_id === "string" && /^[0-9a-f]{32}$/.test(error.details.trace_id)
+      ? `trace ID ${error.details.trace_id}` : "",
+  ].filter(Boolean);
+  const message = references.length ? `${baseMessage}（${references.join(", ")}）` : baseMessage;
   return error.retryAfter && error.retryAfter > 0 ? `${message}（${error.retryAfter} 秒后可重试）` : message;
 }
 

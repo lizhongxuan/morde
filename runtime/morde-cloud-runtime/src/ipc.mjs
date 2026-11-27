@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { once } from 'node:events'
 import { LlmError, textOnlyImageText } from '@deepseek-ai/dsh-llm'
 import {
-  coordinatorCompactionModelCallID, coordinatorModelCallID, MODEL_FAILURE_SUMMARIES, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS,
+  coordinatorCompactionModelCallID, coordinatorModelCallID, modelCallID, MODEL_FAILURE_SUMMARIES, TASK_VALIDATION_REVIEW_IDENTITY_FIELDS,
   taskValidationReviewModelCallID, validDelegateSelection, validLateChildTools, validMessageDelivery,
 } from './engine.mjs'
 
@@ -16,6 +16,7 @@ const MAX_TASK_ATTACHMENT_IMAGE_BYTES = 2 * 1024 * 1024
 const MAX_TOOL_IMAGE_CACHE_BYTES = 8 * 1024 * 1024
 // shortcut: keep a bounded window for late backend replies; expired tombstones fail closed when their reply arrives.
 const MAX_ABANDONED_RESPONSES = 4096
+const MODEL_BUDGET_TIMEOUT_MS = 30_000
 const MAX_DELEGATE_TITLE_BYTES = 256
 const MAX_DELEGATE_OBJECTIVE_BYTES = 32 * 1024
 const TOOL_NAME = /^[A-Za-z][A-Za-z0-9_.-]{0,127}$/
@@ -26,6 +27,8 @@ const CHILD_RESULT_TIMEOUT_MS = 6 * 60_000
 const RECOVERY_TOOL_SUPERSEDED = Symbol.for('morde-cloud-runtime.recovery-tool-superseded.v1')
 const UTF8_DECODER = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
 const COORDINATOR_IDENTITY_FIELDS = ['context_role', 'conversation_id', 'message_id', 'owner_id', 'actor_id', 'agent_id', 'generation', 'authorization_version', 'session_id', 'purpose', 'operation_id']
+const MODEL_BUDGET_IDENTITY_FIELDS = ['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-8][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i
 
 function deferred() {
   let resolve, reject
@@ -54,6 +57,50 @@ function notifyIPCTimeout(onTimeout, requestKind, requestDigest) {
 
 function sha256(value) {
   return createHash('sha256').update(value, 'utf8').digest('hex')
+}
+
+function canonicalModelBudgetJSON(value) {
+  if (value === null || typeof value === 'boolean' || typeof value === 'string') return JSON.stringify(value)
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) throw new Error('model budget request contains a non-finite number')
+    return JSON.stringify(value)
+  }
+  if (Array.isArray(value)) return `[${value.map(canonicalModelBudgetJSON).join(',')}]`
+  if (!isObject(value) || Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) {
+    throw new Error('model budget request is not JSON-safe')
+  }
+  const fields = []
+  for (const key of Object.keys(value).sort()) {
+    if (value[key] === undefined) throw new Error('model budget request contains undefined')
+    fields.push(`${JSON.stringify(key)}:${canonicalModelBudgetJSON(value[key])}`)
+  }
+  return `{${fields.join(',')}}`
+}
+
+export function canonicalModelBudgetRequest(request) {
+  if (!isObject(request) || typeof request.provider !== 'string' || !request.provider ||
+      typeof request.model !== 'string' || !request.model || !Array.isArray(request.messages) || !Array.isArray(request.tools)) {
+    throw new Error('model budget request is invalid')
+  }
+  return { provider: request.provider, model: request.model, messages: request.messages, tools: request.tools }
+}
+
+export function modelBudgetRequestDigest(request) {
+  return sha256(canonicalModelBudgetJSON(canonicalModelBudgetRequest(request)))
+}
+
+function validModelBudgetPlanFrame(frame, pending) {
+  const baseKeys = ['type', ...MODEL_BUDGET_IDENTITY_FIELDS, 'id', 'through_seq', 'call_id', 'dsh_call_id', 'request_digest', 'ok']
+  const successKeys = [...baseKeys, 'budget_plan_id', 'max_tokens']
+  if (!isObject(frame) || typeof frame.ok !== 'boolean' ||
+      !exactKeys(frame, frame.ok ? successKeys : baseKeys) || frame.id !== pending.id ||
+      frame.through_seq !== pending.through || frame.call_id !== pending.callID ||
+      frame.dsh_call_id !== pending.dshCallID ||
+      frame.request_digest !== pending.requestDigest ||
+      !MODEL_BUDGET_IDENTITY_FIELDS.every(key => frame[key] === pending.identity[key])) return false
+  if (!frame.ok) return true
+  return typeof frame.budget_plan_id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(frame.budget_plan_id) &&
+    Number.isSafeInteger(frame.max_tokens) && frame.max_tokens > 0
 }
 
 function trimGoSpace(value) {
@@ -270,6 +317,7 @@ export class WorkerIPC {
     this.start = deferred()
     this.pending = new Map()
     this.childPending = new Map()
+    this.modelBudgetAdmissions = new Map()
     this.images = new Map()
     this.imageCacheBytes = 0
     this.models = new Map()
@@ -367,6 +415,36 @@ export class WorkerIPC {
       return
     }
     if (!this.started) throw new Error('runtime has not started')
+    if (frame.type === 'model_budget_plan') {
+      const pending = this.modelBudgetAdmissions.get(frame.id)
+      if (!pending) throw new Error('unknown model budget response')
+      if (!validModelBudgetPlanFrame(frame, pending)) {
+        if (!pending.abandoned) {
+          this.modelBudgetAdmissions.delete(frame.id)
+          clearTimeout(pending.timer)
+          pending.reject(new Error('model budget response did not match its request'))
+        }
+        throw new Error('invalid model budget response')
+      }
+      this.modelBudgetAdmissions.delete(frame.id)
+      clearTimeout(pending.timer)
+      if (pending.abandoned) return
+      if (!frame.ok) {
+        pending.reject(new Error('model budget admission was denied'))
+        return
+      }
+      pending.resolve({
+        requestID: frame.id,
+        identity: { ...pending.identity },
+        through_seq: frame.through_seq,
+        call_id: frame.call_id,
+        dsh_call_id: frame.dsh_call_id,
+        request_digest: frame.request_digest,
+        budget_plan_id: frame.budget_plan_id,
+        max_tokens: frame.max_tokens,
+      })
+      return
+    }
     if (frame.type === 'cancel') {
       if (this.startFrame.context_role === 'coordinator' &&
           (!exactKeys(frame, ['type', ...COORDINATOR_IDENTITY_FIELDS]) || !matchesCoordinatorIdentity(frame, this.startFrame))) {
@@ -647,6 +725,17 @@ export class WorkerIPC {
 
   cancel() {
     this.cancelled = true
+    for (const [id, pending] of this.modelBudgetAdmissions) {
+      if (pending.abandoned) continue
+      pending.abandoned = true
+      clearTimeout(pending.timer)
+      pending.reject(abortError())
+      let retained = 0
+      for (const [entryID, entry] of this.modelBudgetAdmissions) {
+        if (!entry.abandoned) continue
+        if (++retained > MAX_ABANDONED_RESPONSES) this.modelBudgetAdmissions.delete(entryID)
+      }
+    }
     for (const [id, pending] of this.pending) {
       if (pending.kind !== 'checkpoint_page' && pending.kind !== 'tool_result') continue
       if (pending.abandoned) continue
@@ -864,7 +953,101 @@ export class WorkerIPC {
     }
   }
 
-  async *streamModel(identity, id, through, request, signal) {
+  async prepareModelBudget(identity, through, callID, dshCallID, payload) {
+    if (payload === undefined && isObject(dshCallID)) {
+      payload = dshCallID
+      dshCallID = undefined
+    }
+    const recovery = this.startFrame?.model_recovery
+    const recoveryRequest = recovery && through === recovery.checkpoint_through_seq && payload?.config?.purpose !== 'compaction'
+    const expectedDSHCallID = recoveryRequest ? recovery.recovery_dsh_call_id :
+      typeof identity?.task_id === 'string' && typeof identity?.session_id === 'string' && Number.isSafeInteger(through)
+        ? modelCallID(identity.task_id, identity.session_id, through) : ''
+    if (dshCallID === undefined) dshCallID = expectedDSHCallID
+    if (this.failed || this.cancelled) throw new Error('worker connection unavailable')
+    if (this.startFrame?.model_budget_admission !== true) throw new Error('model budget admission is unavailable')
+    if (!isObject(identity) || !exactKeys(identity, MODEL_BUDGET_IDENTITY_FIELDS) ||
+        !MODEL_BUDGET_IDENTITY_FIELDS.every(key => Object.hasOwn(identity, key)) ||
+        !MODEL_BUDGET_IDENTITY_FIELDS.slice(0, 5).every(key => identity[key] === this.startFrame[key]) ||
+        ![identity.task_id, identity.owner_id, identity.agent_id, identity.session_id].every(value => typeof value === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(value)) ||
+        !Number.isSafeInteger(identity.generation) || identity.generation < 1 ||
+        !Number.isSafeInteger(identity.authorization_version) || identity.authorization_version < 1 ||
+        !Number.isSafeInteger(through) || through < 0 || typeof callID !== 'string' || !UUID.test(callID) ||
+        typeof dshCallID !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(dshCallID) || dshCallID !== expectedDSHCallID ||
+        !isObject(payload) || !Number.isSafeInteger(payload.turn) || payload.turn < 0 ||
+        !Number.isSafeInteger(payload.step) || payload.step < 0 || !isObject(payload.config) ||
+        typeof payload.config.provider !== 'string' || !payload.config.provider || typeof payload.config.model !== 'string' || !payload.config.model ||
+        !payload.signal || typeof payload.signal.throwIfAborted !== 'function' ||
+        typeof payload.signal.addEventListener !== 'function' || typeof payload.signal.removeEventListener !== 'function' ||
+        !Array.isArray(payload.messages) || payload.tools !== undefined && !Array.isArray(payload.tools)) {
+      throw new Error('model budget request is invalid')
+    }
+    payload.signal?.throwIfAborted()
+    const request = modelRequestWithImages({
+      provider: payload.config.provider,
+      model: payload.config.model,
+      messages: payload.messages,
+      tools: payload.tools ?? [],
+    }, this.images)
+    const requestDigest = modelBudgetRequestDigest(request)
+    const { maxTokens: _maxTokens, ...config } = payload.config
+    const requestID = randomUUID()
+    const pending = {
+      id: requestID,
+      identity: { ...identity },
+      through,
+      callID,
+      dshCallID,
+      requestDigest,
+      abandoned: false,
+      ...deferred(),
+    }
+    const result = pending.promise
+    const abandon = error => {
+      if (this.modelBudgetAdmissions.get(requestID) !== pending || pending.abandoned) return
+      pending.abandoned = true
+      clearTimeout(pending.timer)
+      pending.reject(error)
+      let retained = 0
+      for (const [id, entry] of this.modelBudgetAdmissions) {
+        if (!entry.abandoned) continue
+        if (++retained > MAX_ABANDONED_RESPONSES) this.modelBudgetAdmissions.delete(id)
+      }
+    }
+    const abort = () => abandon(abortError())
+    const timer = setTimeout(() => abandon(new Error('model budget admission timed out')), MODEL_BUDGET_TIMEOUT_MS)
+    timer.unref?.()
+    pending.timer = timer
+    this.modelBudgetAdmissions.set(requestID, pending)
+    payload.signal?.addEventListener('abort', abort, { once: true })
+    if (payload.signal?.aborted) abort()
+    try {
+      if (!pending.abandoned) {
+        await this.send({
+          type: 'model_budget_prepare', id: requestID, ...identity, through_seq: through, call_id: callID,
+          dsh_call_id: dshCallID,
+          turn: payload.turn, step: payload.step, request_digest: requestDigest, request,
+          config, tool_history: payload.toolHistory ?? { tools: request.tools, updates: [] },
+        })
+      }
+      return await result
+    } catch (error) {
+      if (this.modelBudgetAdmissions.get(requestID) === pending && !pending.abandoned) {
+        this.modelBudgetAdmissions.delete(requestID)
+        clearTimeout(timer)
+        pending.reject(error)
+      }
+      throw error
+    } finally {
+      payload.signal?.removeEventListener('abort', abort)
+      if (this.modelBudgetAdmissions.get(requestID) === pending && !pending.abandoned) {
+        this.modelBudgetAdmissions.delete(requestID)
+        clearTimeout(timer)
+      }
+    }
+  }
+
+  async *streamModel(identity, id, through, request, signal, budgetAdmission) {
     if (this.models.size >= 17 || this.models.has(id) || this.cancelledModels.has(id)) throw new Error('too many active model requests')
     if (identity.context_role === 'task_validation_review') {
       if (!validTaskValidationReviewIdentity(identity) ||
@@ -949,8 +1132,41 @@ export class WorkerIPC {
     signal?.addEventListener('abort', cancel, { once: true })
     try {
       request = modelRequestWithImages(request, this.images)
+      let budgetFields
+      const recovery = this.startFrame?.model_recovery
+      const taskContext = identity.context_role !== 'coordinator' && identity.context_role !== 'task_validation_review'
+      if (taskContext) {
+        const recoveryPlan = recovery && budgetAdmission?.through_seq === recovery.checkpoint_through_seq &&
+          budgetAdmission?.dsh_call_id === recovery.recovery_dsh_call_id
+        const expectedID = recoveryPlan
+          ? recovery.recovery_dsh_call_id : modelCallID(identity.task_id, identity.session_id, through)
+        if (id !== expectedID) throw new Error('model call identity does not match the authorized Task frame')
+      }
+      if (budgetAdmission !== undefined) {
+        if (this.startFrame?.model_budget_admission !== true || !isObject(budgetAdmission) ||
+            !MODEL_BUDGET_IDENTITY_FIELDS.every(key => budgetAdmission.identity?.[key] === identity[key]) ||
+            !Number.isSafeInteger(budgetAdmission.through_seq) || budgetAdmission.through_seq < 0 ||
+            budgetAdmission.through_seq > through ||
+            typeof budgetAdmission.call_id !== 'string' || !UUID.test(budgetAdmission.call_id) ||
+            typeof budgetAdmission.budget_plan_id !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(budgetAdmission.budget_plan_id) ||
+            !/^[a-f0-9]{64}$/.test(budgetAdmission.request_digest ?? '') ||
+            !Number.isSafeInteger(budgetAdmission.max_tokens) || budgetAdmission.max_tokens <= 0 ||
+            request.max_tokens !== budgetAdmission.max_tokens) throw new Error('model budget plan is missing or does not match the model call')
+        if (recovery && budgetAdmission.dsh_call_id === recovery.recovery_dsh_call_id && id !== recovery.recovery_dsh_call_id) {
+          throw new Error('recovery model plan does not match the authorized DSH frame')
+        }
+        const actualBudgetDigest = modelBudgetRequestDigest(request)
+        if (actualBudgetDigest !== budgetAdmission.request_digest) throw new Error('model request changed after budget admission')
+        budgetFields = {
+          budget_call_id: budgetAdmission.call_id,
+          budget_plan_id: budgetAdmission.budget_plan_id,
+          request_digest: budgetAdmission.request_digest,
+        }
+      } else if (this.startFrame?.model_budget_admission === true) {
+        throw new Error('model budget plan is missing')
+      }
       const digest = createHash('sha256').update(JSON.stringify(request), 'utf8').digest('hex')
-      await this.send({ type: 'model', id, ...identity, through_seq: through, request, sha256: digest })
+      await this.send({ type: 'model', id, ...identity, through_seq: through, request, sha256: digest, ...budgetFields })
       for (;;) {
         signal?.throwIfAborted()
         if (queue.length) {
@@ -985,6 +1201,11 @@ export class WorkerIPC {
       pending.reject(new Error(reason))
     }
     this.childPending.clear()
+    for (const pending of this.modelBudgetAdmissions.values()) {
+      clearTimeout(pending.timer)
+      if (!pending.abandoned) pending.reject(new Error(reason))
+    }
+    this.modelBudgetAdmissions.clear()
     for (const model of this.models.values()) model.cancel()
     this.onFailure?.()
   }

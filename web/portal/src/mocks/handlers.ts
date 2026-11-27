@@ -3305,6 +3305,7 @@ export const handlers = [
     return json({
       sources: {
         spans: { status: "available", reason: "本地演示环境当前没有 trace 样本。", updated_at: now() },
+        logs: { status: "disabled", reason: "本地演示环境未提供结构化服务端日志。", updated_at: null },
         dsh_events: { status: "disabled", reason: "本地演示环境未连接 DSH 事件存储。", updated_at: null },
       },
       spans_24h: { request_count: 0, error_count: 0, p95_duration_ms: 0 },
@@ -3321,6 +3322,10 @@ export const handlers = [
   http.get("/api/admin/observability/traces/:trace_id/events", ({ cookies }) => {
     if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
     return json({ task_id: null, agent_sessions: [], events: [], next_sequence: null, coverage: { status: "disabled", reason: "本地演示环境未连接 DSH 事件存储。", updated_at: null } }, 200, { "Cache-Control": "no-store" });
+  }),
+  http.get("/api/admin/observability/traces/:trace_id/logs", ({ cookies }) => {
+    if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);
+    return json({ items: [], next_cursor: null, coverage: { status: "disabled", reason: "本地演示环境未提供结构化服务端日志。", updated_at: null } }, 200, { "Cache-Control": "no-store" });
   }),
   http.get("/api/admin/model-connections", ({ cookies }) => {
     if (!isAdmin(sessionUser(cookies)!)) return failure("forbidden", "没有执行此操作的权限", 403);

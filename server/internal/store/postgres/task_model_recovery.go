@@ -384,7 +384,7 @@ func loadTaskModelRecoveryIntent(ctx context.Context, queryer interface {
 }, taskID, ownerID string, revision int64, lock bool) (task.ModelRecoveryIntent, bool, error) {
 	query := `SELECT task_id,owner_id,initiator_id,task_revision,authorization_version,agent_instance_id,agent_generation,
 agent_session_id,failed_lease_owner,failed_lease_version,engine_version,profile_version,failed_call_id,failed_model_id,failed_request_digest,failed_through_seq,checkpoint_through_seq,checkpoint_digest,
-toolset_digest,recovery_call_id,state,automatic,event_sequence,attempt_started_at,created_at,updated_at
+toolset_digest,recovery_dsh_call_id,recovery_call_id,state,automatic,event_sequence,attempt_started_at,created_at,updated_at
 FROM task_model_recovery_schedules WHERE task_id=$1 AND owner_id=$2 AND task_revision=$3`
 	if lock {
 		query += ` FOR UPDATE`
@@ -398,7 +398,7 @@ FROM task_model_recovery_schedules WHERE task_id=$1 AND owner_id=$2 AND task_rev
 		&value.EngineVersion, &value.ProfileVersion,
 		&value.FailedCallID, &value.FailedModelID, &value.FailedRequestDigest,
 		&value.FailedThroughSequence, &value.CheckpointThroughSequence, &value.CheckpointDigest,
-		&value.ToolsetDigest, &value.RecoveryCallID, &state, &value.Automatic, &value.EventSequence, &attemptStarted,
+		&value.ToolsetDigest, &value.RecoveryDSHCallID, &value.RecoveryCallID, &state, &value.Automatic, &value.EventSequence, &attemptStarted,
 		&value.CreatedAt, &value.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return task.ModelRecoveryIntent{}, false, nil
@@ -420,12 +420,12 @@ func insertTaskModelRecoveryIntent(ctx context.Context, tx pgx.Tx, value task.Mo
 	_, err := tx.Exec(ctx, `INSERT INTO task_model_recovery_schedules
 (task_id,owner_id,initiator_id,task_revision,authorization_version,agent_instance_id,agent_generation,agent_session_id,
 failed_lease_owner,failed_lease_version,engine_version,profile_version,failed_call_id,failed_model_id,failed_request_digest,failed_through_seq,checkpoint_through_seq,checkpoint_digest,toolset_digest,
-recovery_call_id,state,automatic,event_sequence)
-VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)`,
+recovery_dsh_call_id,recovery_call_id,state,automatic,event_sequence)
+VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24)`,
 		value.TaskID, value.OwnerID, value.InitiatorID, value.TaskRevision, value.AuthorizationVersion, value.AgentInstanceID,
 		value.AgentGeneration, value.AgentSessionID, value.FailedLeaseOwner, value.FailedLeaseVersion, value.EngineVersion, value.ProfileVersion, value.FailedCallID,
 		value.FailedModelID, value.FailedRequestDigest, value.FailedThroughSequence, value.CheckpointThroughSequence, value.CheckpointDigest, value.ToolsetDigest,
-		value.RecoveryCallID, string(value.State), value.Automatic, value.EventSequence)
+		value.RecoveryDSHCallID, value.RecoveryCallID, string(value.State), value.Automatic, value.EventSequence)
 	if err != nil {
 		return fmt.Errorf("persist Task model recovery schedule: %w", err)
 	}
@@ -440,6 +440,10 @@ func taskModelRecoveryIntentForCommand(command app.TaskModelRecoveryCommand) (ta
 	if err != nil {
 		return task.ModelRecoveryIntent{}, err
 	}
+	recoveryDSHCallID, err := app.TaskModelRecoveryDSHCallID(command.Task.ID, revision, evidence.CallID, evidence.TaskFence.ThroughSequence)
+	if err != nil {
+		return task.ModelRecoveryIntent{}, err
+	}
 	state := task.ModelRecoveryRetryAvailable
 	if command.Auto {
 		state = task.ModelRecoveryScheduled
@@ -451,7 +455,8 @@ func taskModelRecoveryIntentForCommand(command app.TaskModelRecoveryCommand) (ta
 		ProfileVersion: fence.ProfileVersion, FailedCallID: evidence.CallID, FailedModelID: evidence.ModelID,
 		FailedRequestDigest: append([]byte(nil), evidence.RequestDigest...), FailedThroughSequence: fence.ThroughSequence,
 		CheckpointThroughSequence: command.CheckpointThroughSequence, CheckpointDigest: append([]byte(nil), command.CheckpointDigest...),
-		ToolsetDigest: append([]byte(nil), command.ToolsetDigest...), RecoveryCallID: recoveryCallID, State: state, Automatic: command.Auto}, nil
+		ToolsetDigest: append([]byte(nil), command.ToolsetDigest...), RecoveryDSHCallID: recoveryDSHCallID,
+		RecoveryCallID: recoveryCallID, State: state, Automatic: command.Auto}, nil
 }
 
 func modelRecoveryAgentFence(value app.ModelTaskFence) app.AgentInstanceFence {
@@ -638,7 +643,8 @@ func sameTaskModelRecoveryIntent(left, right task.ModelRecoveryIntent) bool {
 		left.FailedCallID == right.FailedCallID && left.FailedModelID == right.FailedModelID &&
 		bytes.Equal(left.FailedRequestDigest, right.FailedRequestDigest) && left.FailedThroughSequence == right.FailedThroughSequence &&
 		left.CheckpointThroughSequence == right.CheckpointThroughSequence && bytes.Equal(left.CheckpointDigest, right.CheckpointDigest) &&
-		bytes.Equal(left.ToolsetDigest, right.ToolsetDigest) && left.RecoveryCallID == right.RecoveryCallID
+		bytes.Equal(left.ToolsetDigest, right.ToolsetDigest) && left.RecoveryDSHCallID == right.RecoveryDSHCallID &&
+		left.RecoveryCallID == right.RecoveryCallID
 }
 
 func intentMatchesCurrentTaskForClaim(intent task.ModelRecoveryIntent, claimed task.Task) bool {
@@ -675,7 +681,7 @@ func loadTaskModelRecoveryIntents(ctx context.Context, tx pgx.Tx, values []task.
 recovery.authorization_version,recovery.agent_instance_id,recovery.agent_generation,recovery.agent_session_id,
 recovery.failed_lease_owner,recovery.failed_lease_version,
 recovery.engine_version,recovery.profile_version,recovery.failed_call_id,recovery.failed_model_id,recovery.failed_request_digest,recovery.failed_through_seq,
-recovery.checkpoint_through_seq,recovery.checkpoint_digest,recovery.toolset_digest,recovery.recovery_call_id,
+recovery.checkpoint_through_seq,recovery.checkpoint_digest,recovery.toolset_digest,recovery.recovery_dsh_call_id,recovery.recovery_call_id,
 recovery.state,recovery.automatic,recovery.event_sequence,recovery.attempt_started_at,recovery.created_at,recovery.updated_at
 FROM task_model_recovery_schedules recovery
 JOIN unnest($1::text[],$2::bigint[]) requested(task_id,task_revision)
@@ -709,7 +715,7 @@ func scanTaskModelRecoveryIntent(scanner interface{ Scan(...any) error }) (task.
 		&value.AuthorizationVersion, &value.AgentInstanceID, &value.AgentGeneration, &value.AgentSessionID,
 		&value.FailedLeaseOwner, &value.FailedLeaseVersion,
 		&value.EngineVersion, &value.ProfileVersion, &value.FailedCallID, &value.FailedModelID, &value.FailedRequestDigest, &value.FailedThroughSequence,
-		&value.CheckpointThroughSequence, &value.CheckpointDigest, &value.ToolsetDigest, &value.RecoveryCallID,
+		&value.CheckpointThroughSequence, &value.CheckpointDigest, &value.ToolsetDigest, &value.RecoveryDSHCallID, &value.RecoveryCallID,
 		&state, &value.Automatic, &value.EventSequence, &attemptStarted, &value.CreatedAt, &value.UpdatedAt); err != nil {
 		return task.ModelRecoveryIntent{}, fmt.Errorf("scan Task model recovery schedule: %w", err)
 	}
@@ -764,34 +770,52 @@ FROM model_call_ledger ledger WHERE ledger.owner_id=$1 AND ledger.source='task' 
 }
 
 func verifyTaskModelRecoveryAttemptForReservation(ctx context.Context, tx pgx.Tx, request app.ModelCallReservation) error {
-	if request.Task == nil || request.Task.RecoveryCallID == "" {
+	return verifyTaskModelRecoveryReservation(ctx, tx, request, false)
+}
+
+func verifyTaskModelRecoveryPreparationForReservation(ctx context.Context, tx pgx.Tx, request app.ModelCallReservation) error {
+	return verifyTaskModelRecoveryReservation(ctx, tx, request, true)
+}
+
+func verifyTaskModelRecoveryReservation(ctx context.Context, tx pgx.Tx, request app.ModelCallReservation, allowScheduled bool) error {
+	if request.Task == nil || request.Task.RecoveryCallID == "" && request.Task.RecoveryDSHCallID == "" {
 		return nil
 	}
 	fence := request.Task
+	if fence.RecoveryCallID == "" || fence.RecoveryDSHCallID == "" || request.CallID != fence.RecoveryCallID ||
+		request.DSHCallID != fence.RecoveryDSHCallID {
+		return domain.NewError(domain.CodeConflict, "Task model recovery call identity is invalid")
+	}
+	failedCallID, err := app.DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
+	if err != nil {
+		return domain.NewError(domain.CodeConflict, "Task model recovery source identity is invalid")
+	}
 	var eligible bool
-	err := tx.QueryRow(ctx, `SELECT EXISTS (
+	err = tx.QueryRow(ctx, `SELECT EXISTS (
  SELECT 1 FROM task_model_recovery_schedules recovery
  JOIN tasks current ON current.id=recovery.task_id AND current.owner_id=recovery.owner_id AND current.initiator_id=recovery.initiator_id
  WHERE recovery.task_id=$1 AND recovery.owner_id=$2 AND recovery.initiator_id=$3
    AND recovery.task_revision=$4 AND recovery.authorization_version=$5
-   AND recovery.agent_session_id=$6 AND recovery.failed_call_id=$7 AND recovery.recovery_call_id=$8
-   AND recovery.failed_model_id=$9 AND recovery.failed_request_digest=$10
+	   AND recovery.agent_session_id=$6 AND recovery.failed_call_id=$7
+   AND recovery.recovery_dsh_call_id=$8 AND recovery.recovery_call_id=$9
+   AND recovery.failed_model_id=$10
    AND recovery.failed_through_seq=$11 AND recovery.checkpoint_through_seq=$11
-   AND recovery.engine_version=$12 AND recovery.profile_version=$13 AND recovery.state='attempting'
+   AND recovery.engine_version=$12 AND recovery.profile_version=$13
+   AND (recovery.state='attempting' OR ($17 AND recovery.state='scheduled'))
    AND recovery.agent_generation < $14 AND recovery.agent_instance_id <> $15
    AND current.status='running' AND current.current_revision=$4 AND current.desired_revision=$4
    AND current.auth_version=$5 AND current.agent_instance_id=$15 AND current.agent_generation=$14
    AND current.agent_session_id=$6 AND current.agent_engine_version=$12 AND current.agent_profile_version=$13
    AND current.checkpoint_through_seq=$11 AND current.checkpoint_digest=recovery.checkpoint_digest
-   AND current.lease_owner=$16 AND current.lease_version=$17
+   AND current.lease_owner=$16 AND current.lease_version=$18
 )`, fence.TaskID, fence.OwnerID, fence.InitiatorID, fence.TaskRevision, fence.AuthorizationVersion,
-		fence.AgentRootSessionID, request.DSHCallID, request.CallID, request.ModelID, request.RequestDigest,
+		fence.AgentRootSessionID, failedCallID, fence.RecoveryDSHCallID, fence.RecoveryCallID, request.ModelID,
 		fence.ThroughSequence, fence.EngineVersion, fence.ProfileVersion, fence.AgentGeneration, fence.AgentInstanceID,
-		fence.LeaseOwner, fence.LeaseVersion).Scan(&eligible)
+		fence.LeaseOwner, allowScheduled, fence.LeaseVersion).Scan(&eligible)
 	if err != nil {
 		return fmt.Errorf("verify scheduled Task model recovery attempt: %w", err)
 	}
-	if !eligible || request.DSHCallID == "" || request.DSHCallID == request.CallID {
+	if !eligible {
 		return domain.NewError(domain.CodeConflict, "Task model recovery attempt is no longer current")
 	}
 	return nil

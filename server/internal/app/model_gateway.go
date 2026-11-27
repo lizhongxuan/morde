@@ -51,10 +51,11 @@ type ModelTaskFence struct {
 	ThroughSequence      int64
 	EngineVersion        string
 	ProfileVersion       string
-	// RecoveryCallID is a separate, durable ledger identity for the one
-	// scheduled recovery of this DSH frame. CallID on ModelCall remains the
-	// deterministic DSH frame identity.
-	RecoveryCallID string
+	// RecoveryCallID is the durable model-call ledger identity for the one
+	// scheduled recovery. RecoveryDSHCallID is a separate DSH frame identity;
+	// neither reuses the failed call's identity.
+	RecoveryCallID    string
+	RecoveryDSHCallID string
 }
 
 // ModelTaskProjectResolver reads the project scope from the persisted Task so
@@ -72,6 +73,9 @@ type ModelCall struct {
 	Summary                     *ConversationSummaryModelFence
 	ModelID                     string
 	CallID                      string
+	BudgetPlanID                string
+	BudgetCallID                string
+	BudgetRequestDigest         string
 	RawRequest                  json.RawMessage
 	ImageResolver               TaskModelImageResolver
 	Request                     ModelRequest
@@ -79,28 +83,32 @@ type ModelCall struct {
 }
 
 type ModelCallReservation struct {
-	Source            ModelCallSource
-	Principal         identity.Principal
-	Task              *ModelTaskFence
-	Review            *TaskValidationReviewModelFence
-	TerminalDelivery  *TaskTerminalDeliveryModelFence
-	Summary           *ConversationSummaryModelFence
-	Route             *ConversationRouteModelFence
-	ProjectID         string
-	PersonalModel     bool
-	OwnerID           string
-	ModelID           string
-	ProviderEndpoint  string
-	ProviderModel     string
-	ConnectionVersion time.Time
-	NeedsTools        bool
-	NeedsVision       bool
-	CallID            string
-	DSHCallID         string
-	RequestDigest     []byte
-	LegacyCallID      string
-	LegacyDigest      []byte
-	ReservedTokens    int64
+	Source                  ModelCallSource
+	Principal               identity.Principal
+	Task                    *ModelTaskFence
+	Review                  *TaskValidationReviewModelFence
+	TerminalDelivery        *TaskTerminalDeliveryModelFence
+	Summary                 *ConversationSummaryModelFence
+	Route                   *ConversationRouteModelFence
+	ProjectID               string
+	PersonalModel           bool
+	OwnerID                 string
+	ModelID                 string
+	ProviderEndpoint        string
+	ProviderModel           string
+	ConnectionVersion       time.Time
+	NeedsTools              bool
+	NeedsVision             bool
+	CallID                  string
+	BudgetPlanID            string
+	BudgetCallID            string
+	BudgetRequestDigest     string
+	BudgetCapabilityVersion string
+	DSHCallID               string
+	RequestDigest           []byte
+	LegacyCallID            string
+	LegacyDigest            []byte
+	ReservedTokens          int64
 }
 
 type ModelCallSettlement struct {
@@ -261,14 +269,16 @@ type ModelGatewayResolver interface {
 }
 
 type ModelGatewayService struct {
-	store                ModelCallStore
-	models               ModelGatewayResolver
-	client               ModelClient
-	projectBudget        *ProjectBudgetService
-	responseSealer       *Sealer
-	gpt6LunaMaxReasoning bool
-	usageObserverMu      sync.RWMutex
-	usageObserver        func(ModelUsageObservation)
+	store                 ModelCallStore
+	models                ModelGatewayResolver
+	client                ModelClient
+	projectBudget         *ProjectBudgetService
+	responseSealer        *Sealer
+	gpt6LunaMaxReasoning  bool
+	usageObserverMu       sync.RWMutex
+	usageObserver         func(ModelUsageObservation)
+	modelBudgetStrategyMu sync.RWMutex
+	modelBudgetStrategy   *modelOutputBudgetStrategySnapshot
 }
 
 func (s *ModelGatewayService) SetModelUsageObserver(observer func(ModelUsageObservation)) {
@@ -325,10 +335,16 @@ func normalizedModelTaskFence(value *ModelTaskFence) *ModelTaskFence {
 }
 
 type ModelGatewayEndpoint struct {
-	Endpoint            ModelEndpoint
-	Version             time.Time
-	Personal            bool
-	ContextWindowTokens *int
+	Endpoint                    ModelEndpoint
+	Version                     time.Time
+	Personal                    bool
+	ContextWindowTokens         *int
+	ContextWindowSource         ModelContextWindowSource
+	ContextWindowCatalogVersion *string
+	MaxOutputTokens             *int
+	MaxOutputSource             ModelMaxOutputSource
+	MaxOutputResolvedAt         *time.Time
+	MaxOutputCatalogVersion     *string
 }
 
 func isFirstPartyGPT6Luna(endpoint ModelEndpoint) bool {
@@ -650,17 +666,33 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	ledgerCallID := call.CallID
 	if call.Source == ModelCallTask && call.Task.RecoveryCallID != "" {
-		if !idempotencyKeyPattern.MatchString(call.Task.RecoveryCallID) || call.Task.RecoveryCallID == call.CallID {
+		if !idempotencyKeyPattern.MatchString(call.Task.RecoveryCallID) ||
+			!idempotencyKeyPattern.MatchString(call.Task.RecoveryDSHCallID) || call.Task.RecoveryCallID == call.CallID ||
+			call.Task.RecoveryDSHCallID != call.CallID {
 			return ModelResponse{}, domain.InvalidArgument("model_call", "invalid task recovery call identity")
 		}
 		ledgerCallID = call.Task.RecoveryCallID
+	} else if call.Source == ModelCallTask && call.Task.RecoveryDSHCallID != "" {
+		return ModelResponse{}, domain.InvalidArgument("model_call", "incomplete task recovery call identity")
 	}
 	reservation := ModelCallReservation{
 		Source: call.Source, Principal: call.Principal, Task: call.Task, Review: call.Review,
 		TerminalDelivery: call.TerminalDelivery, Summary: call.Summary, OwnerID: ownerID,
 		ProjectID: projectID, PersonalModel: endpoint.Personal,
 		ModelID: call.ModelID, ProviderEndpoint: endpoint.Endpoint.BaseURL, ProviderModel: endpoint.Endpoint.ModelID, ConnectionVersion: endpoint.Version,
-		NeedsTools: needsTools, NeedsVision: needsVision, CallID: ledgerCallID, DSHCallID: call.CallID, RequestDigest: digest[:], ReservedTokens: reserve,
+		BudgetCapabilityVersion: modelBudgetCapabilityVersion(endpoint),
+		NeedsTools:              needsTools, NeedsVision: needsVision, CallID: ledgerCallID, DSHCallID: call.CallID,
+		BudgetPlanID: call.BudgetPlanID, BudgetCallID: call.BudgetCallID, BudgetRequestDigest: call.BudgetRequestDigest,
+		RequestDigest: digest[:], ReservedTokens: reserve,
+	}
+	if call.BudgetPlanID != "" {
+		preparations, ok := s.store.(ModelBudgetPreparationValidator)
+		if !ok {
+			return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "adaptive model budget ledger is unavailable")
+		}
+		if err := preparations.ValidateTaskModelBudgetPreparation(ctx, reservation); err != nil {
+			return ModelResponse{}, err
+		}
 	}
 	if call.Source == ModelCallCompaction {
 		if recovery, ok := s.store.(ConversationSummaryModelOutputStore); ok {
@@ -699,9 +731,9 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			}
 			return response, nil
 		}
-	}
-	if call.ReplayTaskModelResponseOnly {
-		return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "task model recovery response is not available")
+		if call.ReplayTaskModelResponseOnly {
+			return ModelResponse{}, domain.NewError(domain.CodeInvalidState, "task model recovery response is not available")
+		}
 	}
 	if call.Source == ModelCallReview {
 		recovery, ok := s.store.(TaskValidationReviewModelResponseStore)
@@ -727,8 +759,10 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		}
 	}
 	projectCall := projectID != "" && !endpoint.Personal
-	if err := s.reserveModelCall(ctx, call.Source, projectCall, projectID, reservation, projectUsageReservation(call.Request, reserve)); err != nil {
-		return ModelResponse{}, err
+	if call.BudgetPlanID == "" {
+		if err := s.reserveModelCall(ctx, call.Source, projectCall, projectID, reservation, projectUsageReservation(call.Request, reserve)); err != nil {
+			return ModelResponse{}, err
+		}
 	}
 	request := call.Request
 	currentTaskTurnMessageID := request.CurrentTaskTurnMessageID
@@ -836,6 +870,41 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		settlement.Unknown = true
 		settlement.Usage = ModelUsage{}
 		callErr = &ModelClientError{Kind: ModelErrorInvalidResponse}
+	}
+	if call.BudgetPlanID != "" && callErr == nil && !settlement.Unknown {
+		reservedOutput := int64(request.MaxOutputTokens)
+		reservedInput := reservation.ReservedTokens - reservedOutput
+		if response.Usage.InputTokens > reservedInput || response.Usage.OutputTokens > reservedOutput {
+			overageErr := domain.NewError(domain.CodeQuotaExceeded, "provider usage exceeded the signed model budget; reconciliation is required")
+			overageErr.Details["reason"] = "model_usage_exceeded_reservation"
+			overageCtx, cancelOverage := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+			defer cancelOverage()
+			recorder, ok := s.store.(ModelBudgetOverageRecorder)
+			var recordErr error
+			if ok {
+				recordErr = recorder.RecordTaskModelBudgetOverage(overageCtx, reservation, response.Usage)
+			} else {
+				recordErr = domain.NewError(domain.CodeUnsupported, "adaptive model overage reconciliation is unavailable")
+			}
+			if recordErr != nil {
+				var freezeErr error
+				if projectCall {
+					freezeErr = s.projectBudget.SettleModelCall(overageCtx, SettleProjectModelCallCommand{
+						ProjectID: projectID, Source: call.Source, CallID: reservation.CallID, Unknown: true,
+					})
+				} else {
+					freezeErr = s.store.SettleModelCall(overageCtx, ModelCallSettlement{
+						Source: call.Source, OwnerID: ownerID, CallID: reservation.CallID, Unknown: true,
+					})
+				}
+				if freezeErr != nil {
+					freezeErr = fmt.Errorf("freeze adaptive model overage: %w", freezeErr)
+				}
+				return ModelResponse{}, errors.Join(overageErr, fmt.Errorf("persist adaptive model overage: %w", recordErr), freezeErr)
+			}
+			s.observeModelUsage(ModelCallSettlement{Source: call.Source, Usage: response.Usage})
+			return ModelResponse{}, overageErr
+		}
 	}
 	var summaryOutputErr error
 	var reviewOutputErr error
@@ -1056,6 +1125,11 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 	if !domain.ValidModelConnectionID(call.ModelID) || !idempotencyKeyPattern.MatchString(call.CallID) || call.Request.Endpoint != (ModelEndpoint{}) {
 		return "", empty, 0, domain.InvalidArgument("model_call", "invalid model call")
 	}
+	adaptiveBudget := call.BudgetPlanID != "" || call.BudgetCallID != "" || call.BudgetRequestDigest != ""
+	if adaptiveBudget && (call.Source != ModelCallTask || !idempotencyKeyPattern.MatchString(call.BudgetPlanID) ||
+		!idempotencyKeyPattern.MatchString(call.BudgetCallID) || !modelBudgetDigestPattern.MatchString(call.BudgetRequestDigest)) {
+		return "", empty, 0, domain.InvalidArgument("model_call", "invalid adaptive model budget identity")
+	}
 	ownerID := call.Principal.UserID
 	switch call.Source {
 	case ModelCallClient, ModelCallChat, ModelCallProbe:
@@ -1073,11 +1147,21 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task execution fence")
 		}
 		id, err := DSHModelCallID(call.Task.TaskID, call.Task.AgentSessionID, call.Task.ThroughSequence)
-		if err != nil || id != call.CallID || len(call.RawRequest) == 0 || !json.Valid(call.RawRequest) {
+		if err != nil || len(call.RawRequest) == 0 || !json.Valid(call.RawRequest) {
 			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task model call identity or request")
 		}
-		if call.Task.RecoveryCallID != "" && (!idempotencyKeyPattern.MatchString(call.Task.RecoveryCallID) || call.Task.RecoveryCallID == id) {
-			return "", empty, 0, domain.InvalidArgument("model_call", "invalid task recovery call identity")
+		if call.Task.RecoveryCallID == "" && call.Task.RecoveryDSHCallID == "" {
+			if id != call.CallID || call.Task.RecoveryDSHCallID != "" {
+				return "", empty, 0, domain.InvalidArgument("model_call", "invalid task model call identity")
+			}
+		} else {
+			recoveryDSHCallID, dshErr := TaskModelRecoveryDSHCallID(call.Task.TaskID, call.Task.TaskRevision, id, call.Task.ThroughSequence)
+			recoveryLedgerCallID, ledgerErr := TaskModelRecoveryCallID(call.Task.TaskID, call.Task.TaskRevision, id, call.Task.ThroughSequence)
+			if dshErr != nil || ledgerErr != nil || call.Task.RecoveryDSHCallID != recoveryDSHCallID ||
+				call.Task.RecoveryCallID != recoveryLedgerCallID || call.CallID != recoveryDSHCallID ||
+				call.Task.RecoveryDSHCallID == call.Task.RecoveryCallID || call.Task.RecoveryCallID == id {
+				return "", empty, 0, domain.InvalidArgument("model_call", "invalid task recovery call identity")
+			}
 		}
 		ownerID = call.Task.InitiatorID
 	case ModelCallReview:
@@ -1213,6 +1297,13 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 		}
 	}
 	digest := sha256.Sum256(raw)
+	if adaptiveBudget {
+		boundDigest, err := ModelBudgetFinalRequestDigest(call.BudgetRequestDigest, int64(call.Request.MaxOutputTokens))
+		if err != nil {
+			return "", empty, 0, err
+		}
+		copy(digest[:], boundDigest)
+	}
 	return ownerID, digest, reserve, nil
 }
 

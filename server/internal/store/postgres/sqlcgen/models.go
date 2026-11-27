@@ -1020,6 +1020,12 @@ type ModelConnection struct {
 	ContextWindowSource             string             `json:"context_window_source"`
 	ContextWindowResolvedAt         pgtype.Timestamptz `json:"context_window_resolved_at"`
 	ContextWindowCatalogVersion     pgtype.Text        `json:"context_window_catalog_version"`
+	MaxOutputTokens                 pgtype.Int4        `json:"max_output_tokens"`
+	MaxOutputOverrideTokens         pgtype.Int4        `json:"max_output_override_tokens"`
+	MaxOutputSource                 string             `json:"max_output_source"`
+	MaxOutputResolvedAt             pgtype.Timestamptz `json:"max_output_resolved_at"`
+	MaxOutputCatalogVersion         pgtype.Text        `json:"max_output_catalog_version"`
+	MaxOutputSourceUrl              pgtype.Text        `json:"max_output_source_url"`
 }
 
 type ModelTextStreamingCapability struct {
@@ -1091,6 +1097,60 @@ type NotificationSourceEvent struct {
 	ProjectID     pgtype.Text        `json:"project_id"`
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 	ProcessedAt   pgtype.Timestamptz `json:"processed_at"`
+}
+
+type ObservabilityLog struct {
+	ID         int64              `json:"id"`
+	TraceID    string             `json:"trace_id"`
+	SpanID     string             `json:"span_id"`
+	RequestID  string             `json:"request_id"`
+	TaskID     string             `json:"task_id"`
+	Service    string             `json:"service"`
+	Severity   string             `json:"severity"`
+	Message    string             `json:"message"`
+	Attributes []byte             `json:"attributes"`
+	OccurredAt pgtype.Timestamptz `json:"occurred_at"`
+}
+
+type ObservabilitySpan struct {
+	TraceID           string             `json:"trace_id"`
+	SpanID            string             `json:"span_id"`
+	ParentSpanID      string             `json:"parent_span_id"`
+	Name              string             `json:"name"`
+	SpanKind          string             `json:"span_kind"`
+	StartTime         pgtype.Timestamptz `json:"start_time"`
+	EndTime           pgtype.Timestamptz `json:"end_time"`
+	Status            string             `json:"status"`
+	ScopeName         string             `json:"scope_name"`
+	ScopeVersion      string             `json:"scope_version"`
+	Attributes        []byte             `json:"attributes"`
+	Resource          []byte             `json:"resource"`
+	Links             []byte             `json:"links"`
+	Events            []byte             `json:"events"`
+	DroppedAttributes int32              `json:"dropped_attributes"`
+	DroppedLinks      int32              `json:"dropped_links"`
+	DroppedEvents     int32              `json:"dropped_events"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+}
+
+type ObservabilityTaskAttemptLink struct {
+	TaskID        string             `json:"task_id"`
+	Attempt       int64              `json:"attempt"`
+	OriginTraceID string             `json:"origin_trace_id"`
+	OriginSpanID  string             `json:"origin_span_id"`
+	TaskTraceID   string             `json:"task_trace_id"`
+	TaskSpanID    string             `json:"task_span_id"`
+	RequestID     string             `json:"request_id"`
+	MessageID     string             `json:"message_id"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type ObservabilityTraceLink struct {
+	TraceID   string             `json:"trace_id"`
+	SpanID    string             `json:"span_id"`
+	RequestID string             `json:"request_id"`
+	MessageID string             `json:"message_id"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 type OrphanHostVolumeCleanup struct {
@@ -2227,6 +2287,7 @@ type TaskModelRecoverySchedule struct {
 	CheckpointThroughSeq int64              `json:"checkpoint_through_seq"`
 	CheckpointDigest     []byte             `json:"checkpoint_digest"`
 	ToolsetDigest        []byte             `json:"toolset_digest"`
+	RecoveryDSHCallID    string             `json:"recovery_dsh_call_id"`
 	RecoveryCallID       string             `json:"recovery_call_id"`
 	State                string             `json:"state"`
 	Automatic            bool               `json:"automatic"`

@@ -8,6 +8,8 @@ import (
 	"errors"
 	"io"
 
+	"go.opentelemetry.io/otel/trace"
+
 	"morde/server/internal/app"
 	"morde/server/internal/domain/task"
 )
@@ -21,6 +23,7 @@ type cloudDSHJobCancelPending struct {
 	arguments []byte
 	identity  cloudDSHIdentity
 	jobID     string
+	traceSpan trace.Span
 }
 
 type cloudDSHJobView struct {

@@ -115,7 +115,7 @@ func (s *AgentCheckpointService) ReadAdminPage(ctx context.Context, taskID, owne
 	checkpoint := *stored.Checkpoint
 	if checkpoint.Fence.TaskID != taskID || checkpoint.Fence.OwnerID != ownerID || checkpoint.Fence.AgentSessionID != sessionID ||
 		checkpoint.Fence.AgentRootSessionID != stored.RootSessionID || checkpoint.From > from || checkpoint.Through < from ||
-		checkpoint.Through >= math.MaxInt64 || checkpoint.Through > stored.Watermark || len(checkpoint.Ciphertext) == 0 ||
+		checkpoint.Through == math.MaxInt64 || checkpoint.Through > stored.Watermark || len(checkpoint.Ciphertext) == 0 ||
 		len(checkpoint.Ciphertext) > MaxAdminAgentCheckpointPageBytes+64 || len(checkpoint.Digest) != sha256.Size || stored.CreatedAt == nil {
 		return AgentCheckpointAdminPage{}, domain.NewError(domain.CodeInvalidState, "checkpoint history segment is invalid")
 	}

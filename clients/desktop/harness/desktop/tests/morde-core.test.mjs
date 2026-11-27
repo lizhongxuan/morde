@@ -124,6 +124,20 @@ test('project sync reads the account default computer through its short-lived Po
   } finally { globalThis.fetch = originalFetch; }
 });
 
+test('Portal authorization failures retain response request and trace IDs for diagnosis', async () => {
+  const requestID = '123e4567-e89b-42d3-a456-426614174000';
+  const traceID = 'a'.repeat(32);
+  const api = new MordeAPI(() => credentials, undefined, async () => new Response('{}', {
+    status: 401, headers: { 'X-Request-Id': requestID, 'X-Trace-Id': traceID },
+  }));
+
+  await assert.rejects(() => api.userPreferences({ credential: 'web-secret', expiresAt: future, hostFrameSource: '' }), (error) => {
+    assert.match(error.message, new RegExp(requestID));
+    assert.match(error.message, new RegExp(traceID));
+    return true;
+  });
+});
+
 test('Host embed tickets use the short-lived Portal session and reject targets outside the request', async () => {
   const originalFetch = globalThis.fetch;
   const calls = [];

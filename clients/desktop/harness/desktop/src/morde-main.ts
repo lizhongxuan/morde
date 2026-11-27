@@ -16,10 +16,33 @@ app.setName("Morde");
 const userData = mordeUserDataDirectory(app.getPath("appData"), process.env.MORDE_TEST_USER_DATA);
 mkdirSync(userData, { recursive: true, mode: 0o700 });
 app.setPath("userData", userData);
-const systemFetch: typeof fetch = (input, init) => tracedFetch(
-  (requestInput, requestInit) => net.fetch(typeof requestInput === "string" ? requestInput : requestInput instanceof URL ? requestInput.href : requestInput.url, requestInit),
-  input, init,
-);
+function outgoingHeaders(input: RequestInfo | URL, init?: RequestInit): Headers {
+  const headers = new Headers(input instanceof Request ? input.headers : undefined);
+  new Headers(init?.headers).forEach((value, key) => headers.set(key, value));
+  return headers;
+}
+function recordRequestTrace(requestHeaders: Headers, responseHeaders: Headers | undefined, status: number): void {
+  const requestID = requestHeaders.get("X-Request-Id");
+  const parentTraceID = requestHeaders.get("traceparent")?.split("-")[1];
+  const responseTraceID = responseHeaders?.get("X-Trace-Id");
+  const traceID = responseTraceID && /^[0-9a-f]{32}$/.test(responseTraceID) ? responseTraceID : parentTraceID;
+  console.info("Morde HTTP trace", {
+    request_id: requestID && /^[A-Za-z0-9._:-]{1,128}$/.test(requestID) ? requestID : undefined,
+    trace_id: traceID && /^[0-9a-f]{32}$/.test(traceID) ? traceID : undefined,
+    status,
+  });
+}
+const systemFetch: typeof fetch = (input, init) => tracedFetch(async (requestInput, requestInit) => {
+  const headers = outgoingHeaders(requestInput, requestInit);
+  try {
+    const response = await net.fetch(typeof requestInput === "string" ? requestInput : requestInput instanceof URL ? requestInput.href : requestInput.url, requestInit);
+    recordRequestTrace(headers, response.headers, response.status);
+    return response;
+  } catch (error) {
+    recordRequestTrace(headers, undefined, 0);
+    throw error;
+  }
+}, input, init);
 const hostEmbedFetch: typeof fetch = (input, init) => {
   const options = init;
   const body = options?.body;
@@ -28,6 +51,7 @@ const hostEmbedFetch: typeof fetch = (input, init) => {
   const requestSession = session.fromPartition(`morde-host-embed-${randomUUID()}`);
   const headers: Record<string, string> = {};
   new Headers(options.headers).forEach((value, name) => { headers[name] = value; });
+  const requestHeaders = new Headers(options.headers);
   const request = net.request({
     url, method: options.method ?? "GET", headers, redirect: "manual", session: requestSession, credentials: "omit",
   });
@@ -42,7 +66,11 @@ const hostEmbedFetch: typeof fetch = (input, init) => {
       void requestSession.clearStorageData().catch(() => undefined);
       callback();
     };
-    const onAbort = () => finish(() => { request.abort(); reject(new Error("Host embed exchange timed out")); });
+    const onAbort = () => finish(() => {
+      recordRequestTrace(requestHeaders, undefined, 0);
+      request.abort();
+      reject(new Error("Host embed exchange timed out"));
+    });
     const headersFrom = (source: Record<string, string | string[] | undefined>) => {
       const headers = new Headers();
       for (const [name, value] of Object.entries(source)) {
@@ -56,14 +84,29 @@ const hostEmbedFetch: typeof fetch = (input, init) => {
       callback({});
     });
     request.on("redirect", (statusCode, _method, _redirectUrl, headers) => {
-      finish(() => resolve(new Response(null, { status: statusCode, headers: headersFrom(exchangeHeaders ?? headers) })));
+      finish(() => {
+        const responseHeaders = headersFrom(exchangeHeaders ?? headers);
+        recordRequestTrace(requestHeaders, responseHeaders, statusCode);
+        resolve(new Response(null, { status: statusCode, headers: responseHeaders }));
+      });
     });
     request.on("response", (response) => {
       response.on("data", () => undefined);
-      response.on("error", (error) => finish(() => reject(error)));
-      finish(() => resolve(new Response(null, { status: response.statusCode ?? 500, headers: headersFrom(exchangeHeaders ?? response.headers) })));
+      response.on("error", (error) => finish(() => {
+        recordRequestTrace(requestHeaders, undefined, 0);
+        reject(error);
+      }));
+      finish(() => {
+        const status = response.statusCode ?? 500;
+        const responseHeaders = headersFrom(exchangeHeaders ?? response.headers);
+        recordRequestTrace(requestHeaders, responseHeaders, status);
+        resolve(new Response(null, { status, headers: responseHeaders }));
+      });
     });
-    request.on("error", (error) => finish(() => reject(error)));
+    request.on("error", (error) => finish(() => {
+      recordRequestTrace(requestHeaders, undefined, 0);
+      reject(error);
+    }));
     options.signal?.addEventListener("abort", onAbort, { once: true });
     if (options.signal?.aborted) onAbort();
     else request.end(body.toString());

@@ -35,6 +35,7 @@ type ModelRecoveryIntent struct {
 	CheckpointThroughSequence int64
 	CheckpointDigest          []byte
 	ToolsetDigest             []byte
+	RecoveryDSHCallID         string
 	RecoveryCallID            string
 	State                     ModelRecoveryState
 	Automatic                 bool

@@ -28,7 +28,7 @@
 | PostgreSQL | `github.com/jackc/pgx/v5`（`pgxpool`） | 唯一数据库连接池 |
 | SQL 访问 | `sqlc` + `pgx/v5` | sqlc 生成简单 CRUD/查询；事务、行锁、advisory lock、CAS、状态推进手写 pgx（第 7 节） |
 | 迁移 | `github.com/pressly/goose/v3`，版本化 SQL | 放在 `server/migrations/`，由 `portal migrate` 显式执行 |
-| 日志 | `go.uber.org/zap` | 强类型字段；Logger 构造后注入，禁用全局 Logger |
+| 日志 | `go.uber.org/zap` | 强类型字段；Logger 构造后注入，禁用全局 Logger；只有带有效 `trace_id` 的结构化日志可经有界异步队列镜像到本地 PostgreSQL |
 | 指标 | `github.com/prometheus/client_golang` | 用 `cmd/portal` 创建的 `prometheus.Registry` 注入，不用默认全局 Registry |
 | 链路追踪 | `go.opentelemetry.io/otel`、`go.opentelemetry.io/otel/sdk`、`go.opentelemetry.io/otel/trace` | 允许作为 Portal 唯一 Trace SDK；版本在 `go.mod` 中精确固定；用构造注入的 TracerProvider 和 W3C Trace Context，禁止依赖全局 Provider |
 | 配置 | `gopkg.in/yaml.v3` | 只在 `config` 使用 |
@@ -42,7 +42,7 @@
 
 1. 引入 GORM、Ent 等任何 ORM，或用 `database/sql` 开第二条数据库访问路径。
 2. 创建 `pgxpool` 之外的第二个 PostgreSQL 连接池。
-3. 并行引入另一套 HTTP 框架（chi、echo、用 `http.ServeMux` 做业务路由等）、日志（`log/slog`、logrus、zerolog）、迁移或 SQL 生成工具；运行时自动建表或迁移。Trace 只使用本表登记的 OpenTelemetry SDK；Provider 必须构造注入，Exporter 必须遵守 span 字段白名单、大小与保留期上限，不得使用全局 Provider、自动注入或未登记的 exporter。
+3. 并行引入另一套 HTTP 框架（chi、echo、用 `http.ServeMux` 做业务路由等）、日志（`log/slog`、logrus、zerolog）、迁移或 SQL 生成工具；运行时自动建表或迁移。Trace 只使用本表登记的 OpenTelemetry SDK；Provider 必须构造注入，SpanExporter 必须遵守 span 字段白名单、大小与保留期上限；关联日志只允许通过 zap Core 的有界镜像器、字段白名单与同等保留上限写入本地 PostgreSQL。不得使用全局 Provider、自动注入、网络遥测出口或未登记的 exporter。
 4. 引入未在 `go.mod` 精确固定版本的第三方依赖。
 5. 使用可变的包级状态：全局 Logger（`zap.L()`、`zap.ReplaceGlobals`）、全局连接池、默认 Prometheus Registry（`prometheus.MustRegister`）、全局单例。哨兵错误、只读的 `embed.FS`、常量表不在此列。
 
@@ -64,7 +64,7 @@ server/
 │   ├── gateway/           # HTTP Adapter：主机网关
 │   ├── mcp/               # Adapter：平台 MCP
 │   ├── httpserver/        # HTTP Adapter 共用：中间件链、错误码映射、Server 超时
-│   ├── tracing/           # TracerProvider 构造与 SpanExporter；provider 由 cmd/portal 注入
+│   ├── tracing/           # TracerProvider、SpanExporter 与关联日志镜像；provider 由 cmd/portal 注入
 │   ├── worker/            # 后台任务：创建推进、对账、续期、空闲回收、活跃度落库
 │   ├── store/postgres/    # 持久化 Adapter，实现 app 的 Store 端口
 │   │   ├── queries/       # sqlc 输入
@@ -139,7 +139,7 @@ Recovery → RequestID → Trace → AccessLog → Metrics → 鉴权 → Handle
 - `http.Server` 必须显式设置 `ReadHeaderTimeout`、`ReadTimeout`、`WriteTimeout`、`IdleTimeout`，取值来自 `portal.yaml` 的 `http` 段（00 第 6 节），统一用 `httpserver.NewServer` 构造。
 - 所有请求体都限制最大字节数：Portal API、平台 MCP、网关转发各有上限（00 第 6 节），超限返回 413 `request_too_large`。
 - 网关转发的 WebSocket、SSE、大文件上传下载会超过 Server 级超时：只在鉴权通过后的转发请求上，用 `http.ResponseController` 清除该请求的读写截止时间，并用测试证明长连接不被切断；不得为此把整个 Server 的超时设为 0。
-- 优雅关闭：收到 SIGTERM 先停止接收新请求，`Shutdown` 等待进行中的请求（`http.shutdown_timeout`），再停 worker、落库活跃度、关闭 TraceProvider 并排空 span exporter、关闭 `pgxpool`、`logger.Sync()`。被 hijack 的长连接由网关自己跟踪并在关闭时断开。
+- 优雅关闭：收到 SIGTERM 先停止接收新请求，`Shutdown` 等待进行中的请求（`http.shutdown_timeout`），再停 worker、落库活跃度、关闭 TraceProvider 并排空 span exporter、排空关联日志队列、关闭 `pgxpool`、`logger.Sync()`。被 hijack 的长连接由网关自己跟踪并在关闭时断开。
 
 ## 7. 持久化（pgx 与 PostgreSQL）
 
@@ -172,7 +172,7 @@ Recovery → RequestID → Trace → AccessLog → Metrics → 鉴权 → Handle
 ### 8.1 日志
 
 - 只用注入的 `*zap.Logger`，字段用强类型（`zap.String("host_id", id)`），不拼接字符串；生产环境输出 JSON 到 stdout。
-- 请求日志都带 `request_id`、`trace_id` 和当前 `span_id`；涉及主机的日志带 `host_id`；后台任务日志带 `job`。访问日志字段见 00 第 13 节。
+- 请求日志都带 `request_id`、`trace_id` 和当前 `span_id`；涉及主机的日志带 `host_id`；后台任务日志带 `job`。带有效 trace 上下文的日志经注入式 zap Core 镜像器以字段白名单、单条/批次上限、非阻塞有界队列和 7 天期限写入同一个 PostgreSQL；未关联日志不写入此表，缺失或丢弃状态在管理 API 说明。访问日志字段见 00 第 13 节。
 - 禁止记录：任何凭证的 `secret`、`aio_key`、密码、`Cookie` 与 `Authorization` 头、带 ticket 的查询串（00 第 5 节）。
 - 关键功能必须有日志：
 

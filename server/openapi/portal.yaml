@@ -8220,6 +8220,31 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/admin/observability/traces/{trace_id}/logs:
+    get:
+      tags: [Admin]
+      operationId: listAdminObservabilityTraceLogs
+      summary: Read trace-correlated structured Portal logs
+      description: Administrators only. Results contain allowlisted fields, are bounded and are never cacheable.
+      security: [{ portalSession: [] }]
+      parameters:
+        - { name: trace_id, in: path, required: true, schema: { type: string, pattern: '^[0-9a-f]{32}$' } }
+        - { name: request_id, in: query, schema: { type: string, maxLength: 255 } }
+        - { name: task_id, in: query, schema: { type: string, maxLength: 128 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 50 } }
+        - { name: cursor, in: query, schema: { type: string, maxLength: 512 } }
+      responses:
+        '200':
+          description: Correlated log page and explicit capture coverage
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminObservabilityLogPage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        default: { $ref: '#/components/responses/Error' }
   /api/admin/model-connections:
     get:
       tags: [Admin]
@@ -9763,6 +9788,7 @@ components:
           pattern: '^https://'
           description: HTTPS URL whose DNS host must be on the server's outbound allowlist.
         model_name: { type: string, minLength: 1, maxLength: 256 }
+        max_output_override_tokens: { type: [integer, 'null'], minimum: 1, maximum: 2000000, description: Optional output-capacity metadata override for personal custom model routes. This records provider-documented capacity and does not change the gateway dispatch limit. System presets are maintained by Morde. }
         context_window_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, deprecated: true, description: Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens. }
         context_window_override_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, description: Optional advanced override for custom model routes; null clears the override. System presets use Morde-maintained capacity metadata and cannot be overridden. }
         api_key: { type: string, minLength: 1, maxLength: 4096, writeOnly: true }
@@ -9782,6 +9808,7 @@ components:
           pattern: '^https://'
           description: HTTPS URL whose DNS host must be on the server's outbound allowlist.
         model_name: { type: string, minLength: 1, maxLength: 256 }
+        max_output_override_tokens: { type: [integer, 'null'], minimum: 1, maximum: 2000000, description: Optional output-capacity metadata override for personal custom model routes. Omitted preserves it for an unchanged route; route changes clear it unless a new value is supplied; null clears it. This records provider-documented capacity and does not change the gateway dispatch limit. System presets are maintained by Morde. }
         context_window_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, deprecated: true, description: Legacy write alias for context_window_override_tokens. New clients should use context_window_override_tokens. }
         context_window_override_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, description: Optional advanced override for custom model routes; null clears the override. Omitted preserves it for an unchanged route; route changes clear it unless a new value is supplied. System presets use Morde-maintained capacity metadata and cannot be overridden. }
         api_key:
@@ -9810,12 +9837,19 @@ components:
       additionalProperties: false
     ModelConnection:
       type: object
+      # These response fields are additive and remain optional while older servers may omit them during rolling upgrades.
       required: [id, name, base_url, model_name, context_window_tokens, context_window_override_tokens, context_window_source, context_window_resolved_at, context_window_catalog_version, shared, has_api_key, capabilities, checked_at, created_at, updated_at]
       properties:
         id: { $ref: '#/components/schemas/ModelConnectionId' }
         name: { type: string }
         base_url: { type: string, format: uri }
         model_name: { type: string }
+        max_output_tokens: { type: [integer, 'null'], minimum: 1, maximum: 2000000, description: Additive response field. Effective model output-capacity metadata for this exact configured route; null means unknown. It does not imply that the current gateway can dispatch this many tokens. Older servers may omit it. }
+        max_output_override_tokens: { type: [integer, 'null'], minimum: 1, maximum: 2000000, description: Additive response field. Explicit output-capacity metadata override for personal custom routes only. Older servers may omit it. }
+        max_output_source: { type: string, enum: [unknown, override, model_catalog], description: Additive response field. Older servers may omit it. }
+        max_output_resolved_at: { type: [string, 'null'], format: date-time, description: Additive response field. Older servers may omit it. }
+        max_output_catalog_version: { type: [string, 'null'], maxLength: 64, description: Additive response field. Older servers may omit it. }
+        max_output_source_url: { type: [string, 'null'], format: uri, pattern: '^https://', maxLength: 2048, description: Additive response field. Older servers may omit it. }
         context_window_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, description: Effective capacity for the configured route, resolved by Morde metadata or an explicit custom-route override; null means unknown. }
         context_window_override_tokens: { type: [integer, 'null'], minimum: 4096, maximum: 2000000, description: Explicit advanced override for custom routes only. }
         context_window_source: { type: string, enum: [unknown, override, legacy_manual, provider_metadata, model_catalog, provider_error] }
@@ -13047,6 +13081,7 @@ components:
         model_id: { type: string }
         objective: { type: string }
         status: { $ref: '#/components/schemas/TaskStatus' }
+        waiting_reason: { type: [string, 'null'], description: Safe Task wait/pause reason used for status presentation; clients should not infer a user action from the reason alone. }
         queue_priority: { $ref: '#/components/schemas/TaskQueuePriority', description: User priority for queued work; tasks waiting for 15 minutes or longer are promoted into an age-ordered fairness band. }
         current_step: { type: [string, 'null'] }
         step_count: { type: integer, format: int64, minimum: 0, description: Count of Task steps excluding budget steps. }
@@ -13964,9 +13999,10 @@ components:
       properties:
         sources:
           type: object
-          required: [spans, dsh_events]
+          required: [spans, logs, dsh_events]
           properties:
             spans: { $ref: '#/components/schemas/AdminObservabilitySource' }
+            logs: { $ref: '#/components/schemas/AdminObservabilitySource' }
             dsh_events: { $ref: '#/components/schemas/AdminObservabilitySource' }
           additionalProperties: false
         spans_24h:
@@ -14006,8 +14042,9 @@ components:
       additionalProperties: false
     AdminObservabilitySpan:
       type: object
-      required: [span_id, parent_span_id, name, kind, status, start_at, end_at, attributes, events]
+      required: [trace_id, span_id, parent_span_id, name, kind, status, start_at, end_at, attributes, links, events]
       properties:
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
         span_id: { type: string, pattern: '^[0-9a-f]{16}$' }
         parent_span_id: { type: [string, 'null'], pattern: '^[0-9a-f]{16}$' }
         name: { type: string, minLength: 1, maxLength: 256 }
@@ -14016,7 +14053,16 @@ components:
         start_at: { type: string, format: date-time }
         end_at: { type: [string, 'null'], format: date-time }
         attributes: { type: object, additionalProperties: true }
+        links: { type: array, maxItems: 16, items: { $ref: '#/components/schemas/AdminObservabilitySpanLink' } }
         events: { type: array, items: { type: object, additionalProperties: true } }
+      additionalProperties: false
+    AdminObservabilitySpanLink:
+      type: object
+      required: [trace_id, span_id, attributes]
+      properties:
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        span_id: { type: string, pattern: '^[0-9a-f]{16}$' }
+        attributes: { type: object, additionalProperties: true }
       additionalProperties: false
     AdminObservabilityTrace:
       type: object
@@ -14053,6 +14099,28 @@ components:
         agent_sessions: { type: array, maxItems: 128, items: { $ref: '#/components/schemas/AdminObservabilityAgentSession' } }
         events: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/AdminObservabilityDSHEvent' } }
         next_sequence: { type: [integer, 'null'], format: int64, minimum: 0 }
+        coverage: { $ref: '#/components/schemas/AdminObservabilitySource' }
+      additionalProperties: false
+    AdminObservabilityLog:
+      type: object
+      required: [time, severity, service, message, trace_id, span_id, request_id, task_id, attributes]
+      properties:
+        time: { type: string, format: date-time }
+        severity: { type: string, enum: [debug, info, warn, error, dpanic, panic, fatal] }
+        service: { type: string, minLength: 1, maxLength: 128 }
+        message: { type: string, minLength: 1, maxLength: 2048 }
+        trace_id: { type: string, pattern: '^[0-9a-f]{32}$' }
+        span_id: { type: [string, 'null'], pattern: '^[0-9a-f]{16}$' }
+        request_id: { type: [string, 'null'], maxLength: 255 }
+        task_id: { type: [string, 'null'], maxLength: 128 }
+        attributes: { type: object, additionalProperties: true }
+      additionalProperties: false
+    AdminObservabilityLogPage:
+      type: object
+      required: [items, next_cursor, coverage]
+      properties:
+        items: { type: array, maxItems: 100, items: { $ref: '#/components/schemas/AdminObservabilityLog' } }
+        next_cursor: { type: [string, 'null'], maxLength: 512 }
         coverage: { $ref: '#/components/schemas/AdminObservabilitySource' }
       additionalProperties: false
     EvaluationScore:

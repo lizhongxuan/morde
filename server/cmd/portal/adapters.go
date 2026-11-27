@@ -437,6 +437,7 @@ type workerApplicationAdapter struct {
 	*app.WorkerApp
 	workspaceBlockGC             *app.WorkspaceBlockGarbageCollector
 	workspaceSyncNodeProvisioner *worker.WorkspaceSyncNodeProvisioner
+	modelBudgetCapacityWaits     app.TaskModelBudgetCapacityWaitStore
 	hostUsage                    *app.HostUsageService
 	logger                       *zap.Logger
 }
@@ -450,6 +451,23 @@ func (a workerApplicationAdapter) CollectHostUsage(ctx context.Context) error {
 
 func (a workerApplicationAdapter) Reconcile(ctx context.Context) (map[string]int, error) {
 	actions, reconcileErr := a.WorkerApp.Reconcile(ctx)
+	var modelBudgetCapacityErr error
+	if a.modelBudgetCapacityWaits != nil {
+		stats, err := a.modelBudgetCapacityWaits.ReconcileTaskModelBudgetCapacityWaits(ctx, app.TaskModelBudgetCapacityReconcileBatchSize)
+		modelBudgetCapacityErr = err
+		if err == nil && (stats.Requeued > 0 || stats.Paused > 0 || stats.Discarded > 0 || stats.Deferred > 0) {
+			logger := a.logger
+			if logger == nil {
+				logger = zap.NewNop()
+			}
+			logger.Info("model budget capacity waits reconciled",
+				zap.Int32("requeued", stats.Requeued),
+				zap.Int32("paused", stats.Paused),
+				zap.Int32("discarded", stats.Discarded),
+				zap.Int32("deferred", stats.Deferred),
+			)
+		}
+	}
 	var gcErr error
 	if a.workspaceBlockGC != nil {
 		stats, collectErr := a.workspaceBlockGC.Collect(ctx)
@@ -471,7 +489,7 @@ func (a workerApplicationAdapter) Reconcile(ctx context.Context) (map[string]int
 	if a.workspaceSyncNodeProvisioner != nil {
 		syncNodeErr = a.workspaceSyncNodeProvisioner.ReconcilePendingWorkspaceSyncNodes(ctx)
 	}
-	return actions, errors.Join(reconcileErr, gcErr, syncNodeErr)
+	return actions, errors.Join(reconcileErr, modelBudgetCapacityErr, gcErr, syncNodeErr)
 }
 
 func (a workerApplicationAdapter) TryReconcilerLock(ctx context.Context) (worker.LeaderLock, bool, error) {
