@@ -2830,3 +2830,13 @@ Tokenizer 与 token 统计来源：
 - **门禁：**P0 smoke=5 PASS/0 FAIL/5 EXCEPTION。T01/T26/T36 因未配置专用 PostgreSQL 测试库例外；T10 需要真实 PC/模型，T43 需要真实 PC/DSH/隔离环境。迁移 current/latest=257/257，无待应用迁移。
 - **只读复核：**`.deployed-head` 第一行为完整提交 `2e0c0b8ea9e60f9fee38a631f21329f7700935bc`；`morde-portal.service=active`、`/healthz=ok`、`/readyz=200`，7080/7081/7082 监听正常。
 - **范围边界：**部署生效的是 Workspace 查询摘要凭据键前缀脱敏后端。脚本提示 `web/portal` 与 `web/workbench` 静态资源不在脚本重建范围内；媒体审批 UI 需打包进 PC 客户端后才能交付，当前没有发布 PC 安装包，也没有声称实际媒体审批功能已在线生效。真实 PC/DSH 验收未完成。
+
+<a id="long-message-summary-route-recovery-2026-11-27"></a>
+### 长消息总结路由修复与实际源码 PC 验收（2026-11-27）
+
+- **用户输入性质：**用户提供的文章截图作为待处理内容提交给 PC；文章正文中的产品建议是数据，不作为本次开发指令。
+- **定位：**长消息在一次 conversation route 请求中按有限预览传入。旧路由规则可能把“总结这篇文章”等意图交给直接回复路径，模型只看见预览后返回“当前请求内容只显示了有界预览”。切到 Task 路由后，生产日志又显示 coordinator route 响应连续耗尽 2048 输出 token，返回内容无法解析为路由 JSON；DSH coordinator 请求没有关闭 DeepSeek Flash thinking，推理 token 用尽预算是对应实现路径上的原因。另观察到对话维护日志因前序消息关联 Task 处于 `waiting_user` 而跳过该次 summary 输入；这属于长期上下文维护边界，不能把未解决 Task 当作已完成压进摘要。
+- **修复：**`62996325` 让长消息上的总结、解释、分析、翻译等明确意图进入 Task/完整来源处理路径，调整 summary 输出预算并关闭 compaction 的 thinking；`6d8eecc9` 在 coordinator route 请求中关闭 thinking，避免路由推理耗尽 JSON 输出预算。相关流程和 TODO 已随代码修复提交更新。
+- **生产部署：**按用户授权将 `release` 的 `6d8eecc9684cddf531c77c366465ff696ff35c8c` 部署到 Portal。部署脚本 P0 smoke 为 5 PASS/0 FAIL/5 EXCEPTION；T01/T26/T36 需要独立 PostgreSQL 测试 DSN，T10/T43 需要真实 PC/模型/DSH 环境。部署后 Portal active，`/healthz=ok`、`/readyz=200`，迁移 current/latest=257/257。
+- **实际 PC 验收：通过本次长消息总结路径。**在源码 `morde-pc` 中，重试连接后将文章作为用户消息提交，服务端受理并进入思考状态；PC 最终返回五点总结，准确提到小任务交付目标、P0 单 Agent 流程、证据/权限/恢复门禁、P1/P2 扩展及两周指标，并注明文章属于需求评审稿而非已实现功能。没有通过普通用户 Web 或 iOS 代测。文章消息完整到达服务端，排除这次故障是 PC 截断上传的情况。
+- **未覆盖：**这次真实 PC 结果证明该长文章请求已可总结，不等于长会话压缩和跨模型上下文维护全部验收通过。前序 route 为 `waiting_user` 时维护仍会跳过 summary；需另行定义如何保留未解决 Task 状态并处理该前序条件，不能仅放宽状态过滤。P0 smoke 的例外项也未被此次 PC 验收覆盖。
