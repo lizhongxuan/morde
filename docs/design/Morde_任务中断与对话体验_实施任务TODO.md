@@ -75,6 +75,8 @@
 - 通过：隔离工作树基于 release 基线和本次改动运行 API、app、Portal Go 包测试，及四个恢复 PostgreSQL 集成用例；恢复专属 Worker 测试通过。PC `npm test -- src/routes/Assistant.test.tsx` 为 289/289，`git diff --check` 通过。
 - 未通过：`go test ./internal/worker -count=1` 的全量 Worker 包测试中，多个需启动 DSH Runtime 的用例在首帧前握手失败（`account Agent Runtime handshake is invalid`）；恢复专属测试本身通过。需在 Runtime 可启动的环境重跑全量套件。
 - 共享工作区含未跟踪的模型预算改动，直接构建还会报 `model_budget_preparation.go` 重复定义 `bytesEqual`、未定义 `providerDigest`，以及 `model_usage.go` 未定义 `modelBudgetDigestPattern`。这些文件不在本 TODO 范围，未改动或纳入本次提交；隔离工作树结果用于区分本次改动和这些工作区改动。
+- 服务器发布（2026-11-27）：后端 `release@90529697` 通过部署门禁（P0 5 pass、0 fail、5 exception），数据库迁移到 263，服务重启后 `/healthz=ok`、`/readyz=200`。例外为服务器未配置 `CH_TEST_DATABASE_URL` 的 T01/T26/T36，以及需要真实 PC/DSH 的 T10/T43。前端补丁 `e062db21` 拉取后按 lockfile 安装依赖，在 staging 构建并切换 PC/admin 静态资源；旧资源保存在 `/opt/morde/backups/web-portal-dist-pre-e062db21`。后端二进制仍对应 90529697，e062db21 只补齐其依赖的 SSE helper 与测试。
+- 最终 PC 检查：`make pc` 构建并启动实际客户端；任务卡显示「结果待核对」且只有「查看任务详情」，原始用户消息保留「已接下后台任务」无障碍标记。此检查未新建任务或重放操作。
 - 未完成门槛：截图事故仍未定位；尚未完成“搜索已结算、模型临时失败、Worker 重启、恢复且不重复搜索、原对话交付”的完整 PostgreSQL/模拟模型 E2E；快答/慢任务完整新闻路径、旧事件乱序、跨端并发重试、实机点击安全重试与灰度数据比较待继续。故 T07 暂不标完成，不能把本次实现描述为全项验收通过。
 
 **完成标准：** 用户不用打开任务详情，也能知道 Morde 是否接下任务、最后交付了什么，卡住时轮到谁、有没有下一步。
