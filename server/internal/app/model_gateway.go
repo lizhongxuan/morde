@@ -65,14 +65,14 @@ type ModelTaskProjectResolver interface {
 }
 
 type ModelCall struct {
-	Source                      ModelCallSource
-	Principal                   identity.Principal
-	Task                        *ModelTaskFence
-	Review                      *TaskValidationReviewModelFence
-	TerminalDelivery            *TaskTerminalDeliveryModelFence
-	Summary                     *ConversationSummaryModelFence
-	ModelID                     string
-	CallID                      string
+	Source           ModelCallSource
+	Principal        identity.Principal
+	Task             *ModelTaskFence
+	Review           *TaskValidationReviewModelFence
+	TerminalDelivery *TaskTerminalDeliveryModelFence
+	Summary          *ConversationSummaryModelFence
+	ModelID          string
+	CallID           string
 	// LedgerCallID selects the durable Task model-call ledger row for an
 	// adaptive-budgeted DSH frame. It is empty for every legacy call.
 	LedgerCallID                string
