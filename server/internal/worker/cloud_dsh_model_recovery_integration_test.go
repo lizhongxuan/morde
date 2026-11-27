@@ -266,15 +266,16 @@ WHERE owner_id=$1 AND source='task' AND call_id=$2`, owner.ID, modelCalls[1].cal
 				gatewayErrors = append(gatewayErrors, fmt.Sprintf("%d %s", index, recorded.err))
 			}
 		}
+		providerSummary := t07RecoveryProviderSummary(provider.snapshot())
 		t.Fatalf("recovery worker execution: %v; %s; persisted_recovery_state=%s; recovery_start_error=%s; provider=%+v; model_calls=%+v; gateway_errors=%v; runtime_frames=%v; admissions=%v; search_calls=%d",
-			err, failureDetails, recoveryState, tools.recoveryStartFailure(), provider.snapshot(), callSummary, gatewayErrors,
+			err, failureDetails, recoveryState, tools.recoveryStartFailure(), providerSummary, callSummary, gatewayErrors,
 			t07RecoveryRuntimeSummary([]byte(supervisor.output())), tools.admissionFailures(), search.callCount())
 	}
 
 	providerCalls = provider.snapshot()
 	modelCalls = models.snapshot()
 	if len(providerCalls) != 3 || len(modelCalls) != 3 || providerCalls[2].err != nil || !providerCalls[2].sawSearchResult {
-		t.Fatalf("resumed DSH provider/model calls: provider=%+v model_calls=%d", providerCalls, len(modelCalls))
+		t.Fatalf("resumed DSH provider/model calls: provider=%v model_calls=%d", t07RecoveryProviderSummary(providerCalls), len(modelCalls))
 	}
 	recoveryCall := modelCalls[2].call
 	if recoveryCall.Task == nil || recoveryCall.Task.TaskID != submitted.Task.ID ||
@@ -299,7 +300,8 @@ WHERE task_id=$1 AND owner_id=$2 AND tool_name='morde_web_search' AND status='su
 	completed, err := store.GetTask(ctx, submitted.Task.ID, owner.ID)
 	if err != nil || completed.Task.Status != task.StatusCompleted || completed.Task.Result != t07RecoveryFinalResult ||
 		completed.Task.ConversationID != submitted.Conversation.ID {
-		t.Fatalf("completed recovery Task=%+v err=%v", completed.Task, err)
+		t.Fatalf("completed recovery Task status=%s result=%q conversation_match=%t err=%v",
+			completed.Task.Status, completed.Task.Result, completed.Task.ConversationID == submitted.Conversation.ID, err)
 	}
 	messages, err := store.ListMessages(ctx, owner.ID, submitted.Conversation.ID, app.PageRequest{Limit: 100})
 	if err != nil {
@@ -418,6 +420,18 @@ func (p *t07RecoveryProvider) snapshot() []t07RecoveryProviderCall {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]t07RecoveryProviderCall(nil), p.calls...)
+}
+
+func t07RecoveryProviderSummary(calls []t07RecoveryProviderCall) []string {
+	result := make([]string, 0, len(calls))
+	for index, call := range calls {
+		summary := fmt.Sprintf("%d saw_search_result=%t", index, call.sawSearchResult)
+		if call.err != nil {
+			summary += fmt.Sprintf(" error_type=%T", call.err)
+		}
+		result = append(result, summary)
+	}
+	return result
 }
 
 type t07RecoveryRecordedModelCall struct {

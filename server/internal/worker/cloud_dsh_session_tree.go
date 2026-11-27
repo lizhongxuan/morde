@@ -157,6 +157,7 @@ type cloudDSHModelBudgetPlanBinding struct {
 	ThroughSeq    int64
 	CallID        string
 	DSHCallID     string
+	LedgerCallID  string
 	RequestID     string
 	RequestDigest string
 	PlanID        string
@@ -177,6 +178,7 @@ func storeCloudDSHModelBudgetPlan(plans map[string]cloudDSHModelBudgetPlanBindin
 	pruneCloudDSHModelBudgetPlans(plans, now)
 	if !cloudDSHID.MatchString(plan.PlanID) || !cloudDSHID.MatchString(plan.RequestID) ||
 		!cloudDSHID.MatchString(plan.CallID) || !cloudDSHID.MatchString(plan.DSHCallID) ||
+		!cloudDSHID.MatchString(plan.LedgerCallID) ||
 		plan.MaxTokens <= 0 || plan.MaxTokens > cloudDSHModelBudgetProtocolMaxTokens ||
 		plan.ThroughSeq < 0 {
 		return errors.New("dsh model budget plan is invalid")
@@ -204,25 +206,27 @@ func storeCloudDSHModelBudgetPlan(plans map[string]cloudDSHModelBudgetPlanBindin
 }
 
 func consumeCloudDSHModelBudgetPlan(plans map[string]cloudDSHModelBudgetPlanBinding, identity cloudDSHIdentity,
-	throughSeq int64, dshCallID, budgetCallID, planID, requestDigest string, rawRequest []byte, now time.Time) (int, error) {
+	throughSeq int64, dshCallID, budgetCallID, planID, requestDigest string, rawRequest []byte, now time.Time) (string, int, error) {
 	pruneCloudDSHModelBudgetPlans(plans, now)
 	plan, ok := plans[planID]
 	if !ok {
-		return 0, errors.New("dsh model budget plan is unavailable")
+		return "", 0, errors.New("dsh model budget plan is unavailable")
 	}
 	delete(plans, planID)
 	digest, validDigest := cloudDSHModelBudgetRequestDigest(rawRequest)
 	maxTokens, validMaxTokens := cloudDSHModelBudgetMaxTokens(rawRequest)
 	preparedCallID, preparedIDErr := app.DSHModelCallID(identity.TaskID, identity.SessionID, plan.ThroughSeq)
 	finalCallID, finalIDErr := app.DSHModelCallID(identity.TaskID, identity.SessionID, throughSeq)
-	ordinaryFrame := preparedIDErr == nil && finalIDErr == nil && plan.DSHCallID == preparedCallID && dshCallID == finalCallID
-	recoveryFrame := plan.DSHCallID == dshCallID && strings.HasPrefix(dshCallID, "mdr_")
+	ordinaryFrame := preparedIDErr == nil && finalIDErr == nil && plan.DSHCallID == preparedCallID &&
+		plan.LedgerCallID == plan.DSHCallID && dshCallID == finalCallID
+	recoveryFrame := plan.DSHCallID == dshCallID && strings.HasPrefix(dshCallID, "mdr_") &&
+		strings.HasPrefix(plan.LedgerCallID, "mrc_") && plan.LedgerCallID != plan.DSHCallID
 	if !validDigest || !validMaxTokens || plan.Identity != identity || plan.ThroughSeq > throughSeq ||
 		(!ordinaryFrame && !recoveryFrame) || plan.CallID != budgetCallID || digest != plan.RequestDigest ||
 		requestDigest != plan.RequestDigest || maxTokens != plan.MaxTokens {
-		return 0, errors.New("dsh model budget plan does not match the model request")
+		return "", 0, errors.New("dsh model budget plan does not match the model request")
 	}
-	return maxTokens, nil
+	return plan.LedgerCallID, maxTokens, nil
 }
 
 func cloudDSHModelBudgetMaxTokens(raw []byte) (int, bool) {
@@ -3200,6 +3204,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			budgetFence.AgentSessionID = state.identity.SessionID
 			budgetFence.AuthorizationVersion = state.identity.AuthorizationVersion
 			var recoveryLedgerCallID, recoveryDSHCallID string
+			ledgerCallID := frame.DSHCallID
 			if intent := value.ModelRecovery; intent != nil && state.identity.SessionID == rootIdentity.SessionID &&
 				frame.DSHCallID == intent.RecoveryDSHCallID && frame.Through != nil && *frame.Through == intent.CheckpointThroughSequence {
 				failedCallID, callIDErr := app.DSHModelCallID(value.ID, state.identity.SessionID, *frame.Through)
@@ -3208,6 +3213,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 					return errors.New("dsh adaptive recovery budget identity is invalid")
 				}
 				recoveryLedgerCallID, recoveryDSHCallID = intent.RecoveryCallID, intent.RecoveryDSHCallID
+				ledgerCallID = recoveryLedgerCallID
 			} else {
 				expectedCallID, callIDErr := app.DSHModelCallID(value.ID, state.identity.SessionID, *frame.Through)
 				if callIDErr != nil || expectedCallID != frame.DSHCallID {
@@ -3237,7 +3243,8 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return cloudDSHModelBudgetPlanDenialError(planErr, writeBudgetResponse(false))
 			}
 			binding := cloudDSHModelBudgetPlanBinding{Identity: state.identity, ThroughSeq: *frame.Through,
-				CallID: frame.CallID, DSHCallID: frame.DSHCallID, RequestID: frame.ID, RequestDigest: digest, PlanID: result.PlanID,
+				CallID: frame.CallID, DSHCallID: frame.DSHCallID, LedgerCallID: ledgerCallID,
+				RequestID: frame.ID, RequestDigest: digest, PlanID: result.PlanID,
 				MaxTokens: result.MaxTokens, ExpiresAt: time.Now().Add(cloudDSHModelBudgetPlanTTL)}
 			if err := storeCloudDSHModelBudgetPlan(modelBudgetPlans, binding, time.Now()); err != nil {
 				if denialErr := writeBudgetResponse(false); denialErr != nil {
@@ -3289,6 +3296,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 			if frame.ID != canonicalCallID && !recoveryFrame {
 				return errors.New("dsh model identity is invalid")
 			}
+			ledgerCallID := ""
 			if e.options.ModelBudgetPlanner == nil {
 				if frame.BudgetPlanID != "" || frame.BudgetCallID != "" || frame.RequestDigest != "" {
 					return errors.New("dsh model budget fields were sent while admission is disabled")
@@ -3297,9 +3305,17 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if frame.BudgetPlanID == "" || frame.BudgetCallID == "" || frame.RequestDigest == "" {
 					return errors.New("dsh model budget plan is missing")
 				}
-				if _, err := consumeCloudDSHModelBudgetPlan(modelBudgetPlans, state.identity, state.through,
-					frame.ID, frame.BudgetCallID, frame.BudgetPlanID, frame.RequestDigest, frame.Request, time.Now()); err != nil {
+				var err error
+				ledgerCallID, _, err = consumeCloudDSHModelBudgetPlan(modelBudgetPlans, state.identity, state.through,
+					frame.ID, frame.BudgetCallID, frame.BudgetPlanID, frame.RequestDigest, frame.Request, time.Now())
+				if err != nil {
 					return err
+				}
+				if recoveryFrame {
+					intent := value.ModelRecovery
+					if intent == nil || ledgerCallID != intent.RecoveryCallID {
+						return errors.New("dsh recovery budget ledger identity is invalid")
+					}
 				}
 			}
 			if _, exists := pendingModels[frame.ID]; exists {
@@ -3325,7 +3341,8 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				modelFence.RecoveryCallID, modelFence.RecoveryDSHCallID = intent.RecoveryCallID, intent.RecoveryDSHCallID
 			}
 			modelCall := app.ModelCall{Source: app.ModelCallTask, Task: &modelFence,
-				ModelID: value.ModelID, CallID: frame.ID, BudgetPlanID: frame.BudgetPlanID, BudgetCallID: frame.BudgetCallID,
+				ModelID: value.ModelID, CallID: frame.ID, LedgerCallID: ledgerCallID,
+				BudgetPlanID: frame.BudgetPlanID, BudgetCallID: frame.BudgetCallID,
 				BudgetRequestDigest: frame.RequestDigest, RawRequest: append(json.RawMessage(nil), frame.Request...), ImageResolver: state.images}
 			var memoryVersions []app.CloudDSHMemoryVersion
 			if protectsMemory {

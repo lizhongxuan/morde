@@ -150,7 +150,8 @@ func TestCloudDSHModelBudgetPlanConsumptionIsSessionBoundAndOneShot(t *testing.T
 	newPlans := func() map[string]cloudDSHModelBudgetPlanBinding {
 		plans := make(map[string]cloudDSHModelBudgetPlanBinding)
 		err := storeCloudDSHModelBudgetPlan(plans, cloudDSHModelBudgetPlanBinding{Identity: identity, ThroughSeq: 4,
-			CallID: "budget_call_1", DSHCallID: preparedDSHCallID, RequestID: "req_1", RequestDigest: digest, PlanID: "plan_1", MaxTokens: 128}, now)
+			CallID: "budget_call_1", DSHCallID: preparedDSHCallID, LedgerCallID: preparedDSHCallID,
+			RequestID: "req_1", RequestDigest: digest, PlanID: "plan_1", MaxTokens: 128}, now)
 		if err != nil {
 			t.Fatalf("store plan: %v", err)
 		}
@@ -158,11 +159,12 @@ func TestCloudDSHModelBudgetPlanConsumptionIsSessionBoundAndOneShot(t *testing.T
 	}
 
 	plans := newPlans()
-	maxTokens, err := consumeCloudDSHModelBudgetPlan(plans, identity, 6, finalDSHCallID, "budget_call_1", "plan_1", digest, finaLRequest, now.Add(time.Second))
-	if err != nil || maxTokens != 128 {
-		t.Fatalf("valid plan was not consumed: max_tokens=%d err=%v", maxTokens, err)
+	ledgerCallID, maxTokens, err := consumeCloudDSHModelBudgetPlan(plans, identity, 6, finalDSHCallID, "budget_call_1", "plan_1", digest, finaLRequest, now.Add(time.Second))
+	if err != nil || maxTokens != 128 || ledgerCallID != preparedDSHCallID || ledgerCallID == finalDSHCallID {
+		t.Fatalf("valid plan did not return its distinct ledger identity: ledger_call_id=%q max_tokens=%d err=%v",
+			ledgerCallID, maxTokens, err)
 	}
-	if _, err := consumeCloudDSHModelBudgetPlan(plans, identity, 6, finalDSHCallID, "budget_call_1", "plan_1", digest, finaLRequest, now.Add(time.Second)); err == nil {
+	if _, _, err := consumeCloudDSHModelBudgetPlan(plans, identity, 6, finalDSHCallID, "budget_call_1", "plan_1", digest, finaLRequest, now.Add(time.Second)); err == nil {
 		t.Fatal("one-shot budget plan was reused")
 	}
 
@@ -185,10 +187,46 @@ func TestCloudDSHModelBudgetPlanConsumptionIsSessionBoundAndOneShot(t *testing.T
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, err := consumeCloudDSHModelBudgetPlan(newPlans(), test.identity, test.through, finalDSHCallID, test.budgetCallID, test.planID, test.digest, test.request, now.Add(time.Second)); err == nil {
+			if _, _, err := consumeCloudDSHModelBudgetPlan(newPlans(), test.identity, test.through, finalDSHCallID, test.budgetCallID, test.planID, test.digest, test.request, now.Add(time.Second)); err == nil {
 				t.Fatal("mismatched plan consumption was accepted")
 			}
 		})
+	}
+}
+
+func TestCloudDSHRecoveryModelBudgetPlanBindsLedgerAndFrameIDsSeparately(t *testing.T) {
+	request := []byte(`{"provider":"morde","model":"m1234567","messages":[{"role":"user","content":[{"type":"text","text":"question"}]}],"tools":[]}`)
+	digest, ok := cloudDSHModelBudgetRequestDigest(request)
+	if !ok {
+		t.Fatal("recovery request digest was invalid")
+	}
+	finalRequest := []byte(`{"provider":"morde","model":"m1234567","messages":[{"role":"user","content":[{"type":"text","text":"question"}]}],"tools":[],"max_tokens":128}`)
+	identity := cloudDSHIdentity{TaskID: "task_recovery", OwnerID: "owner_1", AgentID: "agent_1", SessionID: "session_1", Generation: 3, AuthorizationVersion: 7}
+	dshCallID := "mdr_" + strings.Repeat("d", 64)
+	ledgerCallID := "mrc_" + strings.Repeat("c", 64)
+	now := time.Now()
+	plans := map[string]cloudDSHModelBudgetPlanBinding{}
+	if err := storeCloudDSHModelBudgetPlan(plans, cloudDSHModelBudgetPlanBinding{Identity: identity, ThroughSeq: 4,
+		CallID: "budget_call_1", DSHCallID: dshCallID, LedgerCallID: ledgerCallID,
+		RequestID: "request_1", RequestDigest: digest, PlanID: "plan_1", MaxTokens: 128}, now); err != nil {
+		t.Fatalf("store recovery plan: %v", err)
+	}
+	gotLedgerCallID, maxTokens, err := consumeCloudDSHModelBudgetPlan(plans, identity, 4, dshCallID, "budget_call_1", "plan_1", digest,
+		finalRequest, now.Add(time.Second))
+	if err != nil || gotLedgerCallID != ledgerCallID || maxTokens != 128 || gotLedgerCallID == dshCallID {
+		t.Fatalf("recovery plan conflated DSH and ledger IDs: ledger=%q DSH=%q max_tokens=%d err=%v",
+			gotLedgerCallID, dshCallID, maxTokens, err)
+	}
+
+	badPlans := map[string]cloudDSHModelBudgetPlanBinding{}
+	if err := storeCloudDSHModelBudgetPlan(badPlans, cloudDSHModelBudgetPlanBinding{Identity: identity, ThroughSeq: 4,
+		CallID: "budget_call_2", DSHCallID: dshCallID, LedgerCallID: dshCallID,
+		RequestID: "request_2", RequestDigest: digest, PlanID: "plan_2", MaxTokens: 128}, now); err != nil {
+		t.Fatalf("store candidate recovery plan for fail-closed consumption: %v", err)
+	}
+	if _, _, err := consumeCloudDSHModelBudgetPlan(badPlans, identity, 4, dshCallID, "budget_call_2", "plan_2", digest,
+		finalRequest, now.Add(time.Second)); err == nil {
+		t.Fatal("recovery plan with DSH identity reused as ledger identity was accepted")
 	}
 }
 
@@ -203,30 +241,35 @@ func TestCloudDSHModelBudgetPlanExpiresAndStoreIsBounded(t *testing.T) {
 	}
 	plans := map[string]cloudDSHModelBudgetPlanBinding{}
 	if err := storeCloudDSHModelBudgetPlan(plans, cloudDSHModelBudgetPlanBinding{Identity: identity, ThroughSeq: 0,
-		CallID: "budget_call_1", DSHCallID: dshCallID, RequestID: "req_1", RequestDigest: digest, PlanID: "plan_1", MaxTokens: 10}, now); err != nil {
+		CallID: "budget_call_1", DSHCallID: dshCallID, LedgerCallID: dshCallID,
+		RequestID: "req_1", RequestDigest: digest, PlanID: "plan_1", MaxTokens: 10}, now); err != nil {
 		t.Fatalf("store plan: %v", err)
 	}
-	if _, err := consumeCloudDSHModelBudgetPlan(plans, identity, 0, dshCallID, "budget_call_1", "plan_1", digest,
+	if _, _, err := consumeCloudDSHModelBudgetPlan(plans, identity, 0, dshCallID, "budget_call_1", "plan_1", digest,
 		[]byte(`{"provider":"morde","model":"m1234567","messages":[{"role":"user","content":[{"type":"text","text":"question"}]}],"tools":[],"max_tokens":10}`), now.Add(cloudDSHModelBudgetPlanTTL)); err == nil {
 		t.Fatal("expired plan was accepted")
 	}
 	if err := storeCloudDSHModelBudgetPlan(plans, cloudDSHModelBudgetPlanBinding{Identity: identity, ThroughSeq: 0,
-		CallID: "budget_call_1", DSHCallID: dshCallID, RequestID: "req_1", RequestDigest: digest, PlanID: "plan_1", MaxTokens: 10}, now); err != nil {
+		CallID: "budget_call_1", DSHCallID: dshCallID, LedgerCallID: dshCallID,
+		RequestID: "req_1", RequestDigest: digest, PlanID: "plan_1", MaxTokens: 10}, now); err != nil {
 		t.Fatalf("store first session plan: %v", err)
 	}
 	if err := storeCloudDSHModelBudgetPlan(plans, cloudDSHModelBudgetPlanBinding{Identity: identity, ThroughSeq: 1,
-		CallID: "budget_call_2", DSHCallID: dshCallID, RequestID: "req_2", RequestDigest: digest, PlanID: "plan_2", MaxTokens: 10}, now); err == nil {
+		CallID: "budget_call_2", DSHCallID: dshCallID, LedgerCallID: dshCallID,
+		RequestID: "req_2", RequestDigest: digest, PlanID: "plan_2", MaxTokens: 10}, now); err == nil {
 		t.Fatal("same session accepted a second unconsumed plan")
 	}
 
 	plans = map[string]cloudDSHModelBudgetPlanBinding{}
 	if err := storeCloudDSHModelBudgetPlan(plans, cloudDSHModelBudgetPlanBinding{Identity: identity, ThroughSeq: 0,
-		CallID: "budget_call_max", DSHCallID: dshCallID, RequestID: "req_max", RequestDigest: digest, PlanID: "plan_max", MaxTokens: cloudDSHModelBudgetProtocolMaxTokens}, now); err != nil {
+		CallID: "budget_call_max", DSHCallID: dshCallID, LedgerCallID: dshCallID,
+		RequestID: "req_max", RequestDigest: digest, PlanID: "plan_max", MaxTokens: cloudDSHModelBudgetProtocolMaxTokens}, now); err != nil {
 		t.Fatalf("protocol maximum output cap was rejected: %v", err)
 	}
 	plans = map[string]cloudDSHModelBudgetPlanBinding{}
 	if err := storeCloudDSHModelBudgetPlan(plans, cloudDSHModelBudgetPlanBinding{Identity: identity, ThroughSeq: 0,
-		CallID: "budget_call_over", DSHCallID: dshCallID, RequestID: "req_over", RequestDigest: digest, PlanID: "plan_over", MaxTokens: cloudDSHModelBudgetProtocolMaxTokens + 1}, now); err == nil {
+		CallID: "budget_call_over", DSHCallID: dshCallID, LedgerCallID: dshCallID,
+		RequestID: "req_over", RequestDigest: digest, PlanID: "plan_over", MaxTokens: cloudDSHModelBudgetProtocolMaxTokens + 1}, now); err == nil {
 		t.Fatal("plan above the ModelGateway output maximum was accepted")
 	}
 
@@ -234,14 +277,16 @@ func TestCloudDSHModelBudgetPlanExpiresAndStoreIsBounded(t *testing.T) {
 		candidateIdentity := identity
 		candidateIdentity.SessionID = "session_" + strings.Repeat("s", index+1)
 		candidate := cloudDSHModelBudgetPlanBinding{Identity: candidateIdentity, ThroughSeq: int64(index), CallID: "budget_call_" + strings.Repeat("a", index+1),
-			DSHCallID: "mdl_" + strings.Repeat("a", 64), RequestID: "req_" + strings.Repeat("b", index+1), RequestDigest: digest,
+			DSHCallID: "mdl_" + strings.Repeat("a", 64), LedgerCallID: "mdl_" + strings.Repeat("a", 64),
+			RequestID: "req_" + strings.Repeat("b", index+1), RequestDigest: digest,
 			PlanID: "plan_" + strings.Repeat("c", index+1), MaxTokens: 10}
 		if err := storeCloudDSHModelBudgetPlan(plans, candidate, now); err != nil {
 			t.Fatalf("store bounded plan %d: %v", index, err)
 		}
 	}
 	if err := storeCloudDSHModelBudgetPlan(plans, cloudDSHModelBudgetPlanBinding{Identity: identity, ThroughSeq: 100,
-		CallID: "budget_call_overflow", DSHCallID: dshCallID, RequestID: "req_overflow", RequestDigest: digest, PlanID: "plan_overflow", MaxTokens: 10}, now); err == nil {
+		CallID: "budget_call_overflow", DSHCallID: dshCallID, LedgerCallID: dshCallID,
+		RequestID: "req_overflow", RequestDigest: digest, PlanID: "plan_overflow", MaxTokens: 10}, now); err == nil {
 		t.Fatal("plan map exceeded its bound")
 	}
 }

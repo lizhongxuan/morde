@@ -133,6 +133,11 @@ func (s *modelGatewayStoreTest) ValidateTaskModelDelivery(context.Context, Model
 	return s.deliveryErr
 }
 
+func (s *modelGatewayStoreTest) ValidateTaskModelBudgetPreparation(_ context.Context, value ModelCallReservation) error {
+	s.reservation = value
+	return nil
+}
+
 func taskGatewayFixture(t *testing.T, rawRequest []byte, response ModelResponse) (*ModelGatewayService, *modelGatewayStoreTest,
 	*modelGatewayClientTest, ModelCall) {
 	t.Helper()
@@ -197,6 +202,76 @@ func TestTaskModelGatewayReplayOnlyDoesNotDispatchWhenResponseIsMissing(t *testi
 	if domain.CodeOf(err) != domain.CodeInvalidState || store.recoverN != 1 || store.reserveN != 0 || store.dispatchN != 0 ||
 		store.abandonN != 0 || store.settleN != 0 || client.calls != 0 {
 		t.Fatalf("replay-only call dispatched without a settled response: err=%v store=%+v provider_calls=%d", err, store, client.calls)
+	}
+}
+
+func TestTaskModelGatewayAdaptiveBudgetSeparatesLedgerAndFinalDSHCallIDs(t *testing.T) {
+	raw := []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[],"max_tokens":16}`)
+	response := ModelResponse{Text: "done", StopReason: "stop", ProviderReportedModel: "test-model",
+		Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}}
+	service, store, client, call := taskGatewayFixture(t, raw, response)
+	call.Task.ThroughSequence = 7
+	call.CallID, _ = DSHModelCallID(call.Task.TaskID, call.Task.AgentSessionID, 7)
+	call.LedgerCallID, _ = DSHModelCallID(call.Task.TaskID, call.Task.AgentSessionID, 5)
+	call.BudgetPlanID, call.BudgetCallID, call.BudgetRequestDigest = "budget-plan-123", "budget-call-123", strings.Repeat("a", 64)
+	if _, err := service.Complete(context.Background(), call); err != nil {
+		t.Fatalf("complete budgeted Task call with a shorter prepared through-sequence: %v", err)
+	}
+	if store.reservation.CallID != call.LedgerCallID || store.reservation.DSHCallID != call.CallID ||
+		store.reservation.CallID == store.reservation.DSHCallID || client.calls != 1 {
+		t.Fatalf("Gateway conflated the budget ledger and final DSH frame identities: reservation=%+v call=%+v provider_calls=%d",
+			store.reservation, call, client.calls)
+	}
+
+	validFence := *call.Task
+	failedCallID, err := DSHModelCallID(validFence.TaskID, validFence.AgentSessionID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryDSHCallID, err := TaskModelRecoveryDSHCallID(validFence.TaskID, 1, failedCallID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryLedgerCallID, err := TaskModelRecoveryCallID(validFence.TaskID, 1, failedCallID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validFence.TaskRevision, validFence.ThroughSequence = 1, 0
+	validFence.RecoveryDSHCallID, validFence.RecoveryCallID = recoveryDSHCallID, recoveryLedgerCallID
+	recoveryCall := call
+	recoveryCall.Task, recoveryCall.CallID, recoveryCall.LedgerCallID = &validFence, recoveryDSHCallID, recoveryLedgerCallID
+	recoveryCall.Request = ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 16}
+	if _, _, _, err := validateModelCall(recoveryCall); err != nil {
+		t.Fatalf("valid recovery keeps distinct DSH and ledger identities: %v", err)
+	}
+
+	invalid := []struct {
+		name string
+		call ModelCall
+	}{
+		{name: "adaptive call missing ledger identity", call: func() ModelCall { value := call; value.LedgerCallID = ""; return value }()},
+		{name: "ledger identity on legacy call", call: func() ModelCall {
+			value := call
+			value.BudgetPlanID, value.BudgetCallID, value.BudgetRequestDigest = "", "", ""
+			return value
+		}()},
+		{name: "ordinary ledger identity has recovery prefix", call: func() ModelCall {
+			value := call
+			value.LedgerCallID = "mrc_invalid-ledger-id"
+			return value
+		}()},
+		{name: "recovery ledger uses DSH identity", call: func() ModelCall {
+			value := recoveryCall
+			value.LedgerCallID = recoveryDSHCallID
+			return value
+		}()},
+	}
+	for _, test := range invalid {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, _, err := validateModelCall(test.call); err == nil {
+				t.Fatal("invalid ledger/DSH identity combination was accepted")
+			}
+		})
 	}
 }
 
