@@ -95,4 +95,12 @@
 - 灰度：`MORDE_TASK_MODEL_RECOVERY_AUTO` 继续默认关闭；未对线上任务执行重放或状态变更，尚无可比较的灰度指标。
 - T07 仍未完成：PC 快答/工具搜索路径没有稳定通过；全量 Worker 套件、剩余正反例、真实审批/并发入口、部署 commit 核验、灰度指标与截图事故 Task ID 仍待完成。不得据隔离 E2E 将整体验收或灰度标为通过。
 
+### 2026-11-28 续验（用户告知服务器已重新部署后）
+
+- 当前共享工作区完整 Worker 回归：HEAD 为 `release@e689a8e8`，但工作区包含未提交的模型预算、长上下文、配置与部署改动；在独立临时 PostgreSQL 17 容器中运行 `go test ./internal/worker -count=1`，338.8 秒后失败两项：`TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart`（第二次 compaction 返回 summary version 3）与 `TestConversationRouteWorkerTriggersSummaryByTokenPressureBeforeTransportWatermark`（未提交 summary）。其余 Worker 用例通过，包含 T05 重启恢复 E2E；模型预算账本/DSH frame 双 ID 问题在此共享工作区重跑未再失败。由于运行树有未提交改动，这不算 `release@e689a8e8` 的干净整包通过；两项失败涉及长上下文摘要，按本文范围说明不纳入 T07 缺陷修复，整包门槛仍保持未通过。
+- 服务器重查：公开 `/healthz`、`/readyz` 和站点根路径的 TLS 握手均在 8 秒超时；到 `120.25.178.93:22` 与 `:443` 的 TCP 建连成功，但 SSH banner 与 TLS 握手没有响应。当前无法确认实际部署 commit、迁移、服务日志或运行时灰度开关值，也未改远端数据库或任务。
+- PC 实机：实际 Electron `morde-pc` 窗口继续显示「网络异常，部分对话数据暂时无法读取」和「连接中…」；未见新回复。本次没有创建/重试线上任务，也没有点击审批或恢复操作。
+- 灰度审查：自动恢复源码默认开关仍关闭，且为进程级开关；代码没有专用灰度指标埋点。服务器当前开关值、可查询的任务/用量样本和基线指标均不可读取；不能把“无样本”或本地 E2E 当灰度结论，也不在共享服务器上开启可能影响所有符合条件任务的恢复。
+- 后续门槛：服务器本地 health/ready、systemd 与日志确认部署 commit 后，再运行真实 PC 快答/搜索、审批与安全恢复；灰度前先有隔离 cohort 或独立 Worker 和可比较的状态/回告/恢复/额外调用基线。T07 保持进行中。
+
 **完成标准：** 用户不用打开任务详情，也能知道 Morde 是否接下任务、最后交付了什么，卡住时轮到谁、有没有下一步。
