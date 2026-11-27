@@ -17,6 +17,68 @@ export class ApiError extends Error {
   }
 }
 
+export type ServerSentEvent = { event: string; data: string; id: string };
+
+export async function consumeServerSentEvents(response: Response, onEvent: (event: ServerSentEvent) => void,
+  signal?: AbortSignal): Promise<void> {
+  if (!response.body) throw new TypeError("Event stream response has no body");
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let eventName = "";
+  let eventID = "";
+  let data: string[] = [];
+  const dispatch = () => {
+    if (data.length) onEvent({ event: eventName || "message", data: data.join("\n"), id: eventID });
+    eventName = "";
+    data = [];
+  };
+  const processLine = (line: string) => {
+    if (line === "") { dispatch(); return; }
+    if (line.startsWith(":")) return;
+    const separator = line.indexOf(":");
+    const field = separator < 0 ? line : line.slice(0, separator);
+    let value = separator < 0 ? "" : line.slice(separator + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") eventName = value;
+    else if (field === "data") data.push(value);
+    else if (field === "id" && !value.includes("\0")) eventID = value;
+  };
+  const processLines = (final: boolean) => {
+    while (true) {
+      const separator = buffer.search(/[\r\n]/);
+      if (separator < 0 || (!final && buffer[separator] === "\r" && separator === buffer.length - 1)) break;
+      const line = buffer.slice(0, separator);
+      const width = buffer[separator] === "\r" && buffer[separator + 1] === "\n" ? 2 : 1;
+      buffer = buffer.slice(separator + width);
+      processLine(line);
+    }
+    if (final) {
+      if (buffer) processLine(buffer);
+      buffer = "";
+      dispatch();
+    }
+  };
+  const cancel = () => { void reader.cancel().catch(() => undefined); };
+  signal?.addEventListener("abort", cancel, { once: true });
+  try {
+    if (signal?.aborted) cancel();
+    while (!signal?.aborted) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      processLines(false);
+    }
+    if (!signal?.aborted) {
+      buffer += decoder.decode();
+      processLines(true);
+    }
+  } finally {
+    signal?.removeEventListener("abort", cancel);
+    reader.releaseLock();
+  }
+}
+
 function requestId() {
   return globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 }
