@@ -92,6 +92,9 @@ func cloudDSHReadOnlyRecoveryCheckpointFailureReason(value task.Task, state *clo
 		value.CurrentRevision == nil || value.DesiredRevision == nil || *value.CurrentRevision != *value.DesiredRevision {
 		return "identity_or_task_fence_changed"
 	}
+	if state.hasRecoveryInput() {
+		return "new_user_input_arrived_during_recovery"
+	}
 	if state.through < 0 || len(state.checkpointDigest) != 32 {
 		return "current_checkpoint_missing"
 	}

@@ -2,6 +2,7 @@ package worker
 
 import (
 	"encoding/json"
+	"sync/atomic"
 	"testing"
 
 	"morde/server/internal/app"
@@ -26,7 +27,7 @@ func TestCloudDSHReadOnlyRecoveryRequiresExactRootCheckpointAndToolset(t *testin
 		Generation: value.AgentGeneration, SessionID: value.AgentSessionID, AuthorizationVersion: value.Authorization.Version},
 		definitions: definitions, through: 5, checkpointDigest: make([]byte, 32), restoreDigest: make([]byte, 32),
 		restoreThrough: 5, readThrough: 5, resume: true, history: newCloudDSHCheckpointHistory(value.AgentSessionID),
-		toolSelectionVerified: true}
+		toolSelectionVerified: true, recoveryInputDelivered: &atomic.Bool{}, recoverySteerDelivered: &atomic.Bool{}}
 	state.history.nextSeq = 6
 
 	candidate, ok := cloudDSHReadOnlyRecoveryCheckpointFor(value, state, call, false)
@@ -64,12 +65,20 @@ func TestCloudDSHReadOnlyRecoveryRequiresExactRootCheckpointAndToolset(t *testin
 		{name: "tool selection unverified", change: func(state *cloudDSHSessionState, _ *app.ModelCall) {
 			state.toolSelectionVerified = false
 		}},
+		{name: "new followup delivered after checkpoint", change: func(state *cloudDSHSessionState, _ *app.ModelCall) {
+			state.noteRecoveryInput(app.AgentMessageDeliveryFollowup)
+		}},
+		{name: "new steer delivered after checkpoint", change: func(state *cloudDSHSessionState, _ *app.ModelCall) {
+			state.noteRecoveryInput(app.AgentMessageDeliverySteer)
+		}},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
 			candidateState := *state
 			candidateState.definitions = append([]app.AgentToolDefinition(nil), state.definitions...)
 			candidateState.history = state.history.clone()
+			candidateState.recoveryInputDelivered = &atomic.Bool{}
+			candidateState.recoverySteerDelivered = &atomic.Bool{}
 			candidateCall := call
 			if call.Task != nil {
 				fenceCopy := *call.Task

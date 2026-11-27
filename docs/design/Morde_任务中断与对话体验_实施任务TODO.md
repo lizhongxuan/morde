@@ -47,14 +47,14 @@
 - [x] 先核对合并、修订及重复投递是否能产生多个确认；持久化唯一展示锚点，PC 刷新会话消息，不新加确认 API。PC 自动化和 PostgreSQL 路由集成用例覆盖原消息绑定及重复确认约束；分页/重开完整实机回归仍在 T07。
 - [ ] 验收：立即能给结果时直接回答；确认为耗时后台任务后打 👌🏻。实机已观察到原消息的无障碍标记；快答与后台耗时任务组合的真实端到端场景待补。需要报计划时只发一句有用的话，不把 emoji 写进助手正文。
 
-## T05 · P1：开发一次可持久恢复的只读任务路径（实现完成；完整搜索恢复 E2E 待补）
+## T05 · P1：开发一次可持久恢复的只读任务路径（实现与完整搜索恢复 E2E 已通过）
 
 **入口：** `server/internal/worker/cloud_dsh_executor.go`、`cloud_dsh_session_tree.go`、现有模型分类/账本和 PostgreSQL 的任务事件。优先复用已有持久恢复机制；只有确实无法表达才新增记录。
 
 - [x] 分三路：已有结算结果就回放；明确可重试且服务端证明只读，才登记一次自动续跑；效果、用量、checkpoint 或权限无法确认就不派发。只读判定基于实际工具集合与账本，不看任务名称或模型声称。
 - [x] 恢复申请原子绑定 Task ID、修订、授权版本、失败事件/调用、checkpoint 序号和摘要；同一修订累计自动额度首版 1 次，Worker 重启、不同失败事件和多 Worker 竞争不刷新额度。
 - [x] Worker 获得合法租约后再次校验取消、授权、修订、checkpoint 和账本。从已验证位置续跑，复用已确认结果；确实需要新一轮模型调用才使用新的受控尝试身份。不得扩大工具权限、自动换模型或绕过现有预算。自动恢复开关默认关闭。
-- [ ] PostgreSQL + 模拟模型完整集成验收：「搜索已结算 → 下一次模型临时失败 → 重启 Worker → 同一 Task 恢复 → 原对话交付」。现有 PostgreSQL 用例覆盖持久调度、重启后认领、单次额度、不同账本身份和结果回放，但尚未在同一端到端用例中断言搜索不再派发并向原对话交付已核实结果。
+- [x] PostgreSQL + 模拟模型完整集成验收：「搜索已结算 → 下一次模型临时失败 → 重启 Worker → 同一 Task 恢复 → 原对话交付」。同一 E2E 用例断言第二个 Worker 以新 generation 续跑、搜索 operation 只派发一次、Task 完成，并将最终答复只交付到原会话。
 
 ## T06 · P1：接上真实的手动入口（实现完成；实机点击待补）
 
@@ -65,9 +65,9 @@
 
 ## T07 · P0：合并和灰度门槛（进行中；发布验收未完成）
 
-- [x] 隔离工作树验证：`go test ./internal/api ./internal/app ./cmd/portal -count=1`；恢复专属 `go test ./internal/worker -run 'Test(CloudDSHReadOnlyRecovery|CloudDSHModelRecoveryStartRequiresExactAttemptAndConfirmedResponse|CloudDSHModelResultErrorForCallKeepsOnlyMatchingNoDispatchEvidence|CloudDSHModelResultErrorForCallKeepsOnlyMatchingProviderRejectEvidence)' -count=1`；本机 PostgreSQL `go test ./internal/store/postgres -run TestPostgresTaskModelRecovery -count=1`（4 个集成用例）；PC `npm test -- src/routes/Assistant.test.tsx`（289/289）。
+- [x] 隔离工作树回归：`go test ./internal/api ./internal/app ./cmd/portal -count=1`；恢复专属 Worker 测试（含完整搜索恢复 E2E）；本机 PostgreSQL `go test ./internal/store/postgres -run 'Test(DurableRecoveredToolAdmission|PostgresTaskModelRecovery)' -count=1`；DSH Runtime 恢复启动协议测试；PC `npm test -- src/routes/Assistant.test.tsx`（289/289）。2026-11-28 当前结果与命令见下方记录。
 - [ ] 用打包 PC 完成端到端回归，保存目标 commit、任务/事件关联、三种页面状态与实际派发次数；全量 worker 包测试当前未通过，测试 Runtime 在本机握手前退出（`account Agent Runtime handshake is invalid`），需在 DSH Runtime 可启动的环境重跑。
-- [ ] 本次改动尚未在真实 `morde-pc` 交互验收；需确认未知结果只保留在任务详情，原对话只显示 assistant 自然语言说明，终态回告模型未知时仍能收到确定性说明。
+- [ ] 真实 `morde-pc` 交互尚未稳定通过：本轮 `make pc` 构建并启动客户端后，隔离旁聊的无工具快答一直停留在连接状态，未收到助手回复；早先一次快速问答通过不代表当前连接稳定。仍需确认未知结果只保留在任务详情、原对话只显示自然语言说明，且终态回告模型未知时仍能收到确定性说明。
 - [ ] 正例：快答无 👌🏻；耗时任务一次 👌🏻；可重试故障自动恢复后出结果；耗尽后原对话收到说明；真实审批能继续。
 - [ ] 反例：结果或用量未知、工具不在授权范围、权限撤销、用户取消、checkpoint 不匹配、写入结果不明、两个 Worker 竞争。断言不发生不安全派发、跨账号展示或重复交付。
 - [ ] 自动恢复独立灰度并可关闭；关闭后仍保留状态修复与原对话回告。比较「无入口却提示等待用户」次数、任务回告覆盖率、恢复成功率及额外模型调用。任何重复副作用或跨权限展示立即停用自动恢复。
@@ -82,5 +82,16 @@
 - 服务器发布（2026-11-27）：后端 `release@90529697` 通过部署门禁（P0 5 pass、0 fail、5 exception），数据库迁移到 263，服务重启后 `/healthz=ok`、`/readyz=200`。例外为服务器未配置 `CH_TEST_DATABASE_URL` 的 T01/T26/T36，以及需要真实 PC/DSH 的 T10/T43。前端补丁 `e062db21` 拉取后按 lockfile 安装依赖，在 staging 构建并切换 PC/admin 静态资源；旧资源保存在 `/opt/morde/backups/web-portal-dist-pre-e062db21`。后端二进制仍对应 90529697，e062db21 只补齐其依赖的 SSE helper 与测试。
 - 最终 PC 检查：`make pc` 构建并启动实际客户端；任务卡显示「结果待核对」且只有「查看任务详情」，原始用户消息保留「已接下后台任务」无障碍标记。此检查未新建任务或重放操作。
 - 未完成门槛：截图事故仍未定位；尚未完成“搜索已结算、模型临时失败、Worker 重启、恢复且不重复搜索、原对话交付”的完整 PostgreSQL/模拟模型 E2E；快答/慢任务完整新闻路径、旧事件乱序、跨端并发重试、实机点击安全重试与灰度数据比较待继续。故 T07 暂不标完成，不能把本次实现描述为全项验收通过。
+
+## 实施与验证记录（2026-11-28）
+
+- 验证基线：隔离工作树 `/tmp/morde-t07-validation-032d0151` 基于 `release@032d0151`，只叠加本次恢复输入保护改动；共享工作区其余未提交文件未纳入验证或提交。
+- 通过：API、app、Portal：`go test ./internal/api ./internal/app ./cmd/portal -count=1`。恢复专属 Worker 组（包含完整 E2E）：`CH_TEST_DATABASE_URL=... go test ./internal/worker -run 'Test(CloudDSHReadOnlyRecovery|CloudDSHModelRecoveryStartRequiresExactAttemptAndConfirmedResponse|CloudDSHModelResultErrorForCallKeepsOnlyMatchingNoDispatchEvidence|CloudDSHModelResultErrorForCallKeepsOnlyMatchingProviderRejectEvidence|CloudDSHModelRecoveryResumesAfterSettledSearch)$' -count=1`。本机隔离 PostgreSQL：`go test ./internal/store/postgres -run 'Test(DurableRecoveredToolAdmission|PostgresTaskModelRecovery)' -count=1`。
+- T05 完整 E2E 通过：合成只读搜索结算一次，随后模型模拟零用量 429；原 Worker 停止，另一个 Worker 以新 generation 认领并恢复同一 Task；持久搜索结果被重放而没有第二次派发；最终答复写回原 conversation 一次。恢复期间若 checkpoint 后新增追问或 steer，Worker 拒绝沿用旧恢复调用身份；对应两个反例单测通过。
+- 通过：Runtime 恢复启动协议 `node --test --test-name-pattern='account runtime accepts a fenced model recovery start' test/runtime.test.mjs`；恢复预算身份 Runtime 组 `node --test test/model-budget-recovery-runtime.test.mjs`（3/3）；PC Portal `npm test -- src/routes/Assistant.test.tsx`（289/289，既有验证）；`gofmt` 与 `git diff --check` 无输出。
+- PC 实机：本轮 `make pc` 的 Portal、workbench 和 desktop 构建均成功，实际 `morde-pc` 窗口打开。新旁聊的无工具快答提交后持续停留在连接状态，未见助手回复；此前一次快答曾通过，本轮不能复验为稳定。没有在该旁聊重试，也没有重放历史任务。
+- 服务器：本轮 `/healthz` 曾返回 `ok`；随后 `/readyz` 请求超时，SSH 在 banner 阶段超时，无法核对服务器运行 commit、迁移或日志。因此不记录为本轮已部署版本，也不在服务器改库或操作未确认任务。
+- 灰度：`MORDE_TASK_MODEL_RECOVERY_AUTO` 继续默认关闭；未对线上任务执行重放或状态变更，尚无可比较的灰度指标。
+- T07 仍未完成：PC 快答/工具搜索路径没有稳定通过；全量 Worker 套件、剩余正反例、真实审批/并发入口、部署 commit 核验、灰度指标与截图事故 Task ID 仍待完成。不得据隔离 E2E 将整体验收或灰度标为通过。
 
 **完成标准：** 用户不用打开任务详情，也能知道 Morde 是否接下任务、最后交付了什么，卡住时轮到谁、有没有下一步。

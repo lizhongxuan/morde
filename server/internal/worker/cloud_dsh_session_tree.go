@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -53,6 +54,8 @@ type cloudDSHSessionState struct {
 	lastObservationSequence int64
 	activeActivities        map[string]string
 	activeActivityOrder     []string
+	recoveryInputDelivered  *atomic.Bool
+	recoverySteerDelivered  *atomic.Bool
 	agentRequests           map[string]cloudDSHAgentRequest
 	timedOutAgentRequests   map[string]struct{}
 	verifiedAgentRequests   map[string]struct{}
@@ -332,7 +335,26 @@ func newCloudDSHSessionState(fence app.AgentInstanceFence, identity cloudDSHIden
 		checkpointIDs: make(map[string]struct{}), pageReadIDs: make(map[string]struct{}),
 		history: history, images: newCloudDSHImageRegistry(cloudDSHModelFence(fence, identity.SessionID, through, 0)),
 		activeActivities: make(map[string]string), agentRequests: make(map[string]cloudDSHAgentRequest),
-		timedOutAgentRequests: make(map[string]struct{}), verifiedAgentRequests: make(map[string]struct{})}
+		timedOutAgentRequests: make(map[string]struct{}), verifiedAgentRequests: make(map[string]struct{}),
+		recoveryInputDelivered: &atomic.Bool{}, recoverySteerDelivered: &atomic.Bool{}}
+}
+
+func (state *cloudDSHSessionState) noteRecoveryInput(mode app.AgentMessageDeliveryMode) {
+	if state == nil || state.recoveryInputDelivered == nil {
+		return
+	}
+	state.recoveryInputDelivered.Store(true)
+	if mode == app.AgentMessageDeliverySteer && state.recoverySteerDelivered != nil {
+		state.recoverySteerDelivered.Store(true)
+	}
+}
+
+func (state *cloudDSHSessionState) hasRecoveryInput() bool {
+	return state != nil && state.recoveryInputDelivered != nil && state.recoveryInputDelivered.Load()
+}
+
+func (state *cloudDSHSessionState) hasRecoverySteer() bool {
+	return state != nil && state.recoverySteerDelivered != nil && state.recoverySteerDelivered.Load()
 }
 
 func cloudDSHToolDefinitionsSummary(definitions []app.AgentToolDefinition) ([32]byte, bool) {
@@ -2323,6 +2345,9 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				if pending.identity.SessionID != rootIdentity.SessionID {
 					recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_not_allowed",
 						reasonCode: "recovery_session_mismatch"}
+				} else if pending.state.hasRecoveryInput() {
+					recoveryStartErr = cloudDSHModelResultError{stage: "recovery_start", category: "recovery_attempt_not_allowed",
+						reasonCode: "new_user_input_arrived_during_recovery"}
 				} else if checkpoint, ok := cloudDSHReadOnlyRecoveryCheckpointFor(value, pending.state, pending.modelCall, len(childSessions) > 0); !ok ||
 					checkpoint.ThroughSequence != intent.CheckpointThroughSequence || !bytes.Equal(checkpoint.Digest, intent.CheckpointDigest) ||
 					!bytes.Equal(checkpoint.ToolsetDigest, intent.ToolsetDigest) {
@@ -2467,12 +2492,44 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	deliverPendingMessagesOnce := func(deliveryCtx context.Context) error {
 		seenDeliveriesMu.Lock()
 		defer seenDeliveriesMu.Unlock()
-		return e.deliverPendingMessagesOnce(deliveryCtx, fence, input, seenDeliveries)
+		messages, err := e.options.Checkpoints.PendingMessages(deliveryCtx, checkpointFence(fence))
+		if err != nil {
+			return err
+		}
+		for _, message := range messages {
+			if !rootState.resume || message.Initial || message.RevisionUpdate {
+				continue
+			}
+			if _, alreadyDelivered := seenDeliveries[message.ID]; alreadyDelivered {
+				continue
+			}
+			mode := message.Mode
+			if mode == "" {
+				mode = app.AgentMessageDeliveryFollowup
+			}
+			rootState.noteRecoveryInput(mode)
+		}
+		return e.deliverPendingConversationMessages(deliveryCtx, fence, input, messages, seenDeliveries)
 	}
 	deliverSupersedingMessages := func(deliveryCtx context.Context, messages []app.AgentConversationMessage,
 		supersedeSessionID, supersedeCallID string) error {
 		seenDeliveriesMu.Lock()
 		defer seenDeliveriesMu.Unlock()
+		if rootState.resume {
+			for _, message := range messages {
+				if message.Initial || message.RevisionUpdate {
+					continue
+				}
+				if _, alreadyDelivered := seenDeliveries[message.ID]; alreadyDelivered {
+					continue
+				}
+				mode := message.Mode
+				if mode == "" {
+					mode = app.AgentMessageDeliveryFollowup
+				}
+				rootState.noteRecoveryInput(mode)
+			}
+		}
 		return e.deliverSupersedingMessages(deliveryCtx, fence, input, messages, seenDeliveries, supersedeSessionID, supersedeCallID)
 	}
 	supersedeToolCall := func(deliveryCtx context.Context, messages []app.AgentConversationMessage,
@@ -2613,6 +2670,10 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 							break
 						}
 					}
+				}
+				if !steerPending && pending.identity.SessionID == rootIdentity.SessionID && pending.modelCall.Task != nil &&
+					pending.modelCall.Task.RecoveryCallID != "" && pending.state.hasRecoverySteer() {
+					steerPending = true
 				}
 				if steerPending {
 					if err := deliverPendingMessagesOnce(ctx); err != nil {
