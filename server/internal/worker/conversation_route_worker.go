@@ -102,6 +102,12 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	if err != nil || !found {
 		return found, err
 	}
+	if w.metrics != nil && !claim.Message.CreatedAt.IsZero() {
+		claimedAt := time.Now().UTC()
+		if claim.Message.CreatedAt.Before(claimedAt) {
+			w.metrics.receiptAgeAtClaim.Observe(claimedAt.Sub(claim.Message.CreatedAt).Seconds())
+		}
+	}
 	routeCtx, cancel := context.WithDeadline(ctx, claim.LeaseExpiresAt.Add(-time.Second))
 	defer cancel()
 	snapshot, err := w.options.Actions.LoadConversationRouteSnapshot(routeCtx, claim)
@@ -239,7 +245,11 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 	decision := app.ConversationRouteDecision{Action: app.ConversationRouteNew}
 	if classifyContext.Content != "" || len(classifyContext.Candidates) != 0 || classifyContext.ReferenceTaskID != "" ||
 		classifyContext.PreviousUnresolved || classifyContext.SummaryVersion > 0 || classifyContext.ResultReview != nil {
+		classificationStarted := time.Now()
 		decision, err = w.options.Models.ClassifyConversationRoute(routeCtx, claim, classifyContext)
+		if w.metrics != nil {
+			w.metrics.classificationTime.Observe(time.Since(classificationStarted).Seconds())
+		}
 		if err != nil {
 			if snapshot.Context.ResultReview != nil && routeCtx.Err() != nil && ctx.Err() == nil {
 				return true, w.options.Actions.DeferConversationRoute(ctx, claim, 5*time.Second)

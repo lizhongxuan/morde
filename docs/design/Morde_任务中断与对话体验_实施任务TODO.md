@@ -75,6 +75,25 @@
 - [x] 恢复诊断输入：服务端从等待事件提取白名单失败事实，终态解释模型请求只收到自然语言诊断、不包含工具名/调用 ID/内部分类；应用与 PostgreSQL 集成测试覆盖。
 - [ ] 自动恢复独立灰度并可关闭；关闭后仍保留状态修复与原对话回告。比较「无入口却提示等待用户」次数、任务回告覆盖率、恢复成功率及额外模型调用。任何重复副作用或跨权限展示立即停用自动恢复。
 
+## T08 · P0/P1：实时对话、真实失败说明与 Agent 接管（进行中）
+
+**设计依据：** [Morde 实时对话与 Agent 接管设计方案](Morde_实时对话与Agent接管_设计方案.md)。继续只使用 DSH Agent Runtime；OpenClaw 仅参考持久状态、真实文本增量和安全进度的处理方式。
+
+- [x] 移除 PC 对 `dsh_recovery_unresolved` 本地生成的固定助手回复；没有实际助手消息时展示任务状态卡和详情入口。
+- [x] 修复消息列表未完成首屏加载时丢失已受理 receipt 的缓存时序；receipt 出现后立即显示用户消息及 pending/processing 状态。覆盖“发送后回执”与“已加载的 pending/processing”自动化用例。
+- [x] 终态投递错误日志记录稳定 `failure_code`、stage 与现有追踪字段，不记录原始错误文本；增加安全字段单测。
+- [x] 增加 receipt 到 route claim 的等待时长，以及 DSH route 分类耗时直方图；使用无 ID 标签的低基数指标。
+- [ ] 将后端诊断日志补丁部署到 `release`，读取线上 `read_source_facts` 的 `failure_code`，修复真实根因；确认 DSH 收到白名单事实并只向原会话发布一条不同于模板的解释气泡。
+- [ ] 对普通短答完成 DSH 实际回复延迟验收并记录收据、claim、分类、首条持久 assistant 消息的时间。当前只有 receipt 和分类耗时指标，没有 first-delta 持久流；需实现有界增量写入及断线续读后再验收流式速度。
+- [ ] 在实际 `morde-pc` 验证普通问答真实模型回复、一个只读工具请求和一个明确后台任务的进度/最终结果；检查现有 DSH 工具、MCP、子 Agent 和授权边界，不增加第二套 Agent Runtime。
+
+### 2026-11-28 本轮验证
+
+- 通过：PC Portal `npm test -- src/routes/Assistant.test.tsx`（330/330）；`npm run typecheck`；Go Worker 定向日志与 route 延迟指标用例；`git diff --check`。
+- 未完成：本地 PostgreSQL 终态回告集成测试当前环境未提供可确认的测试数据库，定向命令没有运行完整数据库路径；需用隔离 PostgreSQL 重跑。
+- 未完成：线上当前为 `release@ee618bed`，Worker 的终态错误持续发生在 `read_source_facts`。旧日志没有 `failure_code`；新字段尚未部署，不能猜测或宣称已修好该根因。
+- 未完成：本轮尚未实机启动并操作 `morde-pc`，也未生成新对话或测试请求；真实 AI 答案、端到端延迟和工具接管尚未验收。
+
 ## 实施与验证记录（2026-11-27）
 
 - 实施基线：`release@936389c`。本地实现覆盖 T01–T06；自动恢复通过 `MORDE_TASK_MODEL_RECOVERY_AUTO` 独立控制，默认关闭。
@@ -124,3 +143,11 @@
 - 共享工作区前端最新检查：Portal 文件测试 330/330，`npm run typecheck` 通过。工作区含未提交的步骤输出分页/API 改动；这组检查不能代表干净 release 基线，本轮未将这些文件纳入提交。
 - 服务器当前仍不可核验：`/healthz` TLS 握手超时，SSH banner 超时；不能据用户告知推断部署 commit 或查看日志。实际 `morde-pc` 的会话续期此前也失败，因此线上对话与截图任务仍未实测。现代 `morde-pc` 将 Portal UI 嵌入客户端包；服务器部署不等于已更新客户端包。
 - 自动恢复保持默认关闭；开关为进程级、没有灰度 cohort 或独立恢复指标。T07 继续进行中，等待服务器连通和共享前端未提交改动收敛后再完成 PC/灰度验收。
+
+### 2026-11-28 续验（实时对话设计与 PC 状态核对）
+
+- 设计依据已落盘：[Morde 实时对话与 Agent 接管设计方案](Morde_实时对话与Agent接管_设计方案.md)。实际 `morde-pc` 确认旧固定助手气泡已被移除；多条相同状态卡分别关联不同的用户消息。任务详情仍只有通用模型服务未确认状态，真实失败解释没有发布。
+- 服务端只读核对：终态投递仍卡在 `read_source_facts`，服务端为 `release@ee618bed`。Task/outbox 身份字段、修订与授权版本、事件类型及事件摘要相符；步骤计数自洽。当前错误日志没有安全 `failure_code`，不能据此猜根因。
+- 本地 DSH 架构审计：`WorkerModel.stream()` 虽然消费 DSH 增量 chunk，但 coordinator 适配器将 chunks 全部收集后才返回；ConversationRoute 等完整结构化决策后才创建助手消息。现有 Task 流消息必须绑定 Task ID 和 Task event fence，因此还不能承载 taskless 普通对话回复。真实持久流式回复需要单独的 owner/conversation/message/revision 围栏协议、API 重连游标及 PC 接入。
+- 本轮已通过：`go test ./internal/api ./internal/app ./cmd/portal -count=1`、终态安全错误码及 route 指标定向 Worker 用例、`npm test -- src/routes/Assistant.test.tsx`（330/330）、`npm run typecheck`。部署 smoke gate 正在执行，结果待补。
+- 待完成：部署稳定错误码并读取线上诊断；定位并修复 facts 读取根因；实际 PC 新会话真实短答与只读工具请求；端到端时间样本；DSH 持久增量方案和授权/断线回放验收。T07/T08 保持进行中，自动恢复仍关闭。

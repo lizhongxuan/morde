@@ -326,9 +326,11 @@ func TestConversationRouteWorkerClassifiesFollowUpWhilePredecessorRouting(t *tes
 
 func TestConversationRouteMetricsRecordAggregationWaitAndCorrection(t *testing.T) {
 	registry := prometheus.NewRegistry()
+	message := appRouteMessageForMetrics()
+	message.CreatedAt = time.Now().UTC().Add(-5 * time.Second)
 	stub := &routeWorkerStub{
 		claim: app.ConversationRouteClaim{
-			Message: appRouteMessageForMetrics(), LeaseExpiresAt: time.Now().Add(time.Minute),
+			Message: message, LeaseExpiresAt: time.Now().Add(time.Minute),
 			AggregationStartedAt: time.Now().Add(-3 * time.Second),
 		},
 		snapshot: app.ConversationRouteSnapshot{Context: app.ConversationRouteContext{
@@ -354,16 +356,25 @@ func TestConversationRouteMetricsRecordAggregationWaitAndCorrection(t *testing.T
 	if got := gatheredWorkerCounter(t, routeWorker.metrics.aggregationStates.WithLabelValues("corrected")); got != 1 {
 		t.Fatalf("aggregation correction metric = %v, want 1", got)
 	}
+	var foundWait, foundReceiptAge, foundClassification bool
 	for _, family := range mustGatherWorkerMetrics(t, registry) {
-		if family.GetName() == "cloudhost_conversation_aggregation_wait_seconds" {
-			histogram := family.GetMetric()[0].GetHistogram()
-			if histogram.GetSampleCount() != 1 || histogram.GetSampleSum() < 2.9 {
-				t.Fatalf("aggregation wait metric = %#v, want one 3s sample", histogram)
-			}
-			return
+		if len(family.GetMetric()) == 0 {
+			continue
+		}
+		histogram := family.GetMetric()[0].GetHistogram()
+		switch family.GetName() {
+		case "cloudhost_conversation_aggregation_wait_seconds":
+			foundWait = histogram.GetSampleCount() == 1 && histogram.GetSampleSum() >= 2.9
+		case "cloudhost_conversation_route_receipt_age_at_claim_seconds":
+			foundReceiptAge = histogram.GetSampleCount() == 1 && histogram.GetSampleSum() >= 4.9
+		case "cloudhost_conversation_route_classification_duration_seconds":
+			foundClassification = histogram.GetSampleCount() == 1 && histogram.GetSampleSum() >= 0
 		}
 	}
-	t.Fatal("aggregation wait histogram was not gathered")
+	if !foundWait || !foundReceiptAge || !foundClassification {
+		t.Fatalf("route latency histograms missing or invalid: aggregation=%t receipt_age=%t classification=%t",
+			foundWait, foundReceiptAge, foundClassification)
+	}
 }
 
 func TestConversationRouteMetricsRecordAggregationWaitState(t *testing.T) {

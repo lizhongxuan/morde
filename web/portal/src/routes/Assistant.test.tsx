@@ -1972,7 +1972,15 @@ describe('Assistant durable tasks', () => {
 
   it('defaults to short replies and sends an explicit long-form mode when selected', async () => {
     mockCommon({ conversations: [conversation] });
-    const accept = vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
+    let acceptedShortReply: ConversationMessage | undefined;
+    vi.spyOn(portalApi, 'conversationMessages').mockImplementation(async () => ({
+      items: acceptedShortReply ? [acceptedShortReply] : [], next_cursor: null,
+    }));
+    const accept = vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => {
+      const receipt = acceptedReceipt(conversationID, body);
+      acceptedShortReply = receipt.message;
+      return receipt;
+    });
     const user = userEvent.setup();
     renderPage();
     const composer = await findReadyComposer();
@@ -1982,6 +1990,11 @@ describe('Assistant durable tasks', () => {
     await user.type(composer, '默认短答');
     await user.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(accept).toHaveBeenCalledOnce());
+    const acceptedMessage = await screen.findByRole('article', { name: '你的消息' });
+    expect(acceptedMessage).toHaveTextContent('默认短答');
+    const acceptedMessageBody = acceptedMessage.closest('.chat-message-body');
+    expect(acceptedMessageBody).not.toBeNull();
+    expect(await within(acceptedMessageBody as HTMLElement).findByRole('status')).toHaveTextContent('已收到，正在等待处理');
     expect(accept.mock.calls[0]?.[1]).not.toHaveProperty('response_mode');
 
     await user.click(responseLength);

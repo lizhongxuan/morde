@@ -523,7 +523,10 @@ function flattenConversationPages(data: ConversationMessagesData | undefined): C
 }
 
 function appendConversationReceipt(data: ConversationMessagesData | undefined, receipt: ConversationMessage): ConversationMessagesData | undefined {
-  if (!data?.pages.length || data.pages.some((page) => page.items.some((item) => item.id === receipt.id))) return data;
+  if (data?.pages.some((page) => page.items.some((item) => item.id === receipt.id))) return data;
+  if (!data?.pages.length) {
+    return { pages: [{ items: [receipt], next_cursor: null }], pageParams: [undefined] };
+  }
   const [latest, ...older] = data.pages;
   if (!latest) return data;
   return { ...data, pages: [{ ...latest, items: [...latest.items, receipt].sort((left, right) => left.sequence - right.sequence) }, ...older] };
