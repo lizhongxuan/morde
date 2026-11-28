@@ -6,10 +6,12 @@ class FakeRecognition {
   static latest: FakeRecognition | null = null;
   static startThrows = false;
   static omitStartEvent = false;
+  static install: ((options: { langs: string[]; processLocally: true }) => Promise<boolean>) | undefined;
 
   lang = '';
   continuous = false;
   interimResults = true;
+  processLocally: boolean | undefined;
   onresult: ((event: { resultIndex?: number; results: ArrayLike<{ isFinal?: boolean; 0?: { transcript?: string } }> }) => void) | null = null;
   onerror: ((event: { error?: string }) => void) | null = null;
   onstart: (() => void) | null = null;
@@ -83,6 +85,7 @@ describe('AssistantVoiceInput', () => {
     FakeRecognition.latest = null;
     FakeRecognition.startThrows = false;
     FakeRecognition.omitStartEvent = false;
+    FakeRecognition.install = undefined;
     FakeAudioContext.latest = null;
     previousMediaDevices = Object.getOwnPropertyDescriptor(navigator, 'mediaDevices');
     window.history.replaceState({}, '', '/assistant');
@@ -119,6 +122,18 @@ describe('AssistantVoiceInput', () => {
 
     act(() => recognition?.emitFinal('帮我总结这份文件'));
     expect(onTranscript).toHaveBeenCalledWith('帮我总结这份文件');
+  });
+
+  it('installs the local language pack and uses on-device recognition when supported', async () => {
+    const install = vi.fn(async () => true);
+    FakeRecognition.install = install;
+    render(<AssistantVoiceInput onTranscript={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+
+    await waitFor(() => expect(FakeRecognition.latest?.start).toHaveBeenCalledOnce());
+    expect(install).toHaveBeenCalledWith({ langs: ['zh-CN'], processLocally: true });
+    expect(FakeRecognition.latest?.processLocally).toBe(true);
   });
 
   it('stops the active recognition session from the same control', () => {
@@ -449,17 +464,19 @@ describe('AssistantVoiceInput', () => {
     expect(screen.getByRole('button', { name: '开始语音输入' })).toHaveAttribute('aria-pressed', 'false');
   });
 
-  it('shows an actionable error when browser recognition cannot start', () => {
+  it('marks the voice control unavailable when browser recognition cannot start', () => {
     FakeRecognition.startThrows = true;
     render(<AssistantVoiceInput onTranscript={vi.fn()} />);
 
     fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
 
-    expect(screen.getByLabelText('语音输入状态')).toHaveTextContent('无法启动语音输入');
-    expect(screen.getByRole('button', { name: '开始语音输入' })).toHaveAttribute('aria-pressed', 'false');
+    const button = screen.getByRole('button', { name: '语音输入不可用' });
+    expect(button).toHaveClass('is-unavailable');
+    expect(button).toHaveAttribute('aria-pressed', 'false');
+    expect(screen.getByLabelText('语音输入状态').textContent?.trim()).toBe('');
   });
 
-  it('shows a stable status when the browser has no speech recognition API', () => {
+  it('marks the voice control unavailable when the browser has no speech recognition API', () => {
     delete supportedWindow.SpeechRecognition;
     render(<AssistantVoiceInput onTranscript={vi.fn()} />);
     const status = screen.getByLabelText('语音输入状态');
@@ -467,21 +484,45 @@ describe('AssistantVoiceInput', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
 
-    expect(status).toHaveTextContent('当前浏览器不支持语音输入。');
+    expect(screen.getByRole('button', { name: '语音输入不可用' })).toHaveClass('is-unavailable');
+    expect(status).toHaveClass('assistant-voice-status-idle');
+    expect(status.textContent?.trim()).toBe('');
     expect(status.style.height).toBe('1.2em');
     expect(status.getBoundingClientRect().height).toBe(initialHeight);
   });
 
-  it('explains denied microphone permission without emitting transcript text', () => {
+  it('marks denied microphone permission red without showing a status message', () => {
     const onTranscript = vi.fn();
     render(<AssistantVoiceInput onTranscript={onTranscript} />);
     fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
 
     act(() => FakeRecognition.latest?.onerror?.({ error: 'not-allowed' }));
 
-    expect(screen.getByLabelText('语音输入状态')).toHaveTextContent('未获得麦克风权限');
+    expect(screen.getByRole('button', { name: '语音输入不可用' })).toHaveClass('is-unavailable');
+    expect(screen.getByLabelText('语音输入状态').textContent?.trim()).toBe('');
     expect(onTranscript).not.toHaveBeenCalled();
-    expect(screen.getByRole('button', { name: '开始语音输入' })).toBeEnabled();
+    expect(screen.getByRole('button', { name: '语音输入不可用' })).toBeEnabled();
+  });
+
+  it('marks browser network recognition failures red without showing status text', () => {
+    render(<AssistantVoiceInput onTranscript={vi.fn()} compact />);
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+
+    act(() => FakeRecognition.latest?.onerror?.({ error: 'network' }));
+
+    expect(screen.getByRole('button', { name: '语音输入不可用' })).toHaveClass('is-unavailable');
+    expect(screen.getByLabelText('语音输入状态')).toHaveClass('assistant-voice-status-idle');
+    expect(screen.getByLabelText('语音输入状态').textContent?.trim()).toBe('');
+  });
+
+  it('keeps the red state until a retry starts successfully', () => {
+    render(<AssistantVoiceInput onTranscript={vi.fn()} compact />);
+    fireEvent.click(screen.getByRole('button', { name: '开始语音输入' }));
+    act(() => FakeRecognition.latest?.onerror?.({ error: 'network' }));
+
+    fireEvent.click(screen.getByRole('button', { name: '语音输入不可用' }));
+
+    expect(screen.getByRole('button', { name: '停止语音输入' })).not.toHaveClass('is-unavailable');
   });
 
   it('aborts browser recognition and ignores late callbacks when the component unmounts', () => {

@@ -12,6 +12,7 @@ test('local Portal serves bundled routes and safely proxies synthetic API reques
   mkdirSync(join(root, 'mcp-app'));
   writeFileSync(join(root, 'index.html'), '<!doctype html><html><head></head><body><div id="root"></div></body></html>');
   writeFileSync(join(root, 'assets', 'main.js'), 'export {};');
+  writeFileSync(join(root, 'mockServiceWorker.js'), '/* local acceptance worker */');
   writeFileSync(join(root, 'mcp-app', 'task-approval.js'), 'window.__mordeApprovalApp = true;');
   writeFileSync(join(root, 'mcp-app', 'task-approval.css'), 'body { color: blue; }');
   const upstreamRequests = [];
@@ -38,7 +39,9 @@ test('local Portal serves bundled routes and safely proxies synthetic API reques
   const address = upstream.address();
   const serviceOrigin = `http://127.0.0.1:${address.port}`;
   let portal;
+  const previousTestAssets = process.env.MORDE_TEST_PORTAL_ASSETS;
   try {
+    process.env.MORDE_TEST_PORTAL_ASSETS = root;
     let proxyFetches = 0;
     portal = await startLocalPortalServer(root, serviceOrigin, 'https://*.hosts.example.test', 0, (...args) => {
       proxyFetches++;
@@ -55,6 +58,7 @@ test('local Portal serves bundled routes and safely proxies synthetic API reques
     assert.match(page.headers.get('content-security-policy'), /frame-src 'self' https:\/\/\*\.hosts\.example\.test/);
     assert.match(await page.text(), /name="morde-service-origin" content="http:\/\/127\.0\.0\.1:/);
     assert.equal((await fetch(`${portal.origin}/assets/main.js`)).status, 200);
+    assert.equal(await (await fetch(`${portal.origin}/mockServiceWorker.js`)).text(), '/* local acceptance worker */');
     assert.equal((await fetch(`${portal.origin}/mcp-app/task-approval.js`)).headers.get('content-type'), 'text/javascript; charset=utf-8');
     assert.equal((await fetch(`${portal.origin}/mcp-app/task-approval.css`)).headers.get('content-type'), 'text/css; charset=utf-8');
     const sandboxHeaders = { origin: 'null', 'sec-fetch-site': 'cross-site' };
@@ -163,8 +167,35 @@ test('local Portal serves bundled routes and safely proxies synthetic API reques
     portal = await startLocalPortalServer(root, serviceOrigin, undefined, stablePort);
     assert.equal(new URL(portal.origin).port, String(stablePort));
   } finally {
+    if (previousTestAssets === undefined) delete process.env.MORDE_TEST_PORTAL_ASSETS;
+    else process.env.MORDE_TEST_PORTAL_ASSETS = previousTestAssets;
     if (portal) await portal.close();
     await new Promise((resolve) => upstream.close(resolve));
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('local Portal serves the MSW worker only for an explicit test asset override', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'morde-local-portal-test-assets-'));
+  writeFileSync(join(root, 'index.html'), '<!doctype html><html><head></head><body></body></html>');
+  writeFileSync(join(root, 'mockServiceWorker.js'), '/* local acceptance worker */');
+  const previousTestAssets = process.env.MORDE_TEST_PORTAL_ASSETS;
+  let portal;
+  try {
+    delete process.env.MORDE_TEST_PORTAL_ASSETS;
+    portal = await startLocalPortalServer(root, 'http://127.0.0.1:1');
+    assert.equal((await fetch(`${portal.origin}/mockServiceWorker.js`)).status, 404);
+    await portal.close();
+
+    process.env.MORDE_TEST_PORTAL_ASSETS = root;
+    portal = await startLocalPortalServer(root, 'http://127.0.0.1:1');
+    const worker = await fetch(`${portal.origin}/mockServiceWorker.js`);
+    assert.equal(worker.status, 200);
+    assert.equal(await worker.text(), '/* local acceptance worker */');
+  } finally {
+    if (previousTestAssets === undefined) delete process.env.MORDE_TEST_PORTAL_ASSETS;
+    else process.env.MORDE_TEST_PORTAL_ASSETS = previousTestAssets;
+    if (portal) await portal.close();
     rmSync(root, { recursive: true, force: true });
   }
 });

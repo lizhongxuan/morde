@@ -21,11 +21,12 @@ type taskClaimMetrics struct {
 }
 
 type conversationRouteMetrics struct {
-	actions             *prometheus.CounterVec
-	aggregationStates   *prometheus.CounterVec
-	aggregationWaitTime prometheus.Histogram
-	receiptAgeAtClaim   prometheus.Histogram
-	classificationTime  prometheus.Histogram
+	actions                *prometheus.CounterVec
+	aggregationStates      *prometheus.CounterVec
+	aggregationWaitTime    prometheus.Histogram
+	receiptAgeAtClaim      prometheus.Histogram
+	classificationTime     prometheus.Histogram
+	failureExplanationTime prometheus.Histogram
 }
 
 func validHostState(state host.State) bool {
@@ -119,9 +120,13 @@ func newConversationRouteMetrics(registerer prometheus.Registerer) (*conversatio
 			Name: "cloudhost_conversation_route_classification_duration_seconds",
 			Help: "Seconds spent waiting for the DSH conversation route classification to complete.",
 		}),
+		failureExplanationTime: prometheus.NewHistogram(prometheus.HistogramOpts{
+			Name: "cloudhost_conversation_route_failure_explanation_duration_seconds",
+			Help: "Seconds spent waiting for the DSH no-tools explanation after a route output remains invalid.",
+		}),
 	}
 	for _, collector := range []prometheus.Collector{result.actions, result.aggregationStates, result.aggregationWaitTime,
-		result.receiptAgeAtClaim, result.classificationTime} {
+		result.receiptAgeAtClaim, result.classificationTime, result.failureExplanationTime} {
 		if err := registerer.Register(collector); err != nil {
 			return nil, fmt.Errorf("register conversation route metric: %w", err)
 		}

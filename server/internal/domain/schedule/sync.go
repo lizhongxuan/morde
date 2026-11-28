@@ -60,7 +60,7 @@ func ValidateSyncDefinition(id string, value SyncDefinition) error {
 		strings.TrimSpace(value.Objective) == "" || len(strings.TrimSpace(value.Objective)) > 32768 ||
 		!value.FileDeliveryIntent.Valid() || value.FileDeliveryIntent != task.FileDeliveryNone ||
 		!value.MisfirePolicy.Valid() || value.Timing.Validate() != nil ||
-		(task.Budget{ActiveSeconds: value.Budget.ActiveSeconds, ToolCalls: value.Budget.ToolCalls, ModelTokens: value.Budget.ModelTokens}).Validate() != nil {
+		(task.Budget{ActiveSeconds: value.Budget.ActiveSeconds, ToolCalls: value.Budget.ToolCalls, ModelTokens: value.Budget.ModelTokens}).ValidateSchedule() != nil {
 		return errors.New("schedule sync definition is invalid")
 	}
 	if hostID == "" && value.Observation != nil {

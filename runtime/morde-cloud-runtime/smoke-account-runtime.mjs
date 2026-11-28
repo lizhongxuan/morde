@@ -24,6 +24,7 @@ function task(taskID, runtimeSequence) {
     agent_id: `agent_${taskID}`,
     generation: 1,
     authorization_version: 1,
+    task_revision: 0,
     session_id: `session_${taskID}`,
     runtime_sequence: runtimeSequence,
     model: 'container-smoke-model',

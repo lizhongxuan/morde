@@ -1138,6 +1138,9 @@ th, .admin-page table th { color: #8793a4; background: #fafbfc; font-size: 10px;
 .assistant-tool-menu > summary::-webkit-details-marker { display: none; }
 .assistant-tool-menu > summary .morde-icon { width: 14px; height: 14px; }
 .assistant-tool-menu .assistant-tool-connectors { position: absolute; z-index: 5; bottom: calc(100% + 8px); left: 0; min-width: 210px; padding: 12px; border: 1px solid #e7ebf2; border-radius: 11px; background: #fff; box-shadow: 0 12px 32px rgb(38 52 77 / 10%); }
+.assistant-tool-connectors .assistant-budget-field { display: grid; gap: 6px; color: var(--ink); }
+.assistant-tool-connectors .assistant-budget-field input { width: 100%; min-height: 32px; padding: 6px 8px; border: 1px solid var(--line); border-radius: 7px; background: var(--surface); color: var(--ink); }
+.assistant-budget-menu .assistant-tool-connectors { width: min(320px, calc(100vw - 32px)); }
 .assistant-page .assistant-task-actions { flex: 0 0 auto; }
 .assistant-page .assistant-task-actions .button { min-height: 30px; padding: 5px 10px; border-radius: 8px; font-size: 11px; }
 .assistant-page .assistant-send { min-height: 30px; padding: 0 11px; border-radius: 8px; background: #0874f9; font-size: 11px; }

@@ -1594,7 +1594,7 @@ func authorizedTaskHostIDs(ctx context.Context, authorizer TaskAuthorizer, princ
 
 func normalizedBudget(value task.Budget) (task.Budget, error) {
 	if value == (task.Budget{}) {
-		value = task.Budget{ActiveSeconds: task.MaxActiveSeconds, ToolCalls: task.MaxToolCalls, ModelTokens: task.MaxModelTokens}
+		value = task.Budget{ActiveSeconds: task.MaxActiveSeconds, ToolCalls: task.MaxToolCalls, ModelTokens: task.DefaultModelTokens}
 	}
 	if err := value.Validate(); err != nil {
 		return task.Budget{}, domain.InvalidArgument("budget", err.Error())

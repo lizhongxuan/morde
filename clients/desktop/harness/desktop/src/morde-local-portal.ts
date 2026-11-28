@@ -162,8 +162,9 @@ export async function startLocalPortalServer(directory: string, serviceOrigin: s
     if (request.method !== "GET" && request.method !== "HEAD") { writeError(response, 405, "Method not allowed"); return; }
     let pathname: string;
     try { pathname = decodeURIComponent(url.pathname); } catch { writeError(response, 400, "Invalid path"); return; }
+    const testMockServiceWorker = Boolean(process.env.MORDE_TEST_PORTAL_ASSETS) && url.pathname === "/mockServiceWorker.js";
     const route = pathname === "/" || !extname(pathname);
-    if (!route && !pathname.startsWith("/assets/") && !pathname.startsWith("/ocr/") && !approvalMcpAppAssets.has(pathname.slice(1))) { writeError(response, 404, "Not found"); return; }
+    if (!route && !pathname.startsWith("/assets/") && !pathname.startsWith("/ocr/") && !approvalMcpAppAssets.has(pathname.slice(1)) && !testMockServiceWorker) { writeError(response, 404, "Not found"); return; }
     const relativePath = route ? "index.html" : pathname.slice(1);
     const candidatePath = resolve(root, relativePath);
     void fs.realpath(candidatePath).then((filePath) => {

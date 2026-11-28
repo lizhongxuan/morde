@@ -664,6 +664,33 @@ const terminalDeliveryWaitingReasons = new Set([
 ]);
 const conversationReplyRefreshDelaysMs = [1_000, 1_000, 2_000, 4_000, 8_000, 15_000, 30_000, 60_000] as const;
 
+function isTaskStartPlanMessage(message: { message_kind?: string }): boolean {
+  return message.message_kind === 'task_start_plan';
+}
+
+function isAppliedTaskReplyMessage(
+  message: ConversationMessage,
+  taskID: string,
+  afterSequence: number,
+  assistantMessage?: Task['assistant_message'],
+): boolean {
+  if (message.role !== 'assistant' || message.delivery_status !== 'applied' || isTaskStartPlanMessage(message) ||
+      message.sequence <= afterSequence) return false;
+  const relatedToTask = message.task_id === taskID || message.sources?.some((source) => source.task_id === taskID) === true;
+  if (!relatedToTask) return false;
+  if (assistantMessage?.id === message.id) return true;
+
+  const revision = assistantMessage?.task_revision;
+  const resultEventSequence = assistantMessage?.result_event_sequence;
+  if (Number.isSafeInteger(revision) && Number.isSafeInteger(resultEventSequence)) {
+    return message.sources?.some((source) => source.task_id === taskID && source.task_revision === revision &&
+      source.event_sequence === resultEventSequence) === true ||
+      (message.task_id === taskID && message.output_task_revision === revision &&
+        message.output_result_event_sequence === resultEventSequence);
+  }
+  return true;
+}
+
 type ConversationFileItem =
   | { kind: 'attachment'; key: string; attachmentID: string; messageID: string; index: number; createdAt: string }
   | { kind: 'artifact'; key: string; taskID: string; taskTitle: string; artifact: TaskArtifact };
@@ -1803,6 +1830,7 @@ export function Assistant() {
   const [mcpConnectorIDs, setMcpConnectorIDs] = useState<string[]>([]);
   const [content, setContent] = useState(() => hasNavigationIdea ? ideaPrompt : '');
   const [responseMode, setResponseMode] = useState<ConversationResponseMode>('short');
+  const [taskModelTokenBudget, setTaskModelTokenBudget] = useState(String(50000));
   const [savingMessage, setSavingMessage] = useState(false);
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [composerAttachmentPreviewURLs, setComposerAttachmentPreviewURLs] = useState<Record<string, string>>({});
@@ -2578,23 +2606,21 @@ export function Assistant() {
       key: `artifact:${item.id}:${artifact.id}`, taskID: item.id, taskTitle: item.objective || '未命名任务', artifact }))),
   ];
   const tasksAwaitingConversationReply = tasks.filter((task) => {
-    const publishedResultVisible = task.result_message_published && conversationMessageItems.some((message) =>
-      message.sources?.some((source) => source.task_id === task.id &&
-        source.task_revision === task.assistant_message?.task_revision && source.event_sequence === task.assistant_message?.result_event_sequence));
-    if (task.result_message_pending || (task.result_message_published && !publishedResultVisible)) return true;
+    const sourceSequence = conversationMessageItems.reduce((latest, message) =>
+      message.role === 'user' && (message.task_id === task.id || message.related_task_id === task.id)
+        ? Math.max(latest, message.sequence) : latest, -1);
+    const appliedReplyVisible = conversationMessageItems.some((message) =>
+      isAppliedTaskReplyMessage(message, task.id, sourceSequence, task.assistant_message));
+    if (task.result_message_pending || (task.result_message_published && !appliedReplyVisible)) return true;
 
     // Task terminal-delivery runs after the Task status event and does not
-    // publish another Task event. Keep a bounded message refresh alive for
-    // terminal Tasks whose applied assistant bubble has not reached this page.
+    // publish another Task event. Keep a low-frequency message refresh alive
+    // until the applied assistant result reaches this page.
     const terminalDeliveryCanReply = terminalTaskStatuses.has(task.status) ||
       (task.status === 'waiting_user' && terminalDeliveryWaitingReasons.has(task.waiting_reason ?? '') &&
         task.pending_request?.status !== 'pending' && !task.clarification_request);
     if (!terminalDeliveryCanReply) return false;
-    const sourceSequence = conversationMessageItems.reduce((latest, message) =>
-      message.role === 'user' && (message.task_id === task.id || message.related_task_id === task.id)
-        ? Math.max(latest, message.sequence) : latest, -1);
-    return !conversationMessageItems.some((message) => message.role === 'assistant' && message.delivery_status === 'applied' &&
-      message.sequence > sourceSequence && (message.task_id === task.id || message.sources?.some((source) => source.task_id === task.id)));
+    return !appliedReplyVisible;
   });
   const conversationReplyRefreshKey = tasksAwaitingConversationReply.map((task) =>
     `${task.id}:${task.status}:${task.current_revision ?? ''}:${task.event_sequence ?? ''}:${task.waiting_reason ?? ''}:` +
@@ -2611,13 +2637,15 @@ export function Assistant() {
       conversationReplyRefreshAttempts.current = { key: conversationReplyRefreshKey, count: 0 };
     }
     const attempts = conversationReplyRefreshAttempts.current;
-    if (!attempts || attempts.count >= conversationReplyRefreshDelaysMs.length || messages.isFetching) return;
+    if (!attempts || messages.isFetching) return;
     const queryKey = ['conversation-messages', conversationID] as const;
-    const delay = conversationReplyRefreshDelaysMs[attempts.count];
+    const delay = conversationReplyRefreshDelaysMs[Math.min(attempts.count, conversationReplyRefreshDelaysMs.length - 1)];
     const timer = window.setTimeout(() => {
       if (conversationReplyRefreshAttempts.current?.key !== conversationReplyRefreshKey ||
         client.getQueryState(queryKey)?.fetchStatus === 'fetching') return;
-      conversationReplyRefreshAttempts.current.count += 1;
+      conversationReplyRefreshAttempts.current.count = Math.min(
+        conversationReplyRefreshAttempts.current.count + 1, conversationReplyRefreshDelaysMs.length - 1,
+      );
       void client.invalidateQueries({ queryKey, exact: true });
     }, delay);
     return () => window.clearTimeout(timer);
@@ -3649,6 +3677,11 @@ export function Assistant() {
     if (!text.trim() && !composerAttachments.length) return;
     const effectiveText = text.trim() ? text : '请阅读并处理我附加的文件。';
     const selectedResponseMode = responseMode;
+    const selectedTaskModelTokens = Number(taskModelTokenBudget);
+    if (selectedResponseMode === 'short' && (!Number.isSafeInteger(selectedTaskModelTokens) || selectedTaskModelTokens < 1 || selectedTaskModelTokens > 2147483647)) {
+      notify('Task 累计 Token 上限必须是 1–2,147,483,647 之间的整数。', 'error');
+      return;
+    }
     const timeZone = browserIanaTimeZone();
     if (new TextEncoder().encode(effectiveText).length > maxMessageBytes) {
       notify('单条消息不能超过 8 MiB；完整内容仍保留在输入框中。', 'error');
@@ -3676,6 +3709,9 @@ export function Assistant() {
         ...(mcpConnectorIDs.length && selectedResponseMode === 'short' ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
         ...(attachments.length ? { client_attachment_ids: attachments.map((item) => item.id) } : {}),
         ...(selectedResponseMode === 'long_form' ? { response_mode: 'long_form' } : {}),
+        ...(selectedResponseMode === 'short' && selectedTaskModelTokens !== 50000 ? {
+          budget: { active_seconds: 1800, tool_calls: 100, model_tokens: selectedTaskModelTokens },
+        } : {}),
       };
       const message: PendingConversationMessage = {
         actorID: user?.id ?? '',
@@ -4557,8 +4593,7 @@ export function Assistant() {
                   const taskAttention = messageTaskAttentionSource?.conversation_id === conversationID && messageTaskAttentionSource.initiator_id === messageActorID
                     ? taskAttentionPresentation(messageTaskAttentionSource, user?.id) : null;
                   const taskHasTerminalReply = Boolean(messageTaskID && displayMessages.some((item) =>
-                    item.role === 'assistant' && item.task_id === messageTaskID && item.delivery_status === 'applied' &&
-                    item.sequence > message.sequence));
+                    isAppliedTaskReplyMessage(item, messageTaskID, message.sequence, messageTask?.assistant_message)));
                   const showTaskAttention = Boolean(message.role === 'user' && messageTaskAttentionSource && taskAttention &&
                     taskAttention.kind !== 'needs_user_action' && !ambiguousAcknowledgementTaskIDs.has(messageTaskID) &&
                     !taskHasTerminalReply &&
@@ -4956,6 +4991,18 @@ export function Assistant() {
                   </fieldset>
                 </details>}
                 {mcpConnectors.isError && <FloatingError className="error-inline assistant-connector-error" role="alert">工具连接暂不可用<button type="button" className="button button-small button-secondary" onClick={() => void mcpConnectors.refetch()}>重试</button></FloatingError>}
+                {responseMode === 'short' && <details className="assistant-tool-menu assistant-budget-menu">
+                  <summary><MordeIcon name="sliders" />Task 预算</summary>
+                  <fieldset className="assistant-tool-connectors">
+                    <legend>累计模型 Token 上限</legend>
+                    <label className="assistant-budget-field">每个 Task 的输入与输出总 Token
+                      <input aria-label="Task 累计模型 Token 上限" type="number" inputMode="numeric" min={1} max={2147483647} step={1}
+                        value={taskModelTokenBudget} disabled={!composerDraftReady || savingMessage}
+                        onChange={(event) => setTaskModelTokenBudget(event.target.value)} />
+                    </label>
+                    <small>默认 50,000。仅在消息创建后台 Task 时生效；较高额度可能增加耗时或费用，账户、项目、执行时长和工具次数限制仍生效。</small>
+                  </fieldset>
+                </details>}
               </div>
               <div className="assistant-task-actions" role="group" aria-label="发送操作">
                 <AssistantVoiceInput key={composerDraftIdentity ?? 'composer'} compact onTranscript={(transcript) => {
@@ -4981,7 +5028,7 @@ export function Assistant() {
               </div>
             </div>
           </form>
-          <p className="assistant-composer-hint">Enter 发送 · Shift + Enter 换行 · 当前：{responseMode === 'long_form' ? '长回复' : '短答'}</p>
+          <p className="assistant-composer-hint">Enter 发送 · Shift + Enter 换行 · 当前：{responseMode === 'long_form' ? '长回复' : '短答'}{responseMode === 'short' ? ` · Task Token 上限：${Number(taskModelTokenBudget).toLocaleString('zh-CN')}` : ''}</p>
           {responseMode === 'long_form' && (composerAttachments.length > 0 || mcpConnectorIDs.length > 0) &&
             <p className="assistant-composer-hint" role="status">长回复仅支持纯文本；移除附件和工具连接，或切回短答后发送。</p>}
         </section>

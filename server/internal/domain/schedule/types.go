@@ -415,7 +415,7 @@ func Validate(s Schedule) error {
 	if err := s.Timing.Validate(); err != nil {
 		return err
 	}
-	if err := s.Budget.Validate(); err != nil {
+	if err := s.Budget.ValidateSchedule(); err != nil {
 		return err
 	}
 	if s.PersonalRule != nil {

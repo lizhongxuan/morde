@@ -275,6 +275,22 @@ func TestCloudDSHCoordinatorUsesFreshSessionPerRouteAttempt(t *testing.T) {
 	}
 }
 
+func TestCloudDSHCoordinatorFailureExplanationUsesDistinctStableSession(t *testing.T) {
+	claim, value := coordinatorTestClaimAndContext()
+	classification := cloudDSHCoordinatorIdentity(claim, value)
+	diagnosis := app.ConversationRouteFailureDiagnosis{Code: "invalid_model_output", OutputCategory: "action_fields_invalid"}
+	value.FailureDiagnosis = &diagnosis
+	explanation := cloudDSHCoordinatorIdentity(claim, value)
+	if err := app.ValidateConversationCoordinatorIdentity(claim, explanation); err != nil {
+		t.Fatalf("failure explanation coordinator identity is invalid: %v", err)
+	}
+	if explanation.SessionID == classification.SessionID || explanation.AgentID == classification.AgentID ||
+		explanation.SessionID != cloudDSHCoordinatorIdentity(claim, value).SessionID {
+		t.Fatalf("failure explanation reused or changed its DSH session identity: classification=%+v explanation=%+v",
+			classification, explanation)
+	}
+}
+
 func TestCloudDSHCoordinatorUsesFreshSessionPerResultReviewRetry(t *testing.T) {
 	claim, value := coordinatorTestClaimAndContext()
 	initial := cloudDSHCoordinatorIdentity(claim, value)

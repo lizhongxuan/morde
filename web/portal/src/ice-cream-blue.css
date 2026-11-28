@@ -518,6 +518,8 @@
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-selectors select { color: var(--ink); border-color: var(--brand-tint); background: #fff; }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-attach-control:hover,
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-voice-button-compact:hover { color: var(--brand-ink); background: var(--brand-soft); }
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-voice-button-compact.is-unavailable,
+.morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .assistant-voice-button-compact.is-unavailable:hover { color: var(--danger-ink); background: var(--danger-bg); }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-markdown pre,
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-markdown :not(pre) > code { color: var(--ink); border-radius: var(--radius-sm); background: var(--side); }
 .morde-pc-theme .morde-shell:not(.morde-admin-shell):has(.assistant-page) .chat-message-source { border-color: var(--line); border-radius: var(--radius-md); background: var(--side); }

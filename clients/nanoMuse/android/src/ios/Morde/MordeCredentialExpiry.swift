@@ -1643,6 +1643,7 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
     let conversation_id: String?
     let sequence: Int64?
     let task_id: String?
+    let message_kind: String?
     let role: String
     let content: String
     let attachment_ids: [String]?
@@ -1672,12 +1673,15 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
     var displayStatus: String? { output_status ?? status }
     var displayTaskRevision: Int64? { output_task_revision ?? task_revision }
     var displayResultEventSequence: Int64? { output_result_event_sequence ?? result_event_sequence }
+    var isTaskStartPlan: Bool { role == "assistant" && message_kind == "task_start_plan" }
+    var isTerminalAssistantAnswer: Bool { role == "assistant" && !isTaskStartPlan && displayStatus == "completed" }
     var visibleToolActivity: MordeMessageToolActivity? {
         guard role == "user", let tool_activity, tool_activity.isSupported else { return nil }
         return tool_activity
     }
 
     init(id: String, conversation_id: String? = nil, sequence: Int64? = nil, task_id: String? = nil,
+         message_kind: String? = nil,
          role: String, content: String, attachment_ids: [String]? = nil, status: String? = nil, delivery_status: String? = nil,
          created_at: String? = nil, client_message_id: String? = nil, routing_status: String? = nil,
          routing_failure_reason: String? = nil, duplicate_of_message_id: String? = nil, related_task_id: String? = nil,
@@ -1691,6 +1695,7 @@ struct MordeClientMessage: Decodable, Equatable, Identifiable {
         self.conversation_id = conversation_id
         self.sequence = sequence
         self.task_id = task_id
+        self.message_kind = message_kind
         self.role = role
         self.content = content
         self.attachment_ids = attachment_ids
@@ -1916,9 +1921,10 @@ enum MordeConversationVariantPresentation {
         case .editResend:
             return message.role == "user"
         case .regenerateText:
-            return message.role == "assistant" && message.displayStatus == "completed"
+            return message.isTerminalAssistantAnswer
         case .continueGeneration:
-            return message.role == "assistant" && message.displayStatus == "interrupted" && message.task_id != nil
+            return message.role == "assistant" && !message.isTaskStartPlan &&
+                message.displayStatus == "interrupted" && message.task_id != nil
         }
     }
 
@@ -2013,7 +2019,8 @@ enum MordeTaskSnapshotMessageMerge {
     /// A late snapshot can still say `streaming` after the task has already reached a terminal
     /// state; keeping that status would make the chat claim that generation is still in progress.
     static func reconcilingStreamingSnapshot(_ snapshot: MordeClientMessage?, taskStatus: String) -> MordeClientMessage? {
-        guard let snapshot, snapshot.role == "assistant", snapshot.displayStatus == "streaming" else {
+        guard let snapshot, snapshot.role == "assistant", !snapshot.isTaskStartPlan,
+              snapshot.displayStatus == "streaming" else {
             return snapshot
         }
         let resolvedStatus: String
@@ -2029,7 +2036,7 @@ enum MordeTaskSnapshotMessageMerge {
         }
         return MordeClientMessage(
             id: snapshot.id, conversation_id: snapshot.conversation_id, sequence: snapshot.sequence,
-            task_id: snapshot.task_id, role: snapshot.role, content: snapshot.content,
+            task_id: snapshot.task_id, message_kind: snapshot.message_kind, role: snapshot.role, content: snapshot.content,
             attachment_ids: snapshot.attachment_ids, status: resolvedStatus,
             delivery_status: snapshot.delivery_status, created_at: snapshot.created_at,
             client_message_id: snapshot.client_message_id, routing_status: snapshot.routing_status,
@@ -2044,29 +2051,33 @@ enum MordeTaskSnapshotMessageMerge {
             variant_action: snapshot.variant_action, agent_acknowledged: snapshot.agent_acknowledged)
     }
 
-    static func shouldIncludeSnapshot(resultMessagePending: Bool?, resultMessagePublished: Bool?, status: String?) -> Bool {
+    static func shouldIncludeSnapshot(resultMessagePending: Bool?, resultMessagePublished: Bool?, status: String?,
+                                      messageKind: String? = nil) -> Bool {
+        guard messageKind != "task_start_plan" else { return false }
         if status == "interrupted" { return true }
         return resultMessagePublished != true && (resultMessagePending != true || status == "streaming")
     }
 
+    static func shouldShowTaskResult(resultMessagePending: Bool?, resultMessagePublished: Bool?,
+                                     messageKind: String? = nil) -> Bool {
+        guard messageKind != "task_start_plan" else { return true }
+        return resultMessagePending != true && resultMessagePublished != true
+    }
+
     static func shouldDiscardPublishedSynthetic(_ message: MordeClientMessage, taskID: String,
                                                 currentRevision: Int64?, published: Bool?) -> Bool {
-        guard published == true, message.role == "assistant", message.task_id == taskID,
+        guard !message.isTaskStartPlan, published == true, message.role == "assistant", message.task_id == taskID,
               message.output_status == nil, message.status != nil, message.displayStatus != "interrupted",
               message.sources?.isEmpty ?? true,
               let currentRevision, let revision = message.displayTaskRevision else { return false }
         return revision == currentRevision
     }
 
-    static func shouldShowTaskResult(resultMessagePending: Bool?, resultMessagePublished: Bool?) -> Bool {
-        resultMessagePending != true && resultMessagePublished != true
-    }
-
     static let statuses: Set<String> = ["streaming", "completed", "interrupted"]
 
     static func sourceCoversSnapshot(_ source: MordeClientMessageSource, snapshot: MordeClientMessage,
                                      taskID: String) -> Bool {
-        guard snapshot.displayStatus == "completed", let revision = snapshot.displayTaskRevision,
+        guard !snapshot.isTaskStartPlan, snapshot.displayStatus == "completed", let revision = snapshot.displayTaskRevision,
               let eventSequence = snapshot.displayResultEventSequence else { return false }
         return source.task_id == taskID && source.task_revision == revision && source.event_sequence == eventSequence
     }
@@ -2074,7 +2085,7 @@ enum MordeTaskSnapshotMessageMerge {
     static func preservingInterrupted(_ previous: [MordeClientMessage], in current: [MordeClientMessage],
                                       conversationID: String) -> [MordeClientMessage] {
         var values = current
-        for snapshot in previous where snapshot.role == "assistant" && snapshot.displayStatus == "interrupted" &&
+        for snapshot in previous where snapshot.role == "assistant" && !snapshot.isTaskStartPlan && snapshot.displayStatus == "interrupted" &&
             snapshot.output_status == nil && snapshot.conversation_id == conversationID {
             guard let taskID = snapshot.task_id, !values.contains(where: { $0.id == snapshot.id }) else { continue }
             values = merge(values, snapshot: snapshot, taskID: taskID, conversationID: conversationID)
@@ -2085,7 +2096,7 @@ enum MordeTaskSnapshotMessageMerge {
     static func deduplicatingPublished(_ messages: [MordeClientMessage]) -> [MordeClientMessage] {
         let sources = messages.flatMap { $0.sources ?? [] }
         return messages.filter { message in
-            guard message.role == "assistant", message.displayStatus == "completed",
+            guard message.role == "assistant", !message.isTaskStartPlan, message.displayStatus == "completed",
                   message.sources?.isEmpty ?? true, let taskID = message.task_id else { return true }
             return !sources.contains { sourceCoversSnapshot($0, snapshot: message, taskID: taskID) }
         }
@@ -2095,6 +2106,7 @@ enum MordeTaskSnapshotMessageMerge {
                       taskID: String, conversationID: String) -> [MordeClientMessage] {
         guard let snapshot,
               snapshot.role == "assistant",
+              !snapshot.isTaskStartPlan,
               snapshot.task_id == taskID,
               snapshot.conversation_id == conversationID,
               let status = snapshot.displayStatus,
@@ -2109,6 +2121,7 @@ enum MordeTaskSnapshotMessageMerge {
         var merged = messages
         if let index = merged.firstIndex(where: { $0.id == snapshot.id }) {
             let existing = merged[index]
+            if existing.isTaskStartPlan { return merged }
             if existing.sources?.isEmpty == false { return merged }
             guard existing.role == "assistant", existing.conversation_id.map({ $0 == conversationID }) ?? true,
                   existing.task_id.map({ $0 == taskID }) ?? true else { return merged }
@@ -2128,7 +2141,8 @@ enum MordeTaskSnapshotMessageMerge {
             if status == "streaming", existing.output_status == nil, existing.displayStatus == nil {
                 merged[index] = MordeClientMessage(
                     id: existing.id, conversation_id: existing.conversation_id,
-                    sequence: existing.sequence, task_id: existing.task_id, role: existing.role, content: existing.content,
+                    sequence: existing.sequence, task_id: existing.task_id, message_kind: existing.message_kind,
+                    role: existing.role, content: existing.content,
                     attachment_ids: existing.attachment_ids,
                     status: "completed", delivery_status: existing.delivery_status,
                     created_at: existing.created_at, client_message_id: existing.client_message_id,
@@ -2145,7 +2159,9 @@ enum MordeTaskSnapshotMessageMerge {
                 merged[index] = MordeClientMessage(
                     id: snapshot.id, conversation_id: snapshot.conversation_id ?? existing.conversation_id,
                     sequence: existing.sequence ?? snapshot.sequence,
-                    task_id: snapshot.task_id ?? existing.task_id, role: snapshot.role, content: snapshot.content,
+                    task_id: snapshot.task_id ?? existing.task_id,
+                    message_kind: snapshot.message_kind ?? existing.message_kind,
+                    role: snapshot.role, content: snapshot.content,
                     attachment_ids: snapshot.attachment_ids ?? existing.attachment_ids,
                     status: snapshot.status, delivery_status: snapshot.delivery_status ?? existing.delivery_status,
                     created_at: snapshot.created_at ?? existing.created_at,

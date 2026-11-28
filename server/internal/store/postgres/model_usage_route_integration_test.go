@@ -30,6 +30,7 @@ type routeModelClientTest struct {
 	err           error
 	reply         string
 	secondReply   string
+	thirdReply    string
 	allowRepeated bool
 }
 
@@ -128,6 +129,53 @@ func TestConversationRouteRepairsOneInvalidOutputWithSeparateMeteredCall(t *test
 					state, failureReason, attempts, settled, invalid, firstCallAttempt, lastCallAttempt, test.wantFinal, test.wantFailureReason, wantInvalid)
 			}
 		})
+	}
+}
+
+func TestConversationRouteFailureExplanationUsesSeparateMeteredPhase(t *testing.T) {
+	client := &routeModelClientTest{reply: "not json", secondReply: "still not json",
+		thirdReply: `{"action":"reply","acknowledge":false,"reply":"我没有启动这项工作，原消息已保留。请稍后重新发送。"}`}
+	store, gateway, _, claim, value := routeModelFixture(t, false, client)
+	ctx := context.Background()
+
+	first, err := gateway.ClassifyConversationRoute(ctx, claim, value)
+	if err != nil || !first.InvalidOutput || first.InvalidOutputCategory != "invalid_json" {
+		t.Fatalf("initial route decision = %+v err=%v", first, err)
+	}
+	requeued, err := store.RequeueConversationRouteAfterInvalidOutput(ctx, claim)
+	if err != nil || !requeued {
+		t.Fatalf("invalid route output was not requeued once: requeued=%t err=%v", requeued, err)
+	}
+	repairClaim, found, err := store.ClaimConversationRoute(ctx, "failure-explanation-test", time.Minute)
+	if err != nil || !found || repairClaim.Message.ID != claim.Message.ID || repairClaim.RouteAttempt == claim.RouteAttempt {
+		t.Fatalf("claim bounded repair route: claim=%+v found=%t err=%v", repairClaim, found, err)
+	}
+	repairValue, err := store.LoadConversationRouteSnapshot(ctx, repairClaim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	repairValue.Context.ModelID = value.ModelID
+	repairValue.Context.RouteAttempt = repairClaim.RouteAttempt
+	repairValue.Context.Repair = true
+	second, err := gateway.ClassifyConversationRoute(ctx, repairClaim, repairValue.Context)
+	if err != nil || !second.InvalidOutput || second.InvalidOutputCategory != "invalid_json" {
+		t.Fatalf("repair route decision = %+v err=%v", second, err)
+	}
+	diagnosis := app.ConversationRouteFailureDiagnosis{Code: "invalid_model_output", OutputCategory: second.InvalidOutputCategory}
+	repairValue.Context.FailureDiagnosis = &diagnosis
+	explanation, err := gateway.ClassifyConversationRoute(ctx, repairClaim, repairValue.Context)
+	if err != nil || explanation.InvalidOutput || explanation.Action != app.ConversationRouteReply {
+		t.Fatalf("DSH failure explanation decision = %+v err=%v", explanation, err)
+	}
+	var normalCalls, explanationCalls, allCalls int
+	if err := store.pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE phase='normal'),
+count(*) FILTER (WHERE phase='failure_explanation'),count(*) FROM conversation_route_model_calls WHERE message_id=$1`, claim.Message.ID).
+		Scan(&normalCalls, &explanationCalls, &allCalls); err != nil {
+		t.Fatal(err)
+	}
+	if client.calls.Load() != 3 || normalCalls != 2 || explanationCalls != 1 || allCalls != 3 {
+		t.Fatalf("route failure calls collided or were duplicated: provider=%d normal=%d explanation=%d total=%d",
+			client.calls.Load(), normalCalls, explanationCalls, allCalls)
 	}
 }
 
@@ -260,6 +308,11 @@ func TestConversationRouteModelPhaseUsesResultReviewRetryAttempt(t *testing.T) {
 	value.ResultReview.RetryAttempt = 2
 	if phase := conversationRouteModelPhase(value); phase != "result_review_2" {
 		t.Fatalf("retried result review phase = %q, want result_review_2", phase)
+	}
+	value = app.ConversationRouteContext{FailureDiagnosis: &app.ConversationRouteFailureDiagnosis{
+		Code: "invalid_model_output", OutputCategory: "action_fields_invalid"}}
+	if phase := conversationRouteModelPhase(value); phase != "failure_explanation" {
+		t.Fatalf("route failure explanation phase = %q, want failure_explanation", phase)
 	}
 }
 
@@ -508,6 +561,9 @@ func (c *routeModelClientTest) Complete(ctx context.Context, request app.ModelRe
 	reply := c.reply
 	if count > 1 && c.secondReply != "" {
 		reply = c.secondReply
+	}
+	if count > 2 && c.thirdReply != "" {
+		reply = c.thirdReply
 	}
 	if reply == "" {
 		reply = `{"action":"new","task_id":"","question":""}`

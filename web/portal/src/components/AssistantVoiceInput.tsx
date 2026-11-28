@@ -10,6 +10,7 @@ interface SpeechRecognitionLike {
   lang: string;
   continuous: boolean;
   interimResults: boolean;
+  processLocally?: boolean;
   onresult: ((event: SpeechResultEventLike) => void) | null;
   onerror: ((event: SpeechErrorEventLike) => void) | null;
   onstart: (() => void) | null;
@@ -19,7 +20,9 @@ interface SpeechRecognitionLike {
   abort(): void;
 }
 
-type SpeechRecognitionConstructor = new () => SpeechRecognitionLike;
+type SpeechRecognitionConstructor = (new () => SpeechRecognitionLike) & {
+  install?: (options: { langs: string[]; processLocally: true }) => Promise<boolean>;
+};
 
 type VoiceWaveformBridge = {
   voiceWaveformEnabled?: boolean;
@@ -61,6 +64,37 @@ function speechRecognitionConstructor(): SpeechRecognitionConstructor | undefine
   if (typeof window === 'undefined') return undefined;
   const supportedWindow = window as SpeechRecognitionWindow;
   return supportedWindow.SpeechRecognition ?? supportedWindow.webkitSpeechRecognition;
+}
+
+function installLocalSpeechLanguagePack(Constructor: SpeechRecognitionConstructor, language: string): Promise<boolean> | null {
+  if (!Constructor.install) return null;
+  try {
+    // Call in the button's click stack because browsers require transient user
+    // activation before they can download an on-device language pack.
+    return Constructor.install({ langs: [language], processLocally: true });
+  } catch {
+    return null;
+  }
+}
+
+async function configureLocalSpeechRecognition(
+  recognition: SpeechRecognitionLike,
+  installation: Promise<boolean> | null,
+): Promise<void> {
+  if (!installation) {
+    recognition.processLocally = false;
+    return;
+  }
+  try {
+    recognition.processLocally = await installation;
+  } catch {
+    // Keep the existing browser recognition path as a compatibility fallback.
+    recognition.processLocally = false;
+  }
+}
+
+function isSpeechRecognitionUnavailable(error: string | undefined): boolean {
+  return error !== 'no-speech' && error !== 'aborted';
 }
 
 function speechErrorMessage(error: string | undefined): string {
@@ -116,6 +150,7 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
   const waveformGenerationRef = useRef(0);
   const recognitionStartedRef = useRef(false);
   const [listening, setListening] = useState(false);
+  const [unavailable, setUnavailable] = useState(false);
   const [waveformLevel, setWaveformLevel] = useState(0);
   const [waveformVisible, setWaveformVisible] = useState(false);
   const [status, setStatus] = useState('');
@@ -213,7 +248,7 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
     })();
   };
 
-  const prepareVoiceRecording = (recognition: SpeechRecognitionLike, bridge: VoiceWaveformBridge) => {
+  const prepareVoiceRecording = (recognition: SpeechRecognitionLike, bridge: VoiceWaveformBridge, localSpeechInstallation: Promise<boolean> | null) => {
     if (!bridge.beginVoiceRecording || !bridge.endVoiceRecording) return false;
     waveformGenerationRef.current += 1;
     const capture: WaveformCapture = {
@@ -238,7 +273,10 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
     setStatus('正在准备麦克风…');
     void (async () => {
       try {
-        const token = await bridge.beginVoiceRecording!();
+        const [token] = await Promise.all([
+          bridge.beginVoiceRecording!(),
+          configureLocalSpeechRecognition(recognition, localSpeechInstallation),
+        ]);
         if (typeof token !== 'string' || token.length < 1) throw new Error('Invalid voice recording lease');
         capture.token = token;
         if (!isCurrent()) {
@@ -248,6 +286,7 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
         }
         recognition.start();
         recognitionStartedRef.current = true;
+        setUnavailable(false);
         // The browser may never emit SpeechRecognition's onstart event even
         // though start() returned. Start the opt-in local meter independently.
         if (bridge.voiceWaveformEnabled) startWaveform(recognition, capture);
@@ -262,7 +301,8 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
         recognitionStartedRef.current = false;
         stopWaveform(capture);
         setListening(false);
-        setStatus('无法启动语音输入，请检查麦克风权限后重试。');
+        setUnavailable(true);
+        setStatus('');
       }
     })();
     return true;
@@ -286,13 +326,16 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
 
     const Constructor = speechRecognitionConstructor();
     if (!Constructor) {
-      setStatus('当前浏览器不支持语音输入。');
+      setUnavailable(true);
+      setStatus('');
       return;
     }
 
+    setUnavailable(false);
     setStatus('');
     let activeRecognition: SpeechRecognitionLike | null = null;
     try {
+      const localSpeechInstallation = installLocalSpeechLanguagePack(Constructor, language);
       const recognition = new Constructor();
       activeRecognition = recognition;
       recognition.lang = language;
@@ -310,7 +353,10 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
       recognition.onerror = (event) => {
         if (recognitionRef.current !== recognition) return;
         const message = speechErrorMessage(event.error);
-        if (message) setStatus(message);
+        if (isSpeechRecognitionUnavailable(event.error)) {
+          setUnavailable(true);
+          setStatus('');
+        } else if (message) setStatus(message);
         stopWaveform();
         setListening(false);
         recognitionRef.current = null;
@@ -325,19 +371,38 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
       };
       recognitionRef.current = recognition;
       const bridge = localVoiceWaveformBridge();
-      if (bridge && prepareVoiceRecording(recognition, bridge)) return;
-      recognition.start();
-      if (recognitionRef.current === recognition) {
-        recognitionStartedRef.current = true;
+      if (bridge && prepareVoiceRecording(recognition, bridge, localSpeechInstallation)) return;
+      const startBrowserRecognition = () => {
+        if (recognitionRef.current !== recognition) return;
+        try {
+          recognition.start();
+          recognitionStartedRef.current = true;
+          setUnavailable(false);
+          setListening(true);
+          setStatus('正在聆听…');
+        } catch {
+          recognitionRef.current = null;
+          recognitionStartedRef.current = false;
+          setListening(false);
+          setUnavailable(true);
+          setStatus('');
+        }
+      };
+      if (localSpeechInstallation) {
         setListening(true);
-        setStatus('正在聆听…');
+        setStatus('正在准备语音识别…');
+        void configureLocalSpeechRecognition(recognition, localSpeechInstallation).then(startBrowserRecognition);
+      } else {
+        recognition.processLocally = false;
+        startBrowserRecognition();
       }
     } catch {
       if (activeRecognition && recognitionRef.current === activeRecognition) recognitionRef.current = null;
       recognitionStartedRef.current = false;
       stopWaveform();
       setListening(false);
-      setStatus('无法启动语音输入，请检查麦克风权限后重试。');
+      setUnavailable(true);
+      setStatus('');
     }
   };
 
@@ -357,11 +422,11 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
     <div className="assistant-voice-control" style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
       <button
         type="button"
-        className={`button button-secondary button-small${compact ? ' assistant-voice-button-compact' : ''}`}
-        aria-label={listening ? '停止语音输入' : '开始语音输入'}
+        className={`button button-secondary button-small${compact ? ' assistant-voice-button-compact' : ''}${unavailable ? ' is-unavailable' : ''}`}
+        aria-label={unavailable ? '语音输入不可用' : listening ? '停止语音输入' : '开始语音输入'}
         aria-describedby={disclosureID}
         aria-pressed={listening}
-        title="语音识别由浏览器提供，可能使用在线服务。"
+        title={unavailable ? undefined : '语音识别优先使用本机处理，可能回退到浏览器在线服务。'}
         disabled={disabled && !listening}
         onClick={toggleRecognition}
         style={compact ? undefined : { minWidth: 76, justifyContent: 'center' }}
@@ -378,7 +443,7 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
         {[0.38, 0.64, 0.9, 0.64, 0.38].map((weight, index) => <span key={index} style={{ display: 'block', width: 2, height: `${Math.max(2, waveformLevel * 16 * weight)}px`, borderRadius: 2, background: 'currentColor' }} />)}
       </span>}
       <span
-        className={`assistant-voice-status${compact && !status ? ' assistant-voice-status-idle' : ''}`}
+        className={`assistant-voice-status${(unavailable || (compact && !status)) ? ' assistant-voice-status-idle' : ''}`}
         aria-label="语音输入状态"
         aria-live="polite"
         aria-atomic="true"
@@ -388,7 +453,7 @@ export function AssistantVoiceInput({ onTranscript, disabled = false, language =
       >
         {status || '\u00a0'}
       </span>
-      <span id={disclosureID} className="sr-only">语音识别由浏览器提供，处理位置取决于浏览器和设置，可能使用在线服务。仅在点击按钮后开始。波形功能仅在本机启用时读取实时音量，不保存或上传麦克风采样。</span>
+      <span id={disclosureID} className="sr-only">语音识别优先使用浏览器本机处理；本机语言包不可用时可能回退到在线服务。仅在点击按钮后开始。波形功能仅在本机启用时读取实时音量，不保存或上传麦克风采样。</span>
     </div>
   );
 }

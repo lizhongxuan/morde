@@ -50,7 +50,8 @@ describe('resumable message upload', () => {
       if (sequence) return new Response(null, { status: 204 });
       return Response.json({});
     }));
-    const request = { client_message_id: 'message-1', content, model_id: 'p1', previous_client_message_id: 'previous' };
+    const request = { client_message_id: 'message-1', content, model_id: 'p1', previous_client_message_id: 'previous',
+      budget: { active_seconds: 1800, tool_calls: 100, model_tokens: 120000 } };
     expect(needsMessageUpload(content)).toBe(true);
     await expect(uploadMessage({ conversationID: 'c1' }, request, serviceID, 'u1', () => {})).rejects.toThrow('offline');
     expect(received.has(0)).toBe(true);
@@ -65,7 +66,8 @@ describe('resumable message upload', () => {
     const initialization = requests.find((item) => item.method === 'PUT' && item.path.endsWith('/message-1'))!;
     expect(initialization.headers.get('Idempotency-Key')).toBe('message-1');
     expect(initialization.body).toMatchObject({ total_bytes: bytes.length, total_chunks: Math.ceil(bytes.length / 16384),
-      model_id: 'p1', previous_client_message_id: 'previous', sha256: createHash('sha256').update(bytes).digest('hex') });
+      model_id: 'p1', previous_client_message_id: 'previous', budget: { active_seconds: 1800, tool_calls: 100, model_tokens: 120000 },
+      sha256: createHash('sha256').update(bytes).digest('hex') });
     expect(initialization.body).not.toHaveProperty('content');
     for (const item of requests.filter((candidate) => /\/chunks\/\d+$/.test(candidate.path))) {
       expect(item.body?.sha256).toBe(createHash('sha256').update(Buffer.from(String(item.body?.content_base64), 'base64')).digest('hex'));

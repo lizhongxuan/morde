@@ -415,6 +415,9 @@ func conversationRouteModelContentProjectionMatches(expected *app.ConversationRo
 }
 
 func conversationRouteModelPhase(value app.ConversationRouteContext) string {
+	if value.FailureDiagnosis != nil {
+		return "failure_explanation"
+	}
 	if value.ResultReview != nil && value.ResultReview.RetryAttempt > 0 {
 		return fmt.Sprintf("result_review_%d", value.ResultReview.RetryAttempt)
 	}

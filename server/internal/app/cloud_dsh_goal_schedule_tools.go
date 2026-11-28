@@ -510,7 +510,7 @@ func (b *CloudDSHToolBroker) executeScheduleServiceTool(ctx context.Context, cur
 			ToolCalls:     current.Budget.ToolCalls,
 			ModelTokens:   current.Budget.ModelTokens,
 		}
-		if err := budget.Validate(); err != nil {
+		if err := budget.ValidateSchedule(); err != nil {
 			return nil, "", domain.InvalidArgument("schedule.budget", "current task budget cannot be used for a schedule")
 		}
 		var title *string

@@ -104,19 +104,29 @@ type Budget struct {
 }
 
 const (
-	MaxActiveSeconds = 1800
-	MaxToolCalls     = 100
-	MaxModelTokens   = 50000
+	MaxActiveSeconds       = 1800
+	MaxToolCalls           = 100
+	DefaultModelTokens     = 50000
+	MaxModelTokens         = 1<<31 - 1
+	MaxScheduleModelTokens = 50000
 )
 
 func (b Budget) Validate() error {
+	return b.validate(MaxModelTokens)
+}
+
+func (b Budget) ValidateSchedule() error {
+	return b.validate(MaxScheduleModelTokens)
+}
+
+func (b Budget) validate(maxModelTokens int64) error {
 	if b.ActiveSeconds < 1 || b.ActiveSeconds > MaxActiveSeconds {
 		return errors.New("active seconds budget is out of range")
 	}
 	if b.ToolCalls < 1 || b.ToolCalls > MaxToolCalls {
 		return errors.New("tool calls budget is out of range")
 	}
-	if b.ModelTokens < 1 || b.ModelTokens > MaxModelTokens {
+	if b.ModelTokens < 1 || b.ModelTokens > maxModelTokens {
 		return errors.New("model tokens budget is out of range")
 	}
 	return nil

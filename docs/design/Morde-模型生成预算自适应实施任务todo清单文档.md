@@ -1,6 +1,8 @@
 # Morde 模型生成预算自适应实施任务 TODO
 
 **状态（2026-11-28）：预算候选 `663d9250` 已由 `0c906232` 纳入 `release`；B08 长回复请求类型缺陷已修复，并通过定向回归及真实 DeepSeek Gateway 长回复调用。新增真实 DSH Task + PostgreSQL + DeepSeek 整链验证：单次计划上限 16,384 token，provider 实际输出 3,983 token、3,224 个可见字符，settled ledger 与 provider usage 一致；证据及边界见第42节。此前 P0 smoke 8 pass/0 fail/2 预期例外、DSH runtime 302/302、Worker→PostgreSQL→fake HTTP 整链、PostgreSQL 容量恢复及 DSH 来源/校验和检查通过。预算审计记录提交 `84e055f1` 已包含于 `release`。截图所示 worktree 不是 `git worktree list` 中的登记路径；分支引用保留，相关预算改动已在 `release` 或有等价补丁，详见第35、40、42节。其他任务的 detached worktree 与工作区改动仍保留，未纳入预算提交。本轮只读核实测试 Portal 部署在 `338cb3ff`（比当前本地 `release@7c49560b` 落后 12 个提交），其 Portal 配置没有预算策略/费率项；实际 `morde-pc` 的长回复开关可切到长回复并恢复短答，但本轮未发送消息、未调用模型。测试机仍不满足 v4 离线备份、独立存储及安全升级前置条件。尚未部署，PC 真实长回复、刷新/重连、取消恢复与生产账单门禁未验收；B01–B09 生产/PC 门禁仍未完成，B10 尚未开始。**
+
+**后续实现记录（2026-11-28）：** Task 的 50,000 Token 默认值保留；新 Task 现在允许用户通过可选消息 `budget.model_tokens` 显式设置更高的累计输入+输出额度，历史值不迁移，Schedule 仍限制 50,000。对应本地实现、数据库升降级与 PC 控件验收见[精简实施 TODO](Morde-Task累计Token预算扩展实施TODO.md)。这不代表远程已部署，也不改变长回复或 B01–B10 门禁状态。
 评审依据：《Morde_个人Agent_模型预算与可靠交付实施方案.md》、固定提交的 Morde 源码，以及锁定版本 DSH 的本地包契约和离线实跑。保留原 B01–B10 编号；已实现 DSH opt-in IPC/Worker 协议探针、Task compaction prepare、假 HTTP 集成测试、模型输出能力元数据、阶段策略快照及 PostgreSQL 预算准备账本。Portal 可单独加载显式路由阶段策略，但不会因此启用 Task admission 或 shadow sampling；默认配置没有任何阶段预算值。第25–27节记录旧候选 smoke、00270 迁移失败与本地 schema 修复；第28节记录当前候选本地验证、冲突核查及测试机不可达状态。
 
 **方案复核决策（2026-11-27）：** 采纳方案的 P0–P4 门禁、等待/暂停语义、周期止损与试点质量验收；保留“未知能力不猜、短答不多一次模型往返、历史 Task/Schedule 合同不迁移、未知派发结果继续占用”的边界。B03 影子原型不再作为开始 B04 账本工作的硬依赖；预算策略与 `O_send` 计算仍须在 B04/P1 试点启用前通过影子核验。方案中的 `4,000` 仅是反例数值，拟议 API 字段不代表现有接口；均不写成默认额度或既有合同。

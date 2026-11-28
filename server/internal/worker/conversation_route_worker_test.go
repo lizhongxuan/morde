@@ -62,6 +62,24 @@ type routeAggregationWorkerStub struct {
 	beginErr   error
 }
 
+type routeFailureExplainerStub struct {
+	*routeWorkerStub
+	decision  app.ConversationRouteDecision
+	err       error
+	calls     int
+	diagnosis app.ConversationRouteFailureDiagnosis
+	input     app.ConversationRouteContext
+}
+
+func (s *routeFailureExplainerStub) ExplainConversationRouteFailure(_ context.Context, _ app.ConversationRouteClaim,
+	value app.ConversationRouteContext, diagnosis app.ConversationRouteFailureDiagnosis) (app.ConversationRouteDecision, error) {
+	s.calls++
+	s.diagnosis = diagnosis
+	value.FailureDiagnosis = &diagnosis
+	s.input = value
+	return s.decision, s.err
+}
+
 func (s *routeAggregationWorkerStub) BeginConversationRouteAggregation(context.Context, app.ConversationRouteClaim,
 	app.ConversationRouteSnapshot, app.ConversationRouteDecision) (bool, error) {
 	s.beginCalls++
@@ -356,7 +374,7 @@ func TestConversationRouteMetricsRecordAggregationWaitAndCorrection(t *testing.T
 	if got := gatheredWorkerCounter(t, routeWorker.metrics.aggregationStates.WithLabelValues("corrected")); got != 1 {
 		t.Fatalf("aggregation correction metric = %v, want 1", got)
 	}
-	var foundWait, foundReceiptAge, foundClassification bool
+	var foundWait, foundReceiptAge, foundClassification, foundFailureExplanation bool
 	for _, family := range mustGatherWorkerMetrics(t, registry) {
 		if len(family.GetMetric()) == 0 {
 			continue
@@ -369,11 +387,13 @@ func TestConversationRouteMetricsRecordAggregationWaitAndCorrection(t *testing.T
 			foundReceiptAge = histogram.GetSampleCount() == 1 && histogram.GetSampleSum() >= 4.9
 		case "cloudhost_conversation_route_classification_duration_seconds":
 			foundClassification = histogram.GetSampleCount() == 1 && histogram.GetSampleSum() >= 0
+		case "cloudhost_conversation_route_failure_explanation_duration_seconds":
+			foundFailureExplanation = histogram.GetSampleCount() == 0
 		}
 	}
-	if !foundWait || !foundReceiptAge || !foundClassification {
-		t.Fatalf("route latency histograms missing or invalid: aggregation=%t receipt_age=%t classification=%t",
-			foundWait, foundReceiptAge, foundClassification)
+	if !foundWait || !foundReceiptAge || !foundClassification || !foundFailureExplanation {
+		t.Fatalf("route latency histograms missing or invalid: aggregation=%t receipt_age=%t classification=%t failure_explanation=%t",
+			foundWait, foundReceiptAge, foundClassification, foundFailureExplanation)
 	}
 }
 
@@ -732,6 +752,42 @@ func TestConversationRouteWorkerRetriesInvalidOutputOnceThenFallsBack(t *testing
 		len(stub.failures) != 1 || stub.failures[0] != "routing_action_unavailable" || len(stub.applied) != 1 {
 		t.Fatalf("second invalid output did not become a retryable route failure: found=%t err=%v requeues=%d failures=%v applied=%+v",
 			found, err, stub.repairRequeues, stub.failures, stub.applied)
+	}
+}
+
+func TestConversationRouteWorkerUsesDSHForSafeFailureExplanation(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, InvalidOutput: true,
+		InvalidOutputLengthBytes: 198, InvalidOutputUTF8Valid: true, InvalidOutputCategory: "action_fields_invalid"}
+	stub.repairRequeues = 1
+	explainer := &routeFailureExplainerStub{routeWorkerStub: stub,
+		decision: app.ConversationRouteDecision{Action: app.ConversationRouteReply,
+			Reply: "我没能安全启动这项查询，原消息已保留，也没有开始搜索。请稍后重新发送，我再继续处理。"}}
+	worker.options.Models = explainer
+
+	found, err := worker.RunOnce(context.Background())
+	if err != nil || !found || explainer.calls != 1 || explainer.diagnosis.Code != "invalid_model_output" ||
+		explainer.diagnosis.OutputCategory != "action_fields_invalid" || explainer.input.FailureDiagnosis == nil ||
+		len(stub.failures) != 0 || len(stub.applied) != 1 || stub.applied[0].Action != app.ConversationRouteReply ||
+		stub.applied[0].TaskID != "" || stub.applied[0].ToolName != "" {
+		t.Fatalf("DSH failure explanation was not safely delivered: found=%t err=%v calls=%d diagnosis=%+v failures=%v applied=%+v",
+			found, err, explainer.calls, explainer.diagnosis, stub.failures, stub.applied)
+	}
+}
+
+func TestConversationRouteWorkerFallsBackWhenDSHFailureExplanationIsUnavailable(t *testing.T) {
+	worker, stub := newRouteWorkerTest(t)
+	stub.decision = app.ConversationRouteDecision{Action: app.ConversationRouteClarify, InvalidOutput: true,
+		InvalidOutputLengthBytes: 198, InvalidOutputUTF8Valid: true, InvalidOutputCategory: "action_fields_invalid"}
+	stub.repairRequeues = 1
+	explainer := &routeFailureExplainerStub{routeWorkerStub: stub, err: domain.NewError(domain.CodeInternal, "private provider detail")}
+	worker.options.Models = explainer
+
+	found, err := worker.RunOnce(context.Background())
+	if err != nil || !found || explainer.calls != 1 || len(stub.failures) != 1 ||
+		stub.failures[0] != "routing_action_unavailable" || len(stub.applied) != 0 {
+		t.Fatalf("unavailable DSH explanation did not retain safe failure state: found=%t err=%v calls=%d failures=%v applied=%+v",
+			found, err, explainer.calls, stub.failures, stub.applied)
 	}
 }
 

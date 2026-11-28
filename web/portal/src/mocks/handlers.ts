@@ -690,6 +690,7 @@ export function setMockWorkspaceSyncConflict(hostID: string, workspaceID: string
 resetMockState({ restoreAssistantState: true });
 
 const sessionCookieName = "ch_mock_session";
+const portalSessionCookieName = "ch_portal";
 
 function canAccessModel(user: User, model: ModelConnection): boolean {
   return model.shared || modelConnectionOwners.get(model.id) === user.id;
@@ -889,19 +890,24 @@ function onboardingStatusFor(user: User): components["schemas"]["OnboardingStatu
 
 function sessionUser(cookies: Record<string, string>): User | null {
   const sessionId = cookies[sessionCookieName];
-  let session = sessionId ? sessions.get(sessionId) : undefined;
-  if (!session && sessionId && typeof localStorage !== "undefined") {
-    try {
-      const stored = localStorage.getItem(`${sessionStoragePrefix}${sessionId}`);
-      if (stored) session = JSON.parse(stored) as { userId: string; name: string };
-    } catch {
-      session = undefined;
+  if (sessionId !== undefined) {
+    let session = sessionId ? sessions.get(sessionId) : undefined;
+    if (!session && sessionId && typeof localStorage !== "undefined") {
+      try {
+        const stored = localStorage.getItem(`${sessionStoragePrefix}${sessionId}`);
+        if (stored) session = JSON.parse(stored) as { userId: string; name: string };
+      } catch {
+        session = undefined;
+      }
     }
+    if (!session) return null;
+    const user = users.find((item) => item.id === session.userId) ?? (memberUser.id === session.userId ? memberUser : undefined);
+    if (!user || user.status !== "approved") return null;
+    return session.name === user.name ? user : { ...user, name: session.name };
   }
-  if (!session) return null;
-  const user = users.find((item) => item.id === session.userId) ?? (memberUser.id === session.userId ? memberUser : undefined);
-  if (!user || user.status !== "approved") return null;
-  return session.name === user.name ? user : { ...user, name: session.name };
+  if (import.meta.env.DEV && import.meta.env.VITE_MOCK_API === "1" &&
+    (cookies[portalSessionCookieName] || import.meta.env.VITE_K2_TASK_FIXTURE === "1")) return demoUser;
+  return null;
 }
 
 function projectMemberFor(projectID: string, userID: string) {

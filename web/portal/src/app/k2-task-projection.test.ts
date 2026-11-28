@@ -21,6 +21,17 @@ describe('readK2TaskProjection', () => {
     });
   });
 
+  it('includes a contiguous 12-step main-agent run followed by visible exceptional steps', () => {
+    const sample = createK2TaskFixture('u1234567', 'm1234567', '2026-11-24T00:00:00Z').tasks.find((task) => task.id === 'q0000005');
+    expect(sample).toBeDefined();
+    const steps = sample!.steps;
+    expect(steps).toHaveLength(15);
+    expect(steps.slice(0, 12).map((step) => step.status)).toEqual(Array(12).fill('succeeded'));
+    expect(steps.slice(0, 12).map((step) => step.sequence)).toEqual(Array.from({ length: 12 }, (_, index) => index + 1));
+    expect(new Set(steps.slice(0, 12).map((step) => `${step.agent_id}:${step.task_revision}`))).toEqual(new Set(['k2-main-agent-q0000005:1']));
+    expect(steps.slice(12).map((step) => step.status)).toEqual(['failed', 'waiting_user', 'unknown']);
+  });
+
   it('rejects partial or malformed K2 projections instead of silently treating them as final state', () => {
     expect(readK2TaskProjection({ dependencies: [] })).toEqual({ kind: 'invalid' });
     expect(readK2TaskProjection({ dependencies: null, child_jobs: [], result_review: null })).toEqual({ kind: 'invalid' });

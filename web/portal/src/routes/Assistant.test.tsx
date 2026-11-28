@@ -1996,6 +1996,7 @@ describe('Assistant durable tasks', () => {
     expect(acceptedMessageBody).not.toBeNull();
     expect(await within(acceptedMessageBody as HTMLElement).findByRole('status')).toHaveTextContent('已收到，正在等待处理');
     expect(accept.mock.calls[0]?.[1]).not.toHaveProperty('response_mode');
+    expect(accept.mock.calls[0]?.[1]).not.toHaveProperty('budget');
 
     await user.click(responseLength);
     expect(responseLength).toHaveAttribute('aria-pressed', 'true');
@@ -2003,6 +2004,25 @@ describe('Assistant durable tasks', () => {
     await user.click(screen.getByRole('button', { name: '发送' }));
     await waitFor(() => expect(accept).toHaveBeenCalledTimes(2));
     expect(accept.mock.calls[1]?.[1]).toMatchObject({ response_mode: 'long_form', content: '请完整说明实现方案' });
+    expect(accept.mock.calls[1]?.[1]).not.toHaveProperty('budget');
+  });
+
+  it('sends an explicitly selected cumulative Task token budget', async () => {
+    mockCommon({ conversations: [conversation] });
+    const accept = vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
+    const user = userEvent.setup();
+    renderPage();
+    const composer = await findReadyComposer();
+    await user.type(composer, '分析这个较大的项目');
+    await user.click(screen.getByText('Task 预算'));
+    const budget = screen.getByRole('spinbutton', { name: 'Task 累计模型 Token 上限' });
+    await user.clear(budget);
+    await user.type(budget, '120000');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(accept).toHaveBeenCalledOnce());
+    expect(accept.mock.calls[0]?.[1]).toMatchObject({
+      content: '分析这个较大的项目', budget: { active_seconds: 1800, tool_calls: 100, model_tokens: 120000 },
+    });
   });
 
   it('reuses the first creation request while two messages in a new side conversation send independently', async () => {
@@ -2456,7 +2476,7 @@ describe('Assistant durable tasks', () => {
 
     const voiceButton = await screen.findByRole('button', { name: '开始语音输入' });
     expect(voiceButton).toHaveAttribute('aria-pressed', 'false');
-    expect(voiceButton).toHaveAttribute('title', '语音识别由浏览器提供，可能使用在线服务。');
+    expect(voiceButton).toHaveAttribute('title', '语音识别优先使用本机处理，可能回退到浏览器在线服务。');
     expect(voiceButton).toBeEnabled();
   });
 

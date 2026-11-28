@@ -1021,7 +1021,7 @@ func validateScheduleTaskFields(value schedule.Schedule) error {
 		(value.HostID == "" && value.Observation != nil) {
 		return domain.InvalidArgument("schedule", "scheduled task fields are invalid")
 	}
-	if err := value.Budget.Validate(); err != nil {
+	if err := value.Budget.ValidateSchedule(); err != nil {
 		return domain.InvalidArgument("budget", err.Error())
 	}
 	return nil

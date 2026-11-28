@@ -5072,6 +5072,7 @@ private struct MordeProjectConversationMessage: Decodable, Identifiable {
     let role: String
     let content: String
     let task_id: String?
+    let message_kind: String?
     let delivery_status: String?
     let created_at: String
     let owner_id: String
@@ -5094,6 +5095,7 @@ private struct MordeProjectConversationMessage: Decodable, Identifiable {
 
     var clientMessage: MordeClientMessage {
         MordeClientMessage(id: id, conversation_id: conversation_id, sequence: sequence, task_id: task_id,
+            message_kind: message_kind,
             role: role, content: content, attachment_ids: attachment_ids, delivery_status: delivery_status,
             created_at: created_at, client_message_id: client_message_id, routing_status: routing_status,
             routing_failure_reason: routing_failure_reason, duplicate_of_message_id: duplicate_of_message_id,

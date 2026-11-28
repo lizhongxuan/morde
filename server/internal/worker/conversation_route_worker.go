@@ -330,6 +330,35 @@ func (w *ConversationRouteWorker) RunOnce(ctx context.Context) (bool, error) {
 			zap.String("invalid_output_category", decision.InvalidOutputCategory),
 			zap.Int("invalid_output_length_bytes", decision.InvalidOutputLengthBytes),
 			zap.Bool("invalid_output_utf8_valid", decision.InvalidOutputUTF8Valid))
+		if classifyContext.Repair && claim.Input.ResultReviewID == "" {
+			if explainer, ok := w.options.Models.(app.ConversationRouteFailureExplainer); ok {
+				diagnosis := app.ConversationRouteFailureDiagnosis{Code: "invalid_model_output",
+					OutputCategory: decision.InvalidOutputCategory}
+				if app.ValidConversationRouteFailureDiagnosis(diagnosis) {
+					started := time.Now()
+					explanation, explainErr := explainer.ExplainConversationRouteFailure(routeCtx, claim, classifyContext, diagnosis)
+					if w.metrics != nil {
+						w.metrics.failureExplanationTime.Observe(time.Since(started).Seconds())
+					}
+					if explainErr == nil && !explanation.InvalidOutput && explanation.Action == app.ConversationRouteReply &&
+						app.ValidConversationRouteReply(explanation.Reply) {
+						if err := w.options.Actions.ApplyConversationRoute(routeCtx, claim, snapshot, explanation); err != nil {
+							return true, err
+						}
+						w.observeRouteDecision(claim, explanation, "applied")
+						return true, nil
+					}
+					if explainErr != nil {
+						w.options.Logger.Warn("DSH route failure explanation was unavailable",
+							zap.String("job", "conversation_route"),
+							zap.String("failure_code", string(domain.CodeOf(explainErr))))
+					} else {
+						w.options.Logger.Warn("DSH route failure explanation did not produce a valid reply",
+							zap.String("job", "conversation_route"), zap.String("failure_code", "invalid_failure_explanation"))
+					}
+				}
+			}
+		}
 		return true, w.failRoute(ctx, claim, "routing_action_unavailable",
 			domain.NewError(domain.CodeInvalidArgument, "conversation route model output remained invalid after repair"))
 	}

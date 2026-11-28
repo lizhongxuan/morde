@@ -26,6 +26,8 @@ export function createK2TaskFixture(ownerID: string, modelID: string, timestamp:
       task_id: "q0000003", delivery_status: "applied", created_at: timestamp },
     { id: "m0000005", conversation_id: conversation.id, sequence: 5, role: "user", content: "任务 D：检查失败分支。",
       task_id: "q0000004", delivery_status: "applied", created_at: timestamp },
+    { id: "m0000007", conversation_id: conversation.id, sequence: 6, role: "user", content: "任务 E：展示连续工具活动，并保留失败、等待与未知状态。",
+      task_id: "q0000005", delivery_status: "applied", created_at: timestamp },
   ];
   const budget = { active_seconds: 600, tool_calls: 20, model_tokens: 4000 };
   const usage = { active_seconds: 12, tool_calls: 4, model_tokens: 720 };
@@ -40,6 +42,33 @@ export function createK2TaskFixture(ownerID: string, modelID: string, timestamp:
     steps: [], batch_items: [], artifacts: [], pending_request: null, clarification_request: null,
     stop_request: null, assistant_message: null, finished_at: finishedAt,
   });
+  const mainAgentID = "k2-main-agent-q0000005";
+  const activitySteps: Task["steps"] = [
+    ...Array.from({ length: 12 }, (_, index) => ({
+      id: `s${String(index + 6).padStart(7, "0")}`,
+      sequence: index + 1,
+      attempt: 1,
+      retryable: false,
+      kind: "tool" as const,
+      status: "succeeded" as const,
+      title: `Run cloud dsh MCP tool: morde_web_search (${index + 1})`,
+      summary: "The cloud dsh MCP tool completed and its result was saved.",
+      agent_id: mainAgentID,
+      task_revision: 1,
+      tool_name: "morde_web_search",
+      created_at: timestamp,
+    })),
+    { id: "s0000018", sequence: 13, attempt: 1, retryable: false, kind: "tool", status: "failed",
+      title: "Run cloud dsh MCP tool: morde_web_search (failed)", summary: "The source could not be verified.",
+      failure_reason: "tool_execution_failed", agent_id: mainAgentID, task_revision: 1,
+      tool_name: "morde_web_search", created_at: timestamp },
+    { id: "s0000019", sequence: 14, attempt: 1, retryable: false, kind: "tool", status: "waiting_user",
+      title: "Run cloud dsh MCP tool: morde_web_read (waiting for user)", summary: "A user choice is needed to continue.",
+      agent_id: mainAgentID, task_revision: 1, tool_name: "morde_web_read", created_at: timestamp },
+    { id: "s0000020", sequence: 15, attempt: 1, retryable: false, kind: "tool", status: "unknown",
+      title: "Run cloud dsh MCP tool: morde_web_read (unknown)", summary: "The operation outcome could not be confirmed.",
+      agent_id: mainAgentID, task_revision: 1, tool_name: "morde_web_read", created_at: timestamp },
+  ];
 
   const tasks: K2FixtureTask[] = [
     {
@@ -87,6 +116,16 @@ export function createK2TaskFixture(ownerID: string, modelID: string, timestamp:
       child_jobs: [{ job_id: "child-d-failed", task_step_id: "s0000005", title: "执行失败分支", task_revision: 1, status: "failed" }],
       result_review: { state: "failed", source_task_id: "q0000004", source_task_revision: 1,
         source_event_sequence: 4, reply_message_id: null, trigger_message_id: "m0000005" },
+    },
+    {
+      ...taskBase("q0000005", messages[5]!.content, "running", 15, 1, 1, null, 15, 12, null, null),
+      usage: { active_seconds: 45, tool_calls: 15, model_tokens: 1480 },
+      steps: activitySteps,
+      agents: [{ id: mainAgentID, parent_id: null, step_id: null, task_revision: 1, role: "main", status: "running",
+        observed_at: timestamp }],
+      dependencies: [],
+      child_jobs: [],
+      result_review: null,
     },
   ];
 

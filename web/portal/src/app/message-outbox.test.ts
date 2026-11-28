@@ -17,10 +17,10 @@ describe('outbox receipt request', () => {
   it('keeps the accepted message, target and attachment slot', () => {
     const original = entry({ client_message_id: 'message-001', content: '完整原文', reference_task_id: 'q1234567',
       model_id: 'p1234567', time_zone: 'Asia/Shanghai', workspace_id: 'w1234567', change_task_target: true,
-      client_attachment_ids: [attachment.id] });
+      client_attachment_ids: [attachment.id], budget: { active_seconds: 1800, tool_calls: 100, model_tokens: 120000 } });
     expect(outboxReceiptRequest(original)).toEqual({ client_message_id: 'message-001', content: '完整原文',
       reference_task_id: 'q1234567', model_id: 'p1234567', time_zone: 'Asia/Shanghai', workspace_id: 'w1234567', change_task_target: true,
-      client_attachment_ids: [attachment.id] });
+      client_attachment_ids: [attachment.id], budget: { active_seconds: 1800, tool_calls: 100, model_tokens: 120000 } });
     expect(original.attachments[0]?.blob).toBe(attachment.blob);
   });
 

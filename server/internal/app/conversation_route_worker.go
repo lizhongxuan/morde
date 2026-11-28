@@ -40,6 +40,13 @@ type ConversationRouteClassifier interface {
 	ClassifyConversationRoute(context.Context, ConversationRouteClaim, ConversationRouteContext) (ConversationRouteDecision, error)
 }
 
+// ConversationRouteFailureExplainer uses a separate no-tools DSH turn to
+// translate verified route failure facts into one user-facing reply.
+type ConversationRouteFailureExplainer interface {
+	ExplainConversationRouteFailure(context.Context, ConversationRouteClaim, ConversationRouteContext,
+		ConversationRouteFailureDiagnosis) (ConversationRouteDecision, error)
+}
+
 // ConversationRouteLongReplyGenerator creates one bounded no-tools reply for
 // an explicitly selected long-form message. It is separate from classification
 // so the user receives the requested answer without an extra model round trip.

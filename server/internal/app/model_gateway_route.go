@@ -510,7 +510,7 @@ func (s *ModelGatewayService) ClassifyConversationRoute(ctx context.Context, cla
 	if err != nil {
 		return ConversationRouteDecision{}, err
 	}
-	if useLegacyConversationRouteModelRequest(value) {
+	if value.FailureDiagnosis == nil && useLegacyConversationRouteModelRequest(value) {
 		request, err = legacyConversationRouteModelRequest(value, request)
 		if err != nil {
 			return ConversationRouteDecision{}, err

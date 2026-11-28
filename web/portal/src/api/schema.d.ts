@@ -9788,11 +9788,16 @@ export interface components {
         TaskBudgetRequest: {
             active_seconds: number;
             tool_calls: number;
+            /**
+             * Format: int64
+             * @description Cumulative input and output token ceiling for one Task. Omission keeps the 50000 default.
+             */
             model_tokens: number;
         };
         TaskBudget: {
             active_seconds: number;
             tool_calls: number;
+            /** Format: int64 */
             model_tokens: number;
         };
         TaskUsage: {

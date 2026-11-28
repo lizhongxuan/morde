@@ -3,18 +3,34 @@ package task
 import "testing"
 
 func TestBudgetValidate(t *testing.T) {
-	if err := (Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: 50000}).Validate(); err != nil {
+	if err := (Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: DefaultModelTokens}).Validate(); err != nil {
 		t.Fatal(err)
 	}
+	for _, modelTokens := range []int64{50001, MaxModelTokens} {
+		if err := (Budget{ActiveSeconds: 1800, ToolCalls: 100, ModelTokens: modelTokens}).Validate(); err != nil {
+			t.Errorf("valid Task model token budget %d rejected: %v", modelTokens, err)
+		}
+	}
 	for _, budget := range []Budget{
-		{ActiveSeconds: 1801, ToolCalls: 100, ModelTokens: 50000},
-		{ActiveSeconds: 1, ToolCalls: 101, ModelTokens: 50000},
-		{ActiveSeconds: 1, ToolCalls: 1, ModelTokens: 50001},
+		{ActiveSeconds: 1801, ToolCalls: 100, ModelTokens: DefaultModelTokens},
+		{ActiveSeconds: 1, ToolCalls: 101, ModelTokens: DefaultModelTokens},
+		{ActiveSeconds: 1, ToolCalls: 1, ModelTokens: MaxModelTokens + 1},
 		{ActiveSeconds: 0, ToolCalls: 1, ModelTokens: 1},
 	} {
 		if err := budget.Validate(); err == nil {
 			t.Errorf("budget %#v accepted", budget)
 		}
+	}
+}
+
+func TestScheduleBudgetRemainsLimitedTo50000(t *testing.T) {
+	for _, modelTokens := range []int64{1, 50000} {
+		if err := (Budget{ActiveSeconds: 1, ToolCalls: 1, ModelTokens: modelTokens}).ValidateSchedule(); err != nil {
+			t.Errorf("valid Schedule model token budget %d rejected: %v", modelTokens, err)
+		}
+	}
+	if err := (Budget{ActiveSeconds: 1, ToolCalls: 1, ModelTokens: 50001}).ValidateSchedule(); err == nil {
+		t.Fatal("Schedule model token budget above 50,000 was accepted")
 	}
 }
 

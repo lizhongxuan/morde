@@ -75,6 +75,26 @@ describe("local MCP connector mock routes", () => {
   });
 });
 
+describe("local Electron session mock", () => {
+  it("uses the portal cookie only in dev mock mode and never falls through an invalid mock cookie", async () => {
+    const requestWithCookie = (cookie?: string) => fetch(new URL("/api/me", globalThis.location.href), {
+      headers: cookie ? { cookie } : undefined,
+    });
+
+    vi.stubEnv("DEV", true);
+    vi.stubEnv("VITE_MOCK_API", "1");
+    expect((await requestWithCookie("ch_portal=local-fixture-session")).status).toBe(200);
+    expect((await requestWithCookie()).status).toBe(401);
+    expect((await requestWithCookie("ch_portal=local-fixture-session; ch_mock_session=invalid")).status).toBe(401);
+
+    vi.stubEnv("VITE_K2_TASK_FIXTURE", "1");
+    expect((await requestWithCookie()).status).toBe(200);
+
+    vi.stubEnv("DEV", false);
+    expect((await requestWithCookie("ch_portal=local-fixture-session")).status).toBe(401);
+  });
+});
+
 describe("portal personal-data mock reads", () => {
   it("serves an empty account snapshot, quota, changes, and metadata-only record page", async () => {
     expect((await api("/api/sync/snapshot")).status).toBe(401);

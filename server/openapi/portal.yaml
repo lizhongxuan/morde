@@ -13127,14 +13127,14 @@ components:
       properties:
         active_seconds: { type: integer, minimum: 1, maximum: 1800 }
         tool_calls: { type: integer, minimum: 1, maximum: 100 }
-        model_tokens: { type: integer, minimum: 1, maximum: 50000 }
+        model_tokens: { type: integer, format: int64, minimum: 1, maximum: 2147483647, description: Cumulative input and output token ceiling for one Task. Omission keeps the 50000 default. }
     TaskBudget:
       type: object
       required: [active_seconds, tool_calls, model_tokens]
       properties:
         active_seconds: { type: integer, minimum: 1 }
         tool_calls: { type: integer, minimum: 1 }
-        model_tokens: { type: integer, minimum: 1 }
+        model_tokens: { type: integer, format: int64, minimum: 1, maximum: 2147483647 }
     TaskUsage:
       type: object
       required: [active_seconds, tool_calls, model_tokens]

@@ -406,6 +406,16 @@ func (c *CloudDSHConversationCoordinator) ClassifyConversationRoute(ctx context.
 	}
 }
 
+func (c *CloudDSHConversationCoordinator) ExplainConversationRouteFailure(ctx context.Context,
+	claim app.ConversationRouteClaim, value app.ConversationRouteContext,
+	diagnosis app.ConversationRouteFailureDiagnosis) (app.ConversationRouteDecision, error) {
+	if !app.ValidConversationRouteFailureDiagnosis(diagnosis) {
+		return app.ConversationRouteDecision{}, domain.InvalidArgument("route_failure_diagnosis", "route failure diagnosis is invalid")
+	}
+	value.FailureDiagnosis = &diagnosis
+	return c.ClassifyConversationRoute(ctx, claim, value)
+}
+
 func isOwnerExecutionDisabled(err error) bool {
 	var domainErr *domain.Error
 	return errors.As(err, &domainErr) && domainErr.Code == domain.CodeConflict && domainErr.Details["state"] == "disabled"
@@ -421,6 +431,9 @@ func cloudDSHCoordinatorIdentity(claim app.ConversationRouteClaim, value app.Con
 		}
 	} else if claim.RouteAttempt > 0 {
 		seed += fmt.Sprintf("\nroute-attempt:%d", claim.RouteAttempt)
+	}
+	if value.FailureDiagnosis != nil {
+		seed += "\nroute-failure-explanation:" + value.FailureDiagnosis.Code + ":" + value.FailureDiagnosis.OutputCategory
 	}
 	digest := sha256.Sum256([]byte(seed))
 	hexDigest := hex.EncodeToString(digest[:])
