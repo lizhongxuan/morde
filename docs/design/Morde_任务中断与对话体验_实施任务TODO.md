@@ -65,6 +65,7 @@
 
 ## T07 · P0：合并和灰度门槛（进行中；发布验收未完成）
 
+- [x] 代码已合入并部署到 `release@e76e03ad`；对该 commit 完成 P0 smoke（5 pass、0 fail、5 exception），Portal 迁移 280、health/readiness 通过。已把服务器旧部署入口更新为仓库版本并保留备份。记录见本节末。
 - [ ] 实际 PC 验收仍待完成：错误分类、DSH 基于白名单事实生成的终态说明及原会话气泡尚未在新请求中观察。截图对应的历史终态回告已因会话凭据过期作废，不能由客户端重放；代码已部署到 `release@e76e03ad`，需在实际 `morde-pc` 新建请求验证。
 - [x] 自动化回归：`go test ./internal/api ./internal/app ./cmd/portal -count=1`；PostgreSQL `go test ./internal/store/postgres -run '^TestPostgresTaskModelRecovery' -count=1`；独立 Worker 进程重启 E2E `go test ./internal/worker -run '^TestCloudDSHModelRecoverySurvivesWorkerProcessRestart$' -count=1`；PC `Assistant.test.tsx` 既有回归、typecheck 与 DSH Runtime 恢复启动协议验证通过。具体执行环境与结果见 2026-11-28 续验记录。
 - [ ] 用打包 PC 完成端到端回归，保存目标 commit、任务/事件关联、三种页面状态与实际派发次数；全量 Worker 包仍未通过，2026-11-28 的具体失败见下方记录，修复/补齐对应测试环境后重跑。
