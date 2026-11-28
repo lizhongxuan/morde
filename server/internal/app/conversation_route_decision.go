@@ -366,10 +366,11 @@ func ProjectConversationRouteMessage(value *ConversationRouteContext, maxBytes i
 // ShortenConversationRouteMessage is the final bounded fallback after older
 // routing context has been trimmed to fit the model's minimum supported window.
 func ShortenConversationRouteMessage(value *ConversationRouteContext) bool {
-	if value == nil || len(value.Content) <= 1024 {
+	const minimumWindowPreviewBytes = 512
+	if value == nil || len(value.Content) <= minimumWindowPreviewBytes {
 		return false
 	}
-	return ProjectConversationRouteMessage(value, 1024)
+	return ProjectConversationRouteMessage(value, minimumWindowPreviewBytes)
 }
 
 // ConversationRouteTaskMessageObjective keeps large message bodies in the

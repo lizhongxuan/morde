@@ -252,8 +252,9 @@ WHERE ledger.owner_id=$1 AND ledger.source='task' AND ledger.call_id=$2`, owner.
 	if providerHTTPCalls.Load() != 0 {
 		t.Fatalf("provider received HTTP before or during process termination: calls=%d", providerHTTPCalls.Load())
 	}
-	if _, err := pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-interval '3 minutes'
-WHERE owner_id=$1 AND source='task' AND call_id=$2`, owner.ID, callRecord.LedgerCallID); err != nil {
+	staleAge := app.TaskModelCallTimeout + 3*time.Minute
+	if _, err := pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-$3::double precision*interval '1 second'
+WHERE owner_id=$1 AND source='task' AND call_id=$2`, owner.ID, callRecord.LedgerCallID, staleAge.Seconds()); err != nil {
 		t.Fatalf("age interrupted dispatch for the stale model-call recovery pass: %v", err)
 	}
 	marked, err := store.MarkStaleModelCallsUnknown(ctx)

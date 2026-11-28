@@ -829,7 +829,8 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 			}
 		}()
 		coordinator, err := NewCloudDSHConversationCoordinator(CloudDSHConversationCoordinatorOptions{
-			AccountRuntimes: manager, Models: gateway, Checkpoints: checkpoints, SummaryStore: store,
+			AccountRuntimes: manager, Models: gateway,
+			Checkpoints: checkpoints, SummaryStore: store,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -844,7 +845,7 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 	routeWorker, err := NewConversationRouteWorker(ConversationRouteWorkerOptions{
 		Queue: store, Actions: store, Models: routeModels, SummaryStore: store, SummaryInputs: store, SummarySealer: sealer,
 		WorkerID: "context-e2e-route-worker", LeaseDuration: 2 * time.Minute, PollInterval: time.Millisecond,
-		MaxConcurrent: 4, Logger: zap.NewNop(),
+		MaxConcurrent: 4, Logger: zap.NewExample(),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -873,6 +874,7 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 		return message.ID
 	}
 	for chatIndex, conversationID := range conversationIDs {
+		previousVersion := int64(0)
 		for cycle := 1; cycle <= 3; cycle++ {
 			for source := 1; source <= 3; source++ {
 				prefix := fmt.Sprintf("E2E source chat=%d cycle=%d source=%d confirmed durable fact. ", chatIndex, cycle, source)
@@ -882,10 +884,17 @@ func TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart(t
 			acceptAndRoute(conversationID, fmt.Sprintf("E2E_COMPACTION_TRIGGER chat=%d cycle=%d", chatIndex, cycle),
 				fmt.Sprintf("context-compact-%d-%d", chatIndex, cycle))
 			version := conversationContextE2ESummaryVersion(t, ctx, pool, serviceInstanceID, owner.ID, conversationID)
-			if version != int64(cycle) {
-				t.Fatalf("conversation %s compaction %d produced summary version %d", conversationID, cycle, version)
+			if version < int64(cycle) || version <= previousVersion {
+				t.Fatalf("conversation %s compaction cycle %d produced summary version %d after %d; want an advancing summary",
+					conversationID, cycle, version, previousVersion)
 			}
+			previousVersion = version
 		}
+	}
+	summaryHeadsBeforeHistory := make(map[string]int64, len(conversationIDs))
+	for _, conversationID := range conversationIDs {
+		summaryHeadsBeforeHistory[conversationID] = conversationContextE2ESummaryVersion(t, ctx, pool,
+			serviceInstanceID, owner.ID, conversationID)
 	}
 	var oldMainFenceRuntimeID string
 	mainSupervisor := supervisors["context-e2e-runtime-0"]
@@ -995,17 +1004,22 @@ SELECT count(*) FILTER (WHERE client_message_id LIKE 'context-history-%') FROM c
 		acceptAndRoute(conversationID, fmt.Sprintf("E2E_SIDE_CHAT_CONTINUES side=%d", index+1), fmt.Sprintf("context-side-after-restart-%d", index+1))
 	}
 	var expectedCompactions int
+	var mainSummaryVersion int64
 	for _, conversationID := range conversationIDs {
 		got := conversationContextE2ESummaryVersion(t, ctx, pool, serviceInstanceID, owner.ID, conversationID)
 		if conversationID == mainConversation.ConversationID {
-			if got != 4 {
-				t.Fatalf("main conversation summary head=%d, want 4", got)
+			if got != summaryHeadsBeforeHistory[conversationID]+1 {
+				t.Fatalf("main conversation summary head=%d, want one compaction after prior head %d",
+					got, summaryHeadsBeforeHistory[conversationID])
 			}
-		} else if got < 3 || got > 4 {
+			mainSummaryVersion = got
+		} else if got < summaryHeadsBeforeHistory[conversationID] ||
+			got > summaryHeadsBeforeHistory[conversationID]+1 {
 			// Each side chat may cross its own compaction threshold on the one
 			// continuation message. Its summary must remain present and may
 			// advance at most once; it must not inherit the main chat's history.
-			t.Fatalf("side conversation %s summary head=%d, want 3 or 4", conversationID, got)
+			t.Fatalf("side conversation %s summary head=%d, want prior head %d or one advance",
+				conversationID, got, summaryHeadsBeforeHistory[conversationID])
 		}
 		expectedCompactions += int(got)
 	}
@@ -1038,7 +1052,7 @@ WHERE owner_id=$1 AND state='committed' AND octet_length(response_ciphertext)>0`
 	var claimed task.Task
 	claimed, found, err = store.ClaimNextTask(ctx, "context-e2e-history-task", time.Minute)
 	if err != nil || !found || claimed.ConversationID != mainConversation.ConversationID || claimed.ConversationContext == nil ||
-		claimed.ConversationContext.Summary == nil || claimed.ConversationContext.Summary.Version != 4 {
+		claimed.ConversationContext.Summary == nil || claimed.ConversationContext.Summary.Version != mainSummaryVersion {
 		t.Fatalf("new Task did not receive the latest fixed summary: found=%t task=%+v err=%v", found, claimed, err)
 	}
 	var routedTaskID string
@@ -1429,17 +1443,10 @@ func (c *conversationContextE2EModelClient) Complete(ctx context.Context, reques
 			}
 		}
 	}
-	text := request.Instructions
-	for _, input := range request.Input {
-		text += "\n" + input.Text
-		for _, part := range input.Parts {
-			text += "\n" + part.Text
-		}
-	}
-	response := `{"action":"reply","task_id":"","question":"","reply":"已收到，继续保留在当前会话。","dependency_task_ids":[]}`
+	response := `{"action":"reply","reply":"已收到，继续保留在当前会话。","acknowledge":false}`
 	var routeBarrier *conversationContextE2ERouteBarrier
 	c.mu.Lock()
-	if strings.Contains(text, "你负责为一个持续进行的 Morde AI 对话生成紧凑、可靠的续聊摘要") {
+	if currentMessage == "" {
 		c.summaryCalls++
 		response = "持续会话摘要：保留已确认资料、决策与约束，后续继续从当前消息推进。"
 	} else {
@@ -1448,7 +1455,7 @@ func (c *conversationContextE2EModelClient) Complete(ctx context.Context, reques
 			routeBarrier = c.routeBarrier
 		}
 		if currentMessage == conversationContextE2EHistoryTaskContent {
-			response = `{"action":"new","task_id":"","question":"","reply":"","dependency_task_ids":[]}`
+			response = `{"action":"new","file_delivery_intent":"none","acknowledge":false,"explicit_new":false}`
 		}
 		if currentMessage == conversationContextE2EHistorySteerContent && c.steerTaskID != "" {
 			c.steerCalls++

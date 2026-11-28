@@ -42,7 +42,7 @@ type ConversationRouteCoordinatorOutputStore interface {
 
 var ErrRouteProjectReservationRequired = errors.New("route project reservation is required")
 
-const conversationRouteRuntimePromptReserveTokens = 1_200
+const conversationRouteRuntimePromptReserveTokens = 1_080
 
 // ConversationRouteInputFitsContextWindow uses the DSH TokenMeter's fixed
 // four UTF-16 characters-per-token estimate, with a CJK surcharge and room
