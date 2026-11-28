@@ -22,7 +22,10 @@ const (
 	TaskStepOutputCapturePageBytes       = runtimeclient.SupplementalOutputCapturePageBytes
 	TaskStepOutputCaptureMaxPages        = TaskStepOutputCaptureMaxBytes / TaskStepOutputCapturePageBytes
 	TaskStepOutputCaptureOwnerQuotaBytes = 64 << 20
+	TaskStepOutputCaptureCleanupBatch    = 1000
 )
+
+const TaskStepOutputCaptureCleanupInterval = time.Minute
 
 // TaskStepOutputCaptureIdentity binds supplemental output to the exact Task,
 // Workspace authorization snapshot, step, operation and original model CallID.
@@ -82,6 +85,8 @@ type TaskStepOutputCapturePage struct {
 	NextOffset  int                           `json:"next_offset"`
 	TotalBytes  int                           `json:"total_bytes"`
 	SourceBytes int                           `json:"source_bytes"`
+	EOF         bool                          `json:"eof"`
+	Complete    bool                          `json:"complete"`
 	Data        []byte                        `json:"data"`
 }
 
@@ -281,7 +286,7 @@ func (s *TaskService) GetStepOutputCapturePage(ctx context.Context, principal id
 	if !visible {
 		return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
 	}
-	workspaceAuthVersion := current.Authorization.Version
+	workspaceAuthVersion := int64(0)
 	if current.ProjectID != "" {
 		if s.projectAccess == nil {
 			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
@@ -291,6 +296,22 @@ func (s *TaskService) GetStepOutputCapturePage(ctx context.Context, principal id
 			if err != nil && domain.CodeOf(err) != domain.CodeForbidden && domain.CodeOf(err) != domain.CodeNotFound {
 				return TaskStepOutputCapturePage{}, err
 			}
+			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+		}
+		projectReader, ok := s.store.(interface {
+			GetProject(context.Context, string, string) (project.Project, error)
+		})
+		if !ok || current.WorkspaceProjectResourceVersion == nil || *current.WorkspaceProjectResourceVersion < 1 {
+			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+		}
+		projectValue, err := projectReader.GetProject(ctx, principal.UserID, current.ProjectID)
+		if err != nil {
+			if domain.CodeOf(err) != domain.CodeForbidden && domain.CodeOf(err) != domain.CodeNotFound {
+				return TaskStepOutputCapturePage{}, err
+			}
+			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+		}
+		if projectValue.ID != current.ProjectID || projectValue.Version != *current.WorkspaceProjectResourceVersion || projectValue.Version < 1 {
 			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
 		}
 		workspaceAuthVersion = member.Version
@@ -318,7 +339,7 @@ func (s *TaskService) GetStepOutputCapturePage(ctx context.Context, principal id
 			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeInvalidState, "supplemental output capture integrity check failed")
 		}
 		return TaskStepOutputCapturePage{Identity: identity, Stream: stream, Offset: 0, NextOffset: 0, TotalBytes: 0,
-			SourceBytes: record.SourceBytes, Data: []byte{}}, nil
+			SourceBytes: record.SourceBytes, EOF: true, Complete: true, Data: []byte{}}, nil
 	}
 	if record.Offset != offset || record.PlaintextBytes < 1 || record.PlaintextBytes > TaskStepOutputCapturePageBytes ||
 		offset > record.TotalBytes-record.PlaintextBytes || len(record.PageSHA256) != sha256.Size ||
@@ -337,7 +358,22 @@ func (s *TaskService) GetStepOutputCapturePage(ctx context.Context, principal id
 	}
 	return TaskStepOutputCapturePage{Identity: identity, Stream: stream, Offset: offset,
 		NextOffset: offset + len(plain), TotalBytes: record.TotalBytes, SourceBytes: record.SourceBytes,
-		Data: append([]byte(nil), plain...)}, nil
+		EOF: offset+len(plain) == record.TotalBytes, Complete: true, Data: append([]byte(nil), plain...)}, nil
+}
+
+// CleanupExpiredTaskStepOutputCaptures deletes encrypted capture receipts and
+// pages past their fixed retention window. The store owns the bounded batch.
+func (s *TaskService) CleanupExpiredTaskStepOutputCaptures(ctx context.Context, limit int32) (int32, error) {
+	if s == nil || ctx == nil || limit < 1 || limit > TaskStepOutputCaptureCleanupBatch {
+		return 0, domain.InvalidArgument("limit", "supplemental output cleanup limit is invalid")
+	}
+	cleaner, ok := s.store.(interface {
+		CleanupExpiredTaskStepOutputCaptures(context.Context, int32) (int32, error)
+	})
+	if !ok {
+		return 0, domain.NewError(domain.CodeUnsupported, "supplemental output cleanup storage is unavailable")
+	}
+	return cleaner.CleanupExpiredTaskStepOutputCaptures(ctx, limit)
 }
 
 func equalByteSlices(left, right []byte) bool {

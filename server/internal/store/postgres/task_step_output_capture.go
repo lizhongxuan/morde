@@ -11,6 +11,8 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/project"
+	"morde/server/internal/store/postgres/sqlcgen"
 )
 
 const taskStepOutputCaptureRetention = 24 * time.Hour
@@ -71,12 +73,13 @@ VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`, value.Identity.TaskID, value.Identity.StepID,
 }
 
 func verifyTaskStepOutputCaptureFence(ctx context.Context, tx pgx.Tx, identity app.TaskStepOutputCaptureIdentity) error {
-	var ownerID, taskWorkspaceID, taskWorkspaceOwnerID, projectID string
+	var ownerID, initiatorID, taskWorkspaceID, taskWorkspaceOwnerID, projectID string
 	var authVersion, workspaceAuthVersion, taskRevision, desiredRevision, checkpointRevision int64
 	var currentRevision, desired pgtype.Int8
 	var currentWorkspace pgtype.Text
 	var currentWorkspaceOwner pgtype.Text
 	var currentCheckpoint pgtype.Int8
+	var taskProjectResourceVersion, projectResourceVersion pgtype.Int8
 	var memberVersion pgtype.Int8
 	var memberRole pgtype.Text
 	var stepRevision pgtype.Int8
@@ -87,8 +90,8 @@ func verifyTaskStepOutputCaptureFence(ctx context.Context, tx pgx.Tx, identity a
 	var operationCheckpoint pgtype.Int8
 	var workspaceOwner, workspaceState pgtype.Text
 	var workspaceDeleted pgtype.Timestamptz
-	err := tx.QueryRow(ctx, `SELECT t.owner_id,t.auth_version,t.current_revision,t.desired_revision,t.workspace_id,
- t.workspace_owner_id,t.workspace_checkpoint_revision,COALESCE(t.project_id,''),
+	err := tx.QueryRow(ctx, `SELECT t.owner_id,t.initiator_id,t.auth_version,t.current_revision,t.desired_revision,t.workspace_id,
+	 t.workspace_owner_id,t.workspace_checkpoint_revision,COALESCE(t.project_id,''),t.workspace_project_resource_version,p.version,
  pm.version,pm.role,st.task_revision,st.tool_call_key,st.tool_name,st.phase,st.status,
  op.task_revision,op.call_id,op.tool_name,op.workspace_id,op.binding_version,op.workspace_checkpoint_revision,op.status,
  w.owner_id,w.state,w.deleted_at
@@ -97,9 +100,11 @@ JOIN task_steps st ON st.task_id=t.id AND st.id=$3
 JOIN task_operations op ON op.task_id=t.id AND op.id=$4
 LEFT JOIN project_members pm ON pm.project_id=t.project_id AND pm.user_id=t.initiator_id
   AND EXISTS (SELECT 1 FROM users u WHERE u.id=pm.user_id AND u.status='approved')
+LEFT JOIN projects p ON p.id=t.project_id
 LEFT JOIN workspaces w ON w.id=t.workspace_id
 WHERE t.id=$1`, identity.TaskID, identity.OwnerID, identity.StepID, identity.OperationID).Scan(
-		&ownerID, &authVersion, &currentRevision, &desired, &currentWorkspace, &currentWorkspaceOwner, &currentCheckpoint, &projectID,
+		&ownerID, &initiatorID, &authVersion, &currentRevision, &desired, &currentWorkspace, &currentWorkspaceOwner, &currentCheckpoint, &projectID,
+		&taskProjectResourceVersion, &projectResourceVersion,
 		&memberVersion, &memberRole, &stepRevision, &stepCallID, &stepToolName, &stepPhase, &stepStatus,
 		&operationRevision, &operationCallID, &operationToolName, &operationWorkspaceID, &operationBindingVersion, &operationCheckpoint, &operationStatus,
 		&workspaceOwner, &workspaceState, &workspaceDeleted)
@@ -124,9 +129,10 @@ WHERE t.id=$1`, identity.TaskID, identity.OwnerID, identity.StepID, identity.Ope
 	if currentCheckpoint.Valid {
 		checkpointRevision = currentCheckpoint.Int64
 	}
-	workspaceAuthVersion = authVersion
+	workspaceAuthVersion = 0
 	if projectID != "" {
-		if !memberVersion.Valid || !memberRole.Valid || (memberRole.String != "owner" && memberRole.String != "member") {
+		if !memberVersion.Valid || !memberRole.Valid || (memberRole.String != "owner" && memberRole.String != "member") ||
+			!taskProjectResourceVersion.Valid || !projectResourceVersion.Valid || taskProjectResourceVersion.Int64 != projectResourceVersion.Int64 {
 			return domain.NewError(domain.CodeInvalidState, "supplemental output capture authorization changed")
 		}
 		workspaceAuthVersion = memberVersion.Int64
@@ -143,6 +149,15 @@ WHERE t.id=$1`, identity.TaskID, identity.OwnerID, identity.StepID, identity.Ope
 		!operationStatus.Valid || operationStatus.String != "succeeded" && operationStatus.String != "failed" ||
 		!workspaceOwner.Valid || workspaceOwner.String != taskWorkspaceOwnerID || !workspaceState.Valid || workspaceState.String != "ready" || workspaceDeleted.Valid {
 		return domain.NewError(domain.CodeInvalidState, "supplemental output capture fence changed")
+	}
+	if projectID != "" {
+		owner, version, err := lockProjectTaskWorkspaceAccess(ctx, tx, projectID, initiatorID, identity.WorkspaceID, false)
+		if err != nil || owner != taskWorkspaceOwnerID || version != taskProjectResourceVersion.Int64 {
+			return domain.NewError(domain.CodeInvalidState, "supplemental output capture authorization changed")
+		}
+		if err := verifyProjectTaskWorkspaceGrant(ctx, tx, identity.TaskID, projectID, initiatorID, owner, identity.WorkspaceID); err != nil {
+			return domain.NewError(domain.CodeInvalidState, "supplemental output capture authorization changed")
+		}
 	}
 	return nil
 }
@@ -163,21 +178,31 @@ func (s *Store) GetTaskStepOutputCapturePage(ctx context.Context, actorID, taskI
 		return app.TaskStepOutputCapturePageRecord{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
 	}
 	var result app.TaskStepOutputCapturePageRecord
-	err := s.withTaskSnapshot(ctx, func(tx pgx.Tx) error {
+	err := withTx(ctx, s.pool.Begin, func(tx pgx.Tx) error {
 		ownerID, err := taskOwnerIDForActor(ctx, tx, taskID, actorID, false, false)
 		if err != nil {
 			return err
 		}
+		if _, err := tx.Exec(ctx, `SELECT id FROM tasks WHERE id=$1 AND owner_id=$2 FOR SHARE`, taskID, ownerID); err != nil {
+			return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+		}
 		var pageIndex, pageOffset, pageBytes pgtype.Int4
 		var pageDigest, ciphertext []byte
 		var expiresAt time.Time
+		var stepRevision, operationRevision, operationBinding, operationCheckpoint pgtype.Int8
+		var stepCallID, stepToolName, stepPhase, stepStatus pgtype.Text
+		var operationCallID, operationToolName, operationWorkspace, operationStatus pgtype.Text
 		query := `SELECT c.owner_id,c.task_id,c.authorization_version,c.task_revision,c.workspace_id,c.workspace_authorization_version,
  c.workspace_binding_version,c.workspace_view_id,c.workspace_checkpoint_revision,c.step_id,c.call_id,c.operation_id,
  CASE WHEN $4='stdout' THEN c.stdout_source_bytes ELSE c.stderr_source_bytes END,
  CASE WHEN $4='stdout' THEN c.stdout_total_bytes ELSE c.stderr_total_bytes END,
  CASE WHEN $4='stdout' THEN c.stdout_sha256 ELSE c.stderr_sha256 END,
- p.page_index,p.page_offset,p.plaintext_bytes,p.page_sha256,p.payload_ciphertext,c.expires_at
+ p.page_index,p.page_offset,p.plaintext_bytes,p.page_sha256,p.payload_ciphertext,c.expires_at,
+ st.task_revision,st.tool_call_key,st.tool_name,st.phase,st.status,
+ op.task_revision,op.call_id,op.tool_name,op.workspace_id,op.binding_version,op.workspace_checkpoint_revision,op.status
 FROM task_step_output_captures c
+JOIN task_steps st ON st.task_id=c.task_id AND st.id=c.step_id
+JOIN task_operations op ON op.task_id=c.task_id AND op.id=c.operation_id
 LEFT JOIN task_step_output_capture_pages p ON p.task_id=c.task_id AND p.step_id=c.step_id AND p.stream=$4 AND p.page_offset=$5
 WHERE c.task_id=$1 AND c.owner_id=$2 AND c.step_id=$3 AND c.state='complete' AND c.expires_at>clock_timestamp()
  AND (($4='stdout' AND c.stdout_total_bytes=0 AND $5=0 AND p.page_offset IS NULL) OR
@@ -187,12 +212,30 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.step_id=$3 AND c.state='complete' AND
 			&result.Identity.WorkspaceID, &result.Identity.WorkspaceAuthorizationVersion, &result.Identity.WorkspaceBindingVersion,
 			&result.Identity.WorkspaceViewID, &result.Identity.WorkspaceCheckpointRevision, &result.Identity.StepID,
 			&result.Identity.CallID, &result.Identity.OperationID, &result.SourceBytes, &result.TotalBytes, &result.StreamSHA256,
-			&pageIndex, &pageOffset, &pageBytes, &pageDigest, &ciphertext, &expiresAt)
+			&pageIndex, &pageOffset, &pageBytes, &pageDigest, &ciphertext, &expiresAt,
+			&stepRevision, &stepCallID, &stepToolName, &stepPhase, &stepStatus,
+			&operationRevision, &operationCallID, &operationToolName, &operationWorkspace, &operationBinding, &operationCheckpoint, &operationStatus)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
 		}
 		if err != nil {
 			return fmt.Errorf("read supplemental output page: %w", err)
+		}
+		if err := verifyTaskStepOutputCaptureReadAccess(ctx, tx, actorID, ownerID, result.Identity); err != nil {
+			if domain.CodeOf(err) == domain.CodeForbidden || domain.CodeOf(err) == domain.CodeNotFound || domain.CodeOf(err) == domain.CodeInvalidState {
+				return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+			}
+			return err
+		}
+		if stepRevision.Int64 != result.Identity.TaskRevision || !stepCallID.Valid || stepCallID.String != result.Identity.CallID ||
+			!stepToolName.Valid || stepToolName.String != "shell_exec" || !stepPhase.Valid || stepPhase.String != "execute" ||
+			!stepStatus.Valid || stepStatus.String != "succeeded" && stepStatus.String != "failed" ||
+			!operationRevision.Valid || operationRevision.Int64 != result.Identity.TaskRevision || !operationCallID.Valid || operationCallID.String != result.Identity.CallID ||
+			!operationToolName.Valid || operationToolName.String != "shell_exec" || !operationWorkspace.Valid || operationWorkspace.String != result.Identity.WorkspaceID ||
+			!operationBinding.Valid || operationBinding.Int64 != result.Identity.WorkspaceBindingVersion ||
+			!operationCheckpoint.Valid || operationCheckpoint.Int64 != result.Identity.WorkspaceCheckpointRevision ||
+			!operationStatus.Valid || operationStatus.String != "succeeded" && operationStatus.String != "failed" {
+			return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
 		}
 		result.Stream, result.ExpiresAt = stream, expiresAt.UTC()
 		if pageOffset.Valid {
@@ -202,6 +245,53 @@ WHERE c.task_id=$1 AND c.owner_id=$2 AND c.step_id=$3 AND c.state='complete' AND
 		return nil
 	})
 	return result, err
+}
+
+func verifyTaskStepOutputCaptureReadAccess(ctx context.Context, tx pgx.Tx, actorID, ownerID string,
+	identity app.TaskStepOutputCaptureIdentity) error {
+	row, err := sqlcgen.New(tx).GetTask(ctx, sqlcgen.GetTaskParams{ID: identity.TaskID, OwnerID: ownerID})
+	if err != nil {
+		return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+	}
+	current := rowTaskDomain(row)
+	if current.ID != identity.TaskID || current.OwnerID != identity.OwnerID || current.Authorization.Version != identity.AuthorizationVersion ||
+		current.CurrentRevision == nil || current.DesiredRevision == nil || *current.CurrentRevision != identity.TaskRevision ||
+		*current.DesiredRevision != identity.TaskRevision || current.WorkspaceID != identity.WorkspaceID ||
+		current.WorkspaceCheckpointRevision == nil || *current.WorkspaceCheckpointRevision != identity.WorkspaceCheckpointRevision {
+		return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+	}
+	if current.ProjectID != "" {
+		if current.WorkspaceProjectResourceVersion == nil {
+			return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+		}
+		workspaceOwner, resourceVersion, err := lockProjectTaskWorkspaceAccess(ctx, tx, current.ProjectID, actorID, current.WorkspaceID, false)
+		if err != nil || workspaceOwner != current.WorkspaceOwnerID || resourceVersion != *current.WorkspaceProjectResourceVersion {
+			return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+		}
+		if err := verifyProjectTaskWorkspaceGrant(ctx, tx, current.ID, current.ProjectID, current.InitiatorID,
+			current.WorkspaceOwnerID, current.WorkspaceID); err != nil {
+			return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+		}
+		var memberVersion int64
+		var role string
+		if err := tx.QueryRow(ctx, `SELECT pm.version,pm.role FROM project_members pm JOIN users u ON u.id=pm.user_id
+WHERE pm.project_id=$1 AND pm.user_id=$2 AND u.status='approved'`, current.ProjectID, actorID).Scan(&memberVersion, &role); err != nil ||
+			memberVersion != identity.WorkspaceAuthorizationVersion || role != string(project.RoleMember) && role != string(project.RoleOwner) {
+			return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+		}
+		return nil
+	}
+	if identity.WorkspaceAuthorizationVersion != 0 || current.WorkspaceProjectResourceVersion != nil {
+		return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+	}
+	var workspaceOwner, workspaceState string
+	var deletedAt pgtype.Timestamptz
+	if err := tx.QueryRow(ctx, `SELECT owner_id,state,deleted_at FROM workspaces WHERE id=$1`, current.WorkspaceID).
+		Scan(&workspaceOwner, &workspaceState, &deletedAt); err != nil || workspaceOwner != current.WorkspaceOwnerID ||
+		workspaceState != "ready" || deletedAt.Valid {
+		return domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+	}
+	return nil
 }
 
 // CleanupExpiredTaskStepOutputCaptures permanently deletes expired encrypted

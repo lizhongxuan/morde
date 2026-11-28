@@ -2367,6 +2367,26 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/notifications/incremental": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Read the durable notification update stream
+         * @description Portal sessions and native client credentials may consume owner-scoped notifications in per-account commit order. The first request omits cursor and returns an empty page with a baseline cursor, so earlier notices are not backfilled. Later requests pass the returned cursor; each response returns a renewed cursor. The bounded scan advances across notices that are no longer authorized, so filtered project notices do not stall continuation. Cursors are opaque and account-scoped, expire after 30 days, and return event_cursor_expired; reconcile through the existing notification list, then retry without cursor to establish a new baseline.
+         */
+        get: operations["listNotificationUpdates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/notifications/{id}/read": {
         parameters: {
             query?: never;
@@ -4016,6 +4036,33 @@ export interface paths {
         };
         /** Get safe details for one task step */
         get: operations["getTaskStepDetail"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/tasks/{id}/steps/{step_id}/output": {
+        parameters: {
+            query: {
+                stream: "stdout" | "stderr";
+                /** @description Byte offset in the complete redacted UTF-8 stream. Omitted means zero; subsequent requests use next_offset. */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                step_id: components["schemas"]["StepId"];
+            };
+            cookie?: never;
+        };
+        /**
+         * Read one page of complete, redacted Shell output
+         * @description Returns a page only when the complete Runtime stream reached EOF and its encrypted receipt and pages were durably stored. The response contains the reconstructed full stdout or stderr stream, including the legacy prefix; clients replace the short step summary instead of appending this data. Missing, incomplete, failed, expired, or unauthorized output is hidden as not found. Responses are never shared-cacheable.
+         */
+        get: operations["getTaskStepOutputPage"];
         put?: never;
         post?: never;
         delete?: never;
@@ -10142,6 +10189,27 @@ export interface components {
             /** @description Server-derived source locations from successful tool reads. Workspace paths are returned only to readers authorized for the Task Workspace. These locations are not yet a claim-to-source correctness verdict. */
             source_locations?: components["schemas"]["TaskStepSourceLocation"][];
         };
+        TaskStepOutputCapturePage: {
+            /** @enum {string} */
+            stream: "stdout" | "stderr";
+            /** @description Byte offset into the complete redacted UTF-8 stream. */
+            offset: number;
+            /** @description Byte offset to use for the next page; equals total_bytes at EOF. */
+            next_offset: number;
+            /** @description Total bytes in the complete redacted UTF-8 stream. */
+            total_bytes: number;
+            /** @description Total source bytes before redaction for this stream; not a truncation indicator. */
+            source_bytes: number;
+            /** @description Redacted UTF-8 text page. Never base64 and never raw source output. */
+            data: string;
+            /** @description True when this page reaches the end of the stream. */
+            eof: boolean;
+            /**
+             * @description True only when Runtime source EOF and the durable encrypted receipt were both confirmed. Incomplete or unavailable captures return not found.
+             * @constant
+             */
+            complete: true;
+        };
         TaskStepSourceLocation: {
             /** @description Stable server-derived identity bound to Task owner, Task, step, revision, tool call, and this source locator. */
             id: string;
@@ -10794,6 +10862,19 @@ export interface components {
         NotificationPage: {
             items: components["schemas"]["Notification"][];
             next_cursor: string | null;
+        };
+        NotificationUpdates: {
+            items: components["schemas"]["NotificationUpdateItem"][];
+            /** @description Renewed opaque owner-scoped continuation cursor. */
+            cursor: string;
+            /** @description True when at least one additional sequenced notice remains after this bounded page; immediately continue with cursor to drain remaining updates. */
+            has_more: boolean;
+        };
+        /** @description Minimal notification identity for native clients to deduplicate and select event kinds. Notification text and associated Task, project, or source identifiers are omitted. */
+        NotificationUpdateItem: {
+            id: components["schemas"]["NotificationId"];
+            /** @enum {string} */
+            kind: "completed" | "failed" | "waiting_user" | "goal_step_blocked" | "goal_completed" | "project_work_item_blocked" | "project_work_item_delivered";
         };
         HostResourcesTarget: {
             cpu_milli: number;
@@ -15585,6 +15666,34 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    listNotificationUpdates: {
+        parameters: {
+            query?: {
+                limit?: components["parameters"]["PageLimit"];
+                /** @description Opaque account-scoped continuation cursor. Omit to establish a no-backfill baseline. */
+                cursor?: string;
+            };
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Bounded page of currently authorized notification identifiers and kinds in durable commit order; an empty items list may still advance the cursor over inaccessible notices. Notification text and resource identifiers are omitted. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NotificationUpdates"];
+                };
+            };
+            401: components["responses"]["Unauthorized"];
+            /** @description The continuation cursor expired; reconcile through the existing notification list */
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     markNotificationRead: {
         parameters: {
             query?: never;
@@ -18654,6 +18763,38 @@ export interface operations {
                     "application/json": components["schemas"]["TaskStepDetail"];
                 };
             };
+            404: components["responses"]["NotFound"];
+            default: components["responses"]["Error"];
+        };
+    };
+    getTaskStepOutputPage: {
+        parameters: {
+            query: {
+                stream: "stdout" | "stderr";
+                /** @description Byte offset in the complete redacted UTF-8 stream. Omitted means zero; subsequent requests use next_offset. */
+                offset?: number;
+            };
+            header?: never;
+            path: {
+                id: components["schemas"]["TaskId"];
+                step_id: components["schemas"]["StepId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description One UTF-8 page from a complete encrypted-at-rest output receipt; at most 16 KiB before JSON encoding. */
+            200: {
+                headers: {
+                    "Cache-Control"?: "no-store";
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TaskStepOutputCapturePage"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
             404: components["responses"]["NotFound"];
             default: components["responses"]["Error"];
         };

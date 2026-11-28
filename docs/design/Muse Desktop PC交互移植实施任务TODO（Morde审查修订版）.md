@@ -2,7 +2,7 @@
 
 配套：[修订后的设计方案](<Muse Desktop PC交互移植设计方案（Morde审查修订版）.md>)。审查基线 `release@936389c`；开工时确认目标提交。保留原 M01–M12 编号方便对照，但改变发布顺序。E1–E4 是方案验证，不是打包 PC 验收。不把之前的中断修复或模型预算修复塞进此轮。
 
-**本轮开工记录：**当前检出基线提交 `8c87122f`，与文档审查基线不同；候选改动尚在未提交工作树中。后续验收以当前代码为基线，不将旧基线的 E1–E4 视为本轮实测。
+**本轮开工记录：**开工时检出基线为 `8c87122f`，与文档审查基线不同；不将旧基线的 E1–E4 视为本轮实测。2026-11-28 本轮功能提交 `7acb032c` 已在 `release`；本地 `release` 随后合入预算分支，HEAD 为 `0c906232`，当前比 `origin/release` 超前 2 个提交。后续 M02/M03/M06 工作继续基于 `release`，最终推送前会核对完整差异和验收结果。
 
 | 建议 PR | 本次交付 | 强前置 |
 |---|---|---|
@@ -20,7 +20,7 @@
 ## PR B · 追问沿用 Morde；语音先修正确性
 
 - [x] **M05 待答与答复合同。** `task_pending.go`、Task domain/API/OpenAPI：增加可选结构化题组、稳定 ID/版本、单选/多选选择、自由文本、明确 skip、答复幂等；服务端保留单题和原请求授权。保持旧 `/api/tasks/{id}/inputs`；结构化答复使用 v2 接口，旧客户端不能以自由文本误答题组。**验收：**DB/API 覆盖重复、过期、跨账号拒绝；必答 skip、路由/审批/文件交付/批任务题组均拒绝，不改变授权。**验证：**`go test ./internal/domain/task ./internal/app ./internal/api` 通过；PostgreSQL 16 临时容器中，隔离 worktree 应用 M05 补丁后 `TestPostgresStructuredClarificationIsVersionBoundIdempotentAndIsolated` 通过。主工作区未提交的 migration 00270 改动有 SQL 语法错误，故 PostgreSQL 验收在隔离基线执行。
-- [ ] **代码完成，主要恢复闭环已验、矩阵待补 · M06 DSH 原调用恢复。** `cloud_dsh_tool_broker.go`、`engine.mjs`：使用当前 Morde 贯通结构化输入，将同轮独占、子 Agent 禁提问和锁定工具定义覆盖到扩展入口；不引入第二套待答状态。上游实包只作 E6 参考，暂不改包和锁文件；若另做插件试验，单列 PR 与 go/no-go。**验收：**真实 Broker + DSH + 临时 PostgreSQL 测试等待期间重启 Worker、单任务取消、并发两个 Task、答复版本冲突和旧 checkpoint；原 call ID 的结果只交付一次，同一 Task 不因新用户消息重新创建。插件试验失败不阻塞 M05/M07。**验证：**Runtime `node --test --test-concurrency=1 test/runtime.test.mjs` 235/235；`go test ./internal/app` 通过。新建真实 `TaskWorker + DSH + CloudDSHToolBroker + PostgreSQL 16` 测试 `TestCloudDSHStructuredClarificationResumesAfterWorkerRestart` 首次 1/1、稳定性复跑 `-count=3` 3/3 通过；验证了旧版本答复冲突不改变 pending、结构化答复持久并重排队、Worker 重启后恢复同一 DSH session、原 `ask_user` CallID 执行后只 reconcile 一次，且 assistant message 与 `task.result` 各一条。发现并修复 PostgreSQL 创建澄清行时遗漏 `answer_format` 的缺陷。完整 Worker 套件结果及单任务取消、两个 Task 并发隔离、旧 checkpoint 兼容仍待验证。
+- [ ] **代码完成，主要恢复闭环已验、矩阵待补 · M06 DSH 原调用恢复。** `cloud_dsh_tool_broker.go`、`engine.mjs`：使用当前 Morde 贯通结构化输入，将同轮独占、子 Agent 禁提问和锁定工具定义覆盖到扩展入口；不引入第二套待答状态。上游实包只作 E6 参考，暂不改包和锁文件；若另做插件试验，单列 PR 与 go/no-go。**验收：**真实 Broker + DSH + 临时 PostgreSQL 测试等待期间重启 Worker、单任务取消、并发两个 Task、答复版本冲突和旧 checkpoint；原 call ID 的结果只交付一次，同一 Task 不因新用户消息重新创建。插件试验失败不阻塞 M05/M07。**验证：**Runtime `node --test --test-concurrency=1 test/runtime.test.mjs` 235/235；`go test ./internal/app` 通过。真实 `TaskWorker + DSH + CloudDSHToolBroker + PostgreSQL 16` 测试 `TestCloudDSHStructuredClarificationResumesAfterWorkerRestart` 首次 1/1、稳定性复跑 `-count=3` 3/3 通过；验证了旧版本答复冲突不改变 pending、结构化答复持久并重排队、Worker 重启后恢复同一 DSH session、原 `ask_user` CallID 执行后只 reconcile 一次，且 assistant message 与 `task.result` 各一条。发现并修复 PostgreSQL 创建澄清行时遗漏 `answer_format` 的缺陷。额外全量 `go test ./internal/worker -count=1` 曾退出 1，执行约 332 秒但输出诊断未保留，不能视为通过；另一条未归属的 `go test -json ./internal/worker -count=1` 仍在执行。单任务取消、两个 Task 并发隔离、旧 checkpoint 兼容仍待验证。
 - [ ] **待 PC 实测 · M07 PC 结构化追问。** `Assistant.tsx`、`src/app/api.ts`：原聊天气泡就地提交；草稿按 Task/请求/版本隔离。提交中、过期、失败和结果未知均有明确状态；侧栏只读详情不重复创建操作入口。**验收：**选择题相对同一个合成场景不用再打一条自由文本，单选/多选/自填、可跳过、权限与审批回归通过；无真实操作不显示「需要你操作」。自动测试 380 项与类型检查通过；尚未用 `make pc` 实测。
 - [ ] **待 PC 实测 · M09a 语音取消。** `AssistantVoiceInput.tsx` 和草稿归属：停止与取消分开，取消注销当前代次后 abort，已写入文字保留。**验收：**模拟迟到回调、切会话、快速重开、关闭窗口，0 次旧文字写入新草稿；不修改浏览器识别在线披露。组件、路由及草稿测试通过；尚未用 `make pc` 实测。
 
@@ -32,9 +32,9 @@
 ## PR D · 两项风险较高的可选增强
 
 - [ ] **代码完成，实机电平待验 · M09b 真波形，依赖 M09a。** `morde-main.ts` 同时接入权限检查与权限请求；只允许受信 Assistant 主框架当前录音代次获取音频，保持现有剪贴板规则。Web Audio 仅计算电平，默认不打开开关。**验收：**实际设备有声音时电平变化；无音、摄像头、工作台、子帧、未点击录音、切换和迟到音轨全部符合门禁；关窗与取消后无存活音轨、无采样持久化/上行。并行采样冲突时保留原识别、不显示假波形（E3）。**验证：**Desktop bridge/preload 20/20、Portal voice 19/19、两端 typecheck 通过；`make pc` 在 macOS 启动后操作语音按钮，因系统显示“未获得麦克风权限”未能测得实际电平；签名包未验收。
-- [ ] **Runtime/client opt-in transport 已验证，端到端仍未完成 · M02 源头试点。** `runtime/morde-runtime/runtimeactions/shell*.go`：保留现有 64 KiB 默认组合结果与模型输入；只有明确传入 descriptor 才通过独立有界 sideband 传输 Shell 溢出字节，未启用时旧 `Operation.Result` 不变。`go test ./runtimecore ./runtimehttp ./runtimeactions` 与 `go test ./internal/runtimeclient ./internal/app -run 'SupplementalOutputCapture|RuntimeOperationRunner' -count=1` 通过；定向 HTTPS Runner 测试确认 sideband 身份、释放后读取失败且 Shell 只执行一次。服务端默认不发 descriptor，未接入 Worker/Task 持久化；慢接收端、宕机、全局配额、取消和重启验收均未完成。M02 保持未勾选。
-- [ ] **尚未实现 · M03 脱敏保存和读取，依赖 M02。** Runtime/client 目前只有 opt-in 页传输和释放接口；没有服务端跨页脱敏、加密 PostgreSQL 持久化、原子完整回执、逐页 Task/Workspace 当前权限复核、保留期清理或读取路由。不得把 Runtime transport 当成可持久读取的日志；验收仍需覆盖跨任意分块敏感串、缺页/重复页、过期、容量断开、撤权、账号隔离、重启与清理。
-- [ ] **暂缓，依赖 M03 · M04 PC 分页查看。** `Assistant.tsx`、`src/app/api.ts`：保留原摘要，展开才读取分页；显示已完整保存/源头截断/容量截断/未记录/失败。关闭、切换账号、撤权清掉预读缓存，不显示旧授权结果。**验收：**在打包 PC 能找到旧 64 KiB 之外的合成尾部标记；不完整消息不标「完整」；未记录的旧执行不补采、不暗示取回。M03 的加密存储与逐页授权基础未实现，当前不能连通有效分页。
+- [ ] **Runtime/client 与 app/PG 原语已提交，源头闭环待验 · M02 源头试点。** `runtime/morde-runtime/runtimeactions/shell*.go`：保留现有 64 KiB 默认组合结果与模型输入；只有明确传入 descriptor 才通过独立有界 sideband 传输 Shell 溢出字节，未启用时旧 `Operation.Result` 不变。Runtime Go、runtimeclient 和定向 HTTPS Runner 测试通过，确认身份、释放后拒读和 Shell 只执行一次。候选 `7acb032c` 增加服务端完整输出脱敏/加密与 PG receipt/read 原语，但尚未接入 Broker/RuntimeToolExecutor 发 descriptor；慢接收端、宕机、全局配额、取消和重启验收未完成。M02 保持未勾选。
+- [ ] **服务端原语部分实现，持久读闭环待验 · M03 脱敏保存和读取，依赖 M02。** `server/internal/app/task_step_output_capture.go` 已有整段脱敏后分页加密、AAD 绑定与逐调用授权服务；PostgreSQL 新表以事务写完整收据和密文页，并实现账号配额及过期删除 primitive。当前还没有用户分页 API/OpenAPI、Broker 采集接入、周期清理调度，也未运行 M03 app/PG 集成测试；因此尚无端到端可读数据。验收仍需覆盖跨任意分块敏感串、缺页/重复页、过期、容量断开、撤权、账号隔离、重启、配额与清理。
+- [ ] **尚未接入 · M04 PC 分页查看，依赖 M03。** `Assistant.tsx`、`src/app/api.ts`：保留原摘要，展开才读取分页；显示已完整保存/源头截断/容量截断/未记录/失败。关闭、切换账号、撤权清掉预读缓存，不显示旧授权结果。**验收：**在打包 PC 能找到旧 64 KiB 之外的合成尾部标记；不完整消息不标「完整」；未记录的旧执行不补采、不暗示取回。当前 M03 API 未接通，UI 尚未实现分页。
 
 ## M12 · 每个 PR 必填的验收记录
 
@@ -45,7 +45,7 @@
 
 ### 2026-11-28 本轮记录
 
-- 基础提交：`8c87122f`。候选为当前未提交工作树，尚无候选 commit。运行环境：macOS 27.0.1（Build 26A434，arm64）；Morde PC `0.1.0`，Electron `44.7.0`。
+- 基础提交：`8c87122f`。本轮功能提交：`7acb032c`；当前本地 `release` HEAD：`0c906232`（包含并行预算分支 merge），`origin/release` 仍指向 `7acb032c`。新代码继续提交到 `release`；同步远端前会复核新增差异及测试。运行环境：macOS 27.0.1（Build 26A434，arm64）；Morde PC `0.1.0`，Electron `44.7.0`。
 - `MORDE_TEST_USER_DATA=/tmp/morde-pc-todo-acceptance make pc` 完成 Portal、Workbench 与 Desktop 构建并启动 Electron；检查后用 Ctrl-C 结束本轮启动。CUA 看到的 `morde-pc` 窗口属于已有默认用户目录进程，未能绑定到隔离启动实例，故不作为本轮候选交互验收。可见客户端中合成文本附件点击选取后能移除且未发送；拖放合成文件没有可见变化；这些观察不计为候选版本通过。
 - 当前验证：`web/portal` 中 `npm test -- src/routes/Assistant.test.tsx src/app/api.test.ts src/components/AssistantVoiceInput.test.tsx src/routes/AccountSettings.test.tsx` 409/409、`npm run typecheck` 通过；新增 M08 用例确认超限合成 PNG 经文件选择和拖放都会被同样拒绝，且不会发送消息或上传附件。Desktop `npm run typecheck`、通知/桥接 51/51 及全量 `npm test` 308/308 通过；`server` 中 `go test ./internal/domain/task ./internal/app ./internal/api ./internal/worker` 通过，M02 定向 `go test ./internal/runtimeclient ./internal/app -run 'SupplementalOutputCapture|RuntimeOperationRunner' -count=1` 通过；`runtime/morde-runtime` 中 `go test ./runtimecore ./runtimehttp ./runtimeactions` 通过；`runtime/morde-cloud-runtime` 中 `node --test --test-concurrency=1 test/runtime.test.mjs` 235/235；M02 Runtime 与 Server 变更文件 `gofmt -d` 和 `git diff --check` 通过。Desktop 全量套件首轮暴露 main-path/recovery 的 Electron Session mock 缺少 `setPermissionCheckHandler`；补齐两个测试夹具后，`morde-main-path` 2/2、`morde-main-recovery` 63/63、Desktop 全量 308/308 通过。M05、M10 的隔离 PostgreSQL 16 集成测试分别按上文记录通过；未对测试服务器或生产服务部署改动。
-- 未覆盖：当前 PC 候选的原生交互、签名 macOS 通知、真实麦克风电平、M06 Worker 恢复的取消/并发/旧 checkpoint 矩阵与完整 Worker 套件、M02 慢接收端/宕机/配额和服务端集成、M03 durable store/read API 与逐页授权、M04 分页查看和联合跨端回归。视觉规范文件 `docs/design/ice-cream-blue/morde-icecream-blue-ui-spec.html` 当前不存在，相关外观验收待核对。
+- 未覆盖：当前 PC 候选的原生交互、签名 macOS 通知、真实麦克风电平、M06 Worker 恢复的取消/并发/旧 checkpoint 矩阵与全量 Worker suite 归因、M02 Broker/Runtime 接入及慢接收端/宕机/配额、M03 分页 API/清理调度与 PG 集成验证、M04 分页查看和联合跨端回归。视觉规范文件 `docs/design/ice-cream-blue/morde-icecream-blue-ui-spec.html` 当前不存在，相关外观验收待核对。

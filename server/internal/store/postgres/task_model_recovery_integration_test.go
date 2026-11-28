@@ -194,11 +194,33 @@ func TestPostgresTaskModelRecoveryPersistsAndConsumesOneStableAttempt(t *testing
 	if err != nil || replayed || lease.Fence.AgentGeneration != fence.AgentGeneration+1 {
 		t.Fatalf("start recovery Agent: lease=%+v replayed=%t err=%v", lease, replayed, err)
 	}
-	if err := f.store.BeginTaskModelRecoveryAttempt(ctx, *claimed.ModelRecovery, lease.Fence); err != nil {
-		t.Fatalf("consume first recovery attempt: %v", err)
+	start := make(chan struct{})
+	ready := sync.WaitGroup{}
+	ready.Add(2)
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			ready.Done()
+			<-start
+			results <- f.store.BeginTaskModelRecoveryAttempt(ctx, *claimed.ModelRecovery, lease.Fence)
+		}()
 	}
-	if err := f.store.BeginTaskModelRecoveryAttempt(ctx, *claimed.ModelRecovery, lease.Fence); domain.CodeOf(err) != domain.CodeConflict {
-		t.Fatalf("second recovery begin = %v, want conflict", err)
+	ready.Wait()
+	close(start)
+	first, second := <-results, <-results
+	successes, conflicts := 0, 0
+	for _, err := range []error{first, second} {
+		if err == nil {
+			successes++
+		} else if domain.CodeOf(err) == domain.CodeConflict {
+			conflicts++
+		} else {
+			t.Fatalf("concurrent recovery begin returned unexpected error: %v", err)
+		}
+	}
+	if successes != 1 || conflicts != 1 {
+		t.Fatalf("concurrent recovery begins: successes=%d conflicts=%d errors=(%v, %v), want one winner and one conflict",
+			successes, conflicts, first, second)
 	}
 	stored, found, err := f.store.GetTaskModelRecovery(ctx, fence.TaskID, f.ownerID, *details.Task.CurrentRevision)
 	if err != nil || !found || stored.State != task.ModelRecoveryAttempting || stored.AttemptStartedAt == nil ||

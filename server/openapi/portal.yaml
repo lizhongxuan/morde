@@ -5830,6 +5830,43 @@ paths:
               schema: { $ref: '#/components/schemas/TaskStepDetail' }
         '404': { $ref: '#/components/responses/NotFound' }
         default: { $ref: '#/components/responses/Error' }
+  /api/tasks/{id}/steps/{step_id}/output:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/TaskId' }
+      - name: step_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/StepId' }
+      - name: stream
+        in: query
+        required: true
+        schema: { type: string, enum: [stdout, stderr] }
+      - name: offset
+        in: query
+        required: false
+        description: Byte offset in the complete redacted UTF-8 stream. Omitted means zero; subsequent requests use next_offset.
+        schema: { type: integer, minimum: 0, maximum: 2097152, default: 0 }
+    get:
+      tags: [Tasks]
+      operationId: getTaskStepOutputPage
+      summary: Read one page of complete, redacted Shell output
+      description: Returns a page only when the complete Runtime stream reached EOF and its encrypted receipt and pages were durably stored. The response contains the reconstructed full stdout or stderr stream, including the legacy prefix; clients replace the short step summary instead of appending this data. Missing, incomplete, failed, expired, or unauthorized output is hidden as not found. Responses are never shared-cacheable.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      responses:
+        '200':
+          description: One UTF-8 page from a complete encrypted-at-rest output receipt; at most 16 KiB before JSON encoding.
+          headers:
+            Cache-Control: { schema: { type: string, const: no-store } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TaskStepOutputCapturePage' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        default: { $ref: '#/components/responses/Error' }
   /api/tasks/{id}/steps/{step_id}/retries:
     parameters:
       - name: id
@@ -13423,6 +13460,19 @@ components:
           maxItems: 30
           description: Server-derived source locations from successful tool reads. Workspace paths are returned only to readers authorized for the Task Workspace. These locations are not yet a claim-to-source correctness verdict.
           items: { $ref: '#/components/schemas/TaskStepSourceLocation' }
+    TaskStepOutputCapturePage:
+      type: object
+      additionalProperties: false
+      required: [stream, offset, next_offset, total_bytes, source_bytes, data, eof, complete]
+      properties:
+        stream: { type: string, enum: [stdout, stderr] }
+        offset: { type: integer, minimum: 0, maximum: 2097152, description: Byte offset into the complete redacted UTF-8 stream. }
+        next_offset: { type: integer, minimum: 0, maximum: 2097152, description: Byte offset to use for the next page; equals total_bytes at EOF. }
+        total_bytes: { type: integer, minimum: 0, maximum: 2097152, description: Total bytes in the complete redacted UTF-8 stream. }
+        source_bytes: { type: integer, minimum: 0, maximum: 2097152, description: Total source bytes before redaction for this stream; not a truncation indicator. }
+        data: { type: string, maxLength: 16384, description: Redacted UTF-8 text page. Never base64 and never raw source output. }
+        eof: { type: boolean, description: True when this page reaches the end of the stream. }
+        complete: { type: boolean, const: true, description: True only when Runtime source EOF and the durable encrypted receipt were both confirmed. Incomplete or unavailable captures return not found. }
     TaskStepSourceLocation:
       type: object
       required: [id, kind, state, content_sha256]
@@ -14016,11 +14066,11 @@ components:
     Notification:
       type: object
       description: Task-backed notices have a task_id and positive event_sequence. Goal and project work-item source notices have task_id null, event_sequence 0, and source identity fields; project_id is present only for project work-item notices. source_event_id is an internal deduplication key and is not returned.
+      additionalProperties: false
       required: [id, kind, task_id, event_sequence, summary, redacted, actionable, created_at, read_at]
       properties:
         id: { $ref: '#/components/schemas/NotificationId' }
         kind: { type: string, enum: [completed, failed, waiting_user, goal_step_blocked, goal_completed, project_work_item_blocked, project_work_item_delivered] }
-      additionalProperties: false
         task_id: { oneOf: [{ $ref: '#/components/schemas/TaskId' }, { type: 'null' }] }
         event_sequence: { type: integer, minimum: 0, description: Positive for Task-backed notices and 0 for source notices. }
         source_kind: { type: string, enum: [goal, project_work_item], description: Omitted for Task-backed notices. }

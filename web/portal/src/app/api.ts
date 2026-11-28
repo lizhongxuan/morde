@@ -31,6 +31,27 @@ export type MainConversation = {
 };
 export type ConversationDeliveryStatus = components['schemas']['ConversationMessage']['delivery_status'];
 export type TaskWorkbenchObservationTicket = components['schemas']['TaskWorkbenchObservationTicket'];
+export type TaskStepOutputStream = 'stdout' | 'stderr';
+export type TaskStepOutputPage = {
+  state: 'complete';
+  complete: true;
+  stream: TaskStepOutputStream;
+  offset: number;
+  next_offset: number;
+  total_bytes: number;
+  source_bytes: number;
+  data: string;
+  eof: boolean;
+};
+export type TaskStepOutputUnavailableState = 'source_truncated' | 'capacity_truncated' | 'not_recorded' | 'failed';
+export type TaskStepOutputReadResult = TaskStepOutputPage | {
+  state: TaskStepOutputUnavailableState;
+  stream: TaskStepOutputStream;
+  complete: false;
+};
+
+const taskStepOutputPageBytes = 16 * 1024;
+const taskStepOutputMaxBytes = 2 * 1024 * 1024;
 
 async function readMainConversation(response: Response): Promise<MainConversation> {
   if (!response.ok) await throwResponseError(response);
@@ -57,6 +78,44 @@ async function readTaskWorkbenchObservationTicket(response: Response, taskID: st
     throw new Error('Task 观察票据响应无效');
   }
   return { ticket: value.ticket, task_id: value.task_id, host_id: value.host_id, expires_at: value.expires_at };
+}
+
+async function readTaskStepOutputPage(response: Response, stream: TaskStepOutputStream, offset: number): Promise<TaskStepOutputReadResult> {
+  if (!response.ok) await throwResponseError(response);
+  const value: unknown = await response.json();
+  if (!value || typeof value !== 'object' || !('state' in value) || typeof value.state !== 'string') {
+    throw new Error('完整输出响应状态无效。');
+  }
+  if (value.state !== 'complete') {
+    if (['source_truncated', 'capacity_truncated', 'not_recorded', 'failed'].includes(value.state) &&
+      'stream' in value && value.stream === stream && 'complete' in value && value.complete === false &&
+      Object.keys(value).length === 3) return { state: value.state as TaskStepOutputUnavailableState, stream, complete: false };
+    throw new Error('完整输出状态响应格式无效。');
+  }
+  if (!('stream' in value) || value.stream !== stream ||
+    !('offset' in value) || value.offset !== offset || !('next_offset' in value) ||
+    !('total_bytes' in value) || !('source_bytes' in value) || !('data' in value) ||
+    !('eof' in value) || !('complete' in value) || typeof value.data !== 'string' ||
+    typeof value.offset !== 'number' || !Number.isSafeInteger(value.offset) || value.offset < 0 ||
+    typeof value.next_offset !== 'number' || !Number.isSafeInteger(value.next_offset) || value.next_offset < value.offset ||
+    typeof value.total_bytes !== 'number' || !Number.isSafeInteger(value.total_bytes) || value.total_bytes < 0 ||
+    value.total_bytes > taskStepOutputMaxBytes || typeof value.source_bytes !== 'number' ||
+    !Number.isSafeInteger(value.source_bytes) || value.source_bytes < 0 ||
+    typeof value.eof !== 'boolean' || value.complete !== true) {
+    throw new Error('完整输出分页响应格式无效。');
+  }
+  if (Object.keys(value).length !== 9) throw new Error('完整输出分页响应字段无效。');
+  const dataBytes = new TextEncoder().encode(value.data);
+  let decoded: string;
+  try { decoded = new TextDecoder('utf-8', { fatal: true }).decode(dataBytes); }
+  catch { throw new Error('完整输出分页不是有效 UTF-8。'); }
+  if (decoded !== value.data || dataBytes.byteLength > taskStepOutputPageBytes ||
+    value.next_offset !== value.offset + dataBytes.byteLength || value.next_offset > value.total_bytes ||
+    value.eof !== (value.next_offset === value.total_bytes) || !value.complete ||
+    (!value.eof && dataBytes.byteLength === 0)) {
+    throw new Error('完整输出分页边界无效。');
+  }
+  return value as TaskStepOutputPage;
 }
 
 export const portalApi = {
@@ -300,9 +359,20 @@ export const portalApi = {
     return new Blob([body], { type: mediaType });
   },
   agentWorkspaceFileURL: (id: string, path: string) => `/api/workspaces/${encodeURIComponent(id)}/files/${path.split('/').map(encodeURIComponent).join('/')}`,
-  taskStepDetail: async (id: string, stepID: string) => unwrapApiResponse(await api.GET('/api/tasks/{id}/steps/{step_id}', {
-    params: { path: { id, step_id: stepID } },
+  taskStepDetail: async (id: string, stepID: string, signal?: AbortSignal) => unwrapApiResponse(await api.GET('/api/tasks/{id}/steps/{step_id}', {
+    params: { path: { id, step_id: stepID } }, signal,
   })),
+  taskStepOutputPage: async (id: string, stepID: string, stream: TaskStepOutputStream, offset: number,
+    actorID: string, serviceInstanceID: string, signal?: AbortSignal) => {
+    if (!actorID || !serviceInstanceID) throw new Error('账号或服务身份尚未确认。');
+    if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('完整输出分页位置无效。');
+    const query = new URLSearchParams({ stream, offset: String(offset) });
+    const response = await requestFetch(`/api/tasks/${encodeURIComponent(id)}/steps/${encodeURIComponent(stepID)}/output?${query}`, {
+      signal,
+      headers: { accept: 'application/json', ...personalIdentityHeaders(serviceInstanceID, actorID) },
+    });
+    return readTaskStepOutputPage(response, stream, offset);
+  },
   retryTaskModelRecovery: async (id: string, body: { expected_revision: number; expected_event_sequence: number }, idempotencyKey: string) => {
     const response = await requestFetch(`/api/tasks/${encodeURIComponent(id)}/model-recovery-retries`, {
       method: 'POST', headers: { 'Idempotency-Key': idempotencyKey }, body: JSON.stringify(body),

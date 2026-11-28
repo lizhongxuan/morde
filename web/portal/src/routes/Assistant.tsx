@@ -3,7 +3,7 @@ import type { CSSProperties, DragEvent as ReactDragEvent, FormEvent, KeyboardEve
 import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
-import type { ConversationDeliveryStatus, HostEmbedTicket, HostEmbedTicketRequest, HostMemberPermission } from '../app/api';
+import type { ConversationDeliveryStatus, HostEmbedTicket, HostEmbedTicketRequest, HostMemberPermission, TaskStepOutputStream } from '../app/api';
 import type { components } from '../api/schema';
 import { readK2TaskProjection } from '../app/k2-task-projection';
 import type { K2ResultReview } from '../app/k2-task-projection';
@@ -700,6 +700,7 @@ function taskStepStatusText(status: string): string {
 }
 
 const taskStepOutputMaxBytes = 64 * 1024;
+const taskStepOutputPageMaxBytes = 2 * 1024 * 1024;
 const taskStepOutputPreviewCharacters = 2_000;
 
 function safeTaskStepOutput(value: unknown): { value: string; truncated: boolean } | null {
@@ -721,15 +722,38 @@ function safeTaskStepOutput(value: unknown): { value: string; truncated: boolean
   return { value: bounded, truncated: redacted.truncated || byteTruncated };
 }
 
-function TaskStepOutput({ label, value, clientTruncated, truncated, runtimeTruncated, detailTruncated, omittedBytes }: {
+type TaskStepOutputReadState =
+  | { status: 'idle' }
+  | { status: 'loading'; receivedBytes: number; totalBytes: number | null }
+  | { status: 'complete'; value: string; totalBytes: number; sourceBytes: number }
+  | { status: 'not_available' }
+  | { status: 'source_truncated' }
+  | { status: 'capacity_truncated' }
+  | { status: 'not_recorded' }
+  | { status: 'failed' }
+  | { status: 'error' };
+
+function TaskStepOutput({ label, value, stream, canReadFullOutput, taskID, stepID, actorID, serviceInstanceID,
+  conversationID, taskRevision, clientTruncated, truncated, runtimeTruncated, detailTruncated, omittedBytes }: {
   label: string;
   value: string;
+  stream: TaskStepOutputStream;
+  canReadFullOutput: boolean;
+  taskID: string;
+  stepID: string;
+  actorID: string;
+  serviceInstanceID: string;
+  conversationID: string;
+  taskRevision: number | null;
   clientTruncated: boolean;
   truncated: boolean;
   runtimeTruncated: boolean;
   detailTruncated: boolean;
   omittedBytes: number | null;
 }) {
+  const [readState, setReadState] = useState<TaskStepOutputReadState>({ status: 'idle' });
+  const readGeneration = useRef(0);
+  const requestController = useRef<AbortController | null>(null);
   let preview = '';
   let previewCharacters = 0;
   let hasMore = false;
@@ -741,15 +765,107 @@ function TaskStepOutput({ label, value, clientTruncated, truncated, runtimeTrunc
     preview += character;
     previewCharacters += 1;
   }
+
+  const discardRead = () => {
+    readGeneration.current += 1;
+    requestController.current?.abort();
+    requestController.current = null;
+    setReadState({ status: 'idle' });
+  };
+
+  useEffect(() => () => {
+    readGeneration.current += 1;
+    requestController.current?.abort();
+    requestController.current = null;
+  }, []);
+
+  const readFullOutput = async () => {
+    requestController.current?.abort();
+    const controller = new AbortController();
+    requestController.current = controller;
+    const generation = ++readGeneration.current;
+    let offset = 0;
+    let expectedTotalBytes: number | null = null;
+    let expectedSourceBytes: number | null = null;
+    let receivedBytes = 0;
+    const pages: string[] = [];
+    setReadState({ status: 'loading', receivedBytes, totalBytes: null });
+    try {
+      for (let pageNumber = 0; pageNumber < taskStepOutputPageMaxBytes / (16 * 1024); pageNumber += 1) {
+        const page = await portalApi.taskStepOutputPage(taskID, stepID, stream, offset, actorID, serviceInstanceID, controller.signal);
+        if (controller.signal.aborted || generation !== readGeneration.current) return;
+        if (page.state !== 'complete') {
+          setReadState({ status: page.state });
+          return;
+        }
+        if (page.offset !== offset || (expectedTotalBytes !== null && page.total_bytes !== expectedTotalBytes) ||
+          (expectedSourceBytes !== null && page.source_bytes !== expectedSourceBytes) || page.complete !== true) {
+          throw new Error('输出分页与前页不一致。');
+        }
+        expectedTotalBytes ??= page.total_bytes;
+        expectedSourceBytes ??= page.source_bytes;
+        const pageBytes = new TextEncoder().encode(page.data).byteLength;
+        receivedBytes += pageBytes;
+        if (receivedBytes > taskStepOutputPageMaxBytes || receivedBytes > expectedTotalBytes || page.next_offset !== receivedBytes) {
+          throw new Error('输出分页超出已确认范围。');
+        }
+        pages.push(page.data);
+        offset = page.next_offset;
+        setReadState({ status: 'loading', receivedBytes, totalBytes: expectedTotalBytes });
+        if (page.eof) {
+          if (!page.complete || offset !== expectedTotalBytes || receivedBytes !== expectedTotalBytes) {
+            throw new Error('输出分页尚未完整结束。');
+          }
+          const completeText = safeTaskActivityText(pages.join(''), taskStepOutputPageMaxBytes);
+          if (completeText.truncated) throw new Error('输出内容超过客户端显示上限。');
+          setReadState({ status: 'complete', value: completeText.value, totalBytes: expectedTotalBytes,
+            sourceBytes: expectedSourceBytes ?? 0 });
+          return;
+        }
+      }
+      throw new Error('输出分页数量超过客户端安全上限。');
+    } catch (error) {
+      if (controller.signal.aborted || generation !== readGeneration.current) return;
+      if (error instanceof ApiError && error.status === 404) setReadState({ status: 'not_available' });
+      else setReadState({ status: 'error' });
+    } finally {
+      if (requestController.current === controller) requestController.current = null;
+    }
+  };
+
+  const handleToggle = (event: React.SyntheticEvent<HTMLDetailsElement>) => {
+    if (!event.currentTarget.open) {
+      discardRead();
+      return;
+    }
+    if (canReadFullOutput) void readFullOutput();
+  };
+
+  const displayFullOutput = readState.status === 'complete';
   return <div className="task-step-output">
-    <p><strong>{label}</strong> {value ? preview : '（无输出）'}{hasMore ? '…' : ''}</p>
-    {clientTruncated && <p role="status">已记录的{label}超过客户端 64 KiB 显示上限，本页内容已截断。</p>}
-    {runtimeTruncated && <p role="status">执行源头的{label}已截断，后续输出没有进入任务结果。</p>}
-    {detailTruncated && <p role="status">已记录的{label}详情受服务端保存上限限制，无法查看更长记录{omittedBytes === null ? '。' : `，省略 ${omittedBytes} 字节。`}</p>}
-    {truncated && !runtimeTruncated && !detailTruncated && <p role="status">旧版记录标记了{label}截断，但没有说明发生在执行源头还是详情保存阶段。</p>}
-    {hasMore && <details>
+    {displayFullOutput
+      ? <p><strong>{label}</strong> 已完整读取并保存（脱敏后 {readState.totalBytes} 字节）。</p>
+      : <p><strong>{label}</strong> {value ? preview : '（无输出）'}{hasMore ? '…' : ''}</p>}
+    {!displayFullOutput && clientTruncated && <p role="status">已记录的{label}超过客户端 64 KiB 显示上限，本页内容已截断。</p>}
+    {!displayFullOutput && runtimeTruncated && <p role="status">执行源头的{label}已截断，后续输出没有进入任务结果。</p>}
+    {!displayFullOutput && detailTruncated && <p role="status">已记录的{label}详情受服务端保存上限限制，无法查看更长记录{omittedBytes === null ? '。' : `，省略 ${omittedBytes} 字节。`}</p>}
+    {!displayFullOutput && truncated && !runtimeTruncated && !detailTruncated && <p role="status">旧版记录标记了{label}截断，但没有说明发生在执行源头还是详情保存阶段。</p>}
+    {(hasMore || canReadFullOutput) && <details onToggle={handleToggle}>
       <summary>查看完整已记录输出</summary>
-      <pre>{value}</pre>
+      {readState.status === 'complete' ? <pre>{readState.value || '（无输出）'}</pre> : <>
+        {readState.status === 'idle' && !canReadFullOutput && <pre>{value}</pre>}
+        {readState.status === 'loading' && <p role="status">正在读取完整{label}{readState.totalBytes === null
+          ? '…' : `：${readState.receivedBytes} / ${readState.totalBytes} 字节`}</p>}
+        {readState.status === 'not_available' && <p role="status">完整输出未记录或无法访问。</p>}
+        {readState.status === 'source_truncated' && <p role="status">执行源头输出未完整结束，无法显示完整输出。</p>}
+        {readState.status === 'capacity_truncated' && <p role="status">完整输出超过保存容量，服务端未返回部分内容。</p>}
+        {readState.status === 'not_recorded' && <p role="status">完整输出未记录、已过期或无法访问。</p>}
+        {(readState.status === 'failed' || readState.status === 'error') && <p role="alert">完整输出保存或读取失败，请重试。</p>}
+        {(readState.status === 'failed' || readState.status === 'error') && <button type="button" className="button button-small button-secondary"
+          onClick={() => void readFullOutput()}>重试读取完整输出</button>}
+        {canReadFullOutput && readState.status === 'idle' && <p role="status">展开后读取完整输出。</p>}
+        {canReadFullOutput && readState.status !== 'complete' && value && <pre>{value}</pre>}
+      </>}
     </details>}
   </div>;
 }
@@ -833,11 +949,12 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
   const client = useQueryClient();
   const { notify, dismiss } = useToast();
   const [accessRevoked, setAccessRevoked] = useState(false);
-  const queryKey = ['task-step-detail', actorID, serviceInstanceID, conversationID, task.id, step.id] as const;
+  const queryKey = useMemo(() => ['task-step-detail', actorID, serviceInstanceID, conversationID, task.id, step.id] as const,
+    [actorID, conversationID, serviceInstanceID, step.id, task.id]);
   const detail = useQuery({
     queryKey,
-    queryFn: async () => {
-      const result = await portalApi.taskStepDetail(task.id, step.id) as TaskStepDetailWithExecution;
+    queryFn: async ({ signal }) => {
+      const result = await portalApi.taskStepDetail(task.id, step.id, signal) as TaskStepDetailWithExecution;
       if (result.task_id !== task.id || result.step_id !== step.id) throw new Error('详情身份不匹配');
       return result.detail_state === 'available' ? result : { ...result, object: null, input: null, result: null,
         execution: null, content_evidence: undefined };
@@ -855,6 +972,10 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
     refetchInterval: (query) => !terminalTaskStatuses.has(task.status) ||
       (query.state.data && query.state.data.event_sequence < task.event_sequence) ? 1500 : false,
   });
+  useEffect(() => () => {
+    void client.cancelQueries({ queryKey, exact: true });
+    client.removeQueries({ queryKey, exact: true });
+  }, [client, queryKey]);
   const refetchDetail = detail.refetch;
   const inaccessible = isResourceNoLongerAccessible(detail.error);
   if (inaccessible && !accessRevoked) setAccessRevoked(true);
@@ -917,6 +1038,12 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
   const stderrBytes = executionNumber(execution?.stderr_total_bytes);
   const stdoutOmitted = executionNumber(execution?.stdout_omitted_bytes);
   const stderrOmitted = executionNumber(execution?.stderr_omitted_bytes);
+  const stdoutPrefixBytes = safeStdout ? new TextEncoder().encode(safeStdout.value).byteLength : 0;
+  const stderrPrefixBytes = safeStderr ? new TextEncoder().encode(safeStderr.value).byteLength : 0;
+  const canReadFullStdout = confirmedResult && isShell && Boolean(safeStdout?.truncated || execution?.stdout_truncated === true ||
+    execution?.stdout_detail_truncated === true || (stdoutOmitted ?? 0) > 0 || (stdoutBytes !== null && stdoutBytes > stdoutPrefixBytes));
+  const canReadFullStderr = confirmedResult && isShell && Boolean(safeStderr?.truncated || execution?.stderr_truncated === true ||
+    execution?.stderr_detail_truncated === true || (stderrOmitted ?? 0) > 0 || (stderrBytes !== null && stderrBytes > stderrPrefixBytes));
   return <div className="task-step-detail" aria-label="动作详情">
     {safeToolName && <p><strong>工具</strong> {safeToolName.value}</p>}
     <p><strong>时间</strong> {formatDate(step.created_at)}</p>
@@ -946,17 +1073,27 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
         {(duration !== null || isShell) && <p><strong>耗时</strong> {duration === null ? '未记录' : `${duration} 毫秒`}</p>}
         {(exitCode !== null || isShell) && <p><strong>退出码</strong> {exitCode ?? '未记录'}</p>}
         {(typeof execution.timed_out === 'boolean' || isShell) && <p><strong>是否超时</strong> {typeof execution.timed_out === 'boolean' ? (execution.timed_out ? '是' : '否') : '未记录'}</p>}
-        {safeStdout && <TaskStepOutput label="标准输出" value={safeStdout.value} clientTruncated={safeStdout.truncated}
+        {(safeStdout || canReadFullStdout) && <TaskStepOutput key={JSON.stringify([actorID, serviceInstanceID, conversationID, task.id,
+          step.id, task.current_revision ?? null, step.task_revision ?? null, 'stdout'])}
+          label="标准输出" value={safeStdout?.value ?? ''} stream="stdout" canReadFullOutput={canReadFullStdout}
+          taskID={task.id} stepID={step.id} actorID={actorID} serviceInstanceID={serviceInstanceID}
+          conversationID={conversationID} taskRevision={task.current_revision ?? step.task_revision ?? null}
+          clientTruncated={safeStdout?.truncated ?? false}
           truncated={execution.stdout_truncated === true}
           runtimeTruncated={execution.stdout_runtime_truncated === true} detailTruncated={execution.stdout_detail_truncated === true}
           omittedBytes={stdoutOmitted} />}
-        {!safeStdout && (hasStdout || isShell) && <p><strong>标准输出</strong> 未记录</p>}
+        {!safeStdout && !canReadFullStdout && (hasStdout || isShell) && <p><strong>标准输出</strong> 未记录</p>}
         {stdoutBytes !== null && <p><strong>标准输出字节数</strong> {stdoutBytes} 字节</p>}
-        {safeStderr && <TaskStepOutput label="错误输出" value={safeStderr.value} clientTruncated={safeStderr.truncated}
+        {(safeStderr || canReadFullStderr) && <TaskStepOutput key={JSON.stringify([actorID, serviceInstanceID, conversationID, task.id,
+          step.id, task.current_revision ?? null, step.task_revision ?? null, 'stderr'])}
+          label="错误输出" value={safeStderr?.value ?? ''} stream="stderr" canReadFullOutput={canReadFullStderr}
+          taskID={task.id} stepID={step.id} actorID={actorID} serviceInstanceID={serviceInstanceID}
+          conversationID={conversationID} taskRevision={task.current_revision ?? step.task_revision ?? null}
+          clientTruncated={safeStderr?.truncated ?? false}
           truncated={execution.stderr_truncated === true}
           runtimeTruncated={execution.stderr_runtime_truncated === true} detailTruncated={execution.stderr_detail_truncated === true}
           omittedBytes={stderrOmitted} />}
-        {!safeStderr && (hasStderr || isShell) && <p><strong>错误输出</strong> 未记录</p>}
+        {!safeStderr && !canReadFullStderr && (hasStderr || isShell) && <p><strong>错误输出</strong> 未记录</p>}
         {stderrBytes !== null && <p><strong>错误输出字节数</strong> {stderrBytes} 字节</p>}
         {[location, command, parameters, cwd].some((field) => field?.truncated) && <p>执行信息在界面显示时截断。</p>}
       </> : isShell && <p>执行详情未记录或不可用。</p>}
@@ -3910,7 +4047,9 @@ export function Assistant() {
         <p className="task-step-detail-message" role="status">状态：{taskStepStatusText(step.status)}</p>
         {step.status === 'failed' && <p className="task-step-detail-message" role="status">原因：{taskStepFailureText(step)}</p>}
         {step.kind === 'tool' || step.tool_name
-          ? <TaskStepDetails task={task} step={step} conversationID={task.conversation_id} actorID={user?.id ?? ''}
+          ? <TaskStepDetails key={JSON.stringify([user?.id ?? '', capabilities.data?.service_instance_id ?? '', task.conversation_id,
+            task.id, step.id, task.current_revision ?? null, step.task_revision ?? null])}
+            task={task} step={step} conversationID={task.conversation_id} actorID={user?.id ?? ''}
             serviceInstanceID={capabilities.data?.service_instance_id ?? ''} />
           : <div className="task-step-detail" aria-label="步骤结果"><p>{text}</p></div>}
       </div>;
