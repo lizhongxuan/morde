@@ -4494,7 +4494,7 @@ describe('Assistant durable tasks', () => {
     renderPage();
     const activity = await findTaskActivity(task.id);
     await user.click(within(activity).getByRole('button', { name: '查看工作项：使用 MCP 工具：lookup' }));
-    await waitFor(() => expect(read).toHaveBeenCalledWith(task.id, stepID));
+    await waitFor(() => expect(read).toHaveBeenCalledWith(task.id, stepID, expect.any(AbortSignal)));
     expect(within(activity).getByText('lookup')).toBeInTheDocument();
     expect(within(activity).getByText('Synthetic')).toBeInTheDocument();
     expect(within(activity).getByText('完成')).toBeInTheDocument();

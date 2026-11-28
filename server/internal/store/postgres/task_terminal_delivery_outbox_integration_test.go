@@ -304,8 +304,12 @@ BEFORE INSERT ON task_terminal_delivery_outbox FOR EACH ROW EXECUTE FUNCTION tes
 	})
 }
 
-func commitTaskTerminalDeliveryWaiting(t *testing.T, f agentLifecycleFixture, reason string) int64 {
+func commitTaskTerminalDeliveryWaiting(t *testing.T, f agentLifecycleFixture, reason string, eventPayload ...[]byte) int64 {
 	t.Helper()
+	payload := []byte(`{"reason":"` + reason + `","call_id":"private-call-identifier","payload":"private-operation-payload"}`)
+	if len(eventPayload) > 0 {
+		payload = eventPayload[0]
+	}
 	stepID := mustID(t, domain.NewStepID)
 	var stepSequence int64
 	if err := f.store.pool.QueryRow(context.Background(), `SELECT COALESCE(max(sequence),0)+1 FROM task_steps WHERE task_id=$1`,
@@ -317,7 +321,7 @@ func commitTaskTerminalDeliveryWaiting(t *testing.T, f agentLifecycleFixture, re
 		Status: task.StatusWaitingUser, CurrentStep: stepID, WaitingReason: reason,
 		Steps: []task.Step{{ID: stepID, TaskID: f.request.Fence.TaskID, Sequence: stepSequence, Kind: "tool", Status: task.StepUnknown,
 			Title: "Review unresolved result", Summary: "The operation result is unresolved."}},
-		Event: task.Event{Type: "task.waiting_user", Payload: []byte(`{"reason":"` + reason + `","call_id":"private-call-identifier","payload":"private-operation-payload"}`)},
+		Event: task.Event{Type: "task.waiting_user", Payload: payload},
 	})
 	if err != nil {
 		t.Fatalf("commit waiting Task: %v", err)

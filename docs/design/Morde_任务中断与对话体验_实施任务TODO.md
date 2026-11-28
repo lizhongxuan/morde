@@ -70,7 +70,9 @@
 - [ ] 用打包 PC 完成端到端回归，保存目标 commit、任务/事件关联、三种页面状态与实际派发次数；全量 Worker 包仍未通过，2026-11-28 的具体失败见下方记录，修复/补齐对应测试环境后重跑。
 - [ ] 真实 `morde-pc` 交互尚未稳定通过：本轮 `make pc` 构建并启动客户端后，隔离旁聊的无工具快答一直停留在连接状态，未收到助手回复；早先一次快速问答通过不代表当前连接稳定。仍需确认未知结果只保留在任务详情、原对话只显示自然语言说明，且终态回告模型未知时仍能收到确定性说明。
 - [ ] 正例：快答无 👌🏻；耗时任务一次 👌🏻；可重试故障自动恢复后出结果；耗尽后原对话收到说明；真实审批能继续。
-- [ ] 反例：结果或用量未知、工具不在授权范围、权限撤销、用户取消、checkpoint 不匹配、写入结果不明、两个 Worker 竞争。断言不发生不安全派发、跨账号展示或重复交付。
+- [x] 双 Worker 同时竞争同一恢复尝试：PostgreSQL 用例断言恰好一个成功、另一个得到冲突；租约重启后不会再消费同一尝试额度。
+- [ ] 其余反例：结果或用量未知、工具不在授权范围、权限撤销、用户取消、checkpoint 不匹配、写入结果不明。断言不发生不安全派发、跨账号展示或重复交付。
+- [x] 恢复诊断输入：服务端从等待事件提取白名单失败事实，终态解释模型请求只收到自然语言诊断、不包含工具名/调用 ID/内部分类；应用与 PostgreSQL 集成测试覆盖。
 - [ ] 自动恢复独立灰度并可关闭；关闭后仍保留状态修复与原对话回告。比较「无入口却提示等待用户」次数、任务回告覆盖率、恢复成功率及额外模型调用。任何重复副作用或跨权限展示立即停用自动恢复。
 
 ## 实施与验证记录（2026-11-27）
@@ -113,3 +115,12 @@
 - 自动化通过：共享工作区 `npm test -- src/routes/Assistant.test.tsx`（318/318）、`npm run typecheck`；`make pc` 重新构建通过。干净基线上的故障气泡相关用例 10/10 通过；整文件仍有 2 个与本次无关的任务动态批处理断言失败，在未改动的 `release` 基线上也同样失败。
 - 实机/发布未验收：构建后服务器 `https://portal.120.25.178.93.sslip.io/healthz` 在 5 秒超时，SSH banner 在 8 秒超时；新启动 PC 无法续期会话，不能读取截图任务或验证新气泡，也未对旧任务执行重放。本次改动尚未确认部署到服务器。
 - T07 继续进行中：实际 `morde-pc` 故障气泡可见性、稳定快答/搜索、Worker 全量失败项、安全正反例及灰度门槛仍未完成。
+
+### 2026-11-28 续验（诊断气泡与双 Worker 竞争）
+
+- 基线：当前分支和 `origin/release` 均为 `release@0f83fab0`；该提交已包含双 Worker 恢复尝试竞争测试。本轮只增加安全诊断传递测试与本 TODO 记录，未暂存共享工作区其他未提交文件。
+- 通过：`go test ./internal/app -run '^TestTaskTerminalDeliveryRecoveryDiagnosis' -count=1`；本地 PostgreSQL `go test ./internal/store/postgres -run 'TestPostgresTaskTerminalDeliveryRecoveryDiagnosisReachesModelFacts|TestPostgresTaskModelRecovery' -count=1`；同一恢复 fence 的并发竞争 `go test -race ./internal/store/postgres -run '^TestPostgresTaskModelRecoveryPersistsAndConsumesOneStableAttempt$' -count=1`；Worker 重启搜索恢复 E2E `CH_TEST_DATABASE_URL=... go test ./internal/worker -run '^TestCloudDSHModelRecoveryResumesAfterSettledSearch$' -count=1` 均通过。Portal 故障回复气泡定向测试 6/6 通过。
+- 全量 Worker 未通过：`go test ./internal/worker -count=1` 用时 341.3 秒后失败。定向复跑确认 `TestConversationSummaryDSHMainAndSideChatsContinueAfterLongHistoryRestart` 在第二次压缩得到 summary version 3；`TestCloudDSHModelBudgetPostgresHTTPWorkerProcessKilledBeforeProviderHTTP` 的 `MarkStaleModelCallsUnknown` 返回 0（期望 1）。整包门槛仍未通过；前者属于长上下文压缩，后者属于模型预算恢复，不纳入本修复范围。
+- 共享工作区前端最新检查：Portal 文件测试 330/330，`npm run typecheck` 通过。工作区含未提交的步骤输出分页/API 改动；这组检查不能代表干净 release 基线，本轮未将这些文件纳入提交。
+- 服务器当前仍不可核验：`/healthz` TLS 握手超时，SSH banner 超时；不能据用户告知推断部署 commit 或查看日志。实际 `morde-pc` 的会话续期此前也失败，因此线上对话与截图任务仍未实测。现代 `morde-pc` 将 Portal UI 嵌入客户端包；服务器部署不等于已更新客户端包。
+- 自动恢复保持默认关闭；开关为进程级、没有灰度 cohort 或独立恢复指标。T07 继续进行中，等待服务器连通和共享前端未提交改动收敛后再完成 PC/灰度验收。

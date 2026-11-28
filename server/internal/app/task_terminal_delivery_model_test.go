@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -191,5 +192,72 @@ func TestCompleteTaskTerminalDeliveryModelReportsSafeAndUnknownOutcomes(t *testi
 				t.Fatalf("unknown provider use was not retained in the terminal ledger: %+v", store.settlement)
 			}
 		})
+	}
+}
+
+func TestTaskTerminalDeliveryRecoveryDiagnosisIsSentAsSafeModelFact(t *testing.T) {
+	event := []byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_stage":"model_response_validation","failure_category":"unauthorized_tool","failure_reason":"tool_not_in_task_allowlist","tool_name":"morde_mcp_private","tool_call_id":"call_private","tool_dispatched":false}}`)
+	diagnosis := TaskTerminalDeliveryRecoveryDiagnosisFromEvent(event)
+	const expected = "模型提出了当前任务未授权的工具操作，系统在派发前已拦截。"
+	if diagnosis != expected {
+		t.Fatalf("recovery diagnosis = %q, want %q", diagnosis, expected)
+	}
+
+	eventDigest := sha256.Sum256([]byte("waiting event"))
+	objectiveDigest := sha256.Sum256([]byte("today's news"))
+	facts := TaskTerminalDeliverySourceFacts{
+		Identity: TaskTerminalDeliveryIdentity{
+			DeliveryID: 42, TaskID: "q1234567", OwnerID: "u1234567", ConversationID: "c1234567", InitiatorID: "u1234567",
+			TaskRevision: 2, AuthorizationVersion: 1, SourceKind: TaskTerminalDeliverySourceWaiting,
+			SourceEventSequence: 9, SourceEventType: "task.waiting_user", SourceSHA256: eventDigest[:],
+		},
+		TaskStatus: "waiting_user", ModelID: "p1234567", ObjectiveSummary: "today's news", ObjectiveSHA256: objectiveDigest[:],
+		WaitingReason: "reconciliation_required", RecoveryDiagnosis: diagnosis,
+	}
+	factsDigest, err := TaskTerminalDeliveryFactsDigest(facts)
+	if err != nil {
+		t.Fatalf("digest terminal explanation facts: %v", err)
+	}
+	facts.FactsSHA256 = factsDigest
+	request, err := BuildTaskTerminalDeliveryDSHModelRequest(facts.ModelID, facts)
+	if err != nil {
+		t.Fatalf("build terminal explanation request: %v", err)
+	}
+	var decoded struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content []struct {
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(request, &decoded); err != nil {
+		t.Fatalf("decode terminal explanation request: %v", err)
+	}
+	if len(decoded.Messages) != 2 || decoded.Messages[1].Role != "user" || len(decoded.Messages[1].Content) != 1 {
+		t.Fatalf("terminal explanation request messages = %#v", decoded.Messages)
+	}
+	var modelFacts struct {
+		RecoveryDiagnosis string `json:"recovery_diagnosis"`
+	}
+	if err := json.Unmarshal([]byte(decoded.Messages[1].Content[0].Text), &modelFacts); err != nil {
+		t.Fatalf("decode terminal explanation facts: %v", err)
+	}
+	if modelFacts.RecoveryDiagnosis != expected {
+		t.Fatalf("model recovery diagnosis = %q, want %q", modelFacts.RecoveryDiagnosis, expected)
+	}
+	for _, internalValue := range []string{"unauthorized_tool", "tool_not_in_task_allowlist", "morde_mcp_private", "call_private"} {
+		if strings.Contains(string(request), internalValue) {
+			t.Fatalf("terminal explanation model request exposed internal value %q", internalValue)
+		}
+	}
+}
+
+func TestTaskTerminalDeliveryRecoveryDiagnosisUsesPlainFallbackForUnknownCause(t *testing.T) {
+	event := []byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_category":"private_provider_failure","failure_reason":"private_reason","recovery_stage":"cloud_dsh_run","recovery_reason":"unclassified_runtime_error"}}`)
+	diagnosis := TaskTerminalDeliveryRecoveryDiagnosisFromEvent(event)
+	if diagnosis != "模型请求未能得到确认，现有记录无法判定具体原因。" ||
+		strings.Contains(diagnosis, "private_provider_failure") || strings.Contains(diagnosis, "private_reason") {
+		t.Fatalf("unknown recovery diagnosis is not a safe plain fallback: %q", diagnosis)
 	}
 }
