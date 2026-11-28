@@ -1076,6 +1076,7 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 	allowLongReply := len(longReplyMode) == 1 && longReplyMode[0]
 	if !app.ValidConversationRouteModelOutput(value.ModelOutput) ||
 		!app.ValidConversationRouteFileDeliveryIntent(value.Action, value.FileDeliveryIntent) ||
+		!app.ValidConversationRouteAgentToolProfile(value, context) ||
 		!app.ValidConversationRouteInvalidOutputCategory(value.InvalidOutputCategory) ||
 		(!value.InvalidOutput && value.InvalidOutputCategory != "") {
 		return false
@@ -1086,7 +1087,7 @@ func validStoredRouteDecision(value app.ConversationRouteDecision, context app.C
 	if allowLongReply {
 		if !value.LongReply || value.ModelOutput != "" || value.FileDeliveryIntent != "" || value.Acknowledge || value.ExplicitNew ||
 			value.TaskID != "" || value.TargetMessageID != "" || value.ExpectedRevision != 0 || len(value.DependencyTaskIDs) != 0 ||
-			len(value.AggregateMessageIDs) != 0 || value.ToolName != "" || value.ToolArguments != "" || value.InvalidOutput {
+			len(value.AggregateMessageIDs) != 0 || value.ToolName != "" || value.ToolArguments != "" || value.InvalidOutput || value.AgentToolProfile != "" {
 			return false
 		}
 		switch value.Action {

@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/task"
 )
 
@@ -29,6 +31,15 @@ const (
 // data without contacting a provider or public service.
 func TestDSHSearchThenReadCompletesThroughWorkerWithSourceDate(t *testing.T) {
 	executor, _, _, _, models, value := cloudDSHFixture(t)
+	value.InitiatorID = value.OwnerID
+	expiresAt := time.Now().Add(time.Hour)
+	value.Authorization = task.Authorization{Kind: string(identity.KindSession), TokenID: "t1234567",
+		Scopes: []string{string(identity.ScopeTaskRead), string(identity.ScopeTaskSubmit)}, Version: 1, ExpiresAt: &expiresAt}
+	value.ConversationContext = &task.ConversationContext{
+		OwnerID: value.OwnerID, InitiatorID: value.InitiatorID, ConversationID: value.ConversationID,
+		Scope: "personal", ThroughSequence: 0, Digest: bytes.Repeat([]byte{3}, 32),
+		AgentToolProfile: task.AgentToolProfileWebResearch,
+	}
 	searchTool := app.AgentToolDefinition{ModelTool: app.ModelTool{
 		Name: "morde_web_search", Description: "Search for recent public pages.",
 		Parameters: json.RawMessage(`{"type":"object","properties":{"query":{"type":"string"},"time_range":{"type":"string"}},"required":["query","time_range"],"additionalProperties":false}`),
@@ -42,7 +53,9 @@ func TestDSHSearchThenReadCompletesThroughWorkerWithSourceDate(t *testing.T) {
 		outputs:     map[string]string{searchTool.Name: searchReadSearchResult, readTool.Name: searchReadPageResult},
 	}
 	completion := &desktopChainCompleterStub{done: make(chan struct{}, 1)}
+	children := &cloudDSHProfileNoChildStore{}
 	executor.options.Tools = broker
+	executor.options.Children = children
 	executor.options.Completion = completion
 	model := &searchReadWorkerSyntheticModel{taskID: value.ID}
 	models.complete = model.Complete
@@ -103,6 +116,24 @@ func TestDSHSearchThenReadCompletesThroughWorkerWithSourceDate(t *testing.T) {
 	if model.callCount() != 3 || !model.searchResultSeen || !model.readResultSeen || !model.searchToolOffered || !model.readToolOffered {
 		t.Fatalf("model search/read observations = %#v; want search, exact result, read, page date, and final-answer rounds", model)
 	}
+	allowedProfileTools := map[string]bool{
+		"morde_web_search": true, "morde_web_read": true, cloudDSHResultEvidenceToolName: true,
+	}
+	if len(model.offeredToolNames) != len(allowedProfileTools) {
+		t.Fatalf("initial web research toolset = %v; want only Broker-authorized search/read plus the internal evidence mapper", model.offeredToolNames)
+	}
+	for _, name := range model.offeredToolNames {
+		if !allowedProfileTools[name] {
+			t.Fatalf("initial web research exposed an unrelated DSH tool %q in %v", name, model.offeredToolNames)
+		}
+	}
+	if children.listCalls != 0 {
+		t.Fatalf("web research profile queried child sessions %d times; child work must stay disabled", children.listCalls)
+	}
+	if broker.initialContextCalls != 0 || broker.memoryProofCalls != 0 {
+		t.Fatalf("web research loaded or validated personal context: initial_context_calls=%d memory_proof_calls=%d",
+			broker.initialContextCalls, broker.memoryProofCalls)
+	}
 	calls := broker.snapshotCalls()
 	want := []searchReadWorkerCall{
 		{taskID: value.ID, ownerID: value.OwnerID, initiatorID: value.InitiatorID, callID: searchReadSearchCallID,
@@ -129,6 +160,7 @@ func TestDSHSearchThenReadCompletesThroughWorkerWithSourceDate(t *testing.T) {
 type searchReadWorkerSyntheticModel struct {
 	taskID            string
 	calls             int
+	offeredToolNames  []string
 	searchToolOffered bool
 	readToolOffered   bool
 	searchResultSeen  bool
@@ -156,6 +188,9 @@ func (m *searchReadWorkerSyntheticModel) Complete(_ context.Context, call app.Mo
 		return app.ModelResponse{}, fmt.Errorf("decode DSH search/read request: %w", err)
 	}
 	for _, tool := range request.Tools {
+		if m.calls == 1 {
+			m.offeredToolNames = append(m.offeredToolNames, tool.Name)
+		}
 		switch tool.Name {
 		case "morde_web_search":
 			m.searchToolOffered = true
@@ -221,13 +256,32 @@ type searchReadWorkerCall struct {
 }
 
 type searchReadWorkerBrokerStub struct {
-	definitions []app.AgentToolDefinition
-	outputs     map[string]string
-	calls       []searchReadWorkerCall
+	definitions         []app.AgentToolDefinition
+	outputs             map[string]string
+	calls               []searchReadWorkerCall
+	initialContextCalls int
+	memoryProofCalls    int
 }
 
 func (b *searchReadWorkerBrokerStub) Definitions(context.Context, task.Task) ([]app.AgentToolDefinition, error) {
 	return append([]app.AgentToolDefinition(nil), b.definitions...), nil
+}
+
+func (b *searchReadWorkerBrokerStub) InitialContext(context.Context, task.Task) (string, error) {
+	b.initialContextCalls++
+	return "Unrelated private personal context that must not enter web research.", nil
+}
+
+func (*searchReadWorkerBrokerStub) CloudDSHPersonalMemoryProofEnabled() bool { return true }
+
+func (*searchReadWorkerBrokerStub) CloudDSHPersonalMemoryProofEnabledForTask(task.Task) bool {
+	return true
+}
+
+func (b *searchReadWorkerBrokerStub) ValidatePersonalMemoryProof(context.Context, task.Task, string,
+	[]app.CloudDSHMemoryVersion) error {
+	b.memoryProofCalls++
+	return errors.New("personal memory proof is not part of web research")
 }
 
 func (b *searchReadWorkerBrokerStub) Execute(_ context.Context, claimed task.Task, call app.ModelToolCall) (app.AgentToolResult, error) {

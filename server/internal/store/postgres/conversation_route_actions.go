@@ -915,13 +915,16 @@ WHERE service_instance_id=$1::uuid AND message_id=$2 AND owner_id=$3 AND actor_i
 		if !app.ValidConversationRouteModelOutput(decision.ModelOutput) {
 			return domain.InvalidArgument("route_decision", "conversation route model output is invalid")
 		}
+		if !app.ValidConversationRouteAgentToolProfile(decision, current.Context) {
+			return domain.InvalidArgument("route_decision", "conversation route Agent tool profile is invalid")
+		}
 		if decision.Action != app.ConversationRouteNew && len(decision.AggregateMessageIDs) != 0 {
 			return domain.InvalidArgument("route_decision", "aggregation candidates are only valid for a new Task")
 		}
 		if claim.Input.ResponseMode == app.ConversationResponseLongForm {
 			if decision.ModelOutput != "" || decision.InvalidOutput || decision.TaskID != "" || decision.TargetMessageID != "" ||
 				decision.Acknowledge || decision.ExplicitNew || decision.ExpectedRevision != 0 || len(decision.DependencyTaskIDs) != 0 ||
-				len(decision.AggregateMessageIDs) != 0 || decision.ToolName != "" || decision.ToolArguments != "" {
+				len(decision.AggregateMessageIDs) != 0 || decision.ToolName != "" || decision.ToolArguments != "" || decision.AgentToolProfile != "" {
 				return domain.InvalidArgument("route_decision", "long-form conversation decision contains unsupported fields")
 			}
 			switch decision.Action {
@@ -1065,10 +1068,10 @@ WHERE message_id=$1 AND actor_id=$2 AND phase='missing_predecessor' AND state='s
 				}
 			}
 			return createConversationRouteTask(ctx, tx, claim, routedContent, modelID, decision.DependencyTaskIDs,
-				decision.FileDeliveryIntent, current.Context.Candidates, current.Summary, nil)
+				decision.FileDeliveryIntent, current.Context.Candidates, current.Summary, decision.AgentToolProfile, nil)
 		case app.ConversationRouteTool:
 			return createConversationRouteTask(ctx, tx, claim, current.Context.Content, modelID, nil,
-				task.FileDeliveryNone, current.Context.Candidates, current.Summary, &decision)
+				task.FileDeliveryNone, current.Context.Candidates, current.Summary, "", &decision)
 		case app.ConversationRouteReply:
 			if current.Context.ResultReview != nil {
 				return publishConversationResultReviewInTx(ctx, tx, claim, decision.Reply)
@@ -2107,7 +2110,7 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 func createConversationRouteTask(ctx context.Context, tx pgx.Tx, claim app.ConversationRouteClaim, routedContent string, modelID string,
 	dependencyTaskIDs []string, fileDeliveryIntent task.FileDeliveryIntent,
 	candidates []app.ConversationRouteCandidate, storedSummary *app.StoredConversationSummary,
-	internalTool *app.ConversationRouteDecision) error {
+	agentToolProfile task.AgentToolProfile, internalTool *app.ConversationRouteDecision) error {
 	if err := validateInitialRouteAttachments(ctx, tx, claim); err != nil {
 		return err
 	}
@@ -2238,13 +2241,15 @@ FROM model_connections WHERE id=$1 FOR SHARE`, modelID, claim.Message.ActorID).S
 		prior = taskConversationContextWithoutSummarySources(prior, taskConversationSummarySources(storedSummary.Sources))
 	}
 	contextValue := buildTaskConversationContext(value.OwnerID, value.ProjectID, value.InitiatorID, value.ConversationID, through, prior, summary)
+	contextValue.AgentToolProfile = agentToolProfile
 	ids := make([]string, 0, len(contextValue.Messages))
 	for _, message := range contextValue.Messages {
 		ids = append(ids, message.ID)
 	}
 	manifest := taskConversationContextManifest{OwnerID: value.OwnerID, ProjectID: value.ProjectID, InitiatorID: value.InitiatorID,
 		ConversationID: value.ConversationID, Scope: contextValue.Scope, ThroughSequence: through,
-		MessageCount: len(ids), MessageIDs: ids, DigestSHA256: hex.EncodeToString(contextValue.Digest), Summary: contextValue.Summary}
+		MessageCount: len(ids), MessageIDs: ids, DigestSHA256: hex.EncodeToString(contextValue.Digest),
+		AgentToolProfile: agentToolProfile, Summary: contextValue.Summary}
 	if internalTool == nil && claim.Message.Content != "" && routedContent == claim.Message.Content && objective != routedContent {
 		manifest.CurrentMessageSource, err = app.BuildConversationMessageSourceManifest(claim.Message.ID, claim.Message.Sequence, claim.Message.Content)
 		if err != nil {
