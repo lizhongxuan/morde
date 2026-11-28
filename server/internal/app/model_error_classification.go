@@ -151,6 +151,7 @@ var modelClientErrorKindReasons = map[ModelClientErrorKind]FailoverReason{
 	ModelErrorInvalidResponse:   FailoverFormatError,
 	ModelErrorEmptyResponse:     FailoverIncompleteResponse,
 	ModelErrorTruncatedResponse: FailoverIncompleteResponse,
+	ModelErrorContentFiltered:   FailoverGuardrailBlocked,
 }
 
 // providerCodeFailoverReasons refines the kind mapping with the structured
@@ -254,6 +255,7 @@ var modelFailureDiagnosticCategoryReasons = map[string]FailoverReason{
 	"invalid_response":                 FailoverIncompleteResponse,
 	"empty_response":                   FailoverIncompleteResponse,
 	"truncated_response":               FailoverIncompleteResponse,
+	"content_filtered":                 FailoverGuardrailBlocked,
 	"stream_result_mismatch":           FailoverIncompleteResponse,
 	"context_length_exceeded":          FailoverContextOverflow,
 	"provider_context_length_exceeded": FailoverContextOverflow,

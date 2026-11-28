@@ -2968,6 +2968,30 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel processing of an accepted project conversation message
+         * @description Only the original message actor may cancel. Cancellation is idempotent and is bound to this project, conversation, message, service instance, and authenticated actor. The response uses the accepted-message envelope and returns the current source message state.
+         */
+        post: operations["cancelProjectConversationMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-processing": {
         parameters: {
             query?: never;
@@ -3672,6 +3696,29 @@ export interface paths {
          * @description Persists the user's message and routing receipt. Task selection and execution happen asynchronously after acceptance; this response does not require a Task to exist. Set change_task_target=true only when an instruction explicitly changes the target of a referenced Task; otherwise host_id, workspace_id, and application_id are selection hints for new work and do not retarget that Task. The Idempotency-Key must equal client_message_id.
          */
         post: operations["acceptConversationMessage"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/conversations/{id}/messages/{message_id}/cancel": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Cancel processing of an accepted conversation message
+         * @description Only the original message actor may cancel. Cancellation is idempotent and is bound to this conversation, message, service instance, and authenticated actor. The response uses the accepted-message envelope and returns the current source message state.
+         */
+        post: operations["cancelConversationMessage"];
         delete?: never;
         options?: never;
         head?: never;
@@ -6285,7 +6332,7 @@ export interface paths {
         put?: never;
         /**
          * Record provider-verified usage for an unknown model call
-         * @description An approved administrator verifies the provider's counts before submitting them. The ledger, associated server Task usage and audit record commit atomically. Only unknown calls can be reconciled. A repeat by the same administrator with identical counts and evidence is idempotent; different submissions conflict. This does not restore an unpersisted model response or restart the call.
+         * @description An approved administrator verifies the provider's counts before submitting them. The ledger, associated server Task usage and audit record commit atomically. For an adaptive Task budget overage, the administrator must confirm authoritative provider usage; the account and project ledgers are settled with those verified actual amounts even when they exceed the original hold, and the overage record is resolved with the administrator, evidence and verified amounts. This does not increase any budget, restore an unpersisted model response, or restart the call. Other unknown calls still cannot be reconciled above their signed reservation. A repeat by the same administrator with identical counts and evidence is idempotent; different submissions conflict.
          */
         post: operations["reconcileUnknownModelUsage"];
         delete?: never;
@@ -9437,8 +9484,13 @@ export interface components {
             /** @description Task associated through the original request */
             related_task_id?: components["schemas"]["TaskId"];
             client_message_id?: string;
+            /**
+             * @description Requested direct-reply mode for this user message; legacy messages may omit it.
+             * @enum {string}
+             */
+            response_mode?: "short" | "long_form";
             /** @enum {string} */
-            routing_status?: "pending" | "processing" | "routed" | "waiting_user" | "waiting_adjustment" | "failed";
+            routing_status?: "pending" | "processing" | "cancel_requested" | "routed" | "waiting_user" | "waiting_adjustment" | "partial" | "cancelled" | "failed";
             /** @enum {string} */
             routing_failure_reason?: "model_unavailable" | "routing_context_unavailable" | "routing_action_unavailable" | "message_too_long";
             /** @description True only after the Main Agent chose to acknowledge this message and its associated background Task actually started. Clients cannot set this field. */
@@ -9518,6 +9570,11 @@ export interface components {
             model_id?: string;
             /** @description Optional IANA time-zone identifier captured when the user sends the message. */
             time_zone?: string;
+            /**
+             * @description Explicitly choose a direct short response or the bounded long-form conversation reply path. Omission defaults to short.
+             * @enum {string}
+             */
+            response_mode?: "short" | "long_form";
             content: string;
             mcp_connector_ids?: components["schemas"]["MCPConnectorId"][];
             client_attachment_ids?: string[];
@@ -10363,6 +10420,7 @@ export interface components {
             result_event_sequence?: number;
             /** @constant */
             role: "assistant";
+            /** @description Maximum UTF-8 encoded size is 2 MiB; streaming deltas are each limited to 32 KiB. */
             content: string;
             /** @enum {string} */
             status: "streaming" | "completed" | "interrupted";
@@ -16650,6 +16708,41 @@ export interface operations {
             default: components["responses"]["Error"];
         };
     };
+    cancelProjectConversationMessage: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["parameters"]["ProjectId"];
+                conversation_id: components["parameters"]["ProjectConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancellation was accepted or had already been applied. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedProjectConversationMessageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
     retryProjectConversationMessageProcessing: {
         parameters: {
             query?: never;
@@ -17994,6 +18087,40 @@ export interface operations {
         };
         responses: {
             /** @description The message and routing receipt were durably accepted. A Task may be created later. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AcceptedConversationMessageResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            default: components["responses"]["Error"];
+        };
+    };
+    cancelConversationMessage: {
+        parameters: {
+            query?: never;
+            header: {
+                /** @description Current service instance UUID; a mismatch fails without writing. */
+                "X-Morde-Service-Instance-ID": components["parameters"]["ServiceInstanceID"];
+                /** @description Original outbox account ID, which must match the authenticated account. */
+                "X-Morde-Actor-ID": components["parameters"]["MessageActor"];
+            };
+            path: {
+                id: components["schemas"]["ConversationId"];
+                message_id: components["schemas"]["MessageId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Cancellation was accepted or had already been applied. */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -22260,7 +22387,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Unknown calls; no prompt, response, or credential is returned. */
+            /** @description Unknown calls; no prompt, response, or credential is returned. An adaptive_budget_overage object is included when provider-reported usage exceeded a signed adaptive Task hold and the administrator must confirm the usage with provider evidence. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -22281,6 +22408,32 @@ export interface operations {
                             created_at: string;
                             /** Format: date-time */
                             unknown_at: string;
+                            adaptive_budget_overage?: {
+                                /** @enum {string} */
+                                status: "open";
+                                /** @enum {string} */
+                                reason_code: "input_bound_exceeded" | "output_cap_exceeded" | "input_and_output_exceeded";
+                                /** Format: int64 */
+                                reserved_input_tokens: number;
+                                /** Format: int64 */
+                                reserved_output_tokens: number;
+                                /** Format: int64 */
+                                reported_input_tokens: number;
+                                /** Format: int64 */
+                                reported_output_tokens: number;
+                                /** Format: int64 */
+                                input_overage_tokens: number;
+                                /** Format: int64 */
+                                output_overage_tokens: number;
+                                project_id?: string;
+                                currency?: string;
+                                /** Format: int64 */
+                                reserved_micros?: number;
+                                /** Format: int64 */
+                                reported_micros?: number;
+                                /** Format: int64 */
+                                money_overage_micros?: number;
+                            };
                         }[];
                     };
                 };

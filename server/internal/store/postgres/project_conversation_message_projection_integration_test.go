@@ -9,8 +9,41 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/conversation"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
+	"morde/server/internal/domain/task"
 )
+
+func TestProjectConversationMessageProjectsExplicitResponseMode(t *testing.T) {
+	f := newProjectAttachmentFixture(t)
+	ctx := context.Background()
+	const clientID = "project-long-reply-mode-001"
+	token, err := f.store.GetTokenByID(ctx, f.member.TokenID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256([]byte(clientID))
+	_, _, err = f.store.AcceptConversationMessage(ctx, app.ConversationMessageReceipt{
+		Message: conversation.Message{ID: mustID(t, domain.NewMessageID), OwnerID: f.owner.UserID, ActorID: f.member.UserID,
+			ConversationID: f.conversationID, Role: conversation.RoleUser, Content: "Explain this project topic carefully"},
+		ServiceInstanceID: f.instanceID, ClientID: clientID, RequestHash: hash[:],
+		Input:         app.ConversationRoutingInput{ProjectID: f.projectID, ResponseMode: app.ConversationResponseLongForm},
+		Authorization: task.Authorization{Kind: string(identity.KindSession), TokenID: token.ID, Version: 1, ExpiresAt: &token.ExpiresAt},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	page, err := f.store.ListProjectConversationMessages(ctx, f.member.UserID, f.projectID, f.conversationID, app.PageRequest{Limit: 20})
+	if err != nil || len(page.Items) != 1 || page.Items[0].ResponseMode != app.ConversationResponseLongForm {
+		t.Fatalf("project message history omitted long-form mode: items=%+v err=%v", page.Items, err)
+	}
+	reconciled, found, err := f.store.FindConversationMessageByClientID(ctx, f.member.UserID, f.projectID, f.conversationID,
+		clientID, f.instanceID)
+	if err != nil || !found || reconciled.ResponseMode != app.ConversationResponseLongForm {
+		t.Fatalf("project outbox reconciliation omitted long-form mode: message=%+v found=%t err=%v", reconciled, found, err)
+	}
+}
 
 func TestProjectMessageProjectsOnlyCommittedAttachmentsAndAuthorAcknowledgement(t *testing.T) {
 	f := newProjectAttachmentFixture(t)

@@ -386,7 +386,7 @@ func TaskTerminalDeliveryWaitingExplanation(reason string) string {
 	case "unknown_outcome":
 		return "系统无法确认上一步操作是否完成。"
 	case "reconciliation_required":
-		return "这次执行没有得到已确认的最终答复。"
+		return "现有记录无法确定具体的中断原因，也无法确认上一步操作是否完成。"
 	case "external_dependency":
 		return "任务遇到外部依赖或运行条件问题，没有继续完成。"
 	default:

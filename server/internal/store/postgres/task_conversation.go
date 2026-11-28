@@ -572,7 +572,7 @@ COALESCE(r.client_message_id,''),COALESCE(r.duplicate_of_message_id,''),
 CASE WHEN r.duplicate_of_message_id IS NOT NULL AND NOT EXISTS (
  SELECT 1 FROM conversation_route_internal_tool_calls hidden WHERE hidden.task_id=original_message.task_id
 ) THEN COALESCE(original_message.task_id,'') ELSE '' END,
-COALESCE(original_route.state,r.state,''),COALESCE(original_route.failure_reason,r.failure_reason,''),
+CASE WHEN COALESCE(original_route.state,r.state)='processing' AND COALESCE(original_route.cancel_requested_at,r.cancel_requested_at) IS NOT NULL THEN 'cancel_requested' ELSE COALESCE(original_route.state,r.state,'') END,COALESCE(original_route.failure_reason,r.failure_reason,''),COALESCE(r.request_metadata->>'response_mode',''),
 COALESCE(r.agent_acknowledged,false),
 CASE WHEN m.output_status='streaming' AND NOT EXISTS (
  SELECT 1 FROM tasks live WHERE live.id=m.task_id AND live.status='running' AND live.lease_expires_at>clock_timestamp()
@@ -616,7 +616,7 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 	items := make([]conversation.Message, 0)
 	for rows.Next() {
 		var row sqlcgen.ConversationMessage
-		var deliveryStatus, clientID, duplicateID, relatedTaskID, routingStatus, routingFailure string
+		var deliveryStatus, clientID, duplicateID, relatedTaskID, routingStatus, routingFailure, responseMode string
 		var agentAcknowledged bool
 		var outputStatus string
 		var outputRevision, outputEvent pgtype.Int8
@@ -626,7 +626,7 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 		var internalDispatched, internalUnknown bool
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
-			&row.Sequence, &deliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure,
+			&row.Sequence, &deliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure, &responseMode,
 			&agentAcknowledged, &outputStatus, &outputRevision, &outputEvent, &variantGroupID, &variantVersion, &variantAction,
 			&internalToolName, &internalTaskStatus, &internalStepStatus, &internalDispatched, &internalUnknown); err != nil {
 			rows.Close()
@@ -639,6 +639,7 @@ ORDER BY m.sequence DESC LIMIT $4`, ownerID, conversationID, before, limit+1)
 		message.RelatedTaskID = relatedTaskID
 		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
 		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
+		message.ResponseMode = responseMode
 		message.AgentAcknowledged = agentAcknowledged
 		message.ToolActivity = conversationToolActivity(internalToolName, internalTaskStatus, internalStepStatus, internalDispatched, internalUnknown)
 		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)
@@ -693,7 +694,7 @@ CASE WHEN r.actor_id=$2 THEN COALESCE(r.duplicate_of_message_id,'') ELSE '' END,
 CASE WHEN r.actor_id=$2 AND r.duplicate_of_message_id IS NOT NULL AND NOT EXISTS (
  SELECT 1 FROM conversation_route_internal_tool_calls hidden WHERE hidden.task_id=original_message.task_id
 ) THEN COALESCE(original_message.task_id,'') ELSE '' END,
-COALESCE(original_route.state,r.state,''),COALESCE(original_route.failure_reason,r.failure_reason,''),
+CASE WHEN COALESCE(original_route.state,r.state)='processing' AND COALESCE(original_route.cancel_requested_at,r.cancel_requested_at) IS NOT NULL THEN 'cancel_requested' ELSE COALESCE(original_route.state,r.state,'') END,COALESCE(original_route.failure_reason,r.failure_reason,''),COALESCE(r.request_metadata->>'response_mode',''),
 CASE WHEN r.actor_id=$2 THEN COALESCE(r.agent_acknowledged,false) ELSE false END,
 CASE WHEN m.output_status='streaming' AND NOT EXISTS (
  SELECT 1 FROM tasks live WHERE live.id=m.task_id AND live.status='running' AND live.lease_expires_at>clock_timestamp()
@@ -739,7 +740,7 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 	items := make([]conversation.Message, 0)
 	for rows.Next() {
 		var row sqlcgen.ConversationMessage
-		var clientID, duplicateID, relatedTaskID, routingStatus, routingFailure string
+		var clientID, duplicateID, relatedTaskID, routingStatus, routingFailure, responseMode string
 		var agentAcknowledged bool
 		var outputStatus string
 		var outputRevision, outputEvent pgtype.Int8
@@ -749,7 +750,7 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		var internalDispatched, internalUnknown bool
 		if err := rows.Scan(&row.ID, &row.ConversationID, &row.OwnerID, &row.Role, &row.Content, &row.TaskID,
 			&row.CreatedAt, &row.ModelID, &row.SourceKind, &row.SourceExchangeID, &row.RequestedConversationID,
-			&row.Sequence, &row.DeliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure,
+			&row.Sequence, &row.DeliveryStatus, &row.ActorID, &clientID, &duplicateID, &relatedTaskID, &routingStatus, &routingFailure, &responseMode,
 			&agentAcknowledged, &outputStatus, &outputRevision, &outputEvent, &variantGroupID, &variantVersion, &variantAction,
 			&internalToolName, &internalTaskStatus, &internalStepStatus, &internalDispatched, &internalUnknown); err != nil {
 			rows.Close()
@@ -762,6 +763,7 @@ ORDER BY m.sequence DESC LIMIT $5`, projectID, actorID, conversationID, before, 
 		message.RelatedTaskID = relatedTaskID
 		message.RoutingStatus = conversation.RoutingStatus(routingStatus)
 		message.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
+		message.ResponseMode = responseMode
 		message.AgentAcknowledged = agentAcknowledged
 		message.ToolActivity = conversationToolActivity(internalToolName, internalTaskStatus, internalStepStatus, internalDispatched, internalUnknown)
 		applyConversationOutputProjection(&message, outputStatus, outputRevision, outputEvent)

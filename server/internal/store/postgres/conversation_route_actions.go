@@ -882,6 +882,21 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 		if err := lockConversationRouteClaim(ctx, tx, claim); err != nil {
 			return err
 		}
+		var cancelRequested bool
+		if err := tx.QueryRow(ctx, `SELECT cancel_requested_at IS NOT NULL FROM conversation_message_routes
+WHERE service_instance_id=$1::uuid AND message_id=$2 AND owner_id=$3 AND actor_id=$4 AND conversation_id=$5 FOR UPDATE`,
+			claim.ServiceInstanceID, claim.Message.ID, claim.Message.OwnerID, claim.Message.ActorID, claim.Message.ConversationID).Scan(&cancelRequested); err != nil {
+			return fmt.Errorf("read long-form conversation cancellation: %w", err)
+		}
+		if cancelRequested {
+			if claim.Input.ResponseMode != app.ConversationResponseLongForm {
+				return domain.NewError(domain.CodeInvalidState, "a short conversation route cannot be cancelled as a long reply")
+			}
+			return finishConversationRoute(ctx, tx, claim, "cancelled", "", "", true)
+		}
+		if decision.Cancelled {
+			return domain.NewError(domain.CodeConflict, "long-form cancellation has not been recorded")
+		}
 		current, err := loadConversationRouteSnapshotInTx(ctx, tx, claim, true)
 		if err != nil {
 			return err
@@ -903,14 +918,39 @@ func (s *Store) ApplyConversationRoute(ctx context.Context, claim app.Conversati
 		if decision.Action != app.ConversationRouteNew && len(decision.AggregateMessageIDs) != 0 {
 			return domain.InvalidArgument("route_decision", "aggregation candidates are only valid for a new Task")
 		}
-		if decision.Action == app.ConversationRouteReply {
-			if decision.TaskID != "" || decision.ExpectedRevision != 0 || decision.Question != "" ||
-				!app.ValidConversationRouteReply(decision.Reply) {
-				return domain.InvalidArgument("route_decision", "direct conversation reply is invalid")
+		if claim.Input.ResponseMode == app.ConversationResponseLongForm {
+			if decision.ModelOutput != "" || decision.InvalidOutput || decision.TaskID != "" || decision.TargetMessageID != "" ||
+				decision.Acknowledge || decision.ExplicitNew || decision.ExpectedRevision != 0 || len(decision.DependencyTaskIDs) != 0 ||
+				len(decision.AggregateMessageIDs) != 0 || decision.ToolName != "" || decision.ToolArguments != "" {
+				return domain.InvalidArgument("route_decision", "long-form conversation decision contains unsupported fields")
 			}
-			decision.Reply = strings.TrimSpace(decision.Reply)
-		} else if decision.Reply != "" {
-			return domain.InvalidArgument("route_decision", "reply text is only valid for a direct reply")
+			switch decision.Action {
+			case app.ConversationRouteReply:
+				if !decision.LongReply || decision.Question != "" || !app.ValidConversationLongReply(decision.Reply) {
+					return domain.InvalidArgument("route_decision", "long-form conversation reply is invalid")
+				}
+				decision.Reply = strings.TrimSpace(decision.Reply)
+			case app.ConversationRouteClarify:
+				if !decision.LongReply || decision.Partial || decision.Reply != "" || strings.TrimSpace(decision.Question) == "" ||
+					!utf8.ValidString(decision.Question) || strings.ContainsRune(decision.Question, '\x00') || utf8.RuneCountInString(decision.Question) > 200 {
+					return domain.InvalidArgument("route_decision", "long-form clarification is invalid")
+				}
+				decision.Question = strings.TrimSpace(decision.Question)
+			default:
+				return domain.InvalidArgument("route_decision", "long-form replies cannot route Tasks or tools")
+			}
+		} else {
+			if decision.LongReply || decision.Partial {
+				return domain.InvalidArgument("route_decision", "long-form reply fields are unavailable for this route")
+			}
+			if decision.Action == app.ConversationRouteReply {
+				if decision.TaskID != "" || decision.ExpectedRevision != 0 || decision.Question != "" || !app.ValidConversationRouteReply(decision.Reply) {
+					return domain.InvalidArgument("route_decision", "direct conversation reply is invalid")
+				}
+				decision.Reply = strings.TrimSpace(decision.Reply)
+			} else if decision.Reply != "" {
+				return domain.InvalidArgument("route_decision", "reply text is only valid for a direct reply")
+			}
 		}
 		if decision.Action == app.ConversationRouteTool {
 			if decision.Acknowledge || decision.TaskID != "" || decision.TargetMessageID != "" || decision.ExplicitNew ||
@@ -1042,7 +1082,11 @@ WHERE id=$1 AND owner_id=$2 AND actor_id=$3 AND conversation_id=$4 AND role='use
 			if result.RowsAffected() != 1 {
 				return domain.NewError(domain.CodeConflict, "conversation message is no longer awaiting a direct reply")
 			}
-			return finishConversationRoute(ctx, tx, claim, "routed", decision.Reply, "", true)
+			routeState := "routed"
+			if decision.Partial {
+				routeState = "partial"
+			}
+			return finishConversationRoute(ctx, tx, claim, routeState, decision.Reply, "", true)
 		case app.ConversationRouteSteer:
 			if candidate == nil || candidate.Status != task.StatusRunning {
 				return domain.NewError(domain.CodeConflict, "conversation supplement Task is no longer running")

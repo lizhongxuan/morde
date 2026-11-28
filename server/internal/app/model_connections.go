@@ -371,7 +371,7 @@ func (s *ModelConnectionService) Update(ctx context.Context, principal identity.
 		current.Capabilities = ModelCapabilities{ModelID: current.ID}
 		current.CheckedAt = nil
 	}
-	if routeChanged || keyChanged || command.ContextWindowOverridePresent || command.LegacyContextWindowPresent {
+	if routeChanged || keyChanged || command.ContextWindowOverridePresent || command.LegacyContextWindowPresent || modelContextWindowCapacityNeedsRefresh(current) {
 		applyModelContextCapacity(&current, time.Now().UTC())
 	}
 	if routeChanged || keyChanged || command.MaxOutputOverridePresent || modelMaxOutputCapacityNeedsRefresh(current) {
@@ -491,6 +491,7 @@ func (s *ModelConnectionService) ResolveGatewayEndpoint(ctx context.Context, own
 	if (record.OwnerID != "" && record.OwnerID != ownerID) || record.CheckedAt == nil || !record.Capabilities.Text {
 		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
 	}
+	record = modelConnectionWithFreshCapacities(record)
 	if needsTools && !record.Capabilities.Tools {
 		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeUnsupported, "selected model does not support tool calls")
 	}
@@ -525,6 +526,7 @@ func (s *ModelConnectionService) ResolveProbeEndpoint(ctx context.Context, princ
 	if !canManageModelConnection(principal, record) {
 		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
 	}
+	record = modelConnectionWithFreshCapacities(record)
 	key, err := s.sealer.Open(record.APIKeyCipher)
 	if err != nil {
 		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
@@ -599,6 +601,7 @@ func (s *ModelConnectionService) ResolveMediaGenerationEndpoint(ctx context.Cont
 	if record.OwnerID != "" || record.CheckedAt == nil || !available {
 		return ModelGatewayEndpoint{}, domain.NewError(domain.CodeNotFound, "model connection not found")
 	}
+	record = modelConnectionWithFreshCapacities(record)
 	key, err := s.sealer.Open(record.APIKeyCipher)
 	if err != nil {
 		return ModelGatewayEndpoint{}, fmt.Errorf("decrypt model API key: %w", err)
@@ -637,36 +640,43 @@ func canManageModelConnection(principal identity.Principal, record ModelConnecti
 }
 
 func modelConnectionView(record ModelConnectionRecord) ModelConnectionView {
+	record = modelConnectionWithFreshCapacities(record)
 	source := record.ContextWindowSource
 	if source == "" {
 		source = ModelContextWindowUnknown
-	}
-	maxOutputTokens := copyInt(record.MaxOutputTokens)
-	maxOutputOverrideTokens := copyInt(record.MaxOutputOverrideTokens)
-	maxOutputSource := modelMaxOutputSource(record.MaxOutputSource)
-	maxOutputResolvedAt := copyTime(record.MaxOutputResolvedAt)
-	maxOutputCatalogVersion := copyString(record.MaxOutputCatalogVersion)
-	maxOutputSourceURL := copyString(record.MaxOutputSourceURL)
-	if modelMaxOutputCapacityNeedsRefresh(record) {
-		// A read must never expose a capacity resolved for another catalog version or route.
-		maxOutputTokens = nil
-		maxOutputOverrideTokens = nil
-		maxOutputSource = ModelMaxOutputUnknown
-		maxOutputResolvedAt = nil
-		maxOutputCatalogVersion = nil
-		maxOutputSourceURL = nil
 	}
 	return ModelConnectionView{
 		ID: record.ID, Name: record.Name, BaseURL: record.BaseURL, ModelName: record.ModelName,
 		ContextWindowTokens: copyInt(record.ContextWindowTokens), ContextWindowOverrideTokens: copyInt(record.ContextWindowOverrideTokens),
 		ContextWindowSource: source, ContextWindowResolvedAt: copyTime(record.ContextWindowResolvedAt),
 		ContextWindowCatalogVersion: copyString(record.ContextWindowCatalogVersion),
-		MaxOutputTokens:             maxOutputTokens, MaxOutputOverrideTokens: maxOutputOverrideTokens,
-		MaxOutputSource: maxOutputSource, MaxOutputResolvedAt: maxOutputResolvedAt,
-		MaxOutputCatalogVersion: maxOutputCatalogVersion, MaxOutputSourceURL: maxOutputSourceURL,
+		MaxOutputTokens:             copyInt(record.MaxOutputTokens), MaxOutputOverrideTokens: copyInt(record.MaxOutputOverrideTokens),
+		MaxOutputSource: modelMaxOutputSource(record.MaxOutputSource), MaxOutputResolvedAt: copyTime(record.MaxOutputResolvedAt),
+		MaxOutputCatalogVersion: copyString(record.MaxOutputCatalogVersion), MaxOutputSourceURL: copyString(record.MaxOutputSourceURL),
 		Shared: record.OwnerID == "", HasAPIKey: len(record.APIKeyCipher) > 0,
 		Capabilities: record.Capabilities, CheckedAt: record.CheckedAt, CreatedAt: record.CreatedAt, UpdatedAt: record.UpdatedAt,
 	}
+}
+
+func modelConnectionWithFreshCapacities(record ModelConnectionRecord) ModelConnectionRecord {
+	if modelMaxOutputCapacityNeedsRefresh(record) {
+		// A read must never expose output capacity resolved for another catalog version or route.
+		record.MaxOutputTokens = nil
+		record.MaxOutputOverrideTokens = nil
+		record.MaxOutputSource = ModelMaxOutputUnknown
+		record.MaxOutputResolvedAt = nil
+		record.MaxOutputCatalogVersion = nil
+		record.MaxOutputSourceURL = nil
+	}
+	if modelContextWindowCapacityNeedsRefresh(record) {
+		// Adaptive planning must not use a context size from another catalog version or route.
+		record.ContextWindowTokens = nil
+		record.ContextWindowOverrideTokens = nil
+		record.ContextWindowSource = ModelContextWindowUnknown
+		record.ContextWindowResolvedAt = nil
+		record.ContextWindowCatalogVersion = nil
+	}
+	return record
 }
 
 func modelMaxOutputSource(value ModelMaxOutputSource) ModelMaxOutputSource {

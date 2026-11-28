@@ -4,6 +4,7 @@ import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
 import type { ConversationDeliveryStatus, HostEmbedTicket, HostEmbedTicketRequest, HostMemberPermission } from '../app/api';
+import type { components } from '../api/schema';
 import { readK2TaskProjection } from '../app/k2-task-projection';
 import type { K2ResultReview } from '../app/k2-task-projection';
 import type { MessageOutboxEntry } from '../app/use-message-outbox';
@@ -42,6 +43,8 @@ type Conversation = Awaited<ReturnType<typeof portalApi.conversations>>['items']
 type ConversationMessage = Awaited<ReturnType<typeof portalApi.conversationMessages>>['items'][number];
 type ConversationMessagePage = Awaited<ReturnType<typeof portalApi.conversationMessages>>;
 type ConversationMessagesData = { pages: ConversationMessagePage[]; pageParams: unknown[] };
+type ConversationResponseMode = 'short' | 'long_form';
+type ConversationMessageRequest = components['schemas']['AcceptConversationMessageRequest'] & { response_mode?: ConversationResponseMode };
 type TaskSummary = Awaited<ReturnType<typeof portalApi.tasks>>['items'][number];
 type Task = Awaited<ReturnType<typeof portalApi.task>>;
 type AssistantTaskAttention = {
@@ -169,6 +172,11 @@ function conversationMessageActorID(message: RoutingFailureMessage): string | un
 function isUnlinkedRoutingFailure(message: RoutingFailureMessage): boolean {
   return message.role === 'user' && message.routing_status === 'failed'
     && !message.task_id && !message.related_task_id && !message.duplicate_of_message_id;
+}
+
+function conversationResponseMode(value: unknown): ConversationResponseMode | undefined {
+  if (!value || typeof value !== 'object' || !('response_mode' in value)) return undefined;
+  return value.response_mode === 'short' || value.response_mode === 'long_form' ? value.response_mode : undefined;
 }
 
 function retryEligibilityReasonText(reason: string): string {
@@ -1496,6 +1504,7 @@ export function Assistant() {
   const [modelID, setModelID] = useState('');
   const [mcpConnectorIDs, setMcpConnectorIDs] = useState<string[]>([]);
   const [content, setContent] = useState(() => hasNavigationIdea ? ideaPrompt : '');
+  const [responseMode, setResponseMode] = useState<ConversationResponseMode>('short');
   const [savingMessage, setSavingMessage] = useState(false);
   const [composerAttachments, setComposerAttachments] = useState<ComposerAttachment[]>([]);
   const [officePreviews, setOfficePreviews] = useState<Record<string, OfficePreviewState>>({});
@@ -2046,7 +2055,7 @@ export function Assistant() {
     getNextPageParam: (page) => page.next_cursor ?? undefined,
     enabled: Boolean(conversationID),
     refetchInterval: (query) => !isResourceNoLongerAccessible(query.state.error) && query.state.data?.pages.some((page) => page.items.some((item) =>
-      item.routing_status === 'pending' || item.routing_status === 'processing' || item.routing_status === 'waiting_adjustment' ||
+      item.routing_status === 'pending' || item.routing_status === 'processing' || item.routing_status === 'cancel_requested' || item.routing_status === 'waiting_adjustment' ||
       ['queued', 'running', 'waiting_user'].includes(conversationToolActivity(item)?.status ?? ''))) ? 2000 : false,
   });
   const conversationContentAccessRevoked = isResourceNoLongerAccessible(messages.error);
@@ -2135,6 +2144,42 @@ export function Assistant() {
     onError: (error, target) => {
       void client.invalidateQueries({ queryKey: ['conversation-message-retry-eligibility', conversationID, target.messageID] });
       notify(errorDetails(error).message, 'error');
+    },
+  });
+  const cancelLongReply = useMutation({
+    mutationFn: async (targetInput: { conversationID: string; messageID: string }) => {
+      const target = conversationMessageItems.find((item) => item.id === targetInput.messageID &&
+        item.conversation_id === targetInput.conversationID);
+      const actorID = user?.id;
+      const serviceInstanceID = capabilities.data?.service_instance_id;
+      const routingStatus = target?.routing_status as string | undefined;
+      if (!target || target.role !== 'user' || conversationResponseMode(target) !== 'long_form' ||
+        !['pending', 'processing'].includes(routingStatus ?? '') || !actorID || conversationMessageActorID(target) !== actorID ||
+        !serviceInstanceID || !capabilities.isSuccess || capabilities.isError || capabilities.isFetching ||
+        currentRetryIdentity.current.actorID !== actorID || currentRetryIdentity.current.serviceInstanceID !== serviceInstanceID) {
+        throw new Error('长回复、账号或服务状态尚未通过取消检查。');
+      }
+      const result = await portalApi.cancelConversationMessage(target.conversation_id, target.id, serviceInstanceID, actorID);
+      return { ...result, conversationID: target.conversation_id, messageID: target.id };
+    },
+    onSuccess: async (result) => {
+      const queryKey = ['conversation-messages', result.conversationID] as const;
+      client.setQueryData<ConversationMessagesData>(queryKey, (previous) => previous && ({
+        ...previous,
+        pages: previous.pages.map((page) => ({
+          ...page,
+          items: page.items.map((item) => item.id === result.messageID ? result.message : item),
+        })),
+      }));
+      await client.invalidateQueries({ queryKey });
+      const routingStatus = String(result.message.routing_status);
+      notify(routingStatus === 'cancelled' ? '长回复已取消。'
+        : routingStatus === 'partial' ? '长回复已停止，已保存的部分内容仍保留。'
+          : '取消请求已受理，正在核对长回复状态。', 'success');
+    },
+    onError: (error, target) => {
+      void client.invalidateQueries({ queryKey: ['conversation-messages', target.conversationID] });
+      notify(`无法确认长回复是否已取消：${errorDetails(error).message}`, 'error');
     },
   });
   const conversationTasks = useQuery({
@@ -2813,7 +2858,10 @@ export function Assistant() {
       }
 
       if (!accepted) {
-        const request = outboxReceiptRequest(message);
+        const request: ConversationMessageRequest = {
+          ...outboxReceiptRequest(message),
+          ...(conversationResponseMode(message.request) === 'long_form' ? { response_mode: 'long_form' } : {}),
+        };
         await outbox.change(scope, id, (current) => ({ ...current, status: 'sending', error: undefined }));
         checkScope();
         let receipt: ConversationMessage;
@@ -3218,6 +3266,7 @@ export function Assistant() {
     const text = content;
     if (!text.trim() && !composerAttachments.length) return;
     const effectiveText = text.trim() ? text : '请阅读并处理我附加的文件。';
+    const selectedResponseMode = responseMode;
     const timeZone = browserIanaTimeZone();
     if (new TextEncoder().encode(effectiveText).length > maxMessageBytes) {
       notify('单条消息不能超过 8 MiB；完整内容仍保留在输入框中。', 'error');
@@ -3237,16 +3286,18 @@ export function Assistant() {
     savingMessageRef.current = true;
     setSavingMessage(true);
     const previous = pendingMessageSave.current.then(async () => {
+      const request: ConversationMessageRequest = {
+        client_message_id: id, content: effectiveText,
+        ...(timeZone ? { time_zone: timeZone } : {}),
+        ...(submissionModelID ? { model_id: submissionModelID } : {}),
+        ...(preferredHostID && selectedResponseMode === 'short' ? { host_id: preferredHostID } : {}),
+        ...(mcpConnectorIDs.length && selectedResponseMode === 'short' ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
+        ...(attachments.length ? { client_attachment_ids: attachments.map((item) => item.id) } : {}),
+        ...(selectedResponseMode === 'long_form' ? { response_mode: 'long_form' } : {}),
+      };
       const message: PendingConversationMessage = {
         actorID: user?.id ?? '',
-        request: {
-          client_message_id: id, content: effectiveText,
-          ...(timeZone ? { time_zone: timeZone } : {}),
-          ...(submissionModelID ? { model_id: submissionModelID } : {}),
-          ...(preferredHostID ? { host_id: preferredHostID } : {}),
-          ...(mcpConnectorIDs.length ? { mcp_connector_ids: [...mcpConnectorIDs] } : {}),
-          ...(attachments.length ? { client_attachment_ids: attachments.map((item) => item.id) } : {}),
-        },
+        request,
         conversationID, ...(createKey ? { conversationCreateKey: createKey } : {}),
         ...(capabilities.data?.service_instance_id ? { serviceInstanceID: capabilities.data.service_instance_id } : {}),
         attachments, status: 'pending', createdAt: Date.now(),
@@ -4092,6 +4143,14 @@ export function Assistant() {
                 </div>}
                 {displayMessages.map((message, index) => {
                   const messageTaskID = message.task_id ?? message.related_task_id ?? '';
+                  const messageResponseMode = conversationResponseMode(message);
+                  const messageRoutingStatus = message.routing_status as string | undefined;
+                  const longReplyIsPending = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'pending';
+                  const longReplyIsProcessing = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'processing';
+                  const longReplyIsCancelRequested = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'cancel_requested';
+                  const longReplyIsPartial = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'partial';
+                  const longReplyIsCancelled = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'cancelled';
+                  const cancellingThisLongReply = cancelLongReply.isPending && cancelLongReply.variables?.messageID === message.id;
                   const messageTask = tasksByID.get(messageTaskID);
                   const messageActorID = conversationMessageActorID(message);
                   const acknowledgedByServer = message.role === 'user' && message.agent_acknowledged === true &&
@@ -4166,6 +4225,7 @@ export function Assistant() {
                     <div className="chat-message-meta">
                       <time className="chat-message-time" dateTime={message.created_at}
                         aria-label={`${message.role === 'assistant' ? '回复' : '消息'}时间：${formatDate(message.created_at)}`}>{formatDate(message.created_at)}</time>
+                      {messageResponseMode === 'long_form' && message.role === 'user' && <span className="chat-message-status" aria-label="长回复模式">长回复</span>}
                       <button type="button" className="chat-message-copy"
                         aria-label={message.role === 'assistant' ? '复制 Morde 回复' : '复制你的消息'}
                         title={message.role === 'assistant' ? '复制回复' : '复制消息'}
@@ -4191,6 +4251,26 @@ export function Assistant() {
                     </section>}
                     </div>
                     </div>
+                    {(longReplyIsPending || longReplyIsProcessing || longReplyIsCancelRequested || longReplyIsPartial || longReplyIsCancelled) && <div
+                      className="chat-message-row chat-message-row-assistant" role="group"
+                      aria-label={`长回复状态：${longReplyIsPartial ? '部分完成' : longReplyIsCancelled ? '已取消' : longReplyIsCancelRequested ? '正在取消' : longReplyIsPending ? '等待处理' : '正在生成'}`}>
+                      <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
+                      <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
+                        <div className="chat-message-processing-status" role="status" aria-live="polite">
+                          <strong className="chat-message-processing-title">{longReplyIsPartial ? '长回复未完整生成' : longReplyIsCancelled ? '长回复已取消' : longReplyIsCancelRequested ? '正在取消长回复' : longReplyIsPending ? '长回复等待处理' : '正在生成长回复'}</strong>
+                          {longReplyIsPartial && <p>已保存的部分内容仍保留在对话中。</p>}
+                          {longReplyIsCancelled && <p>这条长回复已停止。</p>}
+                          {longReplyIsCancelRequested && <p>取消请求已受理，正在停止本次生成。</p>}
+                          {longReplyIsPending && <p>消息已保存，等待开始生成。</p>}
+                          {longReplyIsProcessing && <p>长回复仍在生成；你可以取消本次生成。</p>}
+                          {(longReplyIsPending || longReplyIsProcessing) && <button type="button" className="button button-secondary chat-message-processing-retry"
+                            aria-label="取消长回复" disabled={cancellingThisLongReply}
+                            onClick={() => cancelLongReply.mutate({ conversationID: message.conversation_id, messageID: message.id })}>
+                            {cancellingThisLongReply ? '正在取消…' : '取消长回复'}
+                          </button>}
+                        </div>
+                      </div>
+                    </div>}
                     {showRoutingFailure && <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的消息处理状态">
                       <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
                       <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
@@ -4402,7 +4482,7 @@ export function Assistant() {
                 {enabledMCPConnectors.length > 0 && <details className="assistant-tool-menu"><summary><MordeIcon name="sliders" />工具</summary>
                   <fieldset className="assistant-tool-connectors"><legend>工具连接</legend>
                     <div>{enabledMCPConnectors.map((connector) => <label key={connector.id}>
-                      <input type="checkbox" checked={composerDraftReady && mcpConnectorIDs.includes(connector.id)} disabled={!composerDraftReady}
+                  <input type="checkbox" checked={composerDraftReady && mcpConnectorIDs.includes(connector.id)} disabled={!composerDraftReady || responseMode === 'long_form'}
                         onChange={(event) => {
                           composerEditRevision.current += 1;
                           const snapshot = latestComposerDraft.current;
@@ -4427,15 +4507,23 @@ export function Assistant() {
                   updateComposerDraftSnapshot({ content: value });
                   setContent(value);
                 }} />
+                <button type="button" className="button button-small button-secondary" aria-label="回复长度"
+                  aria-pressed={responseMode === 'long_form'} title="默认短答；打开后按长回复处理消息，关闭后恢复短答。"
+                  disabled={!composerDraftReady || savingMessage || (responseMode === 'short' && (composerAttachments.length > 0 || mcpConnectorIDs.length > 0))}
+                  onClick={() => setResponseMode((current) => current === 'long_form' ? 'short' : 'long_form')}>
+                  {responseMode === 'long_form' ? '长回复' : '短答'}
+                </button>
                 {preparingAttachmentCount > 0 && <button type="button" className="button button-secondary" onClick={cancelComposerAttachmentPreparation}>取消读取</button>}
-                <button className="button button-primary assistant-send" type="submit" disabled={!composerDraftReady || savingMessage || preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) || (!content.trim() && !composerAttachments.length)}>
+                <button className="button button-primary assistant-send" type="submit" disabled={!composerDraftReady || savingMessage || preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) || (!content.trim() && !composerAttachments.length) || (responseMode === 'long_form' && (composerAttachments.length > 0 || mcpConnectorIDs.length > 0))}>
                   {preparingAttachmentCount > 0 || composerAttachments.some((item) => item.needsPreparation) ? '读取附件…' : savingMessage ? '保存中…' : '发送'}
                   <svg className="assistant-send-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 19V5m-5 5 5-5 5 5" /></svg>
                 </button>
               </div>
             </div>
           </form>
-          <p className="assistant-composer-hint">Enter 发送 · Shift + Enter 换行</p>
+          <p className="assistant-composer-hint">Enter 发送 · Shift + Enter 换行 · 当前：{responseMode === 'long_form' ? '长回复' : '短答'}</p>
+          {responseMode === 'long_form' && (composerAttachments.length > 0 || mcpConnectorIDs.length > 0) &&
+            <p className="assistant-composer-hint" role="status">长回复仅支持纯文本；移除附件和工具连接，或切回短答后发送。</p>}
         </section>
       </div>
       {taskPanelOpen && <aside id="assistant-task-panel" className="assistant-task-panel" aria-label="用户任务与文件侧边栏">

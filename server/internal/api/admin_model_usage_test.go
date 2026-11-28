@@ -61,13 +61,21 @@ func modelUsageAdminRouter(t *testing.T, service *modelUsageAdminHTTPStub, role 
 }
 
 func TestAdminModelUsageListAndReconcile(t *testing.T) {
+	projectID, currency := "p7654321", "USD"
+	reservedMicros, reportedMicros, moneyOverage := int64(300), int64(306), int64(6)
 	service := &modelUsageAdminHTTPStub{items: []app.UnknownModelCall{{OwnerID: "u1234567", Source: app.ModelCallTask,
 		CallID: "model-call-001", ModelID: "p1234567", ProviderModel: "provider-model", TaskID: "q1234567",
-		ReservedTokens: 100, CreatedAt: time.Unix(10, 0), UnknownAt: time.Unix(20, 0)}}}
+		ReservedTokens: 100, CreatedAt: time.Unix(10, 0), UnknownAt: time.Unix(20, 0),
+		AdaptiveBudgetOverage: &app.AdaptiveModelBudgetOverage{Status: "open", ReasonCode: "output_cap_exceeded",
+			ReservedInputTokens: 50, ReservedOutputTokens: 250, ReportedInputTokens: 50, ReportedOutputTokens: 256,
+			InputOverageTokens: 0, OutputOverageTokens: 6, ProjectID: &projectID, Currency: &currency,
+			ReservedMicros: &reservedMicros, ReportedMicros: &reportedMicros, MoneyOverageMicros: &moneyOverage}}}}
 	router := modelUsageAdminRouter(t, service, identity.RoleAdmin)
 	cookie := &http.Cookie{Name: portalCookieName, Value: sessionCredential()}
 	listed := requestWithCookie(router, http.MethodGet, "/api/admin/model-usage/unknown?owner_id=u1234567&limit=10", cookie, "")
 	if listed.Code != http.StatusOK || !strings.Contains(listed.Body.String(), `"call_id":"model-call-001"`) ||
+		!strings.Contains(listed.Body.String(), `"adaptive_budget_overage":{"status":"open"`) ||
+		!strings.Contains(listed.Body.String(), `"reported_output_tokens":256`) || !strings.Contains(listed.Body.String(), `"money_overage_micros":6`) ||
 		service.owner != "u1234567" || service.limit != 10 {
 		t.Fatalf("list = %d %s", listed.Code, listed.Body)
 	}

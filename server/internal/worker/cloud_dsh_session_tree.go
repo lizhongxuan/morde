@@ -153,7 +153,7 @@ const cloudDSHMaxPendingModelCalls = 17
 const cloudDSHModelBudgetPlanTTL = 2 * time.Minute
 
 // Mirrors the ModelGateway task request maximum in app/model_gateway.go.
-const cloudDSHModelBudgetProtocolMaxTokens = 32_768
+const cloudDSHModelBudgetProtocolMaxTokens = app.MaxModelOutputTokens
 
 type cloudDSHModelBudgetPlanBinding struct {
 	Identity      cloudDSHIdentity
@@ -2088,6 +2088,14 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 	input io.WriteCloser, output io.ReadCloser, resume, toolsAllowed, streamAllowed bool, completion *app.CloudDSHTaskCompletion, onStart func()) (runErr error) {
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
+	modelBudgetAdmission := false
+	if e.options.ModelBudgetPlanner != nil {
+		eligible, err := e.options.ModelBudgetPlanner.SupportsTaskModelBudgetAdmission(ctx, value)
+		if err != nil {
+			return errors.New("dsh task model budget eligibility is unavailable")
+		}
+		modelBudgetAdmission = eligible
+	}
 	input = &cloudDSHSerializedWriter{WriteCloser: input}
 	rootIdentity := cloudDSHIdentity{TaskID: fence.TaskID, OwnerID: fence.OwnerID, AgentID: fence.AgentInstanceID,
 		SessionID: fence.AgentSessionID, Generation: fence.AgentGeneration, AuthorizationVersion: fence.AuthorizationVersion}
@@ -2758,7 +2766,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				"agent_id": rootIdentity.AgentID, "session_id": rootIdentity.SessionID, "generation": rootIdentity.Generation,
 				"authorization_version": rootIdentity.AuthorizationVersion, "task_revision": cloudDSHTaskRevision(value), "model": value.ModelID,
 				"tools": cloudDSHToolPayload(rootDefinitions)}
-			configureCloudDSHModelBudgetAdmission(start, e.options.ModelBudgetPlanner, maxTokens)
+			configureCloudDSHModelBudgetAdmission(start, e.options.ModelBudgetPlanner, modelBudgetAdmission, maxTokens)
 			if traceparent := cloudDSHTraceparent(trace.ContextWithSpan(ctx, rootState.traceSpan)); traceparent != "" {
 				start["version"] = 2
 				start["traceparent"] = traceparent
@@ -3238,7 +3246,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return err
 			}
 		case "model_budget_prepare":
-			if e.options.ModelBudgetPlanner == nil {
+			if !modelBudgetAdmission {
 				return errors.New("dsh model budget admission is not enabled")
 			}
 			if state.resume && state.readThrough != state.restoreThrough || !state.history.allCallsReconciled() ||
@@ -3358,7 +3366,7 @@ func (e *CloudDSHExecutor) runCloudDSH(ctx context.Context, value task.Task, fen
 				return errors.New("dsh model identity is invalid")
 			}
 			ledgerCallID := ""
-			if e.options.ModelBudgetPlanner == nil {
+			if !modelBudgetAdmission {
 				if frame.BudgetPlanID != "" || frame.BudgetCallID != "" || frame.RequestDigest != "" {
 					return errors.New("dsh model budget fields were sent while admission is disabled")
 				}

@@ -42,6 +42,26 @@ type conversationServiceStub struct {
 	err              error
 }
 
+type conversationMessageCancelTaskStub struct {
+	TaskService
+	principal       identity.Principal
+	projectID       string
+	conversationID  string
+	messageID       string
+	serviceInstance string
+	cancelCalls     int
+	message         conversation.Message
+	changed         bool
+	err             error
+}
+
+func (s *conversationMessageCancelTaskStub) CancelConversationMessage(_ context.Context, principal identity.Principal,
+	projectID, conversationID, messageID, serviceInstance string) (conversation.Message, bool, error) {
+	s.cancelCalls++
+	s.principal, s.projectID, s.conversationID, s.messageID, s.serviceInstance = principal, projectID, conversationID, messageID, serviceInstance
+	return s.message, s.changed, s.err
+}
+
 func (s *conversationServiceStub) Create(_ context.Context, _ identity.Principal, command app.CreateConversationCommand) (conversation.Conversation, bool, error) {
 	s.createCalls++
 	s.created = command
@@ -111,6 +131,119 @@ func TestConversationMessageLookupReturnsReceiptWithoutTask(t *testing.T) {
 		!strings.Contains(response.Body.String(), `"routing_status":"pending"`) || strings.Contains(response.Body.String(), `"task_id":`) ||
 		!strings.Contains(response.Body.String(), `"next_cursor":null`) {
 		t.Fatalf("message receipt lookup = %d %s", response.Code, response.Body.String())
+	}
+}
+
+func TestAcceptConversationMessageResponseModeDefaultsAndPassesThrough(t *testing.T) {
+	for _, test := range []struct {
+		name, rawMode, wantMode string
+	}{
+		{name: "omitted defaults to short", wantMode: "short"},
+		{name: "explicit short", rawMode: `"short"`, wantMode: "short"},
+		{name: "explicit long form", rawMode: `"long_form"`, wantMode: "long_form"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &taskServiceStub{}
+			body := `{"client_message_id":"long-reply-001","content":"hello"`
+			if test.rawMode != "" {
+				body += `,"response_mode":` + test.rawMode
+			}
+			body += `}`
+			request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("X-Morde-Actor-ID", "u1234567")
+			request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
+			request.Header.Set("Idempotency-Key", "long-reply-001")
+			response := httptest.NewRecorder()
+			taskAPIRouter(service, nil).ServeHTTP(response, request)
+			if response.Code != http.StatusAccepted || service.acceptCalls != 1 || service.acceptCommand.ResponseMode != test.wantMode {
+				t.Fatalf("response mode=%q status=%d calls=%d command=%+v body=%s", test.wantMode, response.Code,
+					service.acceptCalls, service.acceptCommand, response.Body.String())
+			}
+		})
+	}
+}
+
+func TestAcceptConversationMessageResponseModeRejectsInvalidOrUnknownFields(t *testing.T) {
+	for _, body := range []string{
+		`{"client_message_id":"long-reply-001","content":"hello","response_mode":"unbounded"}`,
+		`{"client_message_id":"long-reply-001","content":"hello","response_mode":null}`,
+		`{"client_message_id":"long-reply-001","content":"hello","response_mode":1}`,
+		`{"client_message_id":"long-reply-001","content":"hello","response_mode":"short","unknown":true}`,
+	} {
+		service := &taskServiceStub{}
+		request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages", strings.NewReader(body))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("X-Morde-Actor-ID", "u1234567")
+		request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
+		request.Header.Set("Idempotency-Key", "long-reply-001")
+		response := httptest.NewRecorder()
+		taskAPIRouter(service, nil).ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest || service.acceptCalls != 0 {
+			t.Fatalf("invalid response-mode request accepted: status=%d calls=%d body=%s", response.Code, service.acceptCalls, response.Body.String())
+		}
+	}
+}
+
+func TestCancelConversationMessageReturnsAcceptedEnvelopeForPersonalAndProject(t *testing.T) {
+	for _, test := range []struct {
+		name, path, projectID string
+		changed, replayed     bool
+	}{
+		{name: "personal first cancellation", path: "/api/conversations/c1234567/messages/m1234567/cancel", changed: true},
+		{name: "project idempotent replay", path: "/api/projects/j1234567/conversations/c1234567/messages/m1234567/cancel", projectID: "j1234567", replayed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			message := conversation.Message{ID: "m1234567", ConversationID: "c1234567", OwnerID: "u1234567", ActorID: "u1234567",
+				Role: conversation.RoleUser, Content: "long answer", ClientMessageID: "long-reply-001", Sequence: 1,
+				RoutingStatus: conversation.RoutingRouted, DeliveryStatus: conversation.DeliveryApplied, CreatedAt: time.Now().UTC()}
+			service := &conversationMessageCancelTaskStub{TaskService: &taskServiceStub{}, message: message, changed: test.changed}
+			request := httptest.NewRequest(http.MethodPost, test.path, nil)
+			request.Header.Set("X-Morde-Actor-ID", "u1234567")
+			request.Header.Set("X-Morde-Service-Instance-ID", "11111111-1111-4111-8111-111111111111")
+			response := httptest.NewRecorder()
+			taskAPIRouter(service, nil).ServeHTTP(response, request)
+			if response.Code != http.StatusAccepted || service.cancelCalls != 1 || service.principal.UserID != "u1234567" ||
+				service.projectID != test.projectID || service.conversationID != "c1234567" || service.messageID != "m1234567" ||
+				service.serviceInstance != "11111111-1111-4111-8111-111111111111" ||
+				strings.Contains(response.Body.String(), `"replayed":true`) != test.replayed {
+				t.Fatalf("cancel status=%d calls=%d service=%+v body=%s", response.Code, service.cancelCalls, service, response.Body.String())
+			}
+			if test.projectID != "" && (!strings.Contains(response.Body.String(), `"owner_id":"u1234567"`) || !strings.Contains(response.Body.String(), `"actor_id":"u1234567"`)) {
+				t.Fatalf("project cancel did not return project message envelope: %s", response.Body.String())
+			}
+		})
+	}
+}
+
+func TestCancelConversationMessageRequiresActorInstanceAndEmptyBody(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		actor      string
+		instance   string
+		body       string
+		wantStatus int
+	}{
+		{name: "missing actor", instance: "11111111-1111-4111-8111-111111111111", wantStatus: http.StatusBadRequest},
+		{name: "wrong actor", actor: "u7654321", instance: "11111111-1111-4111-8111-111111111111", wantStatus: http.StatusForbidden},
+		{name: "missing service instance", actor: "u1234567", wantStatus: http.StatusBadRequest},
+		{name: "body is rejected", actor: "u1234567", instance: "11111111-1111-4111-8111-111111111111", body: `{}`, wantStatus: http.StatusBadRequest},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service := &conversationMessageCancelTaskStub{TaskService: &taskServiceStub{}, message: conversation.Message{}}
+			request := httptest.NewRequest(http.MethodPost, "/api/conversations/c1234567/messages/m1234567/cancel", strings.NewReader(test.body))
+			if test.actor != "" {
+				request.Header.Set("X-Morde-Actor-ID", test.actor)
+			}
+			if test.instance != "" {
+				request.Header.Set("X-Morde-Service-Instance-ID", test.instance)
+			}
+			response := httptest.NewRecorder()
+			taskAPIRouter(service, nil).ServeHTTP(response, request)
+			if response.Code != test.wantStatus || service.cancelCalls != 0 {
+				t.Fatalf("invalid cancellation request status=%d calls=%d body=%s", response.Code, service.cancelCalls, response.Body.String())
+			}
+		})
 	}
 }
 

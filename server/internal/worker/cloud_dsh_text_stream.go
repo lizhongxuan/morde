@@ -52,24 +52,39 @@ func (s *cloudDSHTextStream) append(text string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.disabled || s.ctx.Err() != nil || !utf8.ValidString(text) || strings.ContainsRune(text, '\x00') ||
-		s.content.Len()+len(text) > app.MaxAssistantMessageBytes {
+		s.content.Len()+len(text) > app.MaxAssistantReplyBytes {
 		s.disabled = true
 		return nil
 	}
-	if app.HasUnverifiedFileDeliveryClaim(s.content.String() + text) {
+	combined := s.content.String() + text
+	if app.HasUnverifiedFileDeliveryClaim(combined) {
 		// Stop only display; the single provider request must still settle.
 		s.disabled = true
 		return nil
 	}
-	delta := s.delta
-	delta.Text = text
-	appended, err := s.store.AppendCloudDSHTextDelta(s.ctx, delta)
-	if err != nil || !appended {
-		s.disabled = true
-		return nil
+	for len(text) > 0 {
+		end := len(text)
+		if end > app.MaxAssistantMessageBytes {
+			end = app.MaxAssistantMessageBytes
+			for end > 0 && !utf8.RuneStart(text[end]) {
+				end--
+			}
+		}
+		if end == 0 {
+			s.disabled = true
+			return nil
+		}
+		delta := s.delta
+		delta.Text = text[:end]
+		appended, err := s.store.AppendCloudDSHTextDelta(s.ctx, delta)
+		if err != nil || !appended {
+			s.disabled = true
+			return nil
+		}
+		s.accepted = true
+		s.content.WriteString(delta.Text)
+		text = text[end:]
 	}
-	s.accepted = true
-	s.content.WriteString(text)
 	return nil
 }
 

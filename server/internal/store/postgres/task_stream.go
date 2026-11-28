@@ -252,6 +252,9 @@ WHERE id=$1 AND task_id=$3`, delta.MessageID, currentRevision, fence.TaskID); er
 				return fmt.Errorf("touch streamed conversation: %w", err)
 			}
 		} else {
+			if len(previousContent)+len(delta.Text) > app.MaxAssistantReplyBytes {
+				return domain.InvalidArgument("text_delta", "assistant reply exceeds the size limit")
+			}
 			updated, err := tx.Exec(ctx, `UPDATE conversation_messages SET content=content || $1
 WHERE id=$2 AND task_id=$3 AND conversation_id=$4 AND owner_id=$5 AND actor_id=$6
  AND output_status='streaming' AND output_task_revision=$7 AND content=$8`, delta.Text, delta.MessageID,

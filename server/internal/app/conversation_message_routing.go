@@ -28,6 +28,7 @@ type AcceptConversationMessageCommand struct {
 	ChangeTaskTarget        bool
 	ApplicationID           string
 	TimeZone                string
+	ResponseMode            string
 	MCPConnectorIDs         []string
 	ClientAttachmentIDs     []string
 	Budget                  task.Budget
@@ -55,6 +56,7 @@ type ConversationRoutingInput struct {
 	ChangeTaskTarget                bool        `json:"change_task_target,omitempty"`
 	ApplicationID                   string      `json:"application_id,omitempty"`
 	TimeZone                        string      `json:"time_zone,omitempty"`
+	ResponseMode                    string      `json:"response_mode,omitempty"`
 	MCPConnectorIDs                 []string    `json:"mcp_connector_ids,omitempty"`
 	ClientAttachmentIDs             []string    `json:"client_attachment_ids,omitempty"`
 	Budget                          task.Budget `json:"budget"`
@@ -71,6 +73,10 @@ type ConversationMessageReceipt struct {
 
 type ConversationMessageReceiptStore interface {
 	AcceptConversationMessage(context.Context, ConversationMessageReceipt) (conversation.Message, bool, error)
+}
+
+type ConversationRouteCancellationStore interface {
+	CancelConversationRoute(context.Context, string, string, string, string, string) (conversation.Message, bool, error)
 }
 
 // prepareConversationMessage verifies identity and immutable routing options without checking tool availability.
@@ -117,6 +123,18 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 	}
 	if len(command.ClientAttachmentIDs) > conversation.MaxHistoryImportAttachments {
 		return ConversationMessageReceipt{}, domain.InvalidArgument("client_attachment_ids", "message attachment count exceeds the limit")
+	}
+	responseMode := strings.TrimSpace(command.ResponseMode)
+	if responseMode == "" {
+		responseMode = ConversationResponseShort
+	}
+	if responseMode != ConversationResponseShort && responseMode != ConversationResponseLongForm {
+		return ConversationMessageReceipt{}, domain.InvalidArgument("response_mode", "response mode is invalid")
+	}
+	if responseMode == ConversationResponseLongForm && (command.ReferenceTaskID != "" || command.HostID != "" ||
+		command.WorkspaceID != "" || command.ChangeTaskTarget || command.ApplicationID != "" || len(command.ClientAttachmentIDs) != 0 ||
+		len(command.MCPConnectorIDs) != 0) {
+		return ConversationMessageReceipt{}, domain.InvalidArgument("response_mode", "long-form replies cannot include Task, host, tool, or attachment options")
 	}
 	seen := make(map[string]struct{}, len(command.ClientAttachmentIDs))
 	for _, id := range command.ClientAttachmentIDs {
@@ -165,6 +183,7 @@ func (s *TaskService) prepareConversationMessage(ctx context.Context, principal 
 		WorkspaceID: command.WorkspaceID, ChangeTaskTarget: command.ChangeTaskTarget,
 		ApplicationID: command.ApplicationID, MCPConnectorIDs: connectors,
 		TimeZone:            command.TimeZone,
+		ResponseMode:        responseMode,
 		ClientAttachmentIDs: append([]string(nil), command.ClientAttachmentIDs...), Budget: budget,
 	}
 	// A selected personal Workspace is captured at the current committed
@@ -238,4 +257,32 @@ func (s *TaskService) AcceptProjectMessage(ctx context.Context, principal identi
 	}
 	command.ProjectID = projectID
 	return s.AcceptConversationMessage(ctx, principal, conversationID, command)
+}
+
+// CancelConversationMessage requests cancellation of an explicitly selected
+// long-form reply. The second return value reports whether this call changed
+// the persisted route state; repeating cancellation is safe.
+func (s *TaskService) CancelConversationMessage(ctx context.Context, principal identity.Principal, projectID, conversationID,
+	messageID, serviceInstanceID string) (conversation.Message, bool, error) {
+	if err := validateConversationPrincipal(principal, identity.ScopeTaskSubmit); err != nil {
+		return conversation.Message{}, false, err
+	}
+	if !domain.ValidConversationID(conversationID) || !domain.ValidMessageID(messageID) || !domain.ValidServiceInstanceID(serviceInstanceID) {
+		return conversation.Message{}, false, domain.InvalidArgument("conversation_message", "conversation message identity is invalid")
+	}
+	if projectID != "" {
+		if !project.ValidID(projectID) || s.projectAccess == nil {
+			return conversation.Message{}, false, domain.NewError(domain.CodeNotFound, "conversation not found")
+		}
+		if _, err := s.projectAccess.RequireAccess(ctx, principal, projectID, project.RoleMember); err != nil {
+			return conversation.Message{}, false, err
+		}
+	} else if _, err := s.store.GetConversation(ctx, conversationID, principal.UserID); err != nil {
+		return conversation.Message{}, false, err
+	}
+	store, ok := s.store.(ConversationRouteCancellationStore)
+	if !ok {
+		return conversation.Message{}, false, domain.NewError(domain.CodeUnsupported, "conversation route cancellation is unavailable")
+	}
+	return store.CancelConversationRoute(ctx, principal.UserID, projectID, conversationID, messageID, serviceInstanceID)
 }

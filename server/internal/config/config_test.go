@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -23,13 +24,214 @@ func TestLoadReadsConfigExpandsEnvironmentAndConvertsDurations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Instance != "test-instance" || cfg.HTTP.ReadTimeout != 10*time.Second || cfg.Orchestrator.Profiles["container"].RequestTimeout != 7*time.Second || cfg.Orchestrator.Profiles["container"].NetworkPolicyEnabled || cfg.CloudDSH.Enabled || !cfg.Models.GPT6LunaMaxReasoning ||
-		cfg.SiteStorage.RootDir == "" || cfg.SiteStorage.MaxReleaseBytes != 10737418240 || cfg.SiteStorage.MaxOwnerBytes != 53687091200 || cfg.SiteStorage.MinFreeBytes != 10737418240 {
-		t.Fatalf("loaded config values are incomplete: instance=%q read_timeout=%s profile_timeout=%s model_max_reasoning=%t site_storage=%+v", cfg.Instance, cfg.HTTP.ReadTimeout, cfg.Orchestrator.Profiles["container"].RequestTimeout, cfg.Models.GPT6LunaMaxReasoning, cfg.SiteStorage)
+	if cfg.Instance != "test-instance" || cfg.HTTP.ReadTimeout != 10*time.Second || cfg.Orchestrator.Profiles["container"].RequestTimeout != 7*time.Second || cfg.Orchestrator.Profiles["container"].NetworkPolicyEnabled || cfg.CloudDSH.Enabled || !cfg.Models.GPT6LunaMaxReasoning || cfg.Models.OutputBudgetShadow.Enabled ||
+		cfg.Models.OutputBudgetAdmissionEnabled || cfg.SiteStorage.RootDir == "" || cfg.SiteStorage.MaxReleaseBytes != 10737418240 ||
+		cfg.SiteStorage.MaxOwnerBytes != 53687091200 || cfg.SiteStorage.MinFreeBytes != 10737418240 {
+		t.Fatalf("loaded config values are incomplete: instance=%q read_timeout=%s profile_timeout=%s model_max_reasoning=%t output_budget_shadow=%+v site_storage=%+v", cfg.Instance, cfg.HTTP.ReadTimeout, cfg.Orchestrator.Profiles["container"].RequestTimeout, cfg.Models.GPT6LunaMaxReasoning, cfg.Models.OutputBudgetShadow, cfg.SiteStorage)
 	}
 	if cfg.MCP != (MCP{Enabled: true, MaxOutputBytes: 65536, ScreenshotMaxWidth: 1280}) {
 		t.Fatalf("MCP defaults = %+v", cfg.MCP)
 	}
+}
+
+func TestLoadOutputBudgetShadowEnabledConfigurationAndKnownFields(t *testing.T) {
+	t.Setenv("T02_TEST_INSTANCE", "test-instance")
+	data := strings.Replace(validConfigYAML(t.TempDir()), "models:\n  allowed_hosts: [api.openai.com]\n",
+		"models:\n  allowed_hosts: [api.openai.com]\n"+validOutputBudgetShadowYAML(), 1)
+	data = strings.Replace(data, "  output_budget_shadow:\n", "  output_budget_admission_enabled: true\n  output_budget_shadow:\n", 1)
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shadow := cfg.Models.OutputBudgetShadow
+	if !cfg.Models.OutputBudgetAdmissionEnabled || !shadow.Enabled || shadow.SampleRate != 0.25 || shadow.StrategyVersion != "shadow-v1" || len(shadow.Routes) != 1 ||
+		shadow.Routes[0].BaseURL != "https://api.openai.com/v1" || shadow.Routes[0].Model != "deepseek-chat" || len(shadow.Routes[0].Stages) != 6 {
+		t.Fatalf("loaded output budget shadow strategy = %+v", shadow)
+	}
+
+	unknownField := strings.Replace(data, "    enabled: true\n", "    enabled: true\n    unknown_option: true\n", 1)
+	if err := os.WriteFile(path, []byte(unknownField), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil || !strings.Contains(err.Error(), "unknown_option") {
+		t.Fatalf("Load(unknown output_budget_shadow field) error = %v, want KnownFields rejection", err)
+	}
+}
+
+func TestOutputBudgetShadowValidationIsDefaultOffAndRejectsInvalidEnabledStrategies(t *testing.T) {
+	defaultOff := validConfig(t)
+	if err := defaultOff.validate(); err != nil {
+		t.Fatalf("default-off output budget shadow config: %v", err)
+	}
+	if defaultOff.Models.OutputBudgetShadow.Enabled {
+		t.Fatal("output budget shadow must default to disabled")
+	}
+	disabledWithUnusedFields := defaultOff
+	disabledWithUnusedFields.Models.OutputBudgetShadow = OutputBudgetShadow{SampleRate: 2}
+	if err := disabledWithUnusedFields.validate(); err != nil {
+		t.Fatalf("disabled shadow strategy should not gate startup: %v", err)
+	}
+
+	valid := validConfig(t)
+	valid.Models.OutputBudgetShadow = validOutputBudgetShadowConfig()
+	if err := valid.validate(); err != nil {
+		t.Fatalf("valid enabled output budget shadow config: %v", err)
+	}
+	inclusiveBounds := validConfig(t)
+	inclusiveBounds.Models.OutputBudgetShadow = validOutputBudgetShadowConfig()
+	inclusiveBounds.Models.OutputBudgetShadow.SampleRate = 1
+	inclusiveBounds.Models.OutputBudgetShadow.Routes[0].Stages[0].GoalTokens = 1
+	inclusiveBounds.Models.OutputBudgetShadow.Routes[0].Stages[0].MinimumTokens = 1
+	if err := inclusiveBounds.validate(); err != nil {
+		t.Fatalf("valid inclusive output budget shadow bounds: %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		want   string
+		mutate func(*OutputBudgetShadow)
+	}{
+		{name: "zero sample rate", want: "sample_rate", mutate: func(value *OutputBudgetShadow) { value.SampleRate = 0 }},
+		{name: "negative sample rate", want: "sample_rate", mutate: func(value *OutputBudgetShadow) { value.SampleRate = -0.01 }},
+		{name: "sample rate above one", want: "sample_rate", mutate: func(value *OutputBudgetShadow) { value.SampleRate = 1.01 }},
+		{name: "NaN sample rate", want: "sample_rate", mutate: func(value *OutputBudgetShadow) { value.SampleRate = math.NaN() }},
+		{name: "invalid strategy version", want: "strategy_version", mutate: func(value *OutputBudgetShadow) { value.StrategyVersion = " shadow v1" }},
+		{name: "missing route", want: "routes", mutate: func(value *OutputBudgetShadow) { value.Routes = nil }},
+		{name: "empty model", want: "exact model", mutate: func(value *OutputBudgetShadow) { value.Routes[0].Model = " " }},
+		{name: "non HTTPS route", want: "HTTPS base_url", mutate: func(value *OutputBudgetShadow) { value.Routes[0].BaseURL = "http://api.openai.com/v1" }},
+		{name: "route userinfo", want: "HTTPS base_url", mutate: func(value *OutputBudgetShadow) { value.Routes[0].BaseURL = "https://user:pass@api.openai.com/v1" }},
+		{name: "route query", want: "HTTPS base_url", mutate: func(value *OutputBudgetShadow) { value.Routes[0].BaseURL = "https://api.openai.com/v1?x=1" }},
+		{name: "empty route query", want: "HTTPS base_url", mutate: func(value *OutputBudgetShadow) { value.Routes[0].BaseURL = "https://api.openai.com/v1?" }},
+		{name: "route fragment", want: "HTTPS base_url", mutate: func(value *OutputBudgetShadow) { value.Routes[0].BaseURL = "https://api.openai.com/v1#section" }},
+		{name: "empty route fragment", want: "HTTPS base_url", mutate: func(value *OutputBudgetShadow) { value.Routes[0].BaseURL = "https://api.openai.com/v1#" }},
+		{name: "duplicate exact route", want: "duplicate exact base_url and model", mutate: func(value *OutputBudgetShadow) {
+			duplicate := value.Routes[0]
+			duplicate.BaseURL = "HTTPS://API.OPENAI.COM/v1/"
+			value.Routes = append(value.Routes, duplicate)
+		}},
+		{name: "missing stage", want: "all six supported stages", mutate: func(value *OutputBudgetShadow) { value.Routes[0].Stages = value.Routes[0].Stages[:5] }},
+		{name: "duplicate stage", want: "duplicate stage", mutate: func(value *OutputBudgetShadow) { value.Routes[0].Stages[1].Stage = value.Routes[0].Stages[0].Stage }},
+		{name: "unknown stage", want: "unsupported stage", mutate: func(value *OutputBudgetShadow) { value.Routes[0].Stages[0].Stage = "unreviewed_stage" }},
+		{name: "minimum below one", want: "minimum_tokens", mutate: func(value *OutputBudgetShadow) { value.Routes[0].Stages[0].MinimumTokens = 0 }},
+		{name: "goal below one", want: "minimum_tokens", mutate: func(value *OutputBudgetShadow) { value.Routes[0].Stages[0].GoalTokens = 0 }},
+		{name: "minimum exceeds goal", want: "minimum_tokens", mutate: func(value *OutputBudgetShadow) {
+			stage := &value.Routes[0].Stages[0]
+			stage.MinimumTokens = stage.GoalTokens + 1
+		}},
+		{name: "goal exceeds maximum", want: "minimum_tokens", mutate: func(value *OutputBudgetShadow) { value.Routes[0].Stages[0].GoalTokens = 2_000_001 }},
+	}
+	for _, testCase := range tests {
+		t.Run(testCase.name, func(t *testing.T) {
+			cfg := validConfig(t)
+			cfg.Models.OutputBudgetShadow = validOutputBudgetShadowConfig()
+			testCase.mutate(&cfg.Models.OutputBudgetShadow)
+			if err := cfg.validate(); err == nil || !strings.Contains(err.Error(), testCase.want) {
+				t.Fatalf("validate() error = %v, want substring %q", err, testCase.want)
+			}
+		})
+	}
+}
+
+func TestOutputBudgetAdmissionReusesReviewedStrategyWithoutEnablingShadow(t *testing.T) {
+	cfg := validConfig(t)
+	if cfg.Models.OutputBudgetAdmissionEnabled {
+		t.Fatal("adaptive output budget admission must default to disabled")
+	}
+	cfg.Models.OutputBudgetAdmissionEnabled = true
+	cfg.Models.OutputBudgetShadow = validOutputBudgetShadowConfig()
+	cfg.Models.OutputBudgetShadow.Enabled = false
+	cfg.Models.OutputBudgetShadow.SampleRate = 0
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("admission should validate reviewed routes without enabling shadow sampling: %v", err)
+	}
+
+	missingRoute := validConfig(t)
+	missingRoute.Models.OutputBudgetAdmissionEnabled = true
+	missingRoute.Models.OutputBudgetShadow = OutputBudgetShadow{StrategyVersion: "admission-v1"}
+	if err := missingRoute.validate(); err == nil || !strings.Contains(err.Error(), "routes") {
+		t.Fatalf("admission without an exact reviewed route error = %v", err)
+	}
+
+	invalidRate := validConfig(t)
+	invalidRate.Models.OutputBudgetAdmissionEnabled = true
+	invalidRate.Models.OutputBudgetShadow = validOutputBudgetShadowConfig()
+	invalidRate.Models.OutputBudgetShadow.Enabled = false
+	invalidRate.Models.OutputBudgetShadow.SampleRate = math.NaN()
+	if err := invalidRate.validate(); err == nil || !strings.Contains(err.Error(), "sample_rate") {
+		t.Fatalf("invalid unused shadow sample rate error = %v", err)
+	}
+}
+
+func TestOutputBudgetStageStrategyCanBeConfiguredWithoutAdmissionOrShadow(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Models.OutputBudgetAdmissionEnabled = false
+	cfg.Models.OutputBudgetShadow = validOutputBudgetShadowConfig()
+	cfg.Models.OutputBudgetShadow.Enabled = false
+	cfg.Models.OutputBudgetShadow.SampleRate = 0
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("long-form stage strategy should validate while admission and shadow are disabled: %v", err)
+	}
+	if cfg.Models.OutputBudgetAdmissionEnabled || cfg.Models.OutputBudgetShadow.Enabled {
+		t.Fatal("a configured stage strategy must not enable Task admission or shadow sampling")
+	}
+
+	missingVersion := validConfig(t)
+	missingVersion.Models.OutputBudgetShadow = validOutputBudgetShadowConfig()
+	missingVersion.Models.OutputBudgetShadow.Enabled = false
+	missingVersion.Models.OutputBudgetShadow.SampleRate = 0
+	missingVersion.Models.OutputBudgetShadow.StrategyVersion = ""
+	if err := missingVersion.validate(); err == nil || !strings.Contains(err.Error(), "strategy_version") {
+		t.Fatalf("route strategy without a version error = %v, want strategy_version", err)
+	}
+
+	missingRoutes := validConfig(t)
+	missingRoutes.Models.OutputBudgetShadow = OutputBudgetShadow{StrategyVersion: "long-form-v1"}
+	if err := missingRoutes.validate(); err == nil || !strings.Contains(err.Error(), "routes") {
+		t.Fatalf("strategy version without routes error = %v, want routes", err)
+	}
+
+	invalidRoute := validConfig(t)
+	invalidRoute.Models.OutputBudgetShadow = validOutputBudgetShadowConfig()
+	invalidRoute.Models.OutputBudgetShadow.Enabled = false
+	invalidRoute.Models.OutputBudgetShadow.SampleRate = 0
+	invalidRoute.Models.OutputBudgetShadow.Routes[0].Stages[4].MinimumTokens =
+		invalidRoute.Models.OutputBudgetShadow.Routes[0].Stages[4].GoalTokens + 1
+	if err := invalidRoute.validate(); err == nil || !strings.Contains(err.Error(), "minimum_tokens") {
+		t.Fatalf("invalid disabled long-form route policy error = %v, want minimum_tokens", err)
+	}
+}
+
+func validOutputBudgetShadowConfig() OutputBudgetShadow {
+	return OutputBudgetShadow{
+		Enabled: true, SampleRate: 0.25, StrategyVersion: "shadow-v1",
+		Routes: []OutputBudgetShadowRoute{{
+			BaseURL: "https://api.openai.com/v1", Model: "deepseek-chat",
+			Stages: []OutputBudgetShadowStage{
+				{Stage: "short_answer", GoalTokens: 128, MinimumTokens: 32},
+				{Stage: "tool_step", GoalTokens: 640, MinimumTokens: 256},
+				{Stage: "subtask", GoalTokens: 1_024, MinimumTokens: 512},
+				{Stage: "summary", GoalTokens: 768, MinimumTokens: 256},
+				{Stage: "long_form", GoalTokens: 2_000_000, MinimumTokens: 2_048},
+				{Stage: "text_continuation", GoalTokens: 4_096, MinimumTokens: 512},
+			},
+		}},
+	}
+}
+
+func validOutputBudgetShadowYAML() string {
+	return "  output_budget_shadow:\n" +
+		"    enabled: true\n    sample_rate: 0.25\n    strategy_version: shadow-v1\n" +
+		"    routes:\n      - base_url: https://api.openai.com/v1\n        model: deepseek-chat\n        stages:\n" +
+		"          - {stage: short_answer, goal_tokens: 128, minimum_tokens: 32}\n" +
+		"          - {stage: tool_step, goal_tokens: 640, minimum_tokens: 256}\n" +
+		"          - {stage: subtask, goal_tokens: 1024, minimum_tokens: 512}\n" +
+		"          - {stage: summary, goal_tokens: 768, minimum_tokens: 256}\n" +
+		"          - {stage: long_form, goal_tokens: 2000000, minimum_tokens: 2048}\n" +
+		"          - {stage: text_continuation, goal_tokens: 4096, minimum_tokens: 512}\n"
 }
 
 func TestLoadOrchestratorNetworkPolicyCapabilityIsExplicit(t *testing.T) {

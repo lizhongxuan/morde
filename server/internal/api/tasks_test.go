@@ -792,6 +792,20 @@ func TestTaskResponseIncludesValidatedAssistantMessageSnapshot(t *testing.T) {
 		view.EventSequence != current.EventSequence {
 		t.Fatalf("assistant message snapshot response = %#v, err=%v", view.AssistantMessage, err)
 	}
+	largeMessage := message
+	largeMessage.Content = strings.Repeat("长回复", app.MaxAssistantReplyBytes/len("长回复"))
+	value.AssistantMessage = &app.AssistantMessageSnapshot{Message: largeMessage, Status: app.AssistantMessageStreaming}
+	largeView, err := toTaskResponse(value)
+	if err != nil || largeView.AssistantMessage == nil || largeView.AssistantMessage.Content != largeMessage.Content {
+		t.Fatalf("2MiB assistant snapshot response = %#v, err=%v", largeView.AssistantMessage, err)
+	}
+	overLimitMessage := message
+	overLimitMessage.Content = strings.Repeat("x", app.MaxAssistantReplyBytes+1)
+	value.AssistantMessage = &app.AssistantMessageSnapshot{Message: overLimitMessage, Status: app.AssistantMessageStreaming}
+	if _, err := toTaskResponse(value); domain.CodeOf(err) != domain.CodeInternal {
+		t.Fatalf("oversized assistant snapshot response error = %v, want internal", err)
+	}
+	value.AssistantMessage = &app.AssistantMessageSnapshot{Message: message, Status: app.AssistantMessageStreaming}
 	data, err := json.Marshal(view)
 	if err != nil {
 		t.Fatal(err)

@@ -2,14 +2,160 @@ package app
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
+	"morde/server/internal/domain/task"
 )
+
+func TestTaskModelBudgetAdmissionRequiresVerifiedCapacityAndExactStrategyRoute(t *testing.T) {
+	maxOutput, contextWindow := 16_000, 64_000
+	endpoint := ModelGatewayEndpoint{
+		Endpoint: ModelEndpoint{BaseURL: modelBudgetShadowTestBaseURL, ModelID: modelBudgetShadowTestModel},
+		Version:  time.Unix(1, 0), MaxOutputTokens: &maxOutput, MaxOutputSource: ModelMaxOutputModelCatalog,
+		ContextWindowTokens: &contextWindow, ContextWindowSource: ModelContextWindowModelCatalog,
+	}
+	resolver := &modelBudgetShadowTestResolver{endpoint: endpoint}
+	service, err := NewModelGatewayService(&modelGatewayStoreTest{}, resolver, &modelGatewayClientTest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	value := task.Task{InitiatorID: "u1234567", ModelID: "p1234567"}
+	if eligible, err := service.SupportsTaskModelBudgetAdmission(context.Background(), value); err != nil || eligible {
+		t.Fatalf("route without strategy eligibility=%t err=%v, want false", eligible, err)
+	}
+
+	definition := syntheticModelOutputBudgetStrategy()
+	definition.Models[0].BaseURL = modelBudgetShadowTestBaseURL
+	definition.Models[0].Model = modelBudgetShadowTestModel
+	if err := service.SetModelOutputBudgetStrategy(definition); err != nil {
+		t.Fatal(err)
+	}
+	if eligible, err := service.SupportsTaskModelBudgetAdmission(context.Background(), value); err != nil || !eligible {
+		t.Fatalf("reviewed exact route eligibility=%t err=%v, want true", eligible, err)
+	}
+
+	unknownCapacity := *resolver
+	unknownCapacity.endpoint.MaxOutputSource = ModelMaxOutputUnknown
+	service.models = &unknownCapacity
+	if eligible, err := service.SupportsTaskModelBudgetAdmission(context.Background(), value); err != nil || eligible {
+		t.Fatalf("unknown-capacity route eligibility=%t err=%v, want false", eligible, err)
+	}
+
+	unlistedRoute := *resolver
+	unlistedRoute.endpoint.Endpoint.ModelID = "unlisted-model"
+	service.models = &unlistedRoute
+	if eligible, err := service.SupportsTaskModelBudgetAdmission(context.Background(), value); err != nil || eligible {
+		t.Fatalf("unlisted route eligibility=%t err=%v, want false", eligible, err)
+	}
+}
+
+func TestAdaptiveBudgetRejectsStaleCatalogCapacityFromConnectionResolver(t *testing.T) {
+	for _, staleField := range []string{"output", "context"} {
+		t.Run(staleField, func(t *testing.T) {
+			store := &modelConnectionStoreStub{values: make(map[string]ModelConnectionRecord)}
+			modelConnections := modelConnectionTestService(t, store, &modelClientStub{})
+			principal := identity.Principal{UserID: "u7654321", Role: identity.RoleUser, Kind: identity.KindSession, TokenID: "t1234567"}
+			created, err := modelConnections.Create(context.Background(), principal, ModelConnectionCommand{
+				Name: "stale capacity", BaseURL: "https://api.openai.com/v1", ModelName: "gpt-6-luna", APIKey: "secret-value",
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			record := store.values[created.ID]
+			checkedAt := time.Now().UTC()
+			record.Capabilities = ModelCapabilities{Text: true}
+			record.CheckedAt = &checkedAt
+			staleVersion := "outdated-catalog-version"
+			switch staleField {
+			case "output":
+				stale := 64_000
+				record.MaxOutputTokens = &stale
+				record.MaxOutputCatalogVersion = &staleVersion
+			case "context":
+				stale := 900_000
+				record.ContextWindowTokens = &stale
+				record.ContextWindowCatalogVersion = &staleVersion
+			}
+			store.values[created.ID] = record
+
+			endpoint, err := modelConnections.ResolveGatewayEndpoint(context.Background(), principal.UserID, created.ID, false, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if staleField == "output" && (endpoint.MaxOutputTokens != nil || endpoint.MaxOutputSource != ModelMaxOutputUnknown || endpoint.MaxOutputCatalogVersion != nil) {
+				t.Fatalf("gateway resolver exposed stale output catalog capacity: %+v", endpoint)
+			}
+			if staleField == "context" && (endpoint.ContextWindowTokens != nil || endpoint.ContextWindowSource != ModelContextWindowUnknown || endpoint.ContextWindowCatalogVersion != nil) {
+				t.Fatalf("gateway resolver exposed stale context catalog capacity: %+v", endpoint)
+			}
+			view, err := modelConnections.Get(context.Background(), principal, created.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if staleField == "context" && (view.ContextWindowTokens != nil || view.ContextWindowSource != ModelContextWindowUnknown || view.ContextWindowCatalogVersion != nil) {
+				t.Fatalf("model connection view exposed stale context catalog capacity: %+v", view)
+			}
+
+			gateway, err := NewModelGatewayService(&modelGatewayStoreTest{}, modelConnections, &modelGatewayClientTest{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			definition := syntheticModelOutputBudgetStrategy()
+			definition.Models[0].BaseURL = "https://api.openai.com/v1"
+			definition.Models[0].Model = "gpt-6-luna"
+			if err := gateway.SetModelOutputBudgetStrategy(definition); err != nil {
+				t.Fatal(err)
+			}
+			taskValue := task.Task{ID: "q1234567", InitiatorID: principal.UserID, ModelID: created.ID}
+			if eligible, err := gateway.SupportsTaskModelBudgetAdmission(context.Background(), taskValue); err != nil || eligible {
+				t.Fatalf("stale %s capacity eligibility=%t err=%v, want ineligible", staleField, eligible, err)
+			}
+
+			fence := ModelTaskFence{TaskID: taskValue.ID, OwnerID: principal.UserID, InitiatorID: principal.UserID,
+				LeaseOwner: "worker-1", LeaseVersion: 1, AgentInstanceID: "agent-1", AgentGeneration: 1,
+				AgentSessionID: "session-1", AgentRootSessionID: "session-1", AuthorizationVersion: 1,
+				ThroughSequence: 0, EngineVersion: "dsh-1", ProfileVersion: "v1"}
+			dshCallID, err := DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := json.RawMessage(`{"provider":"morde","model":"` + created.ID + `","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[]}`)
+			_, err = gateway.PrepareTaskModelBudget(context.Background(), TaskModelBudgetPrepareRequest{
+				Fence: fence, DSHCallID: dshCallID, ModelID: created.ID, ThroughSequence: 0, Turn: 1, Step: 0,
+				BudgetCallID: "budget_call_1", RequestDigest: strings.Repeat("a", 64), ProviderRequest: request,
+			})
+			if domain.CodeOf(err) != domain.CodeUnsupported {
+				t.Fatalf("prepare with stale %s capacity err=%v, want unsupported before admission", staleField, err)
+			}
+			if staleField == "context" {
+				refreshed, err := modelConnections.Update(context.Background(), principal, created.ID, ModelConnectionCommand{
+					Name: created.Name, BaseURL: created.BaseURL, ModelName: created.ModelName,
+				})
+				if err != nil || refreshed.ContextWindowTokens == nil || *refreshed.ContextWindowTokens != 1_050_000 ||
+					refreshed.ContextWindowCatalogVersion == nil || *refreshed.ContextWindowCatalogVersion != modelContextCapacityCatalogVersion {
+					t.Fatalf("updating connection did not refresh stale context capacity: %+v err=%v", refreshed, err)
+				}
+			}
+		})
+	}
+}
+
+func TestTaskModelBudgetAdmissionPropagatesEndpointResolutionFailure(t *testing.T) {
+	service, err := NewModelGatewayService(&modelGatewayStoreTest{}, &modelBudgetShadowTestResolver{err: errors.New("resolver unavailable")}, &modelGatewayClientTest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eligible, err := service.SupportsTaskModelBudgetAdmission(context.Background(), task.Task{InitiatorID: "u1234567", ModelID: "p1234567"}); err == nil || eligible {
+		t.Fatalf("unresolved route eligibility=%t err=%v, want propagated failure", eligible, err)
+	}
+}
 
 func TestAdaptiveModelBudgetIncludesGatewayAddedTaskInstructions(t *testing.T) {
 	request := ModelRequest{Instructions: "runtime system prompt", Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}}

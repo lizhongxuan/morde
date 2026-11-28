@@ -541,6 +541,23 @@ func routeModelFixtureWithMember(t *testing.T, useProject, separateOwner bool, c
 
 func routeModelFixtureWithMemberAndContent(t *testing.T, useProject, separateOwner bool, client *routeModelClientTest,
 	content string, priorContents ...string) (*Store, *app.ModelGatewayService, identity.Principal, app.ConversationRouteClaim, app.ConversationRouteContext) {
+	return routeModelFixtureWithMemberAndContentAndMode(t, useProject, separateOwner, client, "", content, priorContents...)
+}
+
+func routeModelLongFormFixture(t *testing.T, client *routeModelClientTest) (*Store, *app.ModelGatewayService,
+	identity.Principal, app.ConversationRouteClaim, app.ConversationRouteContext) {
+	return routeModelFixtureWithMemberAndContentAndMode(t, false, false, client, app.ConversationResponseLongForm,
+		"Explain this carefully")
+}
+
+func routeModelLongFormProjectFixture(t *testing.T, client *routeModelClientTest) (*Store, *app.ModelGatewayService,
+	identity.Principal, app.ConversationRouteClaim, app.ConversationRouteContext) {
+	return routeModelFixtureWithMemberAndContentAndMode(t, true, false, client, app.ConversationResponseLongForm,
+		"Explain this carefully")
+}
+
+func routeModelFixtureWithMemberAndContentAndMode(t *testing.T, useProject, separateOwner bool, client *routeModelClientTest,
+	responseMode, content string, priorContents ...string) (*Store, *app.ModelGatewayService, identity.Principal, app.ConversationRouteClaim, app.ConversationRouteContext) {
 	t.Helper()
 	store, _, _, principal, modelID := modelProbeFixture(t, app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1})
 	ctx := context.Background()
@@ -597,7 +614,7 @@ context_window_tokens=32768,context_window_override_tokens=32768,context_window_
 	if err != nil {
 		t.Fatal(err)
 	}
-	input := app.ConversationRoutingInput{ProjectID: projectID, ModelID: modelID,
+	input := app.ConversationRoutingInput{ProjectID: projectID, ModelID: modelID, ResponseMode: responseMode,
 		Budget: task.Budget{ActiveSeconds: 120, ToolCalls: 5, ModelTokens: 1000}}
 	authorization := task.Authorization{Kind: string(principal.Kind), TokenID: principal.TokenID,
 		ClientInstallationID: principal.ClientInstallationID, Scopes: scopes, Version: 1, ExpiresAt: &expires}

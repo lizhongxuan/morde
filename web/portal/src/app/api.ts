@@ -373,6 +373,24 @@ export const portalApi = {
     if (result.error !== undefined) unwrapApiResponse(result);
     if (result.response.status !== 202) throw new Error('服务端未确认消息重试。');
   },
+  cancelConversationMessage: async (conversationID: string, messageID: string, serviceInstanceID: string, actorID: string) => {
+    if (!serviceInstanceID || !actorID) throw new Error('服务或账号身份尚未确认。');
+    const response = await requestFetch(`/api/conversations/${encodeURIComponent(conversationID)}/messages/${encodeURIComponent(messageID)}/cancel`, {
+      method: 'POST', headers: {
+        'X-Morde-Service-Instance-ID': serviceInstanceID,
+        'X-Morde-Actor-ID': actorID,
+      },
+    });
+    if (!response.ok) await throwResponseError(response);
+    if (response.status !== 202) throw new Error('服务端未确认取消长回复。');
+    const value: unknown = await response.json();
+    if (!value || typeof value !== 'object' || !('message' in value) || !('replayed' in value) || typeof value.replayed !== 'boolean' ||
+      !value.message || typeof value.message !== 'object' || !('id' in value.message) || value.message.id !== messageID ||
+      !('conversation_id' in value.message) || value.message.conversation_id !== conversationID) {
+      throw new Error('取消消息响应与当前会话不匹配。');
+    }
+    return value as { message: components['schemas']['ConversationMessage']; replayed: boolean };
+  },
   answerTaskInput: async (id: string, body: components['schemas']['TaskInputRequest'], idempotencyKey = newIdempotencyKey()) => unwrapApiResponse(await api.POST('/api/tasks/{id}/inputs', {
     params: { path: { id }, header: { 'Idempotency-Key': idempotencyKey } }, body,
   })),

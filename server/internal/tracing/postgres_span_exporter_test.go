@@ -75,6 +75,59 @@ func TestMakeSpanRecordStoresOnlyAllowlistedMetadata(t *testing.T) {
 	}
 }
 
+func TestMakeSpanRecordPreservesBoundedModelBudgetShadowEvents(t *testing.T) {
+	span := endedTestSpan(t, func(span trace.Span) {
+		span.AddEvent("model_budget_shadow_plan", trace.WithAttributes(
+			attribute.String("morde.budget.route_fingerprint", "sha256:"+strings.Repeat("a", 64)),
+			attribute.String("morde.budget.strategy_version", "shadow-v1"),
+			attribute.String("morde.budget.stage", "tool_step"),
+			attribute.String("morde.budget.outcome", "calculated"),
+			attribute.String("morde.budget.block_reason", ""),
+			attribute.StringSlice("morde.budget.limiting_dimensions", []string{"task_budget", "context_window"}),
+			attribute.Int64("morde.budget.goal_tokens", 4096),
+			attribute.Int64("morde.budget.minimum_tokens", 512),
+			attribute.Int64("morde.budget.safe_tokens", 3072),
+			attribute.Int64("morde.budget.send_tokens", 3072),
+			attribute.Int64("morde.budget.current_output_cap", 2048),
+			attribute.String("morde.prompt", "must be filtered"),
+			attribute.String("url.full", "https://private-provider.example/secret"),
+		))
+		span.AddEvent("model_budget_shadow_result", trace.WithAttributes(
+			attribute.String("morde.budget.stage", "tool_step"),
+			attribute.Bool("morde.budget.usage_known", true),
+			attribute.Int64("morde.budget.actual_output_tokens", 2187),
+			attribute.String("morde.budget.stop_reason", "stop"),
+			attribute.String("morde.budget.failure_class", "none"),
+		))
+	})
+
+	record, err := makeSpanRecord(span)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var events []spanEvent
+	if err := json.Unmarshal(record.events, &events); err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || len(events[0].Attributes) > maxNestedAttrsBytes {
+		t.Fatalf("model budget shadow events = %d, plan payload bytes=%d", len(events), len(events[0].Attributes))
+	}
+	var plan map[string]any
+	if err := json.Unmarshal(events[0].Attributes, &plan); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"morde.budget.route_fingerprint", "morde.budget.strategy_version", "morde.budget.stage",
+		"morde.budget.goal_tokens", "morde.budget.minimum_tokens", "morde.budget.safe_tokens", "morde.budget.send_tokens",
+		"morde.budget.current_output_cap", "morde.budget.limiting_dimensions"} {
+		if _, ok := plan[key]; !ok {
+			t.Fatalf("model budget shadow plan did not preserve %q: %s", key, events[0].Attributes)
+		}
+	}
+	if strings.Contains(string(record.events), "private-provider") || strings.Contains(string(record.events), "must be filtered") {
+		t.Fatalf("shadow trace persisted raw route or prompt: %s", record.events)
+	}
+}
+
 func TestEncodeAttributesEnforcesAllowlistAndValueBounds(t *testing.T) {
 	values := []attribute.KeyValue{
 		attribute.String("http.route", "/"+strings.Repeat("a", maxAttributeStringBytes)),

@@ -239,6 +239,11 @@ func acceptProjectConversationMessage(service projectConversationRoutesService) 
 		if !decodeStrictTaskJSON(c, &request) {
 			return
 		}
+		responseMode, ok := parseConversationResponseMode(request.ResponseMode)
+		if !ok {
+			writeError(c, domain.InvalidArgument("response_mode", "response_mode must be short or long_form"))
+			return
+		}
 		instanceID, ok := requiredMessageServiceInstance(c)
 		if !ok {
 			return
@@ -261,7 +266,8 @@ func acceptProjectConversationMessage(service projectConversationRoutesService) 
 			HostID: request.HostID, WorkspaceID: request.WorkspaceID, ChangeTaskTarget: request.ChangeTaskTarget,
 			MCPConnectorIDs:     request.MCPConnectorIDs,
 			ClientAttachmentIDs: request.ClientAttachmentIDs, ApplicationID: request.ApplicationID,
-			ModelID: request.ModelID, TimeZone: request.TimeZone, Content: request.Content, Budget: budget, IdempotencyKey: key,
+			ModelID: request.ModelID, TimeZone: request.TimeZone, ResponseMode: responseMode,
+			Content: request.Content, Budget: budget, IdempotencyKey: key,
 		})
 		if err != nil {
 			writeError(c, err)

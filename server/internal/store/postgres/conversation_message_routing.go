@@ -216,8 +216,8 @@ func loadConversationReceipt(ctx context.Context, tx pgx.Tx, actorID, conversati
 	err := tx.QueryRow(ctx, `SELECT m.id,m.conversation_id,m.owner_id,m.actor_id,m.role,m.content,
 COALESCE(m.task_id,''),m.model_id,m.sequence,
 CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_status ELSE m.delivery_status END,
-m.created_at,r.client_message_id,COALESCE(original_route.state,r.state),r.request_hash,r.service_instance_id::text,
-COALESCE(original_route.failure_reason,r.failure_reason),COALESCE(c.project_id,''),
+m.created_at,r.client_message_id,CASE WHEN COALESCE(original_route.state,r.state)='processing' AND COALESCE(original_route.cancel_requested_at,r.cancel_requested_at) IS NOT NULL THEN 'cancel_requested' ELSE COALESCE(original_route.state,r.state) END,r.request_hash,r.service_instance_id::text,
+COALESCE(original_route.failure_reason,r.failure_reason),COALESCE(c.project_id,''),COALESCE(r.request_metadata->>'response_mode','short'),
 COALESCE(r.agent_acknowledged,false),
 COALESCE(r.duplicate_of_message_id,''),COALESCE(original_message.task_id,'')
 FROM conversation_message_routes r
@@ -231,7 +231,7 @@ LEFT JOIN conversation_messages original_message ON original_message.id=original
 WHERE r.actor_id=$1 AND r.conversation_id=$2 AND r.client_message_id=$3`, actorID, conversationID, clientID).Scan(
 		&value.ID, &value.ConversationID, &value.OwnerID, &value.ActorID, &role, &value.Content, &value.TaskID,
 		&value.ModelID, &value.Sequence, &delivery, &value.CreatedAt, &value.ClientMessageID, &routing, &hash, &instanceID, &routingFailure, &projectID,
-		&value.AgentAcknowledged, &value.DuplicateOfMessageID, &value.RelatedTaskID)
+		&value.ResponseMode, &value.AgentAcknowledged, &value.DuplicateOfMessageID, &value.RelatedTaskID)
 	if err != nil {
 		return conversation.Message{}, nil, err
 	}
@@ -254,7 +254,7 @@ WHERE r.actor_id=$1 AND r.conversation_id=$2 AND r.client_message_id=$3`, actorI
 // and rechecks project membership in the same query as the lookup.
 func (s *Store) FindConversationMessageByClientID(ctx context.Context, actorID, projectID, conversationID, clientID, instanceID string) (conversation.Message, bool, error) {
 	var value conversation.Message
-	var role, delivery, routing, routingFailure string
+	var role, delivery, routing, routingFailure, responseMode string
 	var internalToolName, internalTaskStatus, internalStepStatus string
 	var internalDispatched, internalUnknown bool
 	var found bool
@@ -274,7 +274,7 @@ CASE WHEN r.duplicate_of_message_id IS NOT NULL THEN original_message.delivery_s
 m.created_at,r.client_message_id,COALESCE(r.duplicate_of_message_id,''),
 CASE WHEN EXISTS (SELECT 1 FROM conversation_route_internal_tool_calls hidden WHERE hidden.task_id=original_message.task_id)
  THEN '' ELSE COALESCE(original_message.task_id,'') END,
-COALESCE(original_route.state,r.state),COALESCE(original_route.failure_reason,r.failure_reason),
+CASE WHEN COALESCE(original_route.state,r.state)='processing' AND COALESCE(original_route.cancel_requested_at,r.cancel_requested_at) IS NOT NULL THEN 'cancel_requested' ELSE COALESCE(original_route.state,r.state) END,COALESCE(original_route.failure_reason,r.failure_reason),COALESCE(r.request_metadata->>'response_mode','short'),
 COALESCE(r.agent_acknowledged,false),
 CASE WHEN internal_task.id IS NOT NULL THEN internal_tool.tool_name ELSE '' END,
 COALESCE(internal_task.status,''),COALESCE(internal_step.status,''),
@@ -301,7 +301,7 @@ WHERE r.actor_id=$1 AND r.conversation_id=$3 AND r.client_message_id=$4 AND c.ar
        ($2<>'' AND c.project_id=$2 AND EXISTS (SELECT 1 FROM project_members pm WHERE pm.project_id=$2 AND pm.user_id=$1)))`,
 			actorID, projectID, conversationID, clientID).Scan(&value.ID, &value.ConversationID, &value.OwnerID,
 			&value.ActorID, &role, &value.Content, &value.TaskID, &value.ModelID, &value.Sequence, &delivery,
-			&value.CreatedAt, &value.ClientMessageID, &value.DuplicateOfMessageID, &value.RelatedTaskID, &routing, &routingFailure,
+			&value.CreatedAt, &value.ClientMessageID, &value.DuplicateOfMessageID, &value.RelatedTaskID, &routing, &routingFailure, &responseMode,
 			&value.AgentAcknowledged, &internalToolName, &internalTaskStatus, &internalStepStatus, &internalDispatched, &internalUnknown)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
@@ -330,6 +330,7 @@ WHERE r.actor_id=$1 AND r.conversation_id=$3 AND r.client_message_id=$4 AND c.ar
 	value.DeliveryStatus = conversation.DeliveryStatus(delivery)
 	value.RoutingStatus = conversation.RoutingStatus(routing)
 	value.RoutingFailureReason = conversation.RoutingFailureReason(routingFailure)
+	value.ResponseMode = responseMode
 	value.ToolActivity = conversationToolActivity(internalToolName, internalTaskStatus, internalStepStatus, internalDispatched, internalUnknown)
 	return value, found, nil
 }

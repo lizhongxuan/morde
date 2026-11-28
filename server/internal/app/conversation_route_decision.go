@@ -244,6 +244,9 @@ type ConversationRouteDecision struct {
 	DependencyTaskIDs        []string
 	Question                 string
 	Reply                    string
+	LongReply                bool `json:"long_reply,omitempty"`
+	Partial                  bool `json:"partial,omitempty"`
+	Cancelled                bool `json:"cancelled,omitempty"`
 	ToolName                 string
 	ToolArguments            string
 	ModelOutput              string `json:"ModelOutput,omitempty"`

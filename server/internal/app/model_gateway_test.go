@@ -210,6 +210,8 @@ func TestTaskModelGatewayAdaptiveBudgetSeparatesLedgerAndFinalDSHCallIDs(t *test
 	response := ModelResponse{Text: "done", StopReason: "stop", ProviderReportedModel: "test-model",
 		Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}}
 	service, store, client, call := taskGatewayFixture(t, raw, response)
+	verifiedOutputCap := 8192
+	service.models = &modelGatewayResolverTest{maxOutputTokens: &verifiedOutputCap}
 	call.Task.ThroughSequence = 7
 	call.CallID, _ = DSHModelCallID(call.Task.TaskID, call.Task.AgentSessionID, 7)
 	call.LedgerCallID, _ = DSHModelCallID(call.Task.TaskID, call.Task.AgentSessionID, 5)
@@ -275,6 +277,22 @@ func TestTaskModelGatewayAdaptiveBudgetSeparatesLedgerAndFinalDSHCallIDs(t *test
 	}
 }
 
+func TestTaskModelGatewayRejectsAdaptiveOutputAboveVerifiedModelLimit(t *testing.T) {
+	raw := []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[],"max_tokens":16}`)
+	response := ModelResponse{Text: "must not dispatch", StopReason: "stop", ProviderReportedModel: "test-model",
+		Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}}
+	service, store, client, call := taskGatewayFixture(t, raw, response)
+	verifiedOutputCap := 15
+	service.models = &modelGatewayResolverTest{maxOutputTokens: &verifiedOutputCap}
+	call.LedgerCallID = "mdl_ledger_call_123"
+	call.BudgetPlanID, call.BudgetCallID, call.BudgetRequestDigest = "budget-plan-123", "budget-call-123", strings.Repeat("a", 64)
+	if _, err := service.Complete(context.Background(), call); domain.CodeOf(err) != domain.CodeUnsupported ||
+		store.reserveN != 0 || store.dispatchN != 0 || client.calls != 0 {
+		t.Fatalf("adaptive output above verified model cap was not rejected before dispatch: err=%v reserved=%d dispatch=%d provider=%d",
+			err, store.reserveN, store.dispatchN, client.calls)
+	}
+}
+
 func TestTaskModelGatewayStopsWaitingWhenCancelled(t *testing.T) {
 	store := &concurrencyLimitedModelGatewayStore{modelGatewayStoreTest: &modelGatewayStoreTest{}, always: true}
 	service, client, call := concurrencyTaskGatewayFixture(t, store)
@@ -288,11 +306,13 @@ func TestTaskModelGatewayStopsWaitingWhenCancelled(t *testing.T) {
 }
 
 type modelGatewayResolverTest struct {
-	owner, model  string
-	tools, image  bool
-	personal      bool
-	endpoint      ModelEndpoint
-	contextWindow *int
+	owner, model        string
+	tools, image        bool
+	personal            bool
+	endpoint            ModelEndpoint
+	contextWindow       *int
+	contextWindowSource ModelContextWindowSource
+	maxOutputTokens     *int
 }
 
 func (r *modelGatewayResolverTest) ResolveGatewayEndpoint(_ context.Context, owner, model string, tools, image bool) (ModelGatewayEndpoint, error) {
@@ -302,7 +322,8 @@ func (r *modelGatewayResolverTest) ResolveGatewayEndpoint(_ context.Context, own
 		endpoint = ModelEndpoint{BaseURL: "https://provider.example/v1", APIKey: "platform-key", ModelID: "test-model"}
 	}
 	return ModelGatewayEndpoint{Endpoint: endpoint, Version: time.Unix(1, 0), Personal: r.personal,
-		ContextWindowTokens: r.contextWindow}, nil
+		ContextWindowTokens: r.contextWindow, ContextWindowSource: r.contextWindowSource,
+		MaxOutputTokens: r.maxOutputTokens, MaxOutputSource: ModelMaxOutputOverride}, nil
 }
 
 func (r *modelGatewayResolverTest) ResolveProbeEndpoint(_ context.Context, principal identity.Principal, model string) (ModelGatewayEndpoint, error) {
@@ -324,17 +345,52 @@ type modelGatewayClientTest struct {
 	response ModelResponse
 	err      error
 	calls    int
+	ctx      context.Context
 }
 
-func (c *modelGatewayClientTest) Complete(_ context.Context, request ModelRequest) (ModelResponse, error) {
+func (c *modelGatewayClientTest) Complete(ctx context.Context, request ModelRequest) (ModelResponse, error) {
 	c.calls++
 	c.request = request
+	c.ctx = ctx
 	if request.OnTextDelta != nil {
 		if err := request.OnTextDelta("hello"); err != nil {
 			return ModelResponse{}, err
 		}
 	}
 	return c.response, c.err
+}
+
+func TestTaskModelGatewayUsesLongBoundedProviderDeadline(t *testing.T) {
+	raw := []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[],"max_tokens":16}`)
+	response := ModelResponse{Text: "done", StopReason: "stop", ProviderReportedModel: "test-model",
+		Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 1}}
+	service, _, client, call := taskGatewayFixture(t, raw, response)
+	call.Request = ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 16}
+	if _, err := service.Complete(context.Background(), call); err != nil {
+		t.Fatalf("complete Task model call: %v", err)
+	}
+	deadline, ok := client.ctx.Deadline()
+	if !ok || time.Until(deadline) < 9*time.Minute {
+		t.Fatalf("Task provider deadline has less than nine minutes remaining: deadline=%v ok=%t", deadline, ok)
+	}
+
+	shortStore := &modelGatewayStoreTest{}
+	shortClient := &modelGatewayClientTest{response: response}
+	shortService, err := NewModelGatewayService(shortStore, &modelGatewayResolverTest{}, shortClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shortCall := ModelCall{Source: ModelCallClient, Principal: identity.Principal{UserID: "u1234567", Role: identity.RoleUser,
+		Kind: identity.KindClient, TokenID: "t1234567", ClientInstallationID: "i1234567"},
+		ModelID: "p1234567", CallID: "model-call-0001", RawRequest: []byte(`{"content":"hello"}`),
+		Request: ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 16}}
+	if _, err := shortService.Complete(context.Background(), shortCall); err != nil {
+		t.Fatalf("complete short model call: %v", err)
+	}
+	shortDeadline, ok := shortClient.ctx.Deadline()
+	if !ok || time.Until(shortDeadline) > ModelCallTimeout {
+		t.Fatalf("short provider deadline exceeds 45 seconds: deadline=%v ok=%t", shortDeadline, ok)
+	}
 }
 
 func (*modelGatewayClientTest) Check(context.Context, ModelEndpoint) (ModelCapabilities, error) {
@@ -507,11 +563,12 @@ func TestModelGatewayRejectsTaskToolCallsOutsideWorkerContract(t *testing.T) {
 func TestTaskModelGatewayClassifiesOnlyUnambiguousEmptyAndTruncatedResponses(t *testing.T) {
 	rawRequest := []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[]}`)
 	for _, test := range []struct {
-		name       string
-		response   ModelResponse
-		reason     ModelClientErrorKind
-		wantCode   domain.ErrorCode
-		wantReplay bool
+		name               string
+		response           ModelResponse
+		reason             ModelClientErrorKind
+		wantCode           domain.ErrorCode
+		wantReplay         bool
+		wantPersistPartial bool
 	}{
 		{name: "confirmed zero output", response: ModelResponse{StopReason: "stop", Usage: ModelUsage{Known: true, InputTokens: 3},
 			ProviderReportedModel: "provider-snapshot-3"}, reason: ModelErrorEmptyResponse, wantCode: domain.CodeUpstreamError, wantReplay: true},
@@ -533,7 +590,7 @@ func TestTaskModelGatewayClassifiesOnlyUnambiguousEmptyAndTruncatedResponses(t *
 		{name: "length without generated tokens", response: ModelResponse{StopReason: "length", Text: "partial",
 			Usage: ModelUsage{Known: true, InputTokens: 3}}, reason: ModelErrorInvalidResponse, wantCode: domain.CodeUpstreamError},
 		{name: "truncated output", response: ModelResponse{StopReason: "length", Text: "partial", ProviderReportedModel: "provider-snapshot-3",
-			Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2}}, reason: ModelErrorTruncatedResponse, wantCode: domain.CodeUpstreamError},
+			Usage: ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2}}, reason: ModelErrorTruncatedResponse, wantCode: domain.CodeUpstreamError, wantPersistPartial: true},
 		{name: "unknown usage remains unknown", response: ModelResponse{StopReason: "stop", ProviderReportedModel: "provider-snapshot-3"},
 			wantCode: domain.CodeInvalidState},
 	} {
@@ -542,7 +599,8 @@ func TestTaskModelGatewayClassifiesOnlyUnambiguousEmptyAndTruncatedResponses(t *
 			_, err := service.Complete(context.Background(), call)
 			if domain.CodeOf(err) != test.wantCode || client.calls != 1 || store.settleN != 1 ||
 				store.settlement.Unknown != (test.wantCode == domain.CodeInvalidState) ||
-				store.settlement.ResponseInvalid != (test.wantCode == domain.CodeUpstreamError) {
+				store.settlement.ResponseInvalid != (test.wantCode == domain.CodeUpstreamError && !test.wantPersistPartial) ||
+				(test.wantPersistPartial && (store.settlement.TaskCall == nil || len(store.settlement.ResponseCiphertext) == 0)) {
 				t.Fatalf("Task response classification: err=%v calls=%d settles=%d settlement=%#v", err, client.calls, store.settleN, store.settlement)
 			}
 			if test.wantCode == domain.CodeUpstreamError {
@@ -570,6 +628,81 @@ func TestTaskModelGatewayClassifiesOnlyUnambiguousEmptyAndTruncatedResponses(t *
 					t.Fatalf("settled invalid response redispatched: err=%v calls=%d reserve=%d dispatch=%d settle=%d recover=%d",
 						replayErr, client.calls, store.reserveN, store.dispatchN, store.settleN, store.recoverN)
 				}
+			}
+		})
+	}
+}
+
+func TestTaskModelGatewayPersistsKnownTextTruncationAndDoesNotReplayProvider(t *testing.T) {
+	rawRequest := []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"write a report"}]}],"tools":[]}`)
+	service, store, client, call := taskGatewayFixture(t, rawRequest, ModelResponse{Reasoning: "private reasoning", Text: "saved visible prefix",
+		StopReason: "length", ProviderReportedModel: "provider-snapshot-3",
+		Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4}})
+	_, err := service.Complete(context.Background(), call)
+	var upstream *domain.Error
+	if !errors.As(err, &upstream) || upstream.Details["reason"] != string(ModelErrorTruncatedResponse) ||
+		store.settleN != 1 || store.settlement.Unknown || store.settlement.ResponseInvalid || store.settlement.TaskCall == nil ||
+		len(store.settlement.ResponseCiphertext) == 0 || store.settlement.Usage != (ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4}) || client.calls != 1 {
+		t.Fatalf("known text truncation was not durably preserved: response=%+v settlement=%+v calls=%d err=%v",
+			store.settlement.TaskCall, store.settlement, client.calls, err)
+	}
+	_, err = service.Complete(context.Background(), call)
+	if !errors.As(err, &upstream) || upstream.Details["reason"] != string(ModelErrorTruncatedResponse) ||
+		store.settleN != 1 || client.calls != 1 {
+		t.Fatalf("partial response replay dispatched or settled twice: settlement=%+v calls=%d err=%v", store.settlement, client.calls, err)
+	}
+}
+
+func TestTaskModelGatewayReturnsSignedPureTextTruncationForBoundedContinuation(t *testing.T) {
+	rawRequest := []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"write a report"}]}],"tools":[],"max_tokens":16}`)
+	service, store, client, call := taskGatewayFixture(t, rawRequest, ModelResponse{Reasoning: "private reasoning", Text: "saved visible prefix",
+		StopReason: "length", ProviderReportedModel: "provider-snapshot-3",
+		Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4}})
+	verifiedOutput := 32
+	service.models = &modelGatewayResolverTest{maxOutputTokens: &verifiedOutput}
+	call.LedgerCallID = "mdl_budget_ledger_call_123"
+	call.BudgetPlanID, call.BudgetCallID, call.BudgetRequestDigest = "budget-plan-123", "budget-call-123", strings.Repeat("a", 64)
+
+	response, err := service.Complete(context.Background(), call)
+	if err != nil || response.Text != "saved visible prefix" || response.Reasoning != "" || !ValidTaskModelTextTruncation(response) ||
+		response.StopReason != "length" || store.settleN != 1 || store.settlement.ResponseInvalid || store.settlement.TaskCall == nil ||
+		store.settlement.CallID != call.LedgerCallID || len(store.settlement.ResponseCiphertext) == 0 || client.calls != 1 {
+		t.Fatalf("signed Task truncation was not returned as a safe partial: response=%+v settlement=%+v calls=%d err=%v",
+			response, store.settlement, client.calls, err)
+	}
+	if strings.Contains(string(store.settlement.ResponseCiphertext), "saved visible prefix") || strings.Contains(string(store.settlement.ResponseCiphertext), "private reasoning") {
+		t.Fatal("signed Task truncation was not encrypted before settlement")
+	}
+
+	replayed, err := service.Complete(context.Background(), call)
+	if err != nil || replayed.Text != "saved visible prefix" || !ValidTaskModelTextTruncation(replayed) ||
+		store.settleN != 1 || client.calls != 1 {
+		t.Fatalf("settled signed partial was not replayed without provider dispatch: response=%+v settlements=%d calls=%d err=%v",
+			replayed, store.settleN, client.calls, err)
+	}
+}
+
+func TestTaskModelGatewayDoesNotPersistTruncationWithToolsOrContentFilter(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		raw        []byte
+		response   ModelResponse
+		wantReason ModelClientErrorKind
+	}{
+		{name: "tools present", raw: []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"run a tool"}]}],"tools":[{"name":"lookup","parameters":{"type":"object"}}]}`),
+			response:   ModelResponse{Text: "partial", StopReason: "length", ProviderReportedModel: "provider-snapshot-3", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4}},
+			wantReason: ModelErrorTruncatedResponse},
+		{name: "content filter", raw: []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"write a report"}]}],"tools":[]}`),
+			response:   ModelResponse{Text: "filtered", StopReason: "content_filter", ProviderReportedModel: "provider-snapshot-3", Usage: ModelUsage{Known: true, InputTokens: 8, OutputTokens: 4}},
+			wantReason: ModelErrorContentFiltered},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			service, store, client, call := taskGatewayFixture(t, test.raw, test.response)
+			_, err := service.Complete(context.Background(), call)
+			var upstream *domain.Error
+			if !errors.As(err, &upstream) || upstream.Details["reason"] != string(test.wantReason) ||
+				store.settleN != 1 || store.settlement.Unknown || !store.settlement.ResponseInvalid || store.settlement.TaskCall != nil || client.calls != 1 {
+				t.Fatalf("unsafe partial response was persisted or misclassified: settlement=%+v calls=%d err=%v", store.settlement, client.calls, err)
 			}
 		})
 	}
@@ -1099,6 +1232,48 @@ func TestValidateModelCallDoesNotMutateSharedTaskFence(t *testing.T) {
 	}
 	if fence.AgentRootSessionID != "" {
 		t.Fatalf("validation mutated caller-owned Task fence root session: %q", fence.AgentRootSessionID)
+	}
+}
+
+func TestValidateModelCallRejectsLegacyOutputLimitAbove32768(t *testing.T) {
+	fence := &ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
+		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 0,
+		EngineVersion: "dsh-1", ProfileVersion: "v1"}
+	callID, err := DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelCall{Source: ModelCallTask, Task: fence, ModelID: "p1234567", CallID: callID,
+		RawRequest: []byte(`{"messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]}`),
+		Request:    ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 32_769}}
+	if _, _, _, err := validateModelCall(call); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("legacy model call with 32,769 output tokens was accepted: %v", err)
+	}
+}
+
+func TestValidateModelCallAllowsLargerOutputOnlyWithAdaptiveBudgetIdentity(t *testing.T) {
+	fence := &ModelTaskFence{TaskID: "q1234567", OwnerID: "u1234567", InitiatorID: "u1234567", LeaseOwner: "worker-1", LeaseVersion: 1,
+		AgentInstanceID: "agent-1", AgentGeneration: 1, AgentSessionID: "session-1", AuthorizationVersion: 1, ThroughSequence: 0,
+		EngineVersion: "dsh-1", ProfileVersion: "v1"}
+	callID, err := DSHModelCallID(fence.TaskID, fence.AgentSessionID, fence.ThroughSequence)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := ModelCall{Source: ModelCallTask, Task: fence, ModelID: "p1234567", CallID: callID,
+		RawRequest: []byte(`{"provider":"morde","model":"p1234567","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}],"tools":[]}`),
+		Request:    ModelRequest{Input: []ModelInput{{Type: "message", Role: "user", Text: "hello"}}, MaxOutputTokens: 40_000}}
+	if _, _, _, err := validateModelCall(call); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("unsigned model call with 40,000 output tokens was accepted: %v", err)
+	}
+	call.LedgerCallID = "mdl_ledger_call_123"
+	call.BudgetPlanID, call.BudgetCallID, call.BudgetRequestDigest = "budget-plan-123", "budget-call-123", strings.Repeat("a", 64)
+	_, _, reserved, err := validateModelCall(call)
+	if err != nil || reserved < int64(call.Request.MaxOutputTokens) {
+		t.Fatalf("signed adaptive model call with 40,000 output tokens was rejected: reservation=%d err=%v", reserved, err)
+	}
+	call.Request.MaxOutputTokens = MaxModelOutputTokens + 1
+	if _, _, _, err := validateModelCall(call); domain.CodeOf(err) != domain.CodeInvalidArgument {
+		t.Fatalf("adaptive model call exceeded the protocol output ceiling: %v", err)
 	}
 }
 

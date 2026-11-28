@@ -1662,7 +1662,7 @@ func TestConversationRouteWorkerMarksPendingPredecessorSummaryIncomplete(t *test
 }
 
 func TestConversationRouteWorkerTriggersSummaryByTokenPressureBeforeTransportWatermark(t *testing.T) {
-	worker, route, models, store, _, _, _ := newSummaryRouteWorkerHarness(t, strings.Repeat("x", 22_000), 32_768,
+	worker, route, models, store, _, _, _ := newSummaryRouteWorkerHarness(t, strings.Repeat("x", 21_000), 32_768,
 		CloudDSHConversationSummaryResult{Text: "short summary", ModelID: "p1234567", SessionID: "summary-session", Through: 12})
 	committed, err := worker.compactConversationSummary(context.Background(), route.claim, "p1234567")
 	if err != nil || !committed || len(models.request.Sources) != 1 ||

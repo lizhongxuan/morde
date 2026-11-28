@@ -80,7 +80,7 @@ func (client a10LocalHTTPModelClient) Complete(ctx context.Context, request app.
 		return app.ModelResponse{}, err
 	}
 	return app.ModelResponse{
-		Text: result.Text, StopReason: "stop",
+		Text: result.Text, StopReason: "stop", ProviderReportedModel: request.Endpoint.ModelID,
 		Usage: app.ModelUsage{Known: true, InputTokens: result.InputTokens, OutputTokens: result.OutputTokens},
 	}, nil
 }

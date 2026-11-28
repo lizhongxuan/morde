@@ -11,7 +11,14 @@ import (
 	"morde/server/internal/domain/task"
 )
 
+// MaxAssistantMessageBytes bounds each assistant text delta. A larger total
+// reply is persisted as a sequence of these bounded deltas.
 const MaxAssistantMessageBytes = 32 << 10
+
+// MaxAssistantReplyBytes bounds the complete assistant reply persisted in a
+// Task snapshot and conversation message. This remains a finite storage and
+// transfer limit independent of the provider token capability.
+const MaxAssistantReplyBytes = 2 << 20
 const maxEventPage = 100
 
 const (

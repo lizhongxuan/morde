@@ -6,6 +6,7 @@ import (
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
+	"morde/server/internal/domain/identity"
 	"morde/server/internal/domain/project"
 )
 
@@ -93,6 +94,101 @@ WHERE account.owner_id=$1 AND account.source='task' AND account.call_id=$2`,
 	}
 }
 
+func TestPostgresAdaptiveProjectModelOverageReconcilesVerifiedActualUsage(t *testing.T) {
+	fixture, projectID, fence := newProjectBudgetTaskFixture(t, "budget overage reconciliation", 300, 300)
+	ctx := context.Background()
+	store := fixture.store
+	rate := project.RateSnapshot{Provider: "budget-test", ModelID: "p1234567", Model: "test", Currency: "USD", Version: 1,
+		InputMicrosPerMillion: 1_000_000, OutputMicrosPerMillion: 1_000_000}
+	preparation, _ := projectBudgetPreparationForFence(t, store, fixture.ownerID, projectID, fence,
+		"plan-budget-overage-reconcile", "budget-call-overage-reconcile", rate)
+	plan, err := store.PrepareTaskModelBudget(ctx, preparation)
+	if err != nil {
+		t.Fatalf("prepare project adaptive model budget: %v", err)
+	}
+	reservation := finalizeTestModelBudgetReservation(t, preparation, plan)
+	if err := store.BeginModelCallDispatch(ctx, reservation); err != nil {
+		t.Fatalf("begin project adaptive model dispatch: %v", err)
+	}
+	usage := app.ModelUsage{Known: true, InputTokens: preparation.InputTokenReservation + 5, OutputTokens: plan.MaxOutputTokens + 1}
+	if err := store.RecordTaskModelBudgetOverage(ctx, reservation, usage); err != nil {
+		t.Fatalf("record provider-reported adaptive overage: %v", err)
+	}
+
+	adminUser := createTestUser(t, store, 3, 10_000, 20_000)
+	if _, err := store.pool.Exec(ctx, `UPDATE users SET role='admin' WHERE id=$1`, adminUser.ID); err != nil {
+		t.Fatal(err)
+	}
+	adminToken := createTestCredentials(t, store, adminUser.ID)[0]
+	admin := identity.Principal{UserID: adminUser.ID, TokenID: adminToken, Kind: identity.KindSession, Role: identity.RoleAdmin}
+	service, err := app.NewModelUsageAdminService(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := service.ListUnknown(ctx, admin, fixture.ownerID, 10)
+	if err != nil || len(items) != 1 || items[0].CallID != reservation.CallID || items[0].AdaptiveBudgetOverage == nil {
+		t.Fatalf("admin unknown usage overage details = %#v, err=%v", items, err)
+	}
+	overage := items[0].AdaptiveBudgetOverage
+	if overage.Status != "open" || overage.ReasonCode != "input_and_output_exceeded" ||
+		overage.ReservedInputTokens != 50 || overage.ReservedOutputTokens != plan.MaxOutputTokens ||
+		overage.ReportedInputTokens != usage.InputTokens || overage.ReportedOutputTokens != usage.OutputTokens ||
+		overage.InputOverageTokens != 5 || overage.OutputOverageTokens != 1 || overage.Currency == nil || *overage.Currency != "USD" ||
+		overage.ReservedMicros == nil || *overage.ReservedMicros != 300 || overage.ReportedMicros == nil || *overage.ReportedMicros != 306 ||
+		overage.MoneyOverageMicros == nil || *overage.MoneyOverageMicros != 6 {
+		t.Fatalf("admin overage view = %+v", overage)
+	}
+
+	command := app.ModelUsageReconcileCommand{OwnerID: fixture.ownerID, Source: app.ModelCallTask, CallID: reservation.CallID,
+		InputTokens: usage.InputTokens, OutputTokens: usage.OutputTokens, Evidence: "provider invoice usage record #budget-123", IP: "127.0.0.1"}
+	replayed, err := service.Reconcile(ctx, admin, command)
+	if err != nil || replayed {
+		t.Fatalf("reconcile provider-confirmed adaptive overage: replayed=%t err=%v", replayed, err)
+	}
+	var accountState, projectState, status, resolvedBy, evidence string
+	var projectInput, projectOutput, projectMicros, verifiedInput, verifiedOutput, verifiedMicros *int64
+	var taskUsage *int64
+	if err := store.pool.QueryRow(ctx, `SELECT account.state,project.status,project.actual_input_tokens,project.actual_output_tokens,
+project.actual_micros,task.usage_model_tokens,overage.reconciliation_status,overage.resolved_by,overage.resolution_evidence,
+overage.verified_input_tokens,overage.verified_output_tokens,overage.verified_micros
+FROM model_call_ledger account JOIN project_budget_ledger project
+ ON project.project_id=$3 AND project.source=account.source AND project.call_id=account.call_id
+JOIN tasks task ON task.id=account.task_id
+JOIN model_budget_overage_reconciliations overage
+ ON overage.owner_id=account.owner_id AND overage.source=account.source AND overage.call_id=account.call_id
+WHERE account.owner_id=$1 AND account.source='task' AND account.call_id=$2`,
+		fixture.ownerID, reservation.CallID, projectID).Scan(&accountState, &projectState, &projectInput, &projectOutput, &projectMicros,
+		&taskUsage, &status, &resolvedBy, &evidence, &verifiedInput, &verifiedOutput, &verifiedMicros); err != nil {
+		t.Fatal(err)
+	}
+	if accountState != "settled" || projectState != "settled" || projectInput == nil || *projectInput != usage.InputTokens ||
+		projectOutput == nil || *projectOutput != usage.OutputTokens || projectMicros == nil || *projectMicros != 306 ||
+		taskUsage == nil || *taskUsage != usage.InputTokens+usage.OutputTokens || status != "resolved" || resolvedBy != admin.UserID ||
+		evidence != command.Evidence || verifiedInput == nil || *verifiedInput != usage.InputTokens || verifiedOutput == nil ||
+		*verifiedOutput != usage.OutputTokens || verifiedMicros == nil || *verifiedMicros != 306 {
+		t.Fatalf("resolved overage state: account=%q project=%q actual=%v/%v/%v Task=%v status=%q actor=%q evidence=%q verified=%v/%v/%v",
+			accountState, projectState, projectInput, projectOutput, projectMicros, taskUsage, status, resolvedBy, evidence,
+			verifiedInput, verifiedOutput, verifiedMicros)
+	}
+	items, err = service.ListUnknown(ctx, admin, fixture.ownerID, 10)
+	if err != nil || len(items) != 0 {
+		t.Fatalf("resolved overage remained in unknown usage list: %#v err=%v", items, err)
+	}
+	budget, err := service.Budget(ctx, admin, fixture.ownerID)
+	if err != nil || budget.HasUnknown || budget.UsedTokens != usage.InputTokens+usage.OutputTokens || budget.TokenLimit != 300 {
+		t.Fatalf("resolved overage changed account budget: %+v err=%v", budget, err)
+	}
+	replayed, err = service.Reconcile(ctx, admin, command)
+	if err != nil || !replayed {
+		t.Fatalf("replay identical verified overage = replayed %t err=%v", replayed, err)
+	}
+	changed := command
+	changed.Evidence += " changed"
+	if _, err := service.Reconcile(ctx, admin, changed); domain.CodeOf(err) != domain.CodeIdempotencyConflict {
+		t.Fatalf("changed overage evidence replay = %v, want idempotency conflict", err)
+	}
+}
+
 func TestPostgresAdaptiveProjectModelConfirmedNoDispatchReleasesAllHolds(t *testing.T) {
 	fixture, projectID, fence := newProjectBudgetTaskFixture(t, "budget no dispatch", 300, 300)
 	ctx := context.Background()
@@ -147,7 +243,7 @@ func TestPostgresStaleAdaptiveModelDispatchBecomesUnknownAndCannotReplay(t *test
 	if err := store.BeginModelCallDispatch(ctx, reservation); err != nil {
 		t.Fatalf("begin adaptive Task model dispatch: %v", err)
 	}
-	if _, err := store.pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-interval '3 minutes'
+	if _, err := store.pool.Exec(ctx, `UPDATE model_call_ledger SET created_at=clock_timestamp()-interval '13 minutes'
 WHERE owner_id=$1 AND source='task' AND call_id=$2`, reservation.OwnerID, reservation.CallID); err != nil {
 		t.Fatal(err)
 	}

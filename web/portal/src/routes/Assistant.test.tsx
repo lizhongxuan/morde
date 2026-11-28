@@ -1862,6 +1862,28 @@ describe('Assistant durable tasks', () => {
     expect(accept.mock.calls[0]?.[1].time_zone).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
   });
 
+  it('defaults to short replies and sends an explicit long-form mode when selected', async () => {
+    mockCommon({ conversations: [conversation] });
+    const accept = vi.spyOn(portalApi, 'acceptConversationMessage').mockImplementation(async (conversationID, body) => acceptedReceipt(conversationID, body));
+    const user = userEvent.setup();
+    renderPage();
+    const composer = await findReadyComposer();
+    const responseLength = screen.getByRole('button', { name: '回复长度' });
+    expect(responseLength).toHaveAttribute('aria-pressed', 'false');
+
+    await user.type(composer, '默认短答');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(accept).toHaveBeenCalledOnce());
+    expect(accept.mock.calls[0]?.[1]).not.toHaveProperty('response_mode');
+
+    await user.click(responseLength);
+    expect(responseLength).toHaveAttribute('aria-pressed', 'true');
+    await user.type(composer, '请完整说明实现方案');
+    await user.click(screen.getByRole('button', { name: '发送' }));
+    await waitFor(() => expect(accept).toHaveBeenCalledTimes(2));
+    expect(accept.mock.calls[1]?.[1]).toMatchObject({ response_mode: 'long_form', content: '请完整说明实现方案' });
+  });
+
   it('reuses the first creation request while two messages in a new side conversation send independently', async () => {
     mockCommon({ conversations: [{ ...conversation, id: 'cmain001' }] });
     let finishCreate!: (value: Conversation) => void;
@@ -3066,6 +3088,43 @@ describe('Assistant durable tasks', () => {
     expect(within(article).queryByRole('status')).not.toBeInTheDocument();
     expect(within(article).queryByRole('button')).not.toBeInTheDocument();
     expect(article.closest('.chat-message-body')).not.toHaveTextContent(/处理中|发送失败|等待你补充/u);
+  });
+
+  it.each([
+    ['partial', '部分完成', '长回复未完整生成', '已保存的部分内容仍保留在对话中。'],
+    ['cancelled', '已取消', '长回复已取消', '这条长回复已停止。'],
+  ] as const)('shows the saved long-reply %s outcome outside the user message', async (routingStatus, stateLabel, title, detail) => {
+    const longReply = { ...message, task_id: undefined, actor_id: authUser.id, response_mode: 'long_form', routing_status: routingStatus } as unknown as ConversationMessage;
+    mockCommon({ conversations: [conversation], messages: [longReply] });
+    renderPage();
+
+    const status = await screen.findByRole('group', { name: `长回复状态：${stateLabel}` });
+    expect(within(status).getByText(title)).toBeInTheDocument();
+    expect(within(status).getByText(detail)).toBeInTheDocument();
+    expect(within(status).queryByRole('button', { name: '取消长回复' })).not.toBeInTheDocument();
+  });
+
+  it.each(['pending', 'processing'] as const)('cancels a long reply in %s state and reconciles the saved server status', async (initialStatus) => {
+    let routingStatus: 'pending' | 'processing' | 'cancelled' = initialStatus;
+    const activeLongReply = { ...message, task_id: undefined, actor_id: authUser.id,
+      response_mode: 'long_form', routing_status: initialStatus } as unknown as ConversationMessage;
+    mockCommon({ conversations: [conversation], messages: [activeLongReply] });
+    vi.mocked(portalApi.conversationMessages).mockImplementation(async () => ({
+      items: [{ ...activeLongReply, routing_status: routingStatus } as unknown as ConversationMessage], next_cursor: null,
+    }));
+    const cancel = vi.spyOn(portalApi, 'cancelConversationMessage').mockImplementation(async () => {
+      routingStatus = 'cancelled';
+      return { message: { ...activeLongReply, routing_status: 'cancelled' } as unknown as ConversationMessage, replayed: false };
+    });
+    const user = userEvent.setup();
+    renderPage();
+
+    const activeStatus = await screen.findByRole('group', {
+      name: `长回复状态：${initialStatus === 'pending' ? '等待处理' : '正在生成'}`,
+    });
+    await user.click(within(activeStatus).getByRole('button', { name: '取消长回复' }));
+    expect(cancel).toHaveBeenCalledWith(conversation.id, activeLongReply.id, clientContract.capabilities.cloud_execution.service_instance_id, authUser.id);
+    expect(await screen.findByRole('group', { name: '长回复状态：已取消' })).toBeInTheDocument();
   });
 
   it('does not render an acknowledgement badge beneath a user message bubble', async () => {

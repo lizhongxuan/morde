@@ -15,6 +15,7 @@ import (
 
 	"morde/server/internal/domain"
 	"morde/server/internal/domain/project"
+	"morde/server/internal/domain/task"
 )
 
 // TaskModelBudgetPrepareRequest is the provider-bound DSH projection at the
@@ -134,9 +135,9 @@ func ModelBudgetFinalRequestDigest(providerRequestDigest string, maxOutputTokens
 	return append([]byte(nil), value[:]...), nil
 }
 
-// SetModelOutputBudgetStrategy installs an immutable stage snapshot. It is
-// deliberately not called by the production bootstrap until the shadow and
-// end-to-end gates have been accepted.
+// SetModelOutputBudgetStrategy installs an immutable stage snapshot. The
+// production bootstrap loads it for explicit adaptive Task admission or
+// configured route stages; an empty default leaves both paths disabled.
 func (s *ModelGatewayService) SetModelOutputBudgetStrategy(definition ModelOutputBudgetStrategyDefinition) error {
 	if s == nil {
 		return errors.New("model gateway is unavailable")
@@ -162,6 +163,32 @@ func (s *ModelGatewayService) modelOutputBudgetStrategyForStage(routeKey, stage 
 	}
 	policy, err := s.modelBudgetStrategy.policyForModelStage(routeKey, stage)
 	return *s.modelBudgetStrategy, policy, err
+}
+
+// SupportsTaskModelBudgetAdmission reports whether the Task's exact selected
+// model route has verified output/context capacity and a reviewed strategy.
+// Routes outside that allowlist keep the legacy DSH output cap.
+func (s *ModelGatewayService) SupportsTaskModelBudgetAdmission(ctx context.Context, value task.Task) (bool, error) {
+	if s == nil || s.models == nil || ctx == nil || strings.TrimSpace(value.InitiatorID) == "" ||
+		!domain.ValidModelConnectionID(value.ModelID) {
+		return false, domain.InvalidArgument("model_budget", "task model budget eligibility request is invalid")
+	}
+	endpoint, err := s.models.ResolveGatewayEndpoint(ctx, value.InitiatorID, value.ModelID, false, false)
+	if err != nil {
+		return false, err
+	}
+	if endpoint.MaxOutputTokens == nil || *endpoint.MaxOutputTokens < 1 || *endpoint.MaxOutputTokens > MaxModelOutputTokens ||
+		endpoint.ContextWindowTokens == nil || *endpoint.ContextWindowTokens < 4096 || *endpoint.ContextWindowTokens > MaxModelContextWindowTokens ||
+		(endpoint.MaxOutputSource != ModelMaxOutputModelCatalog && endpoint.MaxOutputSource != ModelMaxOutputOverride) ||
+		!supportedAdaptiveContextWindowSource(endpoint.ContextWindowSource) {
+		return false, nil
+	}
+	routeKey := modelMaxOutputCapacityRouteKey(endpoint.Endpoint.BaseURL, endpoint.Endpoint.ModelID)
+	if routeKey == "" {
+		return false, nil
+	}
+	_, _, err = s.modelOutputBudgetStrategyForStage(routeKey, string(modelOutputBudgetStageShortAnswer))
+	return err == nil, nil
 }
 
 // PrepareTaskModelBudget computes a plan from the exact DSH projection, then
@@ -233,7 +260,7 @@ func (s *ModelGatewayService) PrepareTaskModelBudget(ctx context.Context, input 
 		ContextWindowTokens:     modelBudgetInt64Pointer(int64(*endpoint.ContextWindowTokens)),
 		ContextInputUpperBound:  modelBudgetInt64Pointer(inputTokens),
 		ContextSafetyMargin:     0, // modelRequestInputTokenReservation includes bounded framing margins for text-only DSH projections.
-		ProtocolMaxOutputTokens: 32_768,
+		ProtocolMaxOutputTokens: MaxModelOutputTokens,
 	}, routeKey, string(stage))
 	if err != nil {
 		return TaskModelBudgetPlan{}, err
@@ -311,7 +338,7 @@ func (s *ModelGatewayService) PrepareTaskModelBudget(ctx context.Context, input 
 		return TaskModelBudgetPlan{}, s.waitForTaskModelBudgetCapacity(ctx, err, *fence, input.ModelID,
 			dshCallID, ledgerCallID, input.BudgetCallID, input.RequestDigest, inputTokens, minimum, projectID, rate)
 	}
-	if !validModelBudgetProtocolID(result.PlanID) || result.MaxOutputTokens < minimum || result.MaxOutputTokens > shadowPlan.SafeTokens || result.MaxOutputTokens > 32_768 {
+	if !validModelBudgetProtocolID(result.PlanID) || result.MaxOutputTokens < minimum || result.MaxOutputTokens > shadowPlan.SafeTokens || result.MaxOutputTokens > MaxModelOutputTokens {
 		return TaskModelBudgetPlan{}, domain.NewError(domain.CodeInternal, "adaptive model budget store returned an invalid plan")
 	}
 	return TaskModelBudgetPlan{PlanID: result.PlanID, MaxTokens: int(result.MaxOutputTokens)}, nil

@@ -69,11 +69,15 @@ const (
 	RoutingWaitingUser       RoutingStatus = "waiting_user"
 	RoutingWaitingAdjustment RoutingStatus = "waiting_adjustment"
 	RoutingFailed            RoutingStatus = "failed"
+	RoutingPartial           RoutingStatus = "partial"
+	RoutingCancelRequested   RoutingStatus = "cancel_requested"
+	RoutingCancelled         RoutingStatus = "cancelled"
 )
 
 func (s RoutingStatus) Valid() bool {
 	switch s {
-	case RoutingPending, RoutingProcessing, RoutingRouted, RoutingWaitingUser, RoutingWaitingAdjustment, RoutingFailed:
+	case RoutingPending, RoutingProcessing, RoutingRouted, RoutingWaitingUser, RoutingWaitingAdjustment, RoutingFailed,
+		RoutingPartial, RoutingCancelRequested, RoutingCancelled:
 		return true
 	default:
 		return false
@@ -104,6 +108,7 @@ type Message struct {
 	RelatedTaskID             string
 	AttachmentIDs             []string
 	ClientMessageID           string
+	ResponseMode              string
 	RoutingStatus             RoutingStatus
 	RoutingFailureReason      RoutingFailureReason
 	AgentAcknowledged         bool

@@ -209,7 +209,7 @@ WHERE task_id=$1 AND session_id=$2`, details.Task.ID, activitySessionID); err !=
 
 			progressAge := int64(0)
 			if test.progressStale {
-				progressAge = (app.ModelCallTimeout + time.Second).Milliseconds()
+				progressAge = (app.TaskModelCallTimeout + time.Second).Milliseconds()
 			}
 			if _, err := f.store.pool.Exec(ctx, `UPDATE task_agent_sessions
 SET activity_progressed_at=clock_timestamp()-($3::bigint*interval '1 millisecond'),activity_heartbeat_at=clock_timestamp()

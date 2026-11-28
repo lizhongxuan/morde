@@ -118,3 +118,93 @@ WHERE ledger.owner_id=$1 AND ledger.source='task' AND ledger.call_id=$2`, f.owne
 			storedCallID, storedDSHCallID, state)
 	}
 }
+
+func TestPostgresTaskModelResponseAdaptiveBudgetIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name          string
+		finalThrough  int64
+		wantDifferent bool
+	}{
+		{name: "same ledger and DSH identity", finalThrough: 0},
+		{name: "prepared ledger and final DSH identities differ", finalThrough: 7, wantDifferent: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture, preparation := taskModelBudgetPreparationFixture(t)
+			ctx := context.Background()
+			plan, err := fixture.store.PrepareTaskModelBudget(ctx, preparation)
+			if err != nil {
+				t.Fatalf("prepare adaptive Task model budget: %v", err)
+			}
+			reservation := finalizeTestModelBudgetReservation(t, preparation, plan)
+			if test.wantDifferent {
+				advanceTaskModelResponseCheckpointForTest(t, fixture, *reservation.Task, test.finalThrough)
+				finalFence := *reservation.Task
+				finalFence.ThroughSequence = test.finalThrough
+				reservation.Task = &finalFence
+				reservation.DSHCallID, err = app.DSHModelCallID(finalFence.TaskID, finalFence.AgentSessionID, finalFence.ThroughSequence)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			if (reservation.CallID != reservation.DSHCallID) != test.wantDifferent {
+				t.Fatalf("test reservation ledger/DSH IDs = %q/%q, want different=%t",
+					reservation.CallID, reservation.DSHCallID, test.wantDifferent)
+			}
+
+			_, found, err := fixture.store.RecoverTaskModelResponse(ctx, reservation)
+			if err != nil || found {
+				t.Fatalf("prepared adaptive response was not treated as undispatched: found=%t err=%v", found, err)
+			}
+
+			changedPlan := reservation
+			changedPlan.BudgetPlanID = "wrong-budget-plan-0001"
+			if _, found, err := fixture.store.RecoverTaskModelResponse(ctx, changedPlan); err == nil || found {
+				t.Fatalf("changed adaptive plan identity was replayed: found=%t err=%v", found, err)
+			}
+			changedBudgetCall := reservation
+			changedBudgetCall.BudgetCallID = "wrong-budget-call-0001"
+			if _, found, err := fixture.store.RecoverTaskModelResponse(ctx, changedBudgetCall); err == nil || found {
+				t.Fatalf("changed adaptive budget call identity was replayed: found=%t err=%v", found, err)
+			}
+			changedProjection := reservation
+			wrongProjectionDigest := sha256.Sum256([]byte("different canonical provider projection"))
+			changedProjection.BudgetRequestDigest = hex.EncodeToString(wrongProjectionDigest[:])
+			if _, found, err := fixture.store.RecoverTaskModelResponse(ctx, changedProjection); err == nil || found {
+				t.Fatalf("changed adaptive request digest was replayed: found=%t err=%v", found, err)
+			}
+			changedDSH := reservation
+			changedDSH.DSHCallID = "mdl_wrong_dsh_identity"
+			if _, found, err := fixture.store.RecoverTaskModelResponse(ctx, changedDSH); err == nil || found {
+				t.Fatalf("changed adaptive DSH frame identity was replayed: found=%t err=%v", found, err)
+			}
+			changedLedger := reservation
+			changedLedger.CallID = "mdl_wrong_ledger_identity"
+			if _, found, err := fixture.store.RecoverTaskModelResponse(ctx, changedLedger); err == nil || found {
+				t.Fatalf("changed adaptive ledger identity was replayed: found=%t err=%v", found, err)
+			}
+		})
+	}
+}
+
+func advanceTaskModelResponseCheckpointForTest(t *testing.T, fixture routeActionsTestFixture, fence app.ModelTaskFence, through int64) {
+	t.Helper()
+	digest := sha256.Sum256([]byte("adaptive response final checkpoint"))
+	ctx := context.Background()
+	if _, err := fixture.store.pool.Exec(ctx, `UPDATE tasks SET checkpoint_through_seq=$3,checkpoint_digest=$4 WHERE id=$1 AND owner_id=$2`,
+		fence.TaskID, fence.OwnerID, through, digest[:]); err != nil {
+		t.Fatalf("advance Task model response Task checkpoint: %v", err)
+	}
+	if _, err := fixture.store.pool.Exec(ctx, `UPDATE task_agent_sessions SET checkpoint_through_seq=$3,checkpoint_digest=$4,
+root_checkpoint_through_seq=$3,root_checkpoint_baseline_known=true
+WHERE task_id=$1 AND owner_id=$2 AND session_id=$5`, fence.TaskID, fence.OwnerID, through, digest[:], fence.AgentSessionID); err != nil {
+		t.Fatalf("advance Task model response Agent Session checkpoint: %v", err)
+	}
+	if _, err := fixture.store.pool.Exec(ctx, `INSERT INTO task_agent_checkpoints
+(task_id,owner_id,agent_instance_id,agent_generation,agent_session_id,agent_root_session_id,
+ from_seq,through_seq,digest,ciphertext,engine_version,profile_version,auth_version,lease_version)
+VALUES ($1,$2,$3,$4,$5,$5,1,$6,$7,decode('02','hex'),$8,$9,$10,$11)`, fence.TaskID, fence.OwnerID,
+		fence.AgentInstanceID, fence.AgentGeneration, fence.AgentSessionID, through, digest[:], fence.EngineVersion,
+		fence.ProfileVersion, fence.AuthorizationVersion, fence.LeaseVersion); err != nil {
+		t.Fatalf("persist Task model response final checkpoint: %v", err)
+	}
+}

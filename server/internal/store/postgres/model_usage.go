@@ -198,7 +198,15 @@ WHERE project_id=$1 AND source='terminal_delivery' AND call_id=$2 FOR UPDATE`,
 		if unknown {
 			return domain.NewError(domain.CodeInvalidState, "model usage is unknown and requires reconciliation")
 		}
-		if running >= maxConcurrent {
+		claimTaskID := ""
+		if request.Task != nil {
+			claimTaskID = request.Task.TaskID
+		}
+		claims, err := modelBudgetCapacitySlotClaimsInTx(ctx, tx, request.OwnerID, claimTaskID, request.BudgetCallID)
+		if err != nil {
+			return err
+		}
+		if int64(running)+claims >= int64(maxConcurrent) {
 			limited := domain.NewError(domain.CodeRateLimited, "model concurrency limit reached")
 			limited.Details["reason"] = "model_concurrency_limit"
 			limited.Details["stage"] = "reservation"

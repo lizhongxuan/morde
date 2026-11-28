@@ -20,6 +20,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -44,6 +45,7 @@ func TestCloudDSHModelFailureCategoryUsesOnlySafeAllowlistedReason(t *testing.T)
 	}{
 		{name: "empty response", code: domain.CodeUpstreamError, reason: "empty_response", want: "empty_response"},
 		{name: "truncated response", code: domain.CodeUpstreamError, reason: "truncated_response", want: "truncated_response"},
+		{name: "content filtered response", code: domain.CodeUpstreamError, reason: "content_filtered", want: "content_filtered"},
 		{name: "unknown reason", code: domain.CodeUpstreamError, reason: "private provider response containing secrets", want: "upstream_error"},
 		{name: "non-exact reason", code: domain.CodeUpstreamError, reason: " empty_response", want: "upstream_error"},
 		{name: "non-string reason", code: domain.CodeUpstreamError, reason: []string{"empty_response"}, want: "upstream_error"},
@@ -1063,6 +1065,8 @@ func TestCloudDSHModelResponseFailureDiagnosticDistinguishesMalformedAndUnauthor
 			return value
 		}(), definitions: definitions, wantCategory: "invalid_response", wantReason: "tool_call_metadata_invalid", wantTool: "file_read"},
 		{name: "invalid base response", response: app.ModelResponse{Text: "", Usage: app.ModelUsage{Known: true}, StopReason: "stop"}, wantCategory: "invalid_response", wantReason: "response_shape_invalid"},
+		{name: "verified text truncation", response: app.ModelResponse{Text: "partial", Usage: app.ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2},
+			StopReason: "length", ProviderReportedModel: "provider-model", KnownTextTruncation: true}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := cloudDSHModelResponseFailureDiagnostic(test.response, test.definitions)
@@ -1074,6 +1078,54 @@ func TestCloudDSHModelResponseFailureDiagnosticDistinguishesMalformedAndUnauthor
 				t.Fatalf("failure stage = %q, want model_response_validation", got.Stage)
 			}
 		})
+	}
+}
+
+func TestWriteCloudDSHModelMapsOnlyVerifiedTaskTextTruncationToMaxTokens(t *testing.T) {
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "agent_1", SessionID: "session_1", Generation: 2, AuthorizationVersion: 1}
+	response := app.ModelResponse{Text: "saved visible prefix", Usage: app.ModelUsage{Known: true, InputTokens: 3, OutputTokens: 2},
+		StopReason: "length", ProviderReportedModel: "provider-model", KnownTextTruncation: true}
+	if !app.ValidTaskModelTextTruncation(response) {
+		t.Fatal("verified text truncation was rejected before DSH framing")
+	}
+	var output cloudDSHBufferCloser
+	if err := writeCloudDSHModel(context.Background(), &output, "model_123", identity, response); err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(output.Bytes()))
+	var finish map[string]any
+	for scanner.Scan() {
+		var frame struct {
+			Type  string         `json:"type"`
+			Chunk map[string]any `json:"chunk"`
+		}
+		if err := json.Unmarshal(scanner.Bytes(), &frame); err != nil {
+			t.Fatal(err)
+		}
+		if frame.Type == "model_chunk" && frame.Chunk["type"] == "finish" {
+			finish = frame.Chunk
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if finish == nil {
+		t.Fatal("model finish chunk was not written")
+	}
+	if reason, ok := finish["reason"].(map[string]any); !ok || reason["kind"] != "max-tokens" {
+		t.Fatalf("verified text truncation finish reason = %#v", finish["reason"])
+	}
+	replayState, ok := finish["replayState"].(map[string]any)
+	marker, markerOK := replayState["response"].(map[string]any)
+	if !ok || !markerOK || marker["morde_task_text_truncated"] != true || marker["morde_task_call_id"] != "model_123" {
+		t.Fatalf("truncation recovery marker = %#v", finish["replayState"])
+	}
+
+	response.KnownTextTruncation = false
+	var rejected cloudDSHBufferCloser
+	if err := writeCloudDSHModel(context.Background(), &rejected, "model_123", identity, response); err == nil || rejected.Len() != 0 {
+		t.Fatalf("unverified length response reached DSH: bytes=%d err=%v", rejected.Len(), err)
 	}
 }
 
@@ -1689,6 +1741,164 @@ func TestWriteCloudDSHModelPersistsSourceOnlyAsReplayMetadata(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("model finish did not persist source metadata for runtime recovery")
+	}
+}
+
+func TestWriteCloudDSHModelChunksLongUTF8ContentIntoBoundedFrames(t *testing.T) {
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "agent_1", SessionID: "session_1", Generation: 2, AuthorizationVersion: 1}
+	text := strings.Repeat("中😀\x01", 200000) + "中"
+	reasoning := strings.Repeat("推理😀", 70000)
+	if len(text) <= cloudDSHMaxModelResponseBlockBytes || len(text) > cloudDSHMaxModelResponseContentBytes {
+		t.Fatalf("text fixture size = %d, outside intended long-response range", len(text))
+	}
+	if len(reasoning) <= app.MaxAssistantMessageBytes || len(reasoning) > cloudDSHMaxModelResponseContentBytes {
+		t.Fatalf("reasoning fixture size = %d, outside intended long-response range", len(reasoning))
+	}
+
+	var output cloudDSHBufferCloser
+	err := writeCloudDSHModel(context.Background(), &output, "model_123", identity, app.ModelResponse{
+		Text: text, Reasoning: reasoning,
+		Usage: app.ModelUsage{Known: true, InputTokens: 3, OutputTokens: 4}, StopReason: "stop",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(output.Bytes()))
+	scanner.Buffer(make([]byte, 64<<10), cloudDSHMaxFrame)
+	deltas := make(map[int]*strings.Builder)
+	blockTypes := make(map[int]string)
+	var joinedText, joinedReasoning strings.Builder
+	lastChunkType := ""
+	frameCount := 0
+	for scanner.Scan() {
+		line := scanner.Bytes()
+		if len(line) > cloudDSHMaxFrame {
+			t.Fatalf("encoded model frame size = %d, exceeds %d", len(line), cloudDSHMaxFrame)
+		}
+		var frame struct {
+			Type  string         `json:"type"`
+			Chunk map[string]any `json:"chunk"`
+			Index int            `json:"index"`
+		}
+		if err := json.Unmarshal(line, &frame); err != nil {
+			t.Fatal(err)
+		}
+		frameCount++
+		if frame.Type != "model_chunk" {
+			continue
+		}
+		chunkType, _ := frame.Chunk["type"].(string)
+		lastChunkType = chunkType
+		blockIndexValue, hasBlockIndex := frame.Chunk["index"].(float64)
+		blockIndex := int(blockIndexValue)
+		if (chunkType == "block-start" || chunkType == "text-delta" || chunkType == "reasoning-delta" || chunkType == "block-end") && !hasBlockIndex {
+			t.Fatalf("model content chunk has no block index: %#v", frame.Chunk)
+		}
+		switch chunkType {
+		case "block-start":
+			blockType, _ := frame.Chunk["blockType"].(string)
+			blockTypes[blockIndex] = blockType
+			deltas[blockIndex] = &strings.Builder{}
+		case "text-delta", "reasoning-delta":
+			value, ok := frame.Chunk["text"].(string)
+			if !ok || len(value) > app.MaxAssistantMessageBytes || !utf8.ValidString(value) {
+				t.Fatalf("model delta is invalid or above limit: type=%s bytes=%d", chunkType, len(value))
+			}
+			builder := deltas[blockIndex]
+			if builder == nil {
+				t.Fatalf("delta arrived without block-start for index %d", blockIndex)
+			}
+			builder.WriteString(value)
+		case "block-end":
+			block, ok := frame.Chunk["block"].(map[string]any)
+			value, valueOK := block["text"].(string)
+			builder := deltas[blockIndex]
+			var deltaText string
+			if builder != nil {
+				deltaText = builder.String()
+			}
+			if !ok || !valueOK || builder == nil || value != deltaText {
+				t.Fatalf("completed block does not match its deltas: index=%d block=%#v deltas=%q", blockIndex, block, deltaText)
+			}
+			switch blockTypes[blockIndex] {
+			case "text":
+				joinedText.WriteString(value)
+			case "reasoning":
+				joinedReasoning.WriteString(value)
+			default:
+				t.Fatalf("unexpected response block type: %q", blockTypes[blockIndex])
+			}
+		case "usage", "finish":
+		default:
+			t.Fatalf("unexpected model chunk type: %q", chunkType)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if frameCount < 10 || joinedText.String() != text || joinedReasoning.String() != reasoning {
+		t.Fatalf("reassembled response differs: frames=%d text=%d/%d reasoning=%d/%d", frameCount,
+			joinedText.Len(), len(text), joinedReasoning.Len(), len(reasoning))
+	}
+	if lastChunkType != "finish" {
+		t.Fatalf("last model chunk = %q, want finish after usage", lastChunkType)
+	}
+}
+
+func TestWriteCloudDSHModelRejectsInvalidOrOversizedContentBeforeWriting(t *testing.T) {
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "agent_1", SessionID: "session_1", Generation: 2, AuthorizationVersion: 1}
+	for _, test := range []struct {
+		name string
+		text string
+	}{
+		{name: "above total byte cap", text: strings.Repeat("x", cloudDSHMaxModelResponseContentBytes+1)},
+		{name: "invalid UTF-8", text: string([]byte{0xff, 0xfe})},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var output cloudDSHBufferCloser
+			err := writeCloudDSHModel(context.Background(), &output, "model_123", identity, app.ModelResponse{
+				Text: test.text, Usage: app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}, StopReason: "stop",
+			})
+			if err == nil {
+				t.Fatal("invalid response content was accepted")
+			}
+			if output.Len() != 0 {
+				t.Fatalf("invalid response wrote %d bytes before rejection", output.Len())
+			}
+		})
+	}
+}
+
+type cloudDSHBlockingFrameWriter struct {
+	started chan struct{}
+}
+
+func (w *cloudDSHBlockingFrameWriter) Write([]byte) (int, error) {
+	return 0, errors.New("unexpected direct write")
+}
+func (w *cloudDSHBlockingFrameWriter) Close() error { return nil }
+func (w *cloudDSHBlockingFrameWriter) writeFrame(ctx context.Context, _ any) error {
+	close(w.started)
+	<-ctx.Done()
+	return context.Cause(ctx)
+}
+
+func TestWriteCloudDSHModelPropagatesCancellation(t *testing.T) {
+	identity := cloudDSHIdentity{TaskID: "q1234567", OwnerID: "u1234567", AgentID: "agent_1", SessionID: "session_1", Generation: 2, AuthorizationVersion: 1}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	writer := &cloudDSHBlockingFrameWriter{started: make(chan struct{})}
+	done := make(chan error, 1)
+	go func() {
+		done <- writeCloudDSHModel(ctx, writer, "model_123", identity, app.ModelResponse{
+			Text: "long reply", Usage: app.ModelUsage{Known: true, InputTokens: 1, OutputTokens: 1}, StopReason: "stop",
+		})
+	}()
+	<-writer.started
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled model frame write error = %v, want context.Canceled", err)
 	}
 }
 

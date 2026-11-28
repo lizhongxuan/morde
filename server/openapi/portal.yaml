@@ -4332,6 +4332,35 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409': { $ref: '#/components/responses/Conflict' }
         default: { $ref: '#/components/responses/Error' }
+  /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/cancel:
+    parameters:
+      - { $ref: '#/components/parameters/ProjectId' }
+      - { $ref: '#/components/parameters/ProjectConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+    post:
+      tags: [Projects]
+      operationId: cancelProjectConversationMessage
+      summary: Cancel processing of an accepted project conversation message
+      description: Only the original message actor may cancel. Cancellation is idempotent and is bound to this project, conversation, message, service instance, and authenticated actor. The response uses the accepted-message envelope and returns the current source message state.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ServiceInstanceID' }
+        - { $ref: '#/components/parameters/MessageActor' }
+      responses:
+        '202':
+          description: Cancellation was accepted or had already been applied.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedProjectConversationMessageResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
   /api/projects/{id}/conversations/{conversation_id}/messages/{message_id}/retry-processing:
     parameters:
       - { $ref: '#/components/parameters/ProjectId' }
@@ -5346,6 +5375,37 @@ paths:
       responses:
         '202':
           description: The message and routing receipt were durably accepted. A Task may be created later.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AcceptedConversationMessageResponse' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        default: { $ref: '#/components/responses/Error' }
+  /api/conversations/{id}/messages/{message_id}/cancel:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/ConversationId' }
+      - name: message_id
+        in: path
+        required: true
+        schema: { $ref: '#/components/schemas/MessageId' }
+    post:
+      tags: [Tasks]
+      operationId: cancelConversationMessage
+      summary: Cancel processing of an accepted conversation message
+      description: Only the original message actor may cancel. Cancellation is idempotent and is bound to this conversation, message, service instance, and authenticated actor. The response uses the accepted-message envelope and returns the current source message state.
+      security: [{ portalSession: [] }, { clientCredential: [] }]
+      parameters:
+        - { $ref: '#/components/parameters/ServiceInstanceID' }
+        - { $ref: '#/components/parameters/MessageActor' }
+      responses:
+        '202':
+          description: Cancellation was accepted or had already been applied.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/AcceptedConversationMessageResponse' }
@@ -8730,7 +8790,7 @@ paths:
         - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 100 } }
       responses:
         '200':
-          description: Unknown calls; no prompt, response, or credential is returned.
+          description: Unknown calls; no prompt, response, or credential is returned. An adaptive_budget_overage object is included when provider-reported usage exceeded a signed adaptive Task hold and the administrator must confirm the usage with provider evidence.
           content:
             application/json:
               schema:
@@ -8752,6 +8812,23 @@ paths:
                         reserved_tokens: { type: integer, format: int64, minimum: 1 }
                         created_at: { type: string, format: date-time }
                         unknown_at: { type: string, format: date-time }
+                        adaptive_budget_overage:
+                          type: object
+                          required: [status, reason_code, reserved_input_tokens, reserved_output_tokens, reported_input_tokens, reported_output_tokens, input_overage_tokens, output_overage_tokens]
+                          properties:
+                            status: { type: string, enum: [open] }
+                            reason_code: { type: string, enum: [input_bound_exceeded, output_cap_exceeded, input_and_output_exceeded] }
+                            reserved_input_tokens: { type: integer, format: int64, minimum: 0 }
+                            reserved_output_tokens: { type: integer, format: int64, minimum: 1 }
+                            reported_input_tokens: { type: integer, format: int64, minimum: 0 }
+                            reported_output_tokens: { type: integer, format: int64, minimum: 0 }
+                            input_overage_tokens: { type: integer, format: int64, minimum: 0 }
+                            output_overage_tokens: { type: integer, format: int64, minimum: 0 }
+                            project_id: { type: string }
+                            currency: { type: string, pattern: '^[A-Z]{3}$' }
+                            reserved_micros: { type: integer, format: int64, minimum: 1 }
+                            reported_micros: { type: integer, format: int64, minimum: 0 }
+                            money_overage_micros: { type: integer, format: int64, minimum: 0 }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
@@ -8761,7 +8838,7 @@ paths:
       tags: [Admin]
       operationId: reconcileUnknownModelUsage
       summary: Record provider-verified usage for an unknown model call
-      description: An approved administrator verifies the provider's counts before submitting them. The ledger, associated server Task usage and audit record commit atomically. Only unknown calls can be reconciled. A repeat by the same administrator with identical counts and evidence is idempotent; different submissions conflict. This does not restore an unpersisted model response or restart the call.
+      description: An approved administrator verifies the provider's counts before submitting them. The ledger, associated server Task usage and audit record commit atomically. For an adaptive Task budget overage, the administrator must confirm authoritative provider usage; the account and project ledgers are settled with those verified actual amounts even when they exceed the original hold, and the overage record is resolved with the administrator, evidence and verified amounts. This does not increase any budget, restore an unpersisted model response, or restart the call. Other unknown calls still cannot be reconciled above their signed reservation. A repeat by the same administrator with identical counts and evidence is idempotent; different submissions conflict.
       security: [{ portalSession: [] }]
       requestBody:
         required: true
@@ -12708,7 +12785,8 @@ components:
         duplicate_of_message_id: { $ref: '#/components/schemas/MessageId', description: Authorized original user message for a repeated request; the current message remains a separate timeline entry. }
         related_task_id: { $ref: '#/components/schemas/TaskId', description: Task associated through the original request, when one exists and is visible to the caller. }
         client_message_id: { type: string, pattern: '^[A-Za-z0-9._~-]{8,128}$' }
-        routing_status: { type: string, enum: [pending, processing, routed, waiting_user, waiting_adjustment, failed] }
+        response_mode: { type: string, enum: [short, long_form], description: Requested direct-reply mode for this user message; legacy messages may omit it. }
+        routing_status: { type: string, enum: [pending, processing, cancel_requested, routed, waiting_user, waiting_adjustment, partial, cancelled, failed] }
         routing_failure_reason: { type: string, enum: [model_unavailable, routing_context_unavailable, routing_action_unavailable, message_too_long] }
         agent_acknowledged: { type: boolean, description: True only after the Main Agent chose to acknowledge this message and its associated background Task actually started. Clients cannot set this field. }
         tool_activity: { $ref: '#/components/schemas/ConversationToolActivity' }
@@ -12778,6 +12856,7 @@ components:
         application_id: { type: string, maxLength: 64 }
         model_id: { type: string, maxLength: 256, description: Optional routing hint; a server default may be selected asynchronously. }
         time_zone: { type: string, maxLength: 64, description: Optional IANA time-zone identifier captured when the user sends the message. }
+        response_mode: { type: string, enum: [short, long_form], description: Explicitly choose a direct short response or the bounded long-form conversation reply path. Omission defaults to short. }
         content: { type: string, maxLength: 32768 }
         mcp_connector_ids:
           type: array
@@ -13536,7 +13615,7 @@ components:
         task_revision: { type: integer, format: int64, minimum: 0 }
         result_event_sequence: { type: integer, format: int64, minimum: 1, description: Exact event identifying this completed result. }
         role: { type: string, const: assistant }
-        content: { type: string, maxLength: 32768 }
+        content: { type: string, maxLength: 2097152, description: Maximum UTF-8 encoded size is 2 MiB; streaming deltas are each limited to 32 KiB. }
         status: { type: string, enum: [streaming, completed, interrupted] }
         created_at: { type: string, format: date-time }
     TaskWorkbenchObservationTicket:

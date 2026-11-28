@@ -112,6 +112,41 @@ type ModelCallReservation struct {
 	LegacyCallID            string
 	LegacyDigest            []byte
 	ReservedTokens          int64
+	RouteOutputBudget       *ConversationRouteOutputBudgetPlan
+}
+
+// ConversationRouteOutputBudgetPlan binds a long-form conversation route
+// call to the reviewed output policy and the verified capabilities used to
+// calculate its exact provider output cap and ledger reservation.
+type ConversationRouteOutputBudgetPlan struct {
+	Stage                        string
+	StrategyVersion              string
+	CapabilityVersion            string
+	ModelMaxOutputTokens         int64
+	ContextWindowTokens          int64
+	ContextInputUpperBoundTokens int64
+	ContextSafetyMarginTokens    int64
+	ContextSafeTokens            int64
+	AccountSafeTokens            int64
+	ProjectSafeTokens            int64
+	GoalTokens                   int64
+	MinimumTokens                int64
+	SafeTokens                   int64
+	SendTokens                   int64
+	InputReservedTokens          int64
+}
+
+// ConversationRouteOutputBudgetLimits returns current account and project
+// headroom before a long-form route is signed. Prepare rechecks both limits
+// under the same locks as its durable reservation.
+type ConversationRouteOutputBudgetLimits struct {
+	AccountSafeTokens int64
+	ProjectSafeTokens int64
+}
+
+type ConversationRouteOutputBudgetLimiter interface {
+	LimitConversationRouteOutputBudget(context.Context, ModelCallReservation,
+		*project.RateSnapshot) (ConversationRouteOutputBudgetLimits, error)
 }
 
 type ModelCallSettlement struct {
@@ -272,16 +307,19 @@ type ModelGatewayResolver interface {
 }
 
 type ModelGatewayService struct {
-	store                 ModelCallStore
-	models                ModelGatewayResolver
-	client                ModelClient
-	projectBudget         *ProjectBudgetService
-	responseSealer        *Sealer
-	gpt6LunaMaxReasoning  bool
-	usageObserverMu       sync.RWMutex
-	usageObserver         func(ModelUsageObservation)
-	modelBudgetStrategyMu sync.RWMutex
-	modelBudgetStrategy   *modelOutputBudgetStrategySnapshot
+	store                     ModelCallStore
+	models                    ModelGatewayResolver
+	client                    ModelClient
+	projectBudget             *ProjectBudgetService
+	responseSealer            *Sealer
+	gpt6LunaMaxReasoning      bool
+	usageObserverMu           sync.RWMutex
+	usageObserver             func(ModelUsageObservation)
+	modelBudgetStrategyMu     sync.RWMutex
+	modelBudgetStrategy       *modelOutputBudgetStrategySnapshot
+	modelBudgetShadowMu       sync.RWMutex
+	modelBudgetShadow         *modelOutputBudgetShadowSnapshot
+	modelBudgetShadowObserver func(ModelOutputBudgetShadowObservation)
 }
 
 func (s *ModelGatewayService) SetModelUsageObserver(observer func(ModelUsageObservation)) {
@@ -319,7 +357,7 @@ const modelConcurrencyReservationRetryMaxDelay = time.Second
 // MaxDSHModelResponseTextBytes is the maximum response text accepted by the cloud DSH worker.
 // MaxDSHModelResponseToolCalls is the maximum tool-call count accepted by the cloud DSH worker.
 const (
-	MaxDSHModelResponseTextBytes  = 256 << 10
+	MaxDSHModelResponseTextBytes  = MaxAssistantReplyBytes
 	MaxDSHModelResponseToolCalls  = 64
 	maxDSHModelResponseTokenCount = 1<<53 - 1
 	// OpenAI recommends reserving at least 25,000 tokens for max reasoning and output.
@@ -637,6 +675,12 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	if err != nil {
 		return ModelResponse{}, err
 	}
+	adaptiveTaskBudget := call.Source == ModelCallTask && call.BudgetPlanID != ""
+	if adaptiveTaskBudget && (endpoint.MaxOutputTokens == nil || *endpoint.MaxOutputTokens < 1 ||
+		*endpoint.MaxOutputTokens > MaxModelOutputTokens || call.Request.MaxOutputTokens > *endpoint.MaxOutputTokens ||
+		(endpoint.MaxOutputSource != ModelMaxOutputModelCatalog && endpoint.MaxOutputSource != ModelMaxOutputOverride)) {
+		return ModelResponse{}, domain.NewError(domain.CodeUnsupported, "verified adaptive model output capacity is unavailable")
+	}
 	if call.Source == ModelCallTask || call.Source == ModelCallCompaction || call.Source == ModelCallReview {
 		request := call.Request
 		if call.Source == ModelCallCompaction {
@@ -729,6 +773,16 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 				return ModelResponse{}, err
 			}
 			attachCurrentTaskTurnMessageID(&response, call.Request.CurrentTaskTurnMessageID)
+			if validTaskModelTruncatedTextForRequest(call.Request, response) {
+				if err := taskDelivery.ValidateTaskModelDelivery(ctx, reservation); err != nil {
+					return ModelResponse{}, err
+				}
+				if adaptiveTaskBudget {
+					response.KnownTextTruncation = true
+					return response, nil
+				}
+				return ModelResponse{}, invalidTaskModelResponseError(response, "model provider truncated the task text response")
+			}
 			if err := taskDelivery.ValidateTaskModelDelivery(ctx, reservation); err != nil {
 				return ModelResponse{}, err
 			}
@@ -765,6 +819,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 		}
 	}
 	projectCall := projectID != "" && !endpoint.Personal
+	budgetShadowPlan := s.planTaskModelBudgetShadow(ctx, call, call.Request, endpoint, projectID)
 	if call.BudgetPlanID == "" {
 		if err := s.reserveModelCall(ctx, call.Source, projectCall, projectID, reservation, projectUsageReservation(call.Request, reserve)); err != nil {
 			return ModelResponse{}, err
@@ -774,7 +829,14 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	currentTaskTurnMessageID := request.CurrentTaskTurnMessageID
 	request.CurrentTaskTurnMessageID = ""
 	request.Endpoint = endpoint.Endpoint
-	dispatchCtx, cancelDispatch := context.WithTimeout(ctx, ModelCallTimeout)
+	if adaptiveTaskBudget {
+		request.Endpoint.VerifiedMaxOutputTokens = *endpoint.MaxOutputTokens
+	}
+	dispatchTimeout := ModelCallTimeout
+	if call.Source == ModelCallTask {
+		dispatchTimeout = TaskModelCallTimeout
+	}
+	dispatchCtx, cancelDispatch := context.WithTimeout(ctx, dispatchTimeout)
 	defer cancelDispatch()
 	var dispatchErr error
 	if call.Source == ModelCallTask && request.OnTextDelta != nil {
@@ -853,6 +915,8 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	response, callErr := s.client.Complete(providerCtx, request)
 	finishProvider()
+	response.KnownTextTruncation = false
+	observeTaskModelBudgetShadowResult(s, budgetShadowPlan, response, callErr)
 	if call.Source == ModelCallTask {
 		attachCurrentTaskTurnMessageID(&response, currentTaskTurnMessageID)
 	}
@@ -966,21 +1030,45 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 	}
 	var taskOutputErr error
 	if call.Source == ModelCallTask && !settlement.Unknown && !retryableFailure {
-		taskOutputErr = validateTaskModelResponse(call.Request, response)
-		if taskOutputErr == nil {
+		if validTaskModelTruncatedTextForRequest(call.Request, response) {
 			taskOutputErr = taskDelivery.ValidateTaskModelDelivery(ctx, reservation)
-		}
-		if taskOutputErr == nil {
-			stored, sealErr := SealTaskModelResponse(s.responseSealer, reservation, response)
-			if sealErr != nil {
-				settlement.ResponseInvalid = true
-				taskOutputErr = domain.NewError(domain.CodeInvalidState, "task model response could not be stored safely")
+			if taskOutputErr == nil {
+				partial := response
+				partial.Reasoning = "" // Do not retain provider reasoning with a partial user-visible result.
+				stored, sealErr := SealTaskModelResponse(s.responseSealer, reservation, partial)
+				if sealErr != nil {
+					settlement.ResponseInvalid = true
+					taskOutputErr = domain.NewError(domain.CodeInvalidState, "partial task model response could not be stored safely")
+				} else {
+					settlement.TaskCall = &reservation
+					settlement.ResponseCiphertext, settlement.ResponseDigest = stored.Ciphertext, stored.Digest
+					if adaptiveTaskBudget {
+						partial.KnownTextTruncation = true
+						response = partial
+					} else {
+						taskOutputErr = invalidTaskModelResponseError(partial, "model provider truncated the task text response")
+					}
+				}
 			} else {
-				settlement.TaskCall = &reservation
-				settlement.ResponseCiphertext, settlement.ResponseDigest = stored.Ciphertext, stored.Digest
+				settlement.ResponseInvalid = true
 			}
 		} else {
-			settlement.ResponseInvalid = true
+			taskOutputErr = validateTaskModelResponse(call.Request, response)
+			if taskOutputErr == nil {
+				taskOutputErr = taskDelivery.ValidateTaskModelDelivery(ctx, reservation)
+			}
+			if taskOutputErr == nil {
+				stored, sealErr := SealTaskModelResponse(s.responseSealer, reservation, response)
+				if sealErr != nil {
+					settlement.ResponseInvalid = true
+					taskOutputErr = domain.NewError(domain.CodeInvalidState, "task model response could not be stored safely")
+				} else {
+					settlement.TaskCall = &reservation
+					settlement.ResponseCiphertext, settlement.ResponseDigest = stored.Ciphertext, stored.Digest
+				}
+			} else {
+				settlement.ResponseInvalid = true
+			}
 		}
 	}
 	settleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
@@ -1072,7 +1160,7 @@ func (s *ModelGatewayService) Complete(ctx context.Context, call ModelCall) (Mod
 			return ModelResponse{}, err
 		}
 	}
-	if call.Source == ModelCallTask && !ValidDSHModelResponse(response) {
+	if call.Source == ModelCallTask && !ValidDSHModelResponse(response) && !ValidTaskModelTextTruncation(response) {
 		return ModelResponse{}, domain.NewError(domain.CodeUpstreamError, "model provider returned an invalid task response")
 	}
 	seenCallIDs := make(map[string]struct{}, len(response.ToolCalls))
@@ -1247,7 +1335,11 @@ func validateModelCall(call ModelCall) (string, [32]byte, int64, error) {
 	default:
 		return "", empty, 0, domain.InvalidArgument("model_call", "invalid model call source")
 	}
-	if call.Request.MaxOutputTokens < 1 || call.Request.MaxOutputTokens > 32768 {
+	maxOutputTokens := 32_768
+	if adaptiveBudget {
+		maxOutputTokens = MaxModelOutputTokens
+	}
+	if call.Request.MaxOutputTokens < 1 || call.Request.MaxOutputTokens > maxOutputTokens {
 		return "", empty, 0, domain.InvalidArgument("model_call", "model token limit is invalid")
 	}
 	inputReservation := modelRequestInputTokenReservation(call.Request)

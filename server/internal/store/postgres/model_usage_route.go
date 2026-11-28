@@ -431,6 +431,9 @@ func (s *Store) PrepareConversationRouteModelCall(ctx context.Context, call app.
 		(!strings.HasPrefix(call.CallID, "mdl_") || !strings.HasPrefix(call.LegacyCallID, "route_") || len(call.LegacyDigest) != 32)) {
 		return nil, domain.InvalidArgument("route_model", "route model call is invalid")
 	}
+	if err := validateConversationRouteOutputBudget(call); err != nil {
+		return nil, err
+	}
 	if projectCall != nil {
 		if call.ProjectID == "" || call.PersonalModel || projectCall.ProjectID != call.ProjectID || projectCall.ActorID != call.OwnerID ||
 			projectCall.Source != app.ModelCallRoute || projectCall.TaskID != "" || projectCall.CallID != call.CallID ||
@@ -512,7 +515,8 @@ ORDER BY (state IN ('reserved','dispatched')) DESC,(phase=$3 AND attempt=$4) DES
 			}
 			if legacyPrior && state == "settled" {
 				var value app.ConversationRouteDecision
-				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context) {
+				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context,
+					call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm) {
 					return domain.NewError(domain.CodeInvalidState, "settled legacy route decision is invalid")
 				}
 				if staleAttemptZeroRouteDecision(value, call.Route.Context) {
@@ -528,7 +532,8 @@ ORDER BY (state IN ('reserved','dispatched')) DESC,(phase=$3 AND attempt=$4) DES
 					return err
 				}
 				var value app.ConversationRouteDecision
-				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context) {
+				if err := json.Unmarshal(result, &value); err != nil || !validStoredRouteDecision(value, call.Route.Context,
+					call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm) {
 					return domain.NewError(domain.CodeInvalidState, "settled coordinator route decision is invalid")
 				}
 				if staleAttemptZeroRouteDecision(value, call.Route.Context) {
@@ -548,6 +553,10 @@ ORDER BY (state IN ('reserved','dispatched')) DESC,(phase=$3 AND attempt=$4) DES
 				if err := json.Unmarshal(result, &value); err != nil {
 					return fmt.Errorf("decode route decision: %w", err)
 				}
+				if !validStoredRouteDecision(value, call.Route.Context,
+					call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm) {
+					return domain.NewError(domain.CodeInvalidState, "settled route decision is invalid")
+				}
 				decision = &value
 				return nil
 			default:
@@ -560,18 +569,35 @@ ORDER BY (state IN ('reserved','dispatched')) DESC,(phase=$3 AND attempt=$4) DES
 		if err := checkModelCaller(ctx, tx, call); err != nil {
 			return err
 		}
+		if call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm {
+			var cancelled bool
+			if err := tx.QueryRow(ctx, `SELECT cancel_requested_at IS NOT NULL FROM conversation_message_routes
+WHERE message_id=$1 AND actor_id=$2 AND state='processing' AND lease_owner=$3 AND lease_version=$4 FOR UPDATE`,
+				call.Route.Claim.Message.ID, call.OwnerID, call.Route.Claim.LeaseOwner, call.Route.Claim.LeaseVersion).Scan(&cancelled); err != nil {
+				return domain.NewError(domain.CodeConflict, "long-form conversation route is no longer current")
+			} else if cancelled {
+				return domain.NewError(domain.CodeConflict, "long-form conversation reply was cancelled before dispatch")
+			}
+		}
 		if call.ProjectID != "" && !call.PersonalModel && projectCall == nil {
 			return app.ErrRouteProjectReservationRequired
 		}
 		if err := reserveModelCallInTx(ctx, tx, call, projectCall); err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO conversation_route_model_calls
-(message_id,service_instance_id,owner_id,actor_id,conversation_id,project_id,source,call_id,request_digest,model_id,model_version,state,phase,attempt)
-VALUES ($1,$2::uuid,$3,$4,$5,NULLIF($6,''),'route',$7,$8,$9,$10,'reserved',$11,$12)`,
+		args := []any{
 			call.Route.Claim.Message.ID, call.Route.Claim.ServiceInstanceID, call.Route.Claim.Message.OwnerID,
 			call.OwnerID, call.Route.Claim.Message.ConversationID, call.ProjectID, call.CallID,
-			call.RequestDigest, call.ModelID, call.ConnectionVersion, phase, attempt)
+			call.RequestDigest, call.ModelID, call.ConnectionVersion, phase, attempt,
+		}
+		args = append(args, routeOutputBudgetValues(call.RouteOutputBudget)...)
+		_, err = tx.Exec(ctx, `INSERT INTO conversation_route_model_calls
+(message_id,service_instance_id,owner_id,actor_id,conversation_id,project_id,source,call_id,request_digest,model_id,model_version,state,phase,attempt,
+ budget_stage,budget_strategy_version,budget_capability_version,model_max_output_tokens,context_window_tokens,
+ context_input_upper_bound_tokens,context_safety_margin_tokens,context_safe_tokens,account_safe_tokens,project_safe_tokens,
+ goal_tokens,minimum_tokens,safe_tokens,send_tokens,input_reserved_tokens)
+VALUES ($1,$2::uuid,$3,$4,$5,NULLIF($6,''),'route',$7,$8,$9,$10,'reserved',$11,$12,
+ $13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)`, args...)
 		if err != nil {
 			return fmt.Errorf("reserve route model call: %w", err)
 		}
@@ -581,6 +607,45 @@ VALUES ($1,$2::uuid,$3,$4,$5,NULLIF($6,''),'route',$7,$8,$9,$10,'reserved',$11,$
 		return nil, domain.NewError(domain.CodeInvalidState, "route model result is unknown and requires reconciliation")
 	}
 	return decision, err
+}
+
+func validateConversationRouteOutputBudget(call app.ModelCallReservation) error {
+	longForm := call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm
+	plan := call.RouteOutputBudget
+	if !longForm && plan == nil {
+		return nil
+	}
+	if !longForm || plan == nil || plan.Stage != app.ConversationResponseLongForm ||
+		strings.TrimSpace(plan.StrategyVersion) == "" || len(plan.StrategyVersion) > 128 ||
+		strings.TrimSpace(plan.CapabilityVersion) == "" || len(plan.CapabilityVersion) > 128 ||
+		plan.ModelMaxOutputTokens < 1 || plan.ModelMaxOutputTokens > int64(app.MaxModelOutputTokens) ||
+		plan.ContextWindowTokens < 1 || plan.ContextWindowTokens > int64(app.MaxModelContextWindowTokens) ||
+		plan.ContextInputUpperBoundTokens < 1 || plan.ContextSafetyMarginTokens < 1 ||
+		plan.GoalTokens < 1 || plan.GoalTokens > int64(app.MaxModelOutputTokens) ||
+		plan.MinimumTokens < 1 || plan.MinimumTokens > int64(app.MaxModelOutputTokens) || plan.SafeTokens < 1 || plan.SendTokens < 1 ||
+		plan.ContextSafeTokens < 1 || plan.AccountSafeTokens < 1 || plan.ProjectSafeTokens < 1 ||
+		plan.ContextSafeTokens > int64(app.MaxModelOutputTokens) || plan.AccountSafeTokens > int64(app.MaxModelOutputTokens) ||
+		plan.ProjectSafeTokens > int64(app.MaxModelOutputTokens) ||
+		plan.InputReservedTokens < 1 || plan.ContextInputUpperBoundTokens >= plan.ContextWindowTokens ||
+		plan.ContextSafetyMarginTokens > plan.ContextWindowTokens-plan.ContextInputUpperBoundTokens ||
+		plan.ContextSafeTokens != min(plan.ModelMaxOutputTokens,
+			plan.ContextWindowTokens-plan.ContextInputUpperBoundTokens-plan.ContextSafetyMarginTokens) ||
+		plan.SafeTokens != min(plan.ContextSafeTokens, min(plan.AccountSafeTokens, plan.ProjectSafeTokens)) ||
+		plan.MinimumTokens > plan.SendTokens || plan.SendTokens != min(plan.GoalTokens, plan.SafeTokens) ||
+		plan.InputReservedTokens > math.MaxInt64/2-plan.SendTokens ||
+		plan.InputReservedTokens+plan.SendTokens != call.ReservedTokens {
+		return domain.InvalidArgument("route_model", "long-form output budget plan is invalid")
+	}
+	return nil
+}
+
+func routeOutputBudgetValues(plan *app.ConversationRouteOutputBudgetPlan) []any {
+	if plan == nil {
+		return []any{nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil}
+	}
+	return []any{plan.Stage, plan.StrategyVersion, plan.CapabilityVersion, plan.ModelMaxOutputTokens, plan.ContextWindowTokens,
+		plan.ContextInputUpperBoundTokens, plan.ContextSafetyMarginTokens, plan.ContextSafeTokens, plan.AccountSafeTokens,
+		plan.ProjectSafeTokens, plan.GoalTokens, plan.MinimumTokens, plan.SafeTokens, plan.SendTokens, plan.InputReservedTokens}
 }
 
 func markAbandonedRouteCallUnknown(ctx context.Context, tx pgx.Tx, messageID, actorID, projectID, callID string) error {
@@ -788,6 +853,16 @@ func (s *Store) BeginConversationRouteModelCall(ctx context.Context, call app.Mo
 		if err := checkModelCaller(ctx, tx, call); err != nil {
 			return err
 		}
+		if call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm {
+			var cancelled bool
+			if err := tx.QueryRow(ctx, `SELECT cancel_requested_at IS NOT NULL FROM conversation_message_routes
+WHERE message_id=$1 AND actor_id=$2 AND state='processing' AND lease_owner=$3 AND lease_version=$4 FOR UPDATE`,
+				call.Route.Claim.Message.ID, call.OwnerID, call.Route.Claim.LeaseOwner, call.Route.Claim.LeaseVersion).Scan(&cancelled); err != nil {
+				return domain.NewError(domain.CodeConflict, "long-form conversation route is no longer current")
+			} else if cancelled {
+				return domain.NewError(domain.CodeConflict, "long-form conversation reply was cancelled before dispatch")
+			}
+		}
 		var state, modelID string
 		var digest []byte
 		var version time.Time
@@ -864,7 +939,8 @@ WHERE r.message_id=$1 AND r.actor_id=$2 AND r.lease_owner=$3 AND r.lease_version
 // worker's lease expired after dispatch.
 func (s *Store) SettleConversationRouteModelCall(ctx context.Context, call app.ModelCallReservation, decision *app.ConversationRouteDecision, usage app.ModelUsage, unknown bool) error {
 	if call.Source != app.ModelCallRoute || call.Route == nil || !domain.ValidUserID(call.OwnerID) ||
-		(!unknown && (decision == nil || !validStoredRouteDecision(*decision, call.Route.Context) || !usage.Known || usage.InputTokens < 0 || usage.OutputTokens < 0 ||
+		(!unknown && (decision == nil || !validStoredRouteDecision(*decision, call.Route.Context,
+			call.Route.Claim.Input.ResponseMode == app.ConversationResponseLongForm) || !usage.Known || usage.InputTokens < 0 || usage.OutputTokens < 0 ||
 			usage.InputTokens > math.MaxInt64-usage.OutputTokens)) {
 		return domain.InvalidArgument("route_model", "route model settlement is invalid")
 	}
@@ -996,9 +1072,32 @@ WHERE message_id=$1 AND call_id=$3 AND state IN ('dispatched','unknown')`, call.
 	return nil
 }
 
-func validStoredRouteDecision(value app.ConversationRouteDecision, context app.ConversationRouteContext) bool {
+func validStoredRouteDecision(value app.ConversationRouteDecision, context app.ConversationRouteContext, longReplyMode ...bool) bool {
+	allowLongReply := len(longReplyMode) == 1 && longReplyMode[0]
 	if !app.ValidConversationRouteModelOutput(value.ModelOutput) ||
 		!app.ValidConversationRouteFileDeliveryIntent(value.Action, value.FileDeliveryIntent) {
+		return false
+	}
+	if value.Cancelled {
+		return false
+	}
+	if allowLongReply {
+		if !value.LongReply || value.ModelOutput != "" || value.FileDeliveryIntent != "" || value.Acknowledge || value.ExplicitNew ||
+			value.TaskID != "" || value.TargetMessageID != "" || value.ExpectedRevision != 0 || len(value.DependencyTaskIDs) != 0 ||
+			len(value.AggregateMessageIDs) != 0 || value.ToolName != "" || value.ToolArguments != "" || value.InvalidOutput {
+			return false
+		}
+		switch value.Action {
+		case app.ConversationRouteReply:
+			return value.Question == "" && app.ValidConversationLongReply(value.Reply)
+		case app.ConversationRouteClarify:
+			return !value.Partial && value.Reply == "" && value.Question != "" && utf8.ValidString(value.Question) &&
+				!strings.ContainsRune(value.Question, '\x00') && utf8.RuneCountInString(value.Question) <= 200
+		default:
+			return false
+		}
+	}
+	if value.LongReply || value.Partial {
 		return false
 	}
 	if value.InvalidOutput {
@@ -1111,7 +1210,7 @@ WHERE message_id=$1 AND actor_id=$2 AND phase=$3 AND attempt=$4`, claim.Message.
 		}
 		var decision app.ConversationRouteDecision
 		if state != "settled" || modelID != value.ModelID || json.Unmarshal(encoded, &decision) != nil ||
-			!validStoredRouteDecision(decision, value) {
+			!validStoredRouteDecision(decision, value, fence.Claim.Input.ResponseMode == app.ConversationResponseLongForm) {
 			return domain.NewError(domain.CodeInvalidState, "coordinator model result is not safely recoverable")
 		}
 		invalidOutput = decision.InvalidOutput

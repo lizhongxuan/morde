@@ -437,14 +437,33 @@ func (s *ModelGatewayService) routeProjectReservation(ctx context.Context, call 
 	if call.ProjectID == "" || call.PersonalModel {
 		return nil, nil
 	}
+	rate, err := s.routeProjectRateSnapshot(ctx, call)
+	if err != nil {
+		return nil, err
+	}
+	return s.routeProjectReservationWithRate(call, request, *rate)
+}
+
+func (s *ModelGatewayService) routeProjectRateSnapshot(ctx context.Context, call ModelCallReservation) (*project.RateSnapshot, error) {
+	if call.ProjectID == "" || call.PersonalModel {
+		return nil, nil
+	}
 	if s.projectBudget == nil {
 		return nil, domain.NewError(domain.CodeUnsupported, "project model budget is unavailable")
 	}
-	usage := projectUsageReservation(request, call.ReservedTokens)
 	rate, err := s.projectBudget.rates.ProjectRateSnapshot(ctx, call.ModelID)
 	if err != nil || rate.Validate() != nil || rate.ModelID != call.ModelID || rate.Model != call.ProviderModel {
 		return nil, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
 	}
+	return &rate, nil
+}
+
+func (s *ModelGatewayService) routeProjectReservationWithRate(call ModelCallReservation, request ModelRequest,
+	rate project.RateSnapshot) (*ProjectModelReservation, error) {
+	if call.ProjectID == "" || call.PersonalModel || rate.Validate() != nil || rate.ModelID != call.ModelID || rate.Model != call.ProviderModel {
+		return nil, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")
+	}
+	usage := projectUsageReservation(request, call.ReservedTokens)
 	cost, err := rate.EstimateTokenCost(usage)
 	if err != nil || cost < 1 {
 		return nil, domain.NewError(domain.CodeInvalidState, "project model rate is unavailable")

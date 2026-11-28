@@ -199,6 +199,15 @@ function taskFence(frame) {
     .map(key => [key, frame[key]]))
 }
 
+function runtimeModelBudgetPlanResponse(frame, planID) {
+  return {
+    type: 'model_budget_plan', ...Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation',
+      'authorization_version', 'session_id'].map(key => [key, frame[key]])),
+    id: frame.id, through_seq: frame.through_seq, call_id: frame.call_id, dsh_call_id: frame.dsh_call_id,
+    request_digest: frame.request_digest, ok: true, budget_plan_id: planID, max_tokens: 768,
+  }
+}
+
 function assertMonotonicAgentObservations(frames) {
   const sequences = new Map()
   for (const frame of frames.filter(value => ['agent_status', 'agent_activity', 'agent_heartbeat', 'agent_request_timeout'].includes(value.type))) {
@@ -1797,13 +1806,14 @@ for (const type of ['model_chunk', 'model_end']) {
     const ipc = new WorkerIPC(input, output)
     input.write(`${JSON.stringify(start)}\n`)
     const sentFrame = once(output, 'data')
-    const response = ipc.streamModel(taskFence(start), 'model_test', 0, { messages: [], tools: [] })
+    const id = modelCallID(start.task_id, start.session_id, 0)
+    const response = ipc.streamModel(taskFence(start), id, 0, { messages: [], tools: [] })
     const next = response.next()
     const rejected = assert.rejects(next, /request cancelled/)
     await sentFrame
     const frame = type === 'model_chunk'
-      ? { type, ...taskFence(start), id: 'model_test', index: 0, chunk: { type: 'text-delta', text: 'private' } }
-      : { type, ...taskFence(start), id: 'model_test', ok: true }
+      ? { type, ...taskFence(start), id, index: 0, chunk: { type: 'text-delta', text: 'private' } }
+      : { type, ...taskFence(start), id, ok: true }
     frame.session_id = 'session_other'
     input.write(`${JSON.stringify(frame)}\n`)
     await rejected
@@ -1819,10 +1829,11 @@ test('only the allowlisted provider context overflow reaches DSH recovery', asyn
   const ipc = new WorkerIPC(input, output)
   input.write(`${JSON.stringify(start)}\n`)
   const sentFrame = once(output, 'data')
-  const response = ipc.streamModel(taskFence(start), 'model_context_overflow', 0, { messages: [], tools: [] })
+  const id = modelCallID(start.task_id, start.session_id, 0)
+  const response = ipc.streamModel(taskFence(start), id, 0, { messages: [], tools: [] })
   const rejected = assert.rejects(response.next(), error => error.code === 'CONTEXT_WINDOW_EXCEEDED')
   await sentFrame
-  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id: 'model_context_overflow', ok: false,
+  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id, ok: false,
     failure_code: 'CONTEXT_WINDOW_EXCEEDED' })}\n`)
   await rejected
   assert.equal(ipc.failed, false)
@@ -1843,10 +1854,11 @@ test('classified model failures preserve only approved codes and safe text', asy
     const ipc = new WorkerIPC(input, output)
     input.write(`${JSON.stringify(start)}\n`)
     const sentFrame = once(output, 'data')
-    const response = ipc.streamModel(taskFence(start), 'model_classified', 0, { messages: [], tools: [] })
+    const id = modelCallID(start.task_id, start.session_id, 0)
+    const response = ipc.streamModel(taskFence(start), id, 0, { messages: [], tools: [] })
     const rejected = assert.rejects(response.next(), error => error.code === code && !error.message.includes('private provider text'))
     await sentFrame
-    input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id: 'model_classified', ok: false, failure_code: code })}\n`)
+    input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id, ok: false, failure_code: code })}\n`)
     await rejected
     assert.equal(ipc.failed, false)
     input.destroy()
@@ -1860,10 +1872,11 @@ test('model failure frames reject provider text and non-allowlisted failure code
   const ipc = new WorkerIPC(input, output)
   input.write(`${JSON.stringify(start)}\n`)
   const sentFrame = once(output, 'data')
-  const response = ipc.streamModel(taskFence(start), 'model_bad_failure', 0, { messages: [], tools: [] })
+  const id = modelCallID(start.task_id, start.session_id, 0)
+  const response = ipc.streamModel(taskFence(start), id, 0, { messages: [], tools: [] })
   const rejected = assert.rejects(response.next(), /request cancelled/)
   await sentFrame
-  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id: 'model_bad_failure', ok: false,
+  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id, ok: false,
     failure_code: 'provider said the private key was rejected' })}\n`)
   await rejected
   assert.equal(ipc.failed, true)
@@ -1877,10 +1890,11 @@ test('classified model failure rejects an extra provider message', async () => {
   const ipc = new WorkerIPC(input, output)
   input.write(`${JSON.stringify(start)}\n`)
   const sentFrame = once(output, 'data')
-  const response = ipc.streamModel(taskFence(start), 'model_extra_failure', 0, { messages: [], tools: [] })
+  const id = modelCallID(start.task_id, start.session_id, 0)
+  const response = ipc.streamModel(taskFence(start), id, 0, { messages: [], tools: [] })
   const rejected = assert.rejects(response.next(), /request cancelled/)
   await sentFrame
-  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id: 'model_extra_failure', ok: false,
+  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id, ok: false,
     failure_code: 'MODEL_REQUEST_TIMEOUT', message: 'private provider text' })}\n`)
   await rejected
   assert.equal(ipc.failed, true)
@@ -1893,9 +1907,10 @@ test('late model frames after cancellation are drained through the matching mode
   const output = new PassThrough()
   const ipc = new WorkerIPC(input, output)
   input.write(`${JSON.stringify(start)}\n`)
+  const id = modelCallID(start.task_id, start.session_id, 0)
   const controller = new AbortController()
   const requestFramePromise = once(output, 'data')
-  const pending = ipc.streamModel(taskFence(start), 'model_cancelled', 0, { messages: [], tools: [] }, controller.signal).next()
+  const pending = ipc.streamModel(taskFence(start), id, 0, { messages: [], tools: [] }, controller.signal).next()
   const [requestData] = await requestFramePromise
   assert.equal(JSON.parse(requestData.toString()).type, 'model')
   const cancelFramePromise = once(output, 'data')
@@ -1905,10 +1920,10 @@ test('late model frames after cancellation are drained through the matching mode
   assert.equal(JSON.parse(cancelData.toString()).type, 'model_cancel')
 
   input.write(`${JSON.stringify({
-    type: 'model_chunk', ...taskFence(start), id: 'model_cancelled', index: 0,
+    type: 'model_chunk', ...taskFence(start), id, index: 0,
     chunk: { type: 'text-delta', text: 'late response' },
   })}\n`)
-  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id: 'model_cancelled', ok: true })}\n`)
+  input.write(`${JSON.stringify({ type: 'model_end', ...taskFence(start), id, ok: true })}\n`)
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(ipc.failed, false)
   assert.equal(ipc.cancelledModels.has('model_cancelled'), false)
@@ -1921,16 +1936,17 @@ test('late model frames after cancellation still require the original session fe
   const output = new PassThrough()
   const ipc = new WorkerIPC(input, output)
   input.write(`${JSON.stringify(start)}\n`)
+  const id = modelCallID(start.task_id, start.session_id, 0)
   const controller = new AbortController()
   const requestFramePromise = once(output, 'data')
-  const pending = ipc.streamModel(taskFence(start), 'model_cancelled', 0, { messages: [], tools: [] }, controller.signal).next()
+  const pending = ipc.streamModel(taskFence(start), id, 0, { messages: [], tools: [] }, controller.signal).next()
   await requestFramePromise
   const cancelFramePromise = once(output, 'data')
   controller.abort()
   await assert.rejects(pending, /aborted/)
   await cancelFramePromise
   input.write(`${JSON.stringify({
-    type: 'model_end', ...taskFence(start), session_id: 'session_other', id: 'model_cancelled', ok: false,
+    type: 'model_end', ...taskFence(start), session_id: 'session_other', id, ok: false,
   })}\n`)
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(ipc.failed, true)
@@ -6298,7 +6314,7 @@ function checkpointPage(request, page) {
 
 async function resumeSession(pages, { alterStart = value => value, alterPage = value => value, stopRead = false, refuseCheckpoint = false,
   withholdToolResult = false, holdResponsesUntilWaiting = false, onToolCall, onChildCreate, onModel, checkpointPagesBySession,
-  tools = [], deliveries = [], baseStart = start } = {}) {
+  onModelBudgetPrepare, tools = [], deliveries = [], baseStart = start } = {}) {
   const emitted = []
   const offsets = []
   const modelRequests = []
@@ -6380,6 +6396,10 @@ async function resumeSession(pages, { alterStart = value => value, alterPage = v
     }
     if (frame.type === 'model_cancel') {
       send(proc, { type: 'model_end', id: frame.id, ok: false })
+    }
+    if (frame.type === 'model_budget_prepare' && onModelBudgetPrepare) {
+      const response = onModelBudgetPrepare(frame, proc) ?? runtimeModelBudgetPlanResponse(frame, `resume_plan_${frame.call_id}`)
+      send(proc, response)
     }
     if (frame.type === 'model') {
       modelCalls += 1
@@ -6843,6 +6863,75 @@ test('replays a persisted inbox message once during recovery', async () => {
   assert.equal(conflict.modelCalls, 0)
   assert.equal(conflict.frames.some(frame => frame.type === 'settled'), false)
 })
+
+test('restores a queued adaptive text continuation once without adding a generic recovery prompt',
+  { timeout: 30_000 }, async () => {
+    const adaptiveStart = { ...start, tools: [], model_budget_admission: true }
+    const pages = []
+    let queuedContinuationCheckpoint = false
+    const { child, frames } = launch((frame, proc) => {
+      if (frame.type === 'ready') send(proc, adaptiveStart)
+      if (frame.type === 'model_budget_prepare') {
+        send(proc, runtimeModelBudgetPlanResponse(frame, 'initial_budget_plan'))
+      }
+      if (frame.type === 'checkpoint') {
+        pages.push({ from_seq: frame.from_seq, through_seq: frame.through_seq, payload: frame.payload, sha256: frame.sha256 })
+        const events = JSON.parse(frame.payload).events
+        queuedContinuationCheckpoint = events.some(event => event.type === 'agent/inbox/spliced' &&
+          event.data.inserted?.some(message => message.source?.plugin === 'morde-budget-continuation'))
+        if (queuedContinuationCheckpoint) {
+          proc.kill('SIGKILL')
+          return
+        }
+        acknowledgeCheckpoint(proc, frame)
+      }
+      if (frame.type === 'model') {
+        const chunks = [
+          { type: 'block-start', index: 0, blockType: 'text' },
+          { type: 'text-delta', index: 0, text: 'The first verified section.' },
+          { type: 'block-end', index: 0, block: { type: 'text', text: 'The first verified section.' } },
+          { type: 'usage', usage: { inputTokens: 12, outputTokens: 10 } },
+          { type: 'finish', reason: { kind: 'max-tokens' }, replayState: {
+            response: { morde_task_text_truncated: true, morde_task_call_id: frame.id },
+          } },
+        ]
+        chunks.forEach((chunk, index) => send(proc, { type: 'model_chunk', id: frame.id, index, chunk }))
+        send(proc, { type: 'model_end', id: frame.id, ok: true })
+      }
+    })
+    const [code, signal] = await once(child, 'close')
+    assert.equal(code, null)
+    assert.equal(signal, 'SIGKILL')
+    assert.equal(queuedContinuationCheckpoint, true)
+    assert.ok(pages.length > 0)
+
+    const resumedPlans = []
+    const result = await resumeSession(pages, {
+      baseStart: adaptiveStart,
+      onModelBudgetPrepare(frame) {
+        resumedPlans.push(frame)
+        return runtimeModelBudgetPlanResponse(frame, `resumed_budget_plan_${resumedPlans.length}`)
+      },
+      onModel(frame, proc, callIndex) {
+        assert.equal(callIndex, 1)
+        assert.ok(frame.request.messages.some(message => message.role === 'assistant' &&
+          message.content.some(block => block.type === 'text' && block.text === 'The first verified section.')))
+        assert.ok(frame.request.messages.some(message => message.role === 'user' &&
+          message.source?.plugin === 'morde-budget-continuation'))
+        assert.equal(frame.request.messages.some(message => message.role === 'user' &&
+          message.content.some(block => block.type === 'text' && block.text.includes('Continue the existing task from the last verified checkpoint'))), false)
+        replyWithText(proc, frame, 'The remaining section.')
+      },
+    })
+    assert.equal(result.code, 0, `failed=${JSON.stringify(result.frames.find(frame => frame.type === 'failed'))}, frames=${result.frames.map(frame => frame.type).join(', ')}`)
+    assert.equal(result.modelCalls, 1)
+    assert.equal(resumedPlans.length, 1)
+    const originalEvents = pages.flatMap(page => JSON.parse(page.payload).events)
+    const resumedEvents = result.emitted.flatMap(frame => JSON.parse(frame.payload).events)
+    const continuations = [...originalEvents, ...resumedEvents].filter(event => event.type === 'user/message' &&
+      event.data.source?.plugin === 'morde-budget-continuation')
+    assert.equal(continuations.length, 1)
+  })
 
 test('retries a task message once when the worker crashes before delivery', async () => {
   const pages = await captureSession({ interrupt: true })

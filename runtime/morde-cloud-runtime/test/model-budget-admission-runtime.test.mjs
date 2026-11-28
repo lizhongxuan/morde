@@ -48,12 +48,27 @@ function modelBudgetPlanResponse(request, { cap = 768, planID = 'budget_plan_123
   }
 }
 
-function modelChunks(identity, request) {
+function modelChunks(identity, request, text = 'local reply') {
   const chunks = [
     { type: 'block-start', index: 0, blockType: 'text' },
-    { type: 'text-delta', index: 0, text: 'local reply' },
-    { type: 'block-end', index: 0, block: { type: 'text', text: 'local reply' } },
+    { type: 'text-delta', index: 0, text },
+    { type: 'block-end', index: 0, block: { type: 'text', text } },
     { type: 'finish', reason: { kind: 'stop' } },
+  ]
+  chunks.forEach((chunk, index) => writeFrame(request.output, {
+    type: 'model_chunk', ...identity, id: request.id, index, chunk,
+  }))
+  writeFrame(request.output, { type: 'model_end', ...identity, id: request.id, ok: true })
+}
+
+function truncatedModelChunks(identity, request, text = 'partial local reply') {
+  const chunks = [
+    { type: 'block-start', index: 0, blockType: 'text' },
+    { type: 'text-delta', index: 0, text },
+    { type: 'block-end', index: 0, block: { type: 'text', text } },
+    { type: 'finish', reason: { kind: 'max-tokens' }, replayState: {
+      response: { morde_task_text_truncated: true, morde_task_call_id: request.id },
+    } },
   ]
   chunks.forEach((chunk, index) => writeFrame(request.output, {
     type: 'model_chunk', ...identity, id: request.id, index, chunk,
@@ -67,10 +82,10 @@ function isTaskCompactionRequest(request, config) {
 }
 
 async function runLocalRuntime({ sessionID, admission = true, cap = 768, start: customStart, checkpointFrames = [],
-  planForPrepare, respondToModel, respondToToolCall } = {}) {
+  planForPrepare, respondToModel, respondToToolCall, respondToChildCreate, respondToChildSettle, onCheckpointFrame } = {}) {
   const start = customStart ?? startFrame(sessionID, admission)
-  const identity = Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
-    .map(key => [key, start[key]]))
+  const identityForFrame = frame => Object.fromEntries(['task_id', 'owner_id', 'agent_id', 'generation', 'authorization_version', 'session_id']
+    .map(key => [key, frame[key]]))
   const input = new PassThrough()
   const output = new PassThrough()
   const ipc = new WorkerIPC(input, output)
@@ -88,15 +103,16 @@ async function runLocalRuntime({ sessionID, admission = true, cap = 768, start: 
       frames.push(frame)
       if (frame.type === 'checkpoint') {
         writeFrame(input, {
-          type: 'checkpoint_ack', ...identity, id: frame.id, ok: true,
+          type: 'checkpoint_ack', ...identityForFrame(frame), id: frame.id, ok: true,
           through_seq: frame.through_seq, sha256: frame.sha256,
         })
+        onCheckpointFrame?.(frame, { input, identity: identityForFrame(frame) })
       } else if (frame.type === 'checkpoint_read') {
         const page = checkpointFrames.find(entry => JSON.parse(entry.payload).from_seq === frame.from_seq)
         if (!page) throw new Error(`missing test checkpoint page from ${frame.from_seq}`)
         const body = JSON.parse(page.payload)
         writeFrame(input, {
-          type: 'checkpoint_page', ...identity, id: frame.id, ok: true, from_seq: body.from_seq,
+          type: 'checkpoint_page', ...identityForFrame(frame), id: frame.id, ok: true, from_seq: body.from_seq,
           through_seq: page.through_seq, payload: page.payload, sha256: page.sha256,
         })
       } else if (frame.type === 'model_budget_prepare') {
@@ -104,11 +120,16 @@ async function runLocalRuntime({ sessionID, admission = true, cap = 768, start: 
         prepareIndex++
         writeFrame(input, modelBudgetPlanResponse(frame, selection))
       } else if (frame.type === 'model') {
-        if (respondToModel) respondToModel(frame, { input, identity, index: modelIndex })
-        else modelChunks(identity, { ...frame, output: input })
+        const frameIdentity = identityForFrame(frame)
+        if (respondToModel) respondToModel(frame, { input, identity: frameIdentity, index: modelIndex })
+        else modelChunks(frameIdentity, { ...frame, output: input })
         modelIndex++
       } else if (frame.type === 'tool_call' && respondToToolCall) {
-        respondToToolCall(frame, { input, identity })
+        respondToToolCall(frame, { input, identity: identityForFrame(frame) })
+      } else if (frame.type === 'child_create' && respondToChildCreate) {
+        respondToChildCreate(frame, { input, identity: identityForFrame(frame) })
+      } else if (frame.type === 'child_settle' && respondToChildSettle) {
+        respondToChildSettle(frame, { input, identity: identityForFrame(frame) })
       }
     }
   })
@@ -122,6 +143,30 @@ async function runLocalRuntime({ sessionID, admission = true, cap = 768, start: 
     output.destroy()
   }
 }
+
+const budgetFileReadTool = {
+  name: 'file_read', description: 'Read one local test file.',
+  parameters: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false },
+}
+const budgetDelegateTool = {
+  name: 'dsh_delegate', description: 'Delegate one bounded task to a child agent.',
+  parameters: {
+    type: 'object', properties: {
+      title: { type: 'string' }, objective: { type: 'string' }, run_in_background: { type: 'boolean' },
+      tool_names: { type: 'array', items: { type: 'string', enum: ['file_read'] }, uniqueItems: true },
+    },
+    required: ['title', 'objective', 'tool_names'], additionalProperties: false,
+  },
+}
+const budgetJobTools = [
+  { name: 'dsh_job_list', description: 'List background jobs.', parameters: { type: 'object', properties: {}, required: [], additionalProperties: false } },
+  { name: 'dsh_job_get', description: 'Get a background job.', parameters: { type: 'object', properties: { job_id: { type: 'string' } }, required: ['job_id'], additionalProperties: false } },
+  { name: 'dsh_job_output', description: 'Read background job output.', parameters: {
+    type: 'object', properties: { job_id: { type: 'string' }, after_seq: { type: 'integer', minimum: -1 } },
+    required: ['job_id', 'after_seq'], additionalProperties: false,
+  } },
+  { name: 'dsh_job_cancel', description: 'Cancel a background job.', parameters: { type: 'object', properties: { job_id: { type: 'string' } }, required: ['job_id'], additionalProperties: false } },
+]
 
 async function createIPC(start = startFrame('budget_session_123')) {
   const input = new PassThrough()
@@ -399,6 +444,132 @@ test('the same model keeps concurrent Agents isolated by session budget plan', a
     second.frames.find(frame => frame.type === 'model_budget_prepare').session_id)
 })
 
+test('parallel DSH child Agents under one Task keep independent budget plans through settlement', { timeout: 15_000 }, async () => {
+  const sessionID = 'budget_parent_task_session'
+  const childSessionByCall = new Map([
+    ['budget_child_call_a', 'budget_child_agent_a'],
+    ['budget_child_call_b', 'budget_child_agent_b'],
+  ])
+  const capBySession = new Map([
+    ['budget_child_agent_a', 512],
+    ['budget_child_agent_b', 3_072],
+  ])
+  const start = { ...startFrame(sessionID, true), tools: [budgetDelegateTool, budgetFileReadTool, ...budgetJobTools] }
+  const prepares = []
+  const childModels = []
+  const childSettlements = []
+  const childSummaryBySession = new Map()
+  let parentModels = 0
+
+  const { frames, result } = await runLocalRuntime({
+    sessionID,
+    start,
+    planForPrepare: (prepare, index) => {
+      prepares.push(prepare)
+      const cap = capBySession.get(prepare.session_id) ?? 768
+      return { cap, planID: `parallel_plan_${prepare.session_id}_${index}` }
+    },
+    respondToChildCreate: (frame, { input, identity }) => {
+      const childSessionID = childSessionByCall.get(frame.call_id)
+      assert.ok(childSessionID, `unexpected child call ${frame.call_id}`)
+      writeFrame(input, {
+        type: 'child_session', ...identity, session_id: childSessionID, call_id: frame.call_id,
+        parent_session_id: frame.session_id, objective: frame.arguments.objective,
+        tools: [budgetFileReadTool], checkpoint_through_seq: -1, checkpoint_sha256: '',
+        step_status: 'running', summary: '',
+      })
+    },
+    respondToChildSettle: (frame, { input, identity }) => {
+      childSettlements.push(frame)
+      writeFrame(input, { type: 'child_settle_ack', ...identity, call_id: frame.call_id, ok: true })
+    },
+    respondToModel: (frame, { input, identity }) => {
+      if (frame.session_id === sessionID) {
+        parentModels++
+        if (parentModels === 1) {
+          const calls = [
+            { id: 'budget_child_call_a', title: 'Worker A', objective: 'Return result A.' },
+            { id: 'budget_child_call_b', title: 'Worker B', objective: 'Return result B.' },
+          ]
+          calls.forEach((call, index) => writeFrame(input, {
+            type: 'model_chunk', ...identity, id: frame.id, index,
+            chunk: { type: 'tool-call-delta', index, id: call.id, name: budgetDelegateTool.name,
+              argumentsDelta: JSON.stringify({ title: call.title, objective: call.objective,
+                tool_names: ['file_read'], run_in_background: true }) },
+          }))
+          writeFrame(input, { type: 'model_chunk', ...identity, id: frame.id, index: calls.length,
+            chunk: { type: 'finish', reason: { kind: 'tool-calls' } } })
+          writeFrame(input, { type: 'model_end', ...identity, id: frame.id, ok: true })
+          return
+        }
+        modelChunks(identity, { ...frame, output: input })
+        return
+      }
+
+      childModels.push({ frame, identity })
+      if (childModels.length !== 2) return
+      assert.notEqual(childModels[0].frame.session_id, childModels[1].frame.session_id,
+        'the concurrent requests must belong to two real child sessions')
+      for (const [index, child] of childModels.entries()) {
+        const cap = capBySession.get(child.frame.session_id)
+        assert.ok(cap, `unknown child session ${child.frame.session_id}`)
+        const summary = `child result ${index ? 'B' : 'A'}`
+        childSummaryBySession.set(child.frame.session_id, summary)
+        modelChunks(child.identity, { ...child.frame, output: input }, summary)
+      }
+    },
+  })
+
+  assert.equal(result.type, 'settled')
+  assert.equal(result.state, 'completed_candidate', JSON.stringify(frames.map(frame => frame.type)))
+  assert.equal(parentModels, 2)
+  assert.equal(childModels.length, 2, 'both child Agents must make their model request before either is answered')
+  const childPrepares = prepares.filter(frame => capBySession.has(frame.session_id))
+  const childModelFrames = frames.filter(frame => frame.type === 'model' && capBySession.has(frame.session_id))
+  assert.equal(childPrepares.length, 2)
+  assert.equal(childModelFrames.length, 2)
+  assert.equal(childSettlements.length, 2)
+  assert.deepEqual(new Set(childSettlements.map(frame => frame.status)), new Set(['succeeded']))
+  assert.deepEqual(new Set(childSettlements.map(frame => frame.session_id)), new Set(capBySession.keys()))
+  for (const child of childSettlements) {
+    assert.equal(childSessionByCall.get(child.call_id), child.session_id,
+      'each child settlement must match the delegated call that created that child')
+    assert.equal(child.summary, childSummaryBySession.get(child.session_id),
+      'each child settlement must contain its own model result')
+    assert.equal(child.task_id, start.task_id)
+  }
+
+  const callIDs = new Set()
+  const dshCallIDs = new Set()
+  const planIDs = new Set()
+  for (const prepare of childPrepares) {
+    assert.equal(prepare.task_id, start.task_id)
+    assert.equal(prepare.owner_id, start.owner_id)
+    assert.equal(prepare.agent_id, start.agent_id)
+    assert.equal(prepare.generation, start.generation)
+    assert.equal(prepare.authorization_version, start.authorization_version)
+    assert.notEqual(prepare.session_id, sessionID)
+    assert.notEqual(callIDs.has(prepare.call_id), true)
+    callIDs.add(prepare.call_id)
+    assert.equal(prepare.dsh_call_id, modelCallID(prepare.task_id, prepare.session_id, prepare.through_seq))
+    assert.equal(dshCallIDs.has(prepare.dsh_call_id), false)
+    dshCallIDs.add(prepare.dsh_call_id)
+    const model = childModelFrames.find(candidate => candidate.budget_call_id === prepare.call_id)
+    assert.ok(model, `missing child model frame for ${prepare.session_id}`)
+    assert.equal(model.request.max_tokens, capBySession.get(prepare.session_id))
+    assert.equal(model.budget_plan_id, `parallel_plan_${prepare.session_id}_${prepares.indexOf(prepare)}`)
+    assert.equal(model.request_digest, prepare.request_digest)
+    assert.equal(modelBudgetRequestDigest(prepare.request), prepare.request_digest)
+    assert.equal(modelBudgetRequestDigest(model.request), prepare.request_digest)
+    assert.notEqual(planIDs.has(model.budget_plan_id), true)
+    planIDs.add(model.budget_plan_id)
+  }
+  const childCreateFrames = frames.filter(frame => frame.type === 'child_create')
+  assert.equal(childCreateFrames.length, 2)
+  assert.ok(childCreateFrames.every(frame => frame.session_id === sessionID && frame.task_id === start.task_id),
+    'both child Agents must be spawned by the same parent session and Task')
+})
+
 test('opt-in model stream rejects mutated input or a missing plan before sending a model request', async t => {
   async function assertNoModelRequest(ipc, output) {
     await ipc.writes
@@ -447,6 +618,127 @@ test('budget admission stays disabled by default and preserves the old model fra
   assert.equal(Object.hasOwn(model, 'budget_plan_id'), false)
   assert.equal(Object.hasOwn(model, 'budget_call_id'), false)
   assert.equal(Object.hasOwn(model, 'request_digest'), false)
+})
+
+test('signed pure-text truncation continues once with a fresh budget plan', { timeout: 30_000 }, async () => {
+  const sessionID = 'budget_session_text_continue'
+  const start = {
+    type: 'start', version: 1, ...taskIdentity(sessionID), task_revision: 1, model: 'budget-test-model',
+    tools: [], initial_message: { message_id: 'mcont001', content: 'Give a complete multi-part answer.', attachment_ids: [] },
+    model_budget_admission: true,
+  }
+  const { frames, result } = await runLocalRuntime({
+    sessionID,
+    start,
+    planForPrepare: (_prepare, index) => ({ cap: 768, planID: `plan_text_continue_${index}` }),
+    respondToModel: (frame, { input, identity, index }) => index === 0
+      ? truncatedModelChunks(identity, { ...frame, output: input }, 'The first part.')
+      : modelChunks(identity, { ...frame, output: input }),
+  })
+
+  assert.equal(result.type, 'settled')
+  assert.equal(result.state, 'completed_candidate')
+  const prepares = frames.filter(frame => frame.type === 'model_budget_prepare')
+  const models = frames.filter(frame => frame.type === 'model')
+  assert.equal(prepares.length, 2)
+  assert.equal(models.length, 2)
+  assert.notEqual(prepares[0].call_id, prepares[1].call_id)
+  assert.ok(prepares[1].through_seq > models[0].through_seq)
+  for (const [index, prepare] of prepares.entries()) {
+    const model = models.find(candidate => candidate.budget_call_id === prepare.call_id)
+    assert.ok(model)
+    assert.equal(model.budget_plan_id, `plan_text_continue_${index}`)
+    assert.equal(model.request_digest, prepare.request_digest)
+  }
+  assert.ok(models[1].request.messages.some(message => message.role === 'user' &&
+    message.content?.some(block => block.type === 'text' && block.text.includes('Continue from where it ended'))))
+  assert.ok(models[1].request.messages.some(message => message.role === 'assistant' &&
+    message.content?.some(block => block.type === 'text' && block.text === 'The first part.')))
+  const events = frames.filter(frame => frame.type === 'checkpoint').flatMap(frame => JSON.parse(frame.payload).events)
+  const continuation = events.find(event => event.type === 'user/message' &&
+    event.data.source?.plugin === 'morde-budget-continuation')
+  assert.ok(continuation)
+  assert.equal(continuation.data.source.ordinal, 1)
+  assert.equal(continuation.data.source.call_id, models[0].id)
+})
+
+test('signed text continuation stops after two continuations and does not expose tools', { timeout: 30_000 }, async () => {
+  const sessionID = 'budget_session_text_continue_limit'
+  const start = {
+    type: 'start', version: 1, ...taskIdentity(sessionID), task_revision: 1, model: 'budget-test-model',
+    tools: [], initial_message: { message_id: 'mcont002', content: 'Give a complete multi-part answer.', attachment_ids: [] },
+    model_budget_admission: true,
+  }
+  const { frames, result } = await runLocalRuntime({
+    sessionID,
+    start,
+    planForPrepare: (_prepare, index) => ({ cap: 768, planID: `plan_text_limit_${index}` }),
+    respondToModel: (frame, { input, identity, index }) => truncatedModelChunks(identity, { ...frame, output: input }, `partial ${index}`),
+  })
+
+  assert.equal(result.type, 'settled')
+  assert.equal(result.state, 'failed')
+  assert.equal(frames.filter(frame => frame.type === 'model_budget_prepare').length, 3)
+  assert.equal(frames.filter(frame => frame.type === 'model').length, 3)
+  const events = frames.filter(frame => frame.type === 'checkpoint').flatMap(frame => JSON.parse(frame.payload).events)
+  const continuations = events.filter(event => event.type === 'user/message' &&
+    event.data.source?.plugin === 'morde-budget-continuation')
+  assert.equal(continuations.length, 2)
+  assert.deepEqual(continuations.map(event => event.data.source.ordinal), [1, 2])
+
+  const toolSessionID = 'budget_session_text_continue_tool'
+  const toolStart = {
+    type: 'start', version: 1, ...taskIdentity(toolSessionID), task_revision: 1, model: 'budget-test-model',
+    tools: [{ name: 'test_lookup', description: 'Test lookup', parameters: { type: 'object', properties: {}, additionalProperties: false } }],
+    initial_message: { message_id: 'mcont003', content: 'Answer using tools if needed.', attachment_ids: [] },
+    model_budget_admission: true,
+  }
+  const toolResult = await runLocalRuntime({
+    sessionID: toolSessionID,
+    start: toolStart,
+    respondToModel: (frame, { input, identity }) => truncatedModelChunks(identity, { ...frame, output: input }),
+  })
+  assert.equal(toolResult.frames.filter(frame => frame.type === 'model').length, 1)
+  const toolEvents = toolResult.frames.filter(frame => frame.type === 'checkpoint').flatMap(frame => JSON.parse(frame.payload).events)
+  assert.equal(toolEvents.some(event => event.type === 'user/message' &&
+    event.data.source?.plugin === 'morde-budget-continuation'), false)
+})
+
+test('new user input preempts a queued automatic text continuation', { timeout: 30_000 }, async () => {
+  const sessionID = 'budget_session_text_continue_user'
+  const start = {
+    type: 'start', version: 1, ...taskIdentity(sessionID), task_revision: 1, model: 'budget-test-model',
+    tools: [], initial_message: { message_id: 'mcont004', content: 'Give a complete multi-part answer.', attachment_ids: [] },
+    model_budget_admission: true,
+  }
+  let delivered = false
+  const { frames, result } = await runLocalRuntime({
+    sessionID,
+    start,
+    respondToModel: (frame, { input, identity, index }) => index === 0
+      ? truncatedModelChunks(identity, { ...frame, output: input }, 'The first part.')
+      : modelChunks(identity, { ...frame, output: input }),
+    onCheckpointFrame: (frame, { input, identity }) => {
+      if (delivered) return
+      let events
+      try { events = JSON.parse(frame.payload).events } catch { return }
+      if (!events.some(event => event.type === 'user/message' &&
+          event.data.source?.plugin === 'morde-budget-continuation')) return
+      delivered = true
+      writeFrame(input, {
+        type: 'message_delivery', version: 2, ...identity, message_id: 'mnew0001',
+        content: 'Actually, answer only the cost section.', attachment_ids: [],
+      })
+    },
+  })
+
+  assert.equal(delivered, true)
+  assert.equal(result.type, 'settled')
+  assert.equal(result.state, 'completed_candidate')
+  const models = frames.filter(frame => frame.type === 'model')
+  assert.equal(models.length, 2)
+  assert.ok(models[1].request.messages.some(message => message.role === 'user' &&
+    message.content?.some(block => block.type === 'text' && block.text.includes('Actually, answer only the cost section.'))))
 })
 
 test('opt-in Task compaction prepares its direct LLM stream against the final projected request',

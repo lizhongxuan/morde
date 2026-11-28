@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain/task"
 )
 
 type cloudDSHHTTPBudgetProbe struct {
@@ -27,6 +28,10 @@ func (probe *cloudDSHHTTPBudgetProbe) PrepareModelBudget(_ context.Context, requ
 	request.Request = append(json.RawMessage(nil), request.Request...)
 	probe.requests = append(probe.requests, request)
 	return CloudDSHModelBudgetPlan{PlanID: "budget-plan-0001", MaxTokens: probe.maxToken}, nil
+}
+
+func (*cloudDSHHTTPBudgetProbe) SupportsTaskModelBudgetAdmission(context.Context, task.Task) (bool, error) {
+	return true, nil
 }
 
 func TestCloudDSHModelBudgetAdmissionSetsLocalGatewayOutputCap(t *testing.T) {
@@ -54,9 +59,11 @@ func TestCloudDSHModelBudgetAdmissionSetsLocalGatewayOutputCap(t *testing.T) {
 	}))
 	defer modelServer.Close()
 
+	verifiedMaxOutput := 8_192
 	endpoint := app.ModelGatewayEndpoint{
 		Endpoint: app.ModelEndpoint{BaseURL: "https://models.invalid/v1", APIKey: "synthetic-test-only", ModelID: "synthetic-local-v1"},
-		Version:  time.Unix(1, 0), Personal: true,
+		Version:  time.Unix(1, 0), Personal: true, MaxOutputTokens: &verifiedMaxOutput,
+		MaxOutputSource: app.ModelMaxOutputOverride,
 	}
 	gatewayStore := &a10LocalGatewayStore{}
 	gateway, err := app.NewModelGatewayService(gatewayStore, a10LocalGatewayResolver{endpoint: endpoint}, a10LocalHTTPModelClient{

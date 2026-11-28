@@ -4,7 +4,7 @@ import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry from '@deepseek-ai/dsh-agent'
 import AgentLoop from '@deepseek-ai/dsh-agent-loop'
 import { BasicCompactionEngine } from '../vendor/deepseek-harness/packages/compaction/compaction-basic/dist/index.js'
-import LlmRuntime, { AssistantStreamAccumulator, BlockAssembler, CONTEXT_WINDOW_EXCEEDED_CODE, LlmAdapter, LlmError, MessageId, createToolResultMessage, createUserMessage, freezeMessage, projectFilesToText, projectToolUpdates } from '@deepseek-ai/dsh-llm'
+import LlmRuntime, { AssistantStreamAccumulator, BlockAssembler, CONTEXT_WINDOW_EXCEEDED_CODE, LlmAdapter, LlmError, MessageId, createToolResultMessage, createUserMessage, freezeMessage, lastAssistantStreamChunk, projectFilesToText, projectToolUpdates } from '@deepseek-ai/dsh-llm'
 import SessionStore, { SessionId, SessionLogOffset } from '@deepseek-ai/dsh-session'
 import * as checkpointPolicy from '@deepseek-ai/dsh-session-checkpoint-policy'
 import SessionPersistence, { assertContiguous, assertStoredId, assertVersion, materializeAppendBatch, materializeCreateHeader, validateStoredEvents } from '@deepseek-ai/dsh-session-persistence'
@@ -46,6 +46,7 @@ export const MODEL_FAILURE_SUMMARIES = Object.freeze({
   MODEL_REQUEST_FAILED: 'The model request failed.',
   MODEL_BUDGET_EXHAUSTED: 'The account model budget was exhausted.',
   MODEL_TASK_BUDGET_EXHAUSTED: 'The task model budget was exhausted.',
+  MODEL_OUTPUT_LIMIT: 'The answer remained partial after the bounded model-output continuations.',
 })
 export const TASK_VALIDATION_REVIEW_IDENTITY_FIELDS = Object.freeze([
   'context_role', 'owner_id', 'actor_id', 'task_id', 'task_revision', 'result_event_sequence', 'result_sha256',
@@ -56,6 +57,8 @@ const SCHEMA_ANNOTATIONS = new Set(['description', 'title', 'default', 'examples
 const CLARIFICATION_TOOL = 'ask_user'
 const DELEGATE_TOOL = 'dsh_delegate'
 const MORDE_MCP_TOOL_PREFIX = 'mcp_'
+const MORDE_BUDGET_CONTINUATION_PLUGIN = 'morde-budget-continuation'
+const MAX_MORDE_BUDGET_TEXT_CONTINUATIONS = 2
 const JOB_LIST_TOOL = 'dsh_job_list'
 const JOB_GET_TOOL = 'dsh_job_get'
 const JOB_OUTPUT_TOOL = 'dsh_job_output'
@@ -407,6 +410,81 @@ function currentTaskTurnMessageIDFromReplayState(replayState) {
     throw new Error('checkpointed DSH task turn source identity is invalid')
   }
   return response.morde_task_turn_message_id
+}
+
+function mordeTaskTextTruncationCallID(replayState) {
+  const response = replayState?.response
+  if (!isObject(response) || !exactKeys(response, ['morde_task_text_truncated', 'morde_task_call_id']) ||
+      response.morde_task_text_truncated !== true || typeof response.morde_task_call_id !== 'string' ||
+      !ID.test(response.morde_task_call_id)) return ''
+  return response.morde_task_call_id
+}
+
+function mordeBudgetContinuationOrdinal(message) {
+  const source = message?.source
+  if (source?.kind !== 'plugin' || source.plugin !== MORDE_BUDGET_CONTINUATION_PLUGIN) return 0
+  if (!exactKeys(source, ['kind', 'plugin', 'call_id', 'ordinal']) || typeof source.call_id !== 'string' ||
+      !ID.test(source.call_id) || !Number.isSafeInteger(source.ordinal) || source.ordinal < 1 ||
+      source.ordinal > MAX_MORDE_BUDGET_TEXT_CONTINUATIONS) {
+    throw new Error('checkpointed model text continuation identity is invalid')
+  }
+  return source.ordinal
+}
+
+function isMordeBudgetContinuationBaseMessage(message) {
+  const source = message?.source
+  return source?.kind === 'user' || source?.kind === 'plugin' &&
+    source.plugin !== MORDE_BUDGET_CONTINUATION_PLUGIN && source.plugin !== 'morde-context'
+}
+
+function mordeBudgetContinuationCount(events) {
+  let latestUserSequence = -1
+  for (const event of events) {
+    if (event.type === 'user/message' && isMordeBudgetContinuationBaseMessage(event.data)) {
+      latestUserSequence = event.seq
+    }
+  }
+  let count = 0
+  for (const event of events) {
+    if (event.type === 'user/message' && event.seq > latestUserSequence &&
+        mordeBudgetContinuationOrdinal(event.data) > 0) count++
+  }
+  return count
+}
+
+function currentMordeBudgetContinuation(messages) {
+  if (!Array.isArray(messages)) return false
+  let latestUserSequence = -1
+  let latestContinuationSequence = -1
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index]
+    if (message?.role !== 'user') continue
+    if (mordeBudgetContinuationOrdinal(message) > 0) latestContinuationSequence = index
+    else if (isMordeBudgetContinuationBaseMessage(message)) latestUserSequence = index
+  }
+  return latestContinuationSequence > latestUserSequence
+}
+
+function latestMordeTaskTextTruncation(events, agent) {
+  const assistant = events.findLast(event => event.type === 'assistant/message')
+  const message = assistant?.data?.message
+  const stream = assistant?.data?.stream
+  if (!Array.isArray(stream) || !Array.isArray(message?.content) || message.content.length === 0 ||
+      message.content.some(block => block?.type !== 'text' || typeof block.text !== 'string' || block.text.trim() === '')) return ''
+  let finish
+  try {
+    finish = lastAssistantStreamChunk(stream, 'finish')
+  } catch {
+    return ''
+  }
+  if (finish?.reason?.kind !== 'max-tokens') return ''
+  const header = agent.session.requestHeader()
+  if (header === undefined || Array.isArray(header.tools) && header.tools.length > 0) return ''
+  return mordeTaskTextTruncationCallID(message.source?.replayState)
+}
+
+function hasPendingMessageExcept(agent, messageID) {
+  return [...agent.inbox.nextTurn, ...agent.inbox.nextStep].some(message => message?.id !== messageID)
 }
 
 function recoveryToolCalls(events, tools) {
@@ -1935,12 +2013,47 @@ export async function runAgent(ipc, frame) {
       const state = { failed: false, toolFailure: false }
       sessionDurable.agent = agent
       sessionDurable.agentState = state
+      const observedSessionEvents = [...(sessionDurable.restored?.events ?? [])]
+      agentCtx.on('session/event', (session, event) => {
+        if (session === agent.session) observedSessionEvents.push(event)
+      })
       agentCtx.on('agent/error', ({ error }) => {
         state.failed = true
         if (typeof error?.code === 'string' && Object.hasOwn(MODEL_FAILURE_SUMMARIES, error.code)) {
           state.modelFailureCode = error.code
         }
       })
+      if (sessionDurable.start.model_budget_admission === true) {
+        agentCtx.on('agent/pre-step', async ({ agent: subject, messages }, next) => {
+          if (subject === agent && currentMordeBudgetContinuation(messages) && agent.inbox.hasPending) {
+            return { kind: 'reject' }
+          }
+          return next()
+        })
+        agentCtx.on('agent/turn-stopping', async ({ agent: subject, signal }) => {
+          if (subject !== agent || signal.aborted || sessionDurable.superseded || sessionDurable.terminalFailureReason ||
+              agent.inbox.hasPending) return
+          const sourceCallID = latestMordeTaskTextTruncation(observedSessionEvents, agent)
+          if (sourceCallID === '') return
+          const continuationCount = mordeBudgetContinuationCount(observedSessionEvents)
+          if (continuationCount >= MAX_MORDE_BUDGET_TEXT_CONTINUATIONS) {
+            state.failed = true
+            state.modelFailureCode = 'MODEL_OUTPUT_LIMIT'
+            return
+          }
+          const message = createUserMessage({
+            content: [{ type: 'text', text: 'The preceding assistant message is a partial answer stopped by its signed output-token limit. Continue from where it ended without repeating existing text. Complete the remaining requested sections and requirements. If nothing remains, say so briefly.' }],
+            source: { kind: 'plugin', plugin: MORDE_BUDGET_CONTINUATION_PLUGIN,
+              call_id: sourceCallID, ordinal: continuationCount + 1 },
+          })
+          agent.followup(message)
+          if (!await ctx.sessions.flush(agent.session)) throw new Error('model text continuation inbox checkpoint failed')
+          signal.throwIfAborted()
+          if (hasPendingMessageExcept(agent, message.id) && agent.inbox.remove(message.id)) {
+            if (!await ctx.sessions.flush(agent.session)) throw new Error('superseded model continuation removal checkpoint failed')
+          }
+        })
+      }
       if (!coordinator && !taskValidationReview && sessionDurable === durable) {
         const observeStatus = status => {
           void sessionDurable.observeStatus(status).catch(() => ipc.fail('agent status dispatch failed'))
@@ -1957,6 +2070,8 @@ export async function runAgent(ipc, frame) {
               payload.signal === undefined || !isObject(payload.config) || !Array.isArray(payload.messages)) {
             throw new Error('model budget request has no matching durable session')
           }
+          const budgetContinuation = currentMordeBudgetContinuation(payload.messages)
+          if (budgetContinuation && agent.inbox.hasPending) return
           await sessionDurable.flush(agent.session)
           payload.signal.throwIfAborted()
           const through = sessionDurable.through
@@ -2447,6 +2562,13 @@ export async function runAgent(ipc, frame) {
         throw new Error('Task validation review model request is not text-only')
       }
       await sessionDurable.waitForMessageDeliveryCheckpoints(options.signal)
+      if (sessionDurable.start.model_budget_admission === true && currentMordeBudgetContinuation(options.messages)) {
+        if (sessionDurable.agent.inbox.hasPending) {
+          sessionDurable.modelBudgetPlans.clearSession(sessionDurable.identity.session_id)
+          yield { type: 'finish', reason: { kind: 'stop' } }
+          return
+        }
+      }
       if (sessionDurable.agentState?.toolFailure) throw new Error('tool result is unavailable')
       if (sessionDurable.through <= sessionDurable.lastModelThrough) throw new Error('model request has no new durable prefix')
       const requestThrough = sessionDurable.through
@@ -2731,6 +2853,26 @@ export async function runAgent(ipc, frame) {
         revisionMessages = stageRevisionMessages(revisionMessages)
         installMessageDeliveryHandler()
       }
+      const budgetContinuationWasRestored = [...agent.inbox.nextTurn, ...agent.inbox.nextStep]
+        .some(message => mordeBudgetContinuationOrdinal(message) > 0)
+      if (budgetContinuationWasRestored) {
+        const restoredStepMessages = [...agent.inbox.nextStep]
+        const restoredTurnMessages = [...agent.inbox.nextTurn]
+        const hasNewerInput = [...restoredStepMessages, ...restoredTurnMessages]
+          .some(message => isMordeBudgetContinuationBaseMessage(message))
+        for (const message of [...restoredStepMessages, ...restoredTurnMessages]) {
+          if (!agent.inbox.remove(message.id)) throw new Error('restored model continuation inbox could not be restaged')
+        }
+        const pendingStepMessages = hasNewerInput
+          ? restoredStepMessages.filter(message => mordeBudgetContinuationOrdinal(message) === 0)
+          : restoredStepMessages
+        const pendingTurnMessages = hasNewerInput
+          ? restoredTurnMessages.filter(message => mordeBudgetContinuationOrdinal(message) === 0)
+          : restoredTurnMessages
+        for (const message of pendingStepMessages) agent.steer(message)
+        for (const message of pendingTurnMessages) agent.followup(message)
+        if (!await ctx.sessions.flush(agent.session)) throw new Error('restored model continuation inbox checkpoint failed')
+      }
       await agent.whenIdle()
       if (!await ctx.sessions.flush(agent.session)) throw new Error('checkpoint listener unavailable')
       if (state.failed || state.toolFailure || ipc.cancelled) {
@@ -2756,7 +2898,10 @@ export async function runAgent(ipc, frame) {
         if (!await ctx.sessions.flush(agent.session)) throw new Error('step retry checkpoint listener unavailable')
         if (state.failed || state.toolFailure || ipc.cancelled) throw new Error('step retry continuation did not remain idle')
       }
-      if (frame.prompt !== undefined && !continuationAlreadyQueued) {
+      const budgetContinuationAlreadyQueued = [...agent.inbox.nextTurn, ...agent.inbox.nextStep]
+        .some(message => mordeBudgetContinuationOrdinal(message) > 0)
+      if (frame.prompt !== undefined && !continuationAlreadyQueued && !budgetContinuationAlreadyQueued &&
+          !budgetContinuationWasRestored) {
         // A completed checkpoint cannot naturally enter another turn. The
         // trusted worker may supply an internal continuation prompt when a
         // durable background-job result still needs to be read by the parent.
@@ -2767,7 +2912,8 @@ export async function runAgent(ipc, frame) {
         await agent.whenIdle()
         if (!await ctx.sessions.flush(agent.session)) throw new Error('checkpoint listener unavailable')
         if (state.failed || state.toolFailure || ipc.cancelled) throw new Error('session continuation did not remain idle')
-      } else if (revisionMessages.length === 0 && (!recovery.completed || (durable.recoveryHasInbox && agent.inbox.hasPending))) {
+      } else if (revisionMessages.length === 0 && !budgetContinuationAlreadyQueued && !budgetContinuationWasRestored &&
+          (!recovery.completed || (durable.recoveryHasInbox && agent.inbox.hasPending))) {
         agent.followup(createUserMessage({
           content: [{ type: 'text', text: 'Continue the existing task from the last verified checkpoint. Do not repeat completed tool actions; use their recorded results. Process any user message already queued in the session inbox.' }],
           source: { kind: 'user' },
