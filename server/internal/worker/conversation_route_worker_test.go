@@ -885,19 +885,24 @@ func TestSafeConversationRouteDecisionPreservesModelSteerAndRequiresSafeTarget(t
 	}
 }
 
-func TestSafeConversationRouteDecisionPreservesToolAndKeepsStructuralGuards(t *testing.T) {
-	decision := app.ConversationRouteDecision{Action: app.ConversationRouteTool, ToolName: "morde_web_search",
-		ToolArguments: `{"query":"日本央行利率政策"}`}
+func TestSafeConversationRouteDecisionRequiresWebLookupToBecomeDSHTask(t *testing.T) {
 	for _, content := range []string{
 		"请搜索公开网站关于日本央行利率政策的最新信息。",
 		"能否帮我找一下日本央行利率政策的最新公开资料？",
 		"有没有关于日本央行利率政策的最新公开信息？",
 	} {
 		value := app.ConversationRouteContext{ActorID: "u1234567", Content: content}
-		if got := safeConversationRouteDecision(value, decision); got.Action != app.ConversationRouteTool {
-			t.Errorf("search wording changed the structured Tool action for %q: %+v", content, got)
+		output := `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"日本央行利率政策"}}`
+		parsed := app.ParseConversationRouteDecisionForContext(output, value)
+		got := safeConversationRouteDecision(value, parsed)
+		if parsed.InvalidOutput || got.Action != app.ConversationRouteNew || !got.Acknowledge ||
+			got.AgentToolProfile != task.AgentToolProfileWebResearch || !app.ValidConversationRouteAgentToolProfile(got, value) {
+			t.Errorf("public search intent was not promoted to a bounded DSH Task for %q: parsed=%+v safe=%+v", content, parsed, got)
 		}
 	}
+
+	decision := app.ConversationRouteDecision{Action: app.ConversationRouteTool, ToolName: "morde_web_search",
+		ToolArguments: `{"query":"日本央行利率政策"}`}
 
 	for _, test := range []struct {
 		name   string

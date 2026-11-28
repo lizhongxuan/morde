@@ -109,7 +109,7 @@
 - 代码处理：服务端只对经验证的首 revision 公共网页检索 Task 持久化 `web_research` profile，并把其枚举传入 DSH start。DSH 使用现有 repeat-tool-reminder、profile 指引和 pre-execute 历史 guard；Worker 从同一持久 checkpoint 再限制最多 2 次搜索、3 个 URL、每 URL 2 个窗口、总计 6 次读取及精确重复，拒绝不派发 Broker 并反馈给 DSH。终态说明只把白名单失败事实与成功调用计数交给 DSH，不泄漏查询或网页数据；硬预算保持 50,000，不降估算或重放未知动作。
 - 本地通过：`make pc`；`cd server && go test ./internal/app -run '^TestTaskTerminalDelivery' -count=1`；Worker `go test ./internal/worker -run 'WebResearch|CloudDSHTaskProfile|CloudDSHAccountTaskStart|SearchThenReadCompletesThroughWorkerWithSourceDate' -count=1`；Runtime `node --check src/engine.mjs && node --check src/account-runtime.mjs && node --test test/web-research-guard.test.mjs test/account-runtime.test.mjs`（11/11）。新增合成 DSH E2E 验证搜索/读取后遇到重复搜索时，Runtime 持久 guard 拒绝第二次 Broker 派发，模型收到拒绝后仍能用已读证据完成答复。
 - 真实 Provider 搜索结果**未通过**上述本地合成 E2E 覆盖。当前测试 PC 复现的是旧服务器代码，不能代表待发布修复；代码尚待提交/推送/部署，需部署后在另一个全新 PC 旁聊验证工具调用数、来源综合、终态失败气泡和各阶段耗时。自动恢复仍关闭；完整 Worker 包、未知用量/副作用反例、灰度 cohort 与低基数基线以及真实 PC 部署后验收尚未完成，T07/T08 继续进行中。
-- 全量 Worker 包运行 453.9 秒后暴露两项既有测试断言与当前路由/终态提示词不一致；未发现运行逻辑回归。将两项断言同步到当前合同后，新增重复检索拒绝 E2E、coordinator 路由合同与终态解释合同三项定向 Worker 用例均通过，`internal/app` 终态投递用例通过。完整 Worker 包需在合并后的 release 树重跑。
+- Worker 全量包两次隔离 PostgreSQL 回归分别运行 453.9 秒和 478.2 秒。首轮暴露两项旧提示词断言，更新后定向测试通过；第二轮余下一个旧 Worker 用例仍期待网页搜索作为 route-level `tool` 直接放行。实际合同已把公开搜索提升为带 `web_research` profile 的 DSH Task；更新该用例验证模型标记经 parser/safety gate 后进入 DSH Task，Worker 定向用例及 `internal/app` 搜索/新闻 profile 用例通过。全量 Worker 包仍需在当前最终 commit 上重跑。
 
 ## 实施与验证记录（2026-11-27）
 
