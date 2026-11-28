@@ -1,6 +1,6 @@
 # Morde 模型生成预算自适应实施任务 TODO
 
-**状态（2026-11-28）：预算候选 `663d9250` 已由 `0c906232` 纳入本地 `release`；B08 长回复请求类型缺陷已修复，并通过定向回归及一次真实 DeepSeek Gateway 长回复调用（4,096 token cap，provider 报告输出 4,096 token，返回 `length` 部分结果）。截图所示 7 个 Codex worktree 已核对并删除，分支引用保留；其他任务的 detached worktree 与未提交改动仍保留。此前 P0 smoke 8 pass/0 fail/2 预期例外、DSH runtime 302/302、Worker→PostgreSQL→fake HTTP 整链、PostgreSQL 容量恢复及 DSH 来源/校验和检查通过。测试 Portal 当前可达，但远端尚不满足完整 v4 离线备份及安全升级前置条件。本轮复核开始时本地 `release@bdb34b0d` 较 `origin/release@ee618bed` ahead 7；随后 TODO 状态更新已提交到本地 `release`，未 push。尚未部署，PC 真实长回复、刷新/重连、取消恢复与生产账单门禁未验收；B01–B09 生产/PC 门禁仍未完成，B10 尚未开始。**
+**状态（2026-11-28）：预算候选 `663d9250` 已由 `0c906232` 纳入 `release`；B08 长回复请求类型缺陷已修复，并通过定向回归及一次真实 DeepSeek Gateway 长回复调用（4,096 token cap，provider 报告输出 4,096 token，返回 `length` 部分结果）。此前 P0 smoke 8 pass/0 fail/2 预期例外、DSH runtime 302/302、Worker→PostgreSQL→fake HTTP 整链、PostgreSQL 容量恢复及 DSH 来源/校验和检查通过。当前 `release@b363bd38` 与 `origin/release` 一致。截图所示 worktree 当前均不在 `git worktree list`；分支引用保留，目标提交已在 `release` 或有等价补丁，详见第35节。其他任务的 detached worktree 与三处未提交任务输出采集改动仍保留。测试 Portal 当前可达，但远端尚不满足完整 v4 离线备份及安全升级前置条件。尚未部署，PC 真实长回复、刷新/重连、取消恢复与生产账单门禁未验收；B01–B09 生产/PC 门禁仍未完成，B10 尚未开始。**
 评审依据：《Morde_个人Agent_模型预算与可靠交付实施方案.md》、固定提交的 Morde 源码，以及锁定版本 DSH 的本地包契约和离线实跑。保留原 B01–B10 编号；已实现 DSH opt-in IPC/Worker 协议探针、Task compaction prepare、假 HTTP 集成测试、模型输出能力元数据、阶段策略快照及 PostgreSQL 预算准备账本。Portal 可单独加载显式路由阶段策略，但不会因此启用 Task admission 或 shadow sampling；默认配置没有任何阶段预算值。第25–27节记录旧候选 smoke、00270 迁移失败与本地 schema 修复；第28节记录当前候选本地验证、冲突核查及测试机不可达状态。
 
 **方案复核决策（2026-11-27）：** 采纳方案的 P0–P4 门禁、等待/暂停语义、周期止损与试点质量验收；保留“未知能力不猜、短答不多一次模型往返、历史 Task/Schedule 合同不迁移、未知派发结果继续占用”的边界。B03 影子原型不再作为开始 B04 账本工作的硬依赖；预算策略与 `O_send` 计算仍须在 B04/P1 试点启用前通过影子核验。方案中的 `4,000` 仅是反例数值，拟议 API 字段不代表现有接口；均不写成默认额度或既有合同。
@@ -441,3 +441,10 @@ P0 协议子门禁通过后可开始 P1 的 B02、B04；B03 影子计算可与 B
 - **当前 release P0 smoke：** 从 `947d6318` 建立本机干净归档，先运行 `npm run build:dsh-compaction` 生成 DSH compaction 产物，再运行 `deploy/single/smoke.sh`；T01/T04/T06/T13/T19/T22/T26/T36 **8 项通过、0 失败**，T10（真实 PC+模型）和 T43（真实 PC+DSH）为 **2 项预期例外**，退出码 0。记录保存在 `/tmp/morde-budget-smoke-release-947d6318-after-build.json`。未构建 compaction 的首次归档运行因缺生成文件使 T22 无法启动；补齐官方构建步骤后重跑通过，该结果不计代码缺陷。
 - **远端存储核实：** SSH 只读 `lsblk` 显示只有 100 GiB 系统盘 `/dev/vda3`；Workspace 的 `/dev/loop0` 是 20 GiB ext4 loop 挂载，backing file `/var/lib/morde/workspace-sync.img` 位于 `/dev/vda3`，镜像 apparent size 为 20 GiB、实际分配约 135 MiB。它是系统盘上的稀疏文件，不能满足独立固定容量数据盘要求。远端没有创建或挂载云盘，也没有改动系统。
 - **需要的下一项基础设施：** 为继续安全 v4 备份与部署，需在 `cn-shenzhen` 同可用区为 ECS 挂载独立数据盘，再按部署文档把它设为 Workspace sync 的固定容量数据根。ESSD PL0 公开参考价约为 ¥0.5/GB-month，20 GiB 约 ¥10/月；按量约 ¥0.00105/GB/小时，即 20 GiB 约 ¥0.504/天；具体以控制台报价为准。[阿里云 ECS 块存储计费说明](https://help.aliyun.com/zh/ecs/block-storage-devices) 展示 PL0 计费规则与价格示例，[阿里云价格表](https://help.aliyun.com/zh/emr/emr-serverless-starrocks/product-overview/billable-items/)列出深圳地域 PL0 费率。本任务未获该付费资源预算授权，因此磁盘创建仍待用户确认；其余 v4 备份/部署门槛也未完成。
+
+## 35. 截图 worktree 与 release 覆盖核对（2026-11-28）
+
+- **worktree 清理状态：** 当前 `git worktree list` 中不存在截图列出的 Codex worktree；只保留主 `/Users/zhongxuan_li/Desktop/morde` 工作区及 11 个截图之外的 `/private/tmp/morde-*` detached worktree。未删除这些其他任务的 worktree。对应本地分支引用保留。
+- **release 覆盖证据：** `codex/budget-deploy-candidate-8c87122f`、`codex/budget-test-deploy` 和 `main` 均没有比当前 `release` 多出的提交。`m04-06-source-locations`、`m06-03-result-event-regression`、`test-handshake-diagnostic-20261126` 的提交经 `git cherry release <branch>` 判定为等价补丁已包含。
+- **迁移兼容分支：** 两个 `budget-migration-compat-*` 分支与 `release` 没有共同历史，整分支合并会带入整棵不相关快照，故没有合并快照。逐文件核对的 00269/00270/00272 迁移、预算容量等待 Store 与对应 PostgreSQL 回归测试已与 `release` 相同；小型验收机测试差异仅为注释。没有发现需要额外移植的预算迁移代码。
+- **工作区保护：** 核对时 `release` 与 `origin/release` 同为 `b363bd38`。没有改动其它任务尚未提交的 `task_step_output_capture.go` 和对应 PostgreSQL 集成测试。本次分支审计没有触发代码合并或 worktree 删除操作。
