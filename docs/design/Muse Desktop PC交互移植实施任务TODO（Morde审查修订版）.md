@@ -63,7 +63,7 @@
 
 ### 2026-11-28 当前候选续验
 
-- 本轮开始时本地 `release@d7262566` 与 `origin/release` 一致；M08 代码和测试已提交为 `2cbff474`，其余路由代码和记录仍在 `release` 工作区。macOS arm64 源码包由 `npm run dist:dir` 生成，应用 ID 为 `io.morde.client`，Electron `44.7.0`。应用已从独立 profile 打开并显示登录页；由于登录会将本机加入账号授权设备，尚未提交登录凭据或操作账号数据。测试服务器未部署、未写入，未使用提供的 DeepSeek key。
+- 本轮开始时本地 `release@d7262566` 与 `origin/release` 一致；M08 代码和测试提交为 `2cbff474`，路由证据去重及总流程/TODO 更新提交为 `6a3af2ef`。两项提交都在本地 `release`，未推送或部署。macOS arm64 源码包由 `npm run dist:dir` 生成，应用 ID 为 `io.morde.client`，Electron `44.7.0`。应用已从独立 profile 打开并显示登录页；由于登录会将本机加入账号授权设备，尚未提交登录凭据或操作账号数据。测试服务器未部署、未写入，未使用提供的 DeepSeek key。
 - M08 拖放修复后，`web/portal` 的 `npm test -- src/routes/Assistant.test.tsx` 332/332；`npm run typecheck` 通过。当前候选包的实际 Finder 等价拖放验收尚未执行，等待账号授权确认；不要把修复前的 Finder 手测写成当前候选的实测结果。
 - 路由回归：`go test ./internal/worker -run '^TestTrimConversationRouteCandidates(PreservesActiveTaskControlEvidence|DeduplicatesActiveTaskControlEvidence|PreservesTaskWithActiveControlEvidence)$' -count=3` 通过；`go test ./internal/app -run '^TestConversationRouteWebLookupUsesTaskAgentAndSynthesis$' -count=1` 通过。另一次 PG16 `TestCloudDSHModelBudgetPostgresHTTPUsesTaskHermesCompactionSummaryStage` 仍未通过：追问路由停在 `waiting_user`，早先快照还曾报告 `message_too_long`；这是未解决的 M06/路由 E2E，不记录为通过，也不放宽来源、授权或 checkpoint fence。总流程文档已同步公开搜索/网页读取由 DSH Task Agent 执行并综合，路由层不再直返网页工具输出。
 - M01、M07、M09a、M02–M04、M09b、M11 与 M12 的未验项按前文保留；PC 登录、PC/iOS 联合回归、部署 API、真实麦克风电平和签名通知仍无本轮证据。统一 UI 规范文件缺失仍待核对。本 TODO 和 M12 保持未勾选。
