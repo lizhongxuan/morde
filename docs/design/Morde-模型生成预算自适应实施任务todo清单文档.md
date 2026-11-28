@@ -115,12 +115,12 @@
   - 实施：仅对带有效签约 budget plan 的 adaptive Task，把已知用量、明确 `length`、无工具/JSON/图片的纯文本部分结果加密保存；只在这一签约路径将其映射为 DSH `max-tokens` 并带受校验的 replay marker。旧路径继续按截断失败处理。DSH 使用已锁定 Runtime 的 `agent/turn-stopping` 与逐次 `agent/request-budget`：最多续接两次，每轮生成新的 call/checkpoint 身份并重新准备预算；已确认前文保留在同一会话。工具请求、过滤、取消、超时、未知用量和无效响应不进入续写。模型派发前检测到新用户消息时丢弃排队续写；若新消息在派发后到达，已有 delivery-version fence 丢弃旧结果并随后处理用户消息，但 provider 可能已接收这次请求。恢复时不再追加通用 recovery prompt。两次后仍被截断则以 `MODEL_OUTPUT_LIMIT` 返回部分失败。生产 planner admission 仍关闭，普通/旧 Task 路径和生产 cap 不变。
   - 验收：分别模拟 `max_output_tokens`、`content_filter`、网络中断/未知计费、部分正文、重复段落、不完整工具参数、重启恢复与额度不足；账本和原会话内容准确，副作用执行次数不重复。本地实现和已覆盖边界见第 19 节；实际 PC 刷新/重连交付随 B06 验收，因此 B07 整体仍未勾选。
 
-- [ ] **B08（本地实现、exact `long_form` 的 `O_safe/O_send` 原子预留/账本落账、定向 PostgreSQL/全 Go 回归及真实 DeepSeek Gateway 4,096-token 输出验证通过；PC 仅确认入口可切换，PC 交付/重连与生产端到端仍待验，P3 放行依赖 B05–B07 门禁）提供显式原会话长回复路径**
+- [ ] **B08（本地实现、exact `long_form` 的 `O_safe/O_send` 原子预留/账本落账、定向 PostgreSQL/全 Go 回归及文档记录的 DeepSeek Gateway 4,096-token 输出验证通过；当前源码 `make pc` 已实测长回复切换并恢复短答，PC 消息交付/重连与生产端到端仍待验，P3 放行依赖 B05–B07 门禁）提供显式原会话长回复路径**
   - 位置：消息接收/路由、PC 撰写入口、原会话正文持久化与展示。
   - 实施：短答/状态/取消继续走快路径；请求使用明确的 `response_mode=short|long_form`，在调用分类模型前分流；不把隐式识别放进首发标准。`ApplyConversationRoute` 的普通 reply 会把源消息标为 applied 并原子交付，长路径具有同等源消息/会话绑定、幂等和取消，不把现有 reply 结构字段抬成任意长正文。无 Task 长文必须匹配已配置的 exact model route 与 `long_form` 阶段策略，明确取得 `O_goal/O_min`；`O_safe` 由已验证模型输出/上下文、当前账户 token 余额及项目费率下剩余费用共同收紧，`O_send=min(O_goal,O_safe)`，低于 `O_min` 时不派发。新请求先尝试按候选 cap 原子预留；若额度不足，则按当前账户/项目余额重算并以缩小后的 cap 重试一次，最终事务再复核并发变化。没有 exact 策略、能力或可计量额度时 fail closed。route ledger 与账户/项目预留保存一致的分项计划和版本；不把 Task 的 50,000 描述成纯对话额度。每次长回复只调用一次 provider，总时限为 4 分钟；`length` 时保留并展示部分答复，不自动续写。取消、超时、未知用量不得按文本截断处理，也不得自动重放；长回复不创建后台工具 Task，除非用户实际委托后台工作。Portal 已加入显式入口、纯文本限制、取消及状态展示；它不替代 `morde-pc` 验收。
   - 验收：PC 上短答仍不新增模型往返；显式长文完整返回原会话，部分完成/暂停状态可读；验证 4 分钟总时限、取消及刷新重连，超时或未知用量时不自动重放、不误报成功且账本仍可核对；无 Task 模型能处理长文，重试不丢文或重复。普通 Web/iOS 不代替 PC 验收。
 
-- [ ] **B09（进行中：旧候选 `194ba92e` 的 P0 smoke 完整通过（8 pass/0 fail/2 预期例外），但不含服务器已确认的 migration 277；新候选 `663d9250` 已通过本地 P0 smoke（8/0/2）、DSH/runtime/Worker/PG 定向验证，尚未同步到测试机或完成远端 smoke、dry-run 与 PC 验收；B02–B08 的真实验收门禁仍未满足）按基线验证并灰度（P3）**
+- [ ] **B09（进行中：当前 `release@d6c4c794` 的干净快照 P0 smoke 为 8 pass/0 fail/2 预期例外；远端 `/healthz` 可达，但运行提交 `b47f009c` 无法在本地浅克隆核验，尚未部署当前 release、完成远端 smoke/dry-run 或真实 PC+模型基线；B02–B08 的真实验收门禁仍未满足，v4 备份/恢复与独立存储门槛也未满足）按基线验证并灰度（P3）**
   - 位置：定向 Go/Node/PostgreSQL 测试、`make pc` 实测、验证记录，以及当时有效的 Harness 流程/TODO 文档。
   - 实施：锁定代码 SHA、模型与版本、端点/能力/计量来源、用例和判分方式。同一模型及合成输入对照原行为与候选策略；影子阶段先记录，不改变发送额度；通过门禁后只对明确试点用户和一两个可信模型启用，保留关闭新策略的回滚能力。
   - 验收：每类建议至少 30 个固定样本，报告有效样本量、p50/p95、绝对差、质量与失败类别；短答不得增加模型往返；暂以 p95 首字时间相对基线不劣化超过 10% 为门槛，噪声过大则扩样。长文按预先固定的必需条目/事实清单验收完整性，不以字数代替质量；至少一个预期完整的可见文本超过 2,048 个模型 tokenizer token。证明两个子 Agent 实际并发、预算暂停后恢复且已完成步骤不重跑；安全用例超额派发和重复可见副作用均为零，并覆盖长历史、未知能力、预算不足、取消和截断。假端点只证明协议，不冒充真实模型。结果分“通过/失败/未覆盖”；保留 provider 用量、发送上限和可见交付证据，不记录秘密或正文。
@@ -472,3 +472,13 @@ P0 协议子门禁通过后可开始 P1 的 B02、B04；B03 影子计算可与 B
 - **B01 状态：** 本地重复压缩的 DSH→PostgreSQL prepare/ledger settlement→fake HTTP dispatch 子门禁现已通过；B01 仍不勾选，生产 planner 维持默认关闭。真实 provider 与计费、Portal 进程 crash、线上策略加载以及 PC 取消/刷新/重连等门禁仍未验。
 - **截图分支与 worktree：** 截图显示的是本地分支列表，不是当前登记的 worktree 路径。已核对可见分支：预算候选及 migration 相关变更已有 release 等价内容，`budget-test-deploy` 是旧快照，不应整支合并；其他可见小分支的补丁已在 release。当前 `git worktree list` 仅有主工作树及 9 个截图之外的 detached `/private/tmp/morde-*`；这 9 个都含未提交修改或本地 smoke 记录，属于其他任务，未合并、未删除，以免丢失数据。截图所示 worktree 已不存在，因此没有额外的 worktree 可供删除；本轮没有改写这些分支引用。
 - **release 状态：** 本轮预算与 checkpoint 安全修正已提交至 `release`，代码提交为 `3ecaf6b0`；本 TODO 验证记录也已提交。当前本地 `release` 尚未 push。iOS 验收改动和临时 scheme 文件未纳入本轮提交。
+
+## 39. P0 发布门禁修复、当前源码 PC 入口与远端状态（2026-11-28）
+
+- **Smoke 正则缺陷修复：** `deploy/single/smoke.sh` 原先通过在命令替换内临时赋值 `IFS` 拼接 `-run` 正则；Bash 在数组展开时仍使用外层分隔符，多个测试名被拼成带空格的单个模式，真实 `go test` 没有执行这些测试，烟测因此报告 T04/T06/T22 缺失。现改为显式逐项用 `|` 拼接；`TestSmokeGateAccounting` 的假 `go` 若收到含空格模式即失败，防止回归。此前该假执行器会把空格也拆成测试名，未能发现缺陷。
+- **P0 smoke 验证：** 使用 `release@d6c4c794` 干净源码快照、锁定 Node 依赖和 `build:dsh-compaction` 生成物，在本机隔离 PostgreSQL `127.0.0.1:55439` 上运行完整 `deploy/single/smoke.sh`：T01、T04、T06、T13、T19、T22、T26、T36 **8 pass / 0 fail**；T10（真实 PC+模型）和 T43（真实 PC+DSH）是 **2 项预期例外**，退出码 0。记录位于 `/tmp/morde-budget-smoke-d6c4c794-postgres-runtime.json`。`go test ./internal/app -run '^TestSmokeGateAccounting$' -count=1` 通过。没有测试远端生产服务。
+- **当前源码 PC 实测：** `make pc` 的 Portal、Workbench 与 Electron 启动构建通过；在实际 `morde-pc` 内嵌 Assistant 页面将“回复长度”从短答切至长回复，再恢复短答，AX 状态依次为 `Value: 0 → 1 → 0`，页脚随之显示“长回复/短答”。未发送消息、未创建 Task；因此只证明当前源码 PC 入口可用，不证明服务端请求、模型输出、取消或断线重连交付。
+- **测试机只读复核：** `/healthz` 返回 HTTP 200，`morde-portal.service` active，Docker PostgreSQL healthy。`.deployed-head` 为 `b47f009c`，该对象不在本地浅克隆且未找到部署源码 checkout，故无法证明远端运行的是当前 release。物理盘只有 100 GiB `/dev/vda`；`/srv/morde-acceptance` 的 20 GiB `/dev/loop0` 仍位于系统盘。`CH_POSTGRES_WAL_ARCHIVE_DIR`、`CH_WORKSPACE_SYNC_CURRENT_FILES_DIR`、`CH_WORKSPACE_SYNC_DATA_ROOT_DIR` 缺失，`/var/backups/morde` 无 v4 bundle。没有上传或部署文件，没有改配置、数据库、密码，没有停止或重启服务。
+- **发布阻塞：** 当前仍缺与系统/Docker/PGDATA 分离的固定容量 Workspace 文件系统、独立 WAL/v4 备份目标及真实 v4 备份/恢复演练；测试机现有 loop mount 和旧备份不满足要求。满足此前建议至少需要 Workspace 与 WAL/备份各一块 20 GiB 独立盘；新增付费资源未获授权，因此不改远端部署或启用 admission。
+- **worktree 与用户工作区保护：** 截图列出的分支没有对应已登记 worktree，相关预算提交在 release 已有等价内容；其余 9 个 `/private/tmp/morde-*` detached worktree 均含未提交或未跟踪内容，全部保留。主工作区同时存在其他任务的未提交 iOS、Runtime、Task、Worker/Web Research 变更；未纳入本轮提交。为避免这些改动影响 HEAD 验证，P0 smoke 在干净 `release@d6c4c794` 快照运行。
+- **状态结论：** B01–B09 仍未完成各自的真实 provider、PC 交付/恢复、生产部署或灰度门禁；B10 仍依赖 B09 试点数据与产品/费率决策。B01 planner 继续默认关闭。预算及 P0 smoke 修正保留在本地 `release`，未 push。

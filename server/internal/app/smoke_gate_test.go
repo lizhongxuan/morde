@@ -169,6 +169,9 @@ for a in "$@"; do
   if [ "$prev" = "-run" ]; then run="$a"; fi
   prev="$a"
 done
+case "$run" in
+  *" "*) echo "malformed -run regex contains a space: $run" >&2; exit 2 ;;
+esac
 names=$(printf '%s' "$run" | tr -d '^()$' | tr '|' ' ')
 failed=0
 for n in $names; do
