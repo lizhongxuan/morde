@@ -3,6 +3,8 @@ package postgres
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"strings"
 	"testing"
 	"time"
 
@@ -230,7 +232,7 @@ WHERE id=$1 AND task_id=$2 AND owner_id=$3 AND actor_id=$4 AND conversation_id=$
 func TestPostgresTaskTerminalDeliveryRecoveryDiagnosisReachesModelFacts(t *testing.T) {
 	f := newAgentLifecycleFixture(t)
 	ctx := context.Background()
-	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET model_id='p1234567' WHERE id=$1`, f.request.Fence.TaskID); err != nil {
+	if _, err := f.store.pool.Exec(ctx, `UPDATE tasks SET model_id='p1234567',objective=objective||E'\n' WHERE id=$1`, f.request.Fence.TaskID); err != nil {
 		t.Fatalf("set Task model identity for recovery diagnosis: %v", err)
 	}
 	sequence := commitTaskTerminalDeliveryWaiting(t, f, "dsh_recovery_unresolved", []byte(`{"reason":"dsh_recovery_unresolved","detail":{"phase":"recovery","failure_stage":"model_response_validation","failure_category":"unauthorized_tool","failure_reason":"tool_not_in_task_allowlist","tool_name":"morde_mcp_private","tool_call_id":"call_private","tool_dispatched":false}}`))
@@ -241,6 +243,14 @@ func TestPostgresTaskTerminalDeliveryRecoveryDiagnosisReachesModelFacts(t *testi
 	facts, found, err := f.store.ReadTaskTerminalDeliverySourceFacts(ctx, claims[0])
 	if err != nil || !found || !app.ValidTaskTerminalDeliverySourceFacts(claims[0], facts) {
 		t.Fatalf("read verified recovery diagnosis facts: found=%t facts=%+v err=%v", found, facts, err)
+	}
+	var rawObjective string
+	if err := f.store.pool.QueryRow(ctx, `SELECT objective FROM tasks WHERE id=$1`, claims[0].TaskID).Scan(&rawObjective); err != nil {
+		t.Fatalf("read raw objective for digest verification: %v", err)
+	}
+	objectiveDigest := sha256.Sum256([]byte(rawObjective))
+	if facts.ObjectiveSummary != strings.TrimSpace(rawObjective) || !bytes.Equal(facts.ObjectiveSHA256, objectiveDigest[:]) {
+		t.Fatalf("objective summary did not trim chat whitespace while retaining the raw-source digest")
 	}
 	const expected = "模型提出了当前任务未授权的工具操作，系统在派发前已拦截。"
 	if facts.RecoveryDiagnosis != expected {

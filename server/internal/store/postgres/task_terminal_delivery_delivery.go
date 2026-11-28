@@ -498,6 +498,13 @@ FOR SHARE OF task,event`, claim.TaskID, claim.OwnerID, claim.SourceEventSequence
 }
 
 func boundedTerminalDeliveryObjective(objective string) (string, bool) {
+	// Task objectives preserve the original user text, including trailing
+	// newlines from chat input. Normalize only the model-facing summary; the
+	// facts digest still covers the untouched objective below.
+	objective = strings.TrimSpace(objective)
+	if objective == "" {
+		return "user request unavailable", false
+	}
 	if len(objective) <= app.MaxTaskTerminalDeliveryObjectiveSummaryBytes {
 		return objective, false
 	}
@@ -505,7 +512,7 @@ func boundedTerminalDeliveryObjective(objective string) (string, bool) {
 	for !utf8.ValidString(preview) && len(preview) > 0 {
 		preview = preview[:len(preview)-1]
 	}
-	preview = strings.TrimRight(preview, " \t\r\n")
+	preview = strings.TrimSpace(preview)
 	if preview == "" {
 		return "user request unavailable", true
 	}

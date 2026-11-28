@@ -61,3 +61,10 @@
 - DSH coordinator 目前等待完整结构化 route 结果后才落库；Runtime 内部虽然逐块读取模型输出，但 coordinator 适配器先收齐 chunks 再返回。直接回复没有 Taskless 的持久增量事件与续读 API，Task 流表受 `task_id` 和 Task event fence 约束，不能直接复用。
 - 分类调用先于 Task Agent 调用，工具/搜索请求存在两次模型往返；摘要维护在特定长会话场景还会再增加一次串行模型请求。当前阶段耗时指标只有 receipt→claim 与完整分类时长，缺少 accept→first visible answer 和 first durable assistant message。
 - 下一步先部署安全错误码并修复实际 facts 读取错误，再验收真实短答及只读工具；持久增量流需要独立协议与授权围栏，完成前不宣称有真实 token streaming。
+
+### 2026-11-28 终态解释失败根因
+
+- 安全日志部署到 `release@b363bd38` 后，线上错误码确定为 `invalid_argument`，失败阶段为 `read_source_facts`。只读数据库检查未输出 Task ID、用户文本或供应商内容；身份、修订/授权围栏、模型 ID、步骤计数和等待原因均满足约束。
+- 触发任务的原始目标文本以换行结尾。`boundedTerminalDeliveryObjective` 只在目标超长时去除结尾空白；普通长度时原样返回，之后 `validBoundedTerminalDeliveryText` 因首尾空白拒绝事实摘要。这个校验错误让 Worker 永远到不了 DSH 解释调用。
+- 修复为始终只规范化模型可见的目标摘要，原始目标 SHA-256 仍按数据库原文计算。加入普通/Unicode 空白、截断边界及空白输入单测；恢复诊断 PostgreSQL 用例追加结尾换行并校验摘要可读且原文哈希不变。隔离 PostgreSQL 下全部 `TaskTerminalDelivery` 用例通过。
+- 修复尚未部署。真实 PC 的新普通问答、只读搜索、终态解释气泡和端到端延迟仍待部署后实测；直接回复的持久增量协议也尚未实现，不能宣称实时 token 流已完成。

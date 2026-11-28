@@ -83,7 +83,7 @@
 - [x] 修复消息列表未完成首屏加载时丢失已受理 receipt 的缓存时序；receipt 出现后立即显示用户消息及 pending/processing 状态。覆盖“发送后回执”与“已加载的 pending/processing”自动化用例。
 - [x] 终态投递错误日志记录稳定 `failure_code`、stage 与现有追踪字段，不记录原始错误文本；增加安全字段单测。
 - [x] 增加 receipt 到 route claim 的等待时长，以及 DSH route 分类耗时直方图；使用无 ID 标签的低基数指标。
-- [ ] 将后端诊断日志补丁部署到 `release`，读取线上 `read_source_facts` 的 `failure_code`，修复真实根因；确认 DSH 收到白名单事实并只向原会话发布一条不同于模板的解释气泡。
+- [ ] 已部署后端诊断日志并读取到线上 `read_source_facts / invalid_argument`。根因是普通长度的 Task 目标带结尾换行，模型摘要校验拒绝；本地修复及隔离 PostgreSQL 回归通过。待发布修复后确认 DSH 收到白名单事实，并只向原会话发布一条有真实原因差异的解释气泡。
 - [ ] 对普通短答完成 DSH 实际回复延迟验收并记录收据、claim、分类、首条持久 assistant 消息的时间。当前只有 receipt 和分类耗时指标，没有 first-delta 持久流；需实现有界增量写入及断线续读后再验收流式速度。
 - [ ] 在实际 `morde-pc` 验证普通问答真实模型回复、一个只读工具请求和一个明确后台任务的进度/最终结果；检查现有 DSH 工具、MCP、子 Agent 和授权边界，不增加第二套 Agent Runtime。
 
@@ -151,3 +151,11 @@
 - 本地 DSH 架构审计：`WorkerModel.stream()` 虽然消费 DSH 增量 chunk，但 coordinator 适配器将 chunks 全部收集后才返回；ConversationRoute 等完整结构化决策后才创建助手消息。现有 Task 流消息必须绑定 Task ID 和 Task event fence，因此还不能承载 taskless 普通对话回复。真实持久流式回复需要单独的 owner/conversation/message/revision 围栏协议、API 重连游标及 PC 接入。
 - 本轮已通过：`go test ./internal/api ./internal/app ./cmd/portal -count=1`、终态安全错误码及 route 指标定向 Worker 用例、`npm test -- src/routes/Assistant.test.tsx`（330/330）、`npm run typecheck`。部署 smoke gate 正在执行，结果待补。
 - 待完成：部署稳定错误码并读取线上诊断；定位并修复 facts 读取根因；实际 PC 新会话真实短答与只读工具请求；端到端时间样本；DSH 持久增量方案和授权/断线回放验收。T07/T08 保持进行中，自动恢复仍关闭。
+
+### 2026-11-28 续验（终态回告根因与修复）
+
+- 部署核验：服务器运行 `release@b363bd38`，迁移、`/healthz=ok`、`/readyz=200` 通过。Smoke gate 结果为 5 pass、0 fail、5 exception；例外仍是服务器无 `CH_TEST_DATABASE_URL` 的集成项和需要真实 PC/DSH 的场景。
+- 根因：新增安全错误码显示回告 Worker 在 `read_source_facts` 返回 `invalid_argument`。只读检查未打印账号、Task ID 或用户内容；任务围栏、模型 ID、步骤计数等均正常。触发任务目标有末尾换行，而短目标原样进入严格文本校验，导致事实摘要被拒绝，DSH 从未收到解释请求。
+- 修复：模型输入摘要始终去除 Unicode 首尾空白；原始 Task 目标 SHA-256 仍保持不变。新增覆盖聊天换行、Unicode 空白、UTF-8 截断及空白目标的单测，并扩展 PostgreSQL 恢复诊断用例验证换行目标可生成事实摘要且摘要哈希绑定原文。
+- 本地验证：`go test ./internal/store/postgres -run 'TestBoundedTerminalDeliveryObjective|TestPostgresTaskTerminalDeliveryRecoveryDiagnosisReachesModelFacts' -count=1` 通过；隔离 PostgreSQL 17 下 `go test ./internal/store/postgres -run 'TaskTerminalDelivery' -count=1` 通过（38.9 秒）。
+- 尚未完成：修复提交并部署后的真实 DSH 终态解释、实际 morde-pc 新短答/只读搜索及延迟样本；直接回复仍没有持久增量流。T07/T08 继续进行中，自动恢复仍关闭。
