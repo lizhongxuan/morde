@@ -3,6 +3,7 @@ package app
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/json"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -51,11 +52,87 @@ func TestSealTaskStepOutputCaptureRedactsAcrossSourceChunksBeforeEncryption(t *t
 		}
 		redacted.Write(plain)
 	}
-	if bytes.Contains(redacted.Bytes(), []byte("split-secret-value")) || !bytes.Contains(redacted.Bytes(), []byte("[已隐藏凭据]")) {
+	if bytes.Contains(redacted.Bytes(), []byte("split-secret-value")) || !bytes.Contains(redacted.Bytes(), []byte("[已隐藏]")) {
 		t.Fatalf("joined output was not fully redacted: %q", redacted.String())
 	}
 	if strings.Contains(string(capture.Stdout.Pages[0].Ciphertext), "split-secret") {
 		t.Fatal("ciphertext contains a raw secret fragment")
+	}
+}
+
+func TestSealTaskStepOutputCaptureRedactsAcrossLegacyBufferBoundary(t *testing.T) {
+	sealer, err := NewSealer(bytes.Repeat([]byte{17}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The Runtime legacy buffer retains the prefix and sends the remaining
+	// bytes through the sideband. A secret assignment that straddles the exact
+	// 64 KiB boundary must be redacted after the server rejoins both pieces.
+	const legacyCombinedLimit = 64 << 10
+	assignment := []byte("api_key=")
+	prefix := append(bytes.Repeat([]byte("x"), legacyCombinedLimit-len(assignment)), assignment...)
+	spill := []byte("cross-boundary-secret\n")
+	full := append(append([]byte(nil), prefix...), spill...)
+	if len(prefix) != legacyCombinedLimit {
+		t.Fatalf("prefix length = %d; want %d", len(prefix), legacyCombinedLimit)
+	}
+	capture, err := SealTaskStepOutputCapture(sealer, testTaskStepOutputCaptureIdentity(), full, nil)
+	if err != nil {
+		t.Fatalf("SealTaskStepOutputCapture() error=%v", err)
+	}
+	var disclosed bytes.Buffer
+	for _, page := range capture.Stdout.Pages {
+		plain, err := sealer.OpenWithAAD(page.Ciphertext, taskStepOutputCaptureAAD(page))
+		if err != nil {
+			t.Fatal(err)
+		}
+		disclosed.Write(plain)
+	}
+	if bytes.Contains(disclosed.Bytes(), []byte("cross-boundary-secret")) ||
+		!bytes.Contains(disclosed.Bytes(), []byte("[已隐藏]")) {
+		t.Fatalf("secret crossing the legacy boundary was not fully redacted: %q", disclosed.String())
+	}
+}
+
+func TestJoinLegacyShellPrefixAndSpillRedactsAcrossExactBufferBoundary(t *testing.T) {
+	identity := testTaskStepOutputCaptureIdentity()
+	const legacyLimit = 64 << 10
+	prefix := strings.Repeat("x", legacyLimit-len("api_key=")) + "api_key="
+	spill := []byte("join-boundary-secret\n")
+	checkpoint := identity.WorkspaceCheckpointRevision
+	legacy, err := json.Marshal(taskStepShellOutput{
+		ExitCode: 0, Stdout: prefix, StdoutTruncated: true,
+		TaskID: identity.TaskID, WorkspaceID: identity.WorkspaceID, BindingVersion: identity.WorkspaceBindingVersion,
+		WorkspaceViewID: identity.WorkspaceViewID, WorkspaceCheckpointRevision: &checkpoint,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, stderr, ok := joinTaskStepOutputCaptureLegacyPrefix(identity, legacy, spill, nil)
+	if !ok || len(stdout) != legacyLimit+len(spill) || len(stderr) != 0 || !bytes.HasSuffix(stdout, spill) {
+		t.Fatalf("joined prefix/spill = %d/%d bytes, ok=%t", len(stdout), len(stderr), ok)
+	}
+	sealer, err := NewSealer(bytes.Repeat([]byte{19}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := SealTaskStepOutputCapture(sealer, identity, stdout, stderr)
+	clear(stdout)
+	clear(stderr)
+	if err != nil {
+		t.Fatalf("SealTaskStepOutputCapture(joined stream): %v", err)
+	}
+	var disclosure bytes.Buffer
+	for _, page := range record.Stdout.Pages {
+		plain, err := sealer.OpenWithAAD(page.Ciphertext, taskStepOutputCaptureAAD(page))
+		if err != nil {
+			t.Fatal(err)
+		}
+		disclosure.Write(plain)
+	}
+	if bytes.Contains(disclosure.Bytes(), []byte("join-boundary-secret")) ||
+		!bytes.Contains(disclosure.Bytes(), []byte("[已隐藏]")) || record.Stdout.SourceBytes != legacyLimit+len(spill) {
+		t.Fatalf("joined boundary secret leaked or counters changed: source=%d output tail=%q", record.Stdout.SourceBytes, disclosure.String()[legacyLimit-24:])
 	}
 }
 

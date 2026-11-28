@@ -1,5 +1,5 @@
 import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import type { CSSProperties, DragEvent as ReactDragEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode } from 'react';
+import type { CSSProperties, DragEvent as ReactDragEvent, FormEvent, KeyboardEvent as ReactKeyboardEvent, ReactNode, SyntheticEvent } from 'react';
 import { Link, useLocation, useNavigate, useOutletContext } from 'react-router';
 import { useInfiniteQuery, useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { errorDetails, newIdempotencyKey, portalApi } from '../app/api';
@@ -14,7 +14,7 @@ import type { MessageVariantOutboxEntry } from '../app/use-message-variant-outbo
 import { buildMessageVariantTimeline, createMessageVariant, messageVariantActionLabel } from '../app/message-variants';
 import type { VersionableMessage } from '../app/message-variants';
 import { clearProcessingRetryKey, processingRetryKey } from '../app/message-processing-retry';
-import { routingFailureText } from '../app/message-status';
+import { routingFailureText, userVisibleRoutingStatusText } from '../app/message-status';
 import { maxMessageBytes, needsMessageUpload, uploadMessage } from '../app/message-upload';
 import { conversationTitleFromText, firstOutboxConversationMessage, messageOutbox, outboxReceiptRequest } from '../app/message-outbox';
 import type { PendingConversationMessage, PendingMessageAttachment } from '../app/message-outbox';
@@ -71,13 +71,6 @@ type AssistantTaskAttentionView = {
   detail: string;
   action: AssistantTaskAttention['action'];
 };
-
-function unverifiedTaskReply(task: Pick<TaskSummary, 'waiting_reason'>): string {
-  const diagnosis = task.waiting_reason === 'dsh_recovery_unresolved'
-    ? '任务记录显示，模型服务未返回可确认的答复。'
-    : '这次没有拿到可核实的结果。';
-  return `${diagnosis}我暂时不能确认任务已经完成，也不会自动重复可能产生副作用的操作。已确认的进度保留在任务动态中，请先核对后再决定下一步。`;
-}
 
 function taskModelRecoveryRetryIsAvailable(task: AssistantTaskStatusInput): boolean {
   const rawAttention = task.attention;
@@ -734,7 +727,7 @@ type TaskStepOutputReadState =
   | { status: 'error' };
 
 function TaskStepOutput({ label, value, stream, canReadFullOutput, taskID, stepID, actorID, serviceInstanceID,
-  conversationID, taskRevision, clientTruncated, truncated, runtimeTruncated, detailTruncated, omittedBytes }: {
+  taskRevision, onAccessRevoked, clientTruncated, truncated, runtimeTruncated, detailTruncated, omittedBytes }: {
   label: string;
   value: string;
   stream: TaskStepOutputStream;
@@ -743,8 +736,8 @@ function TaskStepOutput({ label, value, stream, canReadFullOutput, taskID, stepI
   stepID: string;
   actorID: string;
   serviceInstanceID: string;
-  conversationID: string;
   taskRevision: number | null;
+  onAccessRevoked: () => void;
   clientTruncated: boolean;
   truncated: boolean;
   runtimeTruncated: boolean;
@@ -754,6 +747,8 @@ function TaskStepOutput({ label, value, stream, canReadFullOutput, taskID, stepI
   const [readState, setReadState] = useState<TaskStepOutputReadState>({ status: 'idle' });
   const readGeneration = useRef(0);
   const requestController = useRef<AbortController | null>(null);
+  const authorizationCheckController = useRef<AbortController | null>(null);
+  const pagesBuffer = useRef<string[]>([]);
   let preview = '';
   let previewCharacters = 0;
   let hasMore = false;
@@ -770,13 +765,19 @@ function TaskStepOutput({ label, value, stream, canReadFullOutput, taskID, stepI
     readGeneration.current += 1;
     requestController.current?.abort();
     requestController.current = null;
-    setReadState({ status: 'idle' });
+    authorizationCheckController.current?.abort();
+    authorizationCheckController.current = null;
+    pagesBuffer.current = [];
+    setReadState((current) => current.status === 'complete' || current.status === 'loading' ? { status: 'idle' } : current);
   };
 
   useEffect(() => () => {
     readGeneration.current += 1;
     requestController.current?.abort();
     requestController.current = null;
+    authorizationCheckController.current?.abort();
+    authorizationCheckController.current = null;
+    pagesBuffer.current = [];
   }, []);
 
   const readFullOutput = async () => {
@@ -788,13 +789,14 @@ function TaskStepOutput({ label, value, stream, canReadFullOutput, taskID, stepI
     let expectedTotalBytes: number | null = null;
     let expectedSourceBytes: number | null = null;
     let receivedBytes = 0;
-    const pages: string[] = [];
+    pagesBuffer.current = [];
     setReadState({ status: 'loading', receivedBytes, totalBytes: null });
     try {
       for (let pageNumber = 0; pageNumber < taskStepOutputPageMaxBytes / (16 * 1024); pageNumber += 1) {
         const page = await portalApi.taskStepOutputPage(taskID, stepID, stream, offset, actorID, serviceInstanceID, controller.signal);
         if (controller.signal.aborted || generation !== readGeneration.current) return;
         if (page.state !== 'complete') {
+          pagesBuffer.current = [];
           setReadState({ status: page.state });
           return;
         }
@@ -809,15 +811,16 @@ function TaskStepOutput({ label, value, stream, canReadFullOutput, taskID, stepI
         if (receivedBytes > taskStepOutputPageMaxBytes || receivedBytes > expectedTotalBytes || page.next_offset !== receivedBytes) {
           throw new Error('输出分页超出已确认范围。');
         }
-        pages.push(page.data);
+        pagesBuffer.current.push(page.data);
         offset = page.next_offset;
         setReadState({ status: 'loading', receivedBytes, totalBytes: expectedTotalBytes });
         if (page.eof) {
           if (!page.complete || offset !== expectedTotalBytes || receivedBytes !== expectedTotalBytes) {
             throw new Error('输出分页尚未完整结束。');
           }
-          const completeText = safeTaskActivityText(pages.join(''), taskStepOutputPageMaxBytes);
+          const completeText = safeTaskActivityText(pagesBuffer.current.join(''), taskStepOutputPageMaxBytes);
           if (completeText.truncated) throw new Error('输出内容超过客户端显示上限。');
+          pagesBuffer.current = [];
           setReadState({ status: 'complete', value: completeText.value, totalBytes: expectedTotalBytes,
             sourceBytes: expectedSourceBytes ?? 0 });
           return;
@@ -826,20 +829,68 @@ function TaskStepOutput({ label, value, stream, canReadFullOutput, taskID, stepI
       throw new Error('输出分页数量超过客户端安全上限。');
     } catch (error) {
       if (controller.signal.aborted || generation !== readGeneration.current) return;
-      if (error instanceof ApiError && error.status === 404) setReadState({ status: 'not_available' });
-      else setReadState({ status: 'error' });
+      pagesBuffer.current = [];
+      if (error instanceof ApiError && error.status === 404) {
+        try {
+          const latest = await portalApi.taskStepDetail(taskID, stepID, controller.signal) as TaskStepDetailWithExecution;
+          if (controller.signal.aborted || generation !== readGeneration.current) return;
+          if (latest.task_id !== taskID || latest.step_id !== stepID || latest.detail_state !== 'available') {
+            onAccessRevoked();
+            return;
+          }
+        } catch (detailError) {
+          if (controller.signal.aborted || generation !== readGeneration.current) return;
+          if (detailError instanceof ApiError && [401, 403, 404].includes(detailError.status)) {
+            onAccessRevoked();
+            return;
+          }
+        }
+        if (controller.signal.aborted || generation !== readGeneration.current) return;
+        setReadState({ status: 'not_available' });
+      } else setReadState({ status: 'error' });
     } finally {
       if (requestController.current === controller) requestController.current = null;
     }
   };
 
-  const handleToggle = (event: React.SyntheticEvent<HTMLDetailsElement>) => {
+  const handleToggle = (event: SyntheticEvent<HTMLDetailsElement>) => {
     if (!event.currentTarget.open) {
       discardRead();
       return;
     }
     if (canReadFullOutput) void readFullOutput();
   };
+
+  useEffect(() => {
+    if (readState.status !== 'complete') return;
+    let disposed = false;
+    let activeController: AbortController | null = null;
+    const verifyAccess = async () => {
+      activeController?.abort();
+      const controller = new AbortController();
+      activeController = controller;
+      authorizationCheckController.current = controller;
+      try {
+        const latest = await portalApi.taskStepDetail(taskID, stepID, controller.signal) as TaskStepDetailWithExecution;
+        if (disposed || controller.signal.aborted) return;
+        if (latest.task_id !== taskID || latest.step_id !== stepID || latest.detail_state !== 'available') onAccessRevoked();
+      } catch (error) {
+        if (!disposed && !controller.signal.aborted && error instanceof ApiError && [401, 403, 404].includes(error.status)) {
+          onAccessRevoked();
+        }
+      } finally {
+        if (authorizationCheckController.current === controller) authorizationCheckController.current = null;
+        if (activeController === controller) activeController = null;
+      }
+    };
+    const interval = window.setInterval(() => { void verifyAccess(); }, 30_000);
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+      activeController?.abort();
+      if (authorizationCheckController.current === activeController) authorizationCheckController.current = null;
+    };
+  }, [onAccessRevoked, readState.status, stepID, taskID, taskRevision]);
 
   const displayFullOutput = readState.status === 'complete';
   return <div className="task-step-output">
@@ -859,12 +910,12 @@ function TaskStepOutput({ label, value, stream, canReadFullOutput, taskID, stepI
         {readState.status === 'not_available' && <p role="status">完整输出未记录或无法访问。</p>}
         {readState.status === 'source_truncated' && <p role="status">执行源头输出未完整结束，无法显示完整输出。</p>}
         {readState.status === 'capacity_truncated' && <p role="status">完整输出超过保存容量，服务端未返回部分内容。</p>}
-        {readState.status === 'not_recorded' && <p role="status">完整输出未记录、已过期或无法访问。</p>}
+        {readState.status === 'not_recorded' && <p role="status">完整输出未记录或已过期。</p>}
         {(readState.status === 'failed' || readState.status === 'error') && <p role="alert">完整输出保存或读取失败，请重试。</p>}
         {(readState.status === 'failed' || readState.status === 'error') && <button type="button" className="button button-small button-secondary"
           onClick={() => void readFullOutput()}>重试读取完整输出</button>}
         {canReadFullOutput && readState.status === 'idle' && <p role="status">展开后读取完整输出。</p>}
-        {canReadFullOutput && readState.status !== 'complete' && value && <pre>{value}</pre>}
+        {canReadFullOutput && value && <pre>{value}</pre>}
       </>}
     </details>}
   </div>;
@@ -951,6 +1002,11 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
   const [accessRevoked, setAccessRevoked] = useState(false);
   const queryKey = useMemo(() => ['task-step-detail', actorID, serviceInstanceID, conversationID, task.id, step.id] as const,
     [actorID, conversationID, serviceInstanceID, step.id, task.id]);
+  const revokeOutputAccess = useCallback(() => {
+    setAccessRevoked(true);
+    void client.cancelQueries({ queryKey, exact: true });
+    client.removeQueries({ queryKey, exact: true });
+  }, [client, queryKey]);
   const detail = useQuery({
     queryKey,
     queryFn: async ({ signal }) => {
@@ -1077,7 +1133,7 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
           step.id, task.current_revision ?? null, step.task_revision ?? null, 'stdout'])}
           label="标准输出" value={safeStdout?.value ?? ''} stream="stdout" canReadFullOutput={canReadFullStdout}
           taskID={task.id} stepID={step.id} actorID={actorID} serviceInstanceID={serviceInstanceID}
-          conversationID={conversationID} taskRevision={task.current_revision ?? step.task_revision ?? null}
+          taskRevision={task.current_revision ?? step.task_revision ?? null} onAccessRevoked={revokeOutputAccess}
           clientTruncated={safeStdout?.truncated ?? false}
           truncated={execution.stdout_truncated === true}
           runtimeTruncated={execution.stdout_runtime_truncated === true} detailTruncated={execution.stdout_detail_truncated === true}
@@ -1088,7 +1144,7 @@ function TaskStepDetails({ task, step, conversationID, actorID, serviceInstanceI
           step.id, task.current_revision ?? null, step.task_revision ?? null, 'stderr'])}
           label="错误输出" value={safeStderr?.value ?? ''} stream="stderr" canReadFullOutput={canReadFullStderr}
           taskID={task.id} stepID={step.id} actorID={actorID} serviceInstanceID={serviceInstanceID}
-          conversationID={conversationID} taskRevision={task.current_revision ?? step.task_revision ?? null}
+          taskRevision={task.current_revision ?? step.task_revision ?? null} onAccessRevoked={revokeOutputAccess}
           clientTruncated={safeStderr?.truncated ?? false}
           truncated={execution.stderr_truncated === true}
           runtimeTruncated={execution.stderr_runtime_truncated === true} detailTruncated={execution.stderr_detail_truncated === true}
@@ -4437,8 +4493,7 @@ export function Assistant() {
                   const longReplyIsCancelled = message.role === 'user' && messageResponseMode === 'long_form' && messageRoutingStatus === 'cancelled';
                   const cancellingThisLongReply = cancelLongReply.isPending && cancelLongReply.variables?.messageID === message.id;
                   const messageTask = tasksByID.get(messageTaskID);
-                  const messageTaskSummary = taskPanelItemsByID.get(messageTaskID) ?? messageTask ?? null;
-                  const messageTaskAttentionSource = messageTask ?? messageTaskSummary;
+                  const messageTaskAttentionSource = messageTask ?? taskPanelItemsByID.get(messageTaskID) ?? null;
                   const messageActorID = conversationMessageActorID(message);
                   const acknowledgedByServer = message.role === 'user' && message.agent_acknowledged === true &&
                     Boolean(user?.id) && messageActorID === user?.id &&
@@ -4454,11 +4509,8 @@ export function Assistant() {
                     taskAttention.kind !== 'needs_user_action' && !ambiguousAcknowledgementTaskIDs.has(messageTaskID) &&
                     !taskHasTerminalReply &&
                     (acknowledgedUserMessageByTaskID.get(messageTaskID) ?? latestUserMessageByTaskID.get(messageTaskID)) === message.id);
-                  const showUnverifiedTaskReply = Boolean(message.role === 'user' && message.task_id && messageTaskSummary &&
-                    messageActorID === user?.id && latestSourceUserMessageByTaskID.get(message.task_id) === message.id &&
-                    messageTaskAttentionSource?.conversation_id === conversationID &&
-                    messageTaskAttentionSource.initiator_id === messageActorID && taskAttention?.kind === 'result_unverified' &&
-                    !taskHasTerminalReply);
+                  const visibleRoutingStatus = message.role === 'user' && messageResponseMode !== 'long_form'
+                    ? userVisibleRoutingStatusText(message.routing_status) : null;
                   const canRetryModelRecovery = Boolean(user?.id && messageTask && taskAttention?.kind === 'paused_retryable' &&
                     taskAttention.action === 'retry' && taskModelRecoveryRetryIsAvailable(messageTask));
                   const retryingModelRecovery = messageTask ? modelRecoveryRetryingTaskIDs.has(messageTask.id) : false;
@@ -4528,6 +4580,7 @@ export function Assistant() {
                           {acknowledgedByServer && <span className="chat-message-agent-acknowledged" role="img" aria-label="已接下后台任务" title="已接下后台任务">👌🏻</span>}
                         </>}
                     </article>
+                    {visibleRoutingStatus && <p className="chat-message-status" role="status" aria-live="polite">{visibleRoutingStatus}</p>}
                     {message.role === 'assistant' && message.task_id && message.delivery_status === 'applied'
                       && message.output_status === 'completed' && typeof message.output_task_revision === 'number'
                       && Number.isSafeInteger(message.output_task_revision) && typeof message.output_result_event_sequence === 'number'
@@ -4541,18 +4594,18 @@ export function Assistant() {
                         title={message.role === 'assistant' ? '复制回复' : '复制消息'}
                         onClick={() => void copyConversationMessage(message.content, message.role)}><MordeIcon name="copy" /></button>
                     </div>
-                    {showTaskAttention && taskAttention && !showUnverifiedTaskReply && <section className={`chat-message-task-attention task-attention-${taskAttention.kind}`}
+                    {showTaskAttention && taskAttention && <section className={`chat-message-task-attention task-attention-${taskAttention.kind}`}
                       role="status" aria-label={`任务状态：${taskAttention.label}`}>
                       <strong>{taskAttention.label}</strong>
                       <p>{taskAttention.detail}</p>
                       {(taskAttention.action === 'view_details' || taskAttention.kind === 'interrupted' || taskAttention.kind === 'result_unverified') &&
                         <button type="button" className="button button-small button-secondary" aria-label="查看任务详情"
                           onClick={() => {
-                            if (!messageTask) return;
+                            if (!messageTaskAttentionSource) return;
                             setTaskDetailStepID(null);
                             setTaskPanelTab('tasks');
                             setTaskPanelOpen(true);
-                            setTaskDetailTaskID(messageTask.id);
+                            setTaskDetailTaskID(messageTaskAttentionSource.id);
                           }}>查看任务详情</button>}
                       {canRetryModelRecovery && messageTask && <button type="button" className="button button-small button-secondary task-model-recovery-retry"
                         aria-label="重试任务" disabled={retryingModelRecovery} onClick={() => void retryTaskModelRecovery(messageTask)}>
@@ -4561,21 +4614,6 @@ export function Assistant() {
                     </section>}
                     </div>
                     </div>
-                    {showUnverifiedTaskReply && messageTaskSummary && <div className="chat-message-row chat-message-row-assistant" role="group" aria-label="Morde 的任务结果说明">
-                      <span className="assistant-logo assistant-logo-message" aria-hidden="true" />
-                      <div className="chat-message-body"><strong className="chat-message-author">Morde</strong>
-                        <article className="chat-message chat-message-assistant" aria-label="Morde 的回复" role="status">
-                          <ChatMarkdown content={unverifiedTaskReply(messageTaskSummary)} />
-                        </article>
-                        <button type="button" className="button button-small button-secondary" aria-label="查看任务详情"
-                          onClick={() => {
-                            setTaskDetailStepID(null);
-                            setTaskPanelTab('tasks');
-                            setTaskPanelOpen(true);
-                            setTaskDetailTaskID(messageTaskSummary.id);
-                          }}>查看任务动态</button>
-                      </div>
-                    </div>}
                     {(longReplyIsPending || longReplyIsProcessing || longReplyIsCancelRequested || longReplyIsPartial || longReplyIsCancelled) && <div
                       className="chat-message-row chat-message-row-assistant" role="group"
                       aria-label={`长回复状态：${longReplyIsPartial ? '部分完成' : longReplyIsCancelled ? '已取消' : longReplyIsCancelRequested ? '正在取消' : longReplyIsPending ? '等待处理' : '正在生成'}`}>

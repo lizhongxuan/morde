@@ -42,6 +42,7 @@ type CloudDSHToolBroker struct {
 	schedules                *ScheduleService
 	projectContext           *ProjectService
 	stepDetailSealer         *Sealer
+	stepOutputCaptureEnabled bool
 	taskModelRecoveryAuto    bool
 }
 
@@ -204,6 +205,34 @@ func (b *CloudDSHToolBroker) SetTaskStepDetailSealer(sealer *Sealer) error {
 		return domain.NewError(domain.CodeInvalidState, "task step detail sealer cannot be replaced")
 	}
 	b.stepDetailSealer = sealer
+	return nil
+}
+
+// SetTaskStepOutputCaptureEnabled enables the separately bounded, encrypted
+// Shell output sideband. It is off unless startup configuration opts in.
+func (b *CloudDSHToolBroker) SetTaskStepOutputCaptureEnabled(enabled bool) error {
+	if b == nil {
+		return domain.NewError(domain.CodeInvalidArgument, "task step output capture broker is required")
+	}
+	if !enabled {
+		if b.stepOutputCaptureEnabled {
+			return domain.NewError(domain.CodeInvalidState, "task step output capture cannot be disabled after startup")
+		}
+		return nil
+	}
+	if b.stepDetailSealer == nil {
+		return domain.NewError(domain.CodeInvalidState, "task step output capture encryption is unavailable")
+	}
+	if _, ok := b.store.(TaskStepOutputCaptureWriter); !ok {
+		return domain.NewError(domain.CodeUnsupported, "task step output capture storage is unavailable")
+	}
+	if _, ok := b.store.(TaskStepOutputCaptureStatusWriter); !ok {
+		return domain.NewError(domain.CodeUnsupported, "task step output capture status storage is unavailable")
+	}
+	if _, ok := b.store.(TaskStepOutputCaptureWorkspaceAuthorizationReader); !ok {
+		return domain.NewError(domain.CodeUnsupported, "task step output capture authorization storage is unavailable")
+	}
+	b.stepOutputCaptureEnabled = true
 	return nil
 }
 
@@ -1377,6 +1406,21 @@ func cloudDSHHasHostToolHistory(inputs []ModelInput) bool {
 	return false
 }
 
+func cloudDSHToolStepForCall(steps []task.Step, current task.Task, call ModelToolCall) (task.Step, bool) {
+	if current.CurrentRevision == nil || call.TaskFence == nil || call.TaskFence.AgentSessionID == "" {
+		return task.Step{}, false
+	}
+	for index := len(steps) - 1; index >= 0; index-- {
+		step := steps[index]
+		if step.TaskID == current.ID && step.AgentSessionID == call.TaskFence.AgentSessionID &&
+			step.TaskRevision != nil && *step.TaskRevision == *current.CurrentRevision &&
+			step.ToolCallKey == call.CallID && step.ToolName == call.Name {
+			return step, true
+		}
+	}
+	return task.Step{}, false
+}
+
 func (b *CloudDSHToolBroker) pauseCompletion(ctx context.Context, current task.Task, step task.Step, reason, summary string) error {
 	step.Status, step.Summary = task.StepUnknown, summary
 	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), agentPersistenceTimeout)
@@ -1773,11 +1817,15 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		return b.commitApprovalMismatch(ctx, current, call.Name, details.Steps)
 	}
 	usage := cloneTaskUsage(current.Usage)
-	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
-		"Run cloud dsh tool: "+call.Name, "Checking current authorization, budget, and Host control.")
-	if err != nil {
-		return AgentToolResult{}, err
+	step, reusedStep := cloudDSHToolStepForCall(details.Steps, current, call)
+	if !reusedStep {
+		step, err = newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
+			"Run cloud dsh tool: "+call.Name, "Checking current authorization, budget, and Host control.")
+		if err != nil {
+			return AgentToolResult{}, err
+		}
 	}
+	request.StepID = step.ID
 	if approvalCall && pendingApproval.Status == task.PendingRequestApproved {
 		request.Approval = &AgentToolApprovalDecision{PendingID: pendingApproval.ID, Version: pendingApproval.Version,
 			Decision: task.PendingDecisionApprove, RequestHash: append([]byte(nil), hash[:]...)}
@@ -1911,6 +1959,13 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 		return b.pauseUnknown(ctx, current, step, usage, request.OperationKey, "The stored tool operation does not match this exact request.")
 	}
 	request.OperationID = operation.ID
+	var outputCaptureExecution *taskStepOutputCaptureExecution
+	if b.stepOutputCaptureEnabled && call.Name == runtimeToolShellExec && request.WorkspaceID != "" &&
+		domain.ValidStepID(request.StepID) && domain.ValidOperationID(request.OperationID) {
+		outputCaptureExecution = newTaskStepOutputCaptureExecution(TaskStepOutputCaptureIdentity{})
+		ctx = withTaskStepOutputCaptureExecution(ctx, outputCaptureExecution)
+		defer outputCaptureExecution.clearBytes()
+	}
 	if replayed {
 		var result AgentToolResult
 		var terminal bool
@@ -2043,6 +2098,9 @@ func (b *CloudDSHToolBroker) execute(ctx context.Context, claimed task.Task, cal
 	step.Status, step.Summary = stepStatus, summary
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", eventDetail); err != nil {
 		return AgentToolResult{}, err
+	}
+	if outputCaptureExecution != nil {
+		b.persistTaskStepOutputCapture(ctx, outputCaptureExecution)
 	}
 	return AgentToolResult{Status: result.Status, ExternalID: result.ExternalID, Output: output, Images: result.Images}, nil
 }
@@ -2537,10 +2595,13 @@ func (b *CloudDSHToolBroker) reconcileCheckpointedCall(ctx context.Context, clai
 	if err != nil {
 		return AgentToolResult{}, true, err
 	}
-	step, err := newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
-		"Recover cloud dsh tool: "+call.Name, "Checking the exact prior Host operation and current authorization.")
-	if err != nil {
-		return AgentToolResult{}, true, err
+	step, reusedStep := cloudDSHToolStepForCall(details.Steps, current, call)
+	if !reusedStep {
+		step, err = newAgentStep(current.ID, maxStepSequence(details.Steps)+1, "tool", task.StepRunning,
+			"Recover cloud dsh tool: "+call.Name, "Checking the exact prior Host operation and current authorization.")
+		if err != nil {
+			return AgentToolResult{}, true, err
+		}
 	}
 	usage := cloneTaskUsage(current.Usage)
 	pause := func(summary string) (AgentToolResult, bool, error) {
@@ -2617,9 +2678,15 @@ func (b *CloudDSHToolBroker) reconcileCheckpointedCall(ctx context.Context, clai
 		return AgentToolResult{}, false, nil
 	}
 	request := AgentToolRequest{
-		Task: current, Call: originalCall, Arguments: arguments, OperationRequestHash: append([]byte(nil), hash[:]...),
+		Task: current, Call: originalCall, StepID: step.ID, Arguments: arguments, OperationRequestHash: append([]byte(nil), hash[:]...),
 		OperationKey: operationKey, OperationID: operation.ID,
 		RequiredScope: mapping.scope, WorkspaceID: workspaceID,
+	}
+	if b.stepOutputCaptureEnabled && call.Name == runtimeToolShellExec && request.WorkspaceID != "" &&
+		domain.ValidStepID(request.StepID) && domain.ValidOperationID(request.OperationID) {
+		capture := newTaskStepOutputCaptureExecution(TaskStepOutputCaptureIdentity{})
+		ctx = withTaskStepOutputCaptureExecution(ctx, capture)
+		defer capture.clearBytes()
 	}
 	if operation.Status == task.OperationDispatched {
 		operation, err = b.store.UpdateOperation(ctx, OperationUpdate{
@@ -2870,6 +2937,7 @@ func modelFailureToolNotDispatched(diagnostic AgentModelFailureDiagnostic) bool 
 }
 
 func (b *CloudDSHToolBroker) commitResult(ctx context.Context, current task.Task, step task.Step, usage task.Usage, name string, result AgentToolResult) (AgentToolResult, error) {
+	capture := taskStepOutputCaptureExecutionFromContext(ctx)
 	ctx = withTaskToolShellExecutionEvidence(ctx, name, result)
 	if result.Status == AgentToolFailed {
 		result = safeCloudDSHToolFailureResult(name, result)
@@ -2883,6 +2951,9 @@ func (b *CloudDSHToolBroker) commitResult(ctx context.Context, current task.Task
 	}
 	if err := b.commitProgress(ctx, current, step, usage, task.StatusRunning, "", "task.step", eventDetail); err != nil {
 		return AgentToolResult{}, err
+	}
+	if capture != nil {
+		b.persistTaskStepOutputCapture(ctx, capture)
 	}
 	result.Output = boundedToolOutput(result.Output)
 	return result, nil

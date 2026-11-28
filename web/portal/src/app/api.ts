@@ -101,6 +101,7 @@ async function readTaskStepOutputPage(response: Response, stream: TaskStepOutput
     typeof value.total_bytes !== 'number' || !Number.isSafeInteger(value.total_bytes) || value.total_bytes < 0 ||
     value.total_bytes > taskStepOutputMaxBytes || typeof value.source_bytes !== 'number' ||
     !Number.isSafeInteger(value.source_bytes) || value.source_bytes < 0 ||
+    value.source_bytes > taskStepOutputMaxBytes ||
     typeof value.eof !== 'boolean' || value.complete !== true) {
     throw new Error('完整输出分页响应格式无效。');
   }
@@ -360,16 +361,21 @@ export const portalApi = {
   },
   agentWorkspaceFileURL: (id: string, path: string) => `/api/workspaces/${encodeURIComponent(id)}/files/${path.split('/').map(encodeURIComponent).join('/')}`,
   taskStepDetail: async (id: string, stepID: string, signal?: AbortSignal) => unwrapApiResponse(await api.GET('/api/tasks/{id}/steps/{step_id}', {
-    params: { path: { id, step_id: stepID } }, signal,
+    params: { path: { id, step_id: stepID } }, signal, cache: 'no-store',
   })),
   taskStepOutputPage: async (id: string, stepID: string, stream: TaskStepOutputStream, offset: number,
     actorID: string, serviceInstanceID: string, signal?: AbortSignal) => {
     if (!actorID || !serviceInstanceID) throw new Error('账号或服务身份尚未确认。');
     if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('完整输出分页位置无效。');
     const query = new URLSearchParams({ stream, offset: String(offset) });
+    const headers = new Headers();
+    headers.set('X-Morde-Service-Instance-ID', serviceInstanceID);
+    headers.set('X-Morde-Actor-ID', actorID);
+    headers.set('accept', 'application/json');
     const response = await requestFetch(`/api/tasks/${encodeURIComponent(id)}/steps/${encodeURIComponent(stepID)}/output?${query}`, {
+      cache: 'no-store',
       signal,
-      headers: { accept: 'application/json', ...personalIdentityHeaders(serviceInstanceID, actorID) },
+      headers,
     });
     return readTaskStepOutputPage(response, stream, offset);
   },

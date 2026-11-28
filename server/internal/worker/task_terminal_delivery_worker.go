@@ -12,6 +12,7 @@ import (
 	"go.uber.org/zap"
 
 	"morde/server/internal/app"
+	"morde/server/internal/domain"
 )
 
 type TaskTerminalDeliveryModelGateway interface {
@@ -106,6 +107,7 @@ func (w *TaskTerminalDeliveryWorker) deliverClaim(ctx context.Context, claim app
 	defer func() {
 		if resultErr != nil {
 			logger.Error("task terminal delivery processing failed", zap.String("stage", stage),
+				zap.String("failure_code", string(domain.CodeOf(resultErr))),
 				zap.String("error_type", typeName(resultErr)))
 		}
 	}()

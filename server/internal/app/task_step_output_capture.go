@@ -23,9 +23,139 @@ const (
 	TaskStepOutputCaptureMaxPages        = TaskStepOutputCaptureMaxBytes / TaskStepOutputCapturePageBytes
 	TaskStepOutputCaptureOwnerQuotaBytes = 64 << 20
 	TaskStepOutputCaptureCleanupBatch    = 1000
+	TaskStepOutputCaptureRetention       = 24 * time.Hour
 )
 
 const TaskStepOutputCaptureCleanupInterval = time.Minute
+
+type taskStepOutputCaptureExecutionKey struct{}
+
+// taskStepOutputCaptureExecution is request-local memory only. It is never
+// serialized into Runtime operation, DSH checkpoint, or Task result payloads.
+type taskStepOutputCaptureExecution struct {
+	identity    TaskStepOutputCaptureIdentity
+	state       TaskStepOutputCaptureState
+	legacyRaw   []byte
+	stdoutSpill []byte
+	stderrSpill []byte
+}
+
+func newTaskStepOutputCaptureExecution(identity TaskStepOutputCaptureIdentity) *taskStepOutputCaptureExecution {
+	return &taskStepOutputCaptureExecution{identity: identity, state: TaskStepOutputCaptureStateNotRecorded}
+}
+
+func withTaskStepOutputCaptureExecution(ctx context.Context, capture *taskStepOutputCaptureExecution) context.Context {
+	if ctx == nil || capture == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, taskStepOutputCaptureExecutionKey{}, capture)
+}
+
+func taskStepOutputCaptureExecutionFromContext(ctx context.Context) *taskStepOutputCaptureExecution {
+	if ctx == nil {
+		return nil
+	}
+	capture, _ := ctx.Value(taskStepOutputCaptureExecutionKey{}).(*taskStepOutputCaptureExecution)
+	return capture
+}
+
+func (capture *taskStepOutputCaptureExecution) setStatus(state TaskStepOutputCaptureState) {
+	if capture == nil || state == TaskStepOutputCaptureStateComplete || state == TaskStepOutputCaptureStateNotRecorded {
+		return
+	}
+	capture.clearBytes()
+	capture.state = state
+}
+
+func (capture *taskStepOutputCaptureExecution) setIdentity(identity TaskStepOutputCaptureIdentity) bool {
+	if capture == nil || !taskStepOutputCaptureIdentityValid(identity) {
+		return false
+	}
+	capture.identity = identity
+	return true
+}
+
+// setLegacyRaw stores only the bounded Runtime legacy Shell result in request
+// memory so the server can join it with the spill and redact the complete
+// stream once. It is never serialized and is cleared with the spill buffers.
+func (capture *taskStepOutputCaptureExecution) setLegacyRaw(raw []byte) bool {
+	if capture == nil || len(raw) == 0 || len(raw) > maxAgentToolOutputBytes {
+		return false
+	}
+	var shell taskStepShellOutput
+	if decodeStrictRuntimeResult(raw, &shell) != nil || len(shell.Stdout)+len(shell.Stderr) > maxAgentToolOutputBytes ||
+		!utf8.ValidString(shell.Stdout) || !utf8.ValidString(shell.Stderr) {
+		return false
+	}
+	encoded, err := json.Marshal(shell)
+	if err != nil || len(encoded) > maxAgentToolOutputBytes {
+		return false
+	}
+	capture.clearLegacyRaw()
+	capture.legacyRaw = encoded
+	return true
+}
+
+func (capture *taskStepOutputCaptureExecution) setComplete(identity TaskStepOutputCaptureIdentity, stdout, stderr []byte) bool {
+	if capture == nil || !taskStepOutputCaptureIdentityValid(identity) || len(stdout) > TaskStepOutputCaptureMaxBytes ||
+		len(stderr) > TaskStepOutputCaptureMaxBytes-len(stdout) || !utf8.Valid(stdout) || !utf8.Valid(stderr) ||
+		strings.ContainsRune(string(stdout), '\x00') || strings.ContainsRune(string(stderr), '\x00') || len(capture.legacyRaw) == 0 {
+		return false
+	}
+	clear(capture.stdoutSpill)
+	clear(capture.stderrSpill)
+	capture.identity = identity
+	capture.stdoutSpill = stdout
+	capture.stderrSpill = stderr
+	capture.state = TaskStepOutputCaptureStateComplete
+	return true
+}
+
+func (capture *taskStepOutputCaptureExecution) take() (TaskStepOutputCaptureIdentity, TaskStepOutputCaptureState, []byte, []byte) {
+	if capture == nil {
+		return TaskStepOutputCaptureIdentity{}, TaskStepOutputCaptureStateNotRecorded, nil, nil
+	}
+	identity, state, stdout, stderr := capture.identity, capture.state, capture.stdoutSpill, capture.stderrSpill
+	capture.stdoutSpill, capture.stderrSpill = nil, nil
+	return identity, state, stdout, stderr
+}
+
+func (capture *taskStepOutputCaptureExecution) takeLegacyRaw() []byte {
+	if capture == nil {
+		return nil
+	}
+	raw := capture.legacyRaw
+	capture.legacyRaw = nil
+	return raw
+}
+
+func (capture *taskStepOutputCaptureExecution) clearLegacyRaw() {
+	if capture == nil {
+		return
+	}
+	clear(capture.legacyRaw)
+	capture.legacyRaw = nil
+}
+
+func (capture *taskStepOutputCaptureExecution) clearBytes() {
+	if capture == nil {
+		return
+	}
+	clear(capture.stdoutSpill)
+	clear(capture.stderrSpill)
+	capture.clearLegacyRaw()
+	capture.stdoutSpill, capture.stderrSpill = nil, nil
+}
+
+type TaskStepOutputCaptureState string
+
+const (
+	TaskStepOutputCaptureStateComplete          TaskStepOutputCaptureState = "complete"
+	TaskStepOutputCaptureStateSourceTruncated   TaskStepOutputCaptureState = "source_truncated"
+	TaskStepOutputCaptureStateCapacityTruncated TaskStepOutputCaptureState = "capacity_truncated"
+	TaskStepOutputCaptureStateNotRecorded       TaskStepOutputCaptureState = "not_recorded"
+	TaskStepOutputCaptureStateFailed            TaskStepOutputCaptureState = "failed"
+)
 
 // TaskStepOutputCaptureIdentity binds supplemental output to the exact Task,
 // Workspace authorization snapshot, step, operation and original model CallID.
@@ -81,6 +211,7 @@ type TaskStepOutputCaptureRecord struct {
 type TaskStepOutputCapturePage struct {
 	Identity    TaskStepOutputCaptureIdentity `json:"-"`
 	Stream      string                        `json:"stream"`
+	State       TaskStepOutputCaptureState    `json:"state"`
 	Offset      int                           `json:"offset"`
 	NextOffset  int                           `json:"next_offset"`
 	TotalBytes  int                           `json:"total_bytes"`
@@ -88,6 +219,25 @@ type TaskStepOutputCapturePage struct {
 	EOF         bool                          `json:"eof"`
 	Complete    bool                          `json:"complete"`
 	Data        []byte                        `json:"data"`
+}
+
+// TaskStepOutputCaptureStatusRecord persists only the identity fence and a
+// non-sensitive result state when no complete encrypted receipt can be saved.
+// It never contains output bytes, a reason, or page metadata.
+type TaskStepOutputCaptureStatusRecord struct {
+	Identity  TaskStepOutputCaptureIdentity
+	State     TaskStepOutputCaptureState
+	ExpiresAt time.Time
+}
+
+func validTaskStepOutputCaptureStatusRecord(value TaskStepOutputCaptureStatusRecord) bool {
+	return taskStepOutputCaptureIdentityValid(value.Identity) &&
+		(value.State == TaskStepOutputCaptureStateSourceTruncated ||
+			value.State == TaskStepOutputCaptureStateCapacityTruncated || value.State == TaskStepOutputCaptureStateFailed)
+}
+
+func ValidTaskStepOutputCaptureStatusRecordForStore(value TaskStepOutputCaptureStatusRecord) bool {
+	return validTaskStepOutputCaptureStatusRecord(value)
 }
 
 func taskStepOutputCaptureIdentityValid(value TaskStepOutputCaptureIdentity) bool {
@@ -316,20 +466,44 @@ func (s *TaskService) GetStepOutputCapturePage(ctx context.Context, principal id
 		}
 		workspaceAuthVersion = member.Version
 	}
+	statusReader, hasStatusReader := s.store.(TaskStepOutputCaptureStatusReader)
+	if !hasStatusReader {
+		return TaskStepOutputCapturePage{Stream: stream, State: TaskStepOutputCaptureStateNotRecorded}, nil
+	}
+	status, err := statusReader.GetTaskStepOutputCaptureStatus(ctx, principal.UserID, taskID, stepID)
+	if err != nil {
+		return TaskStepOutputCapturePage{}, err
+	}
+	if status.State == TaskStepOutputCaptureStateNotRecorded {
+		return TaskStepOutputCapturePage{Stream: stream, State: TaskStepOutputCaptureStateNotRecorded}, nil
+	}
+	if !validTaskStepOutputCaptureStatusRecord(status) && status.State != TaskStepOutputCaptureStateComplete ||
+		!taskStepOutputCaptureIdentityValid(status.Identity) || !status.ExpiresAt.After(time.Now().UTC()) ||
+		status.Identity.OwnerID != current.OwnerID || status.Identity.TaskID != taskID ||
+		status.Identity.TaskRevision != *current.CurrentRevision || status.Identity.AuthorizationVersion != current.Authorization.Version ||
+		status.Identity.WorkspaceID != current.WorkspaceID || status.Identity.WorkspaceAuthorizationVersion != workspaceAuthVersion ||
+		status.Identity.WorkspaceCheckpointRevision != *current.WorkspaceCheckpointRevision ||
+		status.Identity.StepID != stepID || status.Identity.CallID != step.ToolCallKey {
+		return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeInvalidState, "supplemental output capture identity is invalid")
+	}
+	if status.State != TaskStepOutputCaptureStateComplete {
+		return TaskStepOutputCapturePage{Stream: stream, State: status.State, Complete: false}, nil
+	}
 	reader, ok := s.store.(TaskStepOutputCaptureReader)
 	if !ok || s.stepDetailSealer == nil {
-		return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeNotFound, "supplemental output page not found")
+		return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeUnsupported, "supplemental output capture reader is unavailable")
 	}
 	record, err := reader.GetTaskStepOutputCapturePage(ctx, principal.UserID, taskID, stepID, stream, offset)
 	if err != nil {
 		return TaskStepOutputCapturePage{}, err
 	}
 	identity := record.Identity
-	if !taskStepOutputCaptureIdentityValid(identity) || !record.ExpiresAt.After(time.Now().UTC()) || identity.OwnerID != current.OwnerID ||
+	if !taskStepOutputCaptureIdentityValid(identity) || status.Identity != identity || !record.ExpiresAt.After(time.Now().UTC()) || identity.OwnerID != current.OwnerID ||
 		identity.TaskID != taskID || identity.TaskRevision != *current.CurrentRevision || identity.AuthorizationVersion != current.Authorization.Version ||
 		identity.WorkspaceID != current.WorkspaceID || identity.WorkspaceAuthorizationVersion != workspaceAuthVersion ||
 		identity.WorkspaceCheckpointRevision != *current.WorkspaceCheckpointRevision || identity.StepID != stepID || identity.CallID != step.ToolCallKey ||
-		record.Stream != stream || record.SourceBytes < 0 || record.TotalBytes < 0 || record.TotalBytes > TaskStepOutputCaptureMaxBytes ||
+		record.Stream != stream || record.SourceBytes < 0 || record.SourceBytes > TaskStepOutputCaptureMaxBytes ||
+		record.TotalBytes < 0 || record.TotalBytes > TaskStepOutputCaptureMaxBytes ||
 		len(record.StreamSHA256) != sha256.Size || offset > record.TotalBytes {
 		return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeInvalidState, "supplemental output capture identity is invalid")
 	}
@@ -338,7 +512,7 @@ func (s *TaskService) GetStepOutputCapturePage(ctx context.Context, principal id
 		if offset != 0 || record.PlaintextBytes != 0 || len(record.Ciphertext) != 0 || !equalByteSlices(record.StreamSHA256, emptyDigest[:]) {
 			return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeInvalidState, "supplemental output capture integrity check failed")
 		}
-		return TaskStepOutputCapturePage{Identity: identity, Stream: stream, Offset: 0, NextOffset: 0, TotalBytes: 0,
+		return TaskStepOutputCapturePage{Identity: identity, Stream: stream, State: TaskStepOutputCaptureStateComplete, Offset: 0, NextOffset: 0, TotalBytes: 0,
 			SourceBytes: record.SourceBytes, EOF: true, Complete: true, Data: []byte{}}, nil
 	}
 	if record.Offset != offset || record.PlaintextBytes < 1 || record.PlaintextBytes > TaskStepOutputCapturePageBytes ||
@@ -356,7 +530,7 @@ func (s *TaskService) GetStepOutputCapturePage(ctx context.Context, principal id
 	if redacted != string(plain) {
 		return TaskStepOutputCapturePage{}, domain.NewError(domain.CodeInvalidState, "supplemental output capture redaction check failed")
 	}
-	return TaskStepOutputCapturePage{Identity: identity, Stream: stream, Offset: offset,
+	return TaskStepOutputCapturePage{Identity: identity, Stream: stream, State: TaskStepOutputCaptureStateComplete, Offset: offset,
 		NextOffset: offset + len(plain), TotalBytes: record.TotalBytes, SourceBytes: record.SourceBytes,
 		EOF: offset+len(plain) == record.TotalBytes, Complete: true, Data: append([]byte(nil), plain...)}, nil
 }

@@ -54,6 +54,107 @@ func TestWorkspaceNativeMetadataFromRuntimePreservesRawValues(t *testing.T) {
 	}
 }
 
+type runtimeToolOutputCaptureHandler struct {
+	stdoutPrefix string
+	stdoutSpill  []byte
+	stderrPrefix string
+	stderrSpill  []byte
+	calls        atomic.Int32
+	captureCalls atomic.Int32
+}
+
+func (h *runtimeToolOutputCaptureHandler) Capability() string                      { return "shell.exec" }
+func (h *runtimeToolOutputCaptureHandler) Action() string                          { return "run" }
+func (h *runtimeToolOutputCaptureHandler) SupportsSupplementalOutputCapture() bool { return true }
+func (h *runtimeToolOutputCaptureHandler) Stop(context.Context, runtimeclient.Operation) (runtimecore.StopResult, error) {
+	return runtimecore.StopResult{VerifiedStopped: true}, nil
+}
+func (h *runtimeToolOutputCaptureHandler) Execute(ctx context.Context, request contract.ExecuteRequest) (json.RawMessage, error) {
+	h.calls.Add(1)
+	if request.OutputCapture != nil {
+		h.captureCalls.Add(1)
+	}
+	if sink := contract.SupplementalOutputSinkFromContext(ctx); sink != nil {
+		for _, chunk := range [][]byte{h.stdoutSpill[:len(h.stdoutSpill)/2], h.stdoutSpill[len(h.stdoutSpill)/2:]} {
+			if len(chunk) > 0 && !sink.WriteSupplementalOutput(contract.SupplementalOutputCaptureStdout, chunk) {
+				return nil, errors.New("supplemental stdout capture failed")
+			}
+		}
+		if len(h.stderrSpill) > 0 && !sink.WriteSupplementalOutput(contract.SupplementalOutputCaptureStderr, h.stderrSpill) {
+			return nil, errors.New("supplemental stderr capture failed")
+		}
+	}
+	supplemental := contract.SupplementalOutputSinkFromContext(ctx) != nil
+	checkpoint := request.WorkspaceCheckpointRevision
+	result, err := json.Marshal(taskStepShellOutput{
+		ExitCode: 0, Stdout: h.stdoutPrefix, Stderr: h.stderrPrefix,
+		StdoutTruncated: supplemental && len(h.stdoutSpill) > 0, StderrTruncated: supplemental && len(h.stderrSpill) > 0,
+		TaskID: request.TaskID, WorkspaceID: request.WorkspaceID, BindingVersion: request.BindingVersion,
+		WorkspaceViewID: request.WorkspaceViewID, WorkspaceCheckpointRevision: &checkpoint,
+	})
+	return result, err
+}
+
+func TestRuntimeToolExecutorOptInOutputCaptureCollectsOnlySupplementalSpill(t *testing.T) {
+	const legacyPrefixBytes = 8 << 10
+	secret := []byte("cross-boundary-secret")
+	stdoutPrefix := strings.Repeat("x", legacyPrefixBytes-len("api_key=")) + "api_key="
+	stdoutSpill := append(secret, '\n')
+	handler := &runtimeToolOutputCaptureHandler{stdoutPrefix: stdoutPrefix, stdoutSpill: stdoutSpill,
+		stderrPrefix: "warning", stderrSpill: []byte(" continued")}
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{runtimeAction: handler}})
+	fixture.store.details.Task.Authorization.Version = 1
+	request, preparation := fixture.prepared(runtimeToolShellExec, `{"command":"printf output"}`, identity.ScopeComputerOperate)
+	request.Task = fixture.store.details.Task
+	request.StepID = "s1234567"
+	fixture.persistOperation(request)
+	capture := newTaskStepOutputCaptureExecution(TaskStepOutputCaptureIdentity{})
+	result, err := fixture.executor.Execute(withTaskStepOutputCaptureExecution(context.Background(), capture), request, preparation)
+	if err != nil || result.Status != AgentToolSucceeded || handler.calls.Load() != 1 || handler.captureCalls.Load() != 1 {
+		t.Fatalf("Execute() = %#v, %v; calls=%d capture requests=%d", result, err, handler.calls.Load(), handler.captureCalls.Load())
+	}
+	identityValue, state, stdout, stderr := capture.take()
+	defer clear(stdout)
+	defer clear(stderr)
+	if state != TaskStepOutputCaptureStateComplete || !taskStepOutputCaptureIdentityValid(identityValue) ||
+		!bytes.Equal(stdout, stdoutSpill) || !bytes.Equal(stderr, handler.stderrSpill) {
+		t.Fatalf("captured sideband identity/state/streams = %#v, %q, %q, %q", identityValue, state, stdout, stderr)
+	}
+	var legacy taskStepShellOutput
+	if decodeStrictRuntimeResult([]byte(result.Output), &legacy) != nil || legacy.Stdout != stdoutPrefix || legacy.Stderr != "warning" ||
+		!legacy.StdoutTruncated || !legacy.StderrTruncated {
+		t.Fatalf("legacy Shell result changed: output=%q decoded=%#v", result.Output, legacy)
+	}
+	if bytes.Contains([]byte(result.Output), secret) || handler.calls.Load() != 1 {
+		t.Fatal("supplemental bytes leaked into the legacy result or Shell was replayed")
+	}
+}
+
+func TestRuntimeToolExecutorReconcileTerminalShellSanitizesPersistedOutput(t *testing.T) {
+	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{{
+		capability: "shell.exec", action: "run",
+		result: `{"exit_code":0,"stdout":"ok","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`,
+	}})
+	request, _ := fixture.prepared(runtimeToolShellExec, `{"command":"echo safe"}`, identity.ScopeComputerOperate)
+	fixture.persistOperation(request)
+	persisted := fixture.store.operation
+	persisted.Status = task.OperationFailed
+	persisted.Result = `{"exit_code":7,"timed_out":false,"stdout":"api_key=terminal-private-canary","stderr":"password=terminal-password-canary","stdout_truncated":true,"stderr_truncated":false}`
+	fixture.store.operation = persisted
+	fixture.store.operations[persisted.Key] = persisted
+
+	result, err := fixture.executor.ReconcileOperation(context.Background(), request, persisted)
+	if err != nil || result.Status != AgentToolFailed {
+		t.Fatalf("ReconcileOperation() = %#v, %v", result, err)
+	}
+	var shell taskStepShellOutput
+	if decodeStrictRuntimeResult([]byte(result.Output), &shell) != nil || shell.ExitCode != 7 || !shell.StdoutTruncated ||
+		shell.StderrTruncated || !strings.Contains(shell.Stdout, "api_key=[已隐藏]") || !strings.Contains(shell.Stderr, "password=[已隐藏]") ||
+		strings.Contains(result.Output, "terminal-private-canary") || strings.Contains(result.Output, "terminal-password-canary") {
+		t.Fatalf("terminal Shell result was not sanitized without losing structure: %q", result.Output)
+	}
+}
+
 func TestRuntimeToolExecutorDefinitionsReflectRegisteredCapabilitiesAndScopes(t *testing.T) {
 	fixture := newRuntimeToolExecutorFixture(t, []runtimeToolHandlerSpec{
 		{capability: "shell.exec", action: "run", result: `{"exit_code":0,"stdout":"ok","stderr":"","stdout_truncated":false,"stderr_truncated":false,"timed_out":false}`},
@@ -2461,6 +2562,16 @@ func (s *runtimeToolTaskStore) GetTask(ctx context.Context, id, ownerID string) 
 		return TaskDetails{}, domain.NewError(domain.CodeNotFound, "task not found")
 	}
 	return s.details, nil
+}
+
+func (s *runtimeToolTaskStore) GetTaskStepOutputCaptureWorkspaceAuthorizationVersion(ctx context.Context, actorID, taskID, ownerID string) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	if actorID != s.details.Task.InitiatorID || taskID != s.details.Task.ID || ownerID != s.details.Task.OwnerID || s.details.Task.ProjectID != "" {
+		return 0, domain.NewError(domain.CodeNotFound, "supplemental output authorization is unavailable")
+	}
+	return 0, nil
 }
 
 func (s *runtimeToolTaskStore) RenewTaskLease(ctx context.Context, taskID, worker string, version int64, leaseDuration time.Duration) (task.Task, error) {

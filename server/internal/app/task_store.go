@@ -349,10 +349,28 @@ type TaskStepOutputCaptureWriter interface {
 	SaveTaskStepOutputCapture(context.Context, TaskStepOutputCaptureRecord) error
 }
 
+// TaskStepOutputCaptureStatusWriter stores a bounded status only when a
+// complete encrypted receipt cannot be produced. The status is fenced to the
+// same Task, Workspace, step, operation, and model call identity.
+type TaskStepOutputCaptureStatusWriter interface {
+	SaveTaskStepOutputCaptureStatus(context.Context, TaskStepOutputCaptureStatusRecord) error
+}
+
 // TaskStepOutputCaptureReader returns one encrypted page for an actor. The
 // caller must reauthorize the Task and Workspace before every page read.
 type TaskStepOutputCaptureReader interface {
 	GetTaskStepOutputCapturePage(context.Context, string, string, string, string, int) (TaskStepOutputCapturePageRecord, error)
+}
+
+// TaskStepOutputCaptureStatusReader rechecks current Task and Workspace
+// authorization on every status read. A missing/expired receipt is returned as
+// not_recorded only after that authorization check succeeds.
+type TaskStepOutputCaptureStatusReader interface {
+	GetTaskStepOutputCaptureStatus(context.Context, string, string, string) (TaskStepOutputCaptureStatusRecord, error)
+}
+
+type TaskStepOutputCaptureWorkspaceAuthorizationReader interface {
+	GetTaskStepOutputCaptureWorkspaceAuthorizationVersion(context.Context, string, string, string) (int64, error)
 }
 
 type TaskStepRetryRequest struct {

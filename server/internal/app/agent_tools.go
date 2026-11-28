@@ -137,6 +137,7 @@ func sameAgentControlFence(left, right AgentHostFence) bool {
 type AgentToolRequest struct {
 	Task      task.Task
 	Call      ModelToolCall
+	StepID    string
 	Arguments json.RawMessage
 	// OperationRequestHash preserves the exact durable DSH call identity when
 	// Business arguments have had reserved execution metadata removed. It is

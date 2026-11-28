@@ -210,6 +210,29 @@ function fileDragDataTransfer(files: File[], types = files.length ? ['Files'] : 
   return { files: files as unknown as FileList, types, items: [] } as unknown as DataTransfer;
 }
 
+type CompleteTaskStepOutputPage = Extract<Awaited<ReturnType<typeof portalApi.taskStepOutputPage>>, { state: 'complete' }>;
+
+function taskStepOutputPages(text: string, stream: 'stdout' | 'stderr' = 'stdout'): CompleteTaskStepOutputPage[] {
+  const bytes = new TextEncoder().encode(text);
+  if (!bytes.length) return [{ state: 'complete', stream, offset: 0, next_offset: 0, total_bytes: 0,
+    source_bytes: 0, data: '', eof: true, complete: true }];
+  const pages: CompleteTaskStepOutputPage[] = [];
+  let offset = 0;
+  while (offset < bytes.length) {
+    let end = Math.min(bytes.length, offset + 16 * 1024);
+    while (end > offset) {
+      try { new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice(offset, end)); break; }
+      catch { end -= 1; }
+    }
+    if (end <= offset) throw new Error('Unable to split synthetic output at a UTF-8 boundary.');
+    const data = new TextDecoder('utf-8', { fatal: true }).decode(bytes.slice(offset, end));
+    pages.push({ state: 'complete', stream, offset, next_offset: end, total_bytes: bytes.byteLength,
+      source_bytes: bytes.byteLength, data, eof: end === bytes.byteLength, complete: true });
+    offset = end;
+  }
+  return pages;
+}
+
 function mockCommon(options: { conversations?: Conversation[]; messages?: ConversationMessage[]; mainConversation?: MainConversation; cloudTasks?: boolean; capabilities?: Awaited<ReturnType<typeof portalApi.capabilities>>; hosts?: typeof targetHost[]; tasks?: TaskSummary[]; defaultHostID?: string | null } = {}) {
   const standard = options.cloudTasks === false ? clientContract.capabilities.queued_task_api : clientContract.capabilities.cloud_execution;
   vi.spyOn(portalApi, 'capabilities').mockResolvedValue(options.capabilities ??
@@ -234,6 +257,9 @@ function mockCommon(options: { conversations?: Conversation[]; messages?: Conver
   vi.spyOn(portalApi, 'taskApprovals').mockResolvedValue({ items: [], next_cursor: null, pending_count: 0 });
   vi.spyOn(portalApi, 'tasks').mockResolvedValue({ items: options.tasks ?? [], next_cursor: null });
   vi.spyOn(portalApi, 'task').mockImplementation(async (id) => ({ ...task, id }));
+  vi.spyOn(portalApi, 'taskStepOutputPage').mockRejectedValue(new ApiError({
+    message: 'Output is unavailable', code: 'not_found', status: 404,
+  }));
   vi.spyOn(portalApi, 'modelConnections').mockResolvedValue({ items: [model, otherModel], configuration_status: 'configured' });
   vi.spyOn(portalApi, 'mcpConnectors').mockResolvedValue({ items: [] });
   vi.spyOn(portalApi, 'preferences').mockResolvedValue({ assistant_name: 'Morde', selected_model_id: model.id, default_host_id: options.defaultHostID ?? null, updated_at: timestamp });
@@ -288,6 +314,39 @@ describe('Assistant durable tasks', () => {
   });
   afterEach(() => { cleanup(); server.resetHandlers(); localStorage.clear(); authUser.id = 'u1234567'; Reflect.deleteProperty(window, 'morde'); vi.restoreAllMocks(); vi.unstubAllGlobals(); });
   afterAll(() => server.close());
+
+  it('requests identity-bound output pages with no-store caching and validates byte offsets', async () => {
+    let request: Request | undefined;
+    vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      request = new Request(new URL(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url,
+        window.location.origin), init);
+      return Response.json({ state: 'complete', stream: 'stdout', offset: 3, next_offset: 6, total_bytes: 6,
+        source_bytes: 6, data: '界', eof: true, complete: true });
+    }));
+    const controller = new AbortController();
+
+    const page = await portalApi.taskStepOutputPage(task.id, 's1234567', 'stdout', 3, 'u1234567', 'service-test', controller.signal);
+
+    expect(new URL(request!.url).pathname).toBe(`/api/tasks/${task.id}/steps/s1234567/output`);
+    expect(new URL(request!.url).searchParams.get('stream')).toBe('stdout');
+    expect(new URL(request!.url).searchParams.get('offset')).toBe('3');
+    expect(request!.headers.get('X-Morde-Actor-ID')).toBe('u1234567');
+    expect(request!.headers.get('X-Morde-Service-Instance-ID')).toBe('service-test');
+    expect(request!.cache).toBe('no-store');
+    expect(page).toMatchObject({ state: 'complete', offset: 3, next_offset: 6, data: '界', eof: true });
+  });
+
+  it('accepts data-free truncation states and rejects output data attached to them', async () => {
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(Response.json({ stream: 'stdout', state: 'capacity_truncated', complete: false }))
+      .mockResolvedValueOnce(Response.json({ stream: 'stdout', state: 'capacity_truncated', complete: false, data: 'must-not-escape' }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(portalApi.taskStepOutputPage(task.id, 's1234567', 'stdout', 0, 'u1234567', 'service-test'))
+      .resolves.toEqual({ stream: 'stdout', state: 'capacity_truncated', complete: false });
+    await expect(portalApi.taskStepOutputPage(task.id, 's1234567', 'stdout', 0, 'u1234567', 'service-test'))
+      .rejects.toThrow('完整输出状态响应格式无效');
+  });
 
   it('sends the manual model recovery request with its revision fence and idempotency key', async () => {
     const requestBody = { expected_revision: 4, expected_event_sequence: 8 };
@@ -3242,18 +3301,28 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByText('已保存，等待接收')).not.toBeInTheDocument();
   });
 
-  const routingStatusCases: Array<NonNullable<ConversationMessage['routing_status']>> = [
-    'pending', 'processing', 'waiting_user', 'failed',
-  ];
-
-  it.each(routingStatusCases)('keeps %s routing status outside the message bubble', async (routingStatus) => {
+  it.each([
+    ['pending', '已收到，正在等待处理'],
+    ['processing', 'Agent 正在理解你的请求'],
+  ] as const)('shows an immediate user-visible status while routing is %s', async (routingStatus, expectedStatus) => {
     mockCommon({ conversations: [conversation], messages: [{ ...message, task_id: undefined, routing_status: routingStatus,
-      routing_failure_reason: routingStatus === 'failed' ? 'routing_context_unavailable' : undefined, delivery_status: 'pending' }] });
+      delivery_status: 'pending' }] });
     renderPage();
     const article = await screen.findByRole('article', { name: '你的消息' });
     expect(within(article).queryByRole('status')).not.toBeInTheDocument();
     expect(within(article).queryByRole('button')).not.toBeInTheDocument();
-    expect(article.closest('.chat-message-body')).not.toHaveTextContent(/处理中|发送失败|等待你补充/u);
+    const messageBody = article.closest('.chat-message-body');
+    expect(messageBody).not.toBeNull();
+    expect(await within(messageBody as HTMLElement).findByRole('status')).toHaveTextContent(expectedStatus);
+  });
+
+  it.each(['waiting_user', 'failed'] as const)('does not replace actionable %s routing states with a generic receipt', async (routingStatus) => {
+    mockCommon({ conversations: [conversation], messages: [{ ...message, task_id: undefined, routing_status: routingStatus,
+      routing_failure_reason: routingStatus === 'failed' ? 'routing_context_unavailable' : undefined, delivery_status: 'pending' }] });
+    renderPage();
+    const article = await screen.findByRole('article', { name: '你的消息' });
+    expect(article.closest('.chat-message-body')).not.toHaveTextContent('Agent 正在理解你的请求');
+    expect(article.closest('.chat-message-body')).not.toHaveTextContent('已收到，正在等待处理');
   });
 
   it.each([
@@ -4848,6 +4917,283 @@ describe('Assistant durable tasks', () => {
     expect(readDetail).toHaveBeenCalledTimes(1);
   });
 
+  it('reads complete redacted output lazily in UTF-8 byte pages and replaces the legacy prefix', async () => {
+    const stepID = 's1234567';
+    const fullOutput = `${'a'.repeat(16_383)}界${'b'.repeat(70_000)}\nSYNTHETIC_TAIL_MARKER`;
+    const pages = taskStepOutputPages(fullOutput);
+    const runningTask: Task = { ...task, status: 'completed', result: null, finished_at: timestamp, event_sequence: 4,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: shell_exec', summary: '命令完成', created_at: timestamp }] };
+    const detail = { task_id: task.id, step_id: stepID, event_sequence: 4, tool_name: 'shell_exec',
+      detail_state: 'available' as const, object: null, input: null, result: null, truncated: false,
+      execution: { stdout: 'Legacy bounded summary', stdout_total_bytes: new TextEncoder().encode(fullOutput).byteLength,
+        stdout_detail_truncated: true } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(runningTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue(detail);
+    const readPage = vi.spyOn(portalApi, 'taskStepOutputPage').mockImplementation(async (_taskID, _stepID, stream, offset) => {
+      expect(stream).toBe('stdout');
+      const page = pages.find((item) => item.offset === offset);
+      if (!page) throw new Error(`unexpected offset ${offset}`);
+      return page;
+    });
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：运行命令' }));
+    const disclosure = await within(activity).findByText('查看完整已记录输出');
+
+    expect(activity.querySelector('.task-step-output p')).toHaveTextContent('Legacy bounded summary');
+    expect(readPage).not.toHaveBeenCalled();
+    expect(pages[0]?.next_offset).toBe(16_383);
+    expect(pages.every((page) => page.state === 'complete' && new TextEncoder().encode(page.data).byteLength <= 16 * 1024)).toBe(true);
+
+    await user.click(disclosure);
+    await waitFor(() => expect(activity.querySelector('.task-step-output pre')?.textContent).toBe(fullOutput));
+    expect(activity.querySelector('.task-step-output pre')).toBeInTheDocument();
+    expect(within(activity).getByText(/已完整读取并保存/u)).toBeInTheDocument();
+    expect(within(activity).queryByText(/详情受服务端保存上限/u)).not.toBeInTheDocument();
+    expect(readPage).toHaveBeenCalledTimes(pages.length);
+    expect(readPage.mock.calls.map((call) => call[3])).toEqual(pages.map((page) => page.offset));
+  });
+
+  it.each([
+    ['source_truncated', '执行源头输出未完整结束'],
+    ['capacity_truncated', '完整输出超过保存容量'],
+    ['not_recorded', '完整输出未记录或已过期'],
+  ] as const)('keeps the legacy summary and labels a %s full-output status', async (state, statusText) => {
+    const stepID = 's1234567';
+    const runningTask: Task = { ...task, status: 'completed', result: null, finished_at: timestamp, event_sequence: 4,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: shell_exec', summary: '命令完成', created_at: timestamp }] };
+    const detail = { task_id: task.id, step_id: stepID, event_sequence: 4, tool_name: 'shell_exec',
+      detail_state: 'available' as const, object: null, input: null, result: null, truncated: false,
+      execution: { stdout: 'Legacy bounded summary', stdout_total_bytes: 70_000, stdout_detail_truncated: true } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(runningTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue(detail);
+    const readPage = vi.spyOn(portalApi, 'taskStepOutputPage').mockResolvedValue({ stream: 'stdout', state,
+      complete: false } as Awaited<ReturnType<typeof portalApi.taskStepOutputPage>>);
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：运行命令' }));
+    await user.click(await within(activity).findByText('查看完整已记录输出'));
+
+    await waitFor(() => expect(activity.querySelector('.task-step-output')?.textContent).toContain(statusText));
+    expect(activity.querySelector('.task-step-output')?.textContent).toContain('Legacy bounded summary');
+    expect(within(activity).getByText(/详情受服务端保存上限/u)).toBeInTheDocument();
+    expect(readPage).toHaveBeenCalledOnce();
+    expect(within(activity).queryByText(/SYNTHETIC_TAIL_MARKER/u)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['still available', true],
+    ['revoked', false],
+  ] as const)('rechecks Task detail authorization after an output 404 (%s)', async (_caseName, remainsAvailable) => {
+    const stepID = 's1234567';
+    const completedTask: Task = { ...task, status: 'completed', result: null, finished_at: timestamp, event_sequence: 4,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: shell_exec', summary: '命令完成', created_at: timestamp }] };
+    const detail = { task_id: task.id, step_id: stepID, event_sequence: 4, tool_name: 'shell_exec',
+      detail_state: 'available' as const, object: null, input: null, result: null, truncated: false,
+      execution: { stdout: 'Legacy bounded summary', stdout_total_bytes: 70_000, stdout_detail_truncated: true } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    const readDetail = vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValueOnce(detail);
+    if (remainsAvailable) readDetail.mockResolvedValueOnce(detail);
+    else readDetail.mockRejectedValueOnce(new ApiError({ message: 'not found', code: 'not_found', status: 404 }));
+    const readPage = vi.spyOn(portalApi, 'taskStepOutputPage').mockRejectedValue(new ApiError({
+      message: 'not found', code: 'not_found', status: 404,
+    }));
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：运行命令' }));
+    await user.click(await within(activity).findByText('查看完整已记录输出'));
+
+    await waitFor(() => expect(readDetail).toHaveBeenCalledTimes(2));
+    expect(readPage).toHaveBeenCalledOnce();
+    if (remainsAvailable) {
+      expect(activity.querySelector('.task-step-output')?.textContent).toContain('Legacy bounded summary');
+      expect(within(activity).getByText('完整输出未记录或无法访问。')).toBeInTheDocument();
+      expect(within(activity).getByText(/详情受服务端保存上限/u)).toBeInTheDocument();
+    } else {
+      expect(await within(activity).findByText('详情不可访问或已删除。')).toBeInTheDocument();
+      expect(activity.querySelector('.task-step-output')).toBeNull();
+    }
+  });
+
+  it('discards partial output pages and offers retry when page metadata changes', async () => {
+    const stepID = 's1234567';
+    const fullOutput = `PAGE_PRIVATE_MARKER${'a'.repeat(70_000)}SYNTHETIC_TAIL_MARKER`;
+    const pages = taskStepOutputPages(fullOutput);
+    const completedTask: Task = { ...task, status: 'completed', result: null, finished_at: timestamp, event_sequence: 4,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: shell_exec', summary: '命令完成', created_at: timestamp }] };
+    const detail = { task_id: task.id, step_id: stepID, event_sequence: 4, tool_name: 'shell_exec',
+      detail_state: 'available' as const, object: null, input: null, result: null, truncated: false,
+      execution: { stdout: 'Legacy bounded summary', stdout_total_bytes: new TextEncoder().encode(fullOutput).byteLength,
+        stdout_detail_truncated: true } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue(detail);
+    let corruptSecondPage = true;
+    const readPage = vi.spyOn(portalApi, 'taskStepOutputPage').mockImplementation(async (_taskID, _stepID, _stream, offset) => {
+      const page = pages.find((item) => item.offset === offset);
+      if (!page) throw new Error(`unexpected offset ${offset}`);
+      if (corruptSecondPage && offset === pages[1]?.offset) return { ...page, source_bytes: page.source_bytes + 1 };
+      return page;
+    });
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：运行命令' }));
+    const disclosure = await within(activity).findByText('查看完整已记录输出');
+    await user.click(disclosure);
+
+    const retry = await within(activity).findByRole('button', { name: '重试读取完整输出' });
+    expect(within(activity).getByRole('alert')).toHaveTextContent('读取失败');
+    expect(activity.querySelector('.task-step-output p')).toHaveTextContent('Legacy bounded summary');
+    expect(within(activity).queryByText(/PAGE_PRIVATE_MARKER|SYNTHETIC_TAIL_MARKER/u)).not.toBeInTheDocument();
+    expect(readPage).toHaveBeenCalledTimes(2);
+
+    corruptSecondPage = false;
+    await user.click(retry);
+    expect(await within(activity).findByText((content) => content === fullOutput)).toBeInTheDocument();
+    expect(readPage).toHaveBeenCalledTimes(pages.length + 2);
+  });
+
+  it('aborts and clears an in-progress page read when the output disclosure closes', async () => {
+    const stepID = 's1234567';
+    const fullOutput = `PAGE_PRIVATE_MARKER${'a'.repeat(70_000)}SYNTHETIC_TAIL_MARKER`;
+    const pages = taskStepOutputPages(fullOutput);
+    const completedTask: Task = { ...task, status: 'completed', result: null, finished_at: timestamp, event_sequence: 4,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: shell_exec', summary: '命令完成', created_at: timestamp }] };
+    const detail = { task_id: task.id, step_id: stepID, event_sequence: 4, tool_name: 'shell_exec',
+      detail_state: 'available' as const, object: null, input: null, result: null, truncated: false,
+      execution: { stdout: 'Legacy bounded summary', stdout_total_bytes: new TextEncoder().encode(fullOutput).byteLength,
+        stdout_detail_truncated: true } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue(detail);
+    const signals: AbortSignal[] = [];
+    const readPage = vi.spyOn(portalApi, 'taskStepOutputPage').mockImplementation(async (_taskID, _stepID, _stream, offset,
+      _actorID, _serviceID, signal) => {
+      const page = pages.find((item) => item.offset === offset);
+      if (!page) throw new Error(`unexpected offset ${offset}`);
+      signals.push(signal!);
+      if (offset === pages[0]?.offset) return page;
+      return new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true }));
+    });
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：运行命令' }));
+    const disclosure = await within(activity).findByText('查看完整已记录输出');
+    await user.click(disclosure);
+    await waitFor(() => expect(readPage).toHaveBeenCalledTimes(2));
+    expect(within(activity).queryByText(/PAGE_PRIVATE_MARKER|SYNTHETIC_TAIL_MARKER/u)).not.toBeInTheDocument();
+
+    await user.click(disclosure);
+
+    await waitFor(() => expect(signals[0]?.aborted).toBe(true));
+    expect(activity.querySelector('.task-step-output pre')).toHaveTextContent('Legacy bounded summary');
+    expect(activity.querySelector('.task-step-output pre')).not.toHaveTextContent('PAGE_PRIVATE_MARKER');
+  });
+
+  it('clears loaded full output when periodic Task authorization revalidation is revoked', async () => {
+    const stepID = 's1234567';
+    const fullOutput = `${'safe output '.repeat(6_000)}SYNTHETIC_TAIL_MARKER`;
+    const pages = taskStepOutputPages(fullOutput);
+    const completedTask: Task = { ...task, status: 'completed', result: null, finished_at: timestamp, event_sequence: 4,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: shell_exec', summary: '命令完成', created_at: timestamp }] };
+    const detail = { task_id: task.id, step_id: stepID, event_sequence: 4, tool_name: 'shell_exec',
+      detail_state: 'available' as const, object: null, input: null, result: null, truncated: false,
+      execution: { stdout: 'Legacy bounded summary', stdout_total_bytes: new TextEncoder().encode(fullOutput).byteLength,
+        stdout_detail_truncated: true } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    const readDetail = vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValueOnce(detail)
+      .mockRejectedValueOnce(new ApiError({ message: 'not found', code: 'not_found', status: 404 }));
+    let revalidateAuthorization: (() => void) | null = null;
+    const originalSetInterval = window.setInterval.bind(window);
+    vi.spyOn(window, 'setInterval').mockImplementation(((handler: TimerHandler, timeout?: number, ...args: number[]) => {
+      if (timeout === 30_000 && typeof handler === 'function') {
+        revalidateAuthorization = () => handler(...args);
+        return 900_001;
+      }
+      return originalSetInterval(handler, timeout, ...args);
+    }) as typeof window.setInterval);
+    vi.spyOn(portalApi, 'taskStepOutputPage').mockImplementation(async (_taskID, _stepID, _stream, offset) => {
+      const page = pages.find((item) => item.offset === offset);
+      if (!page) throw new Error(`unexpected offset ${offset}`);
+      return page;
+    });
+    const user = userEvent.setup();
+    renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：运行命令' }));
+    await user.click(await within(activity).findByText('查看完整已记录输出'));
+    await waitFor(() => expect(activity.querySelector('.task-step-output pre')?.textContent).toBe(fullOutput));
+
+    expect(revalidateAuthorization).not.toBeNull();
+    await act(async () => { revalidateAuthorization?.(); await Promise.resolve(); });
+    await waitFor(() => expect(readDetail).toHaveBeenCalledTimes(2));
+    expect(await within(activity).findByText('详情不可访问或已删除。')).toBeInTheDocument();
+    expect(activity.querySelector('.task-step-output pre')?.textContent).not.toBe(fullOutput);
+  });
+
+  it('clears loaded output on account-key remount and only reloads with the new identity', async () => {
+    const stepID = 's1234567';
+    const fullOutput = `ACCOUNT_PRIVATE_MARKER${'a'.repeat(70_000)}SYNTHETIC_TAIL_MARKER`;
+    const pages = taskStepOutputPages(fullOutput);
+    const completedTask: Task = { ...task, status: 'completed', result: null, finished_at: timestamp, event_sequence: 4,
+      steps: [{ id: stepID, sequence: 1, attempt: 1, retryable: false, kind: 'tool', status: 'succeeded',
+        title: 'Run cloud dsh tool: shell_exec', summary: '命令完成', created_at: timestamp }] };
+    const detail = { task_id: task.id, step_id: stepID, event_sequence: 4, tool_name: 'shell_exec',
+      detail_state: 'available' as const, object: null, input: null, result: null, truncated: false,
+      execution: { stdout: 'Legacy bounded summary', stdout_total_bytes: new TextEncoder().encode(fullOutput).byteLength,
+        stdout_detail_truncated: true } };
+    mockCommon({ conversations: [conversation], messages: [message] });
+    vi.spyOn(portalApi, 'task').mockResolvedValue(taskWithStepEvidence(completedTask));
+    vi.spyOn(portalApi, 'taskStepDetail').mockResolvedValue(detail);
+    const readPage = vi.spyOn(portalApi, 'taskStepOutputPage').mockImplementation(async (_taskID, _stepID, _stream, offset,
+      actorID) => {
+      expect(actorID).toBe(authUser.id);
+      const page = pages.find((item) => item.offset === offset);
+      if (!page) throw new Error(`unexpected offset ${offset}`);
+      return page;
+    });
+    const user = userEvent.setup();
+    const rendered = renderPage();
+    const activity = await findTaskActivity(task.id);
+    await user.click(within(activity).getByRole('button', { name: '查看工作项：运行命令' }));
+    await user.click(await within(activity).findByText('查看完整已记录输出'));
+    await waitFor(() => expect(activity.querySelector('.task-step-output pre')?.textContent).toBe(fullOutput));
+    const originalPageCallCount = readPage.mock.calls.length;
+
+    authUser.id = 'u7654321';
+    rendered.rerender(<QueryClientProvider client={rendered.client}><ToastProvider><ToastNoticeCenter />
+      <MemoryRouter initialEntries={[{ pathname: '/assistant' }]}><Assistant key={authUser.id} /></MemoryRouter>
+    </ToastProvider></QueryClientProvider>);
+
+    const updatedActivity = await findTaskActivity(task.id);
+    await waitFor(() => expect(updatedActivity.querySelector('.task-step-output pre')?.textContent).not.toBe(fullOutput));
+    expect(readPage).toHaveBeenCalledTimes(originalPageCallCount);
+    expect(document.body.textContent).not.toContain('ACCOUNT_PRIVATE_MARKER');
+    expect(document.body.textContent).not.toContain('SYNTHETIC_TAIL_MARKER');
+
+    await user.click(within(updatedActivity).getByRole('button', { name: '查看工作项：运行命令' }));
+    await waitFor(() => expect(updatedActivity.querySelector('.task-step-output')?.textContent).toContain('Legacy bounded summary'));
+    await user.click(await within(updatedActivity).findByText('查看完整已记录输出'));
+    await waitFor(() => expect(updatedActivity.querySelector('.task-step-output pre')?.textContent).toBe(fullOutput));
+    expect(readPage).toHaveBeenCalledTimes(originalPageCallCount * 2);
+    expect(readPage.mock.calls.slice(originalPageCallCount).every((call) => call[4] === 'u7654321')).toBe(true);
+  });
+
   it('hides output for unknown or cancelled steps even when detail is authorized', async () => {
     const unknownStepID = 's1234567';
     const cancelledStepID = 's2345678';
@@ -5505,7 +5851,7 @@ describe('Assistant durable tasks', () => {
     expect(scrollTop).toBe(160);
   });
 
-  it('shows an unverified-recovery explanation without task action buttons', async () => {
+  it('shows persisted unverified-recovery status without inventing an assistant reply', async () => {
     const pending = { ...message, id: 'm2345678', content: '继续', task_id: undefined, related_task_id: undefined,
       delivery_status: 'pending' as const };
     const source = { ...message, actor_id: authUser.id } as ConversationMessage;
@@ -5530,15 +5876,15 @@ describe('Assistant durable tasks', () => {
     expect(await within(activity).findByText('状态：状态待确认')).toBeInTheDocument();
     expect(screen.queryByText(/category:/)).not.toBeInTheDocument();
     expect(screen.queryByText('Review cloud task recovery')).not.toBeInTheDocument();
-    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
-    expect(replyBubble).toHaveTextContent('模型服务未返回可确认的答复');
+    expect(screen.queryByRole('status', { name: 'Morde 的回复' })).not.toBeInTheDocument();
+    expect(screen.getByRole('status', { name: '任务状态：结果待核对' })).toBeInTheDocument();
     expect(screen.getByRole('button', { name: '查看任务详情' })).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: '等待接收' })).not.toBeInTheDocument();
     expect(within(activity).queryByRole('button', { name: /暂停任务|停止任务|补充任务/u })).not.toBeInTheDocument();
     expect(screen.getByRole('textbox', { name: '消息内容' })).toBeEnabled();
   });
 
-  it('shows a safe assistant reply for an unverified result when the published marker has no visible message', async () => {
+  it('shows persisted task status when the published marker has no visible assistant message', async () => {
     const source = { ...message, actor_id: authUser.id } as ConversationMessage;
     const attentionTask = {
       ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
@@ -5549,18 +5895,16 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
     renderPage();
 
-    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
-    expect(within(replyBubble).getByText(/任务记录显示，模型服务未返回可确认的答复/)).toBeInTheDocument();
-    expect(within(replyBubble).getByText(/不能确认任务已经完成，也不会自动重复可能产生副作用的操作/)).toBeInTheDocument();
+    expect(await screen.findByRole('status', { name: '任务状态：结果待核对' })).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Morde 的回复' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '查看任务详情' })).toBeInTheDocument();
     expect(screen.queryByText('do-not-display-provider-diagnostic')).not.toBeInTheDocument();
     const activity = await findTaskActivity(task.id);
     expect(activity.querySelector('.task-activity-status')).toHaveTextContent('结果待核对');
-    expect(document.querySelector('.chat-message-task-attention')).not.toBeInTheDocument();
     expect(within(activity).queryByRole('button', { name: /暂停任务|停止任务|补充任务|再试一次/u })).not.toBeInTheDocument();
   });
 
-  it('shows a safe assistant reply when the recovery attention snapshot is missing', async () => {
+  it('shows a conservative task status when the recovery attention snapshot is missing', async () => {
     const source = { ...message, actor_id: authUser.id } as ConversationMessage;
     const waitingTask = {
       ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
@@ -5570,13 +5914,12 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockResolvedValue(waitingTask);
     renderPage();
 
-    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
-    expect(within(replyBubble).getByText(/任务记录显示，模型服务未返回可确认的答复/)).toBeInTheDocument();
+    expect(await screen.findByRole('status', { name: '任务状态：结果待核对' })).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Morde 的回复' })).not.toBeInTheDocument();
     expect(screen.getByRole('button', { name: '查看任务详情' })).toBeInTheDocument();
-    expect(screen.queryByRole('status', { name: '任务状态：已中断' })).not.toBeInTheDocument();
   });
 
-  it('keeps the recovery reply on the original Task message when a later related message exists', async () => {
+  it('keeps unverified status on the original Task message when a later related message exists', async () => {
     const source = { ...message, actor_id: authUser.id } as ConversationMessage;
     const relatedFollowup = { ...message, id: 'm2345678', sequence: 2, task_id: undefined,
       related_task_id: task.id, actor_id: undefined, content: '我再补充一句' } as unknown as ConversationMessage;
@@ -5588,11 +5931,11 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockResolvedValue(waitingTask);
     renderPage();
 
-    expect(await screen.findByRole('status', { name: 'Morde 的回复' })).toHaveTextContent('模型服务未返回可确认的答复');
-    expect(screen.getAllByRole('group', { name: 'Morde 的任务结果说明' })).toHaveLength(1);
+    expect(await screen.findByRole('status', { name: '任务状态：结果待核对' })).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Morde 的回复' })).not.toBeInTheDocument();
   });
 
-  it('keeps the safe recovery reply visible when acknowledgement anchors are ambiguous', async () => {
+  it('does not infer a task status from ambiguous acknowledgement anchors', async () => {
     const source = { ...message, actor_id: authUser.id, agent_acknowledged: true } as ConversationMessage;
     const laterSource = { ...message, id: 'm2345679', sequence: 2, actor_id: authUser.id,
       agent_acknowledged: true, content: '同一任务的后续请求' } as ConversationMessage;
@@ -5604,12 +5947,12 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockResolvedValue(waitingTask);
     renderPage();
 
-    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
-    expect(replyBubble).toHaveTextContent('模型服务未返回可确认的答复');
-    expect(screen.getAllByRole('group', { name: 'Morde 的任务结果说明' })).toHaveLength(1);
+    await screen.findAllByRole('article', { name: '你的消息' });
+    expect(screen.queryByRole('status', { name: 'Morde 的回复' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: '任务状态：结果待核对' })).not.toBeInTheDocument();
   });
 
-  it('shows a safe assistant reply from the Task summary when Task detail cannot be loaded', async () => {
+  it('shows the Task summary status when Task detail cannot be loaded', async () => {
     const source = { ...message, actor_id: authUser.id } as ConversationMessage;
     const summary: TaskSummary = {
       ...task, status: 'waiting_user', result: null, waiting_reason: 'dsh_recovery_unresolved',
@@ -5619,9 +5962,8 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockRejectedValue(new Error('task detail unavailable'));
     renderPage();
 
-    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
-    expect(within(replyBubble).getByText(/任务记录显示，模型服务未返回可确认的答复/)).toBeInTheDocument();
-    expect(within(replyBubble).getByText(/不能确认任务已经完成，也不会自动重复可能产生副作用的操作/)).toBeInTheDocument();
+    expect(await screen.findByRole('status', { name: '任务状态：结果待核对' })).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Morde 的回复' })).not.toBeInTheDocument();
     expect(screen.queryByText('task detail unavailable')).not.toBeInTheDocument();
   });
 
@@ -5641,7 +5983,7 @@ describe('Assistant durable tasks', () => {
     expect(screen.queryByRole('group', { name: 'Morde 的任务结果说明' })).not.toBeInTheDocument();
   });
 
-  it('replaces the unverified-result fallback when the applied assistant message arrives later', async () => {
+  it('replaces the unverified task status when the applied assistant message arrives later', async () => {
     const source = { ...message, actor_id: authUser.id } as ConversationMessage;
     const attentionTask = {
       ...task, status: 'waiting_user' as const, result: null, waiting_reason: 'dsh_recovery_unresolved',
@@ -5652,7 +5994,7 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
     const { client } = renderPage();
 
-    expect(await screen.findByRole('status', { name: 'Morde 的回复' })).toBeInTheDocument();
+    expect(await screen.findByRole('status', { name: '任务状态：结果待核对' })).toBeInTheDocument();
     const queryKey = ['conversation-messages', conversation.id] as const;
     await waitFor(() => expect(client.getQueryData(queryKey)).toBeDefined());
     const current = client.getQueryData<{ pages: Array<{ items: ConversationMessage[] }>; pageParams: unknown[] }>(queryKey);
@@ -5668,7 +6010,7 @@ describe('Assistant durable tasks', () => {
     }));
 
     expect(await screen.findByText('真实诊断回复已送达。')).toBeInTheDocument();
-    expect(screen.queryByRole('status', { name: 'Morde 的回复' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: '任务状态：结果待核对' })).not.toBeInTheDocument();
     expect(screen.queryByRole('group', { name: 'Morde 的任务结果说明' })).not.toBeInTheDocument();
     expect(screen.getAllByRole('article', { name: 'Morde 的回复' })).toHaveLength(1);
   });
@@ -5686,9 +6028,8 @@ describe('Assistant durable tasks', () => {
     vi.spyOn(portalApi, 'task').mockResolvedValue(attentionTask);
     renderPage();
 
-    const replyBubble = await screen.findByRole('status', { name: 'Morde 的回复' });
-    expect(replyBubble).toHaveTextContent('模型服务未返回可确认的答复');
-    expect(screen.getAllByRole('group', { name: 'Morde 的任务结果说明' })).toHaveLength(1);
+    expect(await screen.findByRole('status', { name: '任务状态：结果待核对' })).toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Morde 的回复' })).not.toBeInTheDocument();
   });
 
   it('does not attach an unverified-result reply to another user’s message', async () => {
@@ -5703,7 +6044,8 @@ describe('Assistant durable tasks', () => {
     renderPage();
 
     await screen.findByRole('article', { name: '你的消息' });
-    expect(screen.queryByRole('group', { name: 'Morde 的任务结果说明' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: 'Morde 的回复' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('status', { name: '任务状态：结果待核对' })).not.toBeInTheDocument();
   });
 
   it('offers a fenced model recovery retry only for the current server-confirmed retry snapshot', async () => {

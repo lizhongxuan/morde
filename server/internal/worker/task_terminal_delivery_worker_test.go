@@ -6,11 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 
 	"morde/server/internal/app"
 	"morde/server/internal/domain"
@@ -20,6 +22,7 @@ type taskTerminalDeliveryStoreStub struct {
 	claimed       []app.TaskTerminalDeliveryClaim
 	ready         []app.TaskTerminalDeliveryClaim
 	facts         app.TaskTerminalDeliverySourceFacts
+	readFactsErr  error
 	unknown       int
 	invalidated   int
 	persisted     int
@@ -48,6 +51,9 @@ func (s *taskTerminalDeliveryStoreStub) GetTaskTerminalDeliveryReplyReady(_ cont
 
 func (s *taskTerminalDeliveryStoreStub) ReadTaskTerminalDeliverySourceFacts(_ context.Context,
 	claim app.TaskTerminalDeliveryClaim) (app.TaskTerminalDeliverySourceFacts, bool, error) {
+	if s.readFactsErr != nil {
+		return app.TaskTerminalDeliverySourceFacts{}, false, s.readFactsErr
+	}
 	return s.facts, app.ValidTaskTerminalDeliverySourceFacts(claim, s.facts), nil
 }
 
@@ -147,6 +153,26 @@ func TestTaskTerminalDeliveryWorkerUnknownPublishesOneSystemFallback(t *testing.
 	}
 	if gateway.lastFence.ModelCallID != claim.ModelCallID || gateway.lastFence.LeaseOwner != claim.LeaseOwner {
 		t.Fatalf("Gateway dispatch fence changed claim identity: %+v", gateway.lastFence)
+	}
+}
+
+func TestTaskTerminalDeliveryWorkerLogsSafeSourceFactsFailureCode(t *testing.T) {
+	store, _ := taskTerminalDeliveryTestStore(t, app.TaskTerminalDeliveryStateClaimed)
+	const privateDetail = "private source detail must not be logged"
+	store.readFactsErr = domain.NewError(domain.CodeInvalidState, privateDetail)
+	core, logs := observer.New(zap.ErrorLevel)
+	worker := newTaskTerminalDeliveryTestWorker(t, store, &taskTerminalDeliveryGatewayStub{modelID: "p1234567"})
+	worker.options.Logger = zap.New(core)
+
+	worked, err := worker.RunOnce(context.Background())
+	entries := logs.FilterMessage("task terminal delivery processing failed").All()
+	if !worked || err == nil || len(entries) != 1 {
+		t.Fatalf("source facts failure logging: worked=%t err=%v entries=%d", worked, err, len(entries))
+	}
+	fields := entries[0].ContextMap()
+	if fields["stage"] != "read_source_facts" || fields["failure_code"] != string(domain.CodeInvalidState) ||
+		fields["error_type"] != "*domain.Error" || strings.Contains(fmt.Sprint(fields), privateDetail) {
+		t.Fatalf("source facts failure log fields are not safely classified: %#v", fields)
 	}
 }
 

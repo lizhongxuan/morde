@@ -24,7 +24,7 @@ func TestLoadReadsConfigExpandsEnvironmentAndConvertsDurations(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Instance != "test-instance" || cfg.HTTP.ReadTimeout != 10*time.Second || cfg.Orchestrator.Profiles["container"].RequestTimeout != 7*time.Second || cfg.Orchestrator.Profiles["container"].NetworkPolicyEnabled || cfg.CloudDSH.Enabled || !cfg.Models.GPT6LunaMaxReasoning || cfg.Models.OutputBudgetShadow.Enabled ||
+	if cfg.Instance != "test-instance" || cfg.HTTP.ReadTimeout != 10*time.Second || cfg.Orchestrator.Profiles["container"].RequestTimeout != 7*time.Second || cfg.Orchestrator.Profiles["container"].NetworkPolicyEnabled || cfg.CloudDSH.Enabled || cfg.CloudDSH.OutputCaptureEnabled || !cfg.Models.GPT6LunaMaxReasoning || cfg.Models.OutputBudgetShadow.Enabled ||
 		cfg.Models.OutputBudgetAdmissionEnabled || cfg.SiteStorage.RootDir == "" || cfg.SiteStorage.MaxReleaseBytes != 10737418240 ||
 		cfg.SiteStorage.MaxOwnerBytes != 53687091200 || cfg.SiteStorage.MinFreeBytes != 10737418240 {
 		t.Fatalf("loaded config values are incomplete: instance=%q read_timeout=%s profile_timeout=%s model_max_reasoning=%t output_budget_shadow=%+v site_storage=%+v", cfg.Instance, cfg.HTTP.ReadTimeout, cfg.Orchestrator.Profiles["container"].RequestTimeout, cfg.Models.GPT6LunaMaxReasoning, cfg.Models.OutputBudgetShadow, cfg.SiteStorage)
@@ -294,10 +294,20 @@ func TestLoadFeatureRuntimeGatesDefaultEnabledAndCanBeDisabled(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !cfg.CloudDSH.Enabled || !cfg.CloudDSH.BuiltinSearch.Enabled || !cfg.WorkspaceSyncNode.Enabled ||
+		cfg.CloudDSH.OutputCaptureEnabled ||
 		!cfg.WorkspaceSyncNode.ProjectUploadEnabled || !cfg.WorkspaceSyncNode.AgentWorkspaceHostMountEnabled || !cfg.WorkspaceSyncNode.AgentWorkspaceLiveDirectorySourceEnabled ||
 		!cfg.MCP.Enabled || cfg.CloudDSH.MaxConcurrentRoutes != 16 || cfg.CloudDSH.MaxConcurrentTasks != 4 ||
 		cfg.CloudDSH.MaxConcurrentPerOwner != 4 || cfg.CloudDSH.BuiltinSearch.MaxConcurrent != 4 {
 		t.Fatalf("config feature defaults are not enabled: DSH=%+v Workspace=%+v MCP=%+v", cfg.CloudDSH, cfg.WorkspaceSyncNode, cfg.MCP)
+	}
+
+	explicitCapture := strings.Replace(data, "cloud_dsh:\n", "cloud_dsh:\n  output_capture_enabled: true\n", 1)
+	if err := os.WriteFile(path, []byte(explicitCapture), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(path)
+	if err != nil || !cfg.CloudDSH.OutputCaptureEnabled {
+		t.Fatalf("explicit output capture opt-in = %t, err=%v", cfg.CloudDSH.OutputCaptureEnabled, err)
 	}
 
 	data = strings.Replace(data, "cloud_dsh:\n", "cloud_dsh:\n  enabled: false\n", 1)

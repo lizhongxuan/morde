@@ -5853,16 +5853,16 @@ paths:
       tags: [Tasks]
       operationId: getTaskStepOutputPage
       summary: Read one page of complete, redacted Shell output
-      description: Returns a page only when the complete Runtime stream reached EOF and its encrypted receipt and pages were durably stored. The response contains the reconstructed full stdout or stderr stream, including the legacy prefix; clients replace the short step summary instead of appending this data. Missing, incomplete, failed, expired, or unauthorized output is hidden as not found. Responses are never shared-cacheable.
+      description: Complete output pages are returned only after the full Runtime stream reached EOF and its encrypted receipt and pages were durably stored. The response contains the reconstructed full stdout or stderr stream, including the legacy prefix; clients replace the short step summary instead of appending this data. After current Task and Workspace authorization, incomplete captures return only a non-sensitive state and no output bytes. Missing or expired captures return not_recorded. Unauthorized Tasks or Workspaces remain hidden as not found. Responses are never shared-cacheable.
       security: [{ portalSession: [] }, { clientCredential: [] }]
       responses:
         '200':
-          description: One UTF-8 page from a complete encrypted-at-rest output receipt; at most 16 KiB before JSON encoding.
+          description: A complete UTF-8 output page or a metadata-only capture state. Non-complete states never contain output bytes.
           headers:
             Cache-Control: { schema: { type: string, const: no-store } }
           content:
             application/json:
-              schema: { $ref: '#/components/schemas/TaskStepOutputCapturePage' }
+              schema: { $ref: '#/components/schemas/TaskStepOutputCaptureResponse' }
         '400': { $ref: '#/components/responses/BadRequest' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
@@ -13460,19 +13460,32 @@ components:
           maxItems: 30
           description: Server-derived source locations from successful tool reads. Workspace paths are returned only to readers authorized for the Task Workspace. These locations are not yet a claim-to-source correctness verdict.
           items: { $ref: '#/components/schemas/TaskStepSourceLocation' }
+    TaskStepOutputCaptureResponse:
+      oneOf:
+        - $ref: '#/components/schemas/TaskStepOutputCapturePage'
+        - $ref: '#/components/schemas/TaskStepOutputCaptureStatus'
     TaskStepOutputCapturePage:
       type: object
       additionalProperties: false
-      required: [stream, offset, next_offset, total_bytes, source_bytes, data, eof, complete]
+      required: [stream, state, offset, next_offset, total_bytes, source_bytes, data, eof, complete]
       properties:
         stream: { type: string, enum: [stdout, stderr] }
+        state: { type: string, const: complete }
         offset: { type: integer, minimum: 0, maximum: 2097152, description: Byte offset into the complete redacted UTF-8 stream. }
         next_offset: { type: integer, minimum: 0, maximum: 2097152, description: Byte offset to use for the next page; equals total_bytes at EOF. }
         total_bytes: { type: integer, minimum: 0, maximum: 2097152, description: Total bytes in the complete redacted UTF-8 stream. }
         source_bytes: { type: integer, minimum: 0, maximum: 2097152, description: Total source bytes before redaction for this stream; not a truncation indicator. }
         data: { type: string, maxLength: 16384, description: Redacted UTF-8 text page. Never base64 and never raw source output. }
         eof: { type: boolean, description: True when this page reaches the end of the stream. }
-        complete: { type: boolean, const: true, description: True only when Runtime source EOF and the durable encrypted receipt were both confirmed. Incomplete or unavailable captures return not found. }
+        complete: { type: boolean, const: true, description: True only when Runtime source EOF and the durable encrypted receipt were both confirmed. }
+    TaskStepOutputCaptureStatus:
+      type: object
+      additionalProperties: false
+      required: [stream, state, complete]
+      properties:
+        stream: { type: string, enum: [stdout, stderr] }
+        state: { type: string, enum: [source_truncated, capacity_truncated, not_recorded, failed] }
+        complete: { type: boolean, const: false, description: No output bytes are returned for a non-complete status. }
     TaskStepSourceLocation:
       type: object
       required: [id, kind, state, content_sha256]

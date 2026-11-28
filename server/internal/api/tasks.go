@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -63,6 +64,10 @@ type TaskStepDetailService interface {
 	GetStepDetail(context.Context, identity.Principal, string, string) (app.TaskStepDetail, error)
 }
 
+type TaskStepOutputCaptureService interface {
+	GetStepOutputCapturePage(context.Context, identity.Principal, string, string, string, int) (app.TaskStepOutputCapturePage, error)
+}
+
 type TaskStepRetryService interface {
 	RetryStep(context.Context, identity.Principal, string, string, int64, int64, string) (app.TaskStepRetryResult, error)
 }
@@ -112,6 +117,24 @@ type taskApprovalResponse struct {
 	TaskEventSequence int64                        `json:"task_event_sequence"`
 	TaskUpdatedAt     time.Time                    `json:"task_updated_at"`
 	Approval          taskApprovalSnapshotResponse `json:"approval"`
+}
+
+type taskStepOutputCapturePageResponse struct {
+	Stream      string                         `json:"stream"`
+	State       app.TaskStepOutputCaptureState `json:"state"`
+	Offset      int                            `json:"offset"`
+	NextOffset  int                            `json:"next_offset"`
+	TotalBytes  int                            `json:"total_bytes"`
+	SourceBytes int                            `json:"source_bytes"`
+	Data        string                         `json:"data"`
+	EOF         bool                           `json:"eof"`
+	Complete    bool                           `json:"complete"`
+}
+
+type taskStepOutputCaptureStatusResponse struct {
+	Stream   string                         `json:"stream"`
+	State    app.TaskStepOutputCaptureState `json:"state"`
+	Complete bool                           `json:"complete"`
 }
 
 type taskApprovalSnapshotResponse struct {
@@ -716,6 +739,9 @@ func (h *api) registerTasks(group *gin.RouterGroup, service TaskService) {
 	if detailService, ok := service.(TaskStepDetailService); ok {
 		group.GET("/tasks/:id/steps/:step_id", h.getTaskStepDetail(detailService))
 	}
+	if outputService, ok := service.(TaskStepOutputCaptureService); ok {
+		group.GET("/tasks/:id/steps/:step_id/output", h.getTaskStepOutputCapturePage(outputService))
+	}
 	if retryService, ok := service.(TaskStepRetryService); ok {
 		group.POST("/tasks/:id/steps/:step_id/retries", h.retryTaskStep(retryService))
 	}
@@ -876,6 +902,81 @@ func (h *api) getTaskStepDetail(service TaskStepDetailService) gin.HandlerFunc {
 		c.Header("Pragma", "no-cache")
 		c.Header("Referrer-Policy", "no-referrer")
 		c.JSON(http.StatusOK, value)
+	}
+}
+
+func (h *api) getTaskStepOutputCapturePage(service TaskStepOutputCaptureService) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		c.Header("Pragma", "no-cache")
+		c.Header("Referrer-Policy", "no-referrer")
+		query, err := url.ParseQuery(c.Request.URL.RawQuery)
+		if err != nil || c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0 {
+			writeError(c, domain.InvalidArgument("request", "task output capture request is invalid"))
+			return
+		}
+		for key := range query {
+			if key != "stream" && key != "offset" {
+				writeError(c, domain.InvalidArgument("query", "task output capture query is invalid"))
+				return
+			}
+		}
+		streams := query["stream"]
+		if len(streams) != 1 || (streams[0] != "stdout" && streams[0] != "stderr") {
+			writeError(c, domain.InvalidArgument("stream", "task output stream is invalid"))
+			return
+		}
+		offset := 0
+		if values, exists := query["offset"]; exists {
+			if len(values) != 1 || values[0] == "" {
+				writeError(c, domain.InvalidArgument("offset", "task output offset is invalid"))
+				return
+			}
+			parsed, parseErr := strconv.Atoi(values[0])
+			if parseErr != nil || parsed < 0 || parsed > app.TaskStepOutputCaptureMaxBytes || strconv.Itoa(parsed) != values[0] {
+				writeError(c, domain.InvalidArgument("offset", "task output offset is invalid"))
+				return
+			}
+			offset = parsed
+		}
+		principal, ok := principalFrom(c)
+		if !ok {
+			unauthenticated(c)
+			return
+		}
+		taskID, ok := safeID(c, "id", domain.ValidTaskID)
+		if !ok {
+			return
+		}
+		stepID, ok := safeIDParam(c, "step_id", "step_id", domain.ValidStepID)
+		if !ok {
+			return
+		}
+		page, err := service.GetStepOutputCapturePage(c.Request.Context(), principal, taskID, stepID, streams[0], offset)
+		if err != nil {
+			writeError(c, err)
+			return
+		}
+		if page.State != app.TaskStepOutputCaptureStateComplete {
+			if page.Complete || len(page.Data) != 0 || (page.State != app.TaskStepOutputCaptureStateSourceTruncated &&
+				page.State != app.TaskStepOutputCaptureStateCapacityTruncated && page.State != app.TaskStepOutputCaptureStateNotRecorded &&
+				page.State != app.TaskStepOutputCaptureStateFailed) {
+				writeError(c, domain.NewError(domain.CodeInternal, "task output capture status is invalid"))
+				return
+			}
+			c.JSON(http.StatusOK, taskStepOutputCaptureStatusResponse{Stream: streams[0], State: page.State, Complete: false})
+			return
+		}
+		if !page.Complete || page.Stream != streams[0] || page.Offset != offset || page.TotalBytes < 0 ||
+			page.TotalBytes > app.TaskStepOutputCaptureMaxBytes || page.SourceBytes < 0 || page.SourceBytes > app.TaskStepOutputCaptureMaxBytes ||
+			len(page.Data) > app.TaskStepOutputCapturePageBytes || !utf8.Valid(page.Data) || strings.ContainsRune(string(page.Data), '\x00') ||
+			page.NextOffset != page.Offset+len(page.Data) || page.NextOffset > page.TotalBytes || page.EOF != (page.NextOffset == page.TotalBytes) {
+			writeError(c, domain.NewError(domain.CodeInternal, "task output capture page is invalid"))
+			return
+		}
+		c.JSON(http.StatusOK, taskStepOutputCapturePageResponse{Stream: page.Stream, State: page.State, Offset: page.Offset,
+			NextOffset: page.NextOffset, TotalBytes: page.TotalBytes, SourceBytes: page.SourceBytes, Data: string(page.Data),
+			EOF: page.EOF, Complete: true})
 	}
 }
 

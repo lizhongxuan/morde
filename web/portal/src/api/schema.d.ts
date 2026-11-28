@@ -4060,7 +4060,7 @@ export interface paths {
         };
         /**
          * Read one page of complete, redacted Shell output
-         * @description Returns a page only when the complete Runtime stream reached EOF and its encrypted receipt and pages were durably stored. The response contains the reconstructed full stdout or stderr stream, including the legacy prefix; clients replace the short step summary instead of appending this data. Missing, incomplete, failed, expired, or unauthorized output is hidden as not found. Responses are never shared-cacheable.
+         * @description Complete output pages are returned only after the full Runtime stream reached EOF and its encrypted receipt and pages were durably stored. The response contains the reconstructed full stdout or stderr stream, including the legacy prefix; clients replace the short step summary instead of appending this data. After current Task and Workspace authorization, incomplete captures return only a non-sensitive state and no output bytes. Missing or expired captures return not_recorded. Unauthorized Tasks or Workspaces remain hidden as not found. Responses are never shared-cacheable.
          */
         get: operations["getTaskStepOutputPage"];
         put?: never;
@@ -10189,9 +10189,12 @@ export interface components {
             /** @description Server-derived source locations from successful tool reads. Workspace paths are returned only to readers authorized for the Task Workspace. These locations are not yet a claim-to-source correctness verdict. */
             source_locations?: components["schemas"]["TaskStepSourceLocation"][];
         };
+        TaskStepOutputCaptureResponse: components["schemas"]["TaskStepOutputCapturePage"] | components["schemas"]["TaskStepOutputCaptureStatus"];
         TaskStepOutputCapturePage: {
             /** @enum {string} */
             stream: "stdout" | "stderr";
+            /** @constant */
+            state: "complete";
             /** @description Byte offset into the complete redacted UTF-8 stream. */
             offset: number;
             /** @description Byte offset to use for the next page; equals total_bytes at EOF. */
@@ -10205,10 +10208,21 @@ export interface components {
             /** @description True when this page reaches the end of the stream. */
             eof: boolean;
             /**
-             * @description True only when Runtime source EOF and the durable encrypted receipt were both confirmed. Incomplete or unavailable captures return not found.
+             * @description True only when Runtime source EOF and the durable encrypted receipt were both confirmed.
              * @constant
              */
             complete: true;
+        };
+        TaskStepOutputCaptureStatus: {
+            /** @enum {string} */
+            stream: "stdout" | "stderr";
+            /** @enum {string} */
+            state: "source_truncated" | "capacity_truncated" | "not_recorded" | "failed";
+            /**
+             * @description No output bytes are returned for a non-complete status.
+             * @constant
+             */
+            complete: false;
         };
         TaskStepSourceLocation: {
             /** @description Stable server-derived identity bound to Task owner, Task, step, revision, tool call, and this source locator. */
@@ -18783,14 +18797,14 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description One UTF-8 page from a complete encrypted-at-rest output receipt; at most 16 KiB before JSON encoding. */
+            /** @description A complete UTF-8 output page or a metadata-only capture state. Non-complete states never contain output bytes. */
             200: {
                 headers: {
                     "Cache-Control"?: "no-store";
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["TaskStepOutputCapturePage"];
+                    "application/json": components["schemas"]["TaskStepOutputCaptureResponse"];
                 };
             };
             400: components["responses"]["BadRequest"];

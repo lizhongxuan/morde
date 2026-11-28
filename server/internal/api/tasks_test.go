@@ -50,6 +50,13 @@ type taskServiceStub struct {
 	stepDetailCalls              int
 	stepDetailTaskID             string
 	stepDetailStepID             string
+	outputCapturePage            app.TaskStepOutputCapturePage
+	outputCaptureCalls           int
+	outputCaptureTaskID          string
+	outputCaptureStepID          string
+	outputCaptureStream          string
+	outputCaptureOffset          int
+	outputCapturePrincipal       identity.Principal
 	stepRetryResult              app.TaskStepRetryResult
 	stepRetryCalls               int
 	stepRetryTaskID              string
@@ -272,6 +279,13 @@ func (s *taskServiceStub) GetStepDetail(_ context.Context, _ identity.Principal,
 	s.stepDetailCalls++
 	s.stepDetailTaskID, s.stepDetailStepID = taskID, stepID
 	return s.stepDetail, s.err
+}
+
+func (s *taskServiceStub) GetStepOutputCapturePage(_ context.Context, principal identity.Principal, taskID, stepID, stream string, offset int) (app.TaskStepOutputCapturePage, error) {
+	s.outputCaptureCalls++
+	s.outputCaptureTaskID, s.outputCaptureStepID, s.outputCaptureStream, s.outputCaptureOffset = taskID, stepID, stream, offset
+	s.outputCapturePrincipal = principal
+	return s.outputCapturePage, s.err
 }
 
 func (s *taskServiceStub) RetryStep(_ context.Context, _ identity.Principal, taskID, stepID string, revision, attempt int64,
@@ -1481,6 +1495,80 @@ func TestTaskStepDetailRouteIsNoStoreAndRejectsQueryOrBody(t *testing.T) {
 	}
 	if service.stepDetailCalls != 1 {
 		t.Fatalf("invalid detail requests reached service %d times", service.stepDetailCalls-1)
+	}
+}
+
+func TestTaskStepOutputCaptureRouteReturnsCompletePagesAndMetadataOnlyStatus(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &taskServiceStub{outputCapturePage: app.TaskStepOutputCapturePage{
+		Stream: "stdout", State: app.TaskStepOutputCaptureStateComplete, Offset: 5, NextOffset: 13,
+		TotalBytes: 20, SourceBytes: 21, Data: []byte("redacted"), EOF: false, Complete: true,
+	}}
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set(principalKey, identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession})
+		c.Next()
+	})
+	(&api{}).registerTasks(engine.Group("/api"), service)
+
+	request := httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567/output?stream=stdout&offset=5", nil)
+	response := httptest.NewRecorder()
+	engine.ServeHTTP(response, request)
+	if response.Code != http.StatusOK || response.Header().Get("Cache-Control") != "no-store" ||
+		response.Header().Get("Pragma") != "no-cache" || response.Header().Get("Referrer-Policy") != "no-referrer" ||
+		!strings.Contains(response.Body.String(), `"state":"complete"`) || !strings.Contains(response.Body.String(), `"data":"redacted"`) ||
+		strings.Contains(response.Body.String(), "cmVkYWN0ZWQ=") || strings.Contains(response.Body.String(), "identity") ||
+		service.outputCaptureCalls != 1 || service.outputCaptureTaskID != "q1234567" || service.outputCaptureStepID != "s1234567" ||
+		service.outputCaptureStream != "stdout" || service.outputCaptureOffset != 5 || service.outputCapturePrincipal.UserID != "u1234567" {
+		t.Fatalf("complete output response=%d headers=%v body=%s service=%+v", response.Code, response.Header(), response.Body.String(), service)
+	}
+
+	for _, state := range []app.TaskStepOutputCaptureState{
+		app.TaskStepOutputCaptureStateSourceTruncated, app.TaskStepOutputCaptureStateCapacityTruncated,
+		app.TaskStepOutputCaptureStateNotRecorded, app.TaskStepOutputCaptureStateFailed,
+	} {
+		service.outputCapturePage = app.TaskStepOutputCapturePage{Stream: "stderr", State: state}
+		response = httptest.NewRecorder()
+		engine.ServeHTTP(response, httptest.NewRequest(http.MethodGet,
+			"/api/tasks/q1234567/steps/s1234567/output?stream=stderr", nil))
+		var object map[string]any
+		if err := json.Unmarshal(response.Body.Bytes(), &object); err != nil {
+			t.Fatal(err)
+		}
+		if response.Code != http.StatusOK || len(object) != 3 || object["stream"] != "stderr" || object["state"] != string(state) ||
+			object["complete"] != false || object["data"] != nil || object["offset"] != nil || object["total_bytes"] != nil ||
+			object["source_bytes"] != nil || object["identity"] != nil || response.Header().Get("Cache-Control") != "no-store" {
+			t.Fatalf("metadata-only state %q response=%d body=%s", state, response.Code, response.Body.String())
+		}
+	}
+}
+
+func TestTaskStepOutputCaptureRouteRejectsInvalidQueryAndBody(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	service := &taskServiceStub{outputCapturePage: app.TaskStepOutputCapturePage{Stream: "stdout", State: app.TaskStepOutputCaptureStateNotRecorded}}
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		c.Set(principalKey, identity.Principal{UserID: "u1234567", Role: identity.RoleUser, Kind: identity.KindSession})
+		c.Next()
+	})
+	(&api{}).registerTasks(engine.Group("/api"), service)
+	for _, request := range []*http.Request{
+		httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567/output", nil),
+		httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567/output?stream=stdout&stream=stderr", nil),
+		httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567/output?stream=stdout&offset=-1", nil),
+		httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567/output?stream=stdout&offset=02", nil),
+		httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567/output?stream=stdout&offset=2097153", nil),
+		httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567/output?stream=stdout&other=x", nil),
+		httptest.NewRequest(http.MethodGet, "/api/tasks/q1234567/steps/s1234567/output?stream=stdout", strings.NewReader("{}")),
+	} {
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("invalid output query/body accepted: status=%d body=%s", response.Code, response.Body.String())
+		}
+	}
+	if service.outputCaptureCalls != 0 {
+		t.Fatalf("invalid requests reached output service %d times", service.outputCaptureCalls)
 	}
 }
 

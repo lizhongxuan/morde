@@ -218,6 +218,7 @@ func (r ProjectModelRate) Snapshot() project.RateSnapshot {
 
 type CloudDSH struct {
 	Enabled               bool          `yaml:"enabled"`
+	OutputCaptureEnabled  bool          `yaml:"output_capture_enabled"`
 	MaxConcurrentRoutes   int           `yaml:"max_concurrent_routes"`
 	MaxConcurrentTasks    int           `yaml:"max_concurrent_tasks"`
 	MaxConcurrentPerOwner int           `yaml:"max_concurrent_tasks_per_owner"`

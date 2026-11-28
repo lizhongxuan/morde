@@ -1032,6 +1032,9 @@ func serve(ctx context.Context, configPath string) error {
 	fileFetchCleanupCtx, stopFileFetchCleanup := context.WithCancel(ctx)
 	defer stopFileFetchCleanup()
 	go runTaskFileFetchCleanup(fileFetchCleanupCtx, tasks, logger)
+	outputCaptureCleanupCtx, stopOutputCaptureCleanup := context.WithCancel(ctx)
+	defer stopOutputCaptureCleanup()
+	go runTaskStepOutputCaptureCleanup(outputCaptureCleanupCtx, tasks, logger)
 	return runServers(ctx, logger, cfg.HTTP.ShutdownTimeout, background, taskStopWorker, notificationWorker, taskWorker, routeWorker,
 		taskValidationReviewWorker, taskTerminalDeliveryWorker, resultWorker, recordWorker, scheduleWorker, goalAgentTriggerWorker, runtime,
 		gatewayHandler, apiServer, gatewayServer, metricsServer)
@@ -1051,6 +1054,30 @@ func runTaskFileFetchCleanup(ctx context.Context, tasks *app.TaskService, logger
 			}
 		} else if count > 0 && logger != nil {
 			logger.Info("Task file fetch cleanup completed", zap.Int32("records", count))
+		}
+		cancel()
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func runTaskStepOutputCaptureCleanup(ctx context.Context, tasks *app.TaskService, logger *zap.Logger) {
+	ticker := time.NewTicker(app.TaskStepOutputCaptureCleanupInterval)
+	defer ticker.Stop()
+	for {
+		if err := ctx.Err(); err != nil {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		if count, err := tasks.CleanupExpiredTaskStepOutputCaptures(cleanupCtx, app.TaskStepOutputCaptureCleanupBatch); err != nil {
+			if logger != nil {
+				logger.Warn("Task supplemental output capture cleanup failed", zap.Error(err))
+			}
+		} else if count > 0 && logger != nil {
+			logger.Info("Task supplemental output capture cleanup completed", zap.Int32("records", count))
 		}
 		cancel()
 		select {
@@ -1179,6 +1206,11 @@ func newCloudDSHTaskWorker(cfg config.CloudDSH, store *postgres.Store, authorize
 	}
 	if err := tools.SetTaskStepDetailSealer(sealer); err != nil {
 		return nil, err
+	}
+	if cfg.OutputCaptureEnabled {
+		if err := tools.SetTaskStepOutputCaptureEnabled(true); err != nil {
+			return nil, fmt.Errorf("configure supplemental Task output capture: %w", err)
+		}
 	}
 	if err := tools.SetHistorySearchCursorSigning(serviceInstanceID, historyCursorKey); err != nil {
 		return nil, err

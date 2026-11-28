@@ -558,6 +558,24 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 			return AgentToolResult{Status: AgentToolFailed}, err
 		}
 	}
+	captureExecution := taskStepOutputCaptureExecutionFromContext(ctx)
+	var runtimeCaptureIdentity *runtimeclient.SupplementalOutputCaptureIdentity
+	var appCaptureIdentity TaskStepOutputCaptureIdentity
+	if captureExecution != nil && mapping.name == runtimeToolShellExec && preparation.WorkspaceID != "" {
+		runtimeIdentity, appIdentity, identityErr := e.prepareTaskStepOutputCaptureIdentity(
+			ctx, session, current, request, preparation, workspaceViewID, workspaceCheckpointRevision)
+		if identityErr != nil {
+			captureExecution.setStatus(TaskStepOutputCaptureStateFailed)
+		} else {
+			appCaptureIdentity = appIdentity
+			captureExecution.setIdentity(appIdentity)
+			if session.Supports(runtimeclient.SupplementalOutputCaptureCapability) {
+				runtimeCaptureIdentity = &runtimeIdentity
+			} else {
+				captureExecution.setStatus(TaskStepOutputCaptureStateNotRecorded)
+			}
+		}
+	}
 	if err := e.validatePersistedOperation(ctx, current, request, fence, preparation); err != nil {
 		return AgentToolResult{}, err
 	}
@@ -593,10 +611,20 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 		cancelOperation()
 		<-leaseKeeperDone
 	}()
-	operation, err := e.operations.Execute(operationCtx, session, current.ID, request.OperationID, current.Lease.Version,
-		mapping.capability, mapping.action, runtimeArguments, runtimeWorkspaceID, runtimeBindingVersion,
-		workspaceViewID, workspaceCheckpointRevision, inputRevision)
+	var operation runtimeclient.Operation
+	if runtimeCaptureIdentity != nil {
+		operation, err = e.operations.ExecuteWithSupplementalOutputCapture(operationCtx, session, current.ID, request.OperationID,
+			current.Lease.Version, mapping.capability, mapping.action, runtimeArguments, runtimeWorkspaceID, runtimeBindingVersion,
+			workspaceViewID, workspaceCheckpointRevision, inputRevision, *runtimeCaptureIdentity)
+	} else {
+		operation, err = e.operations.Execute(operationCtx, session, current.ID, request.OperationID, current.Lease.Version,
+			mapping.capability, mapping.action, runtimeArguments, runtimeWorkspaceID, runtimeBindingVersion,
+			workspaceViewID, workspaceCheckpointRevision, inputRevision)
+	}
 	if err != nil {
+		if captureExecution != nil && runtimeCaptureIdentity != nil {
+			captureExecution.setStatus(TaskStepOutputCaptureStateFailed)
+		}
 		if domain.CodeOf(err) == domain.CodeWorkspaceConflict {
 			return workspaceInputChangedResult(), nil
 		}
@@ -604,6 +632,9 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 	}
 	operation, err = e.operations.Poll(operationCtx, session, current.ID, request.OperationID, current.Lease.Version, operation)
 	if err != nil {
+		if captureExecution != nil && runtimeCaptureIdentity != nil {
+			captureExecution.setStatus(TaskStepOutputCaptureStateFailed)
+		}
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
 	// A terminal Host response is not safe to expose after the Task, permission,
@@ -613,7 +644,29 @@ func (e *RuntimeToolExecutor) Execute(ctx context.Context, request AgentToolRequ
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
 	if _, err := e.readFence(ctx, latest, &fence); err != nil {
+		if captureExecution != nil && runtimeCaptureIdentity != nil {
+			captureExecution.setStatus(TaskStepOutputCaptureStateFailed)
+		}
 		return AgentToolResult{Status: AgentToolUnknown}, nil
+	}
+	if captureExecution != nil && runtimeCaptureIdentity != nil {
+		if operation.Status != runtimeclient.OperationSucceeded {
+			captureExecution.setStatus(TaskStepOutputCaptureStateFailed)
+		} else if !captureExecution.setLegacyRaw(operation.Result) {
+			captureExecution.setStatus(TaskStepOutputCaptureStateFailed)
+		} else {
+			captureState, stdout, stderr := e.collectTaskStepOutputCapture(operationCtx, session, latest, request,
+				current.Lease.Version, *runtimeCaptureIdentity)
+			if captureState == TaskStepOutputCaptureStateComplete {
+				if !captureExecution.setComplete(appCaptureIdentity, stdout, stderr) {
+					clear(stdout)
+					clear(stderr)
+					captureExecution.setStatus(TaskStepOutputCaptureStateSourceTruncated)
+				}
+			} else {
+				captureExecution.setStatus(captureState)
+			}
+		}
 	}
 	result, err := mapRuntimeToolResult(mapping, operation, request.Arguments)
 	if err == nil && desktopFocusChanged(mapping, operation) {
@@ -709,10 +762,24 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 			return AgentToolResult{Status: AgentToolUnknown}, nil
 		}
 	}
-	if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt, current.WorkspaceID != ""); err != nil {
-		return AgentToolResult{Status: AgentToolUnknown}, nil
+	captureExecution := taskStepOutputCaptureExecutionFromContext(ctx)
+	if captureExecution == nil || mapping.name != runtimeToolShellExec {
+		if err := session.SetTaskLease(ctx, current.ID, current.Lease.Version, *current.Lease.ExpiresAt, current.WorkspaceID != ""); err != nil {
+			return AgentToolResult{Status: AgentToolUnknown}, nil
+		}
 	}
 	if terminal {
+		if captureExecution != nil && mapping.name == runtimeToolShellExec {
+			runtimeOperation, getErr := e.operations.Get(ctx, session, current.ID, persisted.ID, persisted.RuntimeLeaseVersion)
+			if getErr != nil || !runtimeToolOperationMatchesTaskOperation(runtimeOperation, current, persisted, mapping) ||
+				(runtimeOperation.Status != runtimeclient.OperationSucceeded && runtimeOperation.Status != runtimeclient.OperationFailed) {
+				e.captureTaskStepOutputFromTerminalOperation(ctx, session, current, request, runtimeclient.Operation{},
+					[]byte(persisted.Result), persisted.RuntimeLeaseVersion)
+			} else {
+				e.captureTaskStepOutputFromTerminalOperation(ctx, session, current, request, runtimeOperation,
+					[]byte(persisted.Result), persisted.RuntimeLeaseVersion)
+			}
+		}
 		status := AgentToolSucceeded
 		if persisted.Status == task.OperationFailed {
 			status = AgentToolFailed
@@ -721,7 +788,11 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 				return AgentToolResult{Status: status, WaitingReason: "desktop_focus_changed", ExternalID: persisted.ExternalID, Output: persisted.Result}, nil
 			}
 		}
-		return AgentToolResult{Status: status, ExternalID: persisted.ExternalID, Output: persisted.Result}, nil
+		output := persisted.Result
+		if mapping.name == runtimeToolShellExec {
+			output = sanitizePersistedShellToolOutput(output)
+		}
+		return AgentToolResult{Status: status, ExternalID: persisted.ExternalID, Output: output}, nil
 	}
 	operation, err := e.operations.Get(ctx, session, current.ID, persisted.ID, persisted.RuntimeLeaseVersion)
 	if err != nil {
@@ -743,6 +814,10 @@ func (e *RuntimeToolExecutor) ReconcileOperation(ctx context.Context, request Ag
 	operation, err = e.operations.Poll(ctx, session, current.ID, persisted.ID, persisted.RuntimeLeaseVersion, operation)
 	if err != nil || !runtimeToolOperationMatchesTaskOperation(operation, current, persisted, mapping) {
 		return AgentToolResult{Status: AgentToolUnknown}, nil
+	}
+	if captureExecution != nil && mapping.name == runtimeToolShellExec &&
+		(operation.Status == runtimeclient.OperationSucceeded || operation.Status == runtimeclient.OperationFailed) {
+		e.captureTaskStepOutputFromTerminalOperation(ctx, session, current, request, operation, nil, persisted.RuntimeLeaseVersion)
 	}
 	result, err := mapRuntimeToolResult(mapping, operation, request.Arguments)
 	if err == nil && desktopFocusChanged(mapping, operation) {
@@ -2390,6 +2465,8 @@ func mapRuntimeToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 			if err := decodeStrictRuntimeResult(operation.Result, &shell); err != nil || shell.ExitCode < 0 || shell.ExitCode > 255 {
 				return AgentToolResult{Status: AgentToolFailed, ExternalID: operation.OperationID, Output: `{"error":"invalid_shell_result"}`}, nil
 			}
+			shell.Stdout, _ = taskStepSanitizedText(shell.Stdout)
+			shell.Stderr, _ = taskStepSanitizedText(shell.Stderr)
 			encoded, err := json.Marshal(shell)
 			if err != nil {
 				return AgentToolResult{Status: AgentToolFailed, ExternalID: operation.OperationID, Output: `{"error":"invalid_shell_result"}`}, nil
@@ -2428,6 +2505,20 @@ func mapRuntimeToolResult(mapping runtimeToolMapping, operation runtimeclient.Op
 	default:
 		return AgentToolResult{Status: AgentToolUnknown}, nil
 	}
+}
+
+func sanitizePersistedShellToolOutput(raw string) string {
+	var shell taskStepShellOutput
+	if decodeStrictRuntimeResult([]byte(raw), &shell) != nil || shell.ExitCode < 0 || shell.ExitCode > 255 {
+		return `{"error":"invalid_shell_result"}`
+	}
+	shell.Stdout, _ = taskStepSanitizedText(shell.Stdout)
+	shell.Stderr, _ = taskStepSanitizedText(shell.Stderr)
+	encoded, err := json.Marshal(shell)
+	if err != nil {
+		return `{"error":"invalid_shell_result"}`
+	}
+	return boundedToolOutput(string(encoded))
 }
 
 type browserToolTargetResult struct {
