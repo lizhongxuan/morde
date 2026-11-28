@@ -40,8 +40,9 @@ func TestConversationRouteModelRequestCarriesStableLocalizedTime(t *testing.T) {
 		!strings.Contains(request.Instructions, "smallest exact question") {
 		t.Fatalf("direct chat and time rules missing from router instructions: %s", request.Instructions)
 	}
-	if !strings.Contains(request.Instructions, `{"action":"new","acknowledge":true}`) ||
-		!strings.Contains(request.Instructions, "Leave tool_name and tool_arguments empty") ||
+	if !strings.Contains(request.Instructions, `{"action":"new","file_delivery_intent":"none","acknowledge":true}`) ||
+		!strings.Contains(request.Instructions, `{"action":"tool","tool_name":"morde_web_search"`) ||
+		strings.Contains(request.Instructions, `choose action "new" so the DSH Task Agent`) ||
 		!strings.Contains(request.Instructions, "Include only fields relevant to the selected action") {
 		t.Fatalf("JSON examples do not match the action-scoped tool schema: %s", request.Instructions)
 	}
@@ -67,6 +68,35 @@ func TestConversationRouteSearchIntentUsesDSHTaskAgent(t *testing.T) {
 	decision = ParseConversationRouteDecisionForContext(quotedArguments, value)
 	if !decision.InvalidOutput || decision.InvalidOutputCategory != "action_fields_invalid" {
 		t.Fatalf("quoted tool arguments did not fail with a safe structural category: %+v", decision)
+	}
+}
+
+func TestConversationRouteNewsPromptUsesValidatedResearchProfileMarker(t *testing.T) {
+	value := ConversationRouteContext{ActorID: "u1234567", Content: "搜索今天的科技新闻，给我三条，每条附来源链接。"}
+	request, err := ConversationRouteModelRequest(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, required := range []string{
+		`return action "tool"`,
+		`"action":"tool","tool_name":"morde_web_search"`,
+		`category="news"`,
+		`time_range`,
+		`The server validates the marker and creates a DSH Task restricted to those read-only tools`,
+	} {
+		if !strings.Contains(request.Instructions, required) {
+			t.Fatalf("news route instructions omitted %q: %s", required, request.Instructions)
+		}
+	}
+	if strings.Contains(request.Instructions, `choose action "new" so the DSH Task Agent`) {
+		t.Fatalf("news route instructions still direct the model away from the profile trigger: %s", request.Instructions)
+	}
+
+	output := `{"action":"tool","tool_name":"morde_web_search","tool_arguments":{"query":"today technology news","category":"news","time_range":"day"}}`
+	decision := ParseConversationRouteDecisionForContext(output, value)
+	if decision.InvalidOutput || decision.Action != ConversationRouteNew || !decision.Acknowledge ||
+		decision.AgentToolProfile != task.AgentToolProfileWebResearch || !ValidConversationRouteAgentToolProfile(decision, value) {
+		t.Fatalf("validated news marker did not create a profile-bound DSH Task: %+v", decision)
 	}
 }
 
@@ -257,8 +287,7 @@ func TestConversationRouteModelRequestsUseConsistentJSONFieldContract(t *testing
 				`Use "required" only when the user requests a file to be delivered, downloaded, exported, or saved, or a Workspace artifact`,
 				`Empty string means no explicit override`,
 				conversationRouteExplicitNewInstructions,
-				`Leave tool_name and tool_arguments empty`,
-				`choose action "new" so the DSH Task Agent`,
+				`For eligible public web search/read, use action "tool" with tool_name and tool_arguments`,
 				`Actions:`,
 			} {
 				if !strings.Contains(prompt.instructions, required) {
@@ -1099,7 +1128,9 @@ func TestConversationRouteWebLookupUsesTaskAgentAndSynthesis(t *testing.T) {
 	}
 	request, err := ConversationRouteModelRequest(value)
 	if err != nil || !strings.Contains(request.Instructions, `"tool_name"`) ||
-		!strings.Contains(request.Instructions, `choose action "new"`) ||
+		!strings.Contains(request.Instructions, `return action "tool"`) ||
+		!strings.Contains(request.Instructions, `"action":"tool","tool_name":"morde_web_search"`) ||
+		strings.Contains(request.Instructions, `choose action "new" so the DSH Task Agent`) ||
 		!strings.Contains(request.Instructions, `DSH Task Agent`) ||
 		strings.Contains(request.Instructions, `one-call search`) {
 		t.Fatalf("DSH lookup handoff contract missing or direct shortcut still advertised: err=%v instructions=%s", err, request.Instructions)
